@@ -220,77 +220,28 @@ impl Engine {
     }
 
     async fn delete_objects(&self, candidates: &[Candidate]) -> Result<()> {
-        use aws_sdk_s3::types::{Delete, ObjectIdentifier};
-        // S3 keys have no parent/child deletion dependency. Keep batches bounded
-        // independently of file-copy concurrency, and honor the request budget.
-        let mut batches = stream::iter(candidates.chunks(1000).map(|batch| async move {
-            let _slot = self.tuning.requests.acquire().await;
-            self.check_cancelled()?;
-            let objects = batch
-                .iter()
-                .map(|c| {
-                    ObjectIdentifier::builder()
-                        .key(c.key.as_ref().unwrap())
-                        .build()
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let result = self
-                .client
-                .delete_objects()
-                .bucket(&self.options.bucket)
-                .delete(
-                    Delete::builder()
-                        .set_objects(Some(objects))
-                        .quiet(false)
-                        .build()?,
-                )
-                .send()
-                .await;
-            let errors: HashMap<_, _> = result
-                .as_ref()
-                .ok()
-                .into_iter()
-                .flat_map(|r| r.errors())
-                .filter_map(|e| e.key().map(|key| (key, e)))
-                .collect();
-            let deleted: std::collections::HashSet<_> = result
-                .as_ref()
-                .ok()
-                .into_iter()
-                .flat_map(|r| r.deleted())
-                .filter_map(|d| d.key())
-                .collect();
-            for c in batch {
-                let key = c.key.as_deref().unwrap();
-                let outcome = match &result {
-                    Err(error) => Err(anyhow::anyhow!("{error}")),
-                    Ok(_) => {
-                        if let Some(error) = errors.get(key) {
-                            Err(anyhow::anyhow!(
-                                "{}: {}",
-                                error.code().unwrap_or("S3 deletion error"),
-                                error.message().unwrap_or("")
-                            ))
-                        } else if deleted.contains(key) {
-                            Ok(())
-                        } else {
-                            Err(anyhow::anyhow!("S3 deletion response omitted key {key:?}"))
-                        }
-                    }
-                };
-                self.deletion_finished(c, outcome, "transport");
-            }
-            Ok::<_, anyhow::Error>(())
-        }))
-        .buffer_unordered(10);
-        // Drain started requests even on cancellation; never discard their results.
-        let mut failure = None;
-        while let Some(result) = batches.next().await {
-            if let Err(error) = result {
-                failure.get_or_insert(error);
-            }
+        crate::s3::delete::Deleter {
+            client: &self.client,
+            bucket: &self.options.bucket,
+            budget: &self.tuning.requests,
         }
-        failure.map_or(Ok(()), Err)
+        .run(
+            candidates,
+            |c| crate::s3::delete::Target {
+                key: c.key.clone().unwrap(),
+                version: None,
+            },
+            || self.check_cancelled(),
+            |candidate, result| {
+                let class = result.as_ref().err().map_or("transport", |e| e.class);
+                self.deletion_finished(
+                    candidate,
+                    result.map_err(|e| anyhow::anyhow!(e.message)),
+                    class,
+                );
+            },
+        )
+        .await
     }
 
     fn deletion_finished(&self, candidate: &Candidate, result: Result<()>, class: &'static str) {

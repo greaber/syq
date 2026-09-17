@@ -222,6 +222,27 @@ fn serve(
         }
         return;
     }
+    if fault.starts_with("remove-bulk") && method == "GET" && !first.contains("delimiter=") {
+        let second = first.contains("version-id-marker=");
+        let range = if second { 1000..1001 } else { 0..1000 };
+        let mut entries = range.map(|i| format!("<Version><Key>tree/key</Key><VersionId>v{i}</VersionId><IsLatest>false</IsLatest></Version>")).collect::<String>();
+        if second {
+            entries.push_str("<DeleteMarker><Key>tree/key</Key><VersionId>marker</VersionId><IsLatest>true</IsLatest></DeleteMarker>");
+        }
+        let cursor = if second {
+            "<IsTruncated>false</IsTruncated>"
+        } else {
+            "<IsTruncated>true</IsTruncated><NextKeyMarker>tree/key</NextKeyMarker><NextVersionIdMarker>v999</NextVersionIdMarker>"
+        };
+        reply(
+            &mut socket,
+            200,
+            &[],
+            format!("<ListVersionsResult>{cursor}{entries}</ListVersionsResult>").as_bytes(),
+            false,
+        );
+        return;
+    }
     if fault.starts_with("remove-") {
         if method == "GET" && first.contains("delimiter=") {
             reply(
@@ -246,14 +267,63 @@ fn serve(
             } else {
                 "<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>tree/key</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker><DeleteMarker><Key>tree/key</Key><VersionId>marker</VersionId></DeleteMarker><Version><Key>tree/key</Key><VersionId>v1</VersionId></Version></ListVersionsResult>"
             };
+            let body = if fault == "remove-null" {
+                body.replace("<VersionId>v1</VersionId>", "<VersionId>null</VersionId>")
+            } else {
+                body.to_owned()
+            };
             reply(&mut socket, 200, &[], body.as_bytes(), false);
         } else {
-            assert_eq!(method, "DELETE");
-            if fault == "remove-denied" {
+            assert_eq!(method, "POST");
+            assert!(first.contains("delete"));
+            let length: usize = headers["content-length"].parse().unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            let versions: Vec<_> = body
+                .split("<VersionId>")
+                .skip(1)
+                .map(|s| s.split("</VersionId>").next().unwrap())
+                .collect();
+            assert!(!versions.is_empty() && versions.len() <= 1000);
+            let markers = versions.contains(&"marker");
+            assert!(
+                !markers || versions.len() == 1,
+                "mixed data and marker phase"
+            );
+            if !matches!(fault, "remove-ok" | "remove-null" | "remove-bulk") {
+                assert!(!markers, "must preserve markers after data failure");
+            }
+            if fault == "remove-bulk-interrupt" {
+                gate.0.store(true, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !gate.1.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
                 assert!(
-                    !first.contains("versionId=marker"),
-                    "must preserve marker after a failed data deletion"
+                    gate.1.load(Ordering::SeqCst),
+                    "test did not release in-flight deletion"
                 );
+            }
+            if matches!(fault, "remove-bulk" | "remove-bulk-failure") && !markers {
+                let (arrived, peer) = if versions.len() == 1000 {
+                    (&gate.0, &gate.1)
+                } else {
+                    (&gate.1, &gate.0)
+                };
+                arrived.store(true, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !peer.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert!(peer.load(Ordering::SeqCst), "removal batches ran serially");
+                if versions.len() == 1000 {
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+            if fault == "remove-denied"
+                || (fault == "remove-bulk-failure" && versions.len() == 1000)
+            {
                 reply(
                     &mut socket,
                     403,
@@ -262,8 +332,24 @@ fn serve(
                     false,
                 );
             } else {
-                assert!(first.contains("versionId="));
-                reply(&mut socket, 204, &[], b"", false);
+                let entries = versions.iter().rev().map(|version| {
+                    if fault == "remove-null" && *version == "null" {
+                        "<Deleted><Key>tree/key</Key></Deleted>".to_owned()
+                    } else if fault == "remove-mixed" && *version == "v1" {
+                        format!("<Error><Key>tree/key</Key><VersionId>{version}</VersionId><Code>AccessDenied</Code><Message>denied</Message></Error>")
+                    } else if fault == "remove-omitted" && *version == "v1" {
+                        String::new()
+                    } else {
+                        format!("<Deleted><Key>tree/key</Key><VersionId>{version}</VersionId></Deleted>")
+                    }
+                }).collect::<String>();
+                reply(
+                    &mut socket,
+                    200,
+                    &[],
+                    format!("<DeleteResult>{entries}</DeleteResult>").as_bytes(),
+                    false,
+                );
             }
         }
         return;
@@ -2095,7 +2181,10 @@ fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
         ("remove-no-id", 1, 2),
         ("remove-no-cursor", 1, 2),
         ("remove-denied", 23, 4),
-        ("remove-ok", 0, 6),
+        ("remove-ok", 0, 5),
+        ("remove-null", 0, 5),
+        ("remove-mixed", 23, 4),
+        ("remove-omitted", 23, 4),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let server = Server::start(fault);
@@ -2128,21 +2217,49 @@ fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
         for line in records.lines() {
             let value: serde_json::Value = serde_json::from_str(line).unwrap();
             assert!(validator.is_valid(&value), "{value}");
-            if fault == "remove-denied" && value["type"] == "removal_result" {
+            if fault == "remove-denied"
+                && value["type"] == "removal_result"
+                && value["s3_delete_marker"] == false
+            {
                 assert_eq!(value["class"], "io");
                 assert_eq!(value["os_kind"], "permission_denied");
                 assert_eq!(value["retryable"], "no");
             }
         }
+        let outcomes: Vec<serde_json::Value> = records
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|r: &serde_json::Value| r["type"] == "removal_result")
+            .collect();
+        if exit == 23 || exit == 0 {
+            assert_eq!(outcomes.len(), 3);
+        }
+        if exit == 23 {
+            let marker = outcomes
+                .iter()
+                .find(|r| r["s3_delete_marker"] == true)
+                .unwrap();
+            assert_eq!(marker["attempts"], 0);
+            assert_eq!(marker["disposition"], "failed");
+            assert!(marker["message"].as_str().unwrap().contains("preserved"));
+        }
         let result: serde_json::Value =
             serde_json::from_str(records.lines().last().unwrap()).unwrap();
         assert_eq!(
             result["entries_removed"],
-            if fault == "remove-ok" { 3 } else { 0 }
+            match fault {
+                "remove-ok" | "remove-null" => 3,
+                "remove-mixed" | "remove-omitted" => 1,
+                _ => 0,
+            }
         );
         assert_eq!(
             result["entries_failed"],
-            u64::from(fault == "remove-denied")
+            match fault {
+                "remove-denied" => 3,
+                "remove-mixed" | "remove-omitted" => 2,
+                _ => 0,
+            }
         );
     }
 }
@@ -2532,4 +2649,117 @@ fn s3_remove_exact_versions_stops_before_unrelated_prefixes() {
     assert!(output_text(&output).contains("hidden"));
     assert!(output_text(&output).contains("2 entries"));
     assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn s3_remove_batches_are_concurrent_and_preserve_markers_after_late_failure() {
+    for (fault, exit, requests, removed, failed) in [
+        ("remove-bulk", 0, 6, 1002, 0),
+        ("remove-bulk-failure", 23, 5, 1, 1001),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_for(temp.path(), "rm")
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--on",
+                "s3://bucket",
+                "--src-dir",
+                "tree",
+                "--s3-all-versions",
+                "--results",
+                "results.ndjson",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{}", output_text(&output));
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+        let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let records: Vec<serde_json::Value> = records
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let summary = records.last().unwrap();
+        assert_eq!(summary["entries_removed"], removed);
+        assert_eq!(summary["entries_failed"], failed);
+        let outcomes: Vec<_> = records
+            .iter()
+            .filter(|r| r["type"] == "removal_result")
+            .collect();
+        assert_eq!(outcomes.len(), 1002);
+        let ids: std::collections::HashSet<_> = outcomes
+            .iter()
+            .map(|r| r["s3_version_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1002);
+        let marker = outcomes
+            .iter()
+            .find(|r| r["s3_delete_marker"] == true)
+            .unwrap();
+        if failed != 0 {
+            assert_eq!(marker["attempts"], 0);
+        }
+    }
+}
+
+#[test]
+fn s3_remove_interrupt_drains_in_flight_results_before_exiting() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("remove-bulk-interrupt");
+    let mut child = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "--src-dir",
+            "tree",
+            "--s3-all-versions",
+            "--results",
+            "results.ndjson",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while server.requests.load(Ordering::SeqCst) < 5 && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "rm exited before sending batches"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    if server.requests.load(Ordering::SeqCst) < 5 {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!(
+            "timed out waiting for removal requests: {}",
+            server.requests.load(Ordering::SeqCst)
+        );
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    thread::sleep(Duration::from_millis(100));
+    let premature = child.try_wait().unwrap();
+    server.gate.1.store(true, Ordering::SeqCst);
+    let status = child.wait().unwrap();
+    assert!(premature.is_none(), "rm discarded its in-flight requests");
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(server.requests.load(Ordering::SeqCst), 5);
+    let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+    let records: Vec<serde_json::Value> = records
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["type"] == "removal_result")
+            .count(),
+        1001
+    );
+    assert_eq!(records.last().unwrap()["entries_removed"], 1001);
 }

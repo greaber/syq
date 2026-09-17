@@ -259,9 +259,14 @@ version IDs and identifies delete markers without sending deletion requests.
 The same endpoint, region, profile, and custom-header options work as for copies.
 
 All selectors and listings are checked before deletion begins. Overlapping
-selections remove each key/version once. Removal stops at the first deletion
-error and reports partial failure; it cannot undo earlier removals. For
-`--s3-all-versions`, delete markers are removed after the selected data versions.
+selections remove each key/version once. Removal sends concurrent batches of up
+to 1,000 entries and continues after individual or batch failures, reporting
+partial failure with exit 23. It cannot undo earlier removals. With
+`--s3-all-versions`, all selected data versions are attempted before any delete
+markers. If any data version fails, all selected markers are preserved and
+reported as failed removals with zero attempts. This keeps hidden contents from
+being exposed by removing their markers after an incomplete purge. Interrupting
+a run stops new batches and waits for requests already sent to finish.
 Stop concurrent writers when clearing a prefix: versions created after listing
 are not part of the removal plan. Version operations require permission to list
 and delete versions; retention rules may prevent permanent deletion.

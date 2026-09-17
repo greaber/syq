@@ -1,12 +1,12 @@
 //! Explicit S3 removal. Resolve every selector before issuing any DELETE.
-use super::{client, local};
+use super::{client, delete, local};
 use crate::{
     cli::{Args, SourceSelection},
     progress::Progress,
     results::{RemovalRecord, RmResultRecord, RunMode, SelectionResultRecord},
 };
 use anyhow::{bail, Context, Result};
-use aws_sdk_s3::{error::ProvideErrorMetadata, Client};
+use aws_sdk_s3::Client;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -318,26 +318,66 @@ async fn plan(
     Ok(entries)
 }
 
-fn failure_classification(
-    code: Option<&str>,
-    status: Option<u16>,
-) -> (&'static str, &'static str, Option<&'static str>) {
-    match code {
-        Some("AccessDenied" | "InvalidAccessKeyId" | "SignatureDoesNotMatch") => {
-            ("io", "no", Some("permission_denied"))
+fn finished(
+    args: &Args,
+    progress: &Progress,
+    summary: &mut RmResultRecord,
+    entry: &Entry,
+    result: std::result::Result<(), delete::Failure>,
+) {
+    let failure = result.as_ref().err();
+    let message = result
+        .as_ref()
+        .err()
+        .map(|e| format!("S3 remove {:?}: {}", entry.key, e.message));
+    if let Some(message) = &message {
+        progress.error(message);
+        summary.entries_failed += 1;
+        summary.errors += 1;
+    } else if args.dry_run {
+        summary.entries_planned += 1;
+    } else {
+        summary.entries_removed += 1;
+    }
+    if result.is_ok() {
+        progress.files_done.fetch_add(1, Relaxed);
+    }
+    if !args.quiet && args.verbose > 0 {
+        progress.println(&format!(
+            "{} {:?}{}{}",
+            if args.dry_run {
+                "would remove"
+            } else if result.is_ok() {
+                "removed"
+            } else {
+                "failed"
+            },
+            entry.key,
+            entry
+                .version
+                .as_ref()
+                .map_or(String::new(), |v| format!(" version {v:?}")),
+            if entry.marker { " (delete marker)" } else { "" }
+        ));
+    }
+    if let Some(writer) = progress.results_writer() {
+        let record = RemovalRecord {
+            selector: entry.selector,
+            path: entry.key.as_bytes(),
+            kind: Some(entry.kind()),
+            disposition: if result.is_ok() { "removed" } else { "failed" },
+            attempts: Some(failure.map_or(1, |f| f.attempts)),
+            retryable: failure.map(|f| f.retryable),
+            class: failure.map(|f| f.class),
+            os_kind: failure.and_then(|f| f.os_kind),
+            message: message.as_deref(),
+        };
+        let version = entry.version.as_deref().map(|v| (v, entry.marker));
+        if args.dry_run {
+            writer.emit_removal_trace_s3(&record, version);
+        } else {
+            writer.emit_removal_result_s3(&record, version);
         }
-        Some("NoSuchBucket") => ("io", "no", Some("not_found")),
-        Some("InvalidArgument" | "InvalidRequest" | "InvalidBucketName") => {
-            ("usage", "no", Some("invalid_input"))
-        }
-        Some("SlowDown" | "Throttling" | "ThrottlingException" | "RequestTimeout") => {
-            ("transport", "yes", None)
-        }
-        _ => match status {
-            Some(403) => ("io", "no", Some("permission_denied")),
-            Some(429 | 500 | 502 | 503 | 504) => ("transport", "yes", None),
-            _ => ("transport", "unknown", None),
-        },
     }
 }
 
@@ -373,6 +413,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
         .build()?;
     let ticker = progress.spawn_ticker();
     let result = runtime.block_on(async {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
         let work = async {
             let mut options = args.s3.clone().unwrap();
             let (client, note) = client::connect(&mut options).await?;
@@ -382,96 +423,72 @@ pub(super) fn run(args: Args) -> Result<i32> {
             let entries = plan(&args, &client, &progress, &mut summary).await?;
             progress.files_total.store(entries.len() as u64, Relaxed);
             progress.scan_done.store(true, Relaxed);
-            for entry in entries {
-                if progress.results_writer().is_some_and(|w| w.is_dead()) {
-                    bail!("S3 removal result stream became unavailable");
+            let check = || {
+                anyhow::ensure!(!cancelled.load(Relaxed), "S3 removal interrupted");
+                anyhow::ensure!(
+                    !progress.results_writer().is_some_and(|w| w.is_dead()),
+                    "S3 removal result stream became unavailable"
+                );
+                Ok(())
+            };
+            let tuning = super::tuning::Tuning::new(&options, &args);
+            let deleter = delete::Deleter {
+                client: &client,
+                bucket: &options.bucket,
+                budget: &tuning.requests,
+            };
+            let identify = |entry: &Entry| delete::Target {
+                key: entry.key.clone(),
+                version: entry.version.clone(),
+            };
+            if args.dry_run {
+                for entry in &entries {
+                    check()?;
+                    finished(&args, &progress, &mut summary, entry, Ok(()));
                 }
-                let mut failure = ("transport", "unknown", None);
-                let result = if args.dry_run {
-                    Ok(())
-                } else {
-                    client
-                        .delete_object()
-                        .bucket(&options.bucket)
-                        .key(&entry.key)
-                        .set_version_id(entry.version.clone())
-                        .send()
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| {
-                            failure = failure_classification(
-                                e.as_service_error().and_then(|e| e.code()),
-                                e.raw_response().map(|r| r.status().as_u16()),
-                            );
-                            let message = client::failure("S3 removal", &e);
-                            anyhow::Error::new(e.into_service_error()).context(message)
+            } else {
+                let split = entries.partition_point(|e| !e.marker);
+                let (data, markers) = entries.split_at(split);
+                deleter
+                    .run(data, identify, &check, |entry, result| {
+                        finished(&args, &progress, &mut summary, entry, result);
+                    })
+                    .await?;
+                if summary.entries_failed == 0 {
+                    deleter
+                        .run(markers, identify, &check, |entry, result| {
+                            finished(&args, &progress, &mut summary, entry, result);
                         })
-                };
-                let message = result
-                    .as_ref()
-                    .err()
-                    .map(|e| format!("S3 remove {:?}: {e:#}", entry.key));
-                if let Some(message) = &message {
-                    progress.error(message);
-                    summary.entries_failed += 1;
-                    summary.errors += 1;
-                } else if args.dry_run {
-                    summary.entries_planned += 1;
+                        .await?;
                 } else {
-                    summary.entries_removed += 1;
-                }
-                if result.is_ok() {
-                    progress.files_done.fetch_add(1, Relaxed);
-                }
-                if !args.quiet && args.verbose > 0 {
-                    progress.println(&format!(
-                        "{} {:?}{}{}",
-                        if args.dry_run {
-                            "would remove"
-                        } else if result.is_ok() {
-                            "removed"
-                        } else {
-                            "failed"
-                        },
-                        entry.key,
-                        entry
-                            .version
-                            .as_ref()
-                            .map_or(String::new(), |v| format!(" version {v:?}")),
-                        if entry.marker { " (delete marker)" } else { "" }
-                    ));
-                }
-                if let Some(writer) = progress.results_writer() {
-                    let record = RemovalRecord {
-                        selector: entry.selector,
-                        path: entry.key.as_bytes(),
-                        kind: Some(entry.kind()),
-                        disposition: if result.is_ok() { "removed" } else { "failed" },
-                        attempts: Some(1),
-                        retryable: message.as_ref().map(|_| failure.1),
-                        class: message.as_ref().map(|_| failure.0),
-                        os_kind: failure.2,
-                        message: message.as_deref(),
-                    };
-                    let version = entry.version.as_deref().map(|v| (v, entry.marker));
-                    if args.dry_run {
-                        writer.emit_removal_trace_s3(&record, version);
-                    } else {
-                        writer.emit_removal_result_s3(&record, version);
+                    for entry in markers {
+                        finished(
+                            &args,
+                            &progress,
+                            &mut summary,
+                            entry,
+                            Err(delete::Failure::preserved_marker()),
+                        );
                     }
-                }
-                if result.is_err() {
-                    break;
                 }
             }
             Ok::<_, anyhow::Error>(())
         };
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::pin!(work);
         tokio::select! {
-            result = work => result,
-            _ = tokio::signal::ctrl_c() => bail!("S3 removal interrupted"),
-            _ = terminate.recv() => bail!("S3 removal terminated"),
+            result = &mut work => result,
+            _ = tokio::signal::ctrl_c() => {
+                cancelled.store(true, Relaxed);
+                let _ = work.await;
+                bail!("S3 removal interrupted");
+            },
+            _ = terminate.recv() => {
+                cancelled.store(true, Relaxed);
+                let _ = work.await;
+                bail!("S3 removal terminated");
+            },
         }
     });
     if let Err(error) = result {

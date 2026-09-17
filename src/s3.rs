@@ -3,6 +3,7 @@
 mod admission;
 mod checksum;
 mod client;
+mod delete;
 mod diagnostics;
 mod dns;
 mod local;

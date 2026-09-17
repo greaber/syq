@@ -61,8 +61,11 @@ With `--root`, traversal must still stay inside that root.
 
 ## Results
 
-Filesystem removal continues with independent entries after per-entry failures
-and exits 23. S3 removal stops at the first deletion failure and also exits 23. Fatal setup or connection failures exit 1. Use
+Removal continues with independent entries after per-entry failures and exits 23.
+S3 removal uses concurrent batches and reports each key or version separately.
+During permanent removal, a data-version failure preserves all selected delete
+markers; see [S3 removal](object-storage.md#remove-objects-and-versions).
+Fatal setup or connection failures exit 1. Use
 [`--results`](automation.md) for per-path outcomes in scripts.
 
 For the full option list, run `syq rm --help-all`.
