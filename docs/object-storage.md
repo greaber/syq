@@ -66,6 +66,9 @@ copies. Provider controls such as Tigris consistency headers and
 `x-amz-storage-class` remain available.
 Syq refuses overrides of authentication, request
 framing, ranges, conditional writes, checksums, and its own metadata headers.
+It also refuses `x-amz-copy-source*`, `x-amz-metadata-directive`, and
+`x-amz-tagging-directive` on every S3 route; syq controls the copy source and
+metadata/tagging directives.
 Header values are omitted from results and recovery records. Command-line
 arguments may still be visible to other processes on the machine.
 
@@ -151,7 +154,8 @@ copy requests; it does not download or relay object bodies. Both buckets use
 the same configured endpoint, region, and credentials. Copying between different
 providers is not supported, and failed server-side copies never fall back to
 local downloads and uploads. Overlapping source and destination paths in the
-same bucket are rejected.
+same bucket are rejected, including a destination prefix equal to, inside,
+or above a selected source prefix.
 
 Placement, selection filters, overwrite choices, `--dry-run`, `--results`, and
 `--prune` work as for local/S3 copies. Object metadata and tags are copied,
@@ -186,7 +190,7 @@ limit. Larger objects use concurrent multipart server-side copying, with the sha
 request budget and per-object part limit described above. Failed or cancelled
 multipart copies attempt to abort their unfinished upload; retries restart that object.
 If cleanup fails, syq reports the upload ID for manual cleanup. Already completed
-objects remain available. Existing upload and download resume behavior is unchanged.
+objects remain available.
 
 ## Metadata and integrity
 
