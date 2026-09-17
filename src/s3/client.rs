@@ -52,6 +52,27 @@ pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
     aws_sdk_s3::config::Builder::new().retry_config(RetryConfig::disabled())
 }
 
+/// A slow upload can take arbitrarily long. Neither elapsed request time nor
+/// the rate at which Hyper polls a buffered body establishes a network stall.
+/// Keep connection timeouts and response-body protection, but wait for the
+/// provider's answer or explicit cancellation before retiring an upload.
+pub(super) fn upload_config() -> aws_sdk_s3::config::Builder {
+    without_sdk_retries()
+        .timeout_config(
+            TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .disable_read_timeout()
+                .disable_operation_timeout()
+                .disable_operation_attempt_timeout()
+                .build(),
+        )
+        .stalled_stream_protection(
+            aws_sdk_s3::config::StalledStreamProtectionConfig::enabled()
+                .upload_enabled(false)
+                .build(),
+        )
+}
+
 /// Time HEAD and LIST responses to their headers. Each is one small exchange,
 /// unlike data requests, whose duration follows their bodies. Only an answer
 /// about the object or listing counts: errors and throttling describe the
@@ -212,6 +233,7 @@ async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<Str
 pub(super) async fn connect(
     options: &mut Options,
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    uploads: std::sync::Arc<super::upload_http::Cancellation>,
 ) -> Result<(Client, Option<String>)> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(profile) = &options.profile {
@@ -226,7 +248,7 @@ pub(super) async fn connect(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
         ))
         .build_with_resolver(super::dns::CoalescingDns::default());
-    let transport = super::upload_http::client(transport);
+    let transport = super::upload_http::client(transport, uploads);
     let mut config = aws_sdk_s3::config::Builder::from(&shared)
         .http_client(transport)
         .region(
@@ -985,3 +1007,6 @@ mod tests {
 
 #[cfg(test)]
 mod control_latency_tests;
+
+#[cfg(test)]
+mod upload_timeout_tests;

@@ -604,6 +604,7 @@ mod buffer_tests {
             upload_keys: OnceLock::new(),
             cancelled: Default::default(),
             cancel_wake: Default::default(),
+            uploads: Default::default(),
         }
     }
 

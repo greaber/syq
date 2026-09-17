@@ -48,6 +48,13 @@ pub(super) struct Engine {
     tuning: super::tuning::Tuning,
     cancelled: std::sync::atomic::AtomicBool,
     cancel_wake: tokio::sync::Notify,
+    uploads: Arc<super::upload_http::Cancellation>,
+}
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Fatal errors can drop the scheduler before its usual drain finishes.
+        self.uploads.cancel();
+    }
 }
 #[derive(Clone)]
 struct Download {
@@ -105,7 +112,9 @@ impl Engine {
             .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
         let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-        let (client, note) = client::connect(&mut options, control.clone()).await?;
+        let uploads = Arc::new(super::upload_http::Cancellation::default());
+        let (client, note) =
+            client::connect(&mut options, control.clone(), uploads.clone()).await?;
         if let Some(note) = note.filter(|_| args.verbose > 0) {
             progress.println(&note);
         }
@@ -114,6 +123,7 @@ impl Engine {
             tuning: super::tuning::Tuning::new(&options, &args, control),
             cancelled: std::sync::atomic::AtomicBool::new(false),
             cancel_wake: tokio::sync::Notify::new(),
+            uploads,
             args,
             options,
             client,
@@ -134,6 +144,7 @@ impl Engine {
         };
         self.cancelled.store(true, Relaxed);
         self.cancel_wake.notify_waiters();
+        self.uploads.cancel();
         // Drain started requests, including synchronous file bodies, before exit.
         let _ = work.await;
         bail!("S3 copy {interrupted}; rerun the command to continue")
@@ -746,6 +757,7 @@ impl Engine {
                 synchronous.then(|| crate::s3::upload_http::FileBody::new(source.clone(), 0, size));
             let mut attempt = 0;
             loop {
+                self.check_cancelled()?;
                 let body = if let Some(bytes) = &small {
                     ByteStream::from(bytes.clone())
                 } else if synchronous {
@@ -766,7 +778,7 @@ impl Engine {
                     .set_metadata(Some(metadata.encode()))
                     .set_if_none_match(must_be_new.then(|| "*".into()))
                     .customize()
-                    .config_override(super::client::without_sdk_retries())
+                    .config_override(super::client::upload_config())
                     .disable_payload_signing();
                 let request = if let Some(file) = &sync_file {
                     request.interceptor(file.clone())
@@ -980,7 +992,7 @@ impl Engine {
                                     (algorithm == Algorithm::Md5).then(|| checksum.clone()),
                                 )
                                 .customize()
-                                .config_override(super::client::without_sdk_retries())
+                                .config_override(super::client::upload_config())
                                 .disable_payload_signing();
                             let request = if let Some(file) = &sync_file {
                                 request.interceptor(file.clone())

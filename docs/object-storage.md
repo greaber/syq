@@ -195,6 +195,11 @@ than comparable reads in the same copy. The retry checks the object's identity
 and reuses the portion already processed. Other read failures can still restart
 the entire range. Setting `s3-retries=0` disables this recovery.
 
+Uploads have no total-duration deadline, so an object or part can take hours on
+a slow link. Connection attempts and stalled downloads still have timeouts. If
+a provider keeps the connection open but never finishes answering an upload,
+cancel the copy to stop waiting.
+
 Use `--prune` to mirror selected directories or prefixes in either direction:
 
 ```sh

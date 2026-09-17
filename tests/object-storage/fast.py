@@ -4,6 +4,8 @@ import base64, hashlib, shutil, http.server, json, os, pathlib, signal, subproce
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 events = []
 scenario = "upload"
+upload_started = threading.Event()
+uploads_finished = threading.Condition()
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def respond(self, status, body=b"", headers=None):
@@ -35,6 +37,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         assert not self.headers.get("x-amz-meta-syq-blake3")
         part=int(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("partNumber",[0])[0])
         events.append(("put-start",time.monotonic(),part))
+        upload_started.set()
         left=int(self.headers["Content-Length"])
         digest=hashlib.sha256()
         while left:
@@ -42,6 +45,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not block: break
             digest.update(block)
             left-=len(block)
+        if scenario == "upload-interrupted":
+            # Never acknowledge the request. The client must close its socket
+            # on cancellation, whether the body finished or was cut short.
+            assert self.rfile.read(1) == b""
+            with uploads_finished:
+                events.append(("put-end",time.monotonic(),part))
+                uploads_finished.notify_all()
+            return
         assert base64.b64encode(digest.digest()).decode()==self.headers["x-amz-checksum-sha256"]
         if part==2: time.sleep(.4)
         if scenario in ("upload-delayed", "upload-single-delayed"): time.sleep(7)
@@ -61,14 +72,20 @@ try:
         for scenario in ["upload", "upload-delayed", "upload-single", "upload-single-delayed", "upload-single-failure", "upload-failure", "upload-interrupted", "download", "download-truncated"]:
             shutil.rmtree(root/"cache",ignore_errors=True)
             events.clear(); destination=root/"download"; destination.unlink(missing_ok=True)
+            upload_started.clear()
             command=base+([str(source),"--to","s3://fixture","--as","object"] if scenario.startswith("upload") else ["--from","s3://fixture","object","--as",str(destination)])
             if scenario.startswith("upload-single"): command[command.index("--performance-tuning")+1]="s3-retries=0,s3-part-size=16M,s3-max-concurrent-parts-per-object=2"
             if scenario=="upload-interrupted":
-                child=subprocess.Popen(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-                deadline=time.monotonic()+10
-                while not any(e[0]=="put-start" for e in events) and time.monotonic()<deadline: time.sleep(.01)
-                assert any(e[0]=="put-start" for e in events)
-                child.send_signal(signal.SIGTERM);out,err=child.communicate(timeout=20);code=child.returncode
+                child=subprocess.Popen(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+                try:
+                    assert upload_started.wait(10), "upload did not start"
+                    child.send_signal(signal.SIGTERM);out,err=child.communicate(timeout=20);code=child.returncode
+                    with uploads_finished:
+                        assert uploads_finished.wait_for(lambda: sorted(e[2] for e in events if e[0]=="put-start")==sorted(e[2] for e in events if e[0]=="put-end"),10),events
+                finally:
+                    if child.poll() is None:
+                        os.killpg(child.pid,signal.SIGKILL)
+                        child.communicate(timeout=10)
             else:
                 result=subprocess.run(command,env=env,capture_output=True,timeout=30);code=result.returncode;err=result.stderr
             expected=scenario in ("upload","upload-delayed","upload-single","upload-single-delayed","download")
