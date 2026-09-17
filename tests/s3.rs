@@ -59,6 +59,10 @@ impl Server {
         }
     }
     fn command(&self, temp: &Path) -> Command {
+        self.command_with_retries(temp, 0)
+    }
+    fn command_with_retries(&self, temp: &Path, retries: u32) -> Command {
+        let retry_option = format!("s3-retries={retries}");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
             .args([
@@ -66,7 +70,7 @@ impl Server {
                 "--s3-region",
                 "us-east-1",
                 "--performance-tuning",
-                "s3-retries=0",
+                &retry_option,
                 "--s3-header",
                 "X-Tigris-Consistent: true",
                 "--no-progress",
@@ -149,6 +153,77 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault.starts_with("prune-") {
+        if method == "GET" {
+            let keys: Vec<String> = match fault {
+                "prune-outside" => vec!["elsewhere/extra".into()],
+                "prune-invalid" => vec!["mirror/bad//key".into()],
+                "prune-folder-content" => vec!["mirror/bad/".into()],
+                "prune-batch" | "prune-request-failure" | "prune-concurrent" => {
+                    (0..1001).map(|i| format!("mirror/extra{i:04}")).collect()
+                }
+                "prune-mixed" => vec!["mirror/extra".into(), "mirror/good".into()],
+                _ => vec!["mirror/extra".into()],
+            };
+            let contents = keys
+                .iter()
+                .map(|key| format!("<Contents><Key>{key}</Key><Size>1</Size></Contents>"))
+                .collect::<String>();
+            let body = format!(
+                "<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+            );
+            reply(&mut socket, 200, &[], body.as_bytes(), false);
+        } else {
+            assert_eq!(method, "POST");
+            assert!(first.contains("delete"));
+            let length: usize = headers["content-length"].parse().unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            let keys: Vec<_> = body
+                .split("<Key>")
+                .skip(1)
+                .map(|s| s.split("</Key>").next().unwrap())
+                .collect();
+            assert!(!keys.is_empty() && keys.len() <= 1000);
+            if fault == "prune-concurrent" {
+                let (arrived, peer) = if keys.len() == 1000 {
+                    (&gate.0, &gate.1)
+                } else {
+                    (&gate.1, &gate.0)
+                };
+                arrived.store(true, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !peer.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert!(peer.load(Ordering::SeqCst), "deletion batches ran serially");
+            }
+            if fault == "prune-denied" || (fault == "prune-request-failure" && keys.len() == 1000) {
+                reply(
+                    &mut socket,
+                    403,
+                    &[],
+                    b"<Error><Code>AccessDenied</Code><Message>denied</Message></Error>",
+                    false,
+                );
+            } else {
+                let entries = keys.iter().map(|key| if fault == "prune-mixed" && *key == "mirror/extra" {
+                    format!("<Error><Key>{key}</Key><Code>AccessDenied</Code><Message>denied</Message></Error>")
+                } else {
+                    format!("<Deleted><Key>{key}</Key></Deleted>")
+                }).collect::<String>();
+                reply(
+                    &mut socket,
+                    200,
+                    &[],
+                    format!("<DeleteResult>{entries}</DeleteResult>").as_bytes(),
+                    false,
+                );
+            }
+        }
+        return;
+    }
     if fault.starts_with("upload-") {
         if method == "HEAD" {
             reply(&mut socket, 404, &[], b"", true);
@@ -199,6 +274,23 @@ fn serve(
             b"",
             false,
         );
+        return;
+    }
+    if method == "HEAD"
+        && (fault == "single-throttle-always"
+            || (matches!(fault, "single-throttle-once" | "single-transient-once")
+                && !gate.0.swap(true, Ordering::SeqCst)))
+    {
+        let status = if fault == "single-transient-once" {
+            503
+        } else {
+            429
+        };
+        reply(&mut socket, status, &[], b"", false);
+        return;
+    }
+    if fault == "head-denied" && method == "HEAD" {
+        reply(&mut socket, 403, &[], b"", false);
         return;
     }
     if fault == "missing" {
@@ -1245,4 +1337,279 @@ fn s3_review_verify_only_reports_expected_hash_mismatch() {
         std::fs::read(temp.path().join("result")).unwrap(),
         vec![b'x'; 65536]
     );
+}
+
+#[test]
+fn s3_prune_reports_delete_failure_and_rejects_outside_listing() {
+    for (fault, code, requests, planned) in [
+        ("prune-denied", 23, 2, 1),
+        ("prune-outside", 23, 1, 0),
+        ("prune-invalid", 23, 1, 0),
+        ("prune-folder-content", 23, 1, 0),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("empty")).unwrap();
+        let server = Server::start(fault);
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--srcs-in",
+                "empty",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "mirror",
+                "--prune",
+                "--results",
+                "results.ndjson",
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+        let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let result: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(result["deletions_planned"], planned);
+        assert_eq!(result["deletions_completed"], 0);
+    }
+}
+
+#[test]
+fn s3_prune_limit_refuses_without_sending_delete() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("empty")).unwrap();
+    let server = Server::start("prune-denied");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "empty",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "mirror",
+            "--prune",
+            "--max-delete",
+            "0",
+            "--results",
+            "results.ndjson",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(25),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.requests.load(Ordering::Relaxed), 1);
+    let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+    let result: serde_json::Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
+    assert_eq!(result["status"], "refused");
+    assert_eq!(result["errors"], 0);
+    assert_eq!(result["deletions_planned"], 1);
+    assert_eq!(result["deletions_blocked"], 1);
+    assert_eq!(result["deletions_completed"], 0);
+}
+
+#[test]
+fn s3_prune_batches_account_for_every_key_and_continue_after_errors() {
+    for (fault, code, planned, completed, requests) in [
+        ("prune-batch", 0, 1001, 1001, 3),
+        ("prune-concurrent", 0, 1001, 1001, 3),
+        ("prune-mixed", 23, 2, 1, 2),
+        ("prune-request-failure", 23, 1001, 1, 3),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("empty")).unwrap();
+        let server = Server::start(fault);
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--srcs-in",
+                "empty",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "mirror",
+                "--prune",
+                "--results",
+                "results.ndjson",
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+        let text = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(records.last().unwrap()["deletions_planned"], planned);
+        assert_eq!(records.last().unwrap()["deletions_completed"], completed);
+        assert_eq!(
+            records.iter().filter(|r| r["action"] == "delete").count(),
+            planned as usize
+        );
+    }
+}
+
+#[test]
+fn s3_prune_can_ignore_unrepresentable_destination_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("empty")).unwrap();
+    let server = Server::start("prune-invalid");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "empty",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "mirror",
+            "--prune",
+            "--ignore",
+            "bad/",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.requests.load(Ordering::Relaxed), 1);
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "empty",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "mirror",
+            "--prune",
+            "--delete-excluded",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--delete-excluded'")
+    );
+    assert_eq!(server.requests.load(Ordering::Relaxed), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn s3_unchanged_upload_does_not_read_body_unless_content_check_requested() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("source");
+    std::fs::write(&path, vec![b'x'; 65536]).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1700000000))
+        .unwrap();
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(fd >= 0);
+    let mut watch = unsafe { std::fs::File::from_raw_fd(fd) };
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert!(
+        unsafe { libc::inotify_add_watch(watch.as_raw_fd(), name.as_ptr(), libc::IN_ACCESS) } >= 0
+    );
+    for flag in [None, Some("--hash")] {
+        let server = Server::start("single-upload-nohash");
+        let mut args = vec!["source", "--to", "s3://bucket", "--as", "object"];
+        if let Some(flag) = flag {
+            args.push(flag);
+        }
+        let output = server.cp(temp.path(), &args);
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert!(
+            !server.gate.0.load(Ordering::Acquire),
+            "unchanged body uploaded"
+        );
+        let mut events = [0; 4096];
+        match flag {
+            None => assert_eq!(
+                watch.read(&mut events).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            ),
+            Some(_) => assert!(
+                watch.read(&mut events).unwrap() > 0,
+                "checksum did not read source"
+            ),
+        }
+    }
+}
+
+#[test]
+fn s3_head_failure_reports_http_status_without_a_response_body() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("source"), b"source").unwrap();
+    let server = Server::start("head-denied");
+    let output = server.cp(
+        temp.path(),
+        &["source", "--to", "s3://bucket", "--as", "object"],
+    );
+    assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
+    assert!(
+        output_text(&output).contains("S3 HEAD failed (HTTP 403)"),
+        "{}",
+        output_text(&output)
+    );
+}
+
+#[test]
+fn s3_head_throttling_uses_the_retry_budget_and_keeps_permanent_errors_final() {
+    for (fault, retries, expected_exit, requests) in [
+        ("single-throttle-once", 2, 0, 2),
+        ("single-transient-once", 2, 0, 2),
+        ("single-throttle-once", 0, 23, 1),
+        ("single-throttle-always", 2, 23, 3),
+        ("head-denied", 2, 23, 1),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        std::fs::write(&path, vec![b'x'; 65536]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1700000000))
+            .unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_with_retries(temp.path(), retries)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
+    }
 }

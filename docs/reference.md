@@ -189,7 +189,8 @@ The filesystem can change between preview and execution.
 
 ## Mirror a directory
 
-`--prune` removes destination files that have no counterpart in the source:
+`--prune` removes destination files that have no counterpart in the source,
+including [copies to and from S3](object-storage.md):
 
 ```sh
 syq cp --prune --max-delete 100 --srcs-in build --into-existing deploy

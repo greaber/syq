@@ -1,4 +1,5 @@
 mod fast;
+mod pruning;
 
 use super::{
     checksum::Algorithm,
@@ -25,7 +26,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fs::File,
     io::Read,
     os::unix::fs::{FileExt, MetadataExt},
@@ -42,7 +43,7 @@ pub(super) struct Engine {
     client: Client,
     progress: Arc<Progress>,
     pace: Mutex<tokio::time::Instant>,
-    upload_keys: OnceLock<HashSet<String>>,
+    upload_keys: OnceLock<HashMap<String, u64>>,
     tuning: super::tuning::Tuning,
     cancelled: std::sync::atomic::AtomicBool,
     cancel_wake: tokio::sync::Notify,
@@ -141,7 +142,8 @@ impl Engine {
         if self.options.upload {
             let scanning = super::diagnostics::start();
             let args = self.args.clone();
-            let plan = tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
+            let (plan, prune) =
+                tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
             super::diagnostics::elapsed(scanning, "source_plan", plan.len() as u64);
             let planning = std::time::Instant::now();
             if self.args.expected_digest.is_some() && (plan.len() != 1 || plan[0].kind() != "file")
@@ -156,12 +158,25 @@ impl Engine {
                 } else {
                     format!("{target}/")
                 };
-                let keys = client::list(&self.client, &self.options.bucket, &prefix)
-                    .await?
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect();
-                let _ = self.upload_keys.set(keys);
+                let listing = client::list(&self.client, &self.options.bucket, &prefix)
+                    .await
+                    .and_then(|keys| {
+                        anyhow::ensure!(
+                            keys.iter().all(|(key, _)| key.starts_with(&prefix)),
+                            "S3 listing returned a key outside the requested prefix"
+                        );
+                        Ok(keys)
+                    });
+                match listing {
+                    Ok(keys) => {
+                        let _ = self.upload_keys.set(keys.into_iter().collect());
+                    }
+                    Err(error) if self.args.delete => {
+                        self.progress
+                            .error(&format!("list S3 destination: {error:#}"));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
 
             self.tuning.observe_control(planning.elapsed());
@@ -193,10 +208,11 @@ impl Engine {
                 }
             })
             .await?;
+            self.prune(prune, None).await?;
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
             let planning = std::time::Instant::now();
-            let plan = self.download_plan(&destination).await?;
+            let (plan, prune) = self.download_plan(&destination).await?;
             self.tuning.observe_control(planning.elapsed());
             let workers = self.object_workers(plan.iter().map(|s| s.size))?;
             if self.args.expected_digest.is_some() && plan.len() != 1 {
@@ -231,18 +247,30 @@ impl Engine {
                 }
             })
             .await?;
-            if !self.args.dry_run && !self.args.verify_only {
-                let mut directories = directories.lock().await;
-                directories.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
-                for (path, meta, mode) in directories.iter() {
-                    local::apply_metadata(
-                        &destination.root,
-                        &RelativePath::new(path.as_bytes())?,
-                        meta,
-                        &self.args,
-                        *mode,
-                    )?;
-                }
+            // Prune while directories are writable, then restore their modes and times.
+            // Apply metadata even when the deletion budget refuses pruning.
+            let pruned = self.prune(prune, Some(&destination)).await;
+            self.finish_directories(&destination, &directories).await?;
+            pruned?;
+        }
+        Ok(())
+    }
+    async fn finish_directories(
+        &self,
+        destination: &Destination,
+        directories: &DirectoryMetadata,
+    ) -> Result<()> {
+        if !self.args.dry_run && !self.args.verify_only {
+            let mut directories = directories.lock().await;
+            directories.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
+            for (path, meta, mode) in directories.iter() {
+                local::apply_metadata(
+                    &destination.root,
+                    &RelativePath::new(path.as_bytes())?,
+                    meta,
+                    &self.args,
+                    *mode,
+                )?;
             }
         }
         Ok(())
@@ -414,6 +442,18 @@ impl Engine {
         }
         Ok(())
     }
+    fn upload_metadata_matches(&self, source: &Source, size: u64, object: &Object) -> bool {
+        object.kind() == source.kind()
+            && object.size == size
+            && object.metadata.as_ref().is_some_and(|m| {
+                m.mtime == source.meta.mtime
+                    && m.nsec == source.meta.mtime_nsec
+                    && (!self.args.perms || m.mode == source.meta.mode & 0o7777)
+                    && (!(self.args.owner || self.args.group)
+                        || (m.uid == source.meta.uid && m.gid == source.meta.gid))
+            })
+    }
+
     async fn upload(self: &Arc<Self>, source: Source) -> Result<Option<u64>> {
         let expected_digest = source
             .expected_digest
@@ -423,7 +463,7 @@ impl Engine {
         let existing = if self
             .upload_keys
             .get()
-            .is_some_and(|keys| !keys.contains(&source.key))
+            .is_some_and(|keys| !keys.contains_key(&source.key))
         {
             None
         } else {
@@ -449,6 +489,30 @@ impl Engine {
         } else {
             source.meta.len
         };
+        let whole_algorithm = expected_digest.map(|d| d.algorithm).or_else(|| {
+            if self.args.transfer_integrity {
+                Some(self.args.transfer_hash_type.unwrap_or_default())
+            } else if self.args.checksum || self.args.verify_only {
+                Some(self.args.hash_algorithm)
+            } else {
+                None
+            }
+        });
+        if whole_algorithm.is_none()
+            && existing
+                .as_ref()
+                .is_some_and(|o| self.upload_metadata_matches(&source, size, o))
+        {
+            if source.kind() == "file" {
+                // Opening validates the pinned scan identity without reading the
+                // body. Explicit content checks still take the hashing path.
+                source.open()?;
+            } else {
+                source.bytes()?;
+            }
+            self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+            return Ok(None);
+        }
         let part_size = self.part_size(size);
         if part_size > 5 * 1024 * 1024 * 1024 {
             bail!("file exceeds the S3 multipart size limit");
@@ -472,15 +536,6 @@ impl Engine {
         self.check_cancelled()?;
         let source_clone = source.clone();
         let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
-        let whole_algorithm = expected_digest.map(|d| d.algorithm).or_else(|| {
-            if self.args.transfer_integrity {
-                Some(self.args.transfer_hash_type.unwrap_or_default())
-            } else if self.args.checksum || self.args.verify_only {
-                Some(self.args.hash_algorithm)
-            } else {
-                None
-            }
-        });
         let (whole_digest, checksums, small) = tokio::task::spawn_blocking(move || -> Result<_> {
             if source_clone.kind() != "file" {
                 let bytes = source_clone.bytes()?;
@@ -610,17 +665,11 @@ impl Engine {
         metadata.hash_algorithm = whole_algorithm.unwrap_or(HashAlgorithm::Blake3);
         let digest = upload_identity(algorithm, size, part_size, &checksums);
         let mut unchanged = existing.as_ref().is_some_and(|o| {
-            o.kind() == source.kind()
-                && o.size == size
+            self.upload_metadata_matches(&source, size, o)
                 && o.metadata.as_ref().is_some_and(|m| {
-                    (self.args.checksum
+                    self.args.checksum
                         || whole_digest.is_none()
-                        || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm))
-                        && m.mtime == metadata.mtime
-                        && m.nsec == metadata.nsec
-                        && (!self.args.perms || m.mode == metadata.mode)
-                        && (!(self.args.owner || self.args.group)
-                            || (m.uid == metadata.uid && m.gid == metadata.gid))
+                        || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm)
                 })
         });
         let comparison_digest = if self.args.checksum || self.args.verify_only {
@@ -1047,7 +1096,11 @@ impl Engine {
         }
         Ok(())
     }
-    async fn download_plan(&self, destination: &Destination) -> Result<Vec<Download>> {
+    async fn download_plan(
+        &self,
+        destination: &Destination,
+    ) -> Result<(Vec<Download>, super::prune::Plan)> {
+        let mut prune = super::prune::Plan::default();
         let count = self.args.locations.len() - 1;
         let base = local::key_path(
             self.args
@@ -1188,6 +1241,9 @@ impl Engine {
                 if listed.is_empty() {
                     bail!("S3 source prefix {key:?} contains no objects");
                 }
+                if self.args.delete {
+                    prune.scope(path.as_bytes(), key.as_bytes());
+                }
                 let mut objects = Vec::new();
                 for (object, size) in listed {
                     let suffix = object
@@ -1210,6 +1266,7 @@ impl Engine {
                 let directory = key.ends_with('/') && size == 0;
                 if !directory && (size < min || size > max) {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
+                    prune.protect(path.as_bytes());
                     continue;
                 }
                 if matcher
@@ -1217,12 +1274,20 @@ impl Engine {
                     .is_some_and(|m| crate::scan::path_is_ignored(m, key.as_bytes(), directory))
                 {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
+                    prune.protect(path.as_bytes());
                     continue;
                 }
                 if path.is_empty() && !directory {
                     bail!("cannot replace the destination directory with an object");
                 }
                 local::claim(&mut claims, &path, directory)?;
+                if self.args.delete {
+                    if directory {
+                        prune.claim(path.as_bytes());
+                    } else {
+                        prune.protect(path.as_bytes());
+                    }
+                }
                 out.push(Download {
                     key,
                     path,
@@ -1231,7 +1296,7 @@ impl Engine {
                 });
             }
         }
-        Ok(out)
+        Ok((out, prune))
     }
     async fn download(
         self: &Arc<Self>,
@@ -1669,11 +1734,7 @@ impl Engine {
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)?;
         let partial = RelativePath::new(
-            local::join(
-                parent,
-                &format!(".syq-s3-{}.partial", blake3::hash(&random).to_hex()),
-            )
-            .as_bytes(),
+            local::join(parent, &super::prune::partial_name(&random)).as_bytes(),
         )?;
         let file = Arc::new(root.create_file(&partial, 0o600)?);
         let _cleanup = PartialCleanup {
@@ -1742,10 +1803,7 @@ impl Engine {
         let parent = path.rsplit_once('/').map_or("", |(p, _)| p);
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)?;
-        let partial = local::join(
-            parent,
-            &format!(".syq-s3-{}.partial", blake3::hash(&random).to_hex()),
-        );
+        let partial = local::join(parent, &super::prune::partial_name(&random));
         let file = root.create_file(&RelativePath::new(partial.as_bytes())?, 0o600)?;
         file.set_len(object.size)?;
         let m = file.metadata()?;

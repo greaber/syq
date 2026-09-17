@@ -212,6 +212,16 @@ It alternates tool order, checks downloaded bytes, and removes its test prefix.
 The benchmark requires Python 3.11 or newer. If your provider requires a custom
 header, ensure both clients send it: stock s5cmd has no arbitrary-header option.
 
+For pruning comparisons, use
+`python3 tests/object-storage/benchmark-prune.py --syq target/release/syq --s5cmd /path/to/s5cmd --output target/s3-prune-benchmark`
+with the same credentials and a bucket that has never enabled versioning.
+It compares deletion, unchanged trees, and mixed copies with pruning in both
+directions. The default uses 100,000 objects and three repetitions; increase
+`--count` or `--size` when trials fall below the reported ten-second minimum.
+Raw timings, CPU and memory use, binary hashes, verification results, and logs
+are saved in the output directory. Setup and verification are untimed.
+Use `--s5cmd-quiet` for a separate control without s5cmd's per-object logging.
+
 For documentation changes, run `python3 scripts/check-doc-links.py`.
 See the repository's `AGENTS.md` for the full contribution workflow.
 
