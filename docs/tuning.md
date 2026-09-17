@@ -20,7 +20,8 @@ Use `--resource-limits bandwidth=RATE` to leave bandwidth for other work.
 Remote copies start from the last learned count for the same host route,
 direction and transport, or from 8 workers over SSH and 16 over TCP. The cache
 normally lives at `~/.cache/syq/tuning.json` (`XDG_CACHE_HOME` can change its
-parent). The quick benchmark uses this cache, even though it disables SSH
+parent, and `SYQ_TUNING_CACHE` names another file or, when empty, turns the
+cache off). The quick benchmark uses this cache, even though it disables SSH
 connection persistence. Its temporary file paths do not change the cache key.
 
 Short copies may finish before syq can learn a better count. Only successful

@@ -135,10 +135,11 @@ fn max_files_per_process() -> Option<libc::rlim_t> {
 }
 
 fn main() {
+    let environment_options = cli::EnvironmentOptions::take_from_environment();
     tune_allocator();
     raise_nofile();
     fsops::capture_process_umask();
-    let argv = match destination::handoff::enter(std::env::args_os().collect()) {
+    let mut argv = match destination::handoff::enter(std::env::args_os().collect()) {
         Ok(argv) => argv,
         Err(error) => {
             crate::output::diagnostic!("syq: {error:#}");
@@ -286,6 +287,10 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+    if let Err(error) = environment_options.insert(&mut argv) {
+        crate::output::diagnostic!("syq: {error:#}");
+        std::process::exit(2);
     }
     let mut args = match cli::Args::parse_args(&argv[1..]) {
         Ok(a) => a,
