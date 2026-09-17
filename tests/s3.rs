@@ -1209,6 +1209,9 @@ fn s3_review_verify_only_reports_expected_hash_mismatch() {
 
 // A byte-dribbling body never hits the ordinary idle timeout. Healthy peers
 // provide evidence for one fresh, conditional range request instead.
+fn recovery_bytes() -> Vec<u8> {
+    (0..65536).map(|n| (n % 251) as u8).collect()
+}
 fn serve_recovery(
     socket: &mut TcpStream,
     fault: &str,
@@ -1234,16 +1237,30 @@ fn serve_recovery(
     let path = target.split('?').next().unwrap();
     let special = path.ends_with("/00000");
     let repeated = special && gate.0.swap(true, Ordering::SeqCst);
+    let after_retry_error = repeated && gate.1.swap(true, Ordering::SeqCst);
+    let start = headers.get("range").map_or(0, |range| {
+        range
+            .strip_prefix("bytes=")
+            .unwrap()
+            .strip_suffix("-65535")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+    });
+    assert!(start < 65536);
     if repeated {
-        gate.1.store(true, Ordering::SeqCst);
         assert_eq!(
             headers.get("if-match").map(String::as_str),
             Some("\"fixture-v1\"")
         );
-        assert_eq!(
-            headers.get("range").map(String::as_str),
-            Some("bytes=0-65535")
-        );
+        if fault == "recovery-idle" || after_retry_error {
+            assert_eq!(start, 0);
+        } else {
+            assert!(
+                start >= 16384,
+                "processed prefix was downloaded again: {start}"
+            );
+        }
         if fault == "recovery-changed" {
             reply(
                 socket,
@@ -1255,13 +1272,14 @@ fn serve_recovery(
             return;
         }
     }
+    let data = recovery_bytes();
     let mut fields = vec![
         ("ETag".into(), "\"fixture-v1\"".into()),
         (
             "Last-Modified".into(),
             "Tue, 14 Nov 2023 22:13:20 GMT".into(),
         ),
-        ("Content-Length".into(), "65536".into()),
+        ("Content-Length".into(), (65536 - start).to_string()),
         ("x-amz-meta-syq-format".into(), "1".into()),
         ("x-amz-meta-syq-kind".into(), "file".into()),
         ("x-amz-meta-syq-mode".into(), "420".into()),
@@ -1271,11 +1289,15 @@ fn serve_recovery(
         ("x-amz-meta-syq-mtime-nsec".into(), "0".into()),
         (
             "x-amz-meta-syq-blake3".into(),
-            blake3::hash(&[b'x'; 65536]).to_hex().to_string(),
+            blake3::hash(&data).to_hex().to_string(),
         ),
     ];
     let status = if headers.contains_key("range") {
-        fields.push(("Content-Range".into(), "bytes 0-65535/65536".into()));
+        let reported_start = if fault == "recovery-range" { 0 } else { start };
+        fields.push((
+            "Content-Range".into(),
+            format!("bytes {reported_start}-65535/65536"),
+        ));
         206
     } else {
         200
@@ -1284,23 +1306,37 @@ fn serve_recovery(
         (special && (!repeated || fault == "recovery-retry-slow") && fault != "recovery-fast")
             || fault == "recovery-uniform";
     reply(socket, status, &fields, b"", true);
-    if special && !repeated && fault == "recovery-idle" {
+    if !special && !drip {
+        // Ensure healthy bodies finish while the slow attempt is in progress,
+        // instead of relying on Tokio's order of scheduling the initial jobs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !gate.0.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            gate.0.load(Ordering::SeqCst),
+            "slow fixture request never arrived"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    if repeated && !after_retry_error && fault == "recovery-truncated" {
+        let _ = socket.write_all(&data[start..start + (65536 - start) / 2]);
+    } else if special && !repeated && fault == "recovery-idle" {
         thread::sleep(Duration::from_secs(3));
-        let _ = socket.write_all(&[b'x'; 65536]);
+        let _ = socket.write_all(&data);
     } else if drip {
-        for _ in 0..64 {
+        for chunk in data[start..].chunks(1024) {
             thread::sleep(Duration::from_millis(40));
-            if socket.write_all(&[b'x'; 1024]).is_err() {
+            if socket.write_all(chunk).is_err() {
                 return;
             }
         }
     } else {
-        let byte = if special && repeated && fault == "recovery-corrupt" {
-            b'y'
+        if special && repeated && fault == "recovery-corrupt" {
+            let _ = socket.write_all(&vec![b'y'; 65536 - start]);
         } else {
-            b'x'
-        };
-        let _ = socket.write_all(&[byte; 65536]);
+            let _ = socket.write_all(&data[start..]);
+        }
     }
 }
 
@@ -1312,11 +1348,20 @@ fn s3_slow_read_recovery_preserves_contents_and_identity() {
         "recovery-retry-slow",
         "recovery-idle",
         "recovery-corrupt",
+        "recovery-range",
+        "recovery-truncated",
     ] {
         let server = Server::start(fault);
         let temp = tempfile::tempdir().unwrap();
         let output = server
-            .command_with_retries(temp.path(), "s3-retries=1")
+            .command_with_retries(
+                temp.path(),
+                if fault == "recovery-truncated" {
+                    "s3-retries=2"
+                } else {
+                    "s3-retries=1"
+                },
+            )
             .args(["--s3-endpoint", &server.address])
             .args([
                 "--from",
@@ -1331,30 +1376,43 @@ fn s3_slow_read_recovery_preserves_contents_and_identity() {
             .unwrap();
         assert!(
             server.gate.1.load(Ordering::SeqCst),
-            "slow stream was not retried: {}",
+            "{fault}: slow stream was not retried: {}",
             output_text(&output)
         );
         assert_eq!(
             output.status.success(),
-            !matches!(fault, "recovery-changed" | "recovery-corrupt"),
+            !matches!(
+                fault,
+                "recovery-changed" | "recovery-corrupt" | "recovery-range"
+            ),
             "{}",
             output_text(&output)
         );
         for i in 1..32 {
             assert_eq!(
                 std::fs::read(temp.path().join(format!("download/{i:05}"))).unwrap(),
-                vec![b'x'; 65536]
+                recovery_bytes()
             );
         }
-        if !matches!(fault, "recovery-changed" | "recovery-corrupt") {
+        if !matches!(
+            fault,
+            "recovery-changed" | "recovery-corrupt" | "recovery-range"
+        ) {
             assert_eq!(
                 std::fs::read(temp.path().join("download/00000")).unwrap(),
-                vec![b'x'; 65536]
+                recovery_bytes()
             );
         } else {
             assert!(!temp.path().join("download/00000").exists());
         }
-        assert_eq!(server.requests.load(Ordering::SeqCst), 35);
+        assert_eq!(
+            server.requests.load(Ordering::SeqCst),
+            if fault == "recovery-truncated" {
+                36
+            } else {
+                35
+            }
+        );
         assert!(!std::fs::read_dir(temp.path().join("download"))
             .unwrap()
             .any(|entry| entry
@@ -1396,7 +1454,7 @@ fn s3_uniformly_slow_or_retry_disabled_reads_are_not_restarted() {
         for i in 0..32 {
             assert_eq!(
                 std::fs::read(temp.path().join(format!("download/{i:05}"))).unwrap(),
-                vec![b'x'; 65536]
+                recovery_bytes()
             );
         }
     }

@@ -154,14 +154,19 @@ impl Engine {
         let mut attempt = 0;
         // Hold the process-local recovery slot until the retried range finishes.
         let mut recovery = None;
+        let mut done = 0;
+        let mut hash = algorithm.map(HashAlgorithm::hasher);
+        let mut batch = Vec::new();
+        let mut batch_size = 0;
         loop {
             self.check_cancelled()?;
             let started = crate::s3::diagnostics::start();
             let body_started = std::time::Instant::now();
             let mut waited = Duration::ZERO;
             let mut next_check = Duration::from_secs(1);
+            let attempt_offset = offset + done;
+            let attempt_length = length - done;
             let result = async {
-                let mut hash = algorithm.map(HashAlgorithm::hasher);
                 let body = if let Some(body) = initial.take() {
                     body
                 } else {
@@ -171,7 +176,7 @@ impl Engine {
                         .get_object()
                         .bucket(&self.options.bucket)
                         .key(&object.key)
-                        .set_range((length > 0).then(|| format!("bytes={offset}-{end}")))
+                        .set_range((length > 0).then(|| format!("bytes={attempt_offset}-{end}")))
                         .if_match(&object.etag)
                         .set_version_id(object.version.clone())
                         .send()
@@ -184,11 +189,14 @@ impl Engine {
                                     .into()
                             }
                         })?;
-                    if response.content_length() != Some(length as i64)
+                    if response.content_length() != Some(attempt_length as i64)
                         || response.e_tag() != Some(object.etag.as_str())
                         || (length > 0
                             && response.content_range()
-                                != Some(format!("bytes {offset}-{end}/{}", object.size).as_str()))
+                                != Some(
+                                    format!("bytes {attempt_offset}-{end}/{}", object.size)
+                                        .as_str(),
+                                ))
                     {
                         return Err(
                             Permanent("S3 response length, range, or ETag differs".into()).into(),
@@ -216,9 +224,6 @@ impl Engine {
                 };
                 if !output.direct() {
                     let mut body = body;
-                    let mut done = 0;
-                    let mut batch = Vec::new();
-                    let mut batch_size = 0;
                     loop {
                         let bytes =
                             read_body(body.next(), &mut waited, |elapsed| recover(done, elapsed))
@@ -228,10 +233,6 @@ impl Engine {
                         if bytes.len() as u64 > length - done {
                             return Err(Permanent("S3 body exceeded length".into()).into());
                         }
-                        anyhow::ensure!(
-                            !recover(done + bytes.len() as u64, waited),
-                            "S3 body progressing much more slowly than completed peers"
-                        );
                         if let Some(h) = &mut hash {
                             h.update(&bytes);
                         }
@@ -251,26 +252,33 @@ impl Engine {
                             if batch_size == 128 * 1024 || batch.len() == 16 {
                                 self.pace(batch_size as u64).await?;
                                 output
-                                    .write_batch(batch, offset + done - batch_size as u64)
+                                    .write_batch(
+                                        std::mem::take(&mut batch),
+                                        offset + done - batch_size as u64,
+                                    )
                                     .await?;
                                 batch = Vec::new();
                                 batch_size = 0;
                             }
                         }
+                        anyhow::ensure!(!recover(done, waited), SlowRead);
                     }
                     anyhow::ensure!(done == length, "S3 body truncated");
                     if !batch.is_empty() {
                         self.pace(batch_size as u64).await?;
                         output
-                            .write_batch(batch, offset + done - batch_size as u64)
+                            .write_batch(
+                                std::mem::take(&mut batch),
+                                offset + done - batch_size as u64,
+                            )
                             .await?;
                     }
                     return Ok(hash
+                        .take()
                         .map(|h| Digest::from_hash(algorithm.unwrap(), &h.finalize()).value)
                         .unwrap_or_default());
                 }
                 let mut body = body.into_async_read();
-                let mut done = 0;
                 let mut buffer = writer::Aligned::new(1024 * 1024)?;
                 while done < length {
                     let want = (length - done).min(1024 * 1024) as usize;
@@ -280,10 +288,6 @@ impl Engine {
                         |elapsed| recover(done, elapsed),
                     )
                     .await??;
-                    anyhow::ensure!(
-                        !recover(done + want as u64, waited),
-                        "S3 body progressing much more slowly than completed peers"
-                    );
                     anyhow::ensure!(
                         (offset + done).is_multiple_of(4096)
                             && (want.is_multiple_of(4096)
@@ -298,6 +302,7 @@ impl Engine {
                     self.pace(want as u64).await?;
                     buffer = output.write_direct(buffer, offset + done, padded).await?;
                     done += want as u64;
+                    anyhow::ensure!(!recover(done, waited), SlowRead);
                 }
                 let mut extra = [0];
                 if tokio::time::timeout(Duration::from_secs(60), body.read(&mut extra)).await?? != 0
@@ -305,7 +310,8 @@ impl Engine {
                     return Err(Permanent("S3 body exceeded length".into()).into());
                 }
                 Ok::<String, anyhow::Error>(
-                    hash.map(|h| Digest::from_hash(algorithm.unwrap(), &h.finalize()).value)
+                    hash.take()
+                        .map(|h| Digest::from_hash(algorithm.unwrap(), &h.finalize()).value)
                         .unwrap_or_default(),
                 )
             }
@@ -314,8 +320,8 @@ impl Engine {
                 Ok(hash) => {
                     self.tuning
                         .reads
-                        .completed(length, waited, std::time::Instant::now());
-                    crate::s3::diagnostics::elapsed(started, "download_range", length);
+                        .completed(attempt_length, waited, std::time::Instant::now());
+                    crate::s3::diagnostics::elapsed(started, "download_range", attempt_length);
                     self.tuning.requests.completed(length);
                     self.progress.add_bytes(length);
                     return Ok(hash);
@@ -325,6 +331,14 @@ impl Engine {
                         && e.downcast_ref::<Permanent>().is_none() =>
                 {
                     output.finish().await?;
+                    if e.downcast_ref::<SlowRead>().is_none() {
+                        // Only our own slow-read decision trusts the prefix.
+                        // Errors from the response/transport restart the range.
+                        done = 0;
+                        hash = algorithm.map(HashAlgorithm::hasher);
+                        batch.clear();
+                        batch_size = 0;
+                    }
                     crate::s3::backoff(attempt).await;
                     attempt += 1;
                 }
@@ -334,9 +348,19 @@ impl Engine {
     }
 }
 
+#[derive(Debug)]
+struct SlowRead;
+impl std::fmt::Display for SlowRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("S3 body progressing much more slowly than completed peers")
+    }
+}
+impl std::error::Error for SlowRead {}
+
 // Keep a pending read alive across observations. In particular, cancelling
 // read_exact at each tick would lose track of bytes already consumed into its
-// buffer. A recovery abandons the entire attempt and uses its normal barrier.
+// buffer. A recovery discards that unfinished read; only previously processed
+// bytes, their hash and the pending write batch survive the writer barrier.
 async fn read_body<F: std::future::Future>(
     read: F,
     waited: &mut Duration,
@@ -355,10 +379,7 @@ async fn read_body<F: std::future::Future>(
                     started.elapsed() < Duration::from_secs(60),
                     "S3 body read timed out"
                 );
-                anyhow::ensure!(
-                    !recover(*waited + started.elapsed()),
-                    "S3 body progressing much more slowly than completed peers"
-                );
+                anyhow::ensure!(!recover(*waited + started.elapsed()), SlowRead);
             }
         }
     }
