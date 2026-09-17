@@ -144,6 +144,10 @@ impl Budget {
             ready.await;
         }
     }
+    pub fn rejected_increase(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.settled && s.previous.is_some_and(|(previous, _)| s.limit == previous)
+    }
     pub fn begin_objects(&self, workers: usize) -> Option<usize> {
         let mut s = self.state.lock().unwrap();
         if s.adaptive && !s.settled && s.limit < workers {
@@ -277,6 +281,7 @@ mod tests {
             }
         }
         assert_eq!(budget.begin_objects(256), Some(256));
+        assert!(!budget.rejected_increase());
         assert_eq!(budget.state.lock().unwrap().limit, 256);
         budget.finish_objects(512);
         assert_eq!(budget.state.lock().unwrap().limit, 512);
@@ -288,6 +293,61 @@ mod tests {
         assert_eq!(budget.state.lock().unwrap().limit, 64);
         budget.finish_objects(512);
         assert!(!budget.state.lock().unwrap().adaptive);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn object_handoff_tries_downward_after_a_rejected_request_increase() {
+        use std::sync::atomic::AtomicUsize;
+
+        let budget = Arc::new(Budget::new(64, true));
+        // The ramp tries 128 requests, finds lower throughput, and returns to 64.
+        for (bytes, expected) in [(2048, 128), (1024, 64)] {
+            {
+                let mut state = budget.state.lock().unwrap();
+                state.since = Some(Instant::now() - Duration::from_secs(1));
+                state.saturated = true;
+            }
+            for _ in 0..16 {
+                budget.completed(bytes);
+            }
+            let limit = budget.state.lock().unwrap().limit;
+            assert_eq!(limit, expected);
+        }
+        assert!(budget.rejected_increase());
+        let peak = Arc::new(AtomicUsize::new(0));
+        let copy_budget = budget.clone();
+        let copy_peak = peak.clone();
+        let copy = tokio::spawn(async move {
+            crate::s3::admission::parallel(
+                (0..8192).collect(),
+                crate::s3::admission::Concurrency {
+                    initial: 256,
+                    maximum: Some(256),
+                    initial_probe_up: true,
+                    requests: Some(copy_budget.clone()),
+                },
+                move |_| {
+                    let budget = copy_budget.clone();
+                    let peak = copy_peak.clone();
+                    async move {
+                        let _permit = budget.acquire().await;
+                        let active = budget.state.lock().unwrap().active;
+                        peak.fetch_max(active, Relaxed);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok(Some(1024))
+                    }
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let first_probe_peak = peak.load(Relaxed);
+        let first_probe_active = budget.state.lock().unwrap().active;
+        // Downward is only the starting direction: later increases stay possible.
+        copy.await.unwrap().unwrap();
+        assert_eq!(first_probe_peak, 64);
+        assert_eq!(first_probe_active, 32);
+        assert!(peak.load(Relaxed) > 64);
     }
 
     #[tokio::test(start_paused = true)]

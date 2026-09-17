@@ -298,7 +298,14 @@ where
         Some(Controller::new(
             initial,
             maximum,
-            concurrency.initial_probe_up,
+            // The request ramp already tested a higher setting. Try downward
+            // first after it backed off instead of immediately repeating that
+            // losing probe. This is a starting direction, not a lasting bound.
+            concurrency.initial_probe_up
+                && !concurrency
+                    .requests
+                    .as_ref()
+                    .is_some_and(|requests| requests.rejected_increase()),
         ))
     };
     let mut controller = begin();
