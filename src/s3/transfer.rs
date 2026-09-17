@@ -57,6 +57,7 @@ struct Download {
     path: String,
     size: u64,
     expected_digest: Option<Digest>,
+    copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
@@ -423,6 +424,13 @@ impl Engine {
                     let _ = self.upload_keys.set(keys);
                 }
                 Ok(None) => {}
+                Err(error)
+                    if error
+                        .downcast_ref::<client::RequestFailure>()
+                        .is_some_and(|failure| failure.region_mismatch()) =>
+                {
+                    return Err(error);
+                }
                 Err(error) if self.args.delete => {
                     self.progress
                         .error(&format!("list S3 destination: {error:#}"));
@@ -1207,7 +1215,26 @@ impl Engine {
             self.options.source_bucket.as_deref() == Some(self.options.bucket.as_str());
         let mut copy_sources = Vec::new();
         let mut copy_targets = Vec::new();
-        for (key, path, selection, declared_kind, expected_digest) in selectors {
+        // Keep selector order for claims, but overlap bounded source metadata reads.
+        let mut selectors = stream::iter(selectors)
+            .map(|selector| async move {
+                let prefix = self.args.native_mapping.is_none()
+                    && matches!(
+                        selector.2,
+                        SourceSelection::Contents | SourceSelection::Directory
+                    );
+                let head =
+                    if self.options.source_bucket.is_some() && !selector.0.is_empty() && !prefix {
+                        self.copy_head(source_bucket, &selector.0, 0).await?
+                    } else {
+                        None
+                    };
+                Ok::<_, anyhow::Error>((selector, head))
+            })
+            .buffered(32);
+        while let Some(selector) = selectors.next().await {
+            let ((key, path, selection, declared_kind, expected_digest), mut copy_source) =
+                selector?;
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
                 selection,
@@ -1221,6 +1248,10 @@ impl Engine {
             let exact = async {
                 let exact = if key.is_empty() {
                     None
+                } else if self.options.source_bucket.is_some()
+                    && !(directory && self.args.native_mapping.is_none())
+                {
+                    copy_source.as_ref().map(|(object, _)| object.clone())
                 } else {
                     client::head(&self.client, source_bucket, &key).await?
                 };
@@ -1253,9 +1284,16 @@ impl Engine {
                 // copies its marker, while explicit child entries copy children.
                 let object = match exact {
                     Some(object) => object,
-                    None => client::head(&self.client, source_bucket, &format!("{key}/"))
-                        .await?
-                        .context("S3 mapping source object or directory marker is missing")?,
+                    None => {
+                        let marker = format!("{key}/");
+                        let object = if self.options.source_bucket.is_some() {
+                            copy_source = self.copy_head(source_bucket, &marker, 0).await?;
+                            copy_source.as_ref().map(|(object, _)| object.clone())
+                        } else {
+                            client::head(&self.client, source_bucket, &marker).await?
+                        };
+                        object.context("S3 mapping source object or directory marker is missing")?
+                    }
                 };
                 if declared_kind.is_some_and(|kind| kind != object.kind()) {
                     bail!("S3 source type does not match mapping");
@@ -1323,7 +1361,7 @@ impl Engine {
             };
             for (key, size, path) in objects {
                 let directory = key.ends_with('/') && size == 0;
-                if same_bucket {
+                if same_bucket && !already_filtered {
                     copy_sources.push((key.clone(), false));
                     copy_targets.push((
                         if directory {
@@ -1370,6 +1408,7 @@ impl Engine {
                     path,
                     size,
                     expected_digest: expected_digest.clone(),
+                    copy_source: copy_source.take().map(Box::new),
                 });
             }
         }

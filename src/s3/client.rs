@@ -171,7 +171,10 @@ impl std::fmt::Display for RequestFailure {
             write!(f, " (HTTP {status})")?;
         }
         if let (Some(301), Some(region)) = (self.status, &self.region) {
-            write!(f, ": the bucket is in region {region}; check the configured endpoint and signing region")?;
+            write!(
+                f,
+                ": the bucket is in region {region}; pass --s3-region {region} or set AWS_REGION"
+            )?;
         }
         Ok(())
     }

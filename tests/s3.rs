@@ -157,6 +157,23 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault == "server-tree-region"
+        && first
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .starts_with("/destination")
+    {
+        assert_eq!(method, "GET", "copying continued after discovery failed");
+        reply(
+            &mut socket,
+            301,
+            &[("x-amz-bucket-region".into(), "eu-central-1".into())],
+            b"",
+            false,
+        );
+        return;
+    }
     if fault.starts_with("server-tree") {
         let path = first.split_whitespace().nth(1).unwrap();
         if method == "HEAD" {
@@ -224,7 +241,7 @@ fn serve(
                 );
                 if fault.ends_with("skipped") || fault.ends_with("missing") {
                     &["out/a/part1", "out/b/part1"]
-                } else if fault.ends_with("prune") {
+                } else if fault.ends_with("prune") || fault.ends_with("changed") {
                     &["out/a/part1"]
                 } else {
                     &[]
@@ -247,6 +264,17 @@ fn serve(
                 "{path}"
             );
             assert!(!headers.contains_key("if-none-match"));
+            assert_eq!(headers["x-amz-copy-source-if-match"], "\"source\"");
+            if fault.ends_with("changed") {
+                reply(
+                    &mut socket,
+                    412,
+                    &[],
+                    b"<Error><Code>PreconditionFailed</Code></Error>",
+                    false,
+                );
+                return;
+            }
             reply(
                 &mut socket,
                 200,
@@ -286,8 +314,8 @@ fn serve(
             );
         }
         if method == "HEAD" {
-            if fault == "server-copy-heads-overlap" && headers.contains_key("x-amz-checksum-mode") {
-                let (mine, other) = if path.starts_with("/source/") {
+            if fault == "server-copy-heads-overlap" && path.starts_with("/source/") {
+                let (mine, other) = if path == "/source/original" {
                     (&gate.0, &gate.1)
                 } else {
                     (&gate.1, &gate.0)
@@ -299,7 +327,7 @@ fn serve(
                 }
                 assert!(
                     other.load(Ordering::Acquire),
-                    "source/destination HEADs did not overlap"
+                    "source planning HEADs did not overlap"
                 );
             }
             if fault == "server-copy-compare-unavailable"
@@ -371,6 +399,9 @@ fn serve(
                         },
                     ));
                 }
+                if fault == "server-copy-versioned" && source {
+                    fields.push(("x-amz-version-id".into(), "snapshot-version".into()));
+                }
                 if fault.ends_with("zero-tags") {
                     fields.push(("x-amz-tagging-count".into(), "0".into()));
                 }
@@ -433,7 +464,14 @@ fn serve(
             reply(&mut socket, 204, &[], b"", false);
         } else if method == "PUT" {
             assert_eq!(path.split('?').next().unwrap(), "/destination/copied");
-            assert_eq!(headers["x-amz-copy-source"], "source/original");
+            assert_eq!(
+                headers["x-amz-copy-source"],
+                if fault == "server-copy-versioned" {
+                    "source/original?versionId=snapshot-version"
+                } else {
+                    "source/original"
+                }
+            );
             assert_eq!(headers["x-amz-copy-source-if-match"], "\"source-etag\"");
             if multipart {
                 assert!(path.contains("uploadId=owned"));
@@ -1361,7 +1399,7 @@ fn s3_wrong_region_redirects_name_the_bucket_region() {
         assert!(!output.status.success(), "{text}");
         assert!(
             text.contains("(HTTP 301): the bucket is in region eu-central-1")
-                && text.contains("configured endpoint and signing region"),
+                && text.contains("pass --s3-region eu-central-1"),
             "{text}"
         );
     }
@@ -2233,9 +2271,9 @@ fn server_copy_never_reads_or_relays_object_contents() {
         assert_eq!(
             server.requests.load(Ordering::Relaxed),
             if fault == "server-copy-multipart-fails" {
-                7
+                6
             } else {
-                4
+                3
             }
         );
     }
@@ -2615,12 +2653,12 @@ fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
 #[test]
 fn server_copy_compares_remote_checksums_etags_and_metadata_without_body_reads() {
     for (fault, requests) in [
-        ("server-copy-compare-etag", 3),
-        ("server-copy-compare-checksum", 3),
-        ("server-copy-compare-composite", 4),
-        ("server-copy-compare-conflict", 4),
-        ("server-copy-compare-metadata", 4),
-        ("server-copy-compare-unavailable", 5),
+        ("server-copy-compare-etag", 2),
+        ("server-copy-compare-checksum", 2),
+        ("server-copy-compare-composite", 3),
+        ("server-copy-compare-conflict", 3),
+        ("server-copy-compare-metadata", 3),
+        ("server-copy-compare-unavailable", 4),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let server = Server::start(fault);
@@ -2670,7 +2708,7 @@ fn server_copy_parts_overlap_and_respect_one_request_limit() {
             "{fault}: {}",
             output_text(&output)
         );
-        assert_eq!(server.requests.load(Ordering::Relaxed), 8, "{fault}");
+        assert_eq!(server.requests.load(Ordering::Relaxed), 7, "{fault}");
     }
 }
 
@@ -2745,6 +2783,20 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
             "--performance-tuning",
             "s3-max-concurrent-requests=2",
         ];
+        if fault == "server-copy-heads-overlap" {
+            args = vec![
+                "--from",
+                "s3://source",
+                "original",
+                "other",
+                "--to",
+                "s3://destination",
+                "--into",
+                "copied",
+                "--dry-run",
+                "--only-new",
+            ];
+        }
         if fault.contains("storage-class") {
             args.extend(["--s3-header", "x-amz-storage-class: INTELLIGENT_TIERING"]);
         }
@@ -2856,7 +2908,7 @@ fn server_copy_automatic_sizing_uses_one_copy_request() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
-    assert_eq!(server.requests.load(Ordering::Relaxed), 4);
+    assert_eq!(server.requests.load(Ordering::Relaxed), 3);
 }
 
 #[test]
@@ -2890,9 +2942,9 @@ fn server_copy_prune_protects_keys_under_skip_options() {
 #[test]
 fn server_copy_only_skips_tag_reads_for_explicit_zero() {
     for (fault, success, requests) in [
-        ("server-copy-multipart-zero-tags", true, 7),
-        ("server-copy-multipart-tags-denied", false, 4),
-        ("server-copy-multipart-unknown-denied", false, 4),
+        ("server-copy-multipart-zero-tags", true, 6),
+        ("server-copy-multipart-tags-denied", false, 3),
+        ("server-copy-multipart-unknown-denied", false, 3),
     ] {
         let server = Server::start(fault);
         let temp = tempfile::tempdir().unwrap();
@@ -2939,10 +2991,82 @@ fn server_copy_region_error_explains_both_endpoints() {
     assert!(
         text.contains("source")
             && text.contains("destination")
-            && text.contains("changing --s3-region changes both endpoints")
+            && text.contains("--s3-region applies to both endpoints")
             && text.contains("eu-central-1"),
         "{text}"
     );
-    assert!(!text.contains("pass --s3-region eu-central-1"), "{text}");
+    assert!(text.contains("pass --s3-region eu-central-1"), "{text}");
     assert_eq!(server.requests.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn server_copy_discovery_region_failure_stops_before_copying() {
+    let server = Server::start("server-tree-region");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "--srcs-in",
+            "data",
+            "--to",
+            "s3://destination",
+            "--into",
+            "out",
+            "--prune",
+        ],
+    );
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("--s3-region applies to both endpoints"),
+        "{text}"
+    );
+    assert!(text.contains("pass --s3-region eu-central-1"), "{text}");
+    assert_eq!(server.requests.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn server_copy_changed_source_prevents_pruning() {
+    let server = Server::start("server-tree-changed");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "--srcs-in",
+            "data",
+            "--to",
+            "s3://destination",
+            "--into",
+            "out",
+            "--prune",
+        ],
+    );
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("skipping deletions"), "{text}");
+    assert_eq!(server.requests.load(Ordering::Relaxed), 7);
+}
+
+#[test]
+fn server_copy_reuses_versioned_source_snapshot() {
+    let server = Server::start("server-copy-versioned");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "original",
+            "--to",
+            "s3://destination",
+            "--as",
+            "copied",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 3);
 }

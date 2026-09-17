@@ -118,6 +118,9 @@ impl Engine {
     pub(super) fn part_size(&self, size: u64) -> u64 {
         let seed = if !self.options.automatic_part_size {
             self.options.part_size
+        } else if self.options.source_bucket.is_some() {
+            // Server copies allocate no payload buffer; use fewer, larger requests.
+            256 * 1024 * 1024
         } else if self.options.upload {
             if self.tuning.tigris() {
                 8 * 1024 * 1024
@@ -136,6 +139,8 @@ impl Engine {
     pub(super) fn part_workers(&self) -> usize {
         if !self.options.automatic_concurrency {
             self.options.concurrency
+        } else if self.options.source_bucket.is_some() {
+            64
         } else if !self.options.upload && self.tuning.local_latency() {
             4
         } else if self.tuning.tigris() {
@@ -445,6 +450,8 @@ mod buffer_tests {
         let limit = 5 * 1024 * 1024 * 1024;
         assert_eq!(engine.copy_request_limit(32 << 20), limit);
         assert_eq!(engine.copy_request_limit(limit + 1), limit);
+        assert_eq!((6u64 << 30).div_ceil(engine.part_size(6u64 << 30)), 24);
+        assert_eq!(engine.part_workers(), 64);
         assert!(engine
             .object_workers([256 << 20; 100].into_iter())
             .unwrap()

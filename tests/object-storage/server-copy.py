@@ -122,6 +122,18 @@ def check():
         c.request('PUT', bare, b'not a prefix')
         c.run(['--from', remote, name, '--to', remote, '--into-existing', bare],
               ok=False, capture=True)
+        # Ordinary uploads follow the same existence rules.
+        for local_source, placement in [(source / 'small + %.txt', '--into-existing'),
+                                        (source, '--as-existing')]:
+            refused = c.run([local_source, '--to', remote, placement, bare],
+                            ok=False, capture=True)
+            assert 'existence condition failed' in refused.stderr, refused.stderr
+            assert c.request('GET', bare)[1] == b'not a prefix'
+        refused = c.run([source / 'link', '--to', remote, '--as-existing', empty],
+                        ok=False, capture=True)
+        assert 'prefix, not an object' in refused.stderr, refused.stderr
+        c.run([source / 'link', '--to', remote, '--as-existing', bare])
+        assert c.request('GET', bare)[1] == b'small + %.txt'
         mirror = c.PREFIX + '/prune-file-descendants'
         stale = mirror + '/a/stale'
         c.request('PUT', stale, b'extra')

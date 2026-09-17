@@ -24,7 +24,7 @@ impl Tuning {
         Self {
             control_ns: control,
             reads: crate::s3::read_recovery::Recovery::default(),
-            upload: options.upload,
+            upload: options.upload && options.source_bucket.is_none(),
             fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
             // These measured seeds describe provider request behavior; they do

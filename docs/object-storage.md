@@ -254,7 +254,7 @@ a concurrent creation makes the write fail rather than replacing that object.
 A prefix existence check is not a transaction over the bucket.
 `--into-existing photos` requires an object beneath `photos/`, including a
 directory-marker object named `photos/`. An empty prefix without a marker does
-not exist. For a file source, `--as-existing photos` requires the exact object
+not exist. For a file or symlink source, `--as-existing photos` requires the exact object
 `photos`; objects beneath `photos/` do not satisfy it.
 
 Within the retry budget, syq can restart a download range that is much slower

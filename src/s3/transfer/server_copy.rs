@@ -131,7 +131,7 @@ impl Engine {
             .downcast_ref::<client::RequestFailure>()
             .is_some_and(|e| e.region_mismatch())
         {
-            error.context(format!("S3-to-S3 source bucket {:?} and destination bucket {:?} both use region {}; cross-region copies are not supported by this route, and changing --s3-region changes both endpoints",
+            error.context(format!("S3-to-S3 source bucket {:?} and destination bucket {:?} are configured with region {}; --s3-region applies to both endpoints: use the reported region if both buckets are there; buckets in different regions are not supported by this route",
                 self.options.source_bucket.as_deref().unwrap(), self.options.bucket,
                 self.client.config().region().map_or("unknown", |region| region.as_ref())))
         } else {
@@ -148,7 +148,7 @@ impl Engine {
         }
     }
 
-    async fn copy_head(
+    pub(super) async fn copy_head(
         &self,
         bucket: &str,
         key: &str,
@@ -192,20 +192,22 @@ impl Engine {
             }
             Err(e) => {
                 let detail = client::failure("S3 copy HEAD", &e);
-                return Err(
-                    self.copy_error(anyhow::Error::new(e.into_service_error()).context(detail))
-                );
+                return Err(anyhow::Error::new(e.into_service_error()).context(detail));
             }
         };
         Ok(Some((client::from_head(key, &output)?, output)))
     }
 
     pub(super) async fn server_copy(self: Arc<Self>) -> Result<()> {
-        let target = local::key_path(&self.args.locations.last().unwrap().path)?;
-        let (plan, prune) = self
-            .download_plan(&target)
+        self.clone()
+            .server_copy_inner()
             .await
-            .map_err(|error| self.copy_error(error))?;
+            .map_err(|error| self.copy_error(error))
+    }
+
+    async fn server_copy_inner(self: Arc<Self>) -> Result<()> {
+        let target = local::key_path(&self.args.locations.last().unwrap().path)?;
+        let (plan, prune) = self.download_plan(&target).await?;
         self.check_upload_placement(
             plan.first()
                 .map(|job| job.path == target && !job.key.ends_with('/')),
@@ -225,7 +227,10 @@ impl Engine {
             async move {
                 engine.check_cancelled()?;
                 let mut kind = "file";
-                let result = engine.copy_object(&job, &mut kind).await;
+                let result = engine
+                    .copy_object(&job, &mut kind)
+                    .await
+                    .map_err(|error| engine.copy_error(error));
                 engine.settle(job.key.as_bytes(), &job.path, kind, &result, None);
                 Ok(result.ok().flatten())
             }
@@ -255,8 +260,13 @@ impl Engine {
                 self.copy_head(&self.options.bucket, &key, 1).await
             }
         };
-        let (source, existing) =
-            tokio::try_join!(self.copy_head(source_bucket, &job.key, 0), destination)?;
+        let source = async {
+            match job.copy_source.as_deref() {
+                Some(source) => Ok(Some(source.clone())),
+                None => self.copy_head(source_bucket, &job.key, 0).await,
+            }
+        };
+        let (source, existing) = tokio::try_join!(source, destination)?;
         let (source, source_head) = source.context("S3 copy source disappeared")?;
         anyhow::ensure!(
             source.size == job.size,
