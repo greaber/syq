@@ -152,6 +152,8 @@ impl Budget {
             s.max = maximum;
         }
         s.adaptive = false;
+        drop(s);
+        self.changed.notify_waiters();
         Some(initial)
     }
     pub fn completed(&self, bytes: u64) {
@@ -240,6 +242,29 @@ mod tests {
         budget.state.lock().unwrap().settled = true;
         assert_eq!(budget.begin_objects(256, 512), Some(64));
         assert!(!budget.state.lock().unwrap().adaptive);
+    }
+
+    #[test]
+    fn object_handoff_wakes_waiters_without_a_permit_drop() {
+        struct Wakes(std::sync::atomic::AtomicUsize);
+        impl std::task::Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Relaxed);
+            }
+        }
+        let wakes = Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let budget = Arc::new(Budget::new(1, true));
+        let std::task::Poll::Ready(held) = Box::pin(budget.acquire()).as_mut().poll(&mut cx) else {
+            panic!("initial slot unavailable");
+        };
+        let mut waiting = Box::pin(budget.acquire());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(budget.begin_objects(1, 2), Some(1));
+        assert_eq!(wakes.0.load(Relaxed), 1);
+        assert!(waiting.as_mut().poll(&mut cx).is_ready());
+        drop(held);
     }
 
     #[test]

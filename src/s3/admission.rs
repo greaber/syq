@@ -16,6 +16,7 @@ struct Probe {
     from: usize,
     baseline: f64,
     upward: bool,
+    revisit: bool,
 }
 
 struct Controller {
@@ -27,7 +28,11 @@ struct Controller {
     hold: usize,
     lower: usize,
     upper: usize,
-    age: usize,
+    scores: usize,
+    failures: [u32; 2],
+    revisit_at: [usize; 2],
+    reference: Option<f64>,
+    changed_scores: usize,
 }
 
 impl Controller {
@@ -43,7 +48,11 @@ impl Controller {
             hold: 0,
             lower: 0,
             upper: maximum + 1,
-            age: 0,
+            scores: 0,
+            failures: [0; 2],
+            revisit_at: [0; 2],
+            reference: None,
+            changed_scores: 0,
         }
     }
 
@@ -63,19 +72,26 @@ impl Controller {
         }
         if let Some(score) = self.sampler.push(rate) {
             let before = self.limit;
-            self.age += 1;
-            if self.age >= 24 {
-                // Bounds from old conditions guide probes only temporarily.
-                self.lower = 0;
-                self.upper = self.maximum + 1;
-                self.age = 0;
-            }
+            self.scores += 1;
             if let Some(probe) = self.probe.take() {
                 // Pay for more concurrency only when it improves throughput.
                 // Prefer fewer objects only when measured speed holds: a
                 // tolerated loss per step can accumulate into a large loss.
                 let floor = if probe.upward { 1.02 } else { 1.0 };
+                let direction = usize::from(probe.upward);
                 if score > 0.0 && score >= probe.baseline * floor {
+                    if probe.revisit {
+                        // A nearby probe found a change outside the old bounds.
+                        // Resume the coarse search only in that direction.
+                        if probe.upward {
+                            self.upper = self.maximum + 1;
+                        } else {
+                            self.lower = 0;
+                        }
+                    }
+                    self.failures[direction] = 0;
+                    self.reference = Some(score);
+                    self.changed_scores = 0;
                     if probe.upward {
                         self.lower = probe.from;
                     } else {
@@ -85,10 +101,14 @@ impl Controller {
                     self.hold = 0;
                 } else {
                     if probe.upward {
-                        self.upper = self.limit;
+                        self.upper = self.upper.min(self.limit);
                     } else {
-                        self.lower = self.limit;
+                        self.lower = self.lower.max(self.limit);
                     }
+                    self.failures[direction] = (self.failures[direction] + 1).min(3);
+                    self.revisit_at[direction] = self.scores + (8 << self.failures[direction]);
+                    self.reference = Some(probe.baseline);
+                    self.changed_scores = 0;
                     self.limit = probe.from;
                     self.upward = !probe.upward;
                     self.hold = 1;
@@ -96,6 +116,7 @@ impl Controller {
             } else if self.hold > 0 {
                 self.hold -= 1;
             } else if score > 0.0 && queued >= measurement_work.max(active.saturating_mul(2)) {
+                self.observe_change(score);
                 if self.limit == self.maximum {
                     self.upward = false;
                 }
@@ -107,11 +128,33 @@ impl Controller {
                     self.upward = !self.upward;
                     candidate = self.candidate();
                 }
+                let mut revisit = false;
+                if candidate == self.limit {
+                    // Once the bounds converge, only occasionally test outside
+                    // them. Small steps limit the recurring exploration cost.
+                    for upward in [self.upward, !self.upward] {
+                        if self.scores >= self.revisit_at[usize::from(upward)] {
+                            let step = self.limit.div_ceil(if upward { 2 } else { 4 });
+                            let next = if upward {
+                                (self.limit + step).min(self.maximum)
+                            } else {
+                                self.limit.saturating_sub(step).max(1)
+                            };
+                            if next != self.limit {
+                                self.upward = upward;
+                                candidate = next;
+                                revisit = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if candidate != self.limit {
                     self.probe = Some(Probe {
                         from: self.limit,
                         baseline: score,
                         upward: self.upward,
+                        revisit,
                     });
                     self.limit = candidate;
                 }
@@ -123,6 +166,30 @@ impl Controller {
         }
         self.limit
     }
+    fn observe_change(&mut self, score: f64) {
+        if let Some(reference) = self.reference {
+            if (score - reference).abs() > reference * 0.25 {
+                self.changed_scores += 1;
+                if self.changed_scores < 3 {
+                    return;
+                }
+                // A sustained rate change invalidates both search bounds.
+                // A capacity increase need not change the current rate, so
+                // periodic probes remain necessary even without this signal.
+                self.lower = 0;
+                self.upper = self.maximum + 1;
+                self.failures = [0; 2];
+                self.revisit_at = [0; 2];
+            } else {
+                self.reference = Some(reference * 0.9 + score * 0.1);
+                self.changed_scores = 0;
+                return;
+            }
+        }
+        self.reference = Some(score);
+        self.changed_scores = 0;
+    }
+
     fn candidate(&self) -> usize {
         if self.upward {
             (self.limit * 2)
@@ -253,6 +320,110 @@ mod tests {
         let mut controller = Controller::new(32, 256, false);
         for optimum in [16, 64, 4] {
             exercise(&mut controller, optimum);
+        }
+    }
+
+    // A fluid request model: requests finish at the aggregate rate, and a
+    // reduction must drain the excess before the next setting can be measured.
+    // Noise changes delivery, not just the controller's reported score.
+    struct PathModel {
+        active: usize,
+        completions: f64,
+        random: u64,
+    }
+
+    impl PathModel {
+        fn sample(&mut self, controller: &mut Controller, optimum: usize, noise: f64) -> f64 {
+            self.random ^= self.random << 13;
+            self.random ^= self.random >> 7;
+            self.random ^= self.random << 17;
+            let jitter = 1.0 + noise * (2.0 * self.random as f64 / u64::MAX as f64 - 1.0);
+            let rate = if self.active <= optimum {
+                self.active as f64
+            } else {
+                (optimum * optimum) as f64 / self.active as f64
+            } * 16.0
+                * jitter;
+            controller.observe(rate, self.active, 1_000_000, 16);
+            if controller.limit >= self.active {
+                self.active = controller.limit;
+            } else {
+                self.completions += rate * SAMPLE.as_secs_f64();
+                let completed = self.completions.floor() as usize;
+                self.completions -= completed as f64;
+                self.active = self.active.saturating_sub(completed).max(controller.limit);
+            }
+            rate / (optimum as f64 * 16.0 * jitter)
+        }
+    }
+
+    #[test]
+    fn stationary_paths_spend_little_work_on_repeated_probes() {
+        for optimum in [1, 2, 3, 4, 8, 32, 128, 256] {
+            let mut controller = Controller::new(32, 256, false);
+            let mut model = PathModel {
+                active: 32,
+                completions: 0.0,
+                random: 17,
+            };
+            // Separate initial learning from the recurring cost under review.
+            for _ in 0..1000 {
+                model.sample(&mut controller, optimum, 0.0);
+            }
+            let fraction: f64 = (0..4000)
+                .map(|_| model.sample(&mut controller, optimum, 0.0))
+                .sum::<f64>()
+                / 4000.0;
+            assert!(
+                fraction > 0.97,
+                "optimum {optimum}: useful fraction {fraction}"
+            );
+        }
+    }
+
+    #[test]
+    fn probes_discover_capacity_increases_without_a_rate_drop() {
+        let mut controller = Controller::new(4, 256, false);
+        let mut model = PathModel {
+            active: 4,
+            completions: 0.0,
+            random: 251,
+        };
+        for _ in 0..2000 {
+            model.sample(&mut controller, 4, 0.0);
+        }
+        // Increasing capacity does not change the rate at the old optimum.
+        let recovered = (0..400).any(|_| model.sample(&mut controller, 128, 0.0) >= 0.9);
+        assert!(recovered, "periodic probes must discover unused capacity");
+        let fraction = (0..1000)
+            .map(|_| model.sample(&mut controller, 128, 0.0))
+            .sum::<f64>()
+            / 1000.0;
+        assert!(fraction > 0.95, "must sustain the improvement: {fraction}");
+    }
+
+    #[test]
+    fn adapts_to_noisy_changes_and_drains_decreases() {
+        for seed in [17, 251, 902, 1009, 65537] {
+            let mut controller = Controller::new(32, 256, false);
+            let mut model = PathModel {
+                active: 32,
+                completions: 0.0,
+                random: seed,
+            };
+            let mut delivered = 0.0;
+            let mut possible = 0.0;
+            for optimum in [96, 9, 42, 3] {
+                for _ in 0..1000 {
+                    delivered += model.sample(&mut controller, optimum, 0.2) * optimum as f64;
+                    possible += optimum as f64;
+                }
+            }
+            assert!(
+                delivered / possible > 0.8,
+                "seed {seed}: useful fraction {}",
+                delivered / possible
+            );
         }
     }
 
