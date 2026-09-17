@@ -366,7 +366,18 @@ impl Engine {
                 .set_version_id(source.version.clone())
                 .send()
                 .await
-                .map_err(|e| e.into_service_error())?;
+                .map_err(|e| {
+                    let permission = if source.version.is_some() {
+                        "s3:GetObjectVersionTagging"
+                    } else {
+                        "s3:GetObjectTagging"
+                    };
+                    let operation = format!(
+                        "S3 GetObjectTagging for multipart copy (reading source tags requires {permission} on AWS)"
+                    );
+                    let detail = client::failure(&operation, &e);
+                    anyhow::Error::new(e.into_service_error()).context(detail)
+                })?;
             let mut serializer = url::form_urlencoded::Serializer::new(String::new());
             for tag in tags.tag_set() {
                 serializer.append_pair(tag.key(), tag.value());

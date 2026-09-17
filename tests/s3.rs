@@ -2980,6 +2980,15 @@ fn server_copy_only_skips_tag_reads_for_explicit_zero() {
             "{fault}: {}",
             output_text(&output)
         );
+        if !success {
+            let diagnostic = output_text(&output);
+            assert!(
+                diagnostic.contains("S3 GetObjectTagging for multipart copy"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("s3:GetObjectTagging"), "{diagnostic}");
+            assert!(diagnostic.contains("HTTP 403"), "{diagnostic}");
+        }
         assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
     }
 }
