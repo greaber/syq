@@ -2132,6 +2132,9 @@ fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
 fn serve_latency_pages(socket: &mut TcpStream, first: &str) {
     let target = first.split_whitespace().nth(1).unwrap();
     if first.starts_with("HEAD ") {
+        // Slower than the high-latency threshold, so only the listing pages
+        // can show that the path is fast.
+        thread::sleep(Duration::from_millis(80));
         reply(socket, 404, &[], b"", true);
         return;
     }
