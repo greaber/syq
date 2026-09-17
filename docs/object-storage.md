@@ -63,9 +63,10 @@ uploads. Syq does not change bucket policies or lifecycle rules.
 ## Parallelism
 
 Uploads use multipart requests and downloads use concurrent byte ranges. Syq
-chooses starting settings from file sizes, the backend and observed request
-latency. For batches where each object fits in one request, syq tests higher and
-lower object concurrency when there is enough work to measure a change. After
+chooses starting settings from file sizes, payload budgets, the backend and
+observed request latency. For batches where each object fits in one request,
+syq tests higher and lower concurrency when enough work remains to measure
+and benefit from a change. After
 finding a good setting, syq probes less often, while continuing to check for
 changed conditions. For batches of small downloads, the search range also
 accounts for object sizes and available file descriptors.

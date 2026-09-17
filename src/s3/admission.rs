@@ -485,6 +485,11 @@ where
             let future = work(job);
             tasks.spawn(async move { (prepared, future.await) });
         }
+        if controller.is_none() {
+            if let Some(requests) = &concurrency.requests {
+                requests.queued_objects(jobs.len());
+            }
+        }
         if tasks.is_empty() {
             break;
         }

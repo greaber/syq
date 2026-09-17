@@ -55,13 +55,15 @@ impl Engine {
         } else {
             workers
         };
-        // Keep the initial network load conservative; preparation follows the
-        // request budget until its measurements justify the larger object seed.
+        // Preparation follows the request budget. Whole-object batches can
+        // use the size-based estimate before enough responses exist to tune.
         self.tuning.configure(
             tiny,
             if small_upload { workers } else { 256 },
-            if ramp_whole_objects && !self.options.upload {
-                32
+            if ramp_whole_objects {
+                // Leave room for a measured increase within the object target,
+                // while retaining the existing floor for larger objects.
+                workers.div_ceil(2).max(32)
             } else {
                 64
             },
@@ -715,17 +717,17 @@ mod buffer_tests {
 
     #[tokio::test]
     async fn short_whole_object_batches_keep_request_preparation_bounded() {
-        for count in [32, 33, 128, 4096] {
+        for count in [32, 128, 129, 4096] {
             let engine = planning_engine(&[]);
             let concurrency = engine
                 .object_workers(std::iter::repeat_n(1024 * 1024, count))
                 .unwrap();
-            assert_eq!(engine.tuning.request_limit(), 32);
-            assert_eq!(concurrency.maximum, (count > 32).then_some(count.min(256)));
-            if count > 32 {
+            assert_eq!(engine.tuning.request_limit(), 128);
+            assert_eq!(concurrency.maximum, (count > 128).then_some(count.min(256)));
+            if count > 128 {
                 assert_eq!(concurrency.initial, count.min(256));
                 let requests = concurrency.requests.unwrap();
-                assert_eq!(requests.preparation_limit(), 33);
+                assert_eq!(requests.preparation_limit(), 129);
                 assert_eq!(requests.begin_objects(concurrency.initial), None);
             }
         }
