@@ -36,11 +36,19 @@ def check():
             if name == 'flat':
                 request_key = prefix + '/000-leading'
                 checks.request('PUT', request_key, b'leading')
+            prune = []
+            if name == 'pruned':
+                (destination / 'archive').mkdir(parents=True)
+                (destination / 'archive/local').write_bytes(b'protected')
+                (destination / 'extra').write_bytes(b'remove')
+                prune = ['--prune']
             results = root / (name + '.jsonl')
-            checks.run(['--from', remote, '--srcs-in', selected, '--into', destination, *rules, '--results', results])
+            checks.run(['--from', remote, '--srcs-in', selected, '--into', destination, *rules, *prune, '--results', results])
             terminal = json.loads(results.read_text().splitlines()[-1])
             assert terminal['files_excluded'] == excluded, (name, terminal)
             expected = {'root-file': b'root', 'keep/file': b'kept', 'keep/sub/file': b'nested'}
+            if name == 'pruned':
+                expected['archive/local'] = b'protected'
             if archive:
                 expected['archive/0000.tmp'] = b'ignored'
             if name == 'flat':
@@ -54,7 +62,7 @@ def check():
                       for p in destination.rglob('*') if p.is_file()}
             assert actual == expected, (name, sorted(actual), sorted(expected))
             assert (selected_tree / 'keep/empty').is_dir()
-            if not archive:
+            if not archive and name != 'pruned':
                 assert not (selected_tree / 'archive').exists()
             if name == 'flat':
                 checks.request('DELETE', request_key)
@@ -63,6 +71,14 @@ def check():
         assert not list((root / 'excluded').rglob('*'))
         checks.run(['--from', remote, '--srcs-in', prefix + '/missing',
                     '--into', root / 'missing'], ok=False)
+        # A two-file upload would stop discovery after one page without pruning.
+        # Pruning must instead enumerate and delete every old destination object.
+        source = root / 'upload'
+        source.mkdir()
+        (source / 'one').write_bytes(b'one')
+        (source / 'two').write_bytes(b'two')
+        checks.run(['--srcs-in', source, '--to', remote, '--into', prefix, '--prune'])
+        assert set(checks.listing(prefix + '/')) == {prefix + '/one', prefix + '/two'}
     print('Paginated S3 selection, directory markers, ordered negations, and empty selection passed', flush=True)
 
 
