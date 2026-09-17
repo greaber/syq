@@ -10397,6 +10397,9 @@ mod tests {
             assert_eq!(sched.begin_fast_batch(1, 12), 12);
             let mut batch = vec![0];
             batch.extend(sched.take_small(256 << 10, 11, u64::MAX));
+            let owned = batch[..8].to_vec();
+            let stolen = batch[8];
+            let siblings = batch[9..].to_vec();
             sched.mark_fast(11);
             let src = Arc::new(Mutex::new(PipelineState {
                 synchronous: true,
@@ -10426,13 +10429,16 @@ mod tests {
                     .push_back(Response::Applied(vec![None; 4]));
             }
             src.lock().unwrap().replies.push_back(Response::Stats(
-                jobs[..8].iter().map(|j| Some(j.entry.clone())).collect(),
+                owned
+                    .iter()
+                    .map(|&idx| Some(jobs[idx].entry.clone()))
+                    .collect(),
             ));
             let mut worker = pipeline_worker(sched.clone(), src.clone(), dst, 512, false);
             let result = worker.fast_batch(&mut batch);
             assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
-            assert_eq!(src.lock().unwrap().stolen_file, Some(8));
-            assert_eq!(batch, (0..8).collect::<Vec<_>>());
+            assert_eq!(src.lock().unwrap().stolen_file, Some(stolen));
+            assert_eq!(batch, owned);
             assert_eq!(
                 worker.progress.files_done.load(Relaxed),
                 if failure == "none" { 8 } else { 0 }
@@ -10444,7 +10450,10 @@ mod tests {
                 };
                 assert_eq!(
                     paths,
-                    &jobs[..8].iter().map(|j| j.src.clone()).collect::<Vec<_>>()
+                    &owned
+                        .iter()
+                        .map(|&idx| jobs[idx].src.clone())
+                        .collect::<Vec<_>>()
                 );
             }
             sched.complete_fast_batch(batch.len());
@@ -10453,16 +10462,18 @@ mod tests {
                     sched.requeue(idx);
                 }
             }
-            // The peer already owns file 8. Its three siblings were returned
+            // The peer owns the first file of the stolen group. Its siblings were returned
             // to the file queue; no retry may duplicate that ownership.
-            assert!(sched.ranges_ready(8, vec![]).is_none());
-            let expected: Vec<_> = if failure == "none" {
-                (9..12).collect()
-            } else {
-                (0..8).chain(9..12).collect()
-            };
-            for idx in expected {
-                assert!(matches!(sched.next(), Item::File(i) if i == idx));
+            assert!(sched.ranges_ready(stolen, vec![]).is_none());
+            let mut expected: std::collections::BTreeSet<_> = siblings.into_iter().collect();
+            if failure != "none" {
+                expected.extend(owned);
+            }
+            while !expected.is_empty() {
+                let Item::File(idx) = sched.next() else {
+                    panic!("expected queued file")
+                };
+                assert!(expected.remove(&idx), "duplicate or stolen file {idx}");
                 assert!(sched.ranges_ready(idx, vec![]).is_none());
             }
             assert!(sched.finished());
