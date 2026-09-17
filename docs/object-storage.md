@@ -54,11 +54,12 @@ syq cp --from s3://my-bucket backup/data --into restored
 every request, including listing, multipart operations, and retries. Use
 provider headers that are valid on all these operations. Repeating the same
 name uses the last value. Headers are passed through, not interpreted as a
-metadata-editing operation: the service may apply a header differently to
-CopyObject and multipart creation. For example, a custom `x-amz-meta-project`
-header does not replace source metadata under CopyObject’s COPY directive,
-but can set metadata during multipart creation. Such an override can cause
-repeated copying because destination metadata keeps differing from the source.
+metadata-editing operation. S3-to-S3 copies reject custom `x-amz-meta-*`,
+`Content-Type`, `Content-Encoding`, `Content-Language`,
+`Content-Disposition`, `Cache-Control`, `Expires`, and `x-amz-tagging`
+headers because overrides behave differently for single-request and multipart
+copies. Provider controls such as Tigris consistency headers and
+`x-amz-storage-class` remain available.
 Syq refuses overrides of authentication, request
 framing, ranges, conditional writes, checksums, and its own metadata headers.
 Header values are omitted from results and recovery records. Command-line

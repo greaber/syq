@@ -78,7 +78,7 @@ pub(crate) struct Flags {
     /// AWS shared configuration/credentials profile
     #[arg(long, value_name = "NAME", help_heading = "Object storage")]
     s3_profile: Option<String>,
-    /// Add a header before signing every S3 request (repeatable)
+    /// Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused)
     #[arg(long, value_name = "NAME: VALUE", help_heading = "Object storage")]
     s3_header: Vec<Header>,
 }
@@ -150,6 +150,24 @@ impl Options {
         ] {
             if explicit(id) {
                 bail!("--{} is not supported for S3 copies", id.replace('_', "-"));
+            }
+        }
+        if from.is_some() && to.is_some() {
+            for Header(name, _) in &flags.s3_header {
+                if name.starts_with("x-amz-meta-")
+                    || matches!(
+                        name.as_str(),
+                        "content-type"
+                            | "content-encoding"
+                            | "content-language"
+                            | "content-disposition"
+                            | "cache-control"
+                            | "expires"
+                            | "x-amz-tagging"
+                    )
+                {
+                    bail!("--s3-header {name} is not supported for S3-to-S3 copies: metadata and tag overrides behave differently for single-request and multipart copies");
+                }
             }
         }
         let bucket = to.or(from).unwrap().strip_prefix("s3://").unwrap();

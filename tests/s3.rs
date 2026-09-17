@@ -1414,6 +1414,47 @@ fn s3_usage_errors_do_not_contact_storage() {
 }
 
 #[test]
+fn server_copy_rejects_metadata_headers_before_requests() {
+    let server = Server::start("ok");
+    let temp = tempfile::tempdir().unwrap();
+    for name in [
+        "X-Amz-Meta-Project",
+        "Content-Type",
+        "Content-Encoding",
+        "Content-Language",
+        "Content-Disposition",
+        "Cache-Control",
+        "Expires",
+        "X-Amz-Tagging",
+    ] {
+        let header = format!("{name}: private-value");
+        for dry_run in [false, true] {
+            let mut args = vec![
+                "--from",
+                "s3://source",
+                "data",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "out",
+                "--s3-header",
+                &header,
+            ];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let output = server.cp(temp.path(), &args);
+            let text = output_text(&output);
+            assert_eq!(output.status.code(), Some(2), "{text}");
+            assert!(text.contains("single-request and multipart"), "{text}");
+            assert!(text.contains(&name.to_ascii_lowercase()), "{text}");
+            assert!(!text.contains("private-value"), "{text}");
+        }
+    }
+    assert_eq!(server.requests.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn s3_single_get_validates_metadata_length_and_contents() {
     for fault in [
         "single-ok",
