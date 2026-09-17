@@ -13,24 +13,28 @@ const SAMPLE: Duration = Duration::from_millis(250);
 #[derive(Default)]
 struct RateWindow {
     previous: Option<f64>,
+    previous_fresh: Option<f64>,
     discard: bool,
 }
 
 impl RateWindow {
     fn reset(&mut self) {
         self.previous = None;
+        self.previous_fresh = None;
         self.discard = true;
     }
 
-    fn push(&mut self, rate: f64) -> Option<f64> {
+    fn push(&mut self, rate: f64, fresh: f64) -> Option<(f64, f64)> {
         if self.discard {
             self.discard = false;
             return None;
         }
         if let Some(previous) = self.previous.take() {
-            Some((previous + rate) * 0.5)
+            let previous_fresh = self.previous_fresh.take().unwrap_or(previous);
+            Some(((previous + rate) * 0.5, (previous_fresh + fresh) * 0.5))
         } else {
             self.previous = Some(rate);
+            self.previous_fresh = Some(fresh);
             None
         }
     }
@@ -100,7 +104,14 @@ impl Controller {
         active: usize,
         queued: usize,
         measurement_work: usize,
+        old_rate: f64,
     ) -> usize {
+        if rate > 0.0 && old_rate >= rate && !self.sampler.discard {
+            // No completion in this window describes the new setting yet.
+            self.sampler.previous = None;
+            self.sampler.previous_fresh = None;
+            return self.limit;
+        }
         // A decrease drains existing work before its measurement starts. Also
         // avoid learning from a drained queue. New probes need enough queued
         // work to measure them; an existing probe may still finish in the tail.
@@ -108,7 +119,8 @@ impl Controller {
             self.sampler.reset();
             return self.limit;
         }
-        if let Some(score) = self.sampler.push(rate) {
+        let fresh = (rate - old_rate).max(0.0);
+        if let Some((score, fresh_score)) = self.sampler.push(rate, fresh) {
             let before = self.limit;
             self.scores += 1;
             if let Some(mut probe) = self.probe.take() {
@@ -117,7 +129,17 @@ impl Controller {
                 // tolerated loss per step can accumulate into a large loss.
                 let floor = if probe.upward { 1.02 } else { 1.0 };
                 let direction = usize::from(probe.upward);
-                if score > 0.0 && score >= probe.baseline * floor {
+                if fresh_score < probe.baseline * floor && score >= probe.baseline * floor {
+                    // Old completions could explain the apparent gain. Neither
+                    // accept it nor infer a loss from excluding that traffic.
+                    // Keep the latest observation so the next one can resolve it.
+                    self.sampler.previous = Some(rate);
+                    self.sampler.previous_fresh = Some(fresh);
+                    self.probe = Some(probe);
+                    return self.limit;
+                }
+                if fresh_score > 0.0 && fresh_score >= probe.baseline * floor {
+                    let score = fresh_score;
                     // A small apparent improvement can be ordinary variation.
                     // Require another successful score before accepting it;
                     // clearly better settings need no extra confirmation.
@@ -169,6 +191,13 @@ impl Controller {
                     self.upward = !probe.upward;
                     self.hold = 1;
                 }
+            } else if fresh_score * 1.02 < score {
+                // Establish a baseline whose old-work contribution is smaller
+                // than the minimum gain we search for. Sparse late completions
+                // can still be included without restarting the whole warmup.
+                self.sampler.previous = Some(rate);
+                self.sampler.previous_fresh = Some(fresh);
+                return self.limit;
             } else if self.hold > 0 {
                 self.hold -= 1;
             } else if score > 0.0 && queued >= measurement_work.max(active.saturating_mul(2)) {
@@ -353,6 +382,8 @@ where
     let mut since = tokio::time::Instant::now();
     let mut activity = 0u64;
     let mut completed = 0usize;
+    let mut generation = 0u64;
+    let mut old_activity = 0u64;
     let mut error = None;
     let mut observations = concurrency
         .maximum
@@ -381,31 +412,32 @@ where
         };
         while error.is_none() && tasks.len() < preparation_limit {
             let Some(job) = jobs.next() else { break };
-            let task = tasks.spawn(work(job));
-            if let Some(observations) = &mut observations {
-                observations.spawned(task.id());
-            }
+            let prepared = generation;
+            let future = work(job);
+            tasks.spawn(async move { (prepared, future.await) });
         }
         if tasks.is_empty() {
             break;
         }
         tokio::select! {
-            result = tasks.join_next_with_id() => {
+            result = tasks.join_next() => {
                 let result = result.unwrap();
-                if let Some(observations) = &mut observations {
-                    match &result {
-                        Ok((id, result)) => observations.completed(*id,
-                            result.as_ref().ok().and_then(|bytes| *bytes)
-                                .map(|bytes| bytes.saturating_add(FILE_CREDIT))),
-                        Err(error) => observations.completed(error.id(), None),
-                    }
+                if let (Some(observations), Ok((prepared, result))) = (&mut observations, &result) {
+                    observations.completed(*prepared,
+                        result.as_ref().ok().and_then(|bytes| *bytes)
+                            .map(|bytes| bytes.saturating_add(FILE_CREDIT)));
                 }
-                match result.map_err(anyhow::Error::from).and_then(|(_, r)| r) {
-                    Ok(Some(bytes)) => {
-                        activity = activity.saturating_add(bytes.saturating_add(FILE_CREDIT));
+                match result.map_err(anyhow::Error::from)
+                    .and_then(|(prepared, result)| result.map(|bytes| (prepared, bytes))) {
+                    Ok((prepared, Some(bytes))) => {
+                        let work = bytes.saturating_add(FILE_CREDIT);
+                        if prepared != generation {
+                            old_activity = old_activity.saturating_add(work);
+                        }
+                        activity = activity.saturating_add(work);
                         completed += 1;
                     }
-                    Ok(None) => {}, // Skips and failed copies are not transferred work.
+                    Ok((_, None)) => {}, // Skips and failed copies are not transferred work.
                     Err(e) => { if error.is_none() { error = Some(e); } },
                 }
             }
@@ -415,6 +447,7 @@ where
                     // Only one controller changes concurrency at a time.
                     controller = begin();
                     if let Some(controller) = &controller {
+                        generation += 1;
                         if let Some(observations) = &mut observations {
                             observations.changed();
                         }
@@ -423,6 +456,7 @@ where
                     }
                     activity = 0;
                     completed = 0;
+                    old_activity = 0;
                     since = tokio::time::Instant::now();
                     continue;
                 }
@@ -438,7 +472,7 @@ where
                         observations.sample(super::diagnostics::ObjectWindow {
                             limit, active: tasks.len(), queued: jobs.len(),
                             completed, activity, elapsed,
-                            warmup: controller.sampler.discard,
+                            warmup: controller.sampler.discard || old_activity == activity,
                             previous_rate: controller.sampler.previous,
                             probe_from: controller.probe.as_ref().map(|probe| probe.from),
                             probe_baseline: controller.probe.as_ref().map(|probe| probe.baseline),
@@ -448,14 +482,17 @@ where
                     limit = controller.as_mut().unwrap().observe(
                         activity as f64 / elapsed.as_secs_f64(), tasks.len(), jobs.len(),
                         (completed as f64 * 4.0 * SAMPLE.as_secs_f64() / elapsed.as_secs_f64()).ceil() as usize,
+                        old_activity as f64 / elapsed.as_secs_f64(),
                     );
                     if limit != before {
+                        generation += 1;
                         if let Some(observations) = &mut observations {
                             observations.changed();
                         }
                     }
                     activity = 0;
                     completed = 0;
+                    old_activity = 0;
                     since = tokio::time::Instant::now();
                 }
             }
@@ -476,7 +513,7 @@ mod tests {
             } else {
                 (optimum * optimum) as f64 / active as f64
             };
-            controller.observe(rate, active, 10000, 16);
+            controller.observe(rate, active, 10000, 16, 0.0);
         }
         let settled = controller
             .probe
@@ -492,34 +529,135 @@ mod tests {
     #[test]
     fn resetting_measurements_excludes_the_previous_setting() {
         let mut window = Controller::new(7, 256, false).sampler;
-        assert!(window.push(100.0).is_none());
-        assert!(window.push(10000.0).is_none());
+        assert!(window.push(100.0, 100.0).is_none());
+        assert!(window.push(10000.0, 10000.0).is_none());
         window.reset();
-        assert!(window.push(20000.0).is_none());
-        assert!(window.push(10.0).is_none());
-        assert_eq!(window.push(20.0), Some(15.0));
+        assert!(window.push(20000.0, 20000.0).is_none());
+        assert!(window.push(10.0, 10.0).is_none());
+        assert_eq!(window.push(20.0, 20.0), Some((15.0, 15.0)));
+    }
+
+    #[test]
+    fn old_response_bursts_cannot_accept_a_losing_increase() {
+        let mut controller = Controller::new(256, 512, true);
+        controller.upper = 512;
+        for _ in 0..3 {
+            controller.observe(302.6, 256, 10000, 16, 0.0);
+        }
+        assert_eq!(controller.limit, 384);
+        // These rates reproduce a delayed old response wave followed by slower
+        // fresh completions. Including 452.5 would falsely accept the increase.
+        assert_eq!(controller.observe(150.7, 384, 10000, 16, 150.7), 384);
+        assert_eq!(controller.observe(452.5, 384, 10000, 16, 452.5), 384);
+        assert_eq!(controller.observe(184.2, 384, 10000, 16, 0.0), 384);
+        assert_eq!(controller.observe(193.9, 384, 10000, 16, 0.0), 256);
+    }
+
+    #[test]
+    fn old_only_windows_cannot_reject_an_unmeasured_probe() {
+        let mut controller = Controller::new(256, 512, true);
+        controller.upper = 512;
+        for _ in 0..3 {
+            controller.observe(300.0, 256, 10000, 16, 0.0);
+        }
+        for _ in 0..4 {
+            assert_eq!(controller.observe(100.0, 384, 10000, 16, 100.0), 384);
+            assert!(controller.probe.is_some());
+        }
+        controller.observe(360.0, 384, 10000, 16, 0.0);
+        assert_eq!(controller.observe(360.0, 384, 10000, 16, 0.0), 384);
+        assert!(controller.probe.is_none());
+    }
+
+    #[test]
+    fn sparse_old_completions_do_not_delay_clear_decisions() {
+        let mut controller = Controller::new(256, 512, true);
+        controller.upper = 512;
+        controller.sampler.previous = Some(300.0);
+        assert_eq!(controller.observe(300.0, 256, 10000, 16, 300.0), 256);
+        assert_eq!(controller.observe(300.0, 256, 10000, 16, 2.0), 384);
+        assert_eq!(controller.observe(300.0, 384, 10000, 16, 300.0), 384);
+        assert_eq!(controller.observe(120.0, 384, 10000, 16, 0.0), 384);
+        assert_eq!(controller.observe(115.0, 384, 10000, 16, 5.0), 256);
+    }
+
+    #[test]
+    fn uncertain_old_work_does_not_reject_a_useful_increase() {
+        let mut controller = Controller::new(256, 512, true);
+        controller.upper = 512;
+        for _ in 0..3 {
+            controller.observe(300.0, 256, 10000, 16, 0.0);
+        }
+        assert_eq!(controller.limit, 384);
+        controller.observe(300.0, 384, 10000, 16, 300.0);
+        controller.observe(360.0, 384, 10000, 16, 120.0);
+        controller.observe(360.0, 384, 10000, 16, 0.0);
+        assert!(controller.probe.is_some());
+        assert_eq!(controller.observe(360.0, 384, 10000, 16, 0.0), 384);
+        assert!(controller.probe.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tuning_continues_while_an_old_job_is_still_pending() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let copy_peak = peak.clone();
+        let copy_gate = gate.clone();
+        let copy = tokio::spawn(async move {
+            parallel(
+                (0..2048).collect(),
+                Concurrency {
+                    initial: 4,
+                    maximum: Some(16),
+                    initial_probe_up: true,
+                    requests: None,
+                },
+                move |job| {
+                    let active = active.clone();
+                    let peak = copy_peak.clone();
+                    let gate = copy_gate.clone();
+                    async move {
+                        peak.fetch_max(active.fetch_add(1, SeqCst) + 1, SeqCst);
+                        if job == 0 {
+                            let _permit = gate.acquire().await.unwrap();
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        active.fetch_sub(1, SeqCst);
+                        Ok(Some(1024))
+                    }
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let peak_before_old_job_finished = peak.load(SeqCst);
+        gate.add_permits(1);
+        copy.await.unwrap().unwrap();
+        assert!(peak_before_old_job_finished > 4);
     }
 
     #[test]
     fn inherited_request_score_still_excludes_the_handoff_warmup() {
         let mut controller = Controller::new(32, 256, true);
         controller.sampler.previous = Some(1000.0);
-        assert_eq!(controller.observe(100000.0, 32, 10000, 16), 32);
-        assert_eq!(controller.observe(1000.0, 32, 10000, 16), 64);
+        assert_eq!(controller.observe(100000.0, 32, 10000, 16, 0.0), 32);
+        assert_eq!(controller.observe(1000.0, 32, 10000, 16, 0.0), 64);
         assert_eq!(controller.probe.as_ref().unwrap().baseline, 1000.0);
     }
 
     #[test]
     fn scores_include_partial_completion_batches() {
         let mut sampler = Controller::new(7, 256, false).sampler;
-        assert!(sampler.push(0.0).is_none()); // Discard the warmup observation.
+        assert!(sampler.push(0.0, 0.0).is_none()); // Discard the warmup observation.
         let counts = [28.0, 35.0, 35.0, 28.0, 35.0, 35.0];
         let scores: Vec<_> = counts
             .into_iter()
-            .filter_map(|rate| sampler.push(rate))
+            .filter_map(|rate| sampler.push(rate, rate))
             .collect();
         assert_eq!(scores.len(), 3);
-        let measured = scores.iter().sum::<f64>() / scores.len() as f64;
+        let measured = scores.iter().map(|(score, _)| score).sum::<f64>() / scores.len() as f64;
         let delivered = counts.iter().sum::<f64>() / counts.len() as f64;
         assert!((measured - delivered).abs() < 1e-9);
     }
@@ -558,7 +696,7 @@ mod tests {
                 (optimum * optimum) as f64 / self.active as f64
             } * 16.0
                 * jitter;
-            controller.observe(rate, self.active, 1_000_000, 16);
+            controller.observe(rate, self.active, 1_000_000, 16, 0.0);
             if controller.limit >= self.active {
                 self.active = controller.limit;
             } else {
@@ -581,18 +719,18 @@ mod tests {
         ] {
             let mut controller = Controller::new(64, 256, true);
             for _ in 0..3 {
-                controller.observe(1000.0, 64, 10000, 16);
+                controller.observe(1000.0, 64, 10000, 16, 0.0);
             }
             assert_eq!(controller.limit, 128);
             for _ in 0..3 {
-                controller.observe(probe_rate, 128, 10000, 16);
+                controller.observe(probe_rate, 128, 10000, 16, 0.0);
             }
             // Both gains are kept. Only the next search direction differs.
             assert_eq!(controller.limit, 128);
             assert!(controller.probe.is_none());
             assert_eq!(controller.lower, 64);
-            controller.observe(later_rate, 128, 10000, 16);
-            assert_eq!(controller.observe(later_rate, 128, 10000, 16), next);
+            controller.observe(later_rate, 128, 10000, 16, 0.0);
+            assert_eq!(controller.observe(later_rate, 128, 10000, 16, 0.0), next);
         }
     }
 
@@ -716,12 +854,12 @@ mod tests {
         });
         // The first stable score looks 3% better, within the observed variation.
         for _ in 0..3 {
-            assert_eq!(controller.observe(1030.0, 36, 10000, 16), 36);
+            assert_eq!(controller.observe(1030.0, 36, 10000, 16, 0.0), 36);
         }
         assert!(controller.probe.as_ref().unwrap().confirming);
         // A subsequent score reverses that finding. Restore the accepted limit.
-        controller.observe(990.0, 36, 10000, 16);
-        assert_eq!(controller.observe(990.0, 36, 10000, 16), 32);
+        controller.observe(990.0, 36, 10000, 16, 0.0);
+        assert_eq!(controller.observe(990.0, 36, 10000, 16, 0.0), 32);
         assert!(controller.probe.is_none());
     }
 
@@ -782,8 +920,8 @@ mod tests {
     fn draining_and_tail_samples_do_not_advance_the_policy() {
         let mut controller = Controller::new(32, 256, false);
         for _ in 0..50 {
-            assert_eq!(controller.observe(1000.0, 33, 10000, 16), 32);
-            assert_eq!(controller.observe(1000.0, 32, 2, 16), 32);
+            assert_eq!(controller.observe(1000.0, 33, 10000, 16, 0.0), 32);
+            assert_eq!(controller.observe(1000.0, 32, 2, 16, 0.0), 32);
         }
         assert!(controller.probe.is_none());
     }
