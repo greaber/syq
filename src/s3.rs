@@ -1,5 +1,6 @@
 //! Native local/S3 copies. The S3 client and its durable formats are independent
 //! of the filesystem helper protocol: credentials never enter an SSH request.
+mod admission;
 mod checksum;
 mod client;
 mod diagnostics;
@@ -7,6 +8,8 @@ mod dns;
 mod local;
 mod remove;
 pub(crate) use remove::RemoveFlags;
+mod prune;
+mod read_recovery;
 mod state;
 mod transfer;
 mod tuning;
@@ -130,8 +133,6 @@ impl Options {
             bail!("S3 copies require one local endpoint");
         }
         for id in [
-            "prune",
-            "max_delete",
             "inplace",
             "auth_from",
             "via",
@@ -222,7 +223,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
     let writer = crate::results::start(
         &args,
         crate::results::RunMode::Cp {
-            prune: false,
+            prune: args.delete,
             mapping: args.native_mapping.is_some(),
         },
     )?;
@@ -252,13 +253,23 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
         })
     })();
     diagnostics::finish();
+    let limited = result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.is::<prune::Limit>());
     let fatal = result.is_err();
     if let Err(error) = result {
-        progress.error(&format!("syq: {error:#}"));
+        if limited {
+            progress.eprintln(&format!("syq: {error:#}"));
+        } else {
+            progress.error(&format!("syq: {error:#}"));
+        }
     }
     progress.scan_done.store(true, Relaxed);
     let errors = progress.errors.load(Relaxed);
-    let code = if fatal {
+    let code = if limited {
+        25
+    } else if fatal {
         1
     } else if errors != 0 {
         23
@@ -276,6 +287,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             status: match code {
                 0 => "success",
                 23 => "partial",
+                25 => "refused",
                 _ => "failed",
             },
             exit_code: code,
@@ -291,15 +303,34 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
             copying_elapsed_ms: progress.copying_elapsed_ms(),
             elapsed_ms: progress.start.elapsed().as_millis() as u64,
-            deletions_planned: None,
-            deletions_completed: None,
-            deletions_blocked: None,
+            deletions_planned: args
+                .delete
+                .then(|| progress.deletions_planned.load(Relaxed)),
+            deletions_completed: args
+                .delete
+                .then(|| progress.deletions_completed.load(Relaxed)),
+            deletions_blocked: args
+                .delete
+                .then(|| progress.deletions_blocked.load(Relaxed)),
         });
         if writer.is_dead() {
             bail!("S3 result stream could not be completed");
         }
     }
     if !args.quiet {
+        if args.delete {
+            progress.println(&format!(
+                "{} deletions planned, {} {}, {} blocked",
+                progress.deletions_planned.load(Relaxed),
+                progress.deletions_completed.load(Relaxed),
+                if args.dry_run {
+                    "would be removed"
+                } else {
+                    "removed"
+                },
+                progress.deletions_blocked.load(Relaxed),
+            ));
+        }
         let elapsed = progress.start.elapsed().as_secs_f64().max(0.001);
         progress.println(&format!(
             "{}{} files, {} transferred, {} unchanged, {} errors in {:.2}s ({}/s)",

@@ -136,7 +136,13 @@ CARGO_PROFILE_RELEASE_STRIP=none python -m pip install ./sdk/python
 
 The Python build backend must come from the pinned `pyproject.toml`. Published
 wheels are stripped explicitly by release CI. For a standalone debug executable,
-`cargo build --locked` uses Cargo's development profile.
+`cargo build --locked` uses optimization level 1 with debug symbols, debug
+assertions, and overflow checks. Tests inherit these settings. BLAKE3 uses
+level 3 in both development and test builds.
+
+For clearer debugger stepping, temporarily use
+`CARGO_PROFILE_DEV_OPT_LEVEL=0 cargo build --locked`. The BLAKE3 override still
+applies.
 
 ## Reproduce a release binary
 
@@ -211,6 +217,16 @@ build with s5cmd under the same environment, run
 It alternates tool order, checks downloaded bytes, and removes its test prefix.
 The benchmark requires Python 3.11 or newer. If your provider requires a custom
 header, ensure both clients send it: stock s5cmd has no arbitrary-header option.
+
+For pruning comparisons, use
+`python3 tests/object-storage/benchmark-prune.py --syq target/release/syq --s5cmd /path/to/s5cmd --output target/s3-prune-benchmark`
+with the same credentials and a bucket that has never enabled versioning.
+It compares deletion, unchanged trees, and mixed copies with pruning in both
+directions. The default uses 100,000 objects and three repetitions; increase
+`--count` or `--size` when trials fall below the reported ten-second minimum.
+Raw timings, CPU and memory use, binary hashes, verification results, and logs
+are saved in the output directory. Setup and verification are untimed.
+Use `--s5cmd-quiet` for a separate control without s5cmd's per-object logging.
 
 For documentation changes, run `python3 scripts/check-doc-links.py`.
 See the repository's `AGENTS.md` for the full contribution workflow.

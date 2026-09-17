@@ -136,7 +136,8 @@ pub(super) fn join(a: &str, b: &str) -> String {
     }
 }
 
-pub(super) fn upload_plan(args: &Args) -> Result<Vec<Source>> {
+pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Plan)> {
+    let mut prune = super::prune::Plan::default();
     let count = args.locations.len() - 1;
     let target = key_path(&args.locations[count].path)?;
     let base_path = crate::fsops::resolve(
@@ -295,11 +296,20 @@ pub(super) fn upload_plan(args: &Args) -> Result<Vec<Source>> {
         if source.expected_digest.is_some() && source.kind() != "file" {
             bail!("an expected digest requires a regular file");
         }
+        if args.delete
+            && source.kind() == "dir"
+            && !matcher
+                .as_ref()
+                .is_some_and(|m| crate::scan::path_is_ignored(m, &source.label, true))
+        {
+            prune.scope(source.key.as_bytes(), &source.label);
+        }
         let mut stack = vec![(source, selection == SourceSelection::Contents)];
         while let Some((mut source, contents)) = stack.pop() {
             if matcher.as_ref().is_some_and(|m| {
                 crate::scan::path_is_ignored(m, &source.label, source.kind() == "dir")
             }) {
+                prune.protect(source.key.as_bytes());
                 continue;
             }
             if source.kind() == "file"
@@ -308,7 +318,17 @@ pub(super) fn upload_plan(args: &Args) -> Result<Vec<Source>> {
                 if !source.meta.is_file() {
                     bail!("special files cannot be uploaded to S3");
                 }
+                prune.protect(source.key.as_bytes());
                 continue;
+            }
+            if args.delete {
+                if source.kind() == "dir" {
+                    prune.claim(source.key.as_bytes());
+                } else if args.existing || args.ignore_existing {
+                    prune.protect(source.key.as_bytes());
+                } else {
+                    prune.claim_file(source.key.as_bytes());
+                }
             }
             if source.kind() == "dir" {
                 let rel = RelativePath::new(&source.path)?;
@@ -349,7 +369,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<Vec<Source>> {
             out.push(source);
         }
     }
-    Ok(out)
+    Ok((out, prune))
 }
 
 pub(super) fn claim(

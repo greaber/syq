@@ -72,6 +72,10 @@ signal-hook = "0.4.4"
 [build-dependencies]
 serde_json = "1"
 
+# Keep CPU-heavy copies practical in development and test builds.
+[profile.dev]
+opt-level = 1
+
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -80,6 +84,12 @@ debug = 1
 strip = "symbols"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 libc = "0.2"
 serde_json = "1"
-jsonschema = { version = "0.55", default-features = false }
+jsonschema = { version = "0.56", default-features = false }
+
+# BLAKE3 uses C/NEON on ARM, unlike the x86 assembly backend. Keep it
+# optimized in debug/test builds so hashing does not dominate race-test waits.
+[profile.dev.package.blake3]
+opt-level = 3
