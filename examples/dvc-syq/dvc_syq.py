@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["syq", "pyyaml"]
+# dependencies = ["syq>0.6.0", "pyyaml"]
 # ///
 """Pull and push DVC-tracked data with syq.
 

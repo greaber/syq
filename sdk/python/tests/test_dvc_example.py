@@ -1,4 +1,4 @@
-"""Run examples/dvc_syq.py against a DVC-layout repository built by hand.
+"""Run examples/dvc-syq/dvc_syq.py against a DVC-layout repository built by hand.
 
 The fixture writes the cache and remote layouts literally, so the test pins
 the formats DVC 2 and DVC 3 produce without needing DVC installed.
@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 EXECUTABLE = os.environ.get("SYQ_CANDIDATE_EXECUTABLE")
-SCRIPT = Path(__file__).resolve().parents[3] / "examples" / "dvc_syq.py"
+SCRIPT = Path(__file__).resolve().parents[3] / "examples" / "dvc-syq" / "dvc_syq.py"
 
 FILES = {"data/a.txt": b"alpha\n", "data/sub/b.bin": bytes(range(256)) * 40, "model.bin": b"m" * 70000}
 LEGACY = {"old.txt": b"written by DVC 2\r\n"}

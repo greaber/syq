@@ -1,0 +1,2 @@
+[console_scripts]
+dvc-syq = dvc_syq:main

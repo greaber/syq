@@ -1,6 +1,6 @@
 # Pull and push DVC data
 
-[`dvc_syq.py`](https://github.com/greaber/syq/blob/master/examples/dvc_syq.py)
+[`dvc_syq.py`](https://github.com/greaber/syq/blob/master/examples/dvc-syq/dvc_syq.py)
 does the work of `dvc pull` and `dvc push` with syq, and can be faster. DVC
 coordinates its transfers from a single Python process, which keeps it to
 about one CPU core however many jobs it runs. The script works out every copy
@@ -14,25 +14,31 @@ the script's results as their own.
 
 ## Run it
 
-You need [uv](https://docs.astral.sh/uv/), which installs the script's
-dependencies for you. Download the script once, then run it inside a DVC
-repository:
+Install it as a `dvc-syq` command with [uv](https://docs.astral.sh/uv/):
 
 ```sh
-curl -LO https://raw.githubusercontent.com/greaber/syq/master/examples/dvc_syq.py
+uv tool install 'git+https://github.com/greaber/syq#subdirectory=examples/dvc-syq'
+```
 
+Then, inside a DVC repository:
+
+```sh
 # Pull one tracked path, or the .dvc file that describes it.
-uv run dvc_syq.py pull models/speech.dvc
+dvc-syq pull models/speech.dvc
 
 # Pull everything tracked under a directory; "-R ." covers the repository.
-uv run dvc_syq.py pull -R datasets
+dvc-syq pull -R datasets
 
 # Download into DVC's cache without touching the workspace.
-uv run dvc_syq.py fetch -R datasets
+dvc-syq fetch -R datasets
 
 # Upload what the remote does not have yet.
-uv run dvc_syq.py push models/speech.dvc
+dvc-syq push models/speech.dvc
 ```
+
+`uv tool upgrade dvc-syq` fetches the current version. The script is also a
+single file that declares its own dependencies, so you can download it and
+run it without installing anything: `uv run dvc_syq.py pull -R datasets`.
 
 These options have the same meaning as in DVC:
 
