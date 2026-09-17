@@ -34,8 +34,6 @@ import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -187,15 +185,18 @@ def read_remote(root: Path, config: configparser.ConfigParser, name: str | None)
 
     url = urlparse(settings["url"])
     if url.scheme == "s3":
-        names = {"endpointurl": "s3_endpoint", "profile": "s3_profile", "region": "s3_region"}
-        options = {names[key]: settings[key] for key in names if settings.get(key)}
-        custom_endpoint = "s3_endpoint" in options or any(
+        options = {}
+        if settings.get("profile"):
+            options["s3_profile"] = settings["profile"]
+        if settings.get("endpointurl"):
+            options["s3_endpoint"] = settings["endpointurl"]
+        other_provider = "s3_endpoint" in options or any(
             os.environ.get(variable) for variable in ("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
         )
-        if "s3_region" not in options and not custom_endpoint:
-            region = aws_bucket_region(url.netloc)
-            if region:
-                options["s3_region"] = region
+        if other_provider and settings.get("region"):
+            options["s3_region"] = settings["region"]  # used as configured
+        # On AWS no region is passed: syq asks S3 where the bucket is, which works
+        # even when the configured region is wrong, as it does under DVC.
         return Remote(f"s3://{url.netloc}", url.path.strip("/"), options)
     if url.scheme == "ssh":
         if url.port is not None:
@@ -208,23 +209,6 @@ def read_remote(root: Path, config: configparser.ConfigParser, name: str | None)
             path = root / ".dvc" / path  # DVC resolves relative remotes from its config file
         return Remote(None, str(path.resolve()), {})
     sys.exit(f"error: remote {name!r} uses {url.scheme}://, which this script does not support")
-
-
-def aws_bucket_region(bucket: str) -> str | None:
-    """Region of an AWS bucket, which S3 names in a header on every response.
-
-    DVC users rarely configure a region because DVC's S3 library follows
-    S3's cross-region redirects by itself.
-    """
-    request = urllib.request.Request(f"https://s3.amazonaws.com/{bucket}", method="HEAD")
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            headers = response.headers
-    except urllib.error.HTTPError as error:
-        headers = error.headers  # redirects and denials carry the header too
-    except OSError:
-        return None
-    return headers.get("x-amz-bucket-region")
 
 
 # --- Copying ----------------------------------------------------------------

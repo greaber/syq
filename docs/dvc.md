@@ -85,9 +85,9 @@ it as the bytes arrive.
 - A target is required. DVC pulls or pushes the whole repository when you
   name none; here that is `-R .`.
 - Remotes can be local directories, `ssh://host/path` without an explicit
-  port, or `s3://bucket/prefix`. For S3 the script reads `endpointurl`,
-  `profile`, and `region` from the DVC remote and otherwise uses your usual
-  AWS credentials. Remotes that use DVC's cloud versioning are refused.
+  port, or `s3://bucket/prefix`. For S3 the script reads `profile` and
+  `endpointurl` from the DVC remote and otherwise uses your usual AWS
+  credentials. Remotes that use DVC's cloud versioning are refused.
 - Data brought in with `dvc import` is skipped with a message, because it
   lives in another repository's remote. Use `dvc pull` for it.
 - DVC options not listed above, such as `--all-branches`, are not available.
