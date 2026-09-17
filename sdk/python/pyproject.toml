@@ -33,6 +33,7 @@ Issues = "https://github.com/greaber/syq/issues"
 dev = [
     "build==1.3.0",
     "maturin==1.15.0",
+    "pyyaml==6.0.3",
 ]
 
 [tool.maturin]
