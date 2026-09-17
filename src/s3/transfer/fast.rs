@@ -147,7 +147,7 @@ impl Engine {
         initial_slot: Option<crate::s3::tuning::Permit>,
         algorithm: Option<HashAlgorithm>,
     ) -> Result<String> {
-        let _slot = match initial_slot {
+        let slot = match initial_slot {
             Some(slot) => slot,
             None => self.tuning.requests.acquire().await,
         };
@@ -233,6 +233,7 @@ impl Engine {
                         if bytes.len() as u64 > length - done {
                             return Err(Permanent("S3 body exceeded length".into()).into());
                         }
+                        slot.received(bytes.len());
                         if let Some(h) = &mut hash {
                             h.update(&bytes);
                         }
@@ -294,6 +295,7 @@ impl Engine {
                                 || offset + done + want as u64 == object.size),
                         "unaligned S3 direct range"
                     );
+                    slot.received(want);
                     if let Some(h) = &mut hash {
                         h.update(&buffer.bytes()[..want]);
                     }

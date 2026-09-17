@@ -99,6 +99,8 @@ struct Window {
     recent: std::collections::VecDeque<(Instant, u64)>,
     saturated: bool,
     previous: Option<(usize, f64)>,
+    progress_start: u64,
+    previous_progress_rate: Option<f64>,
     slower_limit: usize,
     probe_preserved_rate: bool,
     object_rate: Option<(usize, f64, Duration)>,
@@ -107,9 +109,21 @@ struct Window {
 pub(super) struct Budget {
     state: Mutex<Window>,
     changed: Notify,
+    received: AtomicU64,
 }
 pub(super) struct Permit {
     budget: Arc<Budget>,
+    track_received: bool,
+}
+impl Permit {
+    // Download traffic can include retries; it is evidence for interpreting a
+    // partial sample, not for accepting a gain or declaring a copy successful.
+    // Requests admitted after ramp-up skip the shared counter entirely.
+    pub fn received(&self, bytes: usize) {
+        if self.track_received {
+            self.budget.received.fetch_add(bytes as u64, Relaxed);
+        }
+    }
 }
 impl Budget {
     fn new(limit: usize, adaptive: bool) -> Self {
@@ -125,12 +139,15 @@ impl Budget {
                 recent: std::collections::VecDeque::new(),
                 saturated: false,
                 previous: None,
+                progress_start: 0,
+                previous_progress_rate: None,
                 slower_limit: 0,
                 probe_preserved_rate: false,
                 object_rate: None,
                 settled: false,
             }),
             changed: Notify::new(),
+            received: AtomicU64::new(0),
         }
     }
     pub async fn acquire(self: &Arc<Self>) -> Permit {
@@ -147,6 +164,7 @@ impl Budget {
                     s.active += 1;
                     return Permit {
                         budget: self.clone(),
+                        track_received: s.adaptive && !s.settled,
                     };
                 }
                 s.saturated = true;
@@ -226,6 +244,9 @@ impl Budget {
         // The first window includes startup and is only a baseline, but must
         // contain a full count: the first few replies understate its capacity.
         let rate = s.bytes as f64 / elapsed.as_secs_f64();
+        let received = self.received.load(Relaxed);
+        let progress_rate =
+            received.saturating_sub(s.progress_start) as f64 / elapsed.as_secs_f64();
         let before = s.limit;
         if s.saturated || s.previous.is_some() {
             if let Some((old_limit, old_rate)) = s.previous {
@@ -237,16 +258,28 @@ impl Budget {
                 }
                 if rate < old_rate * 1.05 {
                     if s.completed < s.limit {
-                        // The aggregate rate includes a response-cycle gap. Do
-                        // not reject a partial sample while recent replies are
-                        // arriving fast; a real stall lowers both rates.
-                        if s.recent.len() < 17 {
-                            return;
-                        }
-                        let recent_elapsed = now.duration_since(s.recent[0].0).as_secs_f64();
-                        let recent_bytes: u64 = s.recent.iter().skip(1).map(|(_, n)| *n).sum();
-                        if recent_bytes as f64 / recent_elapsed >= old_rate * 1.05 {
-                            return;
+                        if let Some(old_progress) =
+                            s.previous_progress_rate.filter(|old| *old > 0.0)
+                        {
+                            // Downloads expose bytes still in flight. Compare
+                            // those rates before calling an incomplete wave a
+                            // loss. A late completion burst cannot erase a slow
+                            // body window, nor can unfinished bytes look idle.
+                            if progress_rate >= old_progress * 1.05 {
+                                return;
+                            }
+                        } else {
+                            // Uploads expose only successful completion here.
+                            // Keep their recent-arrival confirmation: the whole
+                            // window can contain a response-cycle gap.
+                            if s.recent.len() < 17 {
+                                return;
+                            }
+                            let recent_elapsed = now.duration_since(s.recent[0].0).as_secs_f64();
+                            let recent_bytes: u64 = s.recent.iter().skip(1).map(|(_, n)| *n).sum();
+                            if recent_bytes as f64 / recent_elapsed >= old_rate * 1.05 {
+                                return;
+                            }
                         }
                     }
                     s.probe_preserved_rate = rate >= old_rate;
@@ -266,6 +299,7 @@ impl Budget {
             }
             if !s.settled && s.saturated && s.limit < s.max {
                 s.previous = Some((s.limit, rate));
+                s.previous_progress_rate = Some(progress_rate);
                 s.limit = (s.limit * 2).min(s.max);
             }
         }
@@ -292,6 +326,7 @@ impl Budget {
         );
         s.since = Some(Instant::now());
         s.bytes = 0;
+        s.progress_start = received;
         s.completed = 0;
         s.recent.clear();
         s.saturated = false;
@@ -372,6 +407,61 @@ mod tests {
         assert_eq!(s.limit, 128);
         assert_eq!(s.previous.unwrap().0, 64);
         assert!(s.recent.is_empty());
+    }
+
+    #[test]
+    fn incoming_download_progress_defers_partial_loss_but_not_a_stall() {
+        let budget = Budget::new(64, true);
+        let mib = 1024 * 1024;
+        {
+            let mut s = budget.state.lock().unwrap();
+            let now = Instant::now();
+            // R2-shaped expansion: completed bytes fall from 32 MiB/482 ms
+            // to 17 MiB/350 ms, but incoming bytes rise from 39 to 32 MiB.
+            s.since = Some(now - Duration::from_millis(350));
+            s.previous = Some((32, 32.0 * mib as f64 / 0.482));
+            s.previous_progress_rate = Some(39.0 * mib as f64 / 0.482);
+            s.saturated = true;
+            s.bytes = 16 * mib;
+            s.completed = 16;
+            s.recent = (0..16)
+                .map(|i| (now - Duration::from_millis(320 - i * 20), mib))
+                .collect();
+        }
+        budget.received.store(32 * mib, Relaxed);
+        budget.completed(mib);
+        assert_eq!(budget.state.lock().unwrap().limit, 64);
+        assert!(!budget.state.lock().unwrap().settled);
+        // No more body progress: the same partial sample can now reject.
+        budget.state.lock().unwrap().since = Some(Instant::now() - Duration::from_secs(1));
+        budget.completed(mib);
+        assert_eq!(budget.state.lock().unwrap().limit, 32);
+        assert!(budget.state.lock().unwrap().settled);
+    }
+
+    #[test]
+    fn a_late_download_burst_does_not_hide_a_slow_body_window() {
+        let budget = Budget::new(128, true);
+        let mib = 1024 * 1024;
+        {
+            let mut s = budget.state.lock().unwrap();
+            let now = Instant::now();
+            s.since = Some(now - Duration::from_secs(5));
+            s.previous = Some((64, 80.0 * mib as f64));
+            s.previous_progress_rate = Some(80.0 * mib as f64);
+            s.saturated = true;
+            s.bytes = 16 * mib;
+            s.completed = 16;
+            s.recent = (0..16)
+                .map(|i| (now - Duration::from_micros(4000 - i * 250), mib))
+                .collect();
+        }
+        // All 128 MiB arrived, but over five seconds rather than at 80 MiB/s.
+        // Seventeen near-simultaneous EOFs are not evidence of a fast link.
+        budget.received.store(128 * mib, Relaxed);
+        budget.completed(mib);
+        assert_eq!(budget.state.lock().unwrap().limit, 64);
+        assert!(budget.state.lock().unwrap().settled);
     }
 
     #[test]
