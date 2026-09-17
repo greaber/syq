@@ -8004,9 +8004,9 @@ impl Worker {
         };
         // Connection setup supplies a conservative latency allowance even
         // for SSH, which has no kernel RTT observation. Do not mistake an
-        // ordinary WAN response for a stalled source read. The first payload
-        // can require several congestion-window growth rounds; allow sixteen
-        // RTTs before reducing read-ahead, including for large whole files.
+        // ordinary WAN response for a stalled source read. Keep the conservative
+        // sixteen-RTT allowance; the measured wait now ends when the reply starts,
+        // before receiving its remaining payload.
         let source_rtt_us = self.src.tcp_rtt_us().unwrap_or(0);
         let read_stall_budget = self
             .setup_elapsed
@@ -8046,29 +8046,27 @@ impl Worker {
                 let Some((group, count)) = reads.pop_front() else {
                     break;
                 };
-                let phase = std::time::Instant::now();
-                let blocks = if count == 0 {
-                    Vec::new()
+                let (blocks, waited) = if count == 0 {
+                    (Vec::new(), std::time::Duration::ZERO)
                 } else {
-                    let response = self.src.recv()?;
+                    let (response, waited) = self.src.recv_with_wait()?;
                     let blocks =
                         ok(response, "read small batch").and_then(|response| match response {
                             Response::SmallBlocks(blocks) if blocks.len() == count => Ok(blocks),
                             other => bail!("unexpected response {other:?}"),
                         });
                     match blocks {
-                        Ok(blocks) => blocks,
+                        Ok(blocks) => (blocks, waited),
                         Err(error) => {
                             Self::fail_small_batch(results, group, &error);
                             break 'issuing;
                         }
                     }
                 };
-                let waited = phase.elapsed();
                 if read_window > 1 && waited > read_stall_budget && self.gate.active() > 1 {
                     if debug() {
                         crate::output::diagnostic!(
-                            "syq: worker {}: source wait {:.3}s exceeded {:.3}s allowance (RTT {}us, setup {:.3}s); draining read-ahead",
+                            "syq: worker {}: source reply wait {:.3}s exceeded {:.3}s allowance (RTT {}us, setup {:.3}s); draining read-ahead",
                             self.id, waited.as_secs_f64(), read_stall_budget.as_secs_f64(),
                             source_rtt_us, self.setup_elapsed.as_secs_f64()
                         );
@@ -9601,6 +9599,7 @@ mod tests {
         steal_on_receive: Option<Arc<Sched>>,
         stolen_file: Option<usize>,
         receive_pause: Option<std::time::Duration>,
+        reply_start_wait: Option<std::time::Duration>,
         rtt_us: Option<u64>,
         dead: bool,
         max_pending: usize,
@@ -9639,6 +9638,17 @@ mod tests {
             }
             state.max_pending = state.max_pending.max(state.requests.len() - state.received);
             Ok(())
+        }
+        fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
+            let start = std::time::Instant::now();
+            let response = self.recv()?;
+            let waited = self
+                .0
+                .lock()
+                .unwrap()
+                .reply_start_wait
+                .unwrap_or_else(|| start.elapsed());
+            Ok((response, waited))
         }
         fn recv(&mut self) -> Result<Response> {
             let mut state = self.0.lock().unwrap();
@@ -10656,10 +10666,17 @@ mod tests {
     fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
         // The same wait is a source stall on a fast connection, but normal
         // startup on a WAN or an SSH connection with a longer setup time.
-        for (rtt_us, setup_ms, expected) in [
-            (None, 0, [4, 4, 4, 4, 5, 6, 7, 8]),
-            (Some(10_000), 0, [4, 5, 6, 7, 8, 8, 8, 8]),
-            (None, 200, [4, 5, 6, 7, 8, 8, 8, 8]),
+        for (rtt_us, setup_ms, reply_start_wait, expected) in [
+            (None, 0, None, [4, 4, 4, 4, 5, 6, 7, 8]),
+            (Some(10_000), 0, None, [4, 5, 6, 7, 8, 8, 8, 8]),
+            (None, 200, None, [4, 5, 6, 7, 8, 8, 8, 8]),
+            // The same slow recv is harmless when its time is in the payload.
+            (
+                None,
+                0,
+                Some(std::time::Duration::ZERO),
+                [4, 5, 6, 7, 8, 8, 8, 8],
+            ),
         ] {
             let jobs: Vec<_> = (0..8)
                 .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
@@ -10667,6 +10684,7 @@ mod tests {
             let src = Arc::new(Mutex::new(PipelineState {
                 receive_pause: Some(std::time::Duration::from_millis(125)),
                 rtt_us,
+                reply_start_wait,
                 ..Default::default()
             }));
             let dst = Arc::new(Mutex::new(PipelineState::default()));
