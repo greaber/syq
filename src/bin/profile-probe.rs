@@ -6,8 +6,15 @@ fn measure(name: &str, mut operation: impl FnMut()) {
     let mut times = Vec::new();
     for _ in 0..3 {
         let start = Instant::now();
-        operation();
-        times.push(start.elapsed().as_secs_f64());
+        let mut iterations = 0;
+        loop {
+            operation();
+            iterations += 1;
+            if start.elapsed().as_secs_f64() >= 0.25 {
+                break;
+            }
+        }
+        times.push(start.elapsed().as_secs_f64() / f64::from(iterations));
     }
     println!("PROBE {}", serde_json::json!({"name":name,"seconds":times}));
 }
