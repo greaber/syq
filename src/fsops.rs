@@ -5439,7 +5439,7 @@ impl FsOps {
         copy_id: &CopyId,
         len: u64,
         block: u64,
-        reuse: bool,
+        reuse_final: bool,
         attempt: u32,
         guard: Option<&ContainerGuard>,
     ) -> Result<Vec<ContentDigest>> {
@@ -5486,7 +5486,7 @@ impl FsOps {
         // Retry bytes already belong to this invocation. Hash them in place;
         // copying them onto themselves adds writes without improving safety.
         let mut input = None;
-        if reuse && basis_size.unwrap_or(0) == 0 && len > 0 {
+        if basis_size.unwrap_or(0) == 0 && len > 0 {
             for candidate in self.candidate_partials(path, rooted.as_ref()) {
                 let candidate_location = if let Some(target) = &rooted {
                     let Ok(relative) = RelativePath::new(&candidate) else {
@@ -5524,7 +5524,7 @@ impl FsOps {
         }
         // A previous transfer's partial is usually closer to the source than
         // the old final. Use the final only when no readable candidate exists.
-        if reuse && basis_size.unwrap_or(0) == 0 && input.is_none() {
+        if reuse_final && basis_size.unwrap_or(0) == 0 && input.is_none() {
             input = held.map(|held| held.file).or_else(|| {
                 if let Some(target) = &rooted {
                     target.root.open_regular_read(&target.relative).ok()
@@ -5540,7 +5540,7 @@ impl FsOps {
         // Freshly allocated zeros are not old copy data worth scanning.
         let reader = input
             .as_ref()
-            .or_else(|| (reuse && basis_size.unwrap_or(0) > 0).then_some(&output));
+            .or_else(|| (basis_size.unwrap_or(0) > 0).then_some(&output));
         let mut hashes = Vec::new();
         if let Some(reader) = reader {
             hashes.reserve(len.div_ceil(block) as usize);
@@ -6926,7 +6926,7 @@ impl FsOps {
                 copy_id,
                 len,
                 block,
-                reuse,
+                reuse_final,
                 attempt,
                 guard,
             } => self
@@ -6935,7 +6935,7 @@ impl FsOps {
                     copy_id,
                     *len,
                     *block,
-                    *reuse,
+                    *reuse_final,
                     *attempt,
                     guard.as_ref(),
                 )
@@ -9242,18 +9242,6 @@ mod tests {
             PRIVATE_PARTIAL_MODE
         );
         assert!(operations.held_basis.is_none());
-        assert!(operations
-            .seed_basis(
-                &path_bytes(&path),
-                &copy_id,
-                12,
-                MIN_HASH_BLOCK_BYTES,
-                false,
-                0,
-                None
-            )
-            .unwrap()
-            .is_empty());
     }
 
     #[test]

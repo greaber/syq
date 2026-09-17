@@ -771,9 +771,9 @@ pub enum Request {
         path: PathBytes,
         copy_id: CopyId,
         len: u64,
-        /// False when comparison found no matches and no interrupted copy
-        /// offers another basis. Still create the full-sized private sidecar.
-        reuse: bool,
+        /// False when no final-file blocks match. Interrupted-copy donors and
+        /// this invocation's retry bytes remain eligible for checked reuse.
+        reuse_final: bool,
         block: u64,
         attempt: u32,
         guard: Option<ContainerGuard>,

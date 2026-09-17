@@ -6703,7 +6703,7 @@ esac
         assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
         for attempt in 0..2 {
             let mut seed = Request::SeedBasis {
-                reuse: true,
+                reuse_final: true,
                 path: path_bytes(&fresh),
                 copy_id: [1; 16],
                 len: 3,
@@ -6822,7 +6822,7 @@ esac
         };
         assert!(authority.authorize(&mut finish, false).is_err());
         let mut seed = Request::SeedBasis {
-            reuse: true,
+            reuse_final: true,
             path: path_bytes(&kept),
             copy_id: [1; 16],
             len: 3,
@@ -8873,7 +8873,7 @@ esac
         assert!(authority.authorize(&mut prepare("b", 3), false).is_err());
         authority.authorize(&mut prepare("b", 2), false).unwrap();
         let mut seed = Request::SeedBasis {
-            reuse: true,
+            reuse_final: true,
             path: root.join("target/b").as_os_str().as_bytes().to_vec(),
             copy_id: [1; 16],
             len: 3,

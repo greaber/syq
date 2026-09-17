@@ -8470,7 +8470,7 @@ impl Worker {
                     self.reuse_blocks(
                         &job,
                         diff.source_hashes,
-                        prepared.has_candidates || diff.ranges.as_slice() != [(0, size)],
+                        diff.ranges.as_slice() != [(0, size)],
                     )?,
                     true,
                 ));
@@ -8613,7 +8613,11 @@ impl Worker {
     fn diff_blocks(&mut self, job: &WorkerJob, which: Which) -> Result<Vec<(u64, u64)>> {
         if which == Which::Partial {
             return self
-                .diff_with(job, self.seed_request(job), "seed and hash destination")
+                .diff_with(
+                    job,
+                    self.seed_request(job, true),
+                    "seed and hash destination",
+                )
                 .map(|diff| diff.ranges);
         }
         self.diff_with(
@@ -8637,16 +8641,9 @@ impl Worker {
         &mut self,
         job: &WorkerJob,
         hashes: Vec<ContentDigest>,
-        reuse: bool,
+        reuse_final: bool,
     ) -> Result<Vec<(u64, u64)>> {
-        let mut request = self.seed_request(job);
-        if let Request::SeedBasis {
-            reuse: allow_reuse, ..
-        } = &mut request
-        {
-            *allow_reuse = reuse;
-        }
-        let response = self.dst.call(request)?;
+        let response = self.dst.call(self.seed_request(job, reuse_final))?;
         let reused = Self::hashes(ok(response, "reuse destination blocks")?)?;
         Ok(Self::different_ranges(
             &hashes,
@@ -8656,13 +8653,13 @@ impl Worker {
         ))
     }
 
-    fn seed_request(&self, job: &WorkerJob) -> Request {
+    fn seed_request(&self, job: &WorkerJob, reuse_final: bool) -> Request {
         Request::SeedBasis {
             path: job.dst.clone(),
             copy_id: self.copy_id(),
             len: job.entry.size,
             block: self.opts.block,
-            reuse: true,
+            reuse_final,
             attempt: job.attempt,
             guard: job.container_guard.clone(),
         }
