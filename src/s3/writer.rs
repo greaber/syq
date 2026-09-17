@@ -42,34 +42,52 @@ impl Writer {
             // At most 64 batches of 128 KiB queued. SDK chunks can share
             // larger backing allocations with the active response reader.
             let (send, mut recv) = mpsc::channel::<Message>(64);
-            tokio::task::spawn_blocking(move || {
+            tokio::spawn(async move {
                 let mut error = None;
-                while let Some(message) = recv.blocking_recv() {
-                    match message {
-                        Message::Write(bytes, offset) if error.is_none() => {
-                            let started = super::diagnostics::start();
-                            if let Err(e) = file.write_all_at(&bytes, offset) {
-                                error = Some(e.to_string());
+                while let Some(message) = recv.recv().await {
+                    let file = file.clone();
+                    // Drain ready writes in order, but never hold a blocking
+                    // thread while waiting for network data or verification.
+                    let result = tokio::task::spawn_blocking(move || {
+                        let mut next = Some(message);
+                        while let Some(message) = next {
+                            match message {
+                                Message::Write(bytes, offset) if error.is_none() => {
+                                    let started = super::diagnostics::start();
+                                    if let Err(e) = file.write_all_at(&bytes, offset) {
+                                        error = Some(e.to_string());
+                                    }
+                                    super::diagnostics::elapsed(
+                                        started,
+                                        "buffered_write",
+                                        bytes.len() as u64,
+                                    );
+                                }
+                                Message::WriteBatch(bytes, offset) if error.is_none() => {
+                                    let started = super::diagnostics::start();
+                                    let length = bytes.iter().map(|b| b.len() as u64).sum();
+                                    if let Err(e) = write_batch(&file, &bytes, offset) {
+                                        error = Some(e.to_string());
+                                    }
+                                    super::diagnostics::elapsed(started, "buffered_write", length);
+                                }
+                                Message::Write(_, _) | Message::WriteBatch(_, _) => {}
+                                Message::Barrier(reply) => {
+                                    let _ = reply.send(error.clone().map_or(Ok(()), Err));
+                                }
                             }
-                            super::diagnostics::elapsed(
-                                started,
-                                "buffered_write",
-                                bytes.len() as u64,
-                            );
+                            next = recv.try_recv().ok();
                         }
-                        Message::WriteBatch(bytes, offset) if error.is_none() => {
-                            let started = super::diagnostics::start();
-                            let length = bytes.iter().map(|b| b.len() as u64).sum();
-                            if let Err(e) = write_batch(&file, &bytes, offset) {
-                                error = Some(e.to_string());
-                            }
-                            super::diagnostics::elapsed(started, "buffered_write", length);
-                        }
-                        Message::Write(_, _) | Message::WriteBatch(_, _) => {}
-                        Message::Barrier(reply) => {
-                            let _ = reply.send(error.clone().map_or(Ok(()), Err));
-                        }
-                    }
+                        (recv, error)
+                    })
+                    .await;
+                    let Ok((receiver, write_error)) = result else {
+                        // Dropping the receiver reports failure to senders and
+                        // any outstanding completion barriers.
+                        return;
+                    };
+                    recv = receiver;
+                    error = write_error;
                 }
             });
             send
@@ -346,12 +364,17 @@ mod tests {
             let copied = tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 // A flush before any data must also leave the worker available.
                 idle.finish().await?;
+                idle.write(bytes::Bytes::from_static(b"12"), 0).await?;
+                idle.finish().await?;
+                tokio::task::spawn_blocking(|| ()).await?;
                 active.write(bytes::Bytes::from_static(b"ab"), 0).await?;
                 active
                     .clone()
                     .write(bytes::Bytes::from_static(b"cd"), 2)
                     .await?;
-                active.finish().await
+                active.finish().await?;
+                idle.write(bytes::Bytes::from_static(b"34"), 2).await?;
+                idle.finish().await
             })
             .await;
             // Release queues even on failure, so runtime shutdown cannot hang.
@@ -364,6 +387,7 @@ mod tests {
             .expect("an idle download starved the ready writer")
             .unwrap();
         assert_eq!(std::fs::read(active_path).unwrap(), b"abcd");
+        assert_eq!(std::fs::read(dir.path().join("idle")).unwrap(), b"1234");
     }
 
     #[test]
@@ -448,6 +472,12 @@ mod tests {
                     .await
                     .unwrap();
             }
+            assert!(writer.finish().await.is_err());
+            // Failure stays sticky after a barrier and another drain of the queue.
+            writer
+                .write(bytes::Bytes::from_static(b"later"), 0)
+                .await
+                .unwrap();
             assert!(writer.finish().await.is_err());
             assert_eq!(std::fs::read(path).unwrap(), b"original");
         }

@@ -598,6 +598,76 @@ mod buffer_tests {
         }
     }
 
+    #[test]
+    fn completed_download_releases_blocking_capacity_for_secondary_hash() {
+        for valid in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("destination");
+            std::fs::write(&destination, b"original").unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap();
+            let data = b"verified through two distinct algorithms";
+            let outcome = runtime.block_on(async {
+                let engine = planning_engine(&["--integrity-checking=transfer=blake3"]);
+                let root = Root::open(dir.path()).unwrap();
+                let path = RelativePath::new(b"destination").unwrap();
+                let expected = Digest::hash_bytes(HashAlgorithm::Sha256, data);
+                let metadata = Metadata {
+                    kind: "file".into(),
+                    mode: 0o644,
+                    uid: unsafe { libc::geteuid() },
+                    gid: unsafe { libc::getegid() },
+                    mtime: 1700000000,
+                    nsec: 0,
+                    hash: Some(
+                        Digest::hash_bytes(
+                            HashAlgorithm::Blake3,
+                            if valid { data.as_slice() } else { b"wrong" },
+                        )
+                        .value,
+                    ),
+                    hash_algorithm: HashAlgorithm::Blake3,
+                };
+                let object = Object {
+                    key: "object".into(),
+                    size: data.len() as u64,
+                    etag: "fixture".into(),
+                    version: None,
+                    metadata: None,
+                    mtime: metadata.mtime,
+                };
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    engine.download_single(
+                        &object,
+                        &root,
+                        &path,
+                        (&metadata, Some(&expected)),
+                        None,
+                        Some(ByteStream::from_static(data)),
+                        None,
+                    ),
+                )
+                .await
+            });
+            // Cancelling the copy drops its writer, allowing a failed baseline
+            // test to shut down rather than leaving a blocked worker alive.
+            runtime.shutdown_timeout(Duration::from_secs(1));
+            let outcome = outcome.expect("completed writer starved secondary verification");
+            if valid {
+                assert_eq!(outcome.unwrap(), Some(data.len() as u64));
+                assert_eq!(std::fs::read(&destination).unwrap(), data);
+            } else {
+                assert!(outcome.is_err());
+                assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+            }
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn small_download_search_preserves_seeds_mixed_batches_and_overrides() {
         let engine = planning_engine(&[]);
