@@ -22,11 +22,13 @@ use aws_smithy_types::config_bag::ConfigBag;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 
-// HEAD errors have no XML body, so the SDK cannot recover a provider's
-// TooManyRequests error code. Keep throttling inside its bounded retry policy.
+// The SDK retries throttling only by known error codes in an XML body. HEAD
+// responses have no body, and some providers send HTTP 429 with other codes,
+// so classify the status itself for every operation. A 429 response means the
+// request was not processed, so a retry within the bounded budget is safe.
 #[derive(Debug)]
-struct HeadThrottling;
-impl ClassifyRetry for HeadThrottling {
+struct Throttling;
+impl ClassifyRetry for Throttling {
     fn classify_retry(&self, context: &InterceptorContext) -> RetryAction {
         if context
             .response()
@@ -38,8 +40,16 @@ impl ClassifyRetry for HeadThrottling {
         }
     }
     fn name(&self) -> &'static str {
-        "S3 HEAD throttling"
+        "S3 HTTP 429 throttling"
     }
+}
+
+/// Requests wrapped by their own retry loop run without SDK retries, so
+/// `s3-retries` is one budget per request. Uploads need the loop because the
+/// SDK cannot rewind a file body; downloads need it because a response body
+/// can fail after the headers arrive. Every other request keeps SDK retries.
+pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
+    aws_sdk_s3::config::Builder::new().retry_config(RetryConfig::disabled())
 }
 
 #[derive(Debug)]
@@ -110,6 +120,7 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
                 .unwrap_or_else(|| Region::new("us-east-1")),
         )
         .retry_config(RetryConfig::standard().with_max_attempts(options.retries + 1))
+        .retry_classifier(Throttling)
         .timeout_config(
             TimeoutConfig::builder()
                 .connect_timeout(Duration::from_secs(15))
@@ -276,15 +287,7 @@ impl Object {
 }
 
 pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Option<Object>> {
-    let output = match client
-        .head_object()
-        .bucket(bucket)
-        .key(key)
-        .customize()
-        .config_override(aws_sdk_s3::config::Builder::new().retry_classifier(HeadThrottling))
-        .send()
-        .await
-    {
+    let output = match client.head_object().bucket(bucket).key(key).send().await {
         Ok(output) => output,
         Err(error)
             if error

@@ -753,6 +753,7 @@ impl Engine {
                     .set_metadata(Some(metadata.encode()))
                     .set_if_none_match(must_be_new.then(|| "*".into()))
                     .customize()
+                    .config_override(super::client::without_sdk_retries())
                     .disable_payload_signing();
                 let request = if let Some(file) = &sync_file {
                     request.interceptor(file.clone())
@@ -765,10 +766,7 @@ impl Engine {
                 }
                 match result {
                     Ok(_) => break,
-                    Err(e)
-                        if retryable_status(e.raw_response().map(|r| r.status().as_u16()))
-                            && attempt < self.options.retries =>
-                    {
+                    Err(e) if retryable(&e) && attempt < self.options.retries => {
                         super::backoff(attempt).await;
                         attempt += 1;
                     }
@@ -969,6 +967,7 @@ impl Engine {
                                     (algorithm == Algorithm::Md5).then(|| checksum.clone()),
                                 )
                                 .customize()
+                                .config_override(super::client::without_sdk_retries())
                                 .disable_payload_signing();
                             let request = if let Some(file) = &sync_file {
                                 request.interceptor(file.clone())
@@ -1006,11 +1005,7 @@ impl Engine {
                                         )
                                         .build());
                                 }
-                                Err(e)
-                                    if retryable_status(
-                                        e.raw_response().map(|r| r.status().as_u16()),
-                                    ) && attempt < self.options.retries =>
-                                {
+                                Err(e) if retryable(&e) && attempt < self.options.retries => {
                                     super::backoff(attempt).await;
                                     attempt += 1;
                                 }
@@ -1915,8 +1910,27 @@ impl std::fmt::Display for Permanent {
     }
 }
 impl std::error::Error for Permanent {}
-fn retryable_status(status: Option<u16>) -> bool {
-    status.is_none_or(|s| matches!(s, 408 | 429 | 500 | 502 | 503 | 504))
+/// The upload loops replace SDK retries, so they must recognize the same
+/// throttling and transient conditions: dispatch failures without a response,
+/// retryable statuses, and the error codes S3 can send with other statuses,
+/// such as `RequestTimeout` with HTTP 400.
+fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
+    error: &aws_sdk_s3::error::SdkError<
+        E,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    use aws_runtime::retries::classifiers::{THROTTLING_ERRORS, TRANSIENT_ERRORS};
+    error
+        .raw_response()
+        .map(|r| r.status().as_u16())
+        .is_none_or(|s| matches!(s, 408 | 429 | 500 | 502 | 503 | 504))
+        || error
+            .as_service_error()
+            .and_then(|e| e.code())
+            .is_some_and(|code| {
+                THROTTLING_ERRORS.contains(&code) || TRANSIENT_ERRORS.contains(&code)
+            })
 }
 async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStream> {
     let source = source.clone();

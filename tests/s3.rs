@@ -233,6 +233,35 @@ fn serve(
         let length: usize = headers["content-length"].parse().unwrap();
         let mut body = vec![0; length];
         socket.read_exact(&mut body).unwrap();
+        if let Some(status) = match fault {
+            "upload-throttle-always" => Some(429),
+            "upload-transient-always" => Some(503),
+            _ => None,
+        } {
+            reply(&mut socket, status, &[], b"", false);
+            return;
+        }
+        if fault == "upload-timeout-code-once" {
+            if !gate.0.swap(true, Ordering::SeqCst) {
+                // S3 reports a slow request body as RequestTimeout with HTTP 400.
+                reply(
+                    &mut socket,
+                    400,
+                    &[],
+                    b"<Error><Code>RequestTimeout</Code><Message>slow</Message></Error>",
+                    false,
+                );
+            } else {
+                reply(
+                    &mut socket,
+                    200,
+                    &[("ETag".into(), "\"stored\"".into())],
+                    b"",
+                    false,
+                );
+            }
+            return;
+        }
         use base64::Engine as _;
         use sha2::Digest as _;
         assert_eq!(
@@ -276,10 +305,13 @@ fn serve(
         );
         return;
     }
-    if method == "HEAD"
+    if (method == "HEAD"
         && (fault == "single-throttle-always"
             || (matches!(fault, "single-throttle-once" | "single-transient-once")
-                && !gate.0.swap(true, Ordering::SeqCst)))
+                && !gate.0.swap(true, Ordering::SeqCst))))
+        || (method == "GET"
+            && fault == "single-get-throttle-once"
+            && !gate.0.swap(true, Ordering::SeqCst))
     {
         let status = if fault == "single-transient-once" {
             503
@@ -288,6 +320,20 @@ fn serve(
         };
         reply(&mut socket, status, &[], b"", false);
         return;
+    }
+    if method == "GET" {
+        if let Some((status, body)) = match fault {
+            "single-get-throttle-always" => Some((429, &b""[..])),
+            "single-get-transient-always" => Some((503, &b""[..])),
+            "single-get-timeout-code-always" => Some((
+                400,
+                &b"<Error><Code>RequestTimeout</Code><Message>slow</Message></Error>"[..],
+            )),
+            _ => None,
+        } {
+            reply(&mut socket, status, &[], body, false);
+            return;
+        }
     }
     if fault == "head-denied" && method == "HEAD" {
         reply(&mut socket, 403, &[], b"", false);
@@ -1570,6 +1616,148 @@ fn s3_head_failure_reports_http_status_without_a_response_body() {
         "{}",
         output_text(&output)
     );
+}
+
+#[test]
+fn s3_get_throttling_without_a_body_is_retried() {
+    for (retries, expected_exit, requests) in [(2, 0, 3), (0, 23, 2)] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start("single-get-throttle-once");
+        let output = server
+            .command_with_retries(temp.path(), retries)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--from",
+                "s3://bucket",
+                "object",
+                "--as",
+                "result",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "retries {retries}: {}",
+            output_text(&output)
+        );
+        // One HEAD, then the throttled GET and its retry.
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+        assert_eq!(
+            temp.path().join("result").exists(),
+            expected_exit == 0,
+            "retries {retries}"
+        );
+    }
+}
+
+#[test]
+fn s3_download_retries_share_one_budget_across_statuses_and_error_codes() {
+    for fault in [
+        "single-get-throttle-always",
+        "single-get-transient-always",
+        "single-get-timeout-code-always",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        // An existing, different file takes the HEAD-then-download-loop path;
+        // a fresh file would fetch its metadata with an SDK-only initial GET.
+        std::fs::write(temp.path().join("result"), b"stale").unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_with_retries(temp.path(), 1)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--from",
+                "s3://bucket",
+                "object",
+                "--as",
+                "result",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        // A HEAD to plan the named object, a HEAD to compare the existing
+        // file, then the GET and exactly one retry from the download loop:
+        // the SDK must not retry inside it (six requests when it does).
+        assert_eq!(server.requests.load(Ordering::Relaxed), 4, "{fault}");
+        assert_eq!(
+            std::fs::read(temp.path().join("result")).unwrap(),
+            b"stale",
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn s3_upload_retries_share_one_budget_for_throttling_and_transient_errors() {
+    for fault in ["upload-throttle-always", "upload-transient-always"] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("source"), b"small body").unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_with_retries(temp.path(), 1)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        // One HEAD, then the PUT and exactly one retry: the in-memory body
+        // must not also be retried inside the SDK.
+        assert_eq!(server.requests.load(Ordering::Relaxed), 3, "{fault}");
+    }
+}
+
+#[test]
+fn s3_upload_retries_request_timeout_error_codes_within_the_budget() {
+    for (retries, expected_exit, requests) in [(1, 0, 3), (0, 23, 2)] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("source"), b"small body").unwrap();
+        let server = Server::start("upload-timeout-code-once");
+        let output = server
+            .command_with_retries(temp.path(), retries)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "retries {retries}: {}",
+            output_text(&output)
+        );
+        // One HEAD, the PUT answered with HTTP 400 RequestTimeout, and one retry.
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            requests,
+            "retries {retries}"
+        );
+    }
 }
 
 #[test]

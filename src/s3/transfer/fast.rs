@@ -184,10 +184,12 @@ impl Engine {
                         .set_range((length > 0).then(|| format!("bytes={attempt_offset}-{end}")))
                         .if_match(&object.etag)
                         .set_version_id(object.version.clone())
+                        .customize()
+                        .config_override(crate::s3::client::without_sdk_retries())
                         .send()
                         .await
                         .map_err(|e| {
-                            if retryable_status(e.raw_response().map(|r| r.status().as_u16())) {
+                            if retryable(&e) {
                                 anyhow::Error::new(e.into_service_error())
                             } else {
                                 Permanent(format!("S3 GET failed: {}", e.into_service_error()))
