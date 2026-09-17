@@ -27,6 +27,8 @@
 //! descriptor-based traversal, an already-open descendant remains the selected
 //! object if another process subsequently renames it.
 
+#[cfg(target_os = "macos")]
+use crate::fsops::CopyLocalOutcome;
 use crate::proto::OperatorSymlinkPolicy;
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, VecDeque};
@@ -1073,7 +1075,7 @@ impl Root {
         source_metadata: &std::fs::Metadata,
         path: &RelativePath,
         size: u64,
-    ) -> Result<CloneOutcome> {
+    ) -> Result<CopyLocalOutcome> {
         let fallback = |error: anyhow::Error| {
             if crate::transfer::debug() {
                 crate::output::diagnostic!(
@@ -1081,7 +1083,7 @@ impl Root {
                     path.label()
                 );
             }
-            Ok(CloneOutcome::Unsupported)
+            Ok(CopyLocalOutcome::Unsupported)
         };
         let parent = match self.resolve_parent(path) {
             Ok(parent) => parent,
@@ -1090,7 +1092,7 @@ impl Root {
         // Reuse the held parent for the partial check and clone publication.
         // RENAME_EXCL below also protects a partial created after this check.
         match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
-            Ok(_) => return Ok(CloneOutcome::Unsupported),
+            Ok(_) => return Ok(CopyLocalOutcome::Unsupported),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return fallback(error.into()),
         }
@@ -1130,18 +1132,18 @@ impl Root {
             supported
         };
         if !supported {
-            return Ok(CloneOutcome::UnsupportedVolume {
+            return Ok(CopyLocalOutcome::UnsupportedVolume {
                 source_dev: pair.0,
                 destination_dev: pair.1,
             });
         }
         if !clone_flags_can_be_removed(source_metadata) {
-            return Ok(CloneOutcome::Unsupported);
+            return Ok(CopyLocalOutcome::Unsupported);
         }
         // An extra staging directory must not change destination ACL inheritance.
         match clone_directory_has_no_inheritable_acl(&parent.directory) {
             Ok(true) => {}
-            Ok(false) => return Ok(CloneOutcome::Unsupported),
+            Ok(false) => return Ok(CopyLocalOutcome::Unsupported),
             Err(error) => return fallback(error),
         }
         let temporary = match create_temporary(&parent, |fd, name| {
@@ -1154,7 +1156,7 @@ impl Root {
         };
         let leaf = &c"data".to_owned();
         let mut trusted_directory = None;
-        let result = (|| -> Result<CloneOutcome> {
+        let result = (|| -> Result<CopyLocalOutcome> {
             #[cfg(debug_assertions)]
             fail_clone_for_test("SYQ_TEST_FAIL_CLONE_AFTER_MKDIR")
                 .context("test clone directory failure")?;
@@ -1165,7 +1167,7 @@ impl Root {
                 .context("open private clone directory")?;
             let metadata = directory.metadata()?;
             if metadata.uid() != unsafe { libc::geteuid() } {
-                return Ok(CloneOutcome::Unsupported);
+                return Ok(CopyLocalOutcome::Unsupported);
             }
             // Preserve inherited setgid while restoring owner access.
             let private_mode = 0o700 | (metadata.mode() as libc::mode_t & 0o2000);
@@ -1176,10 +1178,10 @@ impl Root {
             if directory.metadata()?.mode() & 0o7777 != u32::from(private_mode) {
                 // Some filesystems synthesize permissions. Fall back without
                 // putting source data into a directory we cannot keep private.
-                return Ok(CloneOutcome::Unsupported);
+                return Ok(CopyLocalOutcome::Unsupported);
             }
             if !clone_directory_has_no_inheritable_acl(&directory)? {
-                return Ok(CloneOutcome::Unsupported);
+                return Ok(CopyLocalOutcome::Unsupported);
             }
             trusted_directory = Some(directory);
             let directory = trusted_directory.as_ref().unwrap();
@@ -1217,12 +1219,12 @@ impl Root {
             .context("set private clone permissions")?;
             let file = open_clone_for_copy(directory, leaf).context("open normalized clone")?;
             if !strip_clone_xattrs(&file)? {
-                return Ok(CloneOutcome::Unsupported);
+                return Ok(CopyLocalOutcome::Unsupported);
             }
             if file.metadata()?.len() != size {
                 // Streaming and the final source re-stat handle concurrent
                 // growth/shrinkage using the same retry policy as other copies.
-                return Ok(CloneOutcome::Unsupported);
+                return Ok(CopyLocalOutcome::Unsupported);
             }
             #[cfg(debug_assertions)]
             fail_clone_for_test("SYQ_TEST_FAIL_CLONE_AFTER_CREATE")
@@ -1242,15 +1244,15 @@ impl Root {
             if published != 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::AlreadyExists {
-                    return Ok(CloneOutcome::Unsupported);
+                    return Ok(CopyLocalOutcome::Unsupported);
                 }
                 return Err(error).context("stage cloned local file");
             }
-            Ok(CloneOutcome::Copied)
+            Ok(CopyLocalOutcome::Copied)
         })();
         let cleanup = (|| -> Result<()> {
             if let Some(directory) =
-                trusted_directory.filter(|_| !matches!(result, Ok(CloneOutcome::Copied)))
+                trusted_directory.filter(|_| !matches!(result, Ok(CopyLocalOutcome::Copied)))
             {
                 match unlink_at(directory.as_raw_fd(), leaf, 0) {
                     Ok(()) => {}
@@ -2017,17 +2019,6 @@ impl Root {
             leaf: component_cstring(leaf),
         })
     }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum CloneOutcome {
-    Copied,
-    Unsupported,
-    UnsupportedVolume {
-        source_dev: u64,
-        destination_dev: u64,
-    },
 }
 
 // A leaf directly under the retained root needs no new descriptor. Borrowing
@@ -3158,7 +3149,7 @@ mod tests {
                 13,
             )
             .unwrap(),
-            CloneOutcome::Copied
+            CopyLocalOutcome::Copied
         );
         let clone = OpenOptions::new()
             .read(true)
@@ -3178,7 +3169,7 @@ mod tests {
                 13
             )
             .unwrap(),
-            CloneOutcome::Unsupported
+            CopyLocalOutcome::Unsupported
         );
         (&clone).write_all(b"changed clone").unwrap();
         assert_eq!(fs::read(&source_path).unwrap(), b"original data");
@@ -3192,7 +3183,7 @@ mod tests {
                     planned_size
                 )
                 .unwrap(),
-                CloneOutcome::Unsupported
+                CopyLocalOutcome::Unsupported
             );
         }
         assert!(!t.path().join("wrong-size").exists());
@@ -3243,7 +3234,7 @@ mod tests {
             let source_flags = source.metadata().unwrap().st_flags();
             // Restore fixture mutability even if cloning failed.
             assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
-            assert_eq!(result.unwrap(), CloneOutcome::Copied);
+            assert_eq!(result.unwrap(), CopyLocalOutcome::Copied);
             let clone = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -3300,7 +3291,7 @@ mod tests {
         assert_eq!(
             root.clone_file(&source, &snapshot, &relative(b"partial"), data.len() as u64)
                 .unwrap(),
-            CloneOutcome::Unsupported
+            CopyLocalOutcome::Unsupported
         );
         assert_eq!(fs::read(&compressed).unwrap(), data);
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
@@ -3334,7 +3325,7 @@ mod tests {
                     4
                 )
                 .unwrap(),
-                CloneOutcome::Copied
+                CopyLocalOutcome::Copied
             );
             fs::remove_file(t.path().join("noninherited")).unwrap();
             assert!(Command::new("/bin/chmod")
@@ -3351,7 +3342,7 @@ mod tests {
                     4
                 )
                 .unwrap(),
-                CloneOutcome::Unsupported
+                CopyLocalOutcome::Unsupported
             );
             assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
             assert!(Command::new("/bin/chmod")
@@ -3369,7 +3360,7 @@ mod tests {
                     4
                 )
                 .unwrap(),
-                CloneOutcome::Copied
+                CopyLocalOutcome::Copied
             );
             fs::remove_file(t.path().join("after-acl")).unwrap();
         }
@@ -3421,7 +3412,7 @@ mod tests {
             4,
         );
         assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
-        assert_eq!(locked.unwrap(), CloneOutcome::Copied);
+        assert_eq!(locked.unwrap(), CopyLocalOutcome::Copied);
         let locked = OpenOptions::new()
             .read(true)
             .write(true)
@@ -3437,7 +3428,7 @@ mod tests {
                 4,
             )
             .unwrap(),
-            CloneOutcome::Copied
+            CopyLocalOutcome::Copied
         );
         let clone = OpenOptions::new()
             .read(true)
@@ -3515,7 +3506,7 @@ mod tests {
                 4,
             )
             .unwrap(),
-            CloneOutcome::Copied
+            CopyLocalOutcome::Copied
         );
         let clone = OpenOptions::new()
             .read(true)

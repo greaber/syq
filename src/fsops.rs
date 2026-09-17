@@ -147,9 +147,9 @@ struct CopyLocalPolicy {
     allow_sequential_local_fallback: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
-enum CopyLocalOutcome {
+pub(crate) enum CopyLocalOutcome {
     Copied,
     Unsupported,
     #[cfg(target_os = "macos")]
@@ -157,23 +157,6 @@ enum CopyLocalOutcome {
         source_dev: u64,
         destination_dev: u64,
     },
-}
-
-#[cfg(target_os = "macos")]
-impl From<crate::rooted::CloneOutcome> for CopyLocalOutcome {
-    fn from(outcome: crate::rooted::CloneOutcome) -> Self {
-        match outcome {
-            crate::rooted::CloneOutcome::Copied => Self::Copied,
-            crate::rooted::CloneOutcome::Unsupported => Self::Unsupported,
-            crate::rooted::CloneOutcome::UnsupportedVolume {
-                source_dev,
-                destination_dev,
-            } => Self::UnsupportedVolume {
-                source_dev,
-                destination_dev,
-            },
-        }
-    }
 }
 
 #[cfg(all(target_os = "macos", debug_assertions))]
@@ -6029,12 +6012,12 @@ impl FsOps {
         self.uncache_rooted(&root, &target.relative);
         self.uncache_rooted(&root, &partial);
         let outcome = root.clone_file(&source, &source_metadata, &partial, size)?;
-        if outcome == crate::rooted::CloneOutcome::Copied {
+        if outcome == CopyLocalOutcome::Copied {
             _copy.bytes(size);
         }
         // Like Linux offload, leave no writer-cache entry. CopyLocal has no
         // attempt field; finalize opens and checks the named partial normally.
-        Ok(outcome.into())
+        Ok(outcome)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

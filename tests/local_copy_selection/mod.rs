@@ -513,25 +513,7 @@ fn macos_clone_descriptor_pressure_preserves_ordinary_copy() {
         // The default 64-worker ceiling needs current_open + 1572 slots
         // without cloning, and 192 more with it. Both copies must fit the
         // same limit; disabling an optimization must not require fewer workers.
-        unsafe {
-            command.pre_exec(|| {
-                let mut inherited = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let limit = libc::rlimit {
-                    rlim_cur: inherited.rlim_max.min(1664),
-                    rlim_max: inherited.rlim_max.min(1664),
-                };
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        set_child_nofile_limit(&mut command, 1664);
         let out = command.run().unwrap();
         assert_output_ok(&out);
         assert_eq!(read(&t.path("destination")), data);
