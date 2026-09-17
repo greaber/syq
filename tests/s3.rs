@@ -2196,4 +2196,8 @@ fn s3_paginated_download_records_control_latency() {
         .expect("plan record");
     let control = plan["control_s"].as_f64().expect("observed latency");
     assert!(control.is_finite() && control >= 0.0, "{plan}");
+    // Check the measured latency reaches planning without requiring a loaded
+    // runner to finish real HTTP requests within a wall-clock deadline.
+    let expected_limit = if control >= 0.050 { 256 } else { 64 };
+    assert_eq!(plan["request_limit"], expected_limit, "{plan}");
 }

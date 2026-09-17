@@ -218,8 +218,12 @@ Transfer trials use each tool's built-in defaults unless you request overrides.
 Use `--syq-tuning` for syq and its baseline, and `--s5cmd-workers`,
 `--s5cmd-concurrency`, or `--s5cmd-part-size` (MiB) to tune s5cmd independently.
 The shared `--workers`, `--concurrency`, and `--part-size` options still set
-both tools when explicitly supplied; use either shared or separate overrides.
-The results record the exact commands as well as the binary hashes.
+both tools when explicitly supplied; mixing shared and separate overrides is an error.
+For example, `--workers 32 --concurrency 32 --part-size 64` explicitly selects
+32 object workers, 32 concurrent parts, and 64 MiB parts for both tools.
+The results identify whether transfer tuning uses tool defaults, shared overrides,
+or per-tool overrides, and record the settings, exact commands, and binary hashes.
+Check those settings before comparing results from different benchmark runs.
 By default it runs the transfer workloads (`large`, `medium`, `small`) and
 reports throughput. The pruning workloads (`delete`, `noop`, `mixed`) mirror
 100,000 small objects with `--prune` in both directions, take much longer, and
