@@ -36,6 +36,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--syq', required=True, type=Path)
     parser.add_argument('--s5cmd', required=True, type=Path)
+    parser.add_argument('--s5cmd-quiet', action='store_true', help='Use s5cmd --log error to measure without per-object logging')
     parser.add_argument('--baseline', type=Path)
     parser.add_argument('--syq-tuning', help='Optional performance-tuning override for the syq binaries')
     parser.add_argument('--output', required=True, type=Path)
@@ -119,7 +120,8 @@ def main():
     def command(tool, direction, local, prefix, prune=True):
         remote = f's3://{c.BUCKET}/{prefix}/'
         if tool == 's5cmd':
-            return [binaries[tool], '--endpoint-url', c.ENDPOINT, 'sync', *(['--delete'] if prune else []),
+            return [binaries[tool], *(['--log', 'error'] if args.s5cmd_quiet else []),
+                    '--endpoint-url', c.ENDPOINT, 'sync', *(['--delete'] if prune else []),
                     str(local) + '/' if direction == 'upload' else remote + '*',
                     remote if direction == 'upload' else str(local) + '/']
         return [binaries[tool], 'cp', '--no-progress',
