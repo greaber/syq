@@ -3053,7 +3053,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && bwlimit.is_none()
     {
         let mut files = 0;
-        let mut file_bytes = 0u64;
+        let mut bytes = 0u64;
         let mut all_small = true;
         for planned in st.buffer.iter().flatten().flat_map(|mapped| &mapped.others) {
             let entry = &planned.e;
@@ -3062,7 +3062,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 && opts.min_size.is_none_or(|min| entry.size >= min)
             {
                 files += 1;
-                file_bytes = file_bytes.saturating_add(entry.size);
+                bytes = bytes.saturating_add(entry.size);
                 all_small &= entry.size <= fast_file_size_limit(&opts, bwlimit.as_deref());
             }
         }
@@ -3070,7 +3070,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             spawn_workers(initial_fast_workers(
                 args.connections,
                 files,
-                file_bytes,
+                bytes,
                 opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
                 opts.tuning.batch_bytes(),
             ));
@@ -3137,7 +3137,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             } else {
                 let (multiplex_small_files, file_jobs, file_bytes) = {
                     let jobs = sched.jobs.lock().unwrap();
-                    let summary = (
+                    (
                         !opts.verify_only
                             && !opts.tuning.force_ranges()
                             && bwlimit.is_none()
@@ -3150,9 +3150,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             }),
                         jobs.len(),
                         jobs.iter()
-                            .fold(0u64, |sum, job| sum.saturating_add(job.entry.size)),
-                    );
-                    summary
+                            .fold(0u64, |total, job| total.saturating_add(job.entry.size)),
+                    )
                 };
                 if multiplex_small_files {
                     for spec in [&src_ep, &dst_ep]
