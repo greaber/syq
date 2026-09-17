@@ -14,6 +14,7 @@ use std::{
 };
 
 pub(super) struct State {
+    directory: std::path::PathBuf,
     root: Arc<Root>,
     name: String,
     _lock: File,
@@ -49,7 +50,19 @@ impl State {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             bail!("another S3 copy is using this recovery record; retry after it finishes");
         }
+        // Only the lock holder saves under this name, so a temporary file
+        // found now was left by an interrupted save.
+        let prefix = format!("{name}.");
+        for entry in root
+            .read_directory(&RelativePath::new(b"")?)
+            .unwrap_or_default()
+        {
+            if entry.starts_with(prefix.as_bytes()) && entry.ends_with(b".tmp") {
+                let _ = RelativePath::new(&entry).and_then(|stale| root.unlink(&stale));
+            }
+        }
         Ok(Self {
+            directory: path,
             root,
             name,
             _lock: lock,
@@ -70,9 +83,12 @@ impl State {
         }
         let mut text = Vec::new();
         file.take(16 * 1024 * 1024 + 1).read_to_end(&mut text)?;
-        Ok(Some(serde_json::from_slice(&text).context(
-            "invalid S3 recovery record; preserve it for recovery or remove this record to restart",
-        )?))
+        Ok(Some(serde_json::from_slice(&text).with_context(|| {
+            format!(
+                "invalid S3 recovery record {}; preserve it for recovery or remove it to restart",
+                self.directory.join(format!("{}.json", self.name)).display()
+            )
+        })?))
     }
     pub fn save<T: Serialize>(&self, value: &T) -> Result<()> {
         let mut bytes = [0u8; 8];
@@ -81,8 +97,8 @@ impl State {
             format!("{}.{}.tmp", self.name, u64::from_le_bytes(bytes)).as_bytes(),
         )?;
         let mut file = self.root.create_file(&tmp, 0o600)?;
-        serde_json::to_writer(&mut file, value)?;
-        file.flush()?;
+        // One write: serializing straight to the file costs a syscall per token.
+        file.write_all(&serde_json::to_vec(value)?)?;
         // Recovery handles interrupted processes, not machine-crash durability.
         self.root.rename_regular_if_same(
             &tmp,
