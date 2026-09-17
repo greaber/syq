@@ -70,7 +70,7 @@ pub(crate) struct Flags {
     /// S3 API endpoint URL (also AWS_ENDPOINT_URL_S3 or AWS_ENDPOINT_URL)
     #[arg(long, value_name = "URL", help_heading = "Object storage")]
     s3_endpoint: Option<String>,
-    /// S3 signing region (otherwise AWS configuration, or us-east-1)
+    /// S3 signing region (otherwise AWS configuration, then the bucket's own region on AWS)
     #[arg(long, value_name = "REGION", help_heading = "Object storage")]
     s3_region: Option<String>,
     /// AWS shared configuration/credentials profile
