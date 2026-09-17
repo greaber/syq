@@ -9549,6 +9549,7 @@ fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sched::tests::test_job as pipeline_job;
 
     #[test]
     fn source_block_must_match_the_requested_range() {
@@ -9687,30 +9688,6 @@ mod tests {
             _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
         ) -> Result<()> {
             unreachable!()
-        }
-    }
-
-    fn pipeline_job(name: &[u8], size: usize) -> FileJob {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("source");
-        std::fs::write(&path, vec![0; size]).unwrap();
-        FileJob {
-            dst_entry: None,
-            data: FileJobData {
-                src: name.to_vec(),
-                source: RegisteredPath::new(serde_json::from_str("0").unwrap(), name.to_vec())
-                    .unwrap(),
-                dst: [name, b"-dst"].concat(),
-                rel: String::from_utf8(name.to_vec()).unwrap(),
-                entry: crate::fsops::lstat_entry(Vec::new(), &path).unwrap(),
-                target_condition: TargetCondition::Any,
-                container_guard: None,
-                attempt: 0,
-                done: Arc::new(AtomicU64::new(0)),
-                inplace: false,
-                rel_bytes: name.to_vec(),
-                src_rel: None,
-            },
         }
     }
 
@@ -10122,7 +10099,7 @@ mod tests {
 
     fn pipeline_ranges(spans: &[(u64, u64)]) -> (Arc<Sched>, RangeHandle, FileJob) {
         let sched = Arc::new(Sched::new(512, 8192));
-        let job = pipeline_job(b"source", spans.last().unwrap().1 as usize);
+        let job = pipeline_job(b"source", spans.last().unwrap().1);
         sched.push_file(job.clone());
         sched.scan_done();
         assert!(matches!(sched.next(), Item::File(0)));

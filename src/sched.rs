@@ -429,6 +429,12 @@ struct Inner {
 }
 
 impl Inner {
+    fn claim_range(&mut self, idx: usize, off: u64, end: u64) -> RangeHandle {
+        let handle = Arc::new(Mutex::new(RangeState { idx, pos: off, end }));
+        self.inflight.push(handle.clone());
+        handle
+    }
+
     fn finished(&self) -> bool {
         self.scan_done
             && self.probing == 0
@@ -778,9 +784,7 @@ impl Sched {
             }
             if g.scan_done {
                 if let Some((idx, off, end)) = g.ranges.pop() {
-                    let h = Arc::new(Mutex::new(RangeState { idx, pos: off, end }));
-                    g.inflight.push(h.clone());
-                    return Item::Range(h);
+                    return Item::Range(g.claim_range(idx, off, end));
                 }
                 if let Some((idx, matched)) = g.finishes.pop() {
                     return Item::Finish { idx, matched };
@@ -828,13 +832,7 @@ impl Sched {
         r.end = split;
         drop(r);
         *g.outstanding.entry(idx).or_insert(0) += 1;
-        let h = Arc::new(Mutex::new(RangeState {
-            idx,
-            pos: split,
-            end: old_end,
-        }));
-        g.inflight.push(h.clone());
-        Some(h)
+        Some(g.claim_range(idx, split, old_end))
     }
 
     /// Pop further queued files no larger than `max_size` (largest-first order
@@ -868,17 +866,11 @@ impl Sched {
             return None;
         }
         let mut g = self.inner.lock().unwrap();
-        if g.abort
-            || g.failed.contains(&idx)
-            || g.outstanding.get(&idx).copied().unwrap_or(0) <= 1
-            || g.ranges.len() <= g.waiting_workers
-        {
+        if g.abort || g.failed.contains(&idx) || g.ranges.len() <= g.waiting_workers {
             return None;
         }
         let (idx, off, end) = g.ranges.take_short(idx, max_size)?;
-        let h = Arc::new(Mutex::new(RangeState { idx, pos: off, end }));
-        g.inflight.push(h.clone());
-        Some(h)
+        Some(g.claim_range(idx, off, end))
     }
 
     /// After probing a file: register its ranges. Returns the handle for the
@@ -916,11 +908,7 @@ impl Sched {
             g.outstanding.insert(idx, ranges.len() as u32);
         }
         let mut it = ranges.into_iter();
-        let first = it.next().map(|(off, end)| {
-            let h = Arc::new(Mutex::new(RangeState { idx, pos: off, end }));
-            g.inflight.push(h.clone());
-            h
-        });
+        let first = it.next().map(|(off, end)| g.claim_range(idx, off, end));
         for (off, end) in it {
             g.ranges.push((idx, off, end));
         }
@@ -972,18 +960,18 @@ impl Sched {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn test_job(size: u64) -> FileJob {
+    pub(crate) fn test_job(name: &[u8], size: u64) -> FileJob {
         FileJob {
             data: FileJobData {
-                src: b"source".to_vec(),
-                source: RegisteredPath::new(serde_json::from_str("0").unwrap(), b"source".to_vec())
+                src: name.to_vec(),
+                source: RegisteredPath::new(serde_json::from_str("0").unwrap(), name.to_vec())
                     .unwrap(),
-                dst: b"destination".to_vec(),
-                rel: "destination".into(),
-                rel_bytes: b"destination".to_vec(),
+                dst: [name, b"-dst"].concat(),
+                rel: String::from_utf8(name.to_vec()).unwrap(),
+                rel_bytes: name.to_vec(),
                 src_rel: None,
                 entry: Entry {
                     path: Vec::new(),
@@ -1016,7 +1004,7 @@ mod tests {
         let sched = Sched::new(64, 128);
         // Model a scan of sixteen directories, sixteen files in each.
         for _ in 0..256 {
-            sched.push_file(test_job(4096));
+            sched.push_file(test_job(b"source", 4096));
         }
         sched.scan_done();
         let mut directories = HashSet::new();
@@ -1040,7 +1028,7 @@ mod tests {
         // Include zero-length files, repeated sizes, and a non-power-of-two count.
         let sizes: Vec<_> = (0..257).map(|i| (i % 7) * 1024).collect();
         for &size in &sizes {
-            sched.push_file(test_job(size));
+            sched.push_file(test_job(b"source", size));
         }
         sched.scan_done();
         assert!(sched.take_small(4096, 10, u64::MAX).is_empty());
@@ -1070,7 +1058,7 @@ mod tests {
     fn requeued_files_keep_their_identity_with_concurrent_batch_consumers() {
         let sched = Arc::new(Sched::new(64, 128));
         for idx in 0..257 {
-            let mut job = test_job(4096);
+            let mut job = test_job(b"source", 4096);
             job.done.store(idx as u64, Relaxed);
             job.rel = idx.to_string();
             sched.push_file(job);
@@ -1110,7 +1098,7 @@ mod tests {
     #[test]
     fn combined_destination_snapshots_share_and_preserve_replaced_versions() {
         let mut jobs = Jobs::new(JobStorage::Combined);
-        let mut job = test_job(7);
+        let mut job = test_job(b"source", 7);
         let mut original = job.entry.clone();
         original.path = b"destination/original".to_vec();
         job.dst_entry = Some(original.clone());
@@ -1150,7 +1138,7 @@ mod tests {
     #[test]
     fn combined_chunks_allow_append_retry_and_release_with_live_snapshots() {
         let mut jobs = Jobs::new(JobStorage::Combined);
-        jobs.push(test_job(7));
+        jobs.push(test_job(b"source", 7));
         let first = jobs.snapshot(0);
         let SnapshotData::Chunk { slots, .. } = &first.data else {
             panic!("expected chunk");
@@ -1163,7 +1151,7 @@ mod tests {
                 }
             });
             for _ in 0..(2 * JOBS_PER_CHUNK) {
-                jobs.push(test_job(9));
+                jobs.push(test_job(b"source", 9));
             }
         });
         let second = jobs.snapshot(1);
