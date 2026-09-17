@@ -60,7 +60,11 @@ impl Engine {
         self.tuning.configure(
             tiny,
             if small_upload { workers } else { 256 },
-            if ramp_whole_objects { 32 } else { 64 },
+            if ramp_whole_objects && !self.options.upload {
+                32
+            } else {
+                64
+            },
         );
         let starting = if ramp_whole_objects {
             workers.min(self.tuning.request_limit())
