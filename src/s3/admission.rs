@@ -1,9 +1,40 @@
 //! Adjust whole-object admission without interrupting requests already in flight.
-use crate::tune::{Sampler, FILE_CREDIT};
+use crate::tune::FILE_CREDIT;
 use anyhow::Result;
 use std::{sync::Arc, time::Duration};
 
 const SAMPLE: Duration = Duration::from_millis(250);
+
+// Object completions can arrive in batches even on a stationary path. Waiting
+// for adjacent rates to agree discards partial batches, biases the score, and
+// stretches the controller's sampling and backoff periods. Average every pair
+// of eligible observations instead. The driver still requires 16 completions
+// per observation and measures its actual elapsed time.
+#[derive(Default)]
+struct RateWindow {
+    previous: Option<f64>,
+    discard: bool,
+}
+
+impl RateWindow {
+    fn reset(&mut self) {
+        self.previous = None;
+        self.discard = true;
+    }
+
+    fn push(&mut self, rate: f64) -> Option<f64> {
+        if self.discard {
+            self.discard = false;
+            return None;
+        }
+        if let Some(previous) = self.previous.take() {
+            Some((previous + rate) * 0.5)
+        } else {
+            self.previous = Some(rate);
+            None
+        }
+    }
+}
 
 pub(super) struct Concurrency {
     pub initial: usize,
@@ -23,7 +54,7 @@ struct Probe {
 struct Controller {
     limit: usize,
     maximum: usize,
-    sampler: Sampler,
+    sampler: RateWindow,
     probe: Option<Probe>,
     upward: bool,
     hold: usize,
@@ -40,7 +71,7 @@ struct Controller {
 
 impl Controller {
     fn new(start: usize, maximum: usize, initial_probe_up: bool) -> Self {
-        let mut sampler = Sampler::default();
+        let mut sampler = RateWindow::default();
         sampler.reset();
         Self {
             limit: start.clamp(1, maximum),
@@ -354,6 +385,32 @@ mod tests {
             "optimum {optimum}, settled {settled}, active {}",
             controller.limit
         );
+    }
+
+    #[test]
+    fn resetting_measurements_excludes_the_previous_setting() {
+        let mut window = Controller::new(7, 256, false).sampler;
+        assert!(window.push(100.0).is_none());
+        assert!(window.push(10000.0).is_none());
+        window.reset();
+        assert!(window.push(20000.0).is_none());
+        assert!(window.push(10.0).is_none());
+        assert_eq!(window.push(20.0), Some(15.0));
+    }
+
+    #[test]
+    fn scores_include_partial_completion_batches() {
+        let mut sampler = Controller::new(7, 256, false).sampler;
+        assert!(sampler.push(0.0).is_none()); // Discard the warmup observation.
+        let counts = [28.0, 35.0, 35.0, 28.0, 35.0, 35.0];
+        let scores: Vec<_> = counts
+            .into_iter()
+            .filter_map(|rate| sampler.push(rate))
+            .collect();
+        assert_eq!(scores.len(), 3);
+        let measured = scores.iter().sum::<f64>() / scores.len() as f64;
+        let delivered = counts.iter().sum::<f64>() / counts.len() as f64;
+        assert!((measured - delivered).abs() < 1e-9);
     }
 
     #[test]
