@@ -124,7 +124,7 @@ impl Engine {
                         .send()
                         .await
                         .map_err(|e| {
-                            if retryable_status(e.raw_response().map(|r| r.status().as_u16())) {
+                            if retryable(&e) {
                                 anyhow::Error::new(e.into_service_error())
                             } else {
                                 Permanent(format!("S3 GET failed: {}", e.into_service_error()))
