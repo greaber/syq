@@ -121,17 +121,7 @@ async fn versions(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<Ent
 }
 
 async fn present(client: &Client, bucket: &str, key: &str) -> Result<bool> {
-    match client
-        .head_object()
-        .bucket(bucket)
-        .key(key)
-        .customize()
-        .config_override(
-            aws_sdk_s3::config::Builder::new().retry_classifier(client::HeadThrottling),
-        )
-        .send()
-        .await
-    {
+    match client.head_object().bucket(bucket).key(key).send().await {
         Ok(_) => Ok(true),
         Err(error)
             if error
@@ -201,7 +191,10 @@ async fn plan(
             let has_children = if use_versions {
                 listed.iter().any(|e| e.key.starts_with(&prefix))
             } else {
-                !client::list(client, bucket, &prefix).await?.is_empty()
+                !client::list(client, bucket, &prefix, None, &mut HashSet::new())
+                    .await?
+                    .objects
+                    .is_empty()
             };
             anyhow::ensure!(
                 !has_children,
@@ -211,8 +204,9 @@ async fn plan(
         let exists;
         if is_tree {
             if !use_versions {
-                listed = client::list(client, bucket, &prefix)
+                listed = client::list(client, bucket, &prefix, None, &mut HashSet::new())
                     .await?
+                    .objects
                     .into_iter()
                     .map(|(key, _)| Entry {
                         key,

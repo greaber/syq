@@ -27,7 +27,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::Read,
     os::unix::fs::{FileExt, MetadataExt},
@@ -159,19 +159,34 @@ impl Engine {
                 } else {
                     format!("{target}/")
                 };
-                let listing = client::list(&self.client, &self.options.bucket, &prefix)
+                let listing = if self.args.delete {
+                    // Pruning needs every destination key, including keys absent
+                    // from the upload plan. Only this complete cache is reusable
+                    // by the deletion planner.
+                    client::list(
+                        &self.client,
+                        &self.options.bucket,
+                        &prefix,
+                        None,
+                        &mut HashSet::new(),
+                    )
                     .await
-                    .and_then(|keys| {
-                        anyhow::ensure!(
-                            keys.iter().all(|(key, _)| key.starts_with(&prefix)),
-                            "S3 listing returned a key outside the requested prefix"
-                        );
-                        Ok(keys)
-                    });
+                    .map(|listing| Some(listing.objects.into_iter().collect()))
+                } else {
+                    let source_keys = plan.iter().map(|source| source.key.as_str()).collect();
+                    client::upload_listing(
+                        &self.client,
+                        &self.options.bucket,
+                        &prefix,
+                        &source_keys,
+                    )
+                    .await
+                };
                 match listing {
-                    Ok(keys) => {
-                        let _ = self.upload_keys.set(keys.into_iter().collect());
+                    Ok(Some(keys)) => {
+                        let _ = self.upload_keys.set(keys);
                     }
+                    Ok(None) => {}
                     Err(error) if self.args.delete => {
                         self.progress
                             .error(&format!("list S3 destination: {error:#}"));
@@ -425,10 +440,8 @@ impl Engine {
         } else {
             format!("{target}/")
         };
-        let present = exact
-            || !client::list(&self.client, &self.options.bucket, &prefix)
-                .await?
-                .is_empty();
+        let present =
+            exact || client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
         if (self.args.target_existence == Existence::New && present)
             || (self.args.target_existence == Existence::Existing && !present)
         {
@@ -753,6 +766,7 @@ impl Engine {
                     .set_metadata(Some(metadata.encode()))
                     .set_if_none_match(must_be_new.then(|| "*".into()))
                     .customize()
+                    .config_override(super::client::without_sdk_retries())
                     .disable_payload_signing();
                 let request = if let Some(file) = &sync_file {
                     request.interceptor(file.clone())
@@ -765,10 +779,7 @@ impl Engine {
                 }
                 match result {
                     Ok(_) => break,
-                    Err(e)
-                        if retryable_status(e.raw_response().map(|r| r.status().as_u16()))
-                            && attempt < self.options.retries =>
-                    {
+                    Err(e) if retryable(&e) && attempt < self.options.retries => {
                         super::backoff(attempt).await;
                         attempt += 1;
                     }
@@ -969,6 +980,7 @@ impl Engine {
                                     (algorithm == Algorithm::Md5).then(|| checksum.clone()),
                                 )
                                 .customize()
+                                .config_override(super::client::without_sdk_retries())
                                 .disable_payload_signing();
                             let request = if let Some(file) = &sync_file {
                                 request.interceptor(file.clone())
@@ -1006,11 +1018,7 @@ impl Engine {
                                         )
                                         .build());
                                 }
-                                Err(e)
-                                    if retryable_status(
-                                        e.raw_response().map(|r| r.status().as_u16()),
-                                    ) && attempt < self.options.retries =>
-                                {
+                                Err(e) if retryable(&e) && attempt < self.options.retries => {
                                     super::backoff(attempt).await;
                                     attempt += 1;
                                 }
@@ -1179,6 +1187,7 @@ impl Engine {
             .unwrap_or(u64::MAX);
         let mut out = Vec::new();
         let mut claims = BTreeMap::new();
+        let mut excluded_subtrees = HashSet::new();
         for (key, path, selection, declared_kind, expected_digest) in selectors {
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
@@ -1207,12 +1216,19 @@ impl Engine {
             let (exact, listed) = if directory && self.args.native_mapping.is_none() {
                 let (exact, listed) = tokio::try_join!(
                     exact,
-                    client::list(&self.client, &self.options.bucket, &prefix)
+                    client::list(
+                        &self.client,
+                        &self.options.bucket,
+                        &prefix,
+                        matcher.as_ref(),
+                        &mut excluded_subtrees
+                    )
                 )?;
                 (exact, Some(listed))
             } else {
                 (exact.await?, None)
             };
+            let already_filtered = self.args.native_mapping.is_none() && exact.is_none();
             let objects = if self.args.native_mapping.is_some() {
                 // Mapping entries name individual objects. A directory entry
                 // copies its marker, while explicit child entries copy children.
@@ -1237,16 +1253,28 @@ impl Engine {
                 }
                 let listed = match listed {
                     Some(listed) => listed,
-                    None => client::list(&self.client, &self.options.bucket, &prefix).await?,
+                    None => {
+                        client::list(
+                            &self.client,
+                            &self.options.bucket,
+                            &prefix,
+                            matcher.as_ref(),
+                            &mut excluded_subtrees,
+                        )
+                        .await?
+                    }
                 };
-                if listed.is_empty() {
+                if !listed.found {
                     bail!("S3 source prefix {key:?} contains no objects");
                 }
+                self.progress
+                    .files_excluded
+                    .fetch_add(listed.excluded, Relaxed);
                 if self.args.delete {
                     prune.scope(path.as_bytes(), key.as_bytes());
                 }
                 let mut objects = Vec::new();
-                for (object, size) in listed {
+                for (object, size) in listed.objects {
                     let suffix = object
                         .strip_prefix(&prefix)
                         .context("S3 listing returned a key outside the requested prefix")?;
@@ -1265,15 +1293,17 @@ impl Engine {
             };
             for (key, size, path) in objects {
                 let directory = key.ends_with('/') && size == 0;
-                if !directory && (size < min || size > max) {
-                    self.progress.files_excluded.fetch_add(1, Relaxed);
-                    prune.protect(path.as_bytes());
-                    continue;
+                if !already_filtered {
+                    if let Some(excluded) =
+                        client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
+                    {
+                        self.progress
+                            .files_excluded
+                            .fetch_add(excluded.count(&mut excluded_subtrees), Relaxed);
+                        continue;
+                    }
                 }
-                if matcher
-                    .as_ref()
-                    .is_some_and(|m| crate::scan::path_is_ignored(m, key.as_bytes(), directory))
-                {
+                if !directory && (size < min || size > max) {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     prune.protect(path.as_bytes());
                     continue;
@@ -1915,8 +1945,27 @@ impl std::fmt::Display for Permanent {
     }
 }
 impl std::error::Error for Permanent {}
-fn retryable_status(status: Option<u16>) -> bool {
-    status.is_none_or(|s| matches!(s, 408 | 429 | 500 | 502 | 503 | 504))
+/// The upload loops replace SDK retries, so they must recognize the same
+/// throttling and transient conditions: dispatch failures without a response,
+/// retryable statuses, and the error codes S3 can send with other statuses,
+/// such as `RequestTimeout` with HTTP 400.
+fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
+    error: &aws_sdk_s3::error::SdkError<
+        E,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    use aws_runtime::retries::classifiers::{THROTTLING_ERRORS, TRANSIENT_ERRORS};
+    error
+        .raw_response()
+        .map(|r| r.status().as_u16())
+        .is_none_or(|s| matches!(s, 408 | 429 | 500 | 502 | 503 | 504))
+        || error
+            .as_service_error()
+            .and_then(|e| e.code())
+            .is_some_and(|code| {
+                THROTTLING_ERRORS.contains(&code) || TRANSIENT_ERRORS.contains(&code)
+            })
 }
 async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStream> {
     let source = source.clone();

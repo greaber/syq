@@ -3176,6 +3176,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "aws-config",
+ "aws-runtime",
  "aws-sdk-s3",
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
