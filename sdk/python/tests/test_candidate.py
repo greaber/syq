@@ -196,6 +196,9 @@ class CandidateCompatibilityTests(unittest.TestCase):
             removal_tree = root / "remove-tree"
             removal_tree.mkdir()
             (removal_tree / "child").write_bytes(b"remove")
+            refused = client.rm(removal_tree.name, check=False)
+            self.assertNotEqual(refused.exit_code, 0)
+            self.assertTrue((removal_tree / "child").exists())
             removal_events: list[syq.AutomationEvent] = []
             removal_stream = io.BytesIO()
             removal_preview = client.rm(

@@ -228,13 +228,14 @@ not supported for object storage.
 
 ## Remove objects and versions
 
-`syq rm --on s3://BUCKET` removes selected keys or prefix trees. A named
-selector chooses an exact object if it exists, otherwise its `name/` prefix.
-`--src-dir name` selects a prefix tree and rejects a conflicting exact object;
-`--srcs-in name` keeps the prefix's own directory-marker object. Use
-`--srcs-in .` for bucket contents. Removal never deletes the bucket itself.
-Selectors are literal paths, not wildcard patterns; `-C` and `--root` set a
-key prefix. Missing selections succeed without removing anything.
+`syq rm --on s3://BUCKET` removes selected keys or explicitly selected prefix
+trees. Named paths, `--src`, and `--srcs` select only the exact object; they
+refuse a prefix tree. Use `--src-dir name` to recursively remove `name/`, or
+`--srcs-in name` to remove its contents while keeping its directory-marker
+object. If `name` and `name/` coexist, each selector removes only its selected
+object or tree. Use `--srcs-in .` for bucket contents. Removal never deletes the
+bucket itself. Selectors are literal paths, not wildcard patterns; `-C` and
+`--root` set a key prefix. Missing selections succeed without removing anything.
 `--follow-src` is unsupported for S3 removal. `--follow` applies only to symlinks
 in the local `--results` path; it does not follow links stored as S3 objects.
 
@@ -250,11 +251,9 @@ syq rm --on s3://my-bucket report.txt --s3-version-id VERSION_ID
 ```
 
 `--s3-all-versions` and `--s3-version-id` are mutually exclusive and apply only
-to S3 removal. With `--s3-all-versions`, named selectors prefer the current
-object or tree over hidden history. If neither exists, an exact key's historical
-versions remain selectable. Use `--src-non-dir name` to select that key's history
-when a live `name/` tree also exists. Hidden exact-key history does not conflict
-with an explicit directory selector.
+to S3 removal. With `--s3-all-versions`, named selectors include the exact
+key's hidden history. Explicit directory selectors include only the selected
+prefix's history, even when an exact key also has live or historical versions.
 
 A version ID requires one named or non-directory selector;
 a named key ending in `/` can identify a directory marker's version. Removing

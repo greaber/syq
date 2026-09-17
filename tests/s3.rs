@@ -170,6 +170,24 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault == "rm-explicit-collision" {
+        let body = if method == "HEAD" {
+            assert!(first.contains("/bucket/foo "));
+            ""
+        } else if first.contains("versions") {
+            if first.contains("delimiter=") {
+                "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>foo</Key><VersionId>file</VersionId><IsLatest>true</IsLatest></Version></ListVersionsResult>"
+            } else {
+                assert!(first.contains("prefix=foo%2F"));
+                "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>foo/</Key><VersionId>root</VersionId></Version><Version><Key>foo/nested/child</Key><VersionId>child</VersionId></Version></ListVersionsResult>"
+            }
+        } else {
+            assert!(first.contains("prefix=foo%2F"));
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>foo/</Key><Size>0</Size></Contents><Contents><Key>foo/nested/child</Key><Size>4</Size></Contents></ListBucketResult>"
+        };
+        reply(&mut socket, 200, &[], body.as_bytes(), method == "HEAD");
+        return;
+    }
     if fault == "remove-planning-interrupt" {
         assert_eq!(method, "GET");
         gate.0.store(true, Ordering::SeqCst);
@@ -2200,14 +2218,14 @@ fn s3_head_throttling_uses_the_retry_budget_and_keeps_permanent_errors_final() {
 #[test]
 fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
     for (fault, exit, requests) in [
-        ("remove-outside", 1, 2),
-        ("remove-no-id", 1, 2),
-        ("remove-no-cursor", 1, 2),
-        ("remove-denied", 23, 4),
-        ("remove-ok", 0, 5),
-        ("remove-null", 0, 5),
-        ("remove-mixed", 23, 4),
-        ("remove-omitted", 23, 4),
+        ("remove-outside", 1, 1),
+        ("remove-no-id", 1, 1),
+        ("remove-no-cursor", 1, 1),
+        ("remove-denied", 23, 3),
+        ("remove-ok", 0, 4),
+        ("remove-null", 0, 4),
+        ("remove-mixed", 23, 3),
+        ("remove-omitted", 23, 3),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let server = Server::start(fault);
@@ -2315,7 +2333,7 @@ fn s3_remove_dry_run_and_usage_errors_do_not_delete() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(server.requests.load(Ordering::Relaxed), 3);
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
     for options in [
         vec![
             "--on",
@@ -2608,9 +2626,9 @@ fn s3_remove_follow_still_allows_local_results_symlinks() {
 }
 
 #[test]
-fn s3_remove_hidden_file_history_does_not_override_live_tree() {
+fn s3_remove_exact_history_and_tree_are_selected_explicitly() {
     for (selector, expected) in [
-        (vec!["ghost"], vec!["child"]),
+        (vec!["ghost"], vec!["old", "hidden"]),
         (vec!["--src-dir", "ghost"], vec!["child"]),
         (vec!["--srcs-in", "ghost"], vec!["child"]),
         (vec!["--src-non-dir", "ghost"], vec!["old", "hidden"]),
@@ -2645,10 +2663,7 @@ fn s3_remove_hidden_file_history_does_not_override_live_tree() {
             .map(|r| r["s3_version_id"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(versions, expected);
-        assert_eq!(
-            server.requests.load(Ordering::Relaxed),
-            if expected.len() == 2 { 1 } else { 2 }
-        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), 1);
     }
 }
 
@@ -2681,8 +2696,8 @@ fn s3_remove_exact_versions_stops_before_unrelated_prefixes() {
 #[test]
 fn s3_remove_batches_are_concurrent_and_preserve_markers_after_late_failure() {
     for (fault, exit, requests, removed, failed) in [
-        ("remove-bulk", 0, 6, 1002, 0),
-        ("remove-bulk-failure", 23, 5, 1, 1001),
+        ("remove-bulk", 0, 5, 1002, 0),
+        ("remove-bulk-failure", 23, 4, 1, 1001),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let server = Server::start(fault);
@@ -2826,14 +2841,14 @@ fn s3_remove_interrupt_drains_in_flight_results_before_exiting() {
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while server.requests.load(Ordering::SeqCst) < 5 && std::time::Instant::now() < deadline {
+    while server.requests.load(Ordering::SeqCst) < 4 && std::time::Instant::now() < deadline {
         assert!(
             child.try_wait().unwrap().is_none(),
             "rm exited before sending batches"
         );
         thread::sleep(Duration::from_millis(5));
     }
-    if server.requests.load(Ordering::SeqCst) < 5 {
+    if server.requests.load(Ordering::SeqCst) < 4 {
         child.kill().unwrap();
         child.wait().unwrap();
         panic!(
@@ -2848,7 +2863,7 @@ fn s3_remove_interrupt_drains_in_flight_results_before_exiting() {
     let status = child.wait().unwrap();
     assert!(premature.is_none(), "rm discarded its in-flight requests");
     assert_eq!(status.code(), Some(1));
-    assert_eq!(server.requests.load(Ordering::SeqCst), 5);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 4);
     let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
     let records: Vec<serde_json::Value> = records
         .lines()
@@ -2945,4 +2960,60 @@ fn s3_path_latency_is_one_response_not_the_whole_listing() {
     let control = plan["control_s"].as_f64().expect("observed latency");
     assert!(control < 0.05, "listing time was taken for latency: {plan}");
     assert_eq!(plan["request_limit"], 64, "{plan}");
+}
+
+#[test]
+fn s3_remove_explicit_types_disambiguate_live_object_and_tree_without_extra_probes() {
+    for all_versions in [false, true] {
+        for (selector, paths) in [
+            (vec!["foo"], vec!["foo"]),
+            (vec!["--src-dir", "foo"], vec!["foo/", "foo/nested/child"]),
+            (vec!["--srcs-in", "foo"], vec!["foo/nested/child"]),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let server = Server::start("rm-explicit-collision");
+            let mut command = server.command_for(temp.path(), "rm");
+            command
+                .args([
+                    "--s3-endpoint",
+                    &server.address,
+                    "--on",
+                    "s3://bucket",
+                    "--dry-run",
+                    "--results",
+                    "results.ndjson",
+                ])
+                .args(selector);
+            if all_versions {
+                command.arg("--s3-all-versions");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{}", output_text(&output));
+            let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+            let selected: Vec<String> = records
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .filter(|r| r["type"] == "removal_trace")
+                .map(|r| r["path"]["value"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(selected, paths);
+            assert_eq!(server.requests.load(Ordering::Relaxed), 1);
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("rm-explicit-collision");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "foo/",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output_text(&output).contains("--src-dir"));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 0);
 }
