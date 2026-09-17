@@ -82,21 +82,15 @@ fn initial_fast_workers(
     max_connections: usize,
     file_jobs: usize,
     file_bytes: u64,
-    all_tiny: bool,
-    tuning: crate::transfer_tuning::TransferTuning,
+    batch_files: usize,
+    batch_bytes: u64,
 ) -> usize {
-    // Tiny payloads amortize metadata and connection setup in one batch.
-    // Larger whole-file reads need independent workers, even when several
-    // fit within the logical batch's byte ceiling. Neither uses hash size.
-    let workers = if all_tiny {
-        let files = file_jobs.div_ceil(tuning.batch_files.unwrap_or(FAST_BATCH_FILES));
-        let bytes =
-            usize::try_from(file_bytes.div_ceil(tuning.batch_bytes())).unwrap_or(usize::MAX);
-        files.max(bytes)
-    } else {
-        file_jobs
-    };
-    max_connections.min(workers.max(1))
+    // A batch is independently bounded by its entry count and its payload.
+    // Provision enough fixed workers for whichever ceiling yields more work;
+    // automatic runs may still tune from this bounded starting point.
+    let file_batches = file_jobs.div_ceil(batch_files);
+    let byte_batches = usize::try_from(file_bytes.div_ceil(batch_bytes)).unwrap_or(usize::MAX);
+    max_connections.min(file_batches.max(byte_batches).max(1))
 }
 
 #[cfg(debug_assertions)]
@@ -3061,7 +3055,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     {
         let mut files = 0;
         let mut file_bytes = 0u64;
-        let mut all_tiny = true;
         let mut all_small = true;
         for planned in st.buffer.iter().flatten().flat_map(|mapped| &mapped.others) {
             let entry = &planned.e;
@@ -3071,7 +3064,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             {
                 files += 1;
                 file_bytes = file_bytes.saturating_add(entry.size);
-                all_tiny &= entry.size <= FAST_BATCH_TINY_BYTES;
                 all_small &= entry.size <= fast_file_size_limit(&opts, bwlimit.as_deref());
             }
         }
@@ -3080,8 +3072,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 args.connections,
                 files,
                 file_bytes,
-                all_tiny,
-                opts.tuning,
+                opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
+                opts.tuning.batch_bytes(),
             ));
             workers_started = true;
         }
@@ -3144,7 +3136,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 progress.error("syq: destination root is missing and cannot be anchored");
                 sched.abort();
             } else {
-                let (multiplex_small_files, file_jobs, file_bytes, all_tiny) = {
+                let (multiplex_small_files, file_jobs, file_bytes) = {
                     let jobs = sched.jobs.lock().unwrap();
                     let summary = (
                         !opts.verify_only
@@ -3160,8 +3152,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         jobs.len(),
                         jobs.iter()
                             .fold(0u64, |sum, job| sum.saturating_add(job.entry.size)),
-                        jobs.iter()
-                            .all(|job| job.entry.size <= FAST_BATCH_TINY_BYTES),
                     );
                     summary
                 };
@@ -3194,8 +3184,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             args.connections,
                             file_jobs,
                             file_bytes,
-                            all_tiny || opts.same_host,
-                            opts.tuning,
+                            opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
+                            opts.tuning.batch_bytes(),
                         )
                     } else {
                         args.connections
@@ -10758,17 +10748,36 @@ mod tests {
     }
 
     #[test]
-    fn small_file_startup_balances_read_parallelism_and_tiny_file_setup() {
-        let tuning = crate::transfer_tuning::TransferTuning::default();
-        assert_eq!(initial_fast_workers(8, 256, 64 << 20, false, tuning), 8);
-        assert_eq!(initial_fast_workers(8, 4, 16 << 20, false, tuning), 4);
-        assert_eq!(initial_fast_workers(8, 8, 32 << 10, true, tuning), 1);
-        assert_eq!(initial_fast_workers(32, 300, 300, true, tuning), 3);
-        assert_eq!(initial_fast_workers(8, 0, 0, true, tuning), 1);
-        assert_eq!(initial_fast_workers(0, 100, 100, true, tuning), 0);
+    fn initial_fast_workers_respect_file_and_byte_batch_limits() {
         assert_eq!(
-            initial_fast_workers(8, 8, 4096, true, "batch-bytes=512".parse().unwrap()),
+            initial_fast_workers(
+                32,
+                100,
+                100 * (4 << 20),
+                FAST_BATCH_FILES,
+                crate::transfer_tuning::DEFAULT_BATCH_BYTES
+            ),
+            25
+        );
+        assert_eq!(
+            initial_fast_workers(
+                8,
+                100,
+                100 * (4 << 20),
+                FAST_BATCH_FILES,
+                crate::transfer_tuning::DEFAULT_BATCH_BYTES
+            ),
             8
+        );
+        assert_eq!(
+            initial_fast_workers(
+                32,
+                300,
+                300,
+                FAST_BATCH_FILES,
+                crate::transfer_tuning::DEFAULT_BATCH_BYTES
+            ),
+            3
         );
     }
 
