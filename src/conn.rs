@@ -132,23 +132,23 @@ pub trait Conn: Send {
 /// error. Endpoint errors still consume a response; a broken transport cannot
 /// be drained and must be recovered by the caller. Never send a new request.
 pub(crate) fn drain_range_replies(conn: &mut dyn Conn, count: usize, what: &str) -> Result<()> {
-    drain_range_replies_with(conn, count, what, |_| {})
+    drain_range_replies_with(conn, 0..count, what, |_| {})
 }
 
-pub(crate) fn drain_range_replies_with(
+pub(crate) fn drain_range_replies_with<T>(
     conn: &mut dyn Conn,
-    count: usize,
+    pending: impl IntoIterator<Item = T>,
     what: &str,
-    mut acknowledged: impl FnMut(usize),
+    mut acknowledged: impl FnMut(T),
 ) -> Result<()> {
     let mut error = None;
-    for i in 0..count {
+    for item in pending {
         anyhow::ensure!(!conn.is_dead(), "cannot drain a failed range transport");
         let response = conn.recv()?;
         if let Err(failure) = ok(response, what) {
             error.get_or_insert(failure);
         } else {
-            acknowledged(i);
+            acknowledged(item);
         }
     }
     error.map_or(Ok(()), Err)
@@ -4346,8 +4346,14 @@ mod tests {
         let mut acknowledged = Vec::new();
         // The third receive fails with no pending response. LocalConn does not
         // mark itself dead; draining must still stop at that transport error.
-        assert!(drain_range_replies_with(&mut conn, 4, "write", |i| acknowledged.push(i)).is_err());
-        assert_eq!(acknowledged, [1]);
+        assert!(drain_range_replies_with(
+            &mut conn,
+            ["first", "second", "third", "fourth"],
+            "write",
+            |item| acknowledged.push(item),
+        )
+        .is_err());
+        assert_eq!(acknowledged, ["second"]);
         assert!(!conn.is_dead());
         assert!(conn.pending.is_empty());
     }

@@ -8886,9 +8886,11 @@ impl Worker {
         read_window: usize,
         write_window: usize,
     ) -> Result<()> {
-        let idx = primary.lock().unwrap().idx;
+        let (idx, mut current) = {
+            let range = primary.lock().unwrap();
+            (range.idx, (range.pos < range.end).then_some(0))
+        };
         let mut flights = vec![Some(RangeFlight::new(primary.clone()))];
-        let mut current = Some(0);
         let mut pending_reads = std::collections::VecDeque::new();
         let mut pending_writes = std::collections::VecDeque::new();
         let max_range = self
@@ -8908,9 +8910,8 @@ impl Worker {
                     // Only the current range can have an unread suffix. Never
                     // reserve a batch of unread ranges from a synchronous source.
                     if let Some(slot) = current.take() {
-                        if let Some(flight) = &flights[slot] {
-                            self.sched.release_rest(&flight.handle);
-                        }
+                        let flight = flights[slot].as_ref().expect("readable range");
+                        self.sched.release_rest(&flight.handle);
                     }
                 }
                 while !released && pending_reads.len() < read_window {
@@ -8934,23 +8935,17 @@ impl Worker {
                         current = Some(slot);
                     }
                     let slot = current.expect("readable range");
-                    let Some(flight) = flights[slot].as_mut() else {
-                        // Acknowledged extra shares can retire while reads drain.
-                        current = None;
-                        continue;
-                    };
+                    let flight = flights[slot].as_mut().expect("readable range");
                     let (off, n) = {
                         let mut range = flight.handle.lock().unwrap();
                         let n = (range.end - range.pos).min(block);
                         let off = range.pos;
                         range.pos += n;
+                        if range.pos == range.end {
+                            current = None;
+                        }
                         (off, n)
                     };
-                    if n == 0 {
-                        // The range is exhausted, or a peer stole its suffix.
-                        current = None;
-                        continue;
-                    }
                     flight.pending += 1;
                     self.limit(n);
                     self.src.send(Request::ReadRange {
@@ -9015,10 +9010,9 @@ impl Worker {
 
             let destination_end = crate::conn::drain_range_replies_with(
                 &mut *self.dst,
-                pending_writes.len(),
+                pending_writes,
                 "write",
-                |i| {
-                    let (slot, n) = pending_writes[i];
+                |(slot, n)| {
                     Self::acknowledge_range_write(
                         &self.sched,
                         &self.progress,
@@ -10599,7 +10593,9 @@ mod tests {
     #[test]
     fn multiblock_ranges_refill_windows_and_retry_only_unfinished_shares() {
         for source_sync in [false, true] {
-            for failure in [None, Some(6), Some(10)] {
+            // Each range needs three replies: reads 6 and 10 fail after zero
+            // and two extra ranges, respectively, have been fully acknowledged.
+            for (failure, completed_extras) in [(None, 0), (Some(6), 0), (Some(10), 2)] {
                 let spans: Vec<_> = (0..12).map(|i| (i * 4096, i * 4096 + 1536)).collect();
                 let (sched, h, job) = pipeline_ranges(&spans);
                 let src = Arc::new(Mutex::new(PipelineState {
@@ -10628,8 +10624,7 @@ mod tests {
                 let mut credited = 0;
                 let result = worker.transfer_range(&h, &mut credited);
                 assert_eq!(result.is_ok(), failure.is_none(), "{result:?}");
-                if let Some(failed_read) = failure {
-                    let completed_extras = (failed_read - 1) / 3 - 1;
+                if failure.is_some() {
                     assert_eq!(
                         job.done.load(Relaxed),
                         (completed_extras as u64 + 1) * 1536,
