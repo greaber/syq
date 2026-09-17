@@ -28,11 +28,15 @@ its descendants. Keys inside ignored subtrees are not validated.
 
 Syq uses the AWS SDK credential chain, including environment variables, shared
 configuration profiles, and workload credentials. Use `--s3-profile NAME` to
-select a profile and `--s3-region REGION` to override its signing region.
-On AWS, when no region is configured, syq asks S3 which region holds the bucket;
-this costs one request and needs no extra permissions. A configured region is
-used as given: if the bucket is elsewhere, the copy fails and names the
-bucket's region. With a custom endpoint and no region, syq signs for `us-east-1`.
+select a profile.
+
+On AWS you do not need to tell syq where a bucket is. Before copying, it asks
+S3 which region holds the bucket, which costs one request and needs no extra
+permissions. A region in your environment or profile only decides where that
+question is sent. `--s3-region REGION` skips the question and is used as
+given: if the bucket is elsewhere, the copy fails and names the bucket's
+region. With a custom endpoint syq never asks; it signs for the configured
+region, or `us-east-1` without one.
 
 For an S3-compatible service, set `AWS_ENDPOINT_URL_S3` or pass
 `--s3-endpoint https://storage.example`. `AWS_ENDPOINT_URL` is also accepted;

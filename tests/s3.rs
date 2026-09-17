@@ -589,7 +589,17 @@ fn serve(
         serve_latency_pages(&mut socket, first);
         return;
     }
-    if fault == "wrong-region" {
+    if fault.starts_with("wrong-region") {
+        // A prefix is looked up with a HEAD and a listing at once. Hold one of
+        // them back so each gets a turn at being the first failure.
+        let held_back = match fault {
+            "wrong-region-head-last" => "HEAD",
+            "wrong-region-listing-last" => "GET",
+            _ => "",
+        };
+        if method == held_back {
+            thread::sleep(Duration::from_millis(300));
+        }
         let region = ("x-amz-bucket-region".to_owned(), "eu-central-1".to_owned());
         reply(&mut socket, 301, &[region], b"", method == "HEAD");
         return;
@@ -1387,10 +1397,15 @@ fn s3_bad_responses_preserve_existing_destination() {
 }
 #[test]
 fn s3_wrong_region_redirects_name_the_bucket_region() {
-    let server = Server::start("wrong-region");
     let temp = tempfile::tempdir().unwrap();
-    // A named object is found with HEAD, a prefix with a listing.
-    for selector in [&["object"][..], &["--srcs-in", "prefix"][..]] {
+    // A named object is found with a HEAD. A prefix is found with a HEAD and
+    // a listing sent together, and either may be the first to fail.
+    for (fault, selector) in [
+        ("wrong-region", &["object"][..]),
+        ("wrong-region-listing-last", &["--srcs-in", "prefix"][..]),
+        ("wrong-region-head-last", &["--srcs-in", "prefix"][..]),
+    ] {
+        let server = Server::start(fault);
         let mut args = vec!["--from", "s3://bucket"];
         args.extend_from_slice(selector);
         args.extend_from_slice(&["--into", "output"]);
@@ -1400,7 +1415,7 @@ fn s3_wrong_region_redirects_name_the_bucket_region() {
         assert!(
             text.contains("(HTTP 301): the bucket is in region eu-central-1")
                 && text.contains("pass --s3-region eu-central-1"),
-            "{text}"
+            "{fault}: {text}"
         );
     }
 }

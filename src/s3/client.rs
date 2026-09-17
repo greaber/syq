@@ -195,6 +195,24 @@ pub(super) fn failure<E>(
     }
 }
 
+/// Every listing reports failures the same way. A named source is looked up
+/// with a HEAD and a listing at once, and either one may be the first to fail.
+fn listing_failure(
+    error: aws_sdk_s3::error::SdkError<
+        aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> anyhow::Error {
+    let message = failure("S3 listing", &error);
+    anyhow::Error::new(error.into_service_error()).context(message)
+}
+
+/// Whether to ask S3 for the bucket's region before copying. A custom
+/// endpoint already identifies its provider's storage and is never probed.
+fn looks_up_region(explicit_region: Option<&str>, custom_endpoint: Option<&str>) -> bool {
+    explicit_region.is_none() && custom_endpoint.is_none()
+}
+
 /// Ask S3 where a bucket is. Any response carries the answer, so this needs
 /// no permission on the bucket. The error says why there was no answer.
 async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<String, String> {
@@ -274,20 +292,27 @@ pub(super) async fn connect(
         .or_else(|| shared.endpoint_url().map(str::to_owned));
     options.endpoint = endpoint.clone();
     let mut note = None;
+    let lookup = looks_up_region(options.region.as_deref(), endpoint.as_deref());
     if let Some(endpoint) = endpoint {
         super::validate_endpoint(&endpoint)?;
         config = config.endpoint_url(endpoint).force_path_style(true);
-    } else if shared.region().is_none() {
+    }
+    if lookup {
         // AWS serves each bucket from one region and redirects requests sent
-        // elsewhere. With no region configured, ask instead of assuming
-        // us-east-1. A configured region is used as given, and a custom
-        // endpoint already identifies its provider's storage.
+        // elsewhere. A region from the environment or a profile is the
+        // account's default, not a fact about this bucket, so it only chooses
+        // where to ask. `--s3-region` is a statement about the bucket and is
+        // used as given.
+        let hint = shared
+            .region()
+            .map_or("us-east-1", |r| r.as_ref())
+            .to_owned();
         let probe = Client::from_conf(config.clone().build());
         match bucket_region(&probe, &options.bucket).await {
             Ok(region) => config = config.region(Region::new(region)),
             Err(reason) => {
                 note = Some(format!(
-                    "could not look up the bucket's region, signing for us-east-1: {reason}"
+                    "could not look up the bucket's region, signing for {hint}: {reason}"
                 ))
             }
         }
@@ -470,10 +495,7 @@ pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -
         .max_keys(1)
         .send()
         .await
-        .map_err(|e| {
-            let detail = failure("S3 listing", &e);
-            anyhow::Error::new(e.into_service_error()).context(detail)
-        })?;
+        .map_err(listing_failure)?;
     anyhow::ensure!(
         !output.contents().is_empty() || output.is_truncated() != Some(true),
         "S3 existence listing was truncated without an object"
@@ -501,10 +523,7 @@ pub(super) async fn upload_listing(
             .set_continuation_token(token.clone())
             .send()
             .await
-            .map_err(|e| {
-                let message = failure("S3 listing", &e);
-                anyhow::Error::new(e.into_service_error()).context(message)
-            })?;
+            .map_err(listing_failure)?;
         for object in output.contents() {
             let key = object.key().context("S3 listing omitted key")?;
             anyhow::ensure!(
@@ -635,10 +654,7 @@ pub(super) async fn list(
                 .set_continuation_token(token.clone())
                 .send()
                 .await
-                .map_err(|e| {
-                    let detail = failure("S3 listing", &e);
-                    anyhow::Error::new(e.into_service_error()).context(detail)
-                })?;
+                .map_err(listing_failure)?;
             result.found |= !output.contents().is_empty() || !output.common_prefixes().is_empty();
             let mut reachable_exclusion = false;
             if probes_remaining > 0
@@ -677,10 +693,7 @@ pub(super) async fn list(
                         .delimiter("/")
                         .send()
                         .await
-                        .map_err(|e| {
-                            let detail = failure("S3 listing", &e);
-                            anyhow::Error::new(e.into_service_error()).context(detail)
-                        })?;
+                        .map_err(listing_failure)?;
                     let mut included = 0;
                     let mut excluded = 0;
                     for child in directory_page.common_prefixes() {
@@ -963,6 +976,15 @@ mod tests {
             server.join().unwrap();
             assert_eq!(region.as_deref(), Ok("eu-central-1"), "{status}");
         }
+    }
+
+    #[test]
+    fn only_an_explicit_region_or_a_custom_endpoint_skips_the_lookup() {
+        // Regions from the environment or a profile never reach this decision:
+        // they are hints for where to ask, not reasons to skip asking.
+        assert!(looks_up_region(None, None));
+        assert!(!looks_up_region(Some("eu-central-1"), None));
+        assert!(!looks_up_region(None, Some("https://storage.example")));
     }
 
     #[tokio::test]
