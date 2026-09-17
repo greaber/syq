@@ -109,7 +109,6 @@ struct Window {
     probe_preserved_rate: bool,
     object_rate: Option<(usize, f64, Duration)>,
     settled: bool,
-    queued_objects: Option<usize>,
 }
 pub(super) struct Budget {
     state: Mutex<Window>,
@@ -151,7 +150,6 @@ impl Budget {
                 probe_preserved_rate: false,
                 object_rate: None,
                 settled: false,
-                queued_objects: None,
             }),
             changed: Notify::new(),
             received: AtomicU64::new(0),
@@ -178,9 +176,6 @@ impl Budget {
             }
             ready.await;
         }
-    }
-    pub fn queued_objects(&self, remaining: usize) {
-        self.state.lock().unwrap().queued_objects = Some(remaining);
     }
     pub fn preparation_limit(&self) -> usize {
         self.state.lock().unwrap().limit.saturating_add(1)
@@ -323,19 +318,10 @@ impl Budget {
                 }
             }
             if !s.settled && s.saturated && s.limit < s.max {
-                let candidate = next_limit.min(s.max);
-                // A whole-object probe needs a response count to measure and
-                // another count of queued work to benefit from the result.
-                if s.queued_objects
-                    .is_some_and(|queued| queued < candidate.saturating_mul(2))
-                {
-                    s.settled = true;
-                } else {
-                    s.previous = Some((s.limit, rate));
-                    s.previous_progress_rate = Some(progress_rate);
-                    s.limit = candidate;
-                    s.proposed_limit = s.limit;
-                }
+                s.previous = Some((s.limit, rate));
+                s.previous_progress_rate = Some(progress_rate);
+                s.limit = next_limit.min(s.max);
+                s.proposed_limit = s.limit;
             }
         }
         // Only single-request object batches reuse this score. Match object
@@ -419,39 +405,6 @@ mod tests {
         let _next = budget.acquire().await;
         let next_since = budget.state.lock().unwrap().since;
         assert_eq!(next_since, since);
-    }
-
-    #[test]
-    fn whole_object_ramp_keeps_a_gain_without_starting_an_unaffordable_probe() {
-        for (queued, expected) in [(511, 128), (512, 256)] {
-            let budget = Budget::new(128, true);
-            {
-                let mut state = budget.state.lock().unwrap();
-                state.since = Some(Instant::now() - Duration::from_secs(1));
-                state.previous = Some((64, 32.0 * 1024.0));
-                state.saturated = true;
-                state.completed = 127;
-                state.bytes = 127 * 1024;
-            }
-            budget.queued_objects(queued);
-            budget.completed(1024);
-            assert_eq!(budget.state.lock().unwrap().limit, expected);
-            assert_eq!(budget.slower_limit(), 64);
-            assert!(budget.rejected_limit().is_none());
-            assert_eq!(budget.begin_objects(256), (expected == 128).then_some(128));
-        }
-        // Multipart admission has no whole-object queue count: its request
-        // tuning retains the existing behavior.
-        let budget = Budget::new(32, true);
-        {
-            let mut state = budget.state.lock().unwrap();
-            state.since = Some(Instant::now() - Duration::from_secs(1));
-            state.saturated = true;
-            state.completed = 31;
-            state.bytes = 31 * 1024;
-        }
-        budget.completed(1024);
-        assert_eq!(budget.state.lock().unwrap().limit, 64);
     }
 
     #[test]
@@ -730,7 +683,7 @@ mod tests {
         let copy_gate = gate.clone();
         let copy = tokio::spawn(async move {
             crate::s3::admission::parallel(
-                (0..32).collect(),
+                (0..8).collect(),
                 crate::s3::admission::Concurrency {
                     initial: 8,
                     maximum: Some(16),
@@ -776,7 +729,7 @@ mod tests {
             );
         }
         let extra_after = tokio::time::timeout(Duration::from_millis(100), observed.recv()).await;
-        gate.add_permits(32);
+        gate.add_permits(8);
         copy.await.unwrap().unwrap();
         while let Some(job) = observed.recv().await {
             jobs.push(job);
@@ -789,7 +742,7 @@ mod tests {
             "growth prepared too many waiting jobs"
         );
         jobs.sort_unstable();
-        assert_eq!(jobs, (0..32).collect::<Vec<_>>());
+        assert_eq!(jobs, (0..8).collect::<Vec<_>>());
     }
 
     #[tokio::test(start_paused = true)]

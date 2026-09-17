@@ -100,7 +100,10 @@ impl Engine {
         } else {
             None
         };
-        let initial = workers.min(maximum.unwrap_or(workers));
+        // Whole-object batches already have an object-size starting estimate.
+        // Let the object controller measure fresh generations immediately,
+        // rather than first running a second, request-level concurrency search.
+        let initial = starting.min(maximum.unwrap_or(starting));
         self.tuning.report(initial);
         Ok(Concurrency {
             initial,
@@ -716,7 +719,7 @@ mod buffer_tests {
     }
 
     #[tokio::test]
-    async fn short_whole_object_batches_keep_request_preparation_bounded() {
+    async fn whole_object_batches_start_object_tuning_at_the_size_based_budget() {
         for count in [32, 128, 129, 4096] {
             let engine = planning_engine(&[]);
             let concurrency = engine
@@ -725,10 +728,10 @@ mod buffer_tests {
             assert_eq!(engine.tuning.request_limit(), 128);
             assert_eq!(concurrency.maximum, (count > 128).then_some(count.min(256)));
             if count > 128 {
-                assert_eq!(concurrency.initial, count.min(256));
+                assert_eq!(concurrency.initial, 128);
                 let requests = concurrency.requests.unwrap();
                 assert_eq!(requests.preparation_limit(), 129);
-                assert_eq!(requests.begin_objects(concurrency.initial), None);
+                assert_eq!(requests.begin_objects(concurrency.initial), Some(128));
             }
         }
         let engine = planning_engine(&["--performance-tuning", "s3-max-concurrent-objects=8"]);
