@@ -190,6 +190,11 @@ impl Budget {
                 if rate < old_rate * 1.05 {
                     s.limit = old_limit;
                     s.settled = true;
+                } else if s.completed < s.limit {
+                    // Early completions can still belong to the old setting.
+                    // Require more evidence before accepting a gain, while a
+                    // losing probe can still stop at the usual sample cadence.
+                    return;
                 }
             }
             if !s.settled && s.limit < s.max {
@@ -266,16 +271,53 @@ mod tests {
     }
 
     #[test]
+    fn request_probe_requires_enough_completions_to_accept_a_gain() {
+        let budget = Budget::new(64, true);
+        {
+            let mut state = budget.state.lock().unwrap();
+            state.since = Some(Instant::now() - Duration::from_secs(1));
+            state.saturated = true;
+        }
+        for _ in 0..16 {
+            budget.completed(4096);
+        }
+        // A partial response wave appears faster, but fewer than 128 requests
+        // have completed since increasing concurrency from 64 to 128.
+        {
+            let mut state = budget.state.lock().unwrap();
+            state.since = Some(Instant::now() - Duration::from_secs(1));
+            state.bytes = 79 * 1024;
+            state.completed = 79;
+            state.saturated = true;
+        }
+        budget.completed(1024);
+        let observed = {
+            let state = budget.state.lock().unwrap();
+            (state.limit, state.completed, state.settled)
+        };
+        assert_eq!(observed, (128, 80, false));
+        // If progress then stalls, reject the probe without waiting for 128
+        // completions. The original baseline is still available for comparison.
+        budget.state.lock().unwrap().since = Some(Instant::now() - Duration::from_secs(2));
+        budget.completed(1024);
+        let observed = {
+            let state = budget.state.lock().unwrap();
+            (state.limit, state.settled)
+        };
+        assert_eq!(observed, (64, true));
+    }
+
+    #[test]
     fn object_controller_waits_for_request_ramp_or_plateau() {
         let budget = Budget::new(64, true);
         assert_eq!(budget.begin_objects(256), None);
-        for (bytes, expected) in [(1024, 128), (2048, 256)] {
+        for (bytes, completions, expected) in [(1024, 16, 128), (2048, 128, 256)] {
             {
                 let mut s = budget.state.lock().unwrap();
                 s.since = Some(Instant::now() - Duration::from_secs(1));
                 s.saturated = true;
             }
-            for _ in 0..16 {
+            for _ in 0..completions {
                 budget.completed(bytes);
             }
             assert_eq!(budget.state.lock().unwrap().limit, expected);
