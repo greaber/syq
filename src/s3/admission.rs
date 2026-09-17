@@ -79,6 +79,7 @@ struct Controller {
     maximum: usize,
     sampler: RateWindow,
     probe: Option<Probe>,
+    probe_completed: usize,
     upward: bool,
     hold: usize,
     lower: usize,
@@ -102,6 +103,7 @@ impl Controller {
             maximum,
             sampler,
             probe: None,
+            probe_completed: 0,
             upward: initial_probe_up,
             hold: 0,
             lower: 0,
@@ -126,6 +128,11 @@ impl Controller {
         measurement_work: usize,
         old_rate: f64,
     ) -> usize {
+        // Count-independent policy tests supply enough fresh completions.
+        // Count-sensitive tests call observe_window with explicit completions.
+        if self.probe.is_some() && old_rate < rate {
+            self.probe_completed = self.probe_completed.saturating_add(active);
+        }
         self.observe_window(rate, active, queued, measurement_work, old_rate, SAMPLE)
     }
 
@@ -170,6 +177,14 @@ impl Controller {
                     return self.limit;
                 }
                 if fresh_score > 0.0 && fresh_score >= probe.baseline * floor {
+                    if probe.upward && self.probe_completed < self.limit {
+                        // The fastest replies of a new generation can arrive
+                        // first. Wait for a full count before accepting a gain,
+                        // while still rejecting measured losses promptly.
+                        self.sampler.remember(rate, fresh, elapsed);
+                        self.probe = Some(probe);
+                        return self.limit;
+                    }
                     let score = fresh_score;
                     // A small apparent improvement can be ordinary variation.
                     // Require another successful score before accepting it;
@@ -306,6 +321,7 @@ impl Controller {
                 }
             }
             if self.limit != before {
+                self.probe_completed = 0;
                 self.sampler.reset();
                 super::diagnostics::object_concurrency(before, self.limit, score);
             }
@@ -436,6 +452,7 @@ where
     let mut completed = 0usize;
     let mut generation = 0u64;
     let mut old_activity = 0u64;
+    let mut fresh_completed = 0usize;
     let mut error = None;
     let mut observations = concurrency
         .maximum
@@ -485,6 +502,8 @@ where
                         let work = bytes.saturating_add(FILE_CREDIT);
                         if prepared != generation {
                             old_activity = old_activity.saturating_add(work);
+                        } else {
+                            fresh_completed += 1;
                         }
                         activity = activity.saturating_add(work);
                         completed += 1;
@@ -509,6 +528,7 @@ where
                     activity = 0;
                     completed = 0;
                     old_activity = 0;
+                    fresh_completed = 0;
                     since = tokio::time::Instant::now();
                     continue;
                 }
@@ -531,7 +551,9 @@ where
                         });
                     }
                     let before = limit;
-                    limit = controller.as_mut().unwrap().observe_window(
+                    let controller = controller.as_mut().unwrap();
+                    controller.probe_completed = controller.probe_completed.saturating_add(fresh_completed);
+                    limit = controller.observe_window(
                         activity as f64 / elapsed.as_secs_f64(), tasks.len(), jobs.len(),
                         (completed as f64 * 4.0 * SAMPLE.as_secs_f64() / elapsed.as_secs_f64()).ceil() as usize,
                         old_activity as f64 / elapsed.as_secs_f64(),
@@ -546,6 +568,7 @@ where
                     activity = 0;
                     completed = 0;
                     old_activity = 0;
+                    fresh_completed = 0;
                     since = tokio::time::Instant::now();
                 }
             }
@@ -832,6 +855,32 @@ mod tests {
             assert_eq!(controller.lower, 64);
             controller.observe(later_rate, 128, 10000, 16, 0.0);
             assert_eq!(controller.observe(later_rate, 128, 10000, 16, 0.0), next);
+        }
+    }
+
+    #[test]
+    fn partial_fresh_waves_cannot_accept_a_gain_but_can_reject_a_loss() {
+        for (rate, expected_probe, expected_limit) in [(190.0, true, 96), (120.0, false, 64)] {
+            let mut controller = Controller::new(64, 256, true);
+            controller.upper = 128;
+            for _ in 0..3 {
+                controller.observe(128.0, 64, 10000, 16, 0.0);
+            }
+            assert_eq!(controller.limit, 96);
+            controller.observe_window(128.0, 96, 10000, 16, 128.0, SAMPLE);
+            for _ in 0..2 {
+                controller.probe_completed += 40;
+                controller.observe_window(rate, 96, 10000, 16, 0.0, SAMPLE);
+            }
+            assert_eq!(controller.probe.is_some(), expected_probe);
+            assert_eq!(controller.limit, expected_limit);
+            if expected_probe {
+                // More replies complete the count at a useful sustained rate.
+                controller.probe_completed += 16;
+                controller.observe_window(160.0, 96, 10000, 16, 0.0, SAMPLE);
+                assert!(controller.probe.is_none());
+                assert_eq!(controller.limit, 96);
+            }
         }
     }
 
