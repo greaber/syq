@@ -153,7 +153,9 @@ impl Budget {
     }
     pub fn begin_objects(&self, workers: usize) -> Option<usize> {
         let mut s = self.state.lock().unwrap();
-        if s.adaptive && !s.settled && s.limit < workers {
+        // Reaching the object seed is not evidence that the last increase helped.
+        // Resolve that probe before allowing the object controller to grow again.
+        if s.adaptive && !s.settled && (s.limit < workers || s.previous.is_some()) {
             return None;
         }
         // Freeze the request ramp while the scheduler drains its existing jobs.
@@ -185,19 +187,27 @@ impl Budget {
         // The first window includes startup and is deliberately only a baseline.
         let rate = s.bytes as f64 / elapsed.as_secs_f64();
         let before = s.limit;
-        if s.saturated {
+        if s.saturated || s.previous.is_some() {
             if let Some((old_limit, old_rate)) = s.previous {
+                // At the object seed there may be no request waiter. A partial
+                // response wave then understates capacity on long-latency paths;
+                // collect a full count before accepting or rejecting this probe.
+                if !s.saturated && s.completed < s.limit {
+                    return;
+                }
                 if rate < old_rate * 1.05 {
                     s.limit = old_limit;
                     s.settled = true;
                 } else if s.completed < s.limit {
                     // Early completions can still belong to the old setting.
                     // Require more evidence before accepting a gain, while a
-                    // losing probe can still stop at the usual sample cadence.
+                    // saturated losing probe can stop at the usual sample cadence.
                     return;
+                } else {
+                    s.previous = None;
                 }
             }
-            if !s.settled && s.limit < s.max {
+            if !s.settled && s.saturated && s.limit < s.max {
                 s.previous = Some((s.limit, rate));
                 s.limit = (s.limit * 2).min(s.max);
             }
@@ -321,10 +331,18 @@ mod tests {
                 budget.completed(bytes);
             }
             assert_eq!(budget.state.lock().unwrap().limit, expected);
-            if expected < 256 {
-                assert_eq!(budget.begin_objects(256), None);
-            }
+            assert_eq!(budget.begin_objects(256), None);
         }
+        // The final increase must be evaluated even without a request waiter.
+        {
+            let mut s = budget.state.lock().unwrap();
+            s.since = Some(Instant::now() - Duration::from_secs(1));
+            s.completed = 255;
+            s.bytes = 255 * 4096;
+            assert!(!s.saturated);
+        }
+        budget.completed(4096);
+        assert!(budget.state.lock().unwrap().previous.is_none());
         assert_eq!(budget.begin_objects(256), Some(256));
         assert!(!budget.rejected_increase());
         assert_eq!(budget.state.lock().unwrap().limit, 256);
@@ -338,6 +356,34 @@ mod tests {
         assert_eq!(budget.state.lock().unwrap().limit, 64);
         budget.finish_objects(512);
         assert!(!budget.state.lock().unwrap().adaptive);
+    }
+
+    #[test]
+    fn final_request_probe_keeps_partial_samples_before_rejecting_a_loss() {
+        let budget = Budget::new(256, true);
+        let since = Instant::now() - Duration::from_secs(1);
+        {
+            let mut s = budget.state.lock().unwrap();
+            s.since = Some(since);
+            s.previous = Some((128, 1024.0 * 1024.0));
+        }
+        // Even an apparent loss may just be an incomplete response wave when
+        // there is no waiter. Neither hand off nor discard the pending sample.
+        for count in 1..256 {
+            budget.completed(1024);
+            assert_eq!(budget.begin_objects(256), None);
+            let s = budget.state.lock().unwrap();
+            assert_eq!(s.completed, count);
+            assert_eq!(s.bytes, count as u64 * 1024);
+            assert_eq!(s.since, Some(since));
+            assert!(!s.settled);
+        }
+        budget.completed(1024);
+        assert!(budget.rejected_increase());
+        assert_eq!(budget.begin_objects(256), Some(128));
+        assert_eq!(budget.preparation_limit(), 129);
+        budget.finish_objects(512);
+        assert_eq!(budget.state.lock().unwrap().limit, 512);
     }
 
     #[tokio::test(start_paused = true)]
