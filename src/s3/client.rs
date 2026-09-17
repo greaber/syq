@@ -353,7 +353,7 @@ pub(super) struct Listing {
 }
 
 /// Keep flat listings for small trees and filename filters. Only switch to
-/// directory discovery when the first full page shows excluded descendants.
+/// directory discovery when the first full page contains only excluded descendants.
 /// Probe one directory page, but accept it only when it prunes a subtree and
 /// leaves at most one child to visit. Otherwise reuse the flat sample. This
 /// prevents an exclusion from turning a wide tree into one request per folder.
@@ -392,7 +392,8 @@ pub(super) async fn list(
             result.found |= !output.contents().is_empty() || !output.common_prefixes().is_empty();
             if token.is_none()
                 && output.is_truncated() == Some(true)
-                && output.contents().iter().any(|object| {
+                && !output.contents().is_empty()
+                && output.contents().iter().all(|object| {
                     object.key().is_some_and(|key| {
                         key.rsplit_once('/')
                             .is_some_and(|(parent, _)| ignored(parent, true))

@@ -208,15 +208,16 @@ fn serve(
                         )
                     }
                 }
-                "listing-flat" => {
+                "listing-flat" | "listing-mixed" => {
                     assert!(
                         !query.contains_key("delimiter"),
                         "filename filter caused directory traversal"
                     );
-                    (
-                        object("data/dir/file.tmp"),
-                        !query.contains_key("continuation-token"),
-                    )
+                    let mut body = object("data/dir/file.tmp");
+                    if fault == "listing-mixed" && !query.contains_key("continuation-token") {
+                        body.push_str(&object("data/archive/file"));
+                    }
+                    (body, !query.contains_key("continuation-token"))
                 }
                 _ => panic!("unknown listing fixture"),
             };
@@ -1291,6 +1292,11 @@ fn s3_listing_costs_are_bounded_without_changing_selection() {
         ("listing-all-ignored", vec!["--ignore", "archive/"], 3),
         ("listing-flat", vec!["--ignore", "*.tmp"], 3),
         ("listing-wide", vec!["--ignore", "archive/"], 4),
+        (
+            "listing-mixed",
+            vec!["--ignore", "archive/", "--ignore", "*.tmp"],
+            3,
+        ),
     ] {
         let server = Server::start(fault);
         let temp = tempfile::tempdir().unwrap();
@@ -1331,7 +1337,9 @@ fn s3_listing_costs_are_bounded_without_changing_selection() {
         );
         assert_eq!(
             terminal["files_excluded"],
-            if fault == "listing-flat" || fault == "listing-wide" {
+            if fault == "listing-mixed" {
+                3
+            } else if fault == "listing-flat" || fault == "listing-wide" {
                 2
             } else {
                 0
