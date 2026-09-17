@@ -33,7 +33,7 @@ def run(label, args, timeout=1800, extra_env=None, required=True):
     print('START', label, flush=True)
     start = time.monotonic()
     process = subprocess.Popen(args, env=extra_env or env, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                               stderr=subprocess.STDOUT, text=True, errors="backslashreplace", start_new_session=True)
     expired = threading.Event()
     def kill():
         expired.set()
@@ -54,6 +54,10 @@ def run(label, args, timeout=1800, extra_env=None, required=True):
                 if not line.startswith('{'):
                     print(line, end='', flush=True)
         code = process.wait()
+    except BaseException:
+        kill()
+        process.wait()
+        raise
     finally:
         timer.cancel()
     row = {'label': label, 'seconds': time.monotonic() - start, 'exit_code': code,
