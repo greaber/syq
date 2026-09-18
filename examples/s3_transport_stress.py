@@ -19,7 +19,8 @@ import urllib.request
 
 ROOT = Path.cwd()
 assert subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip() == str(ROOT)
-D = ROOT / 'target/transport-stress'
+PLAIN_HTTP = os.environ.get('SYQ_STRESS_HTTP') == '1'
+D = ROOT / ('target/transport-stress-http' if PLAIN_HTTP else 'target/transport-stress')
 D.mkdir(exist_ok=True)
 STAGE = D / 'stage'
 STAGE.mkdir(exist_ok=True)
@@ -46,7 +47,7 @@ active = None
 results = json.loads((D / "results.json").read_text()) if (D / "results.json").exists() else []
 for previous in results:
     previous.setdefault("commit", "d8e5585f")
-COMMIT = command_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+COMMIT = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 cleanup = json.loads((D / "cleanup.json").read_text()) if (D / "cleanup.json").exists() else []
 
 def command(args, **kwargs):
@@ -146,10 +147,10 @@ try:
                       '--tmpfs', '/data:rw,size=2g', '-p', '127.0.0.1::9000',
                       '-v', str(CERT) + ':/certs:ro', '-e', 'MINIO_ROOT_USER=syq-test-user',
                       '-e', 'MINIO_ROOT_PASSWORD=syq-test-password', MINIO,
-                      'server', '/data', '--certs-dir', '/certs'])
+                      'server', '/data'] + ([] if PLAIN_HTTP else ['--certs-dir', '/certs']))
     port = command(['docker', 'inspect', '--format',
                     '{{(index (index .NetworkSettings.Ports "9000/tcp") 0).HostPort}}', server])
-    endpoint = 'https://127.0.0.1:' + port
+    endpoint = ('http' if PLAIN_HTTP else 'https') + '://127.0.0.1:' + port
     os.environ['AWS_ENDPOINT_URL_S3'] = endpoint
     deadline = time.monotonic() + 60
     while True:
@@ -187,6 +188,8 @@ try:
         {'name': 'writeback-pressure', 'fixture': 'large', 'cpus': '0-7', 'concurrency': 64},
         {'name': 'small-file-fanout', 'fixture': 'small', 'cpus': '0-1', 'concurrency': 64},
     ]
+    if PLAIN_HTTP:
+        cases = [{'name': 'one-core-http', 'fixture': 'large', 'cpus': '0', 'concurrency': 64}]
     for case in cases:
         unit = fixtures[case['fixture']]['count'] * fixtures[case['fixture']]['size']
         pilot_repeats = max(1, (2 * 1024**3) // unit)
