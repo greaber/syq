@@ -7631,12 +7631,14 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
     let rsh = fake_rsh(&t);
     let data = prng(9 * 1024 * 1024 + 123, 905);
     write(&t.path("source"), &data);
-    // Old-format remembered counts must neither override the cap nor be replaced.
-    let cache = br#"{"paths":{"local>host|tcp":64,"local>host|ssh":64}}"#;
-    write(&t.path("tuning.json"), cache);
     for route in ["local", "tcp", "ssh"] {
-        for limit in [1, 3] {
-            let label = format!("{route}-{limit}");
+        for (remembered, limit) in [(64, 1), (64, 3), (2, 3)] {
+            // Keep the old cache format; cover hints above and below the cap.
+            let cache = format!(
+                r#"{{"paths":{{"local>host|tcp":{remembered},"local>host|ssh":{remembered}}}}}"#
+            );
+            write(&t.path("tuning.json"), cache.as_bytes());
+            let label = format!("{route}-{remembered}-{limit}");
             let events = t.path(&format!("events-{label}"));
             let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
             command.args([
@@ -7679,6 +7681,15 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
             let out = command.run().unwrap();
             assert_output_ok(&out);
             assert!(stderr_of(&out).contains("auto-tuned"), "{out:?}");
+            if route != "local" {
+                let start = remembered.min(limit);
+                assert!(
+                    stderr_of(&out).contains(&format!(
+                        "starting with {start} connections remembered for this path"
+                    )),
+                    "{out:?}"
+                );
+            }
             assert_eq!(read(&t.path(&label)), data);
             let observed = fs::read_to_string(&events).unwrap();
             let connected: Vec<_> = observed
@@ -7690,7 +7701,7 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
                 let id: usize = line.split_whitespace().nth(1).unwrap().parse().unwrap();
                 assert!(id < limit, "{label}: {observed}");
             }
-            assert_eq!(read(&t.path("tuning.json")), cache);
+            assert_eq!(read(&t.path("tuning.json")), cache.as_bytes());
         }
     }
 }

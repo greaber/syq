@@ -2,9 +2,9 @@
 
 `--performance-tuning` overrides syq's automatic choices. To keep automatic
 choices within a ceiling, use [resource limits](resource-limits.md) instead.
-Leave performance tuning unset for everyday copies. These experimental controls are available in `syq cp` and
-`syq rsync`; `syq rm` and `syq clean-partials` accept only `workers` for filesystem
-removal.
+Leave performance tuning unset for everyday copies. These experimental controls
+are available in `syq cp` and `syq rsync`; `syq rm` and `syq clean-partials` accept
+only `workers` for filesystem removal.
 
 ## Transfer controls
 
@@ -78,8 +78,10 @@ before syq learns a better count.
 
 The cache is `~/.cache/syq/tuning.json`; `XDG_CACHE_HOME` changes its parent.
 `SYQ_TUNING_CACHE` names another file, or disables the cache when empty.
-Supplying `--performance-tuning` or `--resource-limits workers=N` bypasses the
-cache. A bandwidth limit alone still uses it.
+Supplying `--performance-tuning` bypasses the cache. With
+`--resource-limits workers=N`, syq starts from the remembered count or the
+ceiling, whichever is lower, and leaves the cache unchanged. A bandwidth limit
+alone still reads and updates it.
 Live tuning continues unless you fix `workers`. Use `-vv` to see the starting count.
 
 ## Filesystem tuning examples

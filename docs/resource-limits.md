@@ -74,8 +74,9 @@ For local/S3 copies, the limit applies to scheduled data, with upload bursts
 up to a part. Server-side S3 copies do not pass object bodies through this
 machine and are not paced by this setting.
 
-A worker ceiling bypasses the remembered connection-count cache. A bandwidth
-limit alone still uses it. Live tuning runs unless you fix `workers` through
+With a worker ceiling, syq uses the remembered connection count up to that
+ceiling and leaves the cache unchanged. A bandwidth limit alone still reads
+and updates it. Live tuning runs unless you fix `workers` through
 `--performance-tuning`; see
 [remembered connection counts](tuning.md#remembered-connection-counts).
 

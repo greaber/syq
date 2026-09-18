@@ -2816,15 +2816,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_TCP.min(args.automatic_worker_limit());
             gate.set_active(args.connections);
         }
-        let tuning_key = (autotune
-            && args.tuning_options.is_none()
-            && args
-                .resource_limits
-                .as_ref()
-                .is_none_or(|limits| limits.workers.is_none()))
-        .then(|| tune::path_key(&src_ep, &dst_ep))
-        .flatten();
-        let remembered_start = tuning_key.as_deref().and_then(tune::cached);
+        let tuning_key = (autotune && args.tuning_options.is_none())
+            .then(|| tune::path_key(&src_ep, &dst_ep))
+            .flatten();
+        let remembered_start = tuning_key
+            .as_deref()
+            .and_then(tune::cached)
+            .map(|remembered| remembered.min(args.automatic_worker_limit()));
         if let Some(remembered) = remembered_start {
             args.connections = remembered;
             gate.set_active(remembered);
@@ -3486,6 +3484,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !opts.verify_only
         && scan_err.is_none()
         && !collision
+        // A capped run can use an unrestricted hint, but cannot replace it.
+        && args
+            .resource_limits
+            .as_ref()
+            .is_none_or(|limits| limits.workers.is_none())
     {
         if let Some(policy) = tuned.as_ref().filter(|policy| policy.measured()) {
             // A TCP failure affects later connections but leaves earlier TCP
