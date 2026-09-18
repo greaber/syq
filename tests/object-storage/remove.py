@@ -41,7 +41,7 @@ def run(args, ok=True):
 
 def check():
     with tempfile.TemporaryDirectory(prefix='syq-s3-remove-') as temp:
-        root = Path(temp)
+        root = Path(temp).resolve()
         os.environ['XDG_CACHE_HOME'] = str(root / 'cache')
         c.request('PUT', 'file', b'old')
         c.request('PUT', 'file', b'new')

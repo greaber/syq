@@ -510,7 +510,8 @@ fn macos_clone_descriptor_pressure_preserves_ordinary_copy() {
         if force_ranges {
             command.arg("--performance-tuning=copy-path=ranges");
         }
-        // The default 64-worker ceiling needs current_open + 1572 slots
+        command.arg("--performance-tuning=workers=64");
+        // A fixed 64-worker copy needs current_open + 1572 slots
         // without cloning, and 192 more with it. Both copies must fit the
         // same limit; disabling an optimization must not require fewer workers.
         set_child_nofile_limit(&mut command, 1664);

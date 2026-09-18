@@ -5,7 +5,7 @@ spec=importlib.util.spec_from_file_location('checks',pathlib.Path(__file__).with
 c=importlib.util.module_from_spec(spec);spec.loader.exec_module(c)
 binary=str(pathlib.Path(sys.argv[1]).resolve())
 with tempfile.TemporaryDirectory(prefix='syq-fast-check-') as tmp:
-    root=pathlib.Path(tmp);source=root/'source';source.mkdir();cache=root/'cache'
+    root=pathlib.Path(tmp).resolve();source=root/'source';source.mkdir();cache=root/'cache'
     env={**os.environ,'XDG_CACHE_HOME':str(cache)}
     def run(*args):
         subprocess.run([binary,'cp','--no-progress',*map(str,args)],env=env,check=True,timeout=180)
