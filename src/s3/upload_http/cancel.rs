@@ -1,9 +1,12 @@
-//! Retire blocking upload sockets on cancellation, without a transfer deadline.
+//! Cancel requests, streaming responses, and blocking upload sockets.
 use aws_smithy_runtime_api::client::{http::HttpConnectorFuture, result::ConnectorError};
 use std::{
+    future::Future,
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
+    pin::Pin,
     sync::{Arc, Mutex, Weak},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
@@ -20,7 +23,7 @@ struct State {
 #[derive(Debug, Default)]
 pub(in crate::s3) struct Cancellation {
     state: Mutex<State>,
-    changed: Notify,
+    changed: Arc<Notify>,
 }
 
 fn interrupted() -> io::Error {
@@ -63,9 +66,60 @@ impl Cancellation {
             tokio::select! {
                 biased;
                 _ = &mut cancelled => Err(ConnectorError::other(interrupted().into(), None)),
-                result = request => result,
+                result = request => {
+                    let mut response = result?;
+                    let body = std::mem::replace(response.body_mut(), aws_smithy_types::body::SdkBody::empty());
+                    *response.body_mut() = cancellation.body(body);
+                    Ok(response)
+                },
             }
         })
+    }
+
+    fn body(
+        self: &Arc<Self>,
+        body: aws_smithy_types::body::SdkBody,
+    ) -> aws_smithy_types::body::SdkBody {
+        let mut changed = Box::pin(self.changed.clone().notified_owned());
+        changed.as_mut().enable();
+        let cancelled = self.state.lock().unwrap().cancelled;
+        aws_smithy_types::body::SdkBody::from_body_1_x(ResponseBody {
+            body,
+            changed,
+            cancelled,
+        })
+    }
+}
+
+// Keep cancellation active after headers arrive, including SDK deserialization
+// of control responses and streaming GET bodies. Otherwise a body with no
+// deadline could prevent the engine from draining after Ctrl-C.
+struct ResponseBody {
+    body: aws_smithy_types::body::SdkBody,
+    changed: Pin<Box<tokio::sync::futures::OwnedNotified>>,
+    cancelled: bool,
+}
+impl http_body::Body for ResponseBody {
+    type Data = bytes::Bytes;
+    type Error = aws_smithy_types::body::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.cancelled || self.changed.as_mut().poll(cx).is_ready() {
+            self.cancelled = true;
+            return Poll::Ready(Some(Err(interrupted().into())));
+        }
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
     }
 }
 

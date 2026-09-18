@@ -7,7 +7,6 @@ use std::sync::atomic::AtomicUsize;
 
 const HELPER_VERSION: u16 = 1;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
-const FINISH_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 3600);
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -467,15 +466,9 @@ fn relay(
     let download = std::thread::spawn(move || {
         let _ = done.send(pump(&mut output, &mut writer));
     });
-    let deadline = Instant::now() + FINISH_TIMEOUT;
     let result = loop {
         if cancelled() {
             break Err(anyhow::anyhow!("return connection stopped during copy"));
-        }
-        if Instant::now() >= deadline {
-            break Err(anyhow::anyhow!(
-                "remote copy exceeded its seven-day lifetime"
-            ));
         }
         match completions.recv_timeout(Duration::from_millis(100)) {
             Ok(result) => break result.map(|_| ()).map_err(Into::into),

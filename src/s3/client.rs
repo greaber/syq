@@ -52,25 +52,15 @@ pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
     aws_sdk_s3::config::Builder::new().retry_config(RetryConfig::disabled())
 }
 
-/// A slow upload can take arbitrarily long. Neither elapsed request time nor
-/// the rate at which Hyper polls a buffered body establishes a network stall.
-/// Keep connection timeouts and response-body protection, but wait for the
-/// provider's answer or explicit cancellation before retiring an upload.
-pub(super) fn upload_config() -> aws_sdk_s3::config::Builder {
-    without_sdk_retries()
-        .timeout_config(
-            TimeoutConfig::builder()
-                .connect_timeout(Duration::from_secs(15))
-                .disable_read_timeout()
-                .disable_operation_timeout()
-                .disable_operation_attempt_timeout()
-                .build(),
-        )
-        .stalled_stream_protection(
-            aws_sdk_s3::config::StalledStreamProtectionConfig::enabled()
-                .upload_enabled(false)
-                .build(),
-        )
+/// Only establishing a connection has a deadline. Request headers, response
+/// bodies, and pauses between bytes can all take arbitrarily long.
+pub(super) fn request_timeouts() -> TimeoutConfig {
+    TimeoutConfig::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .disable_read_timeout()
+        .disable_operation_timeout()
+        .disable_operation_attempt_timeout()
+        .build()
 }
 
 /// Time HEAD and LIST responses to their headers. Each is one small exchange,
@@ -259,12 +249,8 @@ pub(super) async fn connect(
         )
         .retry_config(RetryConfig::standard().with_max_attempts(options.retries + 1))
         .retry_classifier(Throttling)
-        .timeout_config(
-            TimeoutConfig::builder()
-                .connect_timeout(Duration::from_secs(15))
-                .read_timeout(Duration::from_secs(60))
-                .build(),
-        )
+        .timeout_config(request_timeouts())
+        .stalled_stream_protection(aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
         // Explicit payload checksums avoid aws-chunked trailers, which several
         // S3-compatible services do not implement. Downloads retain SDK checks.
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)

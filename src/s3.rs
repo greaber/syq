@@ -7,7 +7,6 @@ mod diagnostics;
 mod dns;
 mod local;
 mod prune;
-mod read_recovery;
 mod state;
 mod transfer;
 mod tuning;

@@ -211,7 +211,6 @@ pub(super) fn client(
         .max_redirects(0)
         .timeout_resolve(Some(Duration::from_secs(15)))
         .timeout_connect(Some(Duration::from_secs(15)))
-        .timeout_recv_body(Some(Duration::from_secs(60)))
         .max_idle_connections(256)
         .max_idle_connections_per_host(256)
         .output_buffer_size(64 * 1024)

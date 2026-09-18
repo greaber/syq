@@ -156,8 +156,6 @@ impl Engine {
             None => self.tuning.requests.acquire().await,
         };
         let mut attempt = 0;
-        // Hold the process-local recovery slot until the retried range finishes.
-        let mut recovery = None;
         let mut done = 0;
         let mut hash = algorithm.map(HashAlgorithm::hasher);
         let mut batch = Vec::new();
@@ -166,9 +164,6 @@ impl Engine {
         loop {
             self.check_cancelled()?;
             let started = crate::s3::diagnostics::start();
-            let body_started = tokio::time::Instant::now();
-            let mut waited = Duration::ZERO;
-            let mut next_check = Duration::from_secs(1);
             let attempt_offset = offset + done;
             let attempt_length = length - done;
             let result = async {
@@ -211,30 +206,10 @@ impl Engine {
                     }
                     response.body
                 };
-                let mut recover = |done: u64, waited: Duration| {
-                    if attempt != 0
-                        || self.options.retries == 0
-                        || done >= length
-                        || waited < next_check
-                    {
-                        return false;
-                    }
-                    next_check = waited + Duration::from_millis(250);
-                    recovery = self.tuning.reads.retry(length, body_started, waited);
-                    if recovery.is_some() {
-                        crate::s3::diagnostics::record(serde_json::json!({
-                            "phase": "download_slow_retry", "bytes": length,
-                            "received": done, "network_wait_s": waited.as_secs_f64(),
-                        }));
-                    }
-                    recovery.is_some()
-                };
                 if !output.direct() {
                     let mut body = body;
                     loop {
-                        let bytes =
-                            read_body(body.next(), &mut waited, |elapsed| recover(done, elapsed))
-                                .await?;
+                        let bytes = body.next().await;
                         let Some(bytes) = bytes else { break };
                         let mut bytes = bytes?;
                         if bytes.len() as u64 > length - done {
@@ -282,7 +257,6 @@ impl Engine {
                                 batch_size = 0;
                             }
                         }
-                        anyhow::ensure!(!recover(done, waited), SlowRead);
                     }
                     anyhow::ensure!(done == length, "S3 body truncated");
                     if batch_size != 0 {
@@ -304,12 +278,7 @@ impl Engine {
                 let mut buffer = writer::Aligned::new(1024 * 1024)?;
                 while done < length {
                     let want = (length - done).min(1024 * 1024) as usize;
-                    read_body(
-                        body.read_exact(&mut buffer.bytes_mut()[..want]),
-                        &mut waited,
-                        |elapsed| recover(done, elapsed),
-                    )
-                    .await??;
+                    body.read_exact(&mut buffer.bytes_mut()[..want]).await?;
                     anyhow::ensure!(
                         (offset + done).is_multiple_of(4096)
                             && (want.is_multiple_of(4096)
@@ -325,11 +294,9 @@ impl Engine {
                     self.pace(want as u64).await?;
                     buffer = output.write_direct(buffer, offset + done, padded).await?;
                     done += want as u64;
-                    anyhow::ensure!(!recover(done, waited), SlowRead);
                 }
                 let mut extra = [0];
-                if tokio::time::timeout(Duration::from_secs(60), body.read(&mut extra)).await?? != 0
-                {
+                if body.read(&mut extra).await? != 0 {
                     return Err(Permanent("S3 body exceeded length".into()).into());
                 }
                 Ok::<String, anyhow::Error>(
@@ -341,11 +308,6 @@ impl Engine {
             .await;
             match result {
                 Ok(hash) => {
-                    self.tuning.reads.completed(
-                        attempt_length,
-                        waited,
-                        tokio::time::Instant::now(),
-                    );
                     crate::s3::diagnostics::elapsed(started, "download_range", attempt_length);
                     self.tuning.requests.completed(length);
                     self.progress.add_bytes(length);
@@ -356,16 +318,15 @@ impl Engine {
                         && e.downcast_ref::<Permanent>().is_none() =>
                 {
                     output.finish().await?;
-                    if e.downcast_ref::<SlowRead>().is_none() {
-                        // Only our own slow-read decision trusts the prefix.
-                        // Errors from the response/transport restart the range.
-                        done = 0;
-                        hash = algorithm.map(HashAlgorithm::hasher);
-                        batch.clear();
-                        fragments.clear();
-                        batch_size = 0;
-                        crate::s3::backoff(attempt).await;
-                    }
+                    self.check_cancelled()?;
+                    // Transport errors restart the whole range, retaining its
+                    // identity precondition and the existing retry budget.
+                    done = 0;
+                    hash = algorithm.map(HashAlgorithm::hasher);
+                    batch.clear();
+                    fragments.clear();
+                    batch_size = 0;
+                    crate::s3::backoff(attempt).await;
                     attempt += 1;
                 }
                 Err(e) => return Err(e),
@@ -377,43 +338,6 @@ impl Engine {
 fn flush_fragments(batch: &mut Vec<bytes::Bytes>, fragments: &mut bytes::BytesMut) {
     if !fragments.is_empty() {
         batch.push(std::mem::take(fragments).freeze());
-    }
-}
-
-#[derive(Debug)]
-struct SlowRead;
-impl std::fmt::Display for SlowRead {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("S3 body progressing much more slowly than completed peers")
-    }
-}
-impl std::error::Error for SlowRead {}
-
-// Keep a pending read alive across observations. In particular, cancelling
-// read_exact at each tick would lose track of bytes already consumed into its
-// buffer. A recovery discards that unfinished read; only previously processed
-// bytes, their hash and the pending write batch survive the writer barrier.
-async fn read_body<F: std::future::Future>(
-    read: F,
-    waited: &mut Duration,
-    mut recover: impl FnMut(Duration) -> bool,
-) -> Result<F::Output> {
-    let started = tokio::time::Instant::now();
-    tokio::pin!(read);
-    loop {
-        match tokio::time::timeout(Duration::from_secs(1), &mut read).await {
-            Ok(result) => {
-                *waited += started.elapsed();
-                return Ok(result);
-            }
-            Err(_) => {
-                anyhow::ensure!(
-                    started.elapsed() < Duration::from_secs(60),
-                    "S3 body read timed out"
-                );
-                anyhow::ensure!(!recover(*waited + started.elapsed()), SlowRead);
-            }
-        }
     }
 }
 
@@ -539,30 +463,6 @@ mod buffer_tests {
         assert_eq!(&actual[..7], b"prefix!");
         assert_eq!(&actual[7..], expected);
         assert_eq!(live.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pending_read_exact_keeps_consumed_bytes_across_observations() {
-        use tokio::io::AsyncWriteExt;
-        let (mut send, mut recv) = tokio::io::duplex(4);
-        let writer = tokio::spawn(async move {
-            send.write_all(b"ab").await.unwrap();
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            send.write_all(b"cd").await.unwrap();
-        });
-        let mut bytes = [0; 4];
-        let mut waited = Duration::ZERO;
-        let mut observations = 0;
-        read_body(recv.read_exact(&mut bytes), &mut waited, |_| {
-            observations += 1;
-            false
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        writer.await.unwrap();
-        assert!(observations >= 1);
-        assert_eq!(&bytes, b"abcd");
     }
 
     pub(super) fn planning_engine(extra: &[&str]) -> Engine {

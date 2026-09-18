@@ -51,10 +51,10 @@ impl HttpConnector for SlowTransport {
 }
 
 #[derive(Debug)]
-struct UploadPolicy;
-impl Intercept for UploadPolicy {
+struct RequestPolicy;
+impl Intercept for RequestPolicy {
     fn name(&self) -> &'static str {
-        "CheckUploadPolicy"
+        "CheckRequestPolicy"
     }
     fn read_before_transmit(
         &self,
@@ -71,36 +71,36 @@ impl Intercept for UploadPolicy {
             .load::<aws_sdk_s3::config::StalledStreamProtectionConfig>()
             .unwrap();
         assert!(!protection.upload_enabled());
-        assert!(protection.download_enabled());
+        assert!(!protection.download_enabled());
         Ok(())
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn uploads_can_take_hours_without_changing_control_or_download_deadlines() {
-    let client = Client::from_conf(
-        aws_sdk_s3::config::Builder::new()
-            .behavior_version_latest()
-            .region(Region::new("us-east-1"))
-            .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "test", "test", None, None, "fixture",
-            ))
-            .retry_config(RetryConfig::disabled())
-            .timeout_config(
-                TimeoutConfig::builder()
-                    .connect_timeout(Duration::from_secs(15))
-                    .read_timeout(Duration::from_secs(60))
-                    .build(),
-            )
-            .http_client(http_client_fn(|settings, _| {
-                assert_eq!(settings.connect_timeout(), Some(Duration::from_secs(15)));
-                SharedHttpConnector::new(SlowTransport {
-                    read_timeout: settings.read_timeout(),
-                })
-            }))
-            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-            .build(),
-    );
+async fn requests_can_take_hours_without_duration_or_stall_deadlines() {
+    let client =
+        Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version_latest()
+                .region(Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test", "test", None, None, "fixture",
+                ))
+                .retry_config(RetryConfig::disabled())
+                .timeout_config(request_timeouts())
+                .stalled_stream_protection(
+                    aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+                )
+                .interceptor(RequestPolicy)
+                .http_client(http_client_fn(|settings, _| {
+                    assert_eq!(settings.connect_timeout(), Some(Duration::from_secs(15)));
+                    SharedHttpConnector::new(SlowTransport {
+                        read_timeout: settings.read_timeout(),
+                    })
+                }))
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                .build(),
+        );
     let start = tokio::time::Instant::now();
     client
         .put_object()
@@ -110,8 +110,8 @@ async fn uploads_can_take_hours_without_changing_control_or_download_deadlines()
             b"slow upload",
         ))
         .customize()
-        .config_override(upload_config())
-        .interceptor(UploadPolicy)
+        .config_override(without_sdk_retries())
+        .interceptor(RequestPolicy)
         .send()
         .await
         .unwrap();
@@ -127,23 +127,23 @@ async fn uploads_can_take_hours_without_changing_control_or_download_deadlines()
             b"slow upload",
         ))
         .customize()
-        .config_override(upload_config())
-        .interceptor(UploadPolicy)
+        .config_override(without_sdk_retries())
+        .interceptor(RequestPolicy)
         .send()
         .await
         .unwrap();
     assert_eq!(start.elapsed(), Duration::from_secs(7200));
     let start = tokio::time::Instant::now();
-    assert!(client
+    client
         .head_object()
         .bucket("bucket")
         .key("object")
         .send()
         .await
-        .is_err());
-    assert_eq!(start.elapsed(), Duration::from_secs(60));
+        .unwrap();
+    assert_eq!(start.elapsed(), Duration::from_secs(7200));
     let start = tokio::time::Instant::now();
-    assert!(client
+    client
         .get_object()
         .bucket("bucket")
         .key("object")
@@ -151,6 +151,6 @@ async fn uploads_can_take_hours_without_changing_control_or_download_deadlines()
         .config_override(without_sdk_retries())
         .send()
         .await
-        .is_err());
-    assert_eq!(start.elapsed(), Duration::from_secs(60));
+        .unwrap();
+    assert_eq!(start.elapsed(), Duration::from_secs(7200));
 }
