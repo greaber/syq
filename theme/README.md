@@ -70,7 +70,7 @@ blue Manrope wordmark above an Open Sans title. This adds character to the
 homepages while retaining the compact navigation and normal article headings.
 The docs homepage preserves its copy-files-with-syq fragment for existing links.
 
-The homepage leads with fast, programmable file operations and a short
+The homepage leads with fast, programmable file transfer and a short
 description of copying, reorganizing, removing, resuming and automation.
 Shared landing-actions buttons offer installation, benchmarks, sending files
 home, server-to-server copies and programmable file placement. Quickstart
