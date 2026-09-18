@@ -112,19 +112,6 @@ def render(command, parsed, commands):
         if len(command) == 1 and children and heading == "Help and version":
             heading = "Help (also available on subcommands)"
         title = f"## {heading}" if len(command) == 1 and not children and not command[0].startswith("--") else f"**{heading}**"
-        if command == ("cp",):
-            # Preserve links to the previously published section headings.
-            aliases = {
-                "Sources and filtering": ["sources-and-selection"],
-                "Destination and mapping": ["destination-placement"],
-                "Updates and deletion": ["copy-policy-and-filtering"],
-                "Verification": ["integrity-checking"],
-                "Connections and remote execution": ["ssh-and-transport", "remote-to-remote-transfers"],
-                "Performance and resource limits": ["performance-tuning", "resource-limits"],
-                "Preview, progress, and results": ["progress-and-results", "preview-and-output"],
-            }
-            for old in aliases.get(heading, []):
-                out += [f'<a id="{old}"></a>', ""]
         out += [title, "", "| Argument / option | Meaning |", "|---|---|"]
         for signature, description in rows:
             body = prose(description)

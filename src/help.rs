@@ -198,7 +198,9 @@ pub(crate) fn filesystem(command: Command) -> Command {
             ) || (rm && id == "root")
                 || (clean && matches!(id, "trees" | "on"))
         };
-        let heading =
+        let heading = if cp {
+            copy_heading(id).0
+        } else {
             match id {
                 "sources" | "trees" | "on" | "paths" | "src" | "srcs_in" | "src_non_dir"
                 | "src_dir" | "src_non_dirs" | "src_dirs" | "srcs" | "from" | "cwd" | "root"
@@ -222,15 +224,9 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 "help" | "version" => "Help and version",
                 "dry_run" | "verbose" | "quiet" => "Preview and output",
                 _ => "Copy policy and filtering",
-            };
+            }
+        };
         let mut arg = arg.hide_short_help(!common).help_heading(heading);
-        if cp {
-            let (heading, order) = copy_heading(id);
-            let within_group = arg.get_display_order().min(99);
-            arg = arg
-                .help_heading(heading)
-                .display_order(order * 100 + within_group);
-        }
         // Keep detailed rsync semantics in the full reference.
         if rsync && matches!(id, "ignore" | "delete") {
             if arg.get_long_help().is_none() {

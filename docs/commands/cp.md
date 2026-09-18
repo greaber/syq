@@ -16,8 +16,6 @@ and [results](../automation.md).
 syq cp [OPTIONS] SOURCE... [PLACEMENT]
 ```
 
-<a id="sources-and-selection"></a>
-
 ## Sources and filtering
 
 | Argument / option | Meaning |
@@ -38,8 +36,6 @@ syq cp [OPTIONS] SOURCE... [PLACEMENT]
 | `--min-size <SIZE>` | Skip regular source files smaller than SIZE; --prune protects their destination paths |
 | `[PATH]...` | Named source objects (shorthand for --src) |
 
-<a id="destination-placement"></a>
-
 ## Destination and mapping
 
 | Argument / option | Meaning |
@@ -52,8 +48,6 @@ syq cp [OPTIONS] SOURCE... [PLACEMENT]
 | `--as-new <PATH>` | Map one named source exactly to PATH; its final entry must not exist and is never followed |
 | `--as-existing <PATH>` | Map one named source exactly to PATH; its final entry must exist and is never followed |
 | `--mapping <FILE>` | Copy the entries of a local NDJSON mapping manifest (`-` reads stdin), acquired before destination changes, instead of selecting sources; entry src paths are relative to -C and dst paths are relative to the --into container |
-
-<a id="copy-policy-and-filtering"></a>
 
 ## Updates and deletion
 
@@ -75,8 +69,6 @@ syq cp [OPTIONS] SOURCE... [PLACEMENT]
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
 | `--preserve <FEATURE>` | Preserve permissions or ownership, or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files |
 
-<a id="integrity-checking"></a>
-
 ## Verification
 
 | Argument / option | Meaning |
@@ -85,10 +77,6 @@ syq cp [OPTIONS] SOURCE... [PLACEMENT]
 | `--expected-hash <ALGORITHM:HEX>` | Require one regular file to match ALGORITHM:HEX |
 | `--verify-only` | Compare selected contents without writing; fail on differences or inspection errors |
 | `--integrity-checking <KEY=VALUE,...>` | [Comparison and transfer checksums](../integrity-checking.md) |
-
-<a id="ssh-and-transport"></a>
-
-<a id="remote-to-remote-transfers"></a>
 
 ## Connections and remote execution
 
@@ -121,20 +109,12 @@ syq cp [OPTIONS] SOURCE... [PLACEMENT]
 | `--s3-profile <NAME>` | AWS shared configuration/credentials profile |
 | `--s3-header <NAME: VALUE>` | Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused) |
 
-<a id="performance-tuning"></a>
-
-<a id="resource-limits"></a>
-
 ## Performance and resource limits
 
 | Argument / option | Meaning |
 |---|---|
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
 | `--resource-limits <KEY=VALUE,...>` | [Bandwidth limit](../resource-limits.md) |
-
-<a id="progress-and-results"></a>
-
-<a id="preview-and-output"></a>
 
 ## Preview, progress, and results
 

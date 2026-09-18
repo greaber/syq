@@ -273,6 +273,9 @@ fn everyday_copy_controls_stay_visible_but_performance_overrides_do_not() {
         let short = help(&[command, "--help"]);
         let full = help(&[command, "--help-all"]);
         assert!(short.contains("--no-progress"));
+        if command == "cp" {
+            assert!(!full.contains("Other options:"), "{full}");
+        }
         for option in [
             "--resource-limits",
             "--performance-tuning",
