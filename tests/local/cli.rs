@@ -1008,6 +1008,10 @@ fn stream_placement_and_source_roots() {
         ("--into-existing", "container", false),
         ("--into-existing", "container-link", true),
     ] {
+        // Each case gets a fresh FIFO: a reader inherited briefly by another
+        // test's child must not release the next case's writer early.
+        fs::remove_file(t.path("pipe")).unwrap();
+        mkfifo(&t.path("pipe"));
         let fifo = t.path("pipe");
         let writer = std::thread::spawn(move || {
             File::options()
@@ -1020,12 +1024,14 @@ fn stream_placement_and_source_roots() {
             args.push("--follow-dst");
         }
         let output = cp(&args);
-        // Release the owned writer even if a regression rejected the copy.
-        let _rescue = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(t.path("pipe"))
-            .unwrap();
+        // Only a rejected copy needs a rescue reader to release its writer.
+        let _rescue = (!output.status.success()).then(|| {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(t.path("pipe"))
+                .unwrap()
+        });
         writer.join().unwrap().unwrap();
         assert!(output.status.success(), "{}", stderr_of(&output));
         assert_eq!(read(&t.path("container/pipe")), b"fifo");
