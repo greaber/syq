@@ -215,10 +215,12 @@ try:
         completed = [row for row in measured if row.get('status') != 'oom']
         assert completed and min(row['elapsed'] for row in completed) >= 30, 'measured trial too short; enlarge workload'
         if case['name'] == 'writeback-pressure' and any(row.get('status') == 'oom' for row in measured):
-            lower = dict(case, name='writeback-pressure-low-concurrency', concurrency=8)
-            for rep in range(2):
-                row = run(lower, 'async', repeats, f'measured-{rep}')
-                assert row.get('status') != 'oom' and row['elapsed'] >= 30
+            for limit in (8, 32):
+                name = 'writeback-pressure-low-concurrency' if limit == 8 else 'writeback-pressure-concurrency-32'
+                lower = dict(case, name=name, concurrency=limit)
+                for rep in range(2):
+                    row = run(lower, 'async', repeats, f'measured-{rep}')
+                    assert row.get('status') != 'oom' and row['elapsed'] >= 30
 finally:
     if active:
         remove_container(active)
