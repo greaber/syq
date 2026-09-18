@@ -11718,16 +11718,18 @@ mod tests {
                 })
                 .collect();
             if count == parallel_count {
-                let chunk = sources.len().div_ceil(PAR_THREADS).max(1);
                 let first_root_count = sources
                     .iter()
                     .filter(|source| source.root() == selections[0].root())
                     .count();
-                assert_ne!(
-                    first_root_count % chunk,
-                    0,
-                    "the root boundary must fall inside a parallel chunk"
-                );
+                for threads in [16, PAR_THREADS] {
+                    let chunk = sources.len().div_ceil(threads).max(1);
+                    assert_ne!(
+                        first_root_count % chunk,
+                        0,
+                        "the root boundary must fall inside either pool's chunks"
+                    );
+                }
             }
             let paths = vec![b"/ignored/display/path".to_vec(); count];
             let expected: Vec<_> = sources

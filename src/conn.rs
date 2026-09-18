@@ -16,10 +16,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub trait Conn: Send {
-    /// Local interface address for advisory CPU placement; no peer request.
-    fn placement_address(&self) -> Option<std::net::IpAddr> {
-        None
-    }
     fn observe(
         &mut self,
         _observations: &crate::transfer_observations::Observations,
@@ -927,17 +923,6 @@ fn spawn_observed_reader(
     std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
     std::thread::JoinHandle<()>,
 ) {
-    spawn_observed_tcp_reader(input, read_ahead, observation, None)
-}
-fn spawn_observed_tcp_reader(
-    input: Box<dyn Read + Send>,
-    read_ahead: usize,
-    observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
-    address: Option<std::net::IpAddr>,
-) -> (
-    std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
-    std::thread::JoinHandle<()>,
-) {
     // Control requests also pipeline up to the default depth. Keeping that
     // capacity prevents a sequential helper blocking on replies while its
     // coordinator is still sending requests (including large path batches).
@@ -945,7 +930,6 @@ fn spawn_observed_tcp_reader(
         read_ahead.max(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH),
     );
     let reader = std::thread::spawn(move || {
-        let mut placement = crate::placement::BulkPlacement::new(address.into_iter().collect());
         let mut r = FrameReader::new(input);
         r.set_limit(MAX_HANDSHAKE_FRAME);
         let hello = r
@@ -966,7 +950,6 @@ fn spawn_observed_tcp_reader(
                 .read_budgeted_with_start::<Response>()
                 .map(ReceivedResponse::from_frame);
             if let Ok(message) = &msg {
-                placement.response(&message.value);
                 if let Response::TransportStats(stats) = &message.value {
                     if let Some(value) = &stats.observation {
                         let mut value = value.clone();
@@ -1177,12 +1160,6 @@ impl RemoteConn {
 }
 
 impl Conn for RemoteConn {
-    fn placement_address(&self) -> Option<std::net::IpAddr> {
-        self.tcp_socket
-            .as_ref()
-            .and_then(|socket| socket.local_addr().ok())
-            .map(|address| address.ip())
-    }
     fn observe(
         &mut self,
         observations: &crate::transfer_observations::Observations,
@@ -2646,12 +2623,8 @@ impl RemoteSpec {
             let reader = RecordReader::new(stream, rc);
             let observation =
                 std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-            let (rx, reader) = spawn_observed_tcp_reader(
-                Box::new(reader),
-                self.read_ahead,
-                observation.clone(),
-                tcp_socket.local_addr().ok().map(|address| address.ip()),
-            );
+            let (rx, reader) =
+                spawn_observed_reader(Box::new(reader), self.read_ahead, observation.clone());
             let conn = RemoteConn {
                 observation,
                 child: None,

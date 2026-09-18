@@ -1,4 +1,4 @@
-//! Compact metadata work and socket-local bulk data, within inherited CPU limits.
+//! Keep shared metadata work compact without restricting transfer workers.
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -53,161 +53,6 @@ mod linux {
             // SAFETY: mask is a valid nonempty cpu_set_t with the exact size.
             unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&mask.0), &mask.0) == 0 }
         }
-    }
-
-    impl Mask {
-        fn intersect(&self, other: &Self) -> Option<Self> {
-            Self::from_cpus(
-                (0..libc::CPU_SETSIZE as usize)
-                    .filter(|&cpu| self.contains(cpu) && other.contains(cpu)),
-            )
-        }
-        fn set(&self) -> bool {
-            // SAFETY: this is an initialized cpu_set_t and only addresses the
-            // calling thread; the kernel enforces current cpuset restrictions.
-            unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&self.0), &self.0) == 0 }
-        }
-    }
-
-    /// Lazily resolve interface locality only when a connection carries bulk
-    /// data. Small-file batches keep the scheduler's original CPU allocation.
-    pub struct BulkPlacement {
-        addresses: Vec<std::net::IpAddr>,
-        initialized: bool,
-        original: Option<Mask>,
-        target: Option<Mask>,
-        active: bool,
-        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
-    }
-
-    impl BulkPlacement {
-        pub fn new(addresses: Vec<std::net::IpAddr>) -> Self {
-            Self {
-                addresses,
-                initialized: false,
-                original: None,
-                target: None,
-                active: false,
-                _thread: std::marker::PhantomData,
-            }
-        }
-        fn initialize(&mut self) {
-            self.initialized = true;
-            let addresses = std::mem::take(&mut self.addresses);
-            if addresses.is_empty() {
-                return;
-            }
-            let Some(original) = Mask::current() else {
-                return;
-            };
-            let mut masks = addresses.iter().filter_map(|address| for_address(*address));
-            let Some(mut target) = masks.next() else {
-                return;
-            };
-            for other in masks {
-                let Some(shared) = target.intersect(&other) else {
-                    return;
-                };
-                target = shared;
-            }
-            self.target = target.intersect(&original);
-            self.original = Some(original);
-        }
-        pub fn set_bulk(&mut self, bulk: bool) {
-            if bulk && !self.initialized {
-                self.initialize();
-            }
-            if bulk == self.active {
-                return;
-            }
-            let mask = if bulk { &self.target } else { &self.original };
-            if let Some(mask) = mask {
-                if mask.set() {
-                    self.active = bulk;
-                } else if bulk {
-                    // Affinity can be denied in containers. Do not retry a
-                    // failed optimization for every block of a large file.
-                    self.target = None;
-                }
-            }
-        }
-    }
-    impl Drop for BulkPlacement {
-        fn drop(&mut self) {
-            if self.active {
-                if let Some(mask) = &self.original {
-                    mask.set();
-                }
-            }
-        }
-    }
-
-    fn for_address(address: std::net::IpAddr) -> Option<Mask> {
-        if address.is_loopback() {
-            return None;
-        }
-        let mut first = std::ptr::null_mut();
-        // SAFETY: getifaddrs initializes an owned linked list, held until the
-        // Interfaces guard drops. Its family tags govern the address casts.
-        if unsafe { libc::getifaddrs(&mut first) } != 0 {
-            return None;
-        }
-        struct Interfaces(*mut libc::ifaddrs);
-        impl Drop for Interfaces {
-            fn drop(&mut self) {
-                unsafe { libc::freeifaddrs(self.0) };
-            }
-        }
-        let _interfaces = Interfaces(first);
-        let mut entry = first;
-        while !entry.is_null() {
-            let item = unsafe { &*entry };
-            entry = item.ifa_next;
-            if item.ifa_addr.is_null() || item.ifa_name.is_null() {
-                continue;
-            }
-            let ip = match unsafe { (*item.ifa_addr).sa_family as i32 } {
-                libc::AF_INET => {
-                    let a = unsafe { &*item.ifa_addr.cast::<libc::sockaddr_in>() };
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::from(a.sin_addr.s_addr.to_ne_bytes()))
-                }
-                libc::AF_INET6 => {
-                    let a = unsafe { &*item.ifa_addr.cast::<libc::sockaddr_in6>() };
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::from(a.sin6_addr.s6_addr))
-                }
-                _ => continue,
-            };
-            if ip != address {
-                continue;
-            }
-            let name = unsafe { std::ffi::CStr::from_ptr(item.ifa_name) }
-                .to_str()
-                .ok()?;
-            let node = std::fs::read_to_string(format!("/sys/class/net/{name}/device/numa_node"))
-                .ok()?
-                .trim()
-                .parse::<u32>()
-                .ok()?;
-            let cpus =
-                std::fs::read_to_string(format!("/sys/devices/system/node/node{node}/cpulist"))
-                    .ok()?;
-            return parse_cpulist(&cpus)?.intersect(&Mask::current()?);
-        }
-        None
-    }
-
-    fn parse_cpulist(list: &str) -> Option<Mask> {
-        let mut cpus = Vec::new();
-        for part in list.trim().split(',') {
-            let (start, end) = part.split_once('-').unwrap_or((part, part));
-            let start = start.parse::<usize>().ok()?;
-            let end = end.parse::<usize>().ok()?;
-            if end >= libc::CPU_SETSIZE as usize || start > end {
-                return None;
-            }
-            cpus.extend(start..=end);
-        }
-        Mask::from_cpus(cpus)
     }
 
     struct Core {
@@ -325,73 +170,6 @@ mod linux {
         }
 
         #[test]
-        fn node_cpu_lists_validate_ranges_before_building_a_mask() {
-            assert_eq!(
-                cpus(&parse_cpulist("1-3,7,9-10\n").unwrap()),
-                vec![1, 2, 3, 7, 9, 10]
-            );
-            for bad in ["", "-1", "2-1", "0-1024", "x", "1,", "1-2-3"] {
-                assert!(parse_cpulist(bad).is_none(), "{bad}");
-            }
-        }
-
-        #[test]
-        fn bulk_placement_restores_affinity_for_small_work_and_on_drop() {
-            std::thread::spawn(|| {
-                let original = Mask::current().unwrap();
-                let before = cpus(&original);
-                let first = before[0];
-                let mut placement = BulkPlacement::new(Vec::new());
-                placement.initialized = true;
-                placement.original = Some(original);
-                placement.target = Mask::from_cpus([first]);
-                placement.set_bulk(true);
-                assert_eq!(cpus(&Mask::current().unwrap()), vec![first]);
-                // Non-payload acknowledgements do not churn the affinity mask.
-                placement.response(&crate::proto::Response::Ok);
-                assert!(placement.active);
-                placement.request(&crate::proto::Request::ReadSmallBatch(Vec::new()));
-                assert_eq!(cpus(&Mask::current().unwrap()), before);
-                placement.set_bulk(true);
-                placement.response(&crate::proto::Response::SmallBlocks(Vec::new()));
-                assert_eq!(cpus(&Mask::current().unwrap()), before);
-                placement.set_bulk(true);
-                drop(placement);
-                assert_eq!(cpus(&Mask::current().unwrap()), before);
-            })
-            .join()
-            .unwrap();
-        }
-
-        #[test]
-        fn small_work_does_not_resolve_interface_locality() {
-            let mut placement = BulkPlacement::new(vec![std::net::Ipv4Addr::LOCALHOST.into()]);
-            placement.request(&crate::proto::Request::ReadSmallBatch(Vec::new()));
-            placement.response(&crate::proto::Response::SmallBlocks(Vec::new()));
-            assert!(!placement.initialized);
-            placement.set_bulk(true);
-            assert!(placement.initialized);
-            assert!(!placement.active);
-        }
-
-        #[test]
-        fn incompatible_endpoint_nodes_do_not_share_a_cpu_mask() {
-            assert!(Mask::from_cpus([0, 2])
-                .unwrap()
-                .intersect(&Mask::from_cpus([1, 3]).unwrap())
-                .is_none());
-            assert_eq!(
-                cpus(
-                    &Mask::from_cpus([0, 2])
-                        .unwrap()
-                        .intersect(&Mask::from_cpus([2, 3]).unwrap())
-                        .unwrap()
-                ),
-                vec![2]
-            );
-        }
-
-        #[test]
         fn compact_uses_distinct_cores_in_one_locality() {
             let topology = topology();
             for seed in 0..128 {
@@ -471,7 +249,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{compact, BulkPlacement};
+pub use linux::compact;
 
 #[cfg(not(target_os = "linux"))]
 pub struct Mask;
@@ -484,41 +262,4 @@ impl Mask {
 #[cfg(not(target_os = "linux"))]
 pub fn compact() -> Option<(usize, Mask)> {
     None
-}
-
-#[cfg(not(target_os = "linux"))]
-pub struct BulkPlacement;
-#[cfg(not(target_os = "linux"))]
-impl BulkPlacement {
-    pub fn new(_: Vec<std::net::IpAddr>) -> Self {
-        Self
-    }
-    pub fn set_bulk(&mut self, _: bool) {}
-}
-// Leave control and metadata exchanges alone. A short final block or an ACK
-// does not end a bulk run; a small-file batch explicitly restores the mask.
-impl BulkPlacement {
-    pub fn request(&mut self, request: &crate::proto::Request) {
-        use crate::proto::Request;
-        match request {
-            Request::ReadRange { len, .. } if *len >= 64 << 10 => self.set_bulk(true),
-            Request::WriteRange { data, .. } if data.len() >= 64 << 10 => self.set_bulk(true),
-            Request::ReadStream(stream) if stream.end.saturating_sub(stream.off) >= 64 << 10 => {
-                self.set_bulk(true)
-            }
-            Request::ReadSmallBatch(_) | Request::PutSmallBatch(_) | Request::CopySmallFiles(_) => {
-                self.set_bulk(false)
-            }
-            _ => {}
-        }
-    }
-    pub fn response(&mut self, response: &crate::proto::Response) {
-        match response {
-            crate::proto::Response::Block { data, .. } if data.len() >= 64 << 10 => {
-                self.set_bulk(true)
-            }
-            crate::proto::Response::SmallBlocks(_) => self.set_bulk(false),
-            _ => {}
-        }
-    }
 }

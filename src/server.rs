@@ -27,21 +27,11 @@ impl RequestReader {
         named_socket: Option<std::os::unix::net::UnixStream>,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
-        let address = tcp_socket
-            .as_ref()
-            .and_then(|socket| socket.local_addr().ok())
-            .map(|address| address.ip());
-        let thread = std::thread::spawn(move || {
-            let mut placement = crate::placement::BulkPlacement::new(address.into_iter().collect());
-            loop {
-                let msg = reader.read_budgeted::<Request>();
-                if let Ok(message) = &msg {
-                    placement.request(&message.value);
-                }
-                let failed = msg.is_err();
-                if tx.send(msg).is_err() || failed {
-                    break;
-                }
+        let thread = std::thread::spawn(move || loop {
+            let msg = reader.read_budgeted::<Request>();
+            let failed = msg.is_err();
+            if tx.send(msg).is_err() || failed {
+                break;
             }
         });
         Self {
@@ -381,11 +371,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
         bail!("control role is not allowed on a TCP data connection");
     }
     let is_control = matches!(&role, ConnectionRole::Control);
-    let address = tcp_socket
-        .as_ref()
-        .and_then(|socket| socket.local_addr().ok())
-        .map(|address| address.ip());
-    let mut placement = crate::placement::BulkPlacement::new(address.into_iter().collect());
     let is_source_worker = matches!(&role, ConnectionRole::SourceWorker { .. });
     let mut ops = FsOps::with_descriptor_session(descriptor_session.clone());
     if let Some(authority) = &authority {
@@ -505,7 +490,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
         };
         drop(waiting);
         let (mut req, _request_hold) = queued.into_parts();
-        placement.request(&req);
         if !is_control
             && matches!(
                 &req,
