@@ -1407,166 +1407,9 @@ impl Planner<'_> {
             if opts.dry_run {
                 self.trace_dry_run_dirs(&planned, dst_root);
             } else if !opts.verify_only {
-                // Create new dirs; also "create" existing ones we can't yet
-                // write into (0o700 not set) so apply() opens them up. The
-                // latter are not creations: no record, no count.
-                let existing_dirs: std::collections::HashSet<&PathBytes> = planned
-                    .iter()
-                    .filter(|(_, _, _, st)| matches!(st, Some(d) if d.kind == Kind::Dir))
-                    .map(|(p, _, _, _)| p)
-                    .collect();
-                let mut new_dirs: Vec<Op> = planned
-                    .iter()
-                    .filter(|(path, _, _, st)| {
-                        let root_must_be_new = self.exact_condition == TargetCondition::Absent
-                            && path == &self.dst_root;
-                        if opts.preserve_existing_directory_metadata && existing_dirs.contains(path) {
-                            return false;
-                        }
-                        root_must_be_new
-                            || !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
-                    })
-                    .map(|(p, _, e, st)| Op::Mkdir {
-                        path: p.clone(),
-                        mode: e.mode,
-                        condition: if opts.restricted_receiver
-                            && st.is_none()
-                            && self.implicit_dirs.contains(p)
-                        {
-                            TargetCondition::Absent
-                        } else {
-                            self.exact_condition_for(p)
-                        },
-                    })
-                    .collect();
-                if let Some(root_index) = new_dirs.iter().position(|op| {
-                    matches!(
-                        op,
-                        Op::Mkdir {
-                            path,
-                            condition: TargetCondition::Absent,
-                            ..
-                        } if path == &self.dst_root
-                    )
-                }) {
-                    // Establish the new authority directory by itself. Every
-                    // descendant operation after this point carries the
-                    // identity returned by that atomic mkdir.
-                    let root_op = new_dirs.remove(root_index);
-                    let error = self.apply(vec![root_op])?.into_iter().next().flatten();
-                    if let Some(error) = error {
-                        let os_kind = wire_os_kind(&error);
-                        self.progress.error_classified(
-                            &format!("syq: {error}"),
-                            Some("io"),
-                            os_kind,
-                        );
-                        if capacity_os_kind(os_kind) {
-                            return Err(endpoint_error(error)).context("apply destination changes");
-                        }
-                        self.collision = true;
-                        return Ok(());
-                    }
-                    self.progress.directories_created.fetch_add(1, Relaxed);
-                    if opts.verbose > 0 {
-                        self.progress
-                            .println(&format!("{}/", display(&self.dst_root)));
-                    }
-                    let created = stat_many(self.dst, vec![self.dst_root.clone()], false)?
-                        .pop()
-                        .flatten()
-                        .filter(|entry| entry.kind == Kind::Dir)
-                        .context("new exact target was not a directory after creation")?;
-                    self.exact_condition = target_identity(&created);
-                    self.mutation_root_condition = target_identity(&created);
-                    if self.guard_containers {
-                        self.container_guard = Some(target_container(&self.dst_root, &created));
-                    }
-                }
-                let mut reopened_dirs = std::collections::HashSet::new();
-                for new_dirs in directory_creation_batches(new_dirs, opts.restricted_receiver) {
-                    let n = new_dirs.len();
-                    let op_info: Vec<(PathBytes, TargetCondition)> = new_dirs
-                        .iter()
-                        .map(|op| match op {
-                            Op::Mkdir {
-                                path, condition, ..
-                            } => (path.clone(), *condition),
-                            _ => unreachable!(),
-                        })
-                        .collect();
-                    let errs = self.apply(new_dirs)?;
-                    let capacity_error = first_capacity_error(&errs);
-                    let mut failed = 0;
-                    let mut reopened = 0;
-                    for ((name, condition), err) in op_info.iter().zip(errs) {
-                        let preexisting = existing_dirs.contains(name);
-                        let succeeded = err.is_none();
-                        let created = succeeded && !preexisting;
-                        if created && opts.preserve_existing_directory_metadata {
-                            self.created_dirs.insert(name.clone());
-                        }
-                        let os_kind = err.as_ref().and_then(wire_os_kind);
-                        if let Some(err) = &err {
-                            failed += 1;
-                            self.progress.error_classified(
-                                &format!("syq: {err}"),
-                                Some("io"),
-                                os_kind,
-                            );
-                            if name == &self.dst_root && *condition != TargetCondition::Any {
-                                self.collision = true;
-                            }
-                        } else if opts.verbose > 0 && !preexisting {
-                            self.progress.println(&format!("{}/", display(name)));
-                        }
-                        if preexisting && succeeded {
-                            // Reopened for writability only; nothing was made.
-                            reopened += 1;
-                            if self.implicit_dirs.contains(name) {
-                                reopened_dirs.insert(name.clone());
-                            }
-                            continue;
-                        }
-                        if let (Some(results), Some(dst_rel)) = (
-                            self.progress.results_writer(),
-                            strip_dst_root(name, dst_root),
-                        ) {
-                            // An implicit --mapping ancestor has no source and
-                            // is not independently retryable: the entries
-                            // beneath it carry the actionable retry records.
-                            let implicit = self.implicit_dirs.contains(name);
-                            let src = if implicit {
-                                None
-                            } else {
-                                self.mapping_source_rel(dst_rel)
-                            };
-                            results.emit_operation(&crate::results::OperationRecord {
-                                action: "create_directory",
-                                dst: dst_rel,
-                                src: src.as_deref(),
-                                kind: "dir",
-                                disposition: if created { "succeeded" } else { "failed" },
-                                bytes: None,
-                                attempts: None,
-                                retryable: (!created).then_some(if implicit {
-                                    "no"
-                                } else {
-                                    "unknown"
-                                }),
-                                class: (!created).then_some("io"),
-                                os_kind,
-                                message: err.as_ref().map(WireError::as_str),
-                            });
-                        }
-                    }
-                    self.progress
-                        .directories_created
-                        .fetch_add((n - failed - reopened) as u64, Relaxed);
-                    if let Some(error) = capacity_error {
-                        return Err(endpoint_error(error)).context("apply destination changes");
-                    }
-                }
+                let Some(reopened_dirs) = self.create_directories(&planned, dst_root)? else {
+                    return Ok(());
+                };
                 self.defer_directory_metadata(&planned, &reopened_dirs);
             }
         }
@@ -1992,6 +1835,169 @@ impl Planner<'_> {
         }
         self.flush_meta_fixes(meta_fixes)?;
         self.flush_leaf_ops(ops, &op_names)
+    }
+
+    /// Create this batch's missing directories and reopen existing ones that
+    /// are not yet writable. Returns the implicit directories reopened that
+    /// way, or `None` when a new destination root could not be created and
+    /// nothing below it may proceed.
+    fn create_directories(
+        &mut self,
+        planned: &[PlannedDir],
+        dst_root: &[u8],
+    ) -> Result<Option<std::collections::HashSet<PathBytes>>> {
+        let opts = self.opts;
+        // Create new dirs; also "create" existing ones we can't yet
+        // write into (0o700 not set) so apply() opens them up. The
+        // latter are not creations: no record, no count.
+        let existing_dirs: std::collections::HashSet<&PathBytes> = planned
+            .iter()
+            .filter(|(_, _, _, st)| matches!(st, Some(d) if d.kind == Kind::Dir))
+            .map(|(p, _, _, _)| p)
+            .collect();
+        let mut new_dirs: Vec<Op> = planned
+            .iter()
+            .filter(|(path, _, _, st)| {
+                let root_must_be_new =
+                    self.exact_condition == TargetCondition::Absent && path == &self.dst_root;
+                if opts.preserve_existing_directory_metadata && existing_dirs.contains(path) {
+                    return false;
+                }
+                root_must_be_new
+                    || !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
+            })
+            .map(|(p, _, e, st)| Op::Mkdir {
+                path: p.clone(),
+                mode: e.mode,
+                condition: if opts.restricted_receiver
+                    && st.is_none()
+                    && self.implicit_dirs.contains(p)
+                {
+                    TargetCondition::Absent
+                } else {
+                    self.exact_condition_for(p)
+                },
+            })
+            .collect();
+        if let Some(root_index) = new_dirs.iter().position(|op| {
+            matches!(
+                op,
+                Op::Mkdir {
+                    path,
+                    condition: TargetCondition::Absent,
+                    ..
+                } if path == &self.dst_root
+            )
+        }) {
+            // Establish the new authority directory by itself. Every
+            // descendant operation after this point carries the
+            // identity returned by that atomic mkdir.
+            let root_op = new_dirs.remove(root_index);
+            let error = self.apply(vec![root_op])?.into_iter().next().flatten();
+            if let Some(error) = error {
+                let os_kind = wire_os_kind(&error);
+                self.progress
+                    .error_classified(&format!("syq: {error}"), Some("io"), os_kind);
+                if capacity_os_kind(os_kind) {
+                    return Err(endpoint_error(error)).context("apply destination changes");
+                }
+                self.collision = true;
+                return Ok(None);
+            }
+            self.progress.directories_created.fetch_add(1, Relaxed);
+            if opts.verbose > 0 {
+                self.progress
+                    .println(&format!("{}/", display(&self.dst_root)));
+            }
+            let created = stat_many(self.dst, vec![self.dst_root.clone()], false)?
+                .pop()
+                .flatten()
+                .filter(|entry| entry.kind == Kind::Dir)
+                .context("new exact target was not a directory after creation")?;
+            self.exact_condition = target_identity(&created);
+            self.mutation_root_condition = target_identity(&created);
+            if self.guard_containers {
+                self.container_guard = Some(target_container(&self.dst_root, &created));
+            }
+        }
+        let mut reopened_dirs = std::collections::HashSet::new();
+        for new_dirs in directory_creation_batches(new_dirs, opts.restricted_receiver) {
+            let n = new_dirs.len();
+            let op_info: Vec<(PathBytes, TargetCondition)> = new_dirs
+                .iter()
+                .map(|op| match op {
+                    Op::Mkdir {
+                        path, condition, ..
+                    } => (path.clone(), *condition),
+                    _ => unreachable!(),
+                })
+                .collect();
+            let errs = self.apply(new_dirs)?;
+            let capacity_error = first_capacity_error(&errs);
+            let mut failed = 0;
+            let mut reopened = 0;
+            for ((name, condition), err) in op_info.iter().zip(errs) {
+                let preexisting = existing_dirs.contains(name);
+                let succeeded = err.is_none();
+                let created = succeeded && !preexisting;
+                if created && opts.preserve_existing_directory_metadata {
+                    self.created_dirs.insert(name.clone());
+                }
+                let os_kind = err.as_ref().and_then(wire_os_kind);
+                if let Some(err) = &err {
+                    failed += 1;
+                    self.progress
+                        .error_classified(&format!("syq: {err}"), Some("io"), os_kind);
+                    if name == &self.dst_root && *condition != TargetCondition::Any {
+                        self.collision = true;
+                    }
+                } else if opts.verbose > 0 && !preexisting {
+                    self.progress.println(&format!("{}/", display(name)));
+                }
+                if preexisting && succeeded {
+                    // Reopened for writability only; nothing was made.
+                    reopened += 1;
+                    if self.implicit_dirs.contains(name) {
+                        reopened_dirs.insert(name.clone());
+                    }
+                    continue;
+                }
+                if let (Some(results), Some(dst_rel)) = (
+                    self.progress.results_writer(),
+                    strip_dst_root(name, dst_root),
+                ) {
+                    // An implicit --mapping ancestor has no source and
+                    // is not independently retryable: the entries
+                    // beneath it carry the actionable retry records.
+                    let implicit = self.implicit_dirs.contains(name);
+                    let src = if implicit {
+                        None
+                    } else {
+                        self.mapping_source_rel(dst_rel)
+                    };
+                    results.emit_operation(&crate::results::OperationRecord {
+                        action: "create_directory",
+                        dst: dst_rel,
+                        src: src.as_deref(),
+                        kind: "dir",
+                        disposition: if created { "succeeded" } else { "failed" },
+                        bytes: None,
+                        attempts: None,
+                        retryable: (!created).then_some(if implicit { "no" } else { "unknown" }),
+                        class: (!created).then_some("io"),
+                        os_kind,
+                        message: err.as_ref().map(WireError::as_str),
+                    });
+                }
+            }
+            self.progress
+                .directories_created
+                .fetch_add((n - failed - reopened) as u64, Relaxed);
+            if let Some(error) = capacity_error {
+                return Err(endpoint_error(error)).context("apply destination changes");
+            }
+        }
+        Ok(Some(reopened_dirs))
     }
 
     /// Record what a live run would do to this batch's directories.
