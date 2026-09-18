@@ -41,6 +41,9 @@ if QUEUE_SWEEP:
     BIN = ROOT / os.environ.get('SYQ_STRESS_BINARY', 'target/transport-queue-build/client')
 shutil.copy2(BIN, STAGE / 'client')
 BINARY_SHA256 = hashlib.sha256(BIN.read_bytes()).hexdigest()
+HEAP_PROBE = os.environ.get('SYQ_STRESS_HEAP') == '1'
+if HEAP_PROBE:
+    shutil.copy2(ROOT / 'target/memory-probe.so', STAGE / 'memory-probe.so')
 subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
                 '-keyout', str(CERT / 'private.key'), '-out', str(CERT / 'public.crt'),
                 '-days', '1', '-subj', '/CN=localhost', '-addext', 'basicConstraints=critical,CA:FALSE',
@@ -154,6 +157,10 @@ def run(case, mode, repeats, label):
             *(['-e', 'SYQ_SPIKE_QUEUE=' + mode.removeprefix('queue-')] if QUEUE_SWEEP else []),
             IMAGE, '/bench/client', 'async' if mode.startswith('queue-') else mode, '/bench/' + case['fixture'] + '.json',
             str(case['concurrency']), '/output', '/bench/cert/public.crt', 'auto', str(repeats)]
+    if HEAP_PROBE:
+        at = args.index(IMAGE) + 1
+        args[at:at] = ['/usr/bin/env', 'LD_PRELOAD=/bench/memory-probe.so',
+                      'SYQ_SPIKE_RCVBUF=' + str(case.get('receive_buffer', 0))]
     gate = STAGE / 'start-client'
     if MEMORY_TRACE:
         gate.unlink(missing_ok=True)
@@ -182,6 +189,8 @@ def run(case, mode, repeats, label):
         if monitor:
             monitor.stop()
             monitor = None
+        if HEAP_PROBE:
+            shutil.move(out / '.allocator.csv', D / (tag + '.allocator.csv'))
         state = json.loads(command(['docker', 'inspect', '--format', '{{json .State}}', active]))
         (D / (tag + '.state.json')).write_text(json.dumps(state))
         (D / (tag + '.stderr')).write_text(stderr)
@@ -302,6 +311,8 @@ try:
         indexed = {case['name']: case for case in cases}
         cases = [dict(indexed[name], protocol='http' if PLAIN_HTTP else 'https') for name in requested]
     for case in cases:
+        if HEAP_PROBE:
+            case.update(heap_probe=True, receive_buffer=int(os.environ.get('SYQ_STRESS_RCVBUF', 0)))
         if QUEUE_SWEEP:
             # Same sustained workloads as the previous experiment; never pilot-sized.
             repeats = {'writeback-pressure': 53, 'writeback-roomy': 64,
