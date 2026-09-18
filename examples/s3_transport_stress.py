@@ -169,6 +169,7 @@ def run(case, mode, repeats, label):
             '--memory', memory, '--memory-swap', memory, '--pids-limit', '512',
             '-v', str(STAGE) + ':/bench:ro', '-v', str(out) + ':/output:rw',
             '-e', 'SYQ_SPIKE_READERS_PER_WRITER=' + str(case.get('readers', 1)),
+            '-e', 'SYQ_SPIKE_SERIAL_TAIL=' + str(case.get('serial_tail', 0)),
             *(['--cpus', str(case['cpu_quota'])] if 'cpu_quota' in case else []),
             *(['--device-write-bps', case['write_bps']] if 'write_bps' in case else []),
             *(['-e', 'SYQ_SPIKE_QUEUE=' + mode.removeprefix('queue-')] if QUEUE_SWEEP else []),
@@ -331,6 +332,8 @@ try:
         cases.append({'name': 'writeback-roomy', 'fixture': 'large', 'cpus': '0-7',
                       'concurrency': 64, 'memory': '4g'})
         cases.extend([
+            {'name': 'connection-tail', 'fixture': 'large', 'cpus': '0-7',
+             'concurrency': 64, 'memory': '4g', 'serial_tail': 8},
             {'name': 'shared-writer', 'fixture': 'large', 'cpus': '0-7',
              'concurrency': 8, 'memory': '4g', 'readers': 8},
             {'name': 'many-cores', 'fixture': 'large', 'cpus': '0-7,16-39',
@@ -386,7 +389,7 @@ try:
             repeats = {'writeback-pressure': 53, 'writeback-roomy': 64,
                        'single-stream': 32, 'two-core-fanout': 46,
                        'small-file-fanout': 400, 'many-cores': 64,
-                       'cpu-quota': 32, 'disk-limited': 64, 'shared-writer': 64}[case['name']]
+                       'cpu-quota': 32, 'disk-limited': 64, 'shared-writer': 64, 'connection-tail': 9}[case['name']]
             repeats = int(os.environ.get('SYQ_STRESS_REPEATS', repeats))
             rounds = int(os.environ.get('SYQ_STRESS_ROUNDS', 2))
             label = os.environ.get('SYQ_STRESS_LABEL', 'measured')

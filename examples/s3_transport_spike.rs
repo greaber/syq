@@ -215,6 +215,17 @@ fn main() -> Result<()> {
         "shared writers require async"
     );
     let groups = jobs / readers;
+    let serial_tail: usize = std::env::var("SYQ_SPIKE_SERIAL_TAIL")
+        .ok()
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or(0);
+    ensure!(serial_tail < groups, "tail consumes every group");
+    ensure!(
+        serial_tail == 0 || a[1] == "async",
+        "tail probe requires async"
+    );
+    let mut phase_elapsed = Vec::new();
     let concurrency: usize = a[3].parse()?;
     ensure!(concurrency > 0, "zero concurrency");
     let pem = std::fs::read(&a[5])?;
@@ -282,25 +293,37 @@ fn main() -> Result<()> {
                     .pool_max_idle_per_host(concurrency * readers)
                     .build(),
             );
-            stream::iter(0..groups)
-                .map(|i| {
-                    let o = objects[(i * readers) % objects.len()].clone();
-                    let c = connector.clone();
-                    let dir = a[4].clone();
-                    async move {
-                        tokio::spawn(async move {
-                            tokio::time::timeout(
-                                Duration::from_secs(60),
-                                async_group(c, o, dir, i, readers),
-                            )
+            let phases = if serial_tail == 0 {
+                vec![(0..groups, concurrency)]
+            } else {
+                vec![
+                    (0..groups - serial_tail, concurrency),
+                    (groups - serial_tail..groups, 1),
+                ]
+            };
+            for (indices, limit) in phases {
+                let phase_start = Instant::now();
+                stream::iter(indices)
+                    .map(|i| {
+                        let o = objects[(i * readers) % objects.len()].clone();
+                        let c = connector.clone();
+                        let dir = a[4].clone();
+                        async move {
+                            tokio::spawn(async move {
+                                tokio::time::timeout(
+                                    Duration::from_secs(60),
+                                    async_group(c, o, dir, i, readers),
+                                )
+                                .await?
+                            })
                             .await?
-                        })
-                        .await?
-                    }
-                })
-                .buffer_unordered(concurrency)
-                .try_collect::<Vec<_>>()
-                .await?;
+                        }
+                    })
+                    .buffer_unordered(limit)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                phase_elapsed.push(phase_start.elapsed().as_secs_f64());
+            }
             Ok::<_, anyhow::Error>(())
         })?;
     }
@@ -312,7 +335,7 @@ fn main() -> Result<()> {
     let cpu = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     println!(
         "{}",
-        serde_json::json!({"mode":a[1],"objects":groups,"requests":jobs,"readers_per_writer":readers,"bytes":total,"concurrency":concurrency,"workers":workers,"elapsed":start.elapsed().as_secs_f64(),"user":cpu(usage.ru_utime),"system":cpu(usage.ru_stime),"rss_kib":usage.ru_maxrss,"voluntary":usage.ru_nvcsw,"involuntary":usage.ru_nivcsw,"io_before":io_before,"io_after":std::fs::read_to_string("/sys/fs/cgroup/io.stat").unwrap_or_default(),"memory_stat":std::fs::read_to_string("/sys/fs/cgroup/memory.stat").unwrap_or_default(),"memory_events":std::fs::read_to_string("/sys/fs/cgroup/memory.events").unwrap_or_default()})
+        serde_json::json!({"mode":a[1],"objects":groups,"requests":jobs,"readers_per_writer":readers,"serial_tail":serial_tail,"phase_elapsed":phase_elapsed,"bytes":total,"concurrency":concurrency,"workers":workers,"elapsed":start.elapsed().as_secs_f64(),"user":cpu(usage.ru_utime),"system":cpu(usage.ru_stime),"rss_kib":usage.ru_maxrss,"voluntary":usage.ru_nvcsw,"involuntary":usage.ru_nivcsw,"io_before":io_before,"io_after":std::fs::read_to_string("/sys/fs/cgroup/io.stat").unwrap_or_default(),"memory_stat":std::fs::read_to_string("/sys/fs/cgroup/memory.stat").unwrap_or_default(),"memory_events":std::fs::read_to_string("/sys/fs/cgroup/memory.events").unwrap_or_default()})
     );
     Ok(())
 }
