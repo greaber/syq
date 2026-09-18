@@ -58,7 +58,7 @@ substituting it in an existing script.
 
 | I want to… | Start here |
 |---|---|
-| Look up every command and option | [Command reference](commands/index.md) |
+| Look up commands and options | [Command reference](commands/index.md) |
 | Choose exactly where files land | [Copy and placement](reference.md) |
 | Preview changes | [Dry runs](reference.md#preview-changes) |
 | Skip build files or use `.gitignore` | [Ignoring paths](reference.md#ignoring-paths) |

@@ -43,7 +43,7 @@ they require manual cleanup on both machines.
 
 Enrollment detects the destination platform and installs a matching executable.
 Source builds require compatible platforms; `--syq-path` does not select the
-restricted receiver. See [Developing syq](development.md#direct-server-to-server-copies)
+restricted receiver. See [Developing syq](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#direct-server-to-server-copies)
 for testing source builds.
 
 ## Limits and unsupported options

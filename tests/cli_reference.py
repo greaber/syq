@@ -14,6 +14,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 BLOCK = re.compile(r"<!-- CLI: (.*?) -->\n(.*?)<!-- /CLI -->", re.S)
+# Streaming is omitted from the site while its interface matures.
+DOCS_EXCLUDED_COMMANDS = {("stream",)}
 GROUP_LINKS = {
     "--performance-tuning": "[Workers, request sizes, and copy methods](../tuning.md)",
     "--resource-limits": "[Bandwidth limit](../resource-limits.md)",
@@ -123,8 +125,6 @@ def render(command, parsed, commands):
                     body = link
                     if flag == "--performance-tuning" and command in (("rm",), ("clean-partials",)):
                         body = "Filesystem removal workers: [workers=N](../tuning.md#transfer-controls)"
-                    elif flag == "--performance-tuning" and command == ("stream",):
-                        body = "[S3 stream part size, concurrency, and retries](../tuning.md#s3-streams)"
             # Some management arguments have no help string. Their usage and
             # command-specific prose supply meaning; never silently omit them.
             body = body or "See the command description above."
@@ -136,7 +136,10 @@ def render(command, parsed, commands):
 def collect(binary):
     commands = {}
     def visit(command):
-        parsed = parse_help(read_help(binary, command))
+        usage, groups, children = parse_help(read_help(binary, command))
+        children = [(name, description) for name, description in children
+                    if (*command, name) not in DOCS_EXCLUDED_COMMANDS]
+        parsed = usage, groups, children
         commands[command] = parsed
         for name, _ in parsed[2]:
             visit((*command, name))

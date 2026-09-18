@@ -37,7 +37,7 @@ brew install greaber/tap/syq
 
 ## Build from source
 
-See [source builds](development.md) for Cargo builds, custom compilation options,
+See [source builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for Cargo builds, custom compilation options,
 and choosing between your own executable and compatible official SSH helpers.
 
 ## Try a benchmark

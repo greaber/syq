@@ -36,9 +36,15 @@ connection stays open; there is no detached mode. With `--dry-run`, nothing is
 removed, but remote setup may still cache the helper or
 [install syq](install.md#automatic-installation-on-ssh-servers).
 
-For object storage, use `--on s3://BUCKET`. Ordinary removal respects bucket
+For object storage, use `--on s3://BUCKET`:
+
+```sh
+syq rm --on s3://backups --src-dir old-backup --dry-run -v
+```
+
+Ordinary removal respects bucket
 versioning; explicit version deletion is available with `--s3-all-versions` or
-`--s3-version-id`. See [S3 removal](object-storage.md#remove-objects-and-versions).
+`--s3-version-id`. See [S3 removal](object-storage.md#versions-and-deletion).
 
 ## Limit the selection
 
@@ -73,7 +79,7 @@ With `--root`, traversal must still stay inside that root.
 Removal continues with independent entries after per-entry failures and exits 23.
 S3 removal uses concurrent batches and reports each key or version separately.
 During permanent removal, a data-version failure preserves all selected delete
-markers; see [S3 removal](object-storage.md#remove-objects-and-versions).
+markers; see [S3 removal](object-storage.md#versions-and-deletion).
 Fatal setup or connection failures exit 1. Use
 [`--results`](automation.md) for per-path outcomes in scripts.
 

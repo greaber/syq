@@ -53,9 +53,7 @@ examples.
 
 ## Developing syq
 
-For source builds, remote testing, and contribution checks, see
-[Developing syq](docs/development.md). For everyday use, install a release
-using the commands above.
+See [CONTRIBUTING.md](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for source builds and contribution checks.
 
 ## License
 

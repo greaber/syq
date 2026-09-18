@@ -55,7 +55,7 @@ For a complete check of a local copy, use an [expected digest](#expected-digests
 For local/S3 copies, provider request checksums remain enabled. The `transfer`
 algorithm records a whole-file digest on upload and checks stored digests on
 download when present. Use an expected digest for objects without a stored
-digest. See [S3 metadata and integrity](object-storage.md#metadata-and-integrity).
+digest. See [S3 metadata and integrity](object-storage.md#filesystem-differences).
 
 Server-side S3 copies preserve stored digests without reading or verifying
 object bodies. They do not support content-hash comparison, extra transfer

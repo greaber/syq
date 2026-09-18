@@ -96,10 +96,15 @@ The `@` is required: `--to laptop` selects an SSH destination, while
 `--to @laptop` requires that receiver to be connected and pass its identity check.
 See [Send files home from a server](receive.md) for setup and destination paths.
 
-For object storage, use `--to s3://BUCKET`, `--from s3://BUCKET`, or both to
-copy between buckets. Select keys with the same source and placement options. See
-[Copy to and from object storage](object-storage.md) for credentials, headers,
-metadata, and tuning.
+Use S3 buckets with the same selectors and placement options:
+
+```sh
+syq cp photos --to s3://backups --into laptop
+syq cp --from s3://backups laptop/photos --into restored
+syq cp --from s3://backups --srcs-in laptop --to s3://archive --into laptop
+```
+
+See [S3 options and behavior](object-storage.md) for credentials and filesystem differences.
 
 For two SSH endpoints, see [Copy between servers](remote-to-remote.md).
 
@@ -438,11 +443,10 @@ in names and peer diagnostics. JSON status output keeps the original values.
 Syq reads no configuration file. Besides the usual system variables such as
 `HOME`, `TMPDIR`, and `SSH_AUTH_SOCK`, and the AWS credential, region, and
 endpoint variables described under
-[object storage](object-storage.md#credentials-and-providers), syq honors:
+[object storage](object-storage.md#s3-options), syq honors:
 
-- `SYQ_CP_OPTIONS`, `SYQ_RSYNC_OPTIONS`, `SYQ_RM_OPTIONS`, and
-  `SYQ_STREAM_OPTIONS` hold extra arguments for `syq cp`, `syq rsync`,
-  `syq rm`, and `syq stream`, respectively. Use them to adjust a
+- `SYQ_CP_OPTIONS`, `SYQ_RSYNC_OPTIONS`, and `SYQ_RM_OPTIONS` hold extra
+  arguments for `syq cp`, `syq rsync`, and `syq rm`, respectively. Use them to adjust a
   command inside a script or program that does not let you change its syq
   options. The value is split like a shell command line and inserted right
   after the command name, before the arguments the script supplies, so

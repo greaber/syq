@@ -1,7 +1,7 @@
 # Command reference
 
-The complete option lists for syq's public commands are below. For copy examples,
-start with [Copy files](../reference.md).
+Look up commands and options below. For copy examples, start with
+[Copy files](../reference.md).
 
 The advanced option groups have separate references:
 
@@ -23,7 +23,6 @@ syq --self-update
 | Command | Purpose |
 |---|---|
 | [`cp`](cp.md) | Copy files and directories, optionally removing destination-only files |
-| [`stream`](stream.md) | Stream S3 object contents to or from stdin, stdout, or an inherited descriptor |
 | [`exec`](exec.md) | Run a command on a named receiving machine after local approval |
 | [`rm`](rm.md) | Remove selected files and directory trees |
 | [`clean-partials`](clean-partials.md) | Delete syq partial files in directory trees |
@@ -87,4 +86,4 @@ root help. A trailing `--help` or `-h` selects common help.
 
 ## Build identity
 
-`syq --build-identity` prints the executable’s build identity. See [development builds](../development.md#another-platform-with-your-own-helpers).
+`syq --build-identity` prints the executable’s build identity. See [development builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#another-platform-with-your-own-helpers).

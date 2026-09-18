@@ -2,7 +2,7 @@
 
 Remove local files, remote filesystem entries, or S3 objects.
 See [Remove files](../remove.md) for selection rules and
-[S3 removal](../object-storage.md#remove-objects-and-versions) for versioned objects.
+[S3 removal](../object-storage.md#versions-and-deletion) for versioned objects.
 
 ```sh
 syq rm --src-dir old-output --dry-run -v

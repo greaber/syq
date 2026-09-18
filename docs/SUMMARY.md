@@ -6,7 +6,6 @@
 
 - [Install and setup](install.md)
 - [Copy files](reference.md)
-- [Copy to, from, and between S3 buckets](object-storage.md)
 - [Remove files](remove.md)
 - [Send files home from a server](receive.md)
 - [Run commands on your receiving machine](exec.md)
@@ -28,12 +27,12 @@
   - [rm](commands/rm.md)
   - [clean-partials](commands/clean-partials.md)
   - [map](commands/map.md)
-  - [stream](commands/stream.md)
   - [exec](commands/exec.md)
   - [rsync](commands/rsync.md)
   - [persist](commands/persist.md)
   - [receiver](commands/receiver.md)
   - [completion](commands/completion.md)
+- [S3 options and behavior](object-storage.md)
 - [Performance tuning](tuning.md)
 - [Resource limits](resource-limits.md)
 - [Integrity checking](integrity-checking.md)
@@ -41,10 +40,6 @@
 - [Persistence details](persistence-reference.md)
 - [Automation results](automation.md)
 - [Rsync compatibility](rsync-compat.md)
-
-# Development
-
-- [Developing syq](development.md)
 
 # SDKs
 
