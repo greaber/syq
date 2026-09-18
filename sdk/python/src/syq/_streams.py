@@ -291,8 +291,11 @@ class StreamReader:
         return data
 
     def readinto(self, buffer) -> int:
-        data = self.read(len(buffer))
-        buffer[:len(data)] = data
+        view = memoryview(buffer).cast("B")
+        if view.readonly:
+            raise TypeError("readinto() requires a writable buffer")
+        data = self.read(len(view))
+        view[:len(data)] = data
         return len(data)
 
     def close(self) -> None:

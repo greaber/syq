@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from array import array
 import os
 from pathlib import Path
 import signal
@@ -65,6 +66,16 @@ class StreamTests(unittest.TestCase):
         output.abort()
         output.abort()
         self.assertEqual(target.read_bytes(), b'')
+
+    def test_readinto_accepts_typed_buffers_and_rejects_readonly_before_reading(self):
+        target = self.root / 'bytes'
+        target.write_bytes(bytes(range(16)))
+        buffer = array('I', [0] * 4)
+        with self.client.open_reader(target) as source:
+            with self.assertRaises(TypeError):
+                source.readinto(b'not writable')
+            self.assertEqual(source.readinto(buffer), 16)
+        self.assertEqual(buffer.tobytes(), bytes(range(16)))
 
     def test_remote_helper_and_failure_propagation(self):
         rsh = self.root / 'rsh'
