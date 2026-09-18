@@ -3352,10 +3352,19 @@ impl FsOps {
         copy_id: &CopyId,
         guard: Option<&ContainerGuard>,
     ) -> Vec<std::result::Result<PathBytes, String>> {
-        parallel_map(paths, |path| {
+        parallel_map_init(paths, PartialNameLimits::default, |limits, path| {
             let requested = Path::new(OsStr::from_bytes(path));
             let resolved = if let Some(target) = self.rooted_destination_target(path, guard)? {
-                rooted_partial_target(&target, copy_id)?.1
+                let relative = target.relative.to_path_buf();
+                // Validate the leaf even on a cache hit: an empty relative path
+                // names the root, not a file for which we can make a sidecar.
+                let parent = relative
+                    .parent()
+                    .context("operation requires a descendant path")?;
+                let limit = limits.get_or_query(&target.root, parent, || {
+                    target.root.name_max_for_parent(&target.relative)
+                })?;
+                partial_path_with_name_max(&target.label, copy_id, limit)?
             } else {
                 self.partial_path(&resolve(path), copy_id)?
             };
@@ -3695,6 +3704,36 @@ struct RootedTarget {
     relative: RelativePath,
     label: PathBuf,
     create_missing_parents: bool,
+}
+
+// One filename-limit observation for adjacent siblings in a read-only batch
+// chunk. This avoids repeating parent resolution (including missing-parent
+// probes). The cache opens no descriptors and ends with the chunk. Later
+// requests query again; file operations keep their own confined resolution.
+#[derive(Default)]
+struct PartialNameLimits {
+    last: Option<(Arc<Root>, PathBuf, usize)>,
+}
+
+impl PartialNameLimits {
+    fn get_or_query(
+        &mut self,
+        root: &Arc<Root>,
+        parent: &Path,
+        query: impl FnOnce() -> Result<usize>,
+    ) -> Result<usize> {
+        if let Some((previous_root, previous_parent, limit)) = &self.last {
+            if Arc::ptr_eq(previous_root, root) && previous_parent == parent {
+                return Ok(*limit);
+            }
+        }
+        self.last = None;
+        let limit = query()?;
+        // Keep the actual root alive: device/inode can coincide across
+        // distinct mount views, and a raw pointer could otherwise be reused.
+        self.last = Some((root.clone(), parent.to_path_buf(), limit));
+        Ok(limit)
+    }
 }
 
 impl RootedTarget {
@@ -11555,6 +11594,122 @@ mod tests {
         assert_eq!(
             serde_json::to_value(actual).unwrap(),
             serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn partial_name_limits_keep_roots_parents_and_errors_separate() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = Arc::new(Root::open(temporary.path()).unwrap());
+        let reopened = Arc::new(Root::open(temporary.path()).unwrap());
+        assert_eq!(root.identity(), reopened.identity());
+        let mut limits = PartialNameLimits::default();
+        let parent = Path::new("parent");
+        assert_eq!(limits.get_or_query(&root, parent, || Ok(143)).unwrap(), 143);
+        assert_eq!(
+            limits
+                .get_or_query(&root, parent, || panic!("sibling repeated query"))
+                .unwrap(),
+            143
+        );
+        // Distinct authorities must not share a result, even with the same
+        // device/inode and relative spelling.
+        assert_eq!(
+            limits.get_or_query(&reopened, parent, || Ok(255)).unwrap(),
+            255
+        );
+        assert_eq!(
+            limits
+                .get_or_query(&root, Path::new("other"), || Ok(100))
+                .unwrap(),
+            100
+        );
+        assert!(limits
+            .get_or_query(&root, parent, || bail!("transient failure"))
+            .is_err());
+        assert_eq!(limits.get_or_query(&root, parent, || Ok(120)).unwrap(), 120);
+        // The next batch starts a fresh observation.
+        assert_eq!(
+            PartialNameLimits::default()
+                .get_or_query(&root, parent, || Ok(200))
+                .unwrap(),
+            200
+        );
+    }
+
+    #[test]
+    fn partial_path_batches_preserve_names_errors_and_order() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        fs::create_dir(temporary.path().join("parent")).unwrap();
+        fs::write(temporary.path().join("not-directory"), b"file").unwrap();
+        std::os::unix::fs::symlink("parent", temporary.path().join("link")).unwrap();
+        let mut operations = FsOps::new();
+        operations
+            .install_destination(File::open(temporary.path()).unwrap(), b"logical")
+            .unwrap();
+        let id = [17; 16];
+        let mut cases: Vec<PathBytes> = [
+            b"file".as_slice(),
+            b"",
+            b"other",
+            b"parent/a",
+            b"parent/b",
+            b"missing/deeper/a",
+            b"missing/deeper/b",
+            b"not-directory/child",
+            b"link/child",
+            b"../outside",
+            b"parent//bad",
+            b"parent/..",
+            b"/absolute",
+            b"parent/nul\0",
+            b"parent/raw-\xff",
+        ]
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect();
+        cases.push(format!("parent/{}", "x".repeat(255)).into_bytes());
+        for count in [3, 31, 32, 65, 128] {
+            let paths: Vec<_> = cases.iter().cycle().take(count).cloned().collect();
+            let expected: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    (|| -> Result<PathBytes> {
+                        let target = operations.rooted_destination_target(path, None)?.unwrap();
+                        let (_, label) = rooted_partial_target(&target, &id)?;
+                        let parent = Path::new(OsStr::from_bytes(path))
+                            .parent()
+                            .unwrap_or_else(|| Path::new(""));
+                        Ok(path_bytes(&parent.join(label.file_name().unwrap())))
+                    })()
+                    .map_err(|error| format!("{error:#}"))
+                })
+                .collect();
+            assert_eq!(
+                operations.partial_paths(&paths, &id, None),
+                expected,
+                "batch size {count}"
+            );
+        }
+        // After a namespace change, use the same resolution/fallback rules as
+        // an individual query (a symlink can select the nearest real ancestor).
+        assert!(operations.partial_paths(&[b"parent/a".to_vec()], &id, None)[0].is_ok());
+        fs::rename(
+            temporary.path().join("parent"),
+            temporary.path().join("moved"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("moved", temporary.path().join("parent")).unwrap();
+        let target = operations
+            .rooted_destination_target(b"parent/a", None)
+            .unwrap()
+            .unwrap();
+        let expected = rooted_partial_target(&target, &id)
+            .map(|(_, label)| path_bytes(&Path::new("parent").join(label.file_name().unwrap())))
+            .map_err(|error| format!("{error:#}"));
+        assert_eq!(
+            operations.partial_paths(&[b"parent/a".to_vec()], &id, None),
+            vec![expected]
         );
     }
 
