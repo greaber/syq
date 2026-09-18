@@ -367,6 +367,16 @@ fn serve(
                 "source class must not be preserved by default"
             );
         }
+        if method == "GET" && fault == "server-copy-symlink-head-denied" {
+            reply(
+                &mut socket,
+                403,
+                &[],
+                b"<Error><Code>AccessDenied</Code></Error>",
+                false,
+            );
+            return;
+        }
         if method == "GET"
             && path.contains("list-type=2")
             && fault == "server-copy-multipart-cached-unsupported"
@@ -4243,50 +4253,86 @@ fn failed_marker_reports_directory_action_on_both_routes() {
 }
 
 #[test]
-fn failed_server_copy_reports_known_symlink_action() {
-    for mapping in [false, true] {
-        let server = Server::start("server-copy-symlink-head-denied");
-        let temp = tempfile::tempdir().unwrap();
-        let mut args = vec!["--from", "s3://source"];
-        if mapping {
-            let entry = serde_json::json!({
-                "src": {"encoding": "utf-8", "value": "original"},
-                "dst": {"encoding": "utf-8", "value": "copied"},
-                "kind": "symlink"
-            });
-            std::fs::write(temp.path().join("mapping.jsonl"), format!("{entry}\n")).unwrap();
-            args.extend([
-                "--mapping",
-                "mapping.jsonl",
-                "--to",
-                "s3://destination",
-                "--into",
-                ".",
-            ]);
-        } else {
-            args.extend(["original", "--to", "s3://destination", "--as", "copied"]);
+fn failed_transfers_report_known_symlink_action_on_both_routes() {
+    for server_copy in [false, true] {
+        for mapping in [false, true] {
+            let server = Server::start("server-copy-symlink-head-denied");
+            let temp = tempfile::tempdir().unwrap();
+            let mut args = vec!["--from", "s3://source"];
+            if mapping {
+                let entry = serde_json::json!({
+                    "src": {"encoding": "utf-8", "value": "original"},
+                    "dst": {"encoding": "utf-8", "value": "copied"},
+                    "kind": "symlink"
+                });
+                std::fs::write(temp.path().join("mapping.jsonl"), format!("{entry}\n")).unwrap();
+                args.extend(["--mapping", "mapping.jsonl", "--into", "."]);
+            } else {
+                args.extend(["original", "--as", "copied"]);
+            }
+            if server_copy {
+                args.extend(["--to", "s3://destination"]);
+            }
+            args.extend(["--results", "results.jsonl"]);
+            let output = server.cp(temp.path(), &args);
+            assert!(!output.status.success(), "{}", output_text(&output));
+            let results = std::fs::read_to_string(temp.path().join("results.jsonl"))
+                .unwrap_or_else(|e| panic!("{e}: {}", output_text(&output)));
+            let records: Vec<serde_json::Value> = results
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record["action"] == "create_symlink"
+                        && record["disposition"] == "failed"),
+                "{results}"
+            );
+            assert!(
+                !records
+                    .iter()
+                    .any(|record| record["action"] == "transfer_file"),
+                "{results}"
+            );
         }
-        args.extend(["--results", "results.jsonl"]);
-        let output = server.cp(temp.path(), &args);
-        assert!(!output.status.success(), "{}", output_text(&output));
-        let results = std::fs::read_to_string(temp.path().join("results.jsonl"))
-            .unwrap_or_else(|e| panic!("{e}: {}", output_text(&output)));
+    }
+}
+
+#[test]
+fn skipped_download_markers_do_not_count_as_unchanged_files() {
+    for flag in ["--only-new", "--only-existing"] {
+        let server = Server::start("marker-head-failure");
+        let temp = tempfile::tempdir().unwrap();
+        if flag == "--only-new" {
+            std::fs::create_dir_all(temp.path().join("out/marker")).unwrap();
+        }
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://source",
+                "--srcs-in",
+                "data",
+                "--into",
+                "out",
+                flag,
+                "--results",
+                "results.jsonl",
+            ],
+        );
+        assert!(output.status.success(), "{}", output_text(&output));
+        let results = std::fs::read_to_string(temp.path().join("results.jsonl")).unwrap();
         let records: Vec<serde_json::Value> = results
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert!(
-            records
-                .iter()
-                .any(|record| record["action"] == "create_symlink"
-                    && record["disposition"] == "failed"),
+            records.iter().any(|r| r["type"] == "progress"
+                && r["files_total"] == 1
+                && r["scan_done"] == true),
             "{results}"
         );
-        assert!(
-            !records
-                .iter()
-                .any(|record| record["action"] == "transfer_file"),
-            "{results}"
-        );
+        assert_eq!(records.last().unwrap()["files_unchanged"], 0, "{results}");
     }
 }

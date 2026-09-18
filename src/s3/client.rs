@@ -444,14 +444,18 @@ pub(super) fn is_directory_marker(key: &str, size: u64) -> bool {
 }
 
 impl Object {
-    pub fn kind(&self) -> &str {
+    pub fn kind(&self) -> &'static str {
         self.metadata.as_ref().map_or(
             if is_directory_marker(&self.key, self.size) {
                 "dir"
             } else {
                 "file"
             },
-            |m| m.kind.as_str(),
+            |m| match m.kind.as_str() {
+                "dir" => "dir",
+                "symlink" => "symlink",
+                _ => "file",
+            },
         )
     }
 }

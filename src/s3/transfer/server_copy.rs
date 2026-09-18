@@ -195,7 +195,7 @@ impl Engine {
             let engine = self.clone();
             async move {
                 engine.check_cancelled()?;
-                let mut kind = job.known_kind();
+                let mut kind = job.kind;
                 let result = engine
                     .copy_object(&mut job, &mut kind)
                     .await
@@ -244,11 +244,7 @@ impl Engine {
             source.size == job.size,
             "S3 source size changed after planning"
         );
-        *kind = match source.kind() {
-            "dir" => "dir",
-            "symlink" => "symlink",
-            _ => "file",
-        };
+        *kind = source.kind();
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {
@@ -319,20 +315,17 @@ impl Engine {
             part_size <= 5 * 1024 * 1024 * 1024,
             "object exceeds the S3 multipart size limit"
         );
-        let read_tags = if metadata.tag_count() == Some(0) {
-            false
+        let setup_slot = self.tuning.requests.acquire().await;
+        self.check_cancelled()?;
+        let tagging = if metadata.tag_count() == Some(0) {
+            String::new()
         } else if self.copy_tagging_unsupported.load(Relaxed) {
             anyhow::ensure!(
                 metadata.tag_count().is_none_or(|count| count <= 0),
                 "source has tags but S3 GetObjectTagging is unsupported; refusing to drop known tags"
             );
-            false
+            String::new()
         } else {
-            true
-        };
-        let setup_slot = self.tuning.requests.acquire().await;
-        self.check_cancelled()?;
-        let tagging = if read_tags {
             // A missing count is unknown. Only explicit lack of tagging support
             // permits copying without tags; permission failures remain fatal.
             let tags = self
@@ -376,8 +369,6 @@ impl Engine {
                 }
             }
             serializer.finish().replace('+', "%20")
-        } else {
-            String::new()
         };
         let created = self
             .client

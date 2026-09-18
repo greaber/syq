@@ -62,28 +62,13 @@ impl Drop for Engine {
 }
 #[derive(Clone)]
 struct Download {
+    kind: &'static str,
     key: String,
     path: String,
     size: u64,
     expected_digest: Option<Digest>,
     copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
 }
-impl Download {
-    fn known_kind(&self) -> &'static str {
-        if let Some((source, _)) = self.copy_source.as_deref() {
-            match source.kind() {
-                "dir" => "dir",
-                "symlink" => "symlink",
-                _ => "file",
-            }
-        } else if client::is_directory_marker(&self.key, self.size) {
-            "dir"
-        } else {
-            "file"
-        }
-    }
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
     schema: u32,
@@ -245,7 +230,7 @@ impl Engine {
                 let dirs = directories.clone();
                 async move {
                     engine.check_cancelled()?;
-                    let mut kind = job.known_kind();
+                    let mut kind = job.kind;
                     let result = engine.download(&job, &dst, dirs, &mut kind).await;
                     engine.settle(
                         job.key.as_bytes(),
@@ -1327,9 +1312,11 @@ impl Engine {
                 if expected_digest.is_some() && object.kind() != "file" {
                     bail!("an expected digest requires a regular file");
                 }
-                vec![(object.key, object.size, path.clone())]
+                let kind = object.kind();
+                vec![(object.key, object.size, path.clone(), kind)]
             } else if let Some(exact) = exact {
-                vec![(exact.key, exact.size, path.clone())]
+                let kind = exact.kind();
+                vec![(exact.key, exact.size, path.clone(), kind)]
             } else {
                 if selection == SourceSelection::File {
                     bail!("S3 source object {key:?} is missing");
@@ -1381,11 +1368,16 @@ impl Engine {
                         suffix
                     };
                     let suffix = local::key_path(suffix.as_bytes())?;
-                    objects.push((object, size, local::join(&path, &suffix)));
+                    let kind = if client::is_directory_marker(&object, size) {
+                        "dir"
+                    } else {
+                        "file"
+                    };
+                    objects.push((object, size, local::join(&path, &suffix), kind));
                 }
                 objects
             };
-            for (key, size, path) in objects {
+            for (key, size, path, kind) in objects {
                 let directory = client::is_directory_marker(&key, size);
                 if !already_filtered {
                     if let Some(excluded) =
@@ -1430,6 +1422,7 @@ impl Engine {
                     }
                 }
                 out.push(Download {
+                    kind,
                     key,
                     path,
                     size,
@@ -1508,11 +1501,7 @@ impl Engine {
                 .await?
                 .context("S3 source disappeared after listing")?
         };
-        *kind = match object.kind() {
-            "dir" => "dir",
-            "symlink" => "symlink",
-            _ => "file",
-        };
+        *kind = object.kind();
         let mut initial = initial.map(|output| output.body);
         let metadata = object.metadata.clone().unwrap_or(Metadata {
             kind: object.kind().into(),
