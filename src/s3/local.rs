@@ -1,4 +1,4 @@
-use super::client::Metadata;
+use super::client::{Metadata, ObjectKind};
 use crate::{
     cli::{Args, Existence, Placement, SourceSelection},
     proto::OperatorSymlinkPolicy,
@@ -27,13 +27,13 @@ pub(super) struct Source {
     _pin: Option<Arc<File>>,
 }
 impl Source {
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> ObjectKind {
         if self.meta.is_dir() {
-            "dir"
+            ObjectKind::Dir
         } else if self.meta.is_symlink() {
-            "symlink"
+            ObjectKind::Symlink
         } else {
-            "file"
+            ObjectKind::File
         }
     }
     pub fn open(&self) -> Result<File> {
@@ -71,12 +71,7 @@ impl Source {
     }
     pub fn metadata(&self, hash: Option<String>) -> Metadata {
         Metadata {
-            kind: match self.kind() {
-                "file" => super::client::ObjectKind::File,
-                "dir" => super::client::ObjectKind::Dir,
-                "symlink" => super::client::ObjectKind::Symlink,
-                _ => unreachable!("S3 sources support only files, directories and symlinks"),
-            },
+            kind: self.kind(),
             mode: self.meta.mode & 0o7777,
             uid: self.meta.uid,
             gid: self.meta.gid,
@@ -87,7 +82,7 @@ impl Source {
         }
     }
     pub fn bytes(&self) -> Result<Vec<u8>> {
-        if self.kind() == "dir" {
+        if self.kind() == ObjectKind::Dir {
             return Ok(Vec::new());
         }
         let path = RelativePath::new(&self.path)?;
@@ -285,24 +280,24 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
             }
             _ => bail!("source cannot be selected for S3 upload"),
         };
-        if (selection == SourceSelection::File && source.kind() == "dir")
+        if (selection == SourceSelection::File && source.kind() == ObjectKind::Dir)
             || (matches!(
                 selection,
                 SourceSelection::Directory | SourceSelection::Contents
-            ) && source.kind() != "dir")
+            ) && source.kind() != ObjectKind::Dir)
         {
             bail!("source type does not match selector");
         }
         if let Some(kind) = declared_kind {
-            if kind.label() != source.kind() {
+            if kind.label().parse::<ObjectKind>()? != source.kind() {
                 bail!("source type does not match mapping");
             }
         }
-        if source.expected_digest.is_some() && source.kind() != "file" {
+        if source.expected_digest.is_some() && source.kind() != ObjectKind::File {
             bail!("an expected digest requires a regular file");
         }
         if args.delete
-            && source.kind() == "dir"
+            && source.kind() == ObjectKind::Dir
             && !matcher
                 .as_ref()
                 .is_some_and(|m| crate::scan::path_is_ignored(m, &source.label, true))
@@ -312,12 +307,12 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
         let mut stack = vec![(source, selection == SourceSelection::Contents)];
         while let Some((mut source, contents)) = stack.pop() {
             if matcher.as_ref().is_some_and(|m| {
-                crate::scan::path_is_ignored(m, &source.label, source.kind() == "dir")
+                crate::scan::path_is_ignored(m, &source.label, source.kind() == ObjectKind::Dir)
             }) {
                 prune.protect(source.key.as_bytes());
                 continue;
             }
-            if source.kind() == "file"
+            if source.kind() == ObjectKind::File
                 && (!source.meta.is_file() || source.meta.len < min || source.meta.len > max)
             {
                 if !source.meta.is_file() {
@@ -327,7 +322,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                 continue;
             }
             if args.delete {
-                if source.kind() == "dir" {
+                if source.kind() == ObjectKind::Dir {
                     prune.claim(source.key.as_bytes());
                 } else if args.existing || args.ignore_existing {
                     prune.protect(source.key.as_bytes());
@@ -335,7 +330,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                     prune.claim_file(source.key.as_bytes());
                 }
             }
-            if source.kind() == "dir" {
+            if source.kind() == ObjectKind::Dir {
                 let rel = RelativePath::new(&source.path)?;
                 for name in if args.native_mapping.is_none() {
                     source.root.read_directory(&rel)?
@@ -366,7 +361,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
             claim(
                 &mut claims,
                 source.key.trim_end_matches('/'),
-                source.kind() == "dir",
+                source.kind() == ObjectKind::Dir,
             )?;
             if source.key.len() > 1024 {
                 bail!("S3 key exceeds 1024 bytes");

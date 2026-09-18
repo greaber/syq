@@ -6,7 +6,7 @@ mod server_copy;
 use super::{
     admission::parallel,
     checksum::Algorithm,
-    client::{self, Metadata, Object},
+    client::{self, Metadata, Object, ObjectKind},
     local::{self, Destination, Source},
     state::State,
     Options,
@@ -62,7 +62,7 @@ impl Drop for Engine {
 }
 #[derive(Clone)]
 struct Download {
-    kind: &'static str,
+    kind: ObjectKind,
     key: String,
     path: String,
     size: u64,
@@ -172,11 +172,12 @@ impl Engine {
             let (plan, prune) =
                 tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
             super::diagnostics::elapsed(scanning, "source_plan", plan.len() as u64);
-            if self.args.expected_digest.is_some() && (plan.len() != 1 || plan[0].kind() != "file")
+            if self.args.expected_digest.is_some()
+                && (plan.len() != 1 || plan[0].kind() != ObjectKind::File)
             {
                 bail!("an expected digest requires exactly one regular file");
             }
-            self.check_upload_placement(plan.first().map(|s| s.kind() != "dir"))
+            self.check_upload_placement(plan.first().map(|s| s.kind() != ObjectKind::Dir))
                 .await?;
             self.discover_destination(plan.iter().map(|s| s.key.as_str()).collect())
                 .await?;
@@ -184,7 +185,7 @@ impl Engine {
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress.bytes_total.store(
                 plan.iter()
-                    .filter(|s| s.kind() == "file")
+                    .filter(|s| s.kind() == ObjectKind::File)
                     .map(|s| s.meta.len)
                     .sum(),
                 Relaxed,
@@ -276,21 +277,21 @@ impl Engine {
         &self,
         src: &[u8],
         dst: &str,
-        kind: &'static str,
+        kind: ObjectKind,
         result: &Result<Option<u64>>,
         expected: Option<&Digest>,
     ) {
         let action = match kind {
-            "dir" => "create_directory",
-            "symlink" => "create_symlink",
-            _ => "transfer_file",
+            ObjectKind::Dir => "create_directory",
+            ObjectKind::Symlink => "create_symlink",
+            ObjectKind::File => "transfer_file",
         };
         match result {
             Ok(Some(bytes)) => {
-                if kind == "file" {
+                if kind == ObjectKind::File {
                     self.progress.files_done.fetch_add(1, Relaxed);
                 } else if self.options.route != Route::Download {
-                    if kind == "dir" {
+                    if kind == ObjectKind::Dir {
                         self.progress.directories_created.fetch_add(1, Relaxed);
                     } else {
                         self.progress.symlinks_created.fetch_add(1, Relaxed);
@@ -312,7 +313,7 @@ impl Engine {
                             action,
                             src: Some(src),
                             dst: dst.as_bytes(),
-                            kind,
+                            kind: kind.as_str(),
                             bytes: Some(*bytes),
                             reason: "content_differs",
                         });
@@ -322,7 +323,7 @@ impl Engine {
                                 action,
                                 src: Some(src),
                                 dst: dst.as_bytes(),
-                                kind,
+                                kind: kind.as_str(),
                                 disposition: "succeeded",
                                 bytes: Some(*bytes),
                                 attempts: None,
@@ -337,7 +338,7 @@ impl Engine {
                 }
             }
             Ok(None) => {
-                if kind == "file" {
+                if kind == ObjectKind::File {
                     self.progress.files_unchanged.fetch_add(1, Relaxed);
                 }
             }
@@ -350,7 +351,7 @@ impl Engine {
                             action,
                             src: Some(src),
                             dst: dst.as_bytes(),
-                            kind,
+                            kind: kind.as_str(),
                             disposition: "failed",
                             bytes: None,
                             attempts: None,
@@ -522,7 +523,7 @@ impl Engine {
         {
             return Ok(None);
         }
-        let size = if source.kind() == "dir" {
+        let size = if source.kind() == ObjectKind::Dir {
             0
         } else {
             source.meta.len
@@ -541,7 +542,7 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|o| self.upload_metadata_matches(&source, size, o))
         {
-            if source.kind() == "file" {
+            if source.kind() == ObjectKind::File {
                 // Opening validates the pinned scan identity without reading the
                 // body. Explicit content checks still take the hashing path.
                 source.open()?;
@@ -560,22 +561,23 @@ impl Engine {
         } else {
             1 << 20
         };
-        let reservation = if source.kind() == "file" && size <= part_size && size <= buffer_limit {
-            Some(
-                self.tuning
-                    .upload_buffers
-                    .clone()
-                    .acquire_many_owned(size.max(1) as u32)
-                    .await?,
-            )
-        } else {
-            None
-        };
+        let reservation =
+            if source.kind() == ObjectKind::File && size <= part_size && size <= buffer_limit {
+                Some(
+                    self.tuning
+                        .upload_buffers
+                        .clone()
+                        .acquire_many_owned(size.max(1) as u32)
+                        .await?,
+                )
+            } else {
+                None
+            };
         self.check_cancelled()?;
         let source_clone = source.clone();
         let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
         let (whole_digest, checksums, small) = tokio::task::spawn_blocking(move || -> Result<_> {
-            if source_clone.kind() != "file" {
+            if source_clone.kind() != ObjectKind::File {
                 let bytes = source_clone.bytes()?;
                 return Ok((
                     whole_algorithm.map(|a| Digest::hash_bytes(a, &bytes).value),
@@ -767,7 +769,7 @@ impl Engine {
         if size <= part_size || small.is_some() {
             let _slot = self.tuning.requests.acquire().await;
             let synchronous =
-                source.kind() == "file" && small.is_none() && self.tuning.local_latency();
+                source.kind() == ObjectKind::File && small.is_none() && self.tuning.local_latency();
             let sync_file =
                 synchronous.then(|| crate::s3::upload_http::FileBody::new(source.clone(), 0, size));
             let mut attempt = 0;
@@ -1088,7 +1090,7 @@ impl Engine {
                 .context("complete multipart upload; rerun the command to recover")?;
             state.clear()?;
         }
-        if source.kind() == "file" {
+        if source.kind() == ObjectKind::File {
             source.check(&source.open()?)?;
         }
         Ok(Some(size))
@@ -1102,7 +1104,7 @@ impl Engine {
     ) -> Result<()> {
         let _slot = self.tuning.requests.acquire().await;
         if object.kind() != source.kind()
-            || object.size != source.meta.len && source.kind() != "dir"
+            || object.size != source.meta.len && source.kind() != ObjectKind::Dir
         {
             bail!("verification failed: object type or size differs");
         }
@@ -1305,10 +1307,14 @@ impl Engine {
                         object.context("S3 mapping source object or directory marker is missing")?
                     }
                 };
-                if declared_kind.is_some_and(|kind| kind != object.kind()) {
+                if declared_kind
+                    .map(str::parse::<ObjectKind>)
+                    .transpose()?
+                    .is_some_and(|kind| kind != object.kind())
+                {
                     bail!("S3 source type does not match mapping");
                 }
-                if expected_digest.is_some() && object.kind() != "file" {
+                if expected_digest.is_some() && object.kind() != ObjectKind::File {
                     bail!("an expected digest requires a regular file");
                 }
                 let kind = object.kind();
@@ -1360,17 +1366,26 @@ impl Engine {
                     let suffix = object
                         .strip_prefix(&prefix)
                         .context("S3 listing returned a key outside the requested prefix")?;
-                    if suffix.is_empty() && contents {
+                    let directory = client::is_directory_marker(&object, size);
+                    if suffix.is_empty()
+                        && (contents
+                            || (directory
+                                && self.options.route.is_server_copy()
+                                && path.is_empty()))
+                    {
                         continue;
                     }
-                    let directory = client::is_directory_marker(&object, size);
                     let suffix = if directory {
                         suffix.trim_end_matches('/')
                     } else {
                         suffix
                     };
                     let suffix = local::key_path(suffix.as_bytes())?;
-                    let kind = if directory { "dir" } else { "file" };
+                    let kind = if directory {
+                        ObjectKind::Dir
+                    } else {
+                        ObjectKind::File
+                    };
                     objects.push((object, size, local::join(&path, &suffix), kind, directory));
                 }
                 objects
@@ -1500,12 +1515,12 @@ impl Engine {
         job.kind = object.kind();
         let mut initial = initial.map(|output| output.body);
         let metadata = object.metadata.clone().unwrap_or(Metadata {
-            kind: if client::is_directory_marker(&object.key, object.size) {
-                client::ObjectKind::Dir
+            kind: object.kind(),
+            mode: if object.kind() == ObjectKind::Dir {
+                0o777
             } else {
-                client::ObjectKind::File
+                0o666
             },
-            mode: if object.kind() == "dir" { 0o777 } else { 0o666 },
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
             mtime: object.mtime,
@@ -1517,14 +1532,14 @@ impl Engine {
             return Ok(None);
         }
         if let Some(m) = existing {
-            if m.is_dir() != (object.kind() == "dir") {
+            if m.is_dir() != (object.kind() == ObjectKind::Dir) {
                 bail!("refusing to replace a directory with a non-directory or the reverse");
             }
         }
-        if requires_regular_file && object.kind() != "file" {
+        if requires_regular_file && object.kind() != ObjectKind::File {
             bail!("an expected digest requires a regular file");
         }
-        if object.kind() == "dir" {
+        if object.kind() == ObjectKind::Dir {
             if self.args.verify_only {
                 if existing.is_none() {
                     bail!("verification failed: directory is missing");
@@ -1552,7 +1567,7 @@ impl Engine {
             }
             return Ok(Some(0));
         }
-        if object.kind() == "symlink" {
+        if object.kind() == ObjectKind::Symlink {
             if object.size > 1024 * 1024 {
                 bail!("S3 symlink target is too large");
             }
@@ -1838,7 +1853,7 @@ impl Engine {
         expected: Option<&Digest>,
     ) -> Result<()> {
         if let Some(expected) = expected {
-            if object.kind() != "file" {
+            if object.kind() != ObjectKind::File {
                 bail!("an expected digest requires a regular file");
             }
             let actual = self.remote_hash_as(object, expected.algorithm).await?;

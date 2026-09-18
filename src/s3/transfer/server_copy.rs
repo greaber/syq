@@ -209,11 +209,6 @@ impl Engine {
     }
 
     async fn copy_object(&self, job: &mut Download) -> Result<Option<u64>> {
-        // A directory copied with --as . can plan its source marker here.
-        // The bucket root has no corresponding destination object.
-        if job.path.is_empty() {
-            return Ok(None);
-        }
         let source_bucket = self.options.route.source_bucket().unwrap();
         let key = copy_destination_key(job);
         local::key_path(key.trim_end_matches('/').as_bytes())?;

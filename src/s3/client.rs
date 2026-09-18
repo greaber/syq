@@ -345,6 +345,18 @@ impl ObjectKind {
     }
 }
 
+impl std::str::FromStr for ObjectKind {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "file" => Ok(Self::File),
+            "dir" => Ok(Self::Dir),
+            "symlink" => Ok(Self::Symlink),
+            _ => bail!("unsupported syq object kind"),
+        }
+    }
+}
+
 /// Version 1 is an ordinary object body plus this small metadata record.
 /// Other tools can read regular-file contents without understanding syq.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -409,8 +421,7 @@ impl Metadata {
                 .get(name)
                 .with_context(|| format!("missing object metadata {name}"))
         };
-        let kind = serde_json::from_value(serde_json::Value::String(get("syq-kind")?.clone()))
-            .context("unsupported syq object kind")?;
+        let kind = get("syq-kind")?.parse()?;
         let result = Self {
             kind,
             mode: get("syq-mode")?.parse()?,
@@ -459,14 +470,14 @@ pub(super) fn is_directory_marker(key: &str, size: u64) -> bool {
 }
 
 impl Object {
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> ObjectKind {
         self.metadata.as_ref().map_or(
             if is_directory_marker(&self.key, self.size) {
-                "dir"
+                ObjectKind::Dir
             } else {
-                "file"
+                ObjectKind::File
             },
-            |m| m.kind.as_str(),
+            |m| m.kind,
         )
     }
 }
@@ -889,7 +900,7 @@ pub(super) fn from_get(
         metadata: Metadata::decode(output.metadata())?,
         mtime: output.last_modified().map_or(0, |t| t.secs()),
     };
-    if object.kind() == "dir" && !is_directory_marker(key, size) {
+    if object.kind() == ObjectKind::Dir && !is_directory_marker(key, size) {
         bail!("invalid syq directory marker");
     }
     Ok(object)
