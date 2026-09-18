@@ -265,7 +265,11 @@ jobs:
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
           rm -rf -- target/sdk-python-from-sdist
-          MATURIN_PEP517_ARGS="--profile dev" uv build --wheel \
+          # Rebuild syq from the archive, reusing only its compiled dependencies.
+          # Archive mtimes can repeat across commits, so discard syq artifacts first.
+          cargo clean --package syq --target-dir "$GITHUB_WORKSPACE/target"
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+            MATURIN_PEP517_ARGS="--profile dev" uv build --wheel \
             target/sdk-python-dist-a/*.tar.gz --out-dir target/sdk-python-from-sdist
           set -- target/sdk-python-from-sdist/syq-*-py3-none-*.whl
           test "$#" -eq 1 && test -f "$1"
