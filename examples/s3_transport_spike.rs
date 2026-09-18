@@ -279,7 +279,7 @@ fn main() -> Result<()> {
                         aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
                     ))
                     .tls_context(tls)
-                    .pool_max_idle_per_host(concurrency)
+                    .pool_max_idle_per_host(concurrency * readers)
                     .build(),
             );
             stream::iter(0..groups)
