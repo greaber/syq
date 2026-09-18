@@ -1479,6 +1479,7 @@ fn server_copy_rejects_metadata_headers_before_requests() {
         "Cache-Control",
         "Expires",
         "X-Amz-Tagging",
+        "X-Amz-Website-Redirect-Location",
     ] {
         let header = format!("{name}: private-value");
         for dry_run in [false, true] {

@@ -60,7 +60,8 @@ provider headers that are valid on all these operations. Repeating the same
 name uses the last value. Headers are passed through, not interpreted as a
 metadata-editing operation. S3-to-S3 copies reject custom `x-amz-meta-*`,
 `Content-Type`, `Content-Encoding`, `Content-Language`,
-`Content-Disposition`, `Cache-Control`, `Expires`, and `x-amz-tagging`
+`Content-Disposition`, `Cache-Control`, `Expires`, `x-amz-tagging`, and
+`x-amz-website-redirect-location`
 headers because overrides behave differently for single-request and multipart
 copies. Provider controls such as Tigris consistency headers and
 `x-amz-storage-class` remain available.

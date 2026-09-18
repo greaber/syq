@@ -164,6 +164,7 @@ impl Options {
                             | "cache-control"
                             | "expires"
                             | "x-amz-tagging"
+                            | "x-amz-website-redirect-location"
                     )
                 {
                     bail!("--s3-header {name} is not supported for S3-to-S3 copies: metadata and tag overrides behave differently for single-request and multipart copies");
