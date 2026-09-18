@@ -109,7 +109,12 @@ jobs:
           set -- sdk-dist/syq-*-py3-none-*.whl
           test "$#" -eq 1 && test -f "$1"
           uv venv "$RUNNER_TEMP/wheel-test"
-          uv pip install --python "$RUNNER_TEMP/wheel-test/bin/python" --no-deps "$1" pyyaml==6.0.3
+          uv pip install --python "$RUNNER_TEMP/wheel-test/bin/python" --no-deps "$1"
+          uv export --project sdk/python --frozen --only-group dev --no-header --no-annotate |
+            awk '/^[^[:space:]]/ { keep = /^pyyaml==/ } keep' > "$RUNNER_TEMP/wheel-test-requirements.txt"
+          test -s "$RUNNER_TEMP/wheel-test-requirements.txt"
+          uv pip install --python "$RUNNER_TEMP/wheel-test/bin/python" --no-deps \
+            --require-hashes --only-binary :all: -r "$RUNNER_TEMP/wheel-test-requirements.txt"
           "$RUNNER_TEMP/wheel-test/bin/python" scripts/check-python-wheel.py \
             --version "$version" --identity "v$version"
           SYQ_CANDIDATE_EXECUTABLE=$("$RUNNER_TEMP/wheel-test/bin/python" -c \
