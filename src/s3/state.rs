@@ -14,6 +14,7 @@ use std::{
 };
 
 pub(super) struct State {
+    directory: std::path::PathBuf,
     root: Arc<Root>,
     name: String,
     _lock: File,
@@ -49,11 +50,22 @@ impl State {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             bail!("another S3 copy is using this recovery record; retry after it finishes");
         }
-        Ok(Self {
+        let state = Self {
+            directory: path,
             root,
             name,
             _lock: lock,
-        })
+        };
+        // Only the lock holder writes this file, so one found now was left by
+        // an interrupted save.
+        let temporary = state.temporary()?;
+        if state.root.metadata_optional(&temporary)?.is_some() {
+            state.root.unlink(&temporary)?;
+        }
+        Ok(state)
+    }
+    fn temporary(&self) -> Result<RelativePath> {
+        RelativePath::new(format!("{}.tmp", self.name).as_bytes())
     }
     fn path(&self) -> Result<RelativePath> {
         RelativePath::new(format!("{}.json", self.name).as_bytes())
@@ -70,20 +82,19 @@ impl State {
         }
         let mut text = Vec::new();
         file.take(16 * 1024 * 1024 + 1).read_to_end(&mut text)?;
-        Ok(Some(serde_json::from_slice(&text).context(
-            "invalid S3 recovery record; preserve it for recovery or remove this record to restart",
-        )?))
+        Ok(Some(serde_json::from_slice(&text).with_context(|| {
+            format!(
+                "invalid S3 recovery record {}; preserve it for recovery or remove it to restart",
+                self.directory.join(format!("{}.json", self.name)).display()
+            )
+        })?))
     }
     pub fn save<T: Serialize>(&self, value: &T) -> Result<()> {
-        let mut bytes = [0u8; 8];
-        getrandom::fill(&mut bytes)?;
-        let tmp = RelativePath::new(
-            format!("{}.{}.tmp", self.name, u64::from_le_bytes(bytes)).as_bytes(),
-        )?;
+        let tmp = self.temporary()?;
         let mut file = self.root.create_file(&tmp, 0o600)?;
-        serde_json::to_writer(&mut file, value)?;
-        file.flush()?;
-        file.sync_all()?;
+        // One write: serializing straight to the file costs a syscall per token.
+        file.write_all(&serde_json::to_vec(value)?)?;
+        // Recovery handles interrupted processes, not machine-crash durability.
         self.root.rename_regular_if_same(
             &tmp,
             &self.path()?,
