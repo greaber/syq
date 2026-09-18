@@ -159,7 +159,7 @@ class StreamTests(unittest.TestCase):
         rsh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$1"\n')
         rsh.chmod(0o700)
         target = self.root / 'remote file'
-        options = dict(rsh=str(rsh), syq_path=str(SYQ))
+        options = dict(rsh=str(rsh), syq_path=str(SYQ), no_tcp=True)
         with self.client.open_writer(to='fixture', as_=target, **options) as output:
             output.write(b'remote bytes')
         with self.client.open_reader(target, from_='fixture', **options) as input:

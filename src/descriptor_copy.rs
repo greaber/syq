@@ -20,13 +20,28 @@ const CHUNK: usize = 4 * 1024 * 1024;
 pub(crate) struct Settings {
     request_size: usize,
     algorithm: crate::hashing::HashAlgorithm,
+    verify: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             request_size: CHUNK,
             algorithm: Default::default(),
+            verify: false,
         }
+    }
+}
+
+impl Settings {
+    fn hash(self, data: &[u8]) -> [u8; 32] {
+        if self.verify {
+            self.algorithm.hash(data)
+        } else {
+            [0; 32]
+        }
+    }
+    fn matches(self, data: &[u8], hash: [u8; 32]) -> bool {
+        !self.verify || self.algorithm.hash(data) == hash
     }
 }
 

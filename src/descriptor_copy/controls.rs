@@ -26,7 +26,7 @@ pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
             )
         };
         if !supported {
-            bail!("performance control {key:?} is not supported with this descriptor copy: streams transfer one object without file comparison, batching, or range scheduling; S3 uses its part controls");
+            bail!("performance control {key:?} is not supported with this descriptor copy: streams transfer one object without file comparison or small-file batching; S3 uses its part controls");
         }
     }
     if let Some(checks) = args.integrity_checking {
@@ -45,7 +45,7 @@ pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
             .min(limits.s3_requests.unwrap_or(usize::MAX))
             .min(limits.s3_part_workers.unwrap_or(usize::MAX));
         // There is exactly one object, so every valid object-worker ceiling
-        // is already satisfied. Filesystem streams likewise use one worker.
+        // is already satisfied.
     }
     Ok(())
 }
@@ -68,6 +68,7 @@ impl Controls {
             request_size: tuning.streaming_request_size(super::CHUNK as u64, limit.as_ref(), false)
                 as usize,
             algorithm: args.transfer_hash_type.unwrap_or_default(),
+            verify: args.transfer_integrity,
         };
         let mut progress = Progress::new(
             !args.quiet && !args.no_progress,
@@ -89,7 +90,11 @@ impl Controls {
                     "stream: up to {} bytes per request, {} requests per worker, {} payload checks",
                     settings.request_size,
                     tuning.pipeline_depth(),
-                    settings.algorithm
+                    if settings.verify {
+                        settings.algorithm.to_string()
+                    } else {
+                        "no extra".into()
+                    }
                 );
             }
             if args.bwlimit_bytes > 0 {

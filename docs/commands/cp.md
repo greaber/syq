@@ -157,12 +157,15 @@ syq cp --from server data.gz --as-fd 1 | gzip -dc > data
 `--src-fd 0` reads stdin; `--as-fd 1` writes stdout. The file can also be local
 or in S3. Bash process substitution works with ordinary source syntax:
 `syq cp --src <(gzip -c data) --to server --as data.gz`.
+Paths such as `/dev/fd/63` refer to descriptors in the local syq process.
+Small writes can be forwarded without filling a transfer block.
 
 Each stream copy takes one source. Stdin and process substitution have no
 filename, so use `--as` to choose one, or `--as-fd` to write to a descriptor.
 A named pipe can use `--into`: `syq cp incoming.fifo --into saved` waits for a
 writer, then saves its bytes as the regular file `saved/incoming.fifo`.
-Selecting a pipe alongside other sources is an error. Directory copies never
+A symlink to a pipe requires `--follow-src`. Selecting a pipe alongside other
+sources, including through a shell glob, is an error. Directory copies never
 read pipes; `--preserve=specials` copies the pipe itself.
 
 ### Completion and failures
@@ -194,10 +197,12 @@ during transfer without a second read.
 
 Native streams accept `request-size`, `pipeline-depth`, and `bw-pacing` tuning.
 S3 uses its [multipart controls](../object-storage.md#descriptor-copies).
-Each stream uses one file or object worker; larger worker counts leave idle
-slots. SSH streams use one SSH connection. Restart recovery, named receiving
-destinations, detached execution, directory selection, comparison policies,
-metadata preservation, dry runs, and result records are unsupported.
+Filesystem streams use parallel data workers over SSH or encrypted TCP, with
+automatic worker tuning as in regular-file copies. `workers=N` fixes the worker
+count; `--no-tcp` keeps data on SSH. S3 transfers one object, with concurrent
+parts. Restart recovery, named receiving destinations, detached execution,
+directory selection, comparison policies, metadata preservation, dry runs,
+and result records are unsupported.
 
 Other inherited descriptors work too, except 2, which is reserved for
 diagnostics. Dedicate each descriptor to the copy. Syq advances its offset,

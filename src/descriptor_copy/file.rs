@@ -337,7 +337,7 @@ impl FileWorker {
                     .context("read complete stream range")?;
                 Ok(Response::Block {
                     off: *off,
-                    hash: self.settings.algorithm.hash(&data),
+                    hash: self.settings.hash(&data),
                     data,
                 })
             }
@@ -353,7 +353,7 @@ impl FileWorker {
                 && data.len() <= self.settings.request_size =>
             {
                 anyhow::ensure!(
-                    *hash == self.settings.algorithm.hash(data),
+                    self.settings.matches(data, *hash),
                     "stream range digest mismatch"
                 );
                 self.file.write_all_at(data, *off)?;
@@ -383,7 +383,10 @@ mod tests {
             follow: false,
             root: None,
             placement: StreamPlacement::default(),
-            settings: Settings::default(),
+            settings: Settings {
+                verify: true,
+                ..Settings::default()
+            },
         };
         let Response::DescriptorOpened { ticket, .. } =
             Session::handle(&mut slot, &open, &descriptors).unwrap()
@@ -393,13 +396,19 @@ mod tests {
         let first = FileWorker::new(
             descriptors.acquire(&ticket).unwrap(),
             ticket.stream_write().unwrap(),
-            Settings::default(),
+            Settings {
+                verify: true,
+                ..Settings::default()
+            },
         )
         .unwrap();
         let second = FileWorker::new(
             descriptors.acquire(&ticket).unwrap(),
             true,
-            Settings::default(),
+            Settings {
+                verify: true,
+                ..Settings::default()
+            },
         )
         .unwrap();
         let write = |off, data: &[u8]| Request::WriteRange {

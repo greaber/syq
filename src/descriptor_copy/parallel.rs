@@ -93,6 +93,12 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Prepared> {
     } else {
         args.connections
     };
+    if !args.connections_default {
+        crate::fsops::require_source_descriptor_capacity(1, workers, 0)?;
+    }
+    if args.tcp_congestion.is_some() && !endpoint.is_remote() {
+        bail!("--tcp-congestion applies only to copies with a remote endpoint");
+    }
     if args.verbose > 0 && !args.quiet {
         crate::output::diagnostic!(
             "stream: {workers} data workers{}",
@@ -175,7 +181,7 @@ impl Workers {
                 if streaming {
                     connection.check_streaming_writes()?;
                 }
-                let hash = self.controls.settings.algorithm.hash(&job.data);
+                let hash = self.controls.settings.hash(&job.data);
                 connection.send(Request::WriteRange {
                     path: Vec::new(),
                     inplace: true,
@@ -258,7 +264,7 @@ impl Workers {
                 Response::Block { off, hash, data }
                     if off == job.off
                         && data.len() == job.len
-                        && hash == self.controls.settings.algorithm.hash(&data) =>
+                        && self.controls.settings.matches(&data, hash) =>
                 {
                     job.data = data
                 }
@@ -336,16 +342,30 @@ pub(super) async fn run(
         upload: input.is_some(),
     };
     let mut tasks = tokio::task::JoinSet::new();
-    let spawn = |tasks: &mut tokio::task::JoinSet<Result<()>>, id| {
+    let spawn = |tasks: &mut tokio::task::JoinSet<Result<()>>, id| -> Result<()> {
         let worker = workers.clone();
-        tasks.spawn_blocking(move || {
-            let result = worker.run(id);
-            worker.gate.mark_absent(id);
-            result
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        // Workers must not exhaust Tokio's blocking pool: the pipe reader and
+        // ordered writer also need that pool to make forward progress.
+        let thread = std::thread::Builder::new()
+            .name(format!("stream-{id}"))
+            .spawn(move || {
+                let result = worker.run(id);
+                worker.gate.mark_absent(id);
+                let _ = result_tx.send(result);
+            })
+            .context("start stream data worker")?;
+        tasks.spawn(async move {
+            let result = result_rx.await;
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("stream worker panicked"))?;
+            result.context("stream worker stopped")?
         });
+        Ok(())
     };
     for id in gate.begin_warming(prepared.workers) {
-        spawn(&mut tasks, id);
+        spawn(&mut tasks, id)?;
     }
     let mut policy = tune::Policy::new(
         prepared.workers,
@@ -469,7 +489,7 @@ pub(super) async fn run(
                         let target = policy.observe(score);
                         if target != gate.active() {
                             if target < gate.active() { gate.set_active(target); gate.set_retain(target.max(2)); policy.activated(); }
-                            for id in gate.begin_warming(target) { spawn(&mut tasks, id); }
+                            for id in gate.begin_warming(target) { spawn(&mut tasks, id)?; }
                             sampler.reset();
                         }
                     }
