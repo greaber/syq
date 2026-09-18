@@ -10,9 +10,11 @@ syq cp --srcs-in build --to s3://artifacts --into releases/current
 syq cp --from s3://artifacts releases/current/app.tar --as app.tar
 ```
 
-Exactly one endpoint must be local. Run syq on the machine holding the files.
+For local/S3 copies, run syq on the machine holding the files. Two S3 endpoints
+can also copy within one service, as described below. SSH/S3 copies are not supported.
 A bucket must already exist. Keys are relative UTF-8 paths; syq rejects empty
-components, `.` and `..`, absolute paths, and file/directory collisions.
+components, `.` and `..`, absolute paths, and file/directory collisions in
+the selected source tree.
 Shell wildcards expand locally; use `--srcs-in PREFIX` to select object keys
 beneath a prefix. A named selector selects an exact object when it exists,
 otherwise the objects beneath `NAME/`.
@@ -115,14 +117,37 @@ syq cp --from s3://my-bucket backup/data --into restored
 `--s3-header 'NAME: VALUE'` is repeatable. Headers are added before signing to
 every request, including listing, multipart operations, and retries. Use
 provider headers that are valid on all these operations. Repeating the same
-name uses the last value. Syq refuses overrides of authentication, request
+name uses the last value. Headers are passed through, not interpreted as a
+metadata-editing operation. S3-to-S3 copies reject custom `x-amz-meta-*`,
+`Content-Type`, `Content-Encoding`, `Content-Language`,
+`Content-Disposition`, `Cache-Control`, `Expires`, `x-amz-tagging`, and
+`x-amz-website-redirect-location`
+headers because overrides behave differently for single-request and multipart
+copies. Provider controls such as Tigris consistency headers and
+`x-amz-storage-class` remain available.
+Syq refuses overrides of authentication, request
 framing, ranges, conditional writes, checksums, and its own metadata headers.
+It also refuses `x-amz-copy-source*`, `x-amz-metadata-directive`, and
+`x-amz-tagging-directive` on every S3 route; syq controls the copy source and
+metadata/tagging directives.
 Header values are omitted from results and recovery records. Command-line
 arguments may still be visible to other processes on the machine.
 
-The account needs object read/write and bucket listing permissions. Multipart
+The account needs object read/write and bucket listing permissions. Downloads
+and server-side copies pin the source version when the service supplies a
+version ID. On AWS, reading that version also requires `s3:GetObjectVersion`;
+reading its tags requires `s3:GetObjectVersionTagging`.
+Multipart
 recovery also needs permission to list uploaded parts and abort obsolete
-uploads. Syq does not change bucket policies or lifecycle rules.
+uploads. Server-side copies preserve tags. Multipart copies read source tags
+unless HEAD explicitly reports zero tags, so they can require tag-reading
+permission in addition to the permissions for a single-request copy. Missing
+tag counts are treated as unknown. If the service returns HTTP 501 (tag reads
+unsupported), syq warns once and continues without tags for unknown counts,
+remembering that response for the rest of the run. A positive tag count still
+causes a failure rather than dropping known tags. Permission errors remain fatal.
+Writing copied tags requires the corresponding destination permission. Syq does not change
+bucket policies or lifecycle rules.
 
 ## Parallelism
 
@@ -168,7 +193,8 @@ parts.
 
 An explicit maximum disables automatic adjustment of that setting; actual
 concurrency can be lower when there is insufficient ready work. The shared
-request limit covers uploads, range downloads and content-verification GETs.
+request limit covers uploads, range downloads, server-side copies and
+content-verification GETs.
 Metadata requests and idle SDK sockets are separate, so these settings do not
 cap total open sockets. The payload buffer budget still applies; an explicit
 object maximum beyond the available small-upload capacity is rejected.
@@ -179,8 +205,63 @@ and collision checks finish before copying starts, so planning memory grows
 with the number of selected objects.
 
 `--resource-limits bandwidth=RATE` limits the aggregate scheduled data rate,
-with bursts up to a part on upload. `--no-compress` has no effect because object
+with bursts up to a part on upload. It does not pace server-side copies, where
+object bodies do not pass through this machine. `--no-compress` has no effect because object
 bodies are transferred without compression.
+
+## Copy between buckets or prefixes
+
+Use two S3 endpoints to copy within the same service:
+
+```sh
+syq cp --from s3://source-bucket --srcs-in reports --to s3://destination-bucket --into archive --prune
+```
+
+The service copies object contents directly. Syq sends listing, metadata, and
+copy requests; it does not download or relay object bodies. Both buckets use
+the same configured endpoint, region, and credentials. Copying between different
+providers is not supported, and failed server-side copies never fall back to
+local downloads and uploads. Overlapping source and destination paths in the
+same bucket are rejected, including a destination prefix equal to, inside,
+or above a selected source prefix.
+
+Placement, selection filters, overwrite choices, `--dry-run`, `--results`, and
+`--prune` work as for local/S3 copies. Object metadata and tags are copied,
+including syq metadata and stored digests. Preserving a digest does not verify
+the object's contents. `--hash`, `--verify-only`, `--expected-hash`, mapping
+expected digests, and transfer hashing are not supported for server-side copies.
+The destination uses its bucket's default encryption
+unless request headers specify otherwise; source ACLs are not copied.
+Syq leaves storage class unspecified by default, letting the destination
+service choose it; the source storage class is not preserved. To select a
+class, pass a provider-supported value, for example
+`--s3-header 'x-amz-storage-class: STANDARD_IA'` for AWS S3. The Python API
+accepts `s3_header=["x-amz-storage-class: STANDARD_IA"]`. Supported classes
+and defaults vary by provider. These headers apply when an object is copied;
+changing them alone does not force an unchanged object to be copied.
+
+Before copying, syq compares object type, size, user metadata and content headers.
+It skips objects when these match and a common provider-reported whole-object
+checksum matches; otherwise it uses matching ETags or syq file metadata when no
+comparable checksum is available. This needs no local ETag cache or body reads.
+Composite checksums are not compared because they depend on part boundaries.
+ETags can also change with multipart layout or encryption. Without a comparable
+whole-object checksum or syq metadata, these objects can be copied again on every
+run even when their contents have not changed. Tags, ACLs, storage class and encryption settings are not
+part of this quick check; tag-only changes do not trigger a copy.
+
+S3 permits a key and keys beneath its corresponding prefix to coexist. Server-side
+copies do not reject an existing destination solely for that reason.
+
+By default, server-side copies use one copy request up to the 5 GiB limit.
+An explicit `s3-part-size` also sets the multipart threshold, capped at that
+limit. Larger objects use concurrent multipart server-side copying, with the shared
+request budget described above. Server-copy tuning uses the same rules for
+every provider. Unless you set `s3-max-concurrent-parts-per-object`, parts
+can use the shared request budget's full tuning range. Failed or cancelled
+multipart copies attempt to abort their unfinished upload; retries restart that object.
+If cleanup fails, syq reports the upload ID for manual cleanup. Already completed
+objects remain available.
 
 ## Metadata and integrity
 
@@ -246,9 +327,14 @@ These checks can download objects even when no replacement is needed.
 The [copy placement and overwrite options](reference.md) also apply to object
 storage, including mappings, ignore rules, size filters, `--dry-run`,
 `--only-new`, `--only-existing`, and `--skip-newer`. A prefix exists if it has
-objects beneath it; it is not an independent directory in S3. New-object
-uploads use conditional writes to avoid replacing an object created concurrently.
+objects beneath it; it is not an independent directory in S3. By default,
+uploads and server-side copies can replace an object created concurrently. `--only-new`, `--into-new`, and `--as-new` use conditional writes;
+a concurrent creation makes the write fail rather than replacing that object.
 A prefix existence check is not a transaction over the bucket.
+`--into-existing photos` requires an object beneath `photos/`, including a
+directory-marker object named `photos/`. An empty prefix without a marker does
+not exist. For a file or symlink source, `--as-existing photos` requires the exact object
+`photos`; objects beneath `photos/` do not satisfy it.
 
 Uploads, downloads, verification reads, and S3 API responses have no fixed
 duration or stall deadline. A slow or paused request can continue when the
@@ -293,7 +379,7 @@ not remove uploaded parts. Syq does not delete unrelated objects.
 
 S3 copies support `--results` and the Python `cp` API. Automation endpoints use
 `kind: "s3"` and `host: "s3://BUCKET"`, requiring an SDK that understands S3
-endpoints. SSH delegation, `--inplace`, and S3-to-S3 copies are
+endpoints. SSH delegation and `--inplace` are
 not supported for object storage.
 
 ## Remove objects and versions

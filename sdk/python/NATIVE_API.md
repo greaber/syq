@@ -104,8 +104,10 @@ and [Object storage](https://greaber.github.io/syq/object-storage.html).
 
 For example, `client.cp("data", to="s3://bucket", into="backup",
 s3_header=["X-Tigris-Consistent: true"])` uploads local data using credentials
-from the subprocess environment or AWS configuration. S3 copies require one
-local endpoint. S3 results use `EndpointKind.S3`; older SDKs reject this new
+from the subprocess environment or AWS configuration. Copies between two S3
+endpoints use server-side copying within the same service; content verification
+options that require reading object bodies are rejected. SSH/S3 combinations
+are not supported. S3 results use `EndpointKind.S3`; older SDKs reject this new
 endpoint kind instead of interpreting it as SSH.
 
 `pscope` selects an isolated scope for reusing SSH connections. For return
@@ -115,7 +117,7 @@ for setup and cleanup, and
 [Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility)
 for executable selection.
 
-Typed remote-to-remote copies require an enrolled receiver or
+Typed SSH-to-SSH copies require an enrolled receiver or
 `coordinate_at="local"`. With `dry_run=True` or `verify_only=True`, they require
 `coordinate_at="local"`. Use `run` for detached commands and human output options.
 

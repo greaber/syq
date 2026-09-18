@@ -1280,9 +1280,9 @@ struct NativeSizeSelectionArgs {
 #[command(
     name = "syq cp",
     version,
-    about = "Copy files and directories locally, over SSH, or to/from S3.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
+    about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
     before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
-    long_about = "Copy files and directories locally, over SSH, or to/from S3.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
+    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]"
 )]
 struct NativeCopyCommand {
@@ -1635,7 +1635,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         if (s3_from.is_none() && copy.selection.from.is_some())
             || (s3_to.is_none() && copy.to.is_some())
         {
-            bail!("S3 copies require one local endpoint; run syq on the machine holding the files");
+            bail!("S3 copies with an SSH endpoint are not supported; run syq on the machine holding the files");
         }
         if s3_from.is_some() {
             copy.selection.from = None;
@@ -1801,12 +1801,26 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         if args.devices {
             bail!("--preserve=specials is not supported for S3 copies");
         }
+        if options.source_bucket.is_some()
+            && (args.checksum
+                || args.verify_only
+                || args.expected_digest.is_some()
+                || args.transfer_integrity)
+        {
+            bail!("S3-to-S3 copies stay server-side; content hash and verification options require reading object contents and are not supported");
+        }
         let index = if options.upload {
             args.locations.len() - 1
         } else {
             0
         };
         args.locations[index].host = Some(format!("s3://{}", options.bucket));
+        if let Some(bucket) = &options.source_bucket {
+            let count = args.locations.len() - 1;
+            for location in &mut args.locations[..count] {
+                location.host = Some(format!("s3://{bucket}"));
+            }
+        }
         if !options.upload {
             let count = args.locations.len() - 1;
             for location in &mut args.locations[..count] {
