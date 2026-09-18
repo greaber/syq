@@ -32,9 +32,9 @@ transfers one exact UTF-8 key's raw contents, without path normalization,
 prefix selection, or syq file metadata. No local temporary file is created.
 
 S3 descriptor copies default to four parallel 16 MiB parts, with about one
-part of payload buffering per worker plus one input/output part. The supported
-tuning keys are `s3-part-size`, `s3-max-concurrent-parts-per-object`, and
-`s3-retries`. Unknown-length uploads stop at 10,000 parts: 156.25 GiB at the
+part of payload buffering per worker plus one input/output part. Use `s3-part-size` and `s3-retries` to change the part size and retry budget.
+The usual S3 request and part concurrency controls apply; object concurrency
+is always one. Unknown-length uploads stop at 10,000 parts: 156.25 GiB at the
 default part size. Select a larger part size before starting a larger upload.
 
 Buffered parts can be retried, but there is no restart recovery. Uploads

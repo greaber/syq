@@ -119,7 +119,7 @@ impl BandwidthLimit {
         }
     }
 
-    fn reserve_prepaid_at(&self, now: Instant, bytes: u64) -> Instant {
+    pub(crate) fn reserve_prepaid_at(&self, now: Instant, bytes: u64) -> Instant {
         self.reserve_at(now, bytes)
             + Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec as f64)
     }

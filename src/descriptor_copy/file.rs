@@ -1,5 +1,5 @@
 //! One pinned regular file per connection, with private staging for writes.
-use super::{Operation, StreamPlacement, CHUNK};
+use super::{Operation, Settings, StreamPlacement};
 use crate::{
     proto::{OperatorSymlinkPolicy, Response},
     rooted::{OperatorFinalComponent, OperatorResolver, PinnedPath, RelativePath, Root},
@@ -19,7 +19,8 @@ pub(crate) struct Session {
     original: Metadata,
     remaining: u64,
     offset: u64,
-    hash: blake3::Hasher,
+    hash: Option<crate::hashing::Hasher>,
+    settings: Settings,
     destination: Option<Destination>,
 }
 struct Destination {
@@ -143,7 +144,12 @@ impl Session {
         follow: bool,
         root: Option<&[u8]>,
         placement: &StreamPlacement,
+        settings: Settings,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            (512..=64 << 20).contains(&settings.request_size),
+            "invalid stream request size"
+        );
         let selected = if write {
             anyhow::ensure!(
                 root.is_none(),
@@ -232,7 +238,8 @@ impl Session {
             original,
             file,
             offset: 0,
-            hash: blake3::Hasher::new(),
+            hash: Some(settings.algorithm.hasher()),
+            settings,
             destination,
         })
     }
@@ -262,6 +269,7 @@ impl Session {
             follow,
             root,
             placement,
+            settings,
         } = operation
         {
             anyhow::ensure!(slot.is_none(), "descriptor stream already open");
@@ -271,14 +279,18 @@ impl Session {
                 *follow,
                 root.as_deref(),
                 placement,
+                *settings,
             )?);
-            return Ok(Response::Ok);
+            return Ok(Response::DescriptorOpened(
+                (!*write).then(|| slot.as_ref().unwrap().remaining),
+            ));
         }
         let stream = slot.as_mut().context("no descriptor stream is open")?;
         match operation {
             Operation::Read => {
                 anyhow::ensure!(stream.destination.is_none(), "stream is not readable");
-                let mut data = vec![0; stream.remaining.min(CHUNK as u64) as usize];
+                let mut data =
+                    vec![0; stream.remaining.min(stream.settings.request_size as u64) as usize];
                 stream
                     .file
                     .read_exact(&mut data)
@@ -287,10 +299,10 @@ impl Session {
                 let off = stream.offset;
                 stream.offset += data.len() as u64;
                 stream.remaining -= data.len() as u64;
-                stream.hash.update(&data);
+                stream.hash.as_mut().unwrap().update(&data);
                 Ok(Response::Block {
                     off,
-                    hash: *blake3::hash(&data).as_bytes(),
+                    hash: stream.settings.algorithm.hash(&data),
                     data,
                 })
             }
@@ -299,12 +311,12 @@ impl Session {
                 anyhow::ensure!(
                     *off == stream.offset
                         && !data.is_empty()
-                        && data.len() <= CHUNK
-                        && *hash == *blake3::hash(data).as_bytes(),
+                        && data.len() <= stream.settings.request_size
+                        && *hash == stream.settings.algorithm.hash(data),
                     "invalid stream write block"
                 );
                 stream.file.write_all(data)?;
-                stream.hash.update(data);
+                stream.hash.as_mut().unwrap().update(data);
                 stream.offset = stream
                     .offset
                     .checked_add(data.len() as u64)
@@ -313,7 +325,7 @@ impl Session {
             }
             Operation::Finish { size, hash } => {
                 anyhow::ensure!(
-                    *size == stream.offset && *hash == *stream.hash.finalize().as_bytes(),
+                    *size == stream.offset && *hash == stream.hash.take().unwrap().finalize(),
                     "stream completion length or digest mismatch"
                 );
                 if let Some(destination) = &stream.destination {
@@ -357,6 +369,7 @@ mod tests {
                     follow: false,
                     root: None,
                     placement: StreamPlacement::default(),
+                    settings: Settings::default(),
                 },
             )
             .unwrap();
@@ -390,6 +403,7 @@ mod tests {
                 follow: false,
                 root: None,
                 placement: StreamPlacement::default(),
+                settings: Settings::default(),
             },
         )
         .unwrap();
@@ -411,6 +425,7 @@ mod tests {
                 follow: false,
                 root: None,
                 placement: StreamPlacement::default(),
+                settings: Settings::default(),
             },
         )
         .unwrap();

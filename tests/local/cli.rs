@@ -1065,3 +1065,140 @@ fn stream_placement_and_source_roots() {
         "cannot confine an inherited descriptor",
     );
 }
+
+#[test]
+fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
+    let t = Tmp::new();
+    let payload = vec![73; 128 << 10];
+    write(&t.path("source"), &payload);
+    let digest = format!(
+        "sha256:{}",
+        Sha256::digest(&payload)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let cp = |args: &[&str], inherited: &str| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .current_dir(&t.0)
+            .env("SYQ_CP_OPTIONS", inherited)
+            .arg("cp")
+            .args(args)
+            .stdin(File::open(t.path("source")).unwrap())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap()
+            .wait_with_output()
+            .unwrap()
+    };
+    let start = std::time::Instant::now();
+    let out = cp(
+        &[
+            "--src-fd",
+            "0",
+            "--as",
+            "target",
+            "--expected-hash",
+            &digest,
+            "--resource-limits",
+            "bandwidth=512K,workers=1",
+            "--performance-tuning",
+            "request-size=16K,pipeline-depth=2,bw-pacing=25ms",
+            "--stats",
+            "-v",
+        ],
+        "",
+    );
+    assert_output_ok(&out);
+    assert!(
+        start.elapsed().as_millis() >= 240,
+        "upload ignored bandwidth limit"
+    );
+    assert!(out.stdout.is_empty());
+    assert_eq!(read(&t.path("target")), payload);
+    assert!(
+        stderr_of(&out).contains("131072 bytes"),
+        "{}",
+        stderr_of(&out)
+    );
+    for algorithm in ["blake3", "sha256", "md5", "xxh3-128"] {
+        let out = cp(
+            &[
+                "--src-fd",
+                "0",
+                "--as",
+                "target",
+                "--integrity-checking",
+                &format!("transfer={algorithm}"),
+                "--performance-tuning",
+                "request-size=8K,pipeline-depth=3",
+            ],
+            "",
+        );
+        assert_output_ok(&out);
+        let out = cp(
+            &[
+                "target",
+                "--as-fd",
+                "1",
+                "--expected-hash",
+                &digest,
+                "--integrity-checking",
+                &format!("transfer={algorithm}"),
+                "--progress-json",
+            ],
+            "",
+        );
+        assert_output_ok(&out);
+        assert_eq!(out.stdout, payload);
+        let progress: serde_json::Value =
+            serde_json::from_str(stderr_of(&out).lines().last().unwrap()).unwrap();
+        assert_eq!(progress["bytes_done"], payload.len());
+        assert_eq!(progress["files_done"], 1);
+    }
+    let start = std::time::Instant::now();
+    let out = cp(
+        &[
+            "target",
+            "--as-fd",
+            "1",
+            "--resource-limits",
+            "bandwidth=512K",
+        ],
+        "",
+    );
+    assert_output_ok(&out);
+    assert_eq!(out.stdout, payload);
+    assert!(
+        start.elapsed().as_millis() >= 240,
+        "download ignored bandwidth limit"
+    );
+    write(&t.path("target"), b"old");
+    let wrong = format!("sha256:{}", "0".repeat(64));
+    let out = cp(
+        &["--src-fd", "0", "--as", "target", "--expected-hash", &wrong],
+        "",
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("expected sha256 hash"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(read(&t.path("target")), b"old");
+    assert!(!fs::read_dir(&t.0).unwrap().any(|e| e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".syq-stream-")));
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .current_dir(&t.0)
+        .env("SYQ_CP_OPTIONS", "--stats --performance-tuning workers=1")
+        .args(["cp", "source", "--as-fd", "1"])
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(out.stdout, payload);
+    assert!(stderr_of(&out).contains("131072 bytes"));
+}

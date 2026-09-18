@@ -3806,6 +3806,7 @@ fn receiver_rejects_descriptor_copy_operations() {
             follow: false,
             root: None,
             placement: Default::default(),
+            settings: Default::default(),
         },
         crate::descriptor_copy::Operation::Read,
         crate::descriptor_copy::Operation::Write {

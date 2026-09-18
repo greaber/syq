@@ -125,11 +125,14 @@ syq completion cache clear >/dev/null
 
 printf 'case: descriptor upload and download over real SSH\n'
 python3 - <<'PY_DESCRIPTORS'
-import subprocess
+import subprocess, hashlib
 payload = bytes(range(256)) * 80000 + b'last\x00\xff'
+expected = "sha256:" + hashlib.sha256(payload).hexdigest()
+controls = ["--expected-hash", expected, "--integrity-checking", "transfer=md5",
+            "--performance-tuning", "request-size=1M,pipeline-depth=8", "--stats", "-vv"]
 path = "/tmp/syq-real-ssh/stream 'with spaces'"
-subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path], input=payload, check=True, timeout=60)
-result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'], stdout=subprocess.PIPE, check=True, timeout=60)
+subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path, *controls], input=payload, check=True, timeout=60)
+result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1', *controls], stdout=subprocess.PIPE, check=True, timeout=60)
 assert result.stdout == payload
 result = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as-new', path],
                         input=b'no', capture_output=True, timeout=30)

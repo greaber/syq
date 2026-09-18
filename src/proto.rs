@@ -1157,6 +1157,8 @@ pub enum Response {
     WriteStreamDone,
     Prepared(Preparation),
     SeededBasis(SeededBasis),
+    /// A pinned stream source length, or None for a destination.
+    DescriptorOpened(Option<u64>),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

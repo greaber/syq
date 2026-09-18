@@ -1,7 +1,10 @@
 //! Raw byte copies through caller-owned descriptors. The named counterpart is
 //! one regular file or one exact S3 key; no file-tree or recovery state is made.
+pub(crate) mod controls;
 pub(crate) mod fd;
 mod file;
+pub(crate) use controls::validate_controls;
+use controls::Controls;
 
 use crate::{
     cli::{Args, Location},
@@ -16,7 +19,19 @@ use std::sync::{
 };
 
 const CHUNK: usize = 4 * 1024 * 1024;
-const PIPELINE: usize = 4;
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct Settings {
+    request_size: usize,
+    algorithm: crate::hashing::HashAlgorithm,
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            request_size: CHUNK,
+            algorithm: Default::default(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
@@ -49,6 +64,7 @@ pub(crate) enum Operation {
         follow: bool,
         root: Option<Vec<u8>>,
         placement: StreamPlacement,
+        settings: Settings,
     },
     Read,
     Write {
@@ -73,8 +89,18 @@ impl Connection {
     fn start(args: Args, location: Location) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<Operation>, Reply)>();
         let worker = std::thread::spawn(move || {
-            let connection = crate::transfer::endpoint(&location, &args)
-                .and_then(|endpoint| endpoint.connect_control(args.compress));
+            let connection = (|| {
+                let endpoint = crate::transfer::endpoint(&location, &args)?;
+                let connection = endpoint.connect_control(args.compress)?;
+                if args.verbose > 1 && !args.quiet {
+                    if let crate::conn::Endpoint::Remote(spec) = &endpoint {
+                        if let Some(peer) = spec.diagnostics().peer {
+                            crate::output::diagnostic!("stream SSH helper: {} ({}); one control connection; compression {}", peer.identity, peer.platform, if args.compress { "on" } else { "off" });
+                        }
+                    }
+                }
+                Ok(connection)
+            })();
             match connection {
                 Ok(mut connection) => {
                     while let Ok((operations, reply)) = rx.recv() {
@@ -146,6 +172,17 @@ impl Connection {
 
 pub(crate) fn run(mut args: Args) -> Result<i32> {
     let plan = args.descriptor_copy.take().unwrap();
+    let controls = Controls::new(&args);
+    let ticker = controls.progress.spawn_ticker();
+    let result = run_copy(args, plan, &controls);
+    if let Some(ticker) = ticker {
+        let _ = ticker.join();
+    }
+    controls.finish(result.is_ok());
+    result
+}
+
+fn run_copy(mut args: Args, plan: Plan, controls: &Controls) -> Result<i32> {
     if let Some(options) = args.s3.take() {
         return crate::s3::stream::run(
             options,
@@ -154,6 +191,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             plan.as_fd,
             plan.commit_fd,
             plan.placement,
+            controls,
         );
     }
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -182,17 +220,18 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
                         follow: plan.follow,
                         root: plan.root.clone(),
                         placement: plan.placement.clone(),
+                        settings: controls.settings,
                     })
                     .await?
                 {
-                    Response::Ok => {}
+                    Response::DescriptorOpened(size) => { if let Some(size) = size { controls.set_size(size); } }
                     _ => bail!("unexpected stream open response"),
                 }
             }
             if let Some(source @ fd::Source::Pipe { .. }) = plan.source.clone() {
                 input = Some(source.open(cancelled.clone()).await?);
             }
-            copy(input, output, connection.as_ref(), commit).await
+            copy(input, output, connection.as_ref(), commit, controls).await
         };
         let result = tokio::select! {
             result = operation => result,
@@ -215,21 +254,36 @@ async fn copy(
     mut output: Option<fd::Descriptor>,
     connection: Option<&Connection>,
     commit: Option<fd::Descriptor>,
+    controls: &Controls,
 ) -> Result<()> {
     let mut off = 0u64;
-    let mut hash = blake3::Hasher::new();
+    let algorithm = controls.settings.algorithm;
+    let mut hash = algorithm.hasher();
+    let mut expected_hash = controls.expected_hasher();
+    let chunk = controls.settings.request_size;
+    let pipeline = controls.pipeline;
     loop {
         let blocks: Vec<bytes::Bytes> = if let Some(descriptor) = input.take() {
-            let (descriptor, data) = descriptor.read_available(CHUNK * PIPELINE).await?;
+            let (descriptor, data) = descriptor.read_available(chunk * pipeline).await?;
             input = Some(descriptor);
             (0..data.len())
-                .step_by(CHUNK)
-                .map(|start| data.slice(start..(start + CHUNK).min(data.len())))
+                .step_by(chunk)
+                .map(|start| data.slice(start..(start + chunk).min(data.len())))
                 .collect()
         } else {
+            let remaining = controls
+                .progress
+                .bytes_total
+                .load(Relaxed)
+                .saturating_sub(off);
+            if remaining == 0 {
+                break;
+            }
+            let count = pipeline.min(remaining.div_ceil(chunk as u64) as usize);
+            controls.pace(remaining.min((chunk * count) as u64)).await;
             let replies = connection
                 .unwrap()
-                .batch(vec![Operation::Read; PIPELINE])
+                .batch(vec![Operation::Read; count])
                 .await?;
             let mut expected = off;
             let mut blocks = Vec::new();
@@ -241,8 +295,8 @@ async fn copy(
                         hash,
                         data,
                     } if received == expected
-                        && data.len() <= CHUNK
-                        && hash == *blake3::hash(&data).as_bytes() =>
+                        && data.len() <= chunk
+                        && hash == algorithm.hash(&data) =>
                     {
                         anyhow::ensure!(!ended || data.is_empty(), "payload after stream EOF");
                         ended |= data.is_empty();
@@ -264,16 +318,24 @@ async fn copy(
         let mut writes = Vec::new();
         for data in blocks {
             hash.update(&data);
+            if let Some(hash) = &mut expected_hash {
+                hash.update(&data);
+            }
             let length = data.len() as u64;
             if let Some(descriptor) = output.take() {
+                if connection.is_none() {
+                    controls.pace(length).await;
+                }
                 output = Some(descriptor.write_chunk(data).await?);
             } else {
+                controls.pace(length).await;
                 writes.push(Operation::Write {
                     off,
-                    hash: *blake3::hash(&data).as_bytes(),
+                    hash: algorithm.hash(&data),
                     data: data.to_vec(),
                 });
             }
+            controls.progress.add_bytes(length);
             off = off.checked_add(length).context("stream length overflow")?;
         }
         if !writes.is_empty() {
@@ -285,12 +347,13 @@ async fn copy(
             }
         }
     }
+    controls.verify(expected_hash)?;
     fd::await_commit(commit).await?;
     if let Some(connection) = connection {
         match connection
             .call(Operation::Finish {
                 size: off,
-                hash: *hash.finalize().as_bytes(),
+                hash: hash.finalize(),
             })
             .await?
         {

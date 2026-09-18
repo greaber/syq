@@ -24,21 +24,6 @@ time limits, and
 must finish before their signed authorization expires. SDK callers can also
 set their own deadlines.
 
-## Shell pipelines and file descriptors
-
-Use `--src-fd 0` for stdin or `--as-fd 1` for stdout. The file can be
-local, on an SSH host, or in S3:
-
-```sh
-gzip -c data | syq cp --src-fd 0 --to server --as data.gz
-syq cp --from s3://backups data.gz --as-fd 1 | gzip -dc > data
-```
-
-These copies transfer raw bytes without source metadata or restart recovery.
-EOF ends input even if the producer failed; output can be partial after a
-failure. See [file descriptors](commands/cp.md#file-descriptors) for the full
-contract and restrictions.
-
 ## See where files go
 
 A named directory brings its name along. `--srcs-in` copies its contents;
@@ -358,7 +343,7 @@ syq cp --hash --srcs-in project --into backup
 ```
 
 To require a known whole-file digest, use `--expected-hash ALGORITHM:HEX` with
-one named regular file. Syq checks the complete result, including reused bytes.
+one named regular file or descriptor stream. Syq checks the complete result, including reused bytes.
 A mismatch fails the file; with normal staging it does not replace the destination.
 Selection filters still exclude files from checking. For batch copies, use
 [expected digests in mappings](mappings.md#the-format).
@@ -450,6 +435,28 @@ Sources must be relative to that root. A selection such as `../private` is
 refused; even with `--follow-src`, symlinks cannot lead outside the root.
 Unlike `-C`, this is a boundary, not just a starting directory. It does not
 constrain the destination.
+
+## Shell pipelines and file descriptors
+
+You can compress data while sending it, without first saving the compressed
+file on your machine:
+
+```sh
+gzip -c data | syq cp --src-fd 0 --to server --as data.gz
+```
+
+Here `--src-fd 0` reads from stdin, and `--as data.gz` names the file to create
+on the server. To feed a downloaded file into another program, use `--as-fd 1`
+to write to stdout:
+
+```sh
+syq cp --from server data.gz --as-fd 1 | gzip -dc > data
+```
+
+Both examples also work with local files or S3 objects. A pipeline can leave
+incomplete output if one of its commands fails, so check the whole pipeline's
+status before using the result. See [file descriptors](commands/cp.md#file-descriptors)
+for process substitution, named pipes, and failure handling.
 
 ## Output and diagnostics
 

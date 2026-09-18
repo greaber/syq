@@ -192,8 +192,8 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
         # Reject unsupported settings before opening input or mutating output.
         inherited_target = root / 'inherited-options'
         inherited_target.write_bytes(b'old')
-        for options, diagnostic in (('--stats', b'--stats'),
-                                    ('--performance-tuning workers=1', b'workers')):
+        for options, diagnostic in (('--dry-run', b'--dry-run'),
+                                    ('--performance-tuning batch-files=1', b'batch-files')):
             result = subprocess.run(
                 [SYQ, 'cp', '--src-fd', '0', '--as', str(inherited_target)],
                 input=b'new', stdout=subprocess.PIPE, stderr=subprocess.PIPE,

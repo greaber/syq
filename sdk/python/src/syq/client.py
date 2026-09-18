@@ -996,6 +996,15 @@ class Client:
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
         performance_tuning: str | None = None,
+        resource_limits: str | None = None,
+        integrity_checking: str | None = None,
+        expected_digest: Digest | None = None,
+        stats: bool = False,
+        verbose: int = 0,
+        quiet: bool = False,
+        progress: bool = False,
+        no_progress: bool = False,
+        progress_json: bool = False,
         timeout: Timeout = CLIENT_DEFAULT,
     ) -> StreamWriter:
         """Write one object, committing on successful context exit."""
@@ -1007,6 +1016,10 @@ class Client:
                          no_bootstrap=no_bootstrap, no_compress=no_compress,
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
                          s3_profile=s3_profile, s3_header=s3_header,
+                         resource_limits=resource_limits, integrity_checking=integrity_checking,
+                         expected_digest=expected_digest, stats=stats, verbose=verbose,
+                         quiet=quiet, progress=progress, no_progress=no_progress,
+                         progress_json=progress_json,
                          performance_tuning=performance_tuning, follow_dst=follow_dst),
         )
         stream = StreamWriter(_Process(argv, writing=True, cwd=self.process_cwd, env=self.env,
@@ -1031,6 +1044,15 @@ class Client:
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
         performance_tuning: str | None = None,
+        resource_limits: str | None = None,
+        integrity_checking: str | None = None,
+        expected_digest: Digest | None = None,
+        stats: bool = False,
+        verbose: int = 0,
+        quiet: bool = False,
+        progress: bool = False,
+        no_progress: bool = False,
+        progress_json: bool = False,
         timeout: Timeout = CLIENT_DEFAULT,
     ) -> StreamReader:
         """Read one object; context exit drains and verifies the transfer."""
@@ -1042,6 +1064,10 @@ class Client:
                          no_bootstrap=no_bootstrap, no_compress=no_compress,
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
                          s3_profile=s3_profile, s3_header=s3_header,
+                         resource_limits=resource_limits, integrity_checking=integrity_checking,
+                         expected_digest=expected_digest, stats=stats, verbose=verbose,
+                         quiet=quiet, progress=progress, no_progress=no_progress,
+                         progress_json=progress_json,
                          performance_tuning=performance_tuning, follow_src=follow_src),
         )
         stream = StreamReader(_Process(argv, writing=False, cwd=self.process_cwd, env=self.env,
