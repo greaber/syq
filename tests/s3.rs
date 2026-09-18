@@ -1,5 +1,8 @@
 //! Network fault tests use a local independent HTTP fixture. Real S3 protocol
 //! and signature interoperability are exercised by scripts/test-s3.sh.
+#[path = "s3/streams.rs"]
+mod streams;
+
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},

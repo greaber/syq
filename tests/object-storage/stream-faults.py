@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Independent HTTP fixture; no credentials, packages or remote services needed."""
+import base64
+import hashlib
+import http.server
+import os
+from pathlib import Path
+import signal
+import socketserver
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+
+SYQ = sys.argv[1]
+CASE = sys.argv[2]
+PART = 5 * 1024 * 1024
+DATA = bytes(range(256)) * (PART // 256) + b'last part\x00\xff'
+STATE = {'requests': 0, 'gets': {}, 'parts': {}, 'aborts': 0, 'completed': False}
+LOCK = threading.Lock()
+LATER = threading.Event()
+PART_UPLOADED = threading.Event()
+CHILDREN = []
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+
+    def log_message(self, *_):
+        pass
+
+    def reply(self, code, data=b'', headers=None, length=None):
+        self.send_response(code)
+        self.send_header('Content-Length', str(len(data) if length is None else length))
+        self.send_header('Connection', 'close')
+        for k, v in (headers or {}).items(): self.send_header(k, v)
+        self.end_headers()
+        try: self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError): pass
+        self.close_connection = True
+
+    def do_HEAD(self):
+        STATE['requests'] += 1
+        self.reply(200, headers={'ETag': '"original"', 'x-amz-version-id': 'v1'}, length=len(DATA))
+
+    def do_GET(self):
+        STATE['requests'] += 1
+        assert self.headers['If-Match'] == '"original"'
+        assert urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)['versionId'] == ['v1']
+        start, end = map(int, self.headers['Range'].removeprefix('bytes=').split('-'))
+        with LOCK:
+            attempt = STATE['gets'].get(start, 0)
+            STATE['gets'][start] = attempt + 1
+        if start == 0 and CASE == 'download':
+            assert LATER.wait(5), 'range requests were not parallel'
+        elif start: LATER.set()
+        body = DATA[start:end+1]
+        etag = '"changed"' if CASE == 'bad-range' and STATE.get('bad') == 'etag' else '"original"'
+        headers = {'ETag': etag, 'x-amz-version-id': 'v1', 'Content-Range': f'bytes {start}-{end}/{len(DATA)}'}
+        if CASE == 'bad-range' and STATE.get('bad') == 'range':
+            headers['Content-Range'] = f'bytes {start+1}-{end}/{len(DATA)}'
+        if CASE == 'truncated' or (CASE == 'retry' and not attempt):
+            self.reply(206, body[:100], headers, length=len(body))
+        else: self.reply(206, body, headers)
+
+    def body(self):
+        return self.rfile.read(int(self.headers.get('Content-Length', '0')))
+
+    def do_PUT(self):
+        data = self.body()
+        # Validate the checksum independently of syq's code.
+        assert self.headers['x-amz-checksum-sha256'] == base64.b64encode(hashlib.sha256(data).digest()).decode()
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        if 'partNumber' in query:
+            if CASE == 'upload-error':
+                self.reply(403, b'<Error><Code>AccessDenied</Code></Error>')
+                return
+            number = int(query['partNumber'][0])
+            if CASE == 'upload-retry':
+                with LOCK:
+                    attempts = STATE.setdefault('attempts', {})
+                    attempt = attempts.get(number, 0)
+                    attempts[number] = attempt + 1
+                if not attempt:
+                    self.reply(503, b'<Error><Code>SlowDown</Code></Error>')
+                    return
+            with LOCK: STATE['parts'][number] = data
+            PART_UPLOADED.set()
+        else:
+            STATE['published'] = data
+            STATE['completed'] = True
+        self.reply(200, headers={'ETag': '"part"', 'x-amz-checksum-sha256': self.headers['x-amz-checksum-sha256']})
+
+    def do_POST(self):
+        body = self.body()
+        if 'uploadId=' in self.path:
+            STATE['published'] = b''.join(STATE['parts'][n] for n in sorted(STATE['parts']))
+            STATE['completed'] = True
+            self.reply(200, b'<CompleteMultipartUploadResult><ETag>"done"</ETag></CompleteMultipartUploadResult>')
+        else:
+            self.reply(200, b'<InitiateMultipartUploadResult><UploadId>owned</UploadId></InitiateMultipartUploadResult>')
+
+    def do_DELETE(self):
+        STATE['aborts'] += 1
+        self.reply(204)
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+
+def run(command, **kwargs):
+    return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, **kwargs)
+
+
+def success(result):
+    assert result.returncode == 0, result.stderr.decode(errors='replace')
+
+
+def failure(result):
+    assert result.returncode != 0, result
+
+
+def spawn(*args, **kwargs):
+    child = subprocess.Popen(*args, **kwargs, start_new_session=True)
+    CHILDREN.append(child)
+    return child
+
+
+def stop(child):
+    child.send_signal(signal.SIGTERM)
+    try:
+        _, error = child.communicate(timeout=8)
+        assert child.returncode != 0, error
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.communicate()
+        raise AssertionError('stream failed to cancel')
+
+
+with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0.1', 0), Handler) as server:
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('AWS_', 'SYQ_'))}
+    env.update(AWS_ACCESS_KEY_ID='test-access', AWS_SECRET_ACCESS_KEY='test-secret',
+               AWS_EC2_METADATA_DISABLED='true', AWS_CONFIG_FILE=os.devnull,
+               AWS_SHARED_CREDENTIALS_FILE=os.devnull, HOME=temp)
+    base = [SYQ, 'stream', '--s3-endpoint', f'http://127.0.0.1:{server.server_port}',
+            '--s3-region', 'us-east-1', '--performance-tuning',
+            's3-part-size=5M,s3-max-concurrent-parts-per-object=2,s3-retries=1']
+    get = base + ['--from', 's3://bucket', 'object']
+    put = base + ['--to', 's3://bucket', '--as', 'object']
+    try:
+        if CASE in ('download', 'retry', 'bad-range', 'truncated'):
+            STATE['bad'] = 'etag'
+            result = run(get, env=env)
+            if CASE in ('bad-range', 'truncated'):
+                failure(result)
+                assert not result.stdout
+                if CASE == 'bad-range':
+                    STATE['bad'] = 'range'
+                    failure(run(get, env=env))
+                else:
+                    assert STATE['gets'][0] == 2
+            else:
+                success(result)
+                assert result.stdout == DATA
+                if CASE == 'retry': assert STATE['gets'] == {0: 2, PART: 1}, STATE['gets']
+                with open(Path(temp) / 'output', 'w+b') as output:
+                    output.write(b'prefix')
+                    output.flush()
+                    result = run(get + ['--write-fd', str(output.fileno())], env=env, pass_fds=(output.fileno(),))
+                    success(result)
+                    assert result.stdout == b''
+                    output.seek(0)
+                    assert output.read() == b'prefix' + DATA
+        elif CASE in ('upload', 'upload-retry'):
+            for data in (b'', b'binary\x00\xff', DATA, DATA[:PART]):
+                STATE['parts'] = {}
+                STATE['attempts'] = {}
+                STATE['completed'] = False
+                result = run(put, input=data, env=env)
+                success(result)
+                assert result.stdout == b''
+                assert STATE['published'] == data
+            with open(Path(temp) / 'input', 'w+b') as source:
+                source.write(b'skip' + DATA)
+                source.seek(4)
+                result = run(put + ['--read-fd', str(source.fileno())], env=env, pass_fds=(source.fileno(),))
+                success(result)
+                assert STATE['published'] == DATA
+        elif CASE == 'upload-error':
+            result = run(put, input=DATA, env=env)
+            failure(result)
+            assert STATE['aborts'] == 1
+            assert not STATE['completed']
+        elif CASE == 'cancel':
+            child = spawn(put, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            # Leave the pipe open after a full part; upload must progress without EOF.
+            writer = threading.Thread(target=lambda: (child.stdin.write(DATA[:PART]), child.stdin.flush()), daemon=True)
+            writer.start()
+            assert PART_UPLOADED.wait(10), 'upload did not overlap input production'
+            assert not STATE['completed']
+            # communicate() would close stdin and turn cancellation into ordinary EOF.
+            held_input = child.stdin
+            child.stdin = None
+            stop(child)
+            held_input.close()
+            writer.join(2)
+            assert STATE['aborts'] == 1
+            child = spawn(get, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            assert child.stdout.read(1) == DATA[:1]
+            held_output = child.stdout
+            child.stdout = None
+            stop(child)
+            held_output.close()
+        elif CASE == 'descriptors':
+            result = run(get + ['--write-fd', '99999'], env=env)
+            failure(result)
+            assert STATE['requests'] == 0
+            with open(os.devnull, 'rb') as source:
+                failure(run(get + ['--write-fd', str(source.fileno())], env=env, pass_fds=(source.fileno(),)))
+            child = spawn(get, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            child.stdout.close()
+            child.stdout = None
+            _, error = child.communicate(timeout=15)
+            assert child.returncode != 0, error
+        else: raise AssertionError(CASE)
+    finally:
+        for child in CHILDREN:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=5)
+            for file in (child.stdin, child.stdout, child.stderr):
+                if file and not file.closed: file.close()
+        server.shutdown()
+        worker.join(3)
+print(CASE, 'passed')

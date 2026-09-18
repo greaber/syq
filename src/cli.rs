@@ -886,6 +886,9 @@ fn print_root_help(full: bool) {
 /// spelling and hidden flags in one place.
 pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
     match name {
+        "stream" => {
+            Some(crate::help::configure(crate::s3::stream::command()).bin_name("syq stream"))
+        }
         "rsync" => Some(crate::help::filesystem(Args::command())),
         "cp" => Some(crate::help::filesystem(NativeCopyCommand::command())),
         "rm" => Some(crate::help::filesystem(NativeRmCommand::command())),
