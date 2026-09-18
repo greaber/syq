@@ -21,6 +21,8 @@ static pthread_mutex_t sockets_lock = PTHREAD_MUTEX_INITIALIZER;
 static int sockets[4096];
 static int configured[4096];
 static int budget_active_requests;
+static int budget_window_clamp;
+static int actual_configured[4096];
 static _Atomic unsigned active_requests;
 static unsigned socket_count;
 static _Atomic unsigned tracked_sockets;
@@ -46,7 +48,7 @@ static void rebudget(void) {
         int bytes = (int)allowance;
         for (unsigned i = 0; i < socket_count; ++i) {
             if (configured[i] == bytes) {
-                total += 2UL * bytes;
+                total += actual_configured[i];
                 continue;
             }
             if (setsockopt(sockets[i], SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes))) _exit(115);
@@ -54,6 +56,9 @@ static void rebudget(void) {
             int actual;
             socklen_t size = sizeof(actual);
             if (getsockopt(sockets[i], SOL_SOCKET, SO_RCVBUF, &actual, &size)) _exit(116);
+            actual_configured[i] = actual;
+            if (budget_window_clamp && setsockopt(sockets[i], IPPROTO_TCP, TCP_WINDOW_CLAMP,
+                                                   &actual, sizeof(actual))) _exit(120);
             total += actual;
         }
     }
@@ -84,6 +89,7 @@ int close(int fd) {
         if (sockets[i] == fd) {
             sockets[i] = sockets[--socket_count];
             configured[i] = configured[socket_count];
+            actual_configured[i] = actual_configured[socket_count];
             rebudget();
             break;
         }
@@ -102,7 +108,7 @@ static void *sample_heap(void *unused) {
     (void)unused;
     FILE *out = fopen("/output/.allocator.csv", "w");
     if (!out) _exit(110);
-    fprintf(out, "seconds,arena,uordblks,fordblks,hblkhd,connections,initial_rcvbuf,rtt_us,current_rcvbuf,tracked_sockets,configured_total,active_requests\n");
+    fprintf(out, "seconds,arena,uordblks,fordblks,hblkhd,connections,initial_rcvbuf,rtt_us,current_rcvbuf,tracked_sockets,configured_total,active_requests,window_clamp,rcv_ssthresh\n");
     struct timespec start, now, interval = {.tv_nsec = 100000000};
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int i = 0; i < 6000; ++i) {
@@ -115,11 +121,14 @@ static void *sample_heap(void *unused) {
         socklen_t receive_size = sizeof(current_receive);
         if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &info_size)) info.tcpi_rtt = 0;
         if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &current_receive, &receive_size)) current_receive = 0;
-        fprintf(out, "%.6f,%zu,%zu,%zu,%zu,%u,%d,%u,%d,%u,%lu,%u\n", elapsed,
+        int clamp = 0;
+        socklen_t clamp_size = sizeof(clamp);
+        if (getsockopt(fd, IPPROTO_TCP, TCP_WINDOW_CLAMP, &clamp, &clamp_size)) clamp = 0;
+        fprintf(out, "%.6f,%zu,%zu,%zu,%zu,%u,%d,%u,%d,%u,%lu,%u,%d,%u\n", elapsed,
                 m.arena, m.uordblks, m.fordblks, m.hblkhd,
                 atomic_load(&connections), atomic_load(&observed_receive_bytes),
                 info.tcpi_rtt, current_receive, atomic_load(&tracked_sockets),
-                atomic_load(&configured_total), atomic_load(&active_requests));
+                atomic_load(&configured_total), atomic_load(&active_requests), clamp, info.tcpi_rcv_ssthresh);
         fflush(out);
         nanosleep(&interval, NULL);
     }
@@ -137,6 +146,8 @@ __attribute__((constructor)) static void initialize(void) {
     if (receive_budget && receive_bytes) _exit(117);
     value = getenv("SYQ_SPIKE_BUDGET_ACTIVE");
     budget_active_requests = value && atoi(value);
+    value = getenv("SYQ_SPIKE_WINDOW_CLAMP");
+    budget_window_clamp = value && atoi(value);
     pthread_t thread;
     pthread_attr_t attr;
     if (pthread_attr_init(&attr) || pthread_attr_setstacksize(&attr, 128 * 1024) ||

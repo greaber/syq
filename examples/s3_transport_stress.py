@@ -181,6 +181,7 @@ def run(case, mode, repeats, label):
                       'SYQ_SPIKE_RCVBUF=' + str(case.get('receive_buffer', 0)),
                       'SYQ_SPIKE_RCVBUDGET=' + str(case.get('receive_budget', 0)),
                       'SYQ_SPIKE_BUDGET_ACTIVE=' + str(int(case.get('budget_active', False))),
+                      'SYQ_SPIKE_WINDOW_CLAMP=' + str(int(case.get('window_clamp', False))),
                       *(['MALLOC_ARENA_MAX=' + str(case['malloc_arenas'])] if 'malloc_arenas' in case else [])]
     gate = STAGE / 'start-client'
     if MEMORY_TRACE:
@@ -379,7 +380,8 @@ try:
                  for value in os.environ['SYQ_STRESS_RCVBUDGETS'].split(',')]
     for case in cases:
         if HEAP_PROBE:
-            case.update(heap_probe=True, budget_active=os.environ.get('SYQ_STRESS_BUDGET_ACTIVE') == '1')
+            case.update(heap_probe=True, budget_active=os.environ.get('SYQ_STRESS_BUDGET_ACTIVE') == '1',
+                        window_clamp=os.environ.get('SYQ_STRESS_WINDOW_CLAMP') == '1')
             case.setdefault('receive_buffer', int(os.environ.get('SYQ_STRESS_RCVBUF', 0)))
             if os.environ.get('SYQ_STRESS_RCVBUDGET'):
                 case['receive_budget'] = int(os.environ['SYQ_STRESS_RCVBUDGET'])
