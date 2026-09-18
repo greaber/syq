@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 # Disposable, loopback-only S3 integration tests. No cloud credentials needed.
+# SYQ_S3_TEST_TIMEOUT raises the 1800-second overall check deadline for slow hosts.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 _syq_s3_binary=${1:-target/debug/syq}
 if [[ $# == 0 ]]; then cargo build --locked; fi
 _syq_s3_image=minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
 _syq_s3_container=
+_syq_s3_runner=
 cleanup() {
+  trap '' INT TERM
+  if [[ -n $_syq_s3_runner ]]; then
+    kill -TERM "$_syq_s3_runner" 2>/dev/null || true
+    wait "$_syq_s3_runner" || true
+  fi
   if [[ -n $_syq_s3_container ]]; then docker rm -f "$_syq_s3_container" >/dev/null; fi
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 export AWS_ACCESS_KEY_ID=syq-test-user AWS_SECRET_ACCESS_KEY=syq-test-password
 export AWS_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true SYQ_TEST_BUCKET=syq-test
 unset AWS_SESSION_TOKEN AWS_PROFILE SYQ_TEST_HEADERS
@@ -38,14 +47,8 @@ checks = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checks)
 checks.request('PUT')
 PY
-python3 tests/object-storage/check.py "$_syq_s3_binary"
-python3 tests/object-storage/selection.py "$_syq_s3_binary"
-
-python3 tests/object-storage/remove.py "$_syq_s3_binary"
-python3 tests/object-storage/prune.py "$_syq_s3_binary"
-
-python3 tests/object-storage/fast.py "$_syq_s3_binary"
-python3 tests/object-storage/fast-provider.py "$_syq_s3_binary"
-
-python3 tests/object-storage/streams.py "$_syq_s3_binary"
-python3 tests/object-storage/server-copy.py "$_syq_s3_binary"
+# The fault server owns its endpoint and cache; overlap it with MinIO checks.
+python3 tests/object-storage/run.py "$_syq_s3_binary" &
+_syq_s3_runner=$!
+wait "$_syq_s3_runner"
+_syq_s3_runner=
