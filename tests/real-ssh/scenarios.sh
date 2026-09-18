@@ -255,8 +255,8 @@ return_copy_pid=
 test ! -e "$receive_root/denied"
 if syq persist receive approve "$request_id"; then echo 'denied approval ID was reused' >&2; exit 1; fi
 
-printf 'case: approval allows only the pending copy once\n'
-timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as approved' &
+printf 'case: approval allows the pending 128-worker copy once\n'
+timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as approved --performance-tuning workers=128' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')

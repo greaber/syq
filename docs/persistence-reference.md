@@ -87,7 +87,7 @@ times.
 Each copy is limited to 100 GiB and one million touched entries by default.
 Change these ceilings with `syq persist receive on --max-bytes 20G --max-entries 100000`.
 Lower limits requested by the sender also apply. Limits are per copy; repeated
-copies can fill the disk. Copies support at most 32 workers each.
+copies can fill the disk. Copies support at most 128 workers each.
 
 Pruning is disabled unless the laptop sets a positive `--max-delete`.
 A sending `--prune` command must also supply its own `--max-delete` ceiling,

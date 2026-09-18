@@ -709,8 +709,13 @@ fn select_copy(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
     {
         bail!("named destinations own their connection; --syq-path, --rsh, --pscope, --detach, --peer-auth, and --tcp-plain cannot be combined with them");
     }
-    if args.connections_opt.is_some() && args.connections > 32 {
-        bail!("named destinations support at most 32 workers per transfer");
+    if args.connections_opt.is_some()
+        && args.connections > usize::from(crate::delegation::MAX_CONNECTIONS)
+    {
+        bail!(
+            "named destinations support at most {} workers per transfer",
+            crate::delegation::MAX_CONNECTIONS
+        );
     }
     Ok(Some(handoff::Selection::new(
         name,
