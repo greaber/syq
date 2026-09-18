@@ -15,7 +15,7 @@ from .errors import SyqInvocationError, SyqProcessError
 Argument = str | bytes
 
 
-def arguments(*, executable: str, writing: bool, path: PathArgument,
+def arguments(*, executable: str, writing: bool, path: PathArgument | None,
               endpoint: str | None, options: Mapping[str, object]) -> list[Argument]:
     from .client import _append_path_option, _argument, _text_arg
     argv: list[Argument] = [executable, "cp"]
@@ -23,13 +23,26 @@ def arguments(*, executable: str, writing: bool, path: PathArgument,
         argv += ["--src-fd", "0"]
         if endpoint is not None:
             argv += ["--to", _text_arg(endpoint, label="to")]
-        _append_path_option(argv, "--as", _argument(path, label="as_"))
+        placements = [("as", path), ("as-new", options.get("as_new")),
+                      ("as-existing", options.get("as_existing"))]
+        selected = [(name, value) for name, value in placements if value is not None]
+        if len(selected) != 1:
+            raise SyqInvocationError("open_writer requires exactly one of as_, as_new, or as_existing")
+        name, value = selected[0]
+        _append_path_option(argv, "--" + name, _argument(value, label=name))
     else:
+        if options.get("cwd") is not None and options.get("root") is not None:
+            raise SyqInvocationError("cwd and root are mutually exclusive")
+        for name in ("cwd", "root"):
+            if options.get(name) is not None:
+                _append_path_option(argv, "--" + name, _argument(options[name], label=name))
         if endpoint is not None:
             argv += ["--from", _text_arg(endpoint, label="from_")]
         _append_path_option(argv, "--src", _argument(path, label="src"))
         argv += ["--as-fd", "1"]
     for name, value in options.items():
+        if name in {"as_new", "as_existing", "cwd", "root"}:
+            continue
         if value is None or value is False:
             continue
         option = "--" + name.replace("_", "-")

@@ -21,6 +21,8 @@ use std::{
 struct Plan {
     options: Options,
     key: String,
+    placement: crate::descriptor_copy::StreamPlacement,
+    target: String,
 }
 pub(crate) fn run(
     options: Options,
@@ -28,8 +30,22 @@ pub(crate) fn run(
     source: Option<Source>,
     as_fd: Option<i32>,
     commit_fd: Option<i32>,
+    placement: crate::descriptor_copy::StreamPlacement,
 ) -> Result<i32> {
-    let mut plan = Plan { options, key };
+    let target = key.clone();
+    let key = match &placement.name {
+        Some(name) => super::local::join(
+            key.trim_end_matches('/'),
+            std::str::from_utf8(name).context("S3 keys must be UTF-8")?,
+        ),
+        None => key,
+    };
+    let mut plan = Plan {
+        options,
+        key,
+        placement,
+        target,
+    };
     let cancelled = Arc::new(AtomicBool::new(false));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -40,14 +56,12 @@ pub(crate) fn run(
         let interrupt = async { tokio::select! { result = tokio::signal::ctrl_c() => { result?; }, _ = term.recv() => {} }; Ok::<_, anyhow::Error>(()) };
         tokio::pin!(interrupt);
         let commit = commit_fd.map(|n| Descriptor::open(n, true, cancelled.clone())).transpose()?;
-        let descriptor = tokio::select! {
-            descriptor = async {
-                match source {
-                    Some(source) => source.open(cancelled.clone()).await,
-                    None => Descriptor::open(as_fd.unwrap(), false, cancelled.clone()),
-                }
-            } => descriptor?,
-            value = &mut interrupt => { value?; bail!("stream cancelled"); }
+        // Protect caller-owned FDs before connecting. Defer opening a named
+        // FIFO until the destination conditions have been checked.
+        let descriptor = match &source {
+            Some(Source::Descriptor(number)) => Some(Descriptor::open(*number, true, cancelled.clone())?),
+            Some(Source::Pipe { .. }) => None,
+            None => Some(Descriptor::open(as_fd.unwrap(), false, cancelled.clone())?),
         };
         let cancellation = Arc::new(super::upload_http::Cancellation::default());
         let (client, _) = tokio::select! {
@@ -57,6 +71,13 @@ pub(crate) fn run(
         let mut upload_id = None;
         let result = {
             let operation = async {
+                if plan.options.route == crate::s3::Route::Upload {
+                    check_placement(&client, &plan).await?;
+                }
+                let descriptor = match descriptor {
+                    Some(descriptor) => descriptor,
+                    None => source.unwrap().open(cancelled.clone()).await?,
+                };
                 if plan.options.route == crate::s3::Route::Upload { upload(&client, &plan, descriptor, &mut upload_id, commit).await }
                 else { download(&client, &plan, descriptor).await }
             };
@@ -86,6 +107,55 @@ pub(crate) fn run(
     result.map(|()| 0)
 }
 
+/// With a source base, keys use ordinary cp's relative path semantics.
+/// Without one, preserve literal raw-object key spellings.
+pub(crate) fn source_key(path: &[u8], base: Option<&[u8]>) -> Result<String> {
+    match base {
+        Some(base) => Ok(super::local::join(
+            &super::local::key_path(base)?,
+            &super::local::key_path(path)?,
+        )),
+        None => Ok(std::str::from_utf8(path)
+            .context("S3 key must be UTF-8")?
+            .to_owned()),
+    }
+}
+
+async fn check_placement(client: &Client, plan: &Plan) -> Result<()> {
+    use crate::cli::Existence;
+    let existence = plan.placement.existence;
+    if existence == Existence::Any {
+        return Ok(());
+    }
+    // Match ordinary S3 cp: a new target must have neither an exact object
+    // nor descendants; an existing container needs at least one prefixed key.
+    // Inspect raw metadata only, since stream inputs need no syq encoding.
+    let container = plan.placement.name.is_some();
+    let target = if container {
+        plan.target.trim_end_matches('/')
+    } else {
+        &plan.target
+    };
+    let exact = !target.is_empty()
+        && super::client::head_output(client, &plan.options.bucket, target, None)
+            .await?
+            .is_some();
+    let prefix = if target.is_empty() {
+        String::new()
+    } else {
+        format!("{target}/")
+    };
+    let present = (!(existence == Existence::Existing && container) && exact)
+        || super::client::prefix_exists(client, &plan.options.bucket, &prefix).await?;
+    if (existence == Existence::New && present) || (existence == Existence::Existing && !present) {
+        bail!("S3 destination existence condition failed");
+    }
+    if !container && present && !exact {
+        bail!("S3 destination is a prefix, not an object");
+    }
+    Ok(())
+}
+
 fn digest(algorithm: Algorithm, data: &[u8]) -> String {
     let mut hash = algorithm.hasher();
     hash.update(data);
@@ -112,6 +182,9 @@ async fn upload(
             .key(&plan.key)
             .set_checksum_sha256(algorithm.is_sha256().then_some(hash.clone()))
             .set_content_md5((algorithm == Algorithm::Md5).then_some(hash))
+            .set_if_none_match(
+                (plan.placement.existence == crate::cli::Existence::New).then(|| "*".into()),
+            )
             .body(ByteStream::from(first))
             .send()
             .await
@@ -179,6 +252,9 @@ async fn upload(
         .bucket(&options.bucket)
         .key(&plan.key)
         .upload_id(&id)
+        .set_if_none_match(
+            (plan.placement.existence == crate::cli::Existence::New).then(|| "*".into()),
+        )
         .multipart_upload(
             CompletedMultipartUpload::builder()
                 .set_parts(Some(completed))

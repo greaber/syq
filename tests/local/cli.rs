@@ -889,3 +889,179 @@ fn managed_descriptor_upload_requires_commit() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn stream_placement_and_source_roots() {
+    let t = Tmp::new();
+    write(&t.path("payload"), b"stream");
+    mkfifo(&t.path("pipe"));
+    let rsh = fake_rsh(&t);
+
+    // Tiny payloads keep captured output below pipe capacity. Bound failures
+    // so opening a FIFO before checking placement cannot hang the test suite.
+    let cp = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("SYQ_") {
+                command.env_remove(name);
+            }
+        }
+        command
+            .current_dir(&t.0)
+            .env("HOME", &t.0)
+            .env("FAKE_REMOTE_HOME", &t.0)
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .args(args)
+            .stdin(File::open(t.path("payload")).unwrap())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = command.start().unwrap();
+        let started = std::time::Instant::now();
+        let mut next_progress = 1;
+        while child.try_wait().unwrap().is_none() {
+            let elapsed = started.elapsed().as_secs();
+            if elapsed >= 15 {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let output = child.wait_with_output().unwrap();
+                panic!("stream copy timed out: {args:?}: {}", stderr_of(&output));
+            }
+            if elapsed >= next_progress {
+                eprintln!("waiting for stream copy ({elapsed}s): {args:?}");
+                next_progress += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.wait_with_output().unwrap()
+    };
+    let succeeds = |args: &[&str]| {
+        let output = cp(args);
+        assert!(output.status.success(), "{args:?}: {}", stderr_of(&output));
+        output
+    };
+    let fails = |args: &[&str], message: &str| {
+        let output = cp(args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            stderr_of(&output).contains(message),
+            "{args:?}: {}",
+            stderr_of(&output)
+        );
+    };
+
+    succeeds(&["--src-fd", "0", "--as-new", "target"]);
+    write(&t.path("target"), b"old");
+    // No writer: these must reject placement without even opening the pipe.
+    for (flag, target) in [
+        ("--as-new", "target"),
+        ("--as-existing", "absent/file"),
+        ("--into-new", "."),
+        ("--into-existing", "absent"),
+    ] {
+        fails(&["pipe", flag, target], "existence condition failed");
+    }
+    assert_eq!(read(&t.path("target")), b"old");
+    assert!(!t.path("absent").exists());
+    // One helper case covers ordering across connection setup. The complete
+    // placement matrix need not be repeated over the same filesystem code.
+    fails(
+        &["pipe", "--to", "fixture", "--as-new", &t.s("target")],
+        "existence condition failed",
+    );
+    succeeds(&["--src-fd", "0", "--as-existing", "target"]);
+    assert_eq!(read(&t.path("target")), b"stream");
+
+    // Existence refers to the destination entry, including symlinks. Replacing
+    // one must leave its referent intact; a dangling link is still an entry.
+    write(&t.path("referent"), b"keep");
+    std::os::unix::fs::symlink("referent", t.path("link")).unwrap();
+    succeeds(&["--src-fd", "0", "--as-existing", "link"]);
+    assert!(fs::symlink_metadata(t.path("link")).unwrap().is_file());
+    assert_eq!(read(&t.path("link")), b"stream");
+    assert_eq!(read(&t.path("referent")), b"keep");
+    std::os::unix::fs::symlink("missing-referent", t.path("dangling")).unwrap();
+    fails(
+        &["--src-fd", "0", "--as-new", "dangling"],
+        "existence condition failed",
+    );
+    assert_eq!(
+        fs::read_link(t.path("dangling")).unwrap(),
+        Path::new("missing-referent")
+    );
+    assert!(!t.path("missing-referent").exists());
+
+    write(&t.path("directory/keep"), b"keep");
+    for flag in ["--as", "--as-new", "--as-existing"] {
+        let output = cp(&["--src-fd", "0", flag, "directory"]);
+        assert!(!output.status.success(), "{flag} accepted a directory");
+        assert_eq!(read(&t.path("directory/keep")), b"keep");
+    }
+
+    std::os::unix::fs::symlink("container", t.path("container-link")).unwrap();
+    for (flag, destination, follow) in [
+        ("--into-new", "container", false),
+        ("--into-existing", "container", false),
+        ("--into-existing", "container-link", true),
+    ] {
+        let fifo = t.path("pipe");
+        let writer = std::thread::spawn(move || {
+            File::options()
+                .write(true)
+                .open(fifo)
+                .and_then(|mut file| file.write_all(b"fifo"))
+        });
+        let mut args = vec!["--root", ".", "--src-non-dir", "pipe", flag, destination];
+        if follow {
+            args.push("--follow-dst");
+        }
+        let output = cp(&args);
+        // Release the owned writer even if a regression rejected the copy.
+        let _rescue = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(t.path("pipe"))
+            .unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        assert_eq!(read(&t.path("container/pipe")), b"fifo");
+        fs::remove_file(t.path("container/pipe")).unwrap();
+    }
+    fails(&["pipe", "--into-existing", "container-link"], "symlink");
+    assert_eq!(
+        fs::read_link(t.path("container-link")).unwrap(),
+        Path::new("container")
+    );
+    assert!(!t.path("container/pipe").exists());
+    fails(
+        &["--src-fd", "0", "--into-new", "unnamed"],
+        "needs a source name",
+    );
+
+    write(&t.path("source/data"), b"read me");
+    std::os::unix::fs::symlink("data", t.path("source/inside")).unwrap();
+    std::os::unix::fs::symlink("../target", t.path("source/escape")).unwrap();
+    for base in ["--cwd", "--root"] {
+        assert_eq!(
+            succeeds(&[base, "source", "data", "--as-fd", "1"]).stdout,
+            b"read me"
+        );
+    }
+    for path in ["../target", "escape"] {
+        let output = cp(&["--root", "source", "--follow-src", path, "--as-fd", "1"]);
+        assert!(!output.status.success(), "{path}");
+        assert!(output.stdout.is_empty());
+    }
+    assert_eq!(
+        succeeds(&["--root", "source", "--follow-src", "inside", "--as-fd", "1"]).stdout,
+        b"read me"
+    );
+    fails(
+        &["--root", "source", "--src-fd", "0", "--as", "target"],
+        "cannot confine an inherited descriptor",
+    );
+}

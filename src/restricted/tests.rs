@@ -3804,6 +3804,8 @@ fn receiver_rejects_descriptor_copy_operations() {
             path: path_bytes(&root.join("file")),
             write: true,
             follow: false,
+            root: None,
+            placement: Default::default(),
         },
         crate::descriptor_copy::Operation::Read,
         crate::descriptor_copy::Operation::Write {

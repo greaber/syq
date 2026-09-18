@@ -130,9 +130,15 @@ Typed SSH-to-SSH copies require an enrolled receiver or
 
 ## Byte streams
 
-`client.open_writer(*, as_, to=None, follow_dst=False, ...)` returns a
-`StreamWriter`; `client.open_reader(src, *, from_=None, follow_src=False, ...)`
-returns a `StreamReader`. Both accept `rsh`, `syq_path`, `pscope`,
+`client.open_writer(*, as_=None, as_new=None, as_existing=None, to=None,
+follow_dst=False, ...)` returns a `StreamWriter`. Choose exactly one of
+`as_`, `as_new`, or `as_existing`; the latter two require the destination to
+be absent or present, following `cp` placement semantics. Writers have no
+source basename, so they require an exact destination path.
+`client.open_reader(src, *, from_=None, cwd=None, root=None, follow_src=False, ...)`
+returns a `StreamReader`. `cwd` resolves relative sources; `root` also confines
+them. Choose at most one, as with `cp`. These bases belong to the source
+endpoint, independently of the client's local `process_cwd`. Both accept `rsh`, `syq_path`, `pscope`,
 `no_bootstrap`, `no_compress`, `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
 `performance_tuning`, and `timeout` with the same meanings as `cp`.
 Only the stream-supported S3 part controls apply to `performance_tuning`.

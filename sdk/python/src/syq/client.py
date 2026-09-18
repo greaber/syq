@@ -981,7 +981,9 @@ class Client:
     def open_writer(
         self,
         *,
-        as_: PathArgument,
+        as_: PathArgument | None = None,
+        as_new: PathArgument | None = None,
+        as_existing: PathArgument | None = None,
         to: str | None = None,
         follow_dst: bool = False,
         rsh: str | None = None,
@@ -1000,7 +1002,8 @@ class Client:
         from ._streams import _Process, arguments, StreamWriter
         argv = arguments(
             executable=self._executable_value(), writing=True, path=as_, endpoint=to,
-            options=dict(rsh=rsh, syq_path=syq_path, pscope=pscope,
+            options=dict(as_new=as_new, as_existing=as_existing,
+                         rsh=rsh, syq_path=syq_path, pscope=pscope,
                          no_bootstrap=no_bootstrap, no_compress=no_compress,
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
                          s3_profile=s3_profile, s3_header=s3_header,
@@ -1015,6 +1018,8 @@ class Client:
         src: PathArgument,
         *,
         from_: str | None = None,
+        cwd: PathArgument | None = None,
+        root: PathArgument | None = None,
         follow_src: bool = False,
         rsh: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
@@ -1032,7 +1037,8 @@ class Client:
         from ._streams import _Process, arguments, StreamReader
         argv = arguments(
             executable=self._executable_value(), writing=False, path=src, endpoint=from_,
-            options=dict(rsh=rsh, syq_path=syq_path, pscope=pscope,
+            options=dict(cwd=cwd, root=root,
+                         rsh=rsh, syq_path=syq_path, pscope=pscope,
                          no_bootstrap=no_bootstrap, no_compress=no_compress,
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
                          s3_profile=s3_profile, s3_header=s3_header,
