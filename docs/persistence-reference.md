@@ -104,7 +104,6 @@ persistence enabled; a healthy connection is reused without cancelling requests.
 Connections have no idle expiry. Receiving reconnects after interruptions;
 other SSH logins reopen on their next use. Syq installs no login service, so
 connect again after reboot. Copies are not queued or retried automatically.
-A return copy must finish within seven days of approval.
 
 Use `syq persist receive wait server --timeout 30` to wait without starting or
 restarting a connection. On the server:

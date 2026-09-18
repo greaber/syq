@@ -29,6 +29,14 @@ The final summary shows what was copied or skipped, how long it took, and any
 errors. Add `-v` to list copied paths. For connection and performance details,
 see [diagnosing a slow copy](speed.md#diagnose-a-slow-copy).
 
+File transfers have no fixed duration or stall deadline. They can continue
+through slowdowns and pauses; cancel the command if you no longer want to wait.
+Connection setup, SSH keepalives, and return-connection heartbeats still have
+time limits, and
+[restricted server-to-server copies](remote-reference.md#limits-and-unsupported-options)
+must finish before their signed authorization expires. SDK callers can also
+set their own deadlines.
+
 On Linux, syq asks the kernel to read ahead in source files when reads show
 storage activity or waits. This works for local and remote copies and uses a
 small, bounded number of helper threads. Local copies can also use faster

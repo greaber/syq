@@ -31,6 +31,9 @@ use std::{
 };
 use tokio::sync::Notify;
 
+mod cancel;
+pub(super) use cancel::Cancellation;
+
 #[derive(Debug, Default)]
 struct Active {
     count: AtomicUsize,
@@ -91,7 +94,7 @@ impl Intercept for FileBody {
         // This connector reads the source itself, so the SDK's asynchronous
         // body monitor cannot observe progress. Configure this before its
         // interceptor installs a monitor; keep download protection unchanged.
-        // The synchronous connector enforces its own connect/global timeouts.
+        // The synchronous connector enforces its own connection timeout.
         if let Some(protection) = cfg.load::<StalledStreamProtectionConfig>().cloned() {
             let builder: aws_smithy_runtime_api::client::stalled_stream_protection::Builder =
                 protection.into();
@@ -115,9 +118,15 @@ impl Intercept for FileBody {
 struct Connector {
     fallback: SharedHttpConnector,
     agent: ureq::Agent,
+    cancellation: Arc<Cancellation>,
 }
 impl HttpConnector for Connector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        self.cancellation.wrap(self.call_inner(request))
+    }
+}
+impl Connector {
+    fn call_inner(&self, request: HttpRequest) -> HttpConnectorFuture {
         let request = match request.try_into_http1x() {
             Ok(r) => r,
             Err(e) => {
@@ -192,21 +201,32 @@ impl HttpConnector for Connector {
         })
     }
 }
-pub(super) fn client(fallback: SharedHttpClient) -> SharedHttpClient {
-    let agent = ureq::Agent::config_builder()
+pub(super) fn client(
+    fallback: SharedHttpClient,
+    cancellation: Arc<Cancellation>,
+) -> SharedHttpClient {
+    use ureq::unversioned::transport::{ConnectProxyConnector, Connector as _, RustlsConnector};
+    let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
-        .timeout_global(Some(Duration::from_secs(60)))
+        .timeout_resolve(Some(Duration::from_secs(15)))
         .timeout_connect(Some(Duration::from_secs(15)))
         .max_idle_connections(256)
         .max_idle_connections_per_host(256)
         .output_buffer_size(64 * 1024)
-        .build()
-        .new_agent();
+        .build();
+    let agent = ureq::Agent::with_parts(
+        config,
+        ().chain(ConnectProxyConnector::default())
+            .chain(cancel::TcpConnector(cancellation.clone()))
+            .chain(RustlsConnector::default()),
+        ureq::unversioned::resolver::DefaultResolver::default(),
+    );
     http_client_fn(move |settings, components| {
         SharedHttpConnector::new(Connector {
             fallback: fallback.http_connector(settings, components),
             agent: agent.clone(),
+            cancellation: cancellation.clone(),
         })
     })
 }
@@ -245,3 +265,6 @@ impl<R: Read> Read for ObservedReader<R> {
         Ok(n)
     }
 }
+
+#[cfg(test)]
+mod tests;

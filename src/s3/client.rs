@@ -52,6 +52,17 @@ pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
     aws_sdk_s3::config::Builder::new().retry_config(RetryConfig::disabled())
 }
 
+/// Only establishing a connection has a deadline. Request headers, response
+/// bodies, and pauses between bytes can all take arbitrarily long.
+pub(super) fn request_timeouts() -> TimeoutConfig {
+    TimeoutConfig::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .disable_read_timeout()
+        .disable_operation_timeout()
+        .disable_operation_attempt_timeout()
+        .build()
+}
+
 /// Time HEAD and LIST responses to their headers. Each is one small exchange,
 /// unlike data requests, whose duration follows their bodies. Only an answer
 /// about the object or listing counts: errors and throttling describe the
@@ -212,6 +223,7 @@ async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<Str
 pub(super) async fn connect(
     options: &mut Options,
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    uploads: std::sync::Arc<super::upload_http::Cancellation>,
 ) -> Result<(Client, Option<String>)> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(profile) = &options.profile {
@@ -226,7 +238,7 @@ pub(super) async fn connect(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
         ))
         .build_with_resolver(super::dns::CoalescingDns::default());
-    let transport = super::upload_http::client(transport);
+    let transport = super::upload_http::client(transport, uploads);
     let mut config = aws_sdk_s3::config::Builder::from(&shared)
         .http_client(transport)
         .region(
@@ -237,12 +249,8 @@ pub(super) async fn connect(
         )
         .retry_config(RetryConfig::standard().with_max_attempts(options.retries + 1))
         .retry_classifier(Throttling)
-        .timeout_config(
-            TimeoutConfig::builder()
-                .connect_timeout(Duration::from_secs(15))
-                .read_timeout(Duration::from_secs(60))
-                .build(),
-        )
+        .timeout_config(request_timeouts())
+        .stalled_stream_protection(aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
         // Explicit payload checksums avoid aws-chunked trailers, which several
         // S3-compatible services do not implement. Downloads retain SDK checks.
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
@@ -985,3 +993,6 @@ mod tests {
 
 #[cfg(test)]
 mod control_latency_tests;
+
+#[cfg(test)]
+mod upload_timeout_tests;

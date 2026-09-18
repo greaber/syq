@@ -190,10 +190,17 @@ objects beneath it; it is not an independent directory in S3. New-object
 uploads use conditional writes to avoid replacing an object created concurrently.
 A prefix existence check is not a transaction over the bucket.
 
-Within the retry budget, syq can restart a download range that is much slower
-than comparable reads in the same copy. The retry checks the object's identity
-and reuses the portion already processed. Other read failures can still restart
-the entire range. Setting `s3-retries=0` disables this recovery.
+Uploads, downloads, verification reads, and S3 API responses have no fixed
+duration or stall deadline. A slow or paused request can continue when the
+provider resumes responding. If it never responds, cancel the copy to stop
+waiting. Connection attempts still have a timeout.
+
+Within the `s3-retries` budget, syq can replace a download range that is much
+slower than comparable reads completing in the same copy. The replacement
+checks the object's identity and reuses the portion already processed. Only
+one such recovery runs at a time. Actual transport and provider errors can
+also trigger retries; other read failures restart the entire range. Setting
+`s3-retries=0` disables retries.
 
 Use `--prune` to mirror selected directories or prefixes in either direction:
 

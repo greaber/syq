@@ -194,6 +194,10 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
         ByteStream::from(bytes.clone())
     } else {
         let mut body = Body::slow(&bytes, fault == "idle");
+        if fault == "long-pause" {
+            body.delay = Duration::from_secs(120);
+            body.ready = Box::pin(tokio::time::sleep(Duration::from_secs(3600)));
+        }
         body.dropped = Some(dropped.clone());
         ByteStream::new(SdkBody::from_body_1_x(body))
     };
@@ -279,4 +283,67 @@ async fn uniformly_slow_or_retry_disabled_reads_are_not_restarted() {
     copy("ok", 0, true, false).await;
     copy("ok", 1, false, false).await;
     copy("ok", 1, true, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn downloads_without_peers_can_wait_through_long_pauses() {
+    copy("long-pause", 1, false, false).await;
+    copy("long-pause", 0, false, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn direct_download_can_resume_after_a_long_pause_within_one_read() {
+    use std::os::unix::fs::FileExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large");
+    let size = 256 * 1024 * 1024;
+    let file = Arc::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap(),
+    );
+    file.set_len(size).unwrap();
+    let output = writer::Writer::with_readback(file.clone(), size, false).unwrap();
+    // macOS uses the buffered path. Linux exercises the production direct-I/O
+    // path when the temporary filesystem supports it.
+    let bytes = data();
+    let offset = size - bytes.len() as u64;
+    let object = Object {
+        key: "object".into(),
+        size,
+        etag: "fixture".into(),
+        version: None,
+        metadata: None,
+        mtime: 0,
+    };
+    let engine = super::buffer_tests::planning_engine(&["--performance-tuning", "s3-retries=0"]);
+    let mut delayed = Body::slow(&bytes, true);
+    delayed.delay = Duration::from_secs(120);
+    delayed.ready = Box::pin(tokio::time::sleep(Duration::from_secs(3600)));
+    let body = ByteStream::new(SdkBody::from_body_1_x(delayed));
+    let started = Instant::now();
+    let hash = engine
+        .download_fast_range(
+            &object,
+            &output,
+            offset,
+            bytes.len() as u64,
+            Some(body),
+            None,
+            Some(HashAlgorithm::Blake3),
+        )
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(3600));
+    output.finish().await.unwrap();
+    let mut actual = vec![0; bytes.len()];
+    file.read_exact_at(&mut actual, offset).unwrap();
+    assert_eq!(actual, bytes);
+    assert_eq!(
+        hash,
+        Digest::hash_bytes(HashAlgorithm::Blake3, &bytes).value
+    );
 }

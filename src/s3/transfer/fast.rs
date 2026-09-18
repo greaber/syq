@@ -331,8 +331,7 @@ impl Engine {
                     anyhow::ensure!(!recover(done, waited), SlowRead);
                 }
                 let mut extra = [0];
-                if tokio::time::timeout(Duration::from_secs(60), body.read(&mut extra)).await?? != 0
-                {
+                if body.read(&mut extra).await? != 0 {
                     return Err(Permanent("S3 body exceeded length".into()).into());
                 }
                 Ok::<String, anyhow::Error>(
@@ -359,6 +358,7 @@ impl Engine {
                         && e.downcast_ref::<Permanent>().is_none() =>
                 {
                     output.finish().await?;
+                    self.check_cancelled()?;
                     if e.downcast_ref::<SlowRead>().is_none() {
                         // Only our own slow-read decision trusts the prefix.
                         // Errors from the response/transport restart the range.
@@ -410,10 +410,6 @@ async fn read_body<F: std::future::Future>(
                 return Ok(result);
             }
             Err(_) => {
-                anyhow::ensure!(
-                    started.elapsed() < Duration::from_secs(60),
-                    "S3 body read timed out"
-                );
                 anyhow::ensure!(!recover(*waited + started.elapsed()), SlowRead);
             }
         }
@@ -550,7 +546,7 @@ mod buffer_tests {
         let (mut send, mut recv) = tokio::io::duplex(4);
         let writer = tokio::spawn(async move {
             send.write_all(b"ab").await.unwrap();
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(120)).await;
             send.write_all(b"cd").await.unwrap();
         });
         let mut bytes = [0; 4];
@@ -607,6 +603,7 @@ mod buffer_tests {
             upload_keys: OnceLock::new(),
             cancelled: Default::default(),
             cancel_wake: Default::default(),
+            uploads: Default::default(),
         }
     }
 

@@ -48,6 +48,13 @@ pub(super) struct Engine {
     tuning: super::tuning::Tuning,
     cancelled: std::sync::atomic::AtomicBool,
     cancel_wake: tokio::sync::Notify,
+    uploads: Arc<super::upload_http::Cancellation>,
+}
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Fatal errors can drop the scheduler before its usual drain finishes.
+        self.uploads.cancel();
+    }
 }
 #[derive(Clone)]
 struct Download {
@@ -105,7 +112,9 @@ impl Engine {
             .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
         let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-        let (client, note) = client::connect(&mut options, control.clone()).await?;
+        let uploads = Arc::new(super::upload_http::Cancellation::default());
+        let (client, note) =
+            client::connect(&mut options, control.clone(), uploads.clone()).await?;
         if let Some(note) = note.filter(|_| args.verbose > 0) {
             progress.println(&note);
         }
@@ -114,6 +123,7 @@ impl Engine {
             tuning: super::tuning::Tuning::new(&options, &args, control),
             cancelled: std::sync::atomic::AtomicBool::new(false),
             cancel_wake: tokio::sync::Notify::new(),
+            uploads,
             args,
             options,
             client,
@@ -134,6 +144,7 @@ impl Engine {
         };
         self.cancelled.store(true, Relaxed);
         self.cancel_wake.notify_waiters();
+        self.uploads.cancel();
         // Drain started requests, including synchronous file bodies, before exit.
         let _ = work.await;
         bail!("S3 copy {interrupted}; rerun the command to continue")
@@ -746,6 +757,7 @@ impl Engine {
                 synchronous.then(|| crate::s3::upload_http::FileBody::new(source.clone(), 0, size));
             let mut attempt = 0;
             loop {
+                self.check_cancelled()?;
                 let body = if let Some(bytes) = &small {
                     ByteStream::from(bytes.clone())
                 } else if synchronous {
@@ -1093,8 +1105,7 @@ impl Engine {
         let mut hasher = algorithm.hasher();
         let mut buffer = vec![0; 1024 * 1024];
         loop {
-            let n =
-                tokio::time::timeout(Duration::from_secs(60), reader.read(&mut buffer)).await??;
+            let n = reader.read(&mut buffer).await?;
             if n == 0 {
                 break;
             }
@@ -1879,13 +1890,10 @@ impl Engine {
             }
         };
         let mut bytes = Vec::new();
-        tokio::time::timeout(
-            Duration::from_secs(60),
-            body.into_async_read()
-                .take(object.size + 1)
-                .read_to_end(&mut bytes),
-        )
-        .await??;
+        body.into_async_read()
+            .take(object.size + 1)
+            .read_to_end(&mut bytes)
+            .await?;
         if bytes.len() as u64 != object.size {
             bail!("S3 response length differs");
         }
@@ -1923,8 +1931,7 @@ impl Engine {
         let mut hash = algorithm.hasher();
         let mut n = 0;
         loop {
-            let got =
-                tokio::time::timeout(Duration::from_secs(60), body.read(&mut buffer)).await??;
+            let got = body.read(&mut buffer).await?;
             if got == 0 {
                 break;
             }
