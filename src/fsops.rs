@@ -7,8 +7,8 @@ use crate::descriptor_broker::{
 };
 use crate::proto::*;
 use crate::rooted::{
-    read_open_symlink, root_metadata_from_std, OperatorFinalComponent, OperatorResolver,
-    PinnedPath, RelativePath, Root, RootIdentity, RootMetadata,
+    open_operator_directory_at, read_open_symlink, root_metadata_from_std, OperatorFinalComponent,
+    OperatorResolver, PinnedPath, RelativePath, Root, RootIdentity, RootMetadata,
 };
 use crate::sys::{
     absent_or_nondirectory, COMMON_NAME_MAX, MODE_BLOCK, MODE_CHAR, MODE_DIRECTORY, MODE_FIFO,
@@ -20,12 +20,12 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 #[cfg(target_os = "linux")]
 use std::io::Write;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -684,41 +684,6 @@ pub(crate) fn create_operator_file(
         }
         PinnedPath::Missing(missing) => missing.create_regular(0o666),
         PinnedPath::OpenFile(_) => unreachable!("output resolution never opens a procfs input"),
-    }
-}
-
-fn operator_directory_flags() -> libc::c_int {
-    #[cfg(target_os = "linux")]
-    {
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-    }
-    #[cfg(target_os = "macos")]
-    {
-        libc::O_SEARCH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-    }
-}
-
-fn open_operator_directory_at(parent: &File, component: &[u8]) -> Result<File> {
-    let component = CString::new(component).expect("path component was checked for NUL");
-    open_operator_directory_fd(parent.as_raw_fd(), &component)
-}
-
-fn open_operator_directory_fd(parent: libc::c_int, component: &CStr) -> Result<File> {
-    loop {
-        let fd = unsafe { libc::openat(parent, component.as_ptr(), operator_directory_flags()) };
-        if fd >= 0 {
-            // O_DIRECTORY is the kernel-enforced type check. Repeating it with
-            // fstat costs another metadata operation on network filesystems.
-            return Ok(unsafe { File::from_raw_fd(fd) });
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error.into());
-        }
     }
 }
 
