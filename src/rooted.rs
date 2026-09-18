@@ -53,6 +53,8 @@ use std::sync::{Mutex, OnceLock};
 #[path = "../tests/support/macos_clone.rs"]
 mod macos_clone_support;
 
+#[cfg(any(target_os = "linux", test))]
+mod directory_gate;
 mod operator;
 
 pub(crate) use operator::*;
@@ -227,6 +229,12 @@ impl Root {
         Ok(root)
     }
 
+    #[cfg(any(target_os = "linux", test))]
+    fn mutation_permit(&self, path: &RelativePath) -> Result<directory_gate::Permit> {
+        let (parents, _) = path.leaf()?;
+        Ok(directory_gate::acquire(self.identity, parents))
+    }
+
     pub(crate) fn identity(&self) -> RootIdentity {
         self.identity
     }
@@ -372,6 +380,8 @@ impl Root {
     /// Create a new regular leaf. Existing leaves of every type are refused.
     /// Special permission bits require the explicit metadata operations.
     pub(crate) fn create_file(&self, path: &RelativePath, mode: u32) -> Result<File> {
+        #[cfg(any(target_os = "linux", test))]
+        let permit = self.mutation_permit(path)?;
         let file = self
             .open_leaf(
                 path,
@@ -385,6 +395,8 @@ impl Root {
                 mode & 0o777,
             )
             .with_context(|| format!("create confined file {}", path.label()))?;
+        #[cfg(any(target_os = "linux", test))]
+        drop(permit);
         require_regular(&file, path)?;
         clear_nonblocking(&file)
             .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
@@ -1109,6 +1121,8 @@ impl Root {
         let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
+        #[cfg(any(target_os = "linux", test))]
+        let permit = self.mutation_permit(target)?;
         retry_zero(|| unsafe {
             libc::renameat(
                 source_parent.directory.as_raw_fd(),
@@ -1118,6 +1132,8 @@ impl Root {
             )
         })
         .with_context(|| format!("publish confined path {}", target.label()))?;
+        #[cfg(any(target_os = "linux", test))]
+        drop(permit);
         #[cfg(test)]
         run_publication_test_hook(self.identity, target, PublicationTestPoint::AfterAnyRename);
         Ok(())
@@ -1137,6 +1153,8 @@ impl Root {
         let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
+        #[cfg(any(target_os = "linux", test))]
+        let permit = self.mutation_permit(target)?;
         retry_zero(|| unsafe {
             libc::linkat(
                 source_parent.directory.as_raw_fd(),
@@ -1153,6 +1171,8 @@ impl Root {
                 target.label()
             )
         })?;
+        #[cfg(any(target_os = "linux", test))]
+        drop(permit);
         #[cfg(test)]
         run_publication_test_hook(self.identity, target, PublicationTestPoint::AfterAbsentLink);
         let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
@@ -1162,6 +1182,8 @@ impl Root {
                 source.label()
             );
         }
+        #[cfg(any(target_os = "linux", test))]
+        let _permit = self.mutation_permit(source)?;
         unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
             .with_context(|| format!("remove staged confined path {}", source.label()))
     }
@@ -1204,6 +1226,8 @@ impl Root {
             target,
             PublicationTestPoint::BeforeMatchedExchange,
         );
+        #[cfg(any(target_os = "linux", test))]
+        let permit = self.mutation_permit(target)?;
         rename_exchange(
             source_parent.directory.as_raw_fd(),
             &source_parent.leaf,
@@ -1211,6 +1235,8 @@ impl Root {
             &target_parent.leaf,
         )
         .with_context(|| format!("atomically publish confined path {}", target.label()))?;
+        #[cfg(any(target_os = "linux", test))]
+        drop(permit);
         #[cfg(test)]
         run_publication_test_hook(
             self.identity,
@@ -1237,6 +1263,8 @@ impl Root {
                 target.label()
             );
         }
+        #[cfg(any(target_os = "linux", test))]
+        let _permit = self.mutation_permit(source)?;
         unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
             .with_context(|| format!("remove displaced confined path {}", target.label()))
     }
