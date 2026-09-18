@@ -8,7 +8,7 @@ use std::{
     io::{Read, Write},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -70,6 +70,35 @@ fn sync_get(agent: &ureq::Agent, object: &Object, dir: &str, i: usize) -> Result
     ensure!(reader.read(&mut buffer[..1])? == 0, "extra body bytes");
     finish(hash, object, bytes)
 }
+// Optional diagnostic preload hook. No production code links to this symbol.
+struct RequestProbe(Option<unsafe extern "C" fn(i32)>);
+impl RequestProbe {
+    fn start() -> Self {
+        static HOOK: OnceLock<Option<unsafe extern "C" fn(i32)>> = OnceLock::new();
+        let hook = *HOOK.get_or_init(|| {
+            if std::env::var("SYQ_SPIKE_BUDGET_ACTIVE").as_deref() != Ok("1") {
+                return None;
+            }
+            let symbol =
+                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"syq_spike_request_delta".as_ptr()) };
+            assert!(!symbol.is_null(), "active-request probe hook missing");
+            Some(unsafe {
+                std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(i32)>(symbol)
+            })
+        });
+        if let Some(hook) = hook {
+            unsafe { hook(1) };
+        }
+        Self(hook)
+    }
+}
+impl Drop for RequestProbe {
+    fn drop(&mut self) {
+        if let Some(hook) = self.0 {
+            unsafe { hook(-1) };
+        }
+    }
+}
 async fn async_get(
     connector: Arc<aws_smithy_http_client::Connector>,
     object: Object,
@@ -77,6 +106,7 @@ async fn async_get(
     i: usize,
     destination: Option<(writer::Writer, u64)>,
 ) -> Result<()> {
+    let request_probe = RequestProbe::start();
     let request = http::Request::builder()
         .uri(&object.url)
         .body(SdkBody::empty())?;
@@ -137,6 +167,7 @@ async fn async_get(
             bytes += frame.len();
         }
     }
+    drop(request_probe);
     if let Some(w) = &writer {
         flush_fragments(&mut batch, &mut fragments);
         if !batch.is_empty() {
