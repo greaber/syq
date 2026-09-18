@@ -6,6 +6,7 @@
 #include <malloc.h>
 #include <netinet/tcp.h>
 #include <netinet/in.h>
+#include <linux/sock_diag.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -22,6 +23,12 @@ static int sockets[4096];
 static int configured[4096];
 static int budget_active_requests;
 static int budget_window_clamp;
+static int budget_on_pressure;
+static int under_pressure;
+static int controlled[4096];
+static unsigned queued[4096];
+static _Atomic unsigned long sampled_socket_memory;
+static _Atomic unsigned pressure_entries;
 static int actual_configured[4096];
 static _Atomic unsigned active_requests;
 static unsigned reserved_requests;
@@ -54,8 +61,21 @@ static void rebudget(void) {
         unsigned long allowance = divisor ? receive_budget / (2 * divisor) : 16384;
         if (allowance < 16384) allowance = 16384;
         if (allowance > 64 * 1024 * 1024) allowance = 64 * 1024 * 1024;
-        int bytes = (int)allowance;
         for (unsigned i = 0; i < socket_count; ++i) {
+            int bytes = (int)allowance;
+            if (budget_on_pressure) {
+                if (!under_pressure) {
+                    if (!controlled[i]) { total += actual_configured[i]; continue; }
+                    bytes = 64 * 1024 * 1024;
+                    controlled[i] = 0;
+                } else {
+                    if (!controlled[i] && queued[i] <= 2 * allowance) {
+                        total += actual_configured[i];
+                        continue;
+                    }
+                    controlled[i] = 1;
+                }
+            }
             if (configured[i] == bytes) {
                 total += actual_configured[i];
                 continue;
@@ -122,6 +142,8 @@ int close(int fd) {
             sockets[i] = sockets[--socket_count];
             configured[i] = configured[socket_count];
             actual_configured[i] = actual_configured[socket_count];
+            controlled[i] = controlled[socket_count];
+            queued[i] = queued[socket_count];
             rebudget();
             break;
         }
@@ -136,18 +158,45 @@ static _Atomic unsigned connections;
 static _Atomic int observed_receive_bytes;
 static _Atomic int last_socket = -1;
 
+// Read actual receive allocations, rather than treating a large advertised
+// window as allocated memory. This experiment polls only its own TCP sockets.
+static void sample_pressure(void) {
+    unsigned long total = 0;
+    for (unsigned i = 0; i < socket_count; ++i) {
+        unsigned info[SK_MEMINFO_VARS] = {0};
+        socklen_t length = sizeof(info);
+        if (getsockopt(sockets[i], SOL_SOCKET, SO_MEMINFO, info, &length)) _exit(122);
+        queued[i] = info[SK_MEMINFO_RMEM_ALLOC];
+        actual_configured[i] = info[SK_MEMINFO_RCVBUF];
+        total += queued[i];
+    }
+    atomic_store(&sampled_socket_memory, total);
+    if (!under_pressure && total > receive_budget) {
+        under_pressure = 1;
+        atomic_fetch_add(&pressure_entries, 1);
+    } else if (under_pressure && total < receive_budget / 4) {
+        under_pressure = 0;
+    }
+    rebudget();
+}
+
 static void *sample_heap(void *unused) {
     (void)unused;
     FILE *out = fopen("/output/.allocator.csv", "w");
     if (!out) _exit(110);
-    fprintf(out, "seconds,arena,uordblks,fordblks,hblkhd,connections,initial_rcvbuf,rtt_us,current_rcvbuf,tracked_sockets,configured_total,active_requests,window_clamp,rcv_ssthresh,resize_calls\n");
-    struct timespec start, now, interval = {.tv_nsec = 100000000};
+    fprintf(out, "seconds,arena,uordblks,fordblks,hblkhd,connections,initial_rcvbuf,rtt_us,current_rcvbuf,tracked_sockets,configured_total,active_requests,window_clamp,rcv_ssthresh,resize_calls,sampled_socket_memory,pressure_entries\n");
+    struct timespec start, now, interval = {.tv_nsec = budget_on_pressure ? 10000000 : 100000000};
     clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int i = 0; i < 6000; ++i) {
+    for (int i = 0; i < (budget_on_pressure ? 60000 : 6000); ++i) {
         if (receive_budget && budget_active_requests) {
             pthread_mutex_lock(&sockets_lock);
             update_active_budget(1);
+            if (budget_on_pressure) sample_pressure();
             pthread_mutex_unlock(&sockets_lock);
+        }
+        if (budget_on_pressure && i % 10) {
+            nanosleep(&interval, NULL);
+            continue;
         }
         struct mallinfo2 m = mallinfo2();
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -161,11 +210,12 @@ static void *sample_heap(void *unused) {
         int clamp = 0;
         socklen_t clamp_size = sizeof(clamp);
         if (getsockopt(fd, IPPROTO_TCP, TCP_WINDOW_CLAMP, &clamp, &clamp_size)) clamp = 0;
-        fprintf(out, "%.6f,%zu,%zu,%zu,%zu,%u,%d,%u,%d,%u,%lu,%u,%d,%u,%lu\n", elapsed,
+        fprintf(out, "%.6f,%zu,%zu,%zu,%zu,%u,%d,%u,%d,%u,%lu,%u,%d,%u,%lu,%lu,%u\n", elapsed,
                 m.arena, m.uordblks, m.fordblks, m.hblkhd,
                 atomic_load(&connections), atomic_load(&observed_receive_bytes),
                 info.tcpi_rtt, current_receive, atomic_load(&tracked_sockets),
-                atomic_load(&configured_total), atomic_load(&active_requests), clamp, info.tcpi_rcv_ssthresh, atomic_load(&resize_calls));
+                atomic_load(&configured_total), atomic_load(&active_requests), clamp, info.tcpi_rcv_ssthresh, atomic_load(&resize_calls),
+                atomic_load(&sampled_socket_memory), atomic_load(&pressure_entries));
         fflush(out);
         nanosleep(&interval, NULL);
     }
@@ -185,6 +235,9 @@ __attribute__((constructor)) static void initialize(void) {
     budget_active_requests = value && atoi(value);
     value = getenv("SYQ_SPIKE_WINDOW_CLAMP");
     budget_window_clamp = value && atoi(value);
+    value = getenv("SYQ_SPIKE_ON_PRESSURE");
+    budget_on_pressure = value && atoi(value);
+    if (budget_on_pressure && (!budget_active_requests || !budget_window_clamp)) _exit(123);
     pthread_t thread;
     pthread_attr_t attr;
     if (pthread_attr_init(&attr) || pthread_attr_setstacksize(&attr, 128 * 1024) ||
@@ -197,7 +250,7 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {
     int inet = address && (address->sa_family == AF_INET || address->sa_family == AF_INET6);
     if (inet) {
         // Negotiate window scaling for later growth before sending the SYN.
-        int initial = receive_budget ? 64 * 1024 * 1024 : receive_bytes;
+        int initial = receive_budget && !budget_on_pressure ? 64 * 1024 * 1024 : receive_bytes;
         if (initial && setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &initial, sizeof(initial))) _exit(113);
         int actual = 0;
         socklen_t size = sizeof(actual);
@@ -212,6 +265,12 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {
         pthread_mutex_lock(&sockets_lock);
         if (socket_count == sizeof(sockets) / sizeof(sockets[0])) _exit(118);
         configured[socket_count] = 0;
+        controlled[socket_count] = 0;
+        queued[socket_count] = 0;
+        int actual = 0;
+        socklen_t size = sizeof(actual);
+        if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual, &size)) _exit(114);
+        actual_configured[socket_count] = actual;
         sockets[socket_count++] = fd;
         rebudget();
         pthread_mutex_unlock(&sockets_lock);
