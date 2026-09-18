@@ -172,9 +172,10 @@ def run(case, mode, repeats, label):
             '-v', str(STAGE) + ':/bench:ro', '-v', str(out) + ':/output:rw',
             '-e', 'SYQ_SPIKE_READERS_PER_WRITER=' + str(case.get('readers', 1)),
             '-e', 'SYQ_SPIKE_SERIAL_TAIL=' + str(case.get('serial_tail', 0)),
+            '-e', 'SYQ_SPIKE_CHUNK=' + str(case.get('chunk_bytes', 128 * 1024)),
             *(['--cpus', str(case['cpu_quota'])] if 'cpu_quota' in case else []),
             *(['--device-write-bps', case['write_bps']] if 'write_bps' in case else []),
-            *(['-e', 'SYQ_SPIKE_QUEUE=' + mode.removeprefix('queue-')] if QUEUE_SWEEP else []),
+            *(['-e', 'SYQ_SPIKE_QUEUE=' + mode.removeprefix('queue-')] if mode.startswith('queue-') else []),
             IMAGE, '/bench/client', 'async' if mode.startswith('queue-') else mode, '/bench/' + case['fixture'] + '.json',
             str(case['concurrency']), '/output', '/bench/cert/public.crt', 'auto', str(repeats)]
     if HEAP_PROBE:
@@ -381,6 +382,9 @@ try:
         assert HEAP_PROBE
         cases = [dict(case, receive_budget=int(value)) for case in cases
                  for value in os.environ['SYQ_STRESS_RCVBUDGETS'].split(',')]
+    if os.environ.get('SYQ_STRESS_CHUNKS'):
+        cases = [dict(case, chunk_bytes=int(value)) for case in cases
+                 for value in os.environ['SYQ_STRESS_CHUNKS'].split(',')]
     for case in cases:
         if os.environ.get('SYQ_STRESS_MEMORY_LIMIT'):
             case['memory'] = os.environ['SYQ_STRESS_MEMORY_LIMIT']
@@ -406,10 +410,14 @@ try:
                 label += '-rcv' + str(case['receive_buffer'])
             if os.environ.get('SYQ_STRESS_RCVBUDGETS'):
                 label += '-budget' + str(case['receive_budget'])
+            if 'chunk_bytes' in case:
+                label += '-chunk' + str(case['chunk_bytes'])
             minimum = float(os.environ.get('SYQ_STRESS_MIN_SECONDS', 30))
             modes = [f'queue-{queue}' for queue in QUEUES]
             if os.environ.get('SYQ_STRESS_SYNC') == '1':
                 modes.append('sync')
+            if os.environ.get('SYQ_STRESS_MODES'):
+                modes = os.environ['SYQ_STRESS_MODES'].split(',')
             for rep in range(rounds):
                 for mode in (modes if rep % 2 == 0 else list(reversed(modes))):
                     row = run(case, mode, repeats, f'{label}-{rep}')
