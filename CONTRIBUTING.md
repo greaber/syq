@@ -144,6 +144,26 @@ existing bucket. See `python3 tests/object-storage/benchmark.py --help` for
 benchmark options.
 
 For docs, run `python3 scripts/check-doc-links.py` and build with mdBook.
+The published site defaults to the latest stable release, with tagged versions
+and `master` available through the documentation selector. Archives start at
+v0.2.0, the first release containing the mdBook sources. Each version uses its
+own documentation and search index. Existing unversioned links to pages only
+available on `master` redirect there. The latest selector option follows the
+unversioned site URL. Stable pages declare that URL as canonical and appear in
+`sitemap.xml`; older releases and `master` carry `noindex` metadata and a notice
+linking to stable. They remain available through the selector and direct links.
+
+To build the complete site, fetch release tags and run
+`python3 scripts/build-doc-site.py` with mdBook and the GitHub CLI available.
+It writes to a fresh `target/doc-site/` directory; use `--dest-dir` to choose
+another directory. The build reads published stable releases from GitHub and
+uses the current checkout for the `master` preview. Run
+`python3 scripts/test-doc-site.py` and `node --test scripts/test-doc-selector.cjs`
+to check version selection and navigation.
+The Pages workflow rebuilds on documentation changes and after release
+publication. A manual run on a task branch produces an artifact without
+deploying it.
+
 After CLI changes, update and check the command tables:
 
 ```sh
