@@ -276,6 +276,12 @@ Stop concurrent writers when clearing a prefix: versions created after listing
 are not part of the removal plan. Version operations require permission to list
 and delete versions; retention rules may prevent permanent deletion.
 
+On recognized Tigris endpoints, versioned removal prints a compatibility warning:
+bulk deletion has been observed to ignore version IDs and create delete markers
+instead. The warning also appears in dry runs. It does not block removal or
+change the API requests; provider behavior may change. Check the resulting
+version history when using these options.
+
 The Python `rm` and `AsyncClient.rm` APIs accept `s3_all_versions=True` or
 `s3_version_id="..."`, along with `on="s3://BUCKET"` and the S3 connection options.
 Removal results count each version or delete marker as one entry.

@@ -410,6 +410,15 @@ pub(super) fn run(args: Args) -> Result<i32> {
                 Ok(())
             };
             let tuning = super::tuning::Tuning::new(&options, &args, control);
+            if tuning.tigris()
+                && (args.s3_remove.s3_all_versions || args.s3_remove.s3_version_id.is_some())
+            {
+                progress.warning(
+                    "s3_versioned_bulk_delete_compatibility",
+                    1,
+                    "Tigris versioned bulk deletion has been observed to ignore version IDs, leaving versions intact and creating delete markers. Continuing with standard S3 requests; verify the resulting version history. Provider behavior may have changed.",
+                );
+            }
             let deleter = delete::Deleter {
                 client: &client,
                 bucket: &options.bucket,
