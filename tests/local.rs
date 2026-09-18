@@ -22853,3 +22853,21 @@ fn descriptor_copies_preserve_bytes_offsets_flags_and_publication() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn managed_descriptor_upload_requires_commit() {
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/managed-streams.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .output()
+        .expect("run managed stream fixture");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

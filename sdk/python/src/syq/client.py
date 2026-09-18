@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from ._streams import StreamReader, StreamWriter
 from ._defaults import CLIENT_DEFAULT, Timeout, resolve_timeout
 from ._mapping import Mapping as FileMapping, _source_options
 from ._paths import PathArgument, _map_stream_cwd
@@ -976,6 +977,70 @@ class Client:
             timeout=resolve_timeout(timeout, self.timeout),
             input=input,
         )
+
+    def open_writer(
+        self,
+        *,
+        as_: PathArgument,
+        to: str | None = None,
+        follow_dst: bool = False,
+        rsh: str | None = None,
+        syq_path: str | os.PathLike[str] | None = None,
+        pscope: PathArgument | None = None,
+        no_bootstrap: bool = False,
+        no_compress: bool = False,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
+        performance_tuning: str | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
+    ) -> StreamWriter:
+        """Write one object, committing on successful context exit."""
+        from ._streams import _Process, arguments, StreamWriter
+        argv = arguments(
+            executable=self._executable_value(), writing=True, path=as_, endpoint=to,
+            options=dict(rsh=rsh, syq_path=syq_path, pscope=pscope,
+                         no_bootstrap=no_bootstrap, no_compress=no_compress,
+                         s3_endpoint=s3_endpoint, s3_region=s3_region,
+                         s3_profile=s3_profile, s3_header=s3_header,
+                         performance_tuning=performance_tuning, follow_dst=follow_dst),
+        )
+        stream = StreamWriter(_Process(argv, writing=True, cwd=self.process_cwd, env=self.env,
+                                    timeout=resolve_timeout(timeout, self.timeout)))
+        return stream
+
+    def open_reader(
+        self,
+        src: PathArgument,
+        *,
+        from_: str | None = None,
+        follow_src: bool = False,
+        rsh: str | None = None,
+        syq_path: str | os.PathLike[str] | None = None,
+        pscope: PathArgument | None = None,
+        no_bootstrap: bool = False,
+        no_compress: bool = False,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
+        performance_tuning: str | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
+    ) -> StreamReader:
+        """Read one object; context exit drains and verifies the transfer."""
+        from ._streams import _Process, arguments, StreamReader
+        argv = arguments(
+            executable=self._executable_value(), writing=False, path=src, endpoint=from_,
+            options=dict(rsh=rsh, syq_path=syq_path, pscope=pscope,
+                         no_bootstrap=no_bootstrap, no_compress=no_compress,
+                         s3_endpoint=s3_endpoint, s3_region=s3_region,
+                         s3_profile=s3_profile, s3_header=s3_header,
+                         performance_tuning=performance_tuning, follow_src=follow_src),
+        )
+        stream = StreamReader(_Process(argv, writing=False, cwd=self.process_cwd, env=self.env,
+                                    timeout=resolve_timeout(timeout, self.timeout)))
+        return stream
 
     def version(self) -> str:
         """Return the selected syq executable's version."""

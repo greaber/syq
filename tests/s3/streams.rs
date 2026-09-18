@@ -69,3 +69,8 @@ fn environment_options_apply_to_streams() {
 fn named_pipes_and_process_substitution_upload() {
     scenario("pipe-sources");
 }
+
+#[test]
+fn managed_streams_commit_only_after_producer_success() {
+    scenario("managed-commit");
+}

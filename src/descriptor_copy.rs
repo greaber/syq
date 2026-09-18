@@ -22,6 +22,7 @@ const PIPELINE: usize = 4;
 pub(crate) struct Plan {
     pub source: Option<fd::Source>,
     pub as_fd: Option<i32>,
+    pub commit_fd: Option<i32>,
     pub location: Option<Location>,
     pub key: Option<String>,
     pub follow: bool,
@@ -133,7 +134,13 @@ impl Connection {
 pub(crate) fn run(mut args: Args) -> Result<i32> {
     let plan = args.descriptor_copy.take().unwrap();
     if let Some(options) = args.s3.take() {
-        return crate::s3::stream::run(options, plan.key.unwrap(), plan.source, plan.as_fd);
+        return crate::s3::stream::run(
+            options,
+            plan.key.unwrap(),
+            plan.source,
+            plan.as_fd,
+            plan.commit_fd,
+        );
     }
     let cancelled = Arc::new(AtomicBool::new(false));
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -146,13 +153,14 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
         let operation = async {
             // Protect inherited descriptors before starting any children. FIFO
             // opening is also inside cancellation, including waits for writers.
+            let commit = plan.commit_fd.map(|n| fd::Descriptor::open(n, true, cancelled.clone())).transpose()?;
             let input = match plan.source.clone() {
                 Some(source) => Some(source.open(cancelled.clone()).await?),
                 None => None,
             };
             let output = plan.as_fd.map(|n| fd::Descriptor::open(n, false, cancelled.clone())).transpose()?;
             connection = plan.location.clone().map(|location| Connection::start(args, location));
-            copy(&plan, input, output, connection.as_ref()).await
+            copy(&plan, input, output, connection.as_ref(), commit).await
         };
         let result = tokio::select! {
             result = operation => result,
@@ -175,6 +183,7 @@ async fn copy(
     mut input: Option<fd::Descriptor>,
     mut output: Option<fd::Descriptor>,
     connection: Option<&Connection>,
+    commit: Option<fd::Descriptor>,
 ) -> Result<()> {
     if let Some(connection) = connection {
         match connection
@@ -258,6 +267,7 @@ async fn copy(
             }
         }
     }
+    fd::await_commit(commit).await?;
     if let Some(connection) = connection {
         match connection
             .call(Operation::Finish {

@@ -64,6 +64,7 @@
       ],
       "internal": [
         "delegated-operands-b64",
+        "stream-commit-fd",
         "results-fd",
         "suppress-summary"
       ],

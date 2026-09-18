@@ -1247,6 +1247,10 @@ struct NativeCopyFields {
     #[arg(long, value_name="FD", value_parser=clap::value_parser!(i32).range(0..),
         conflicts_with_all = ["to", "into", "into_new", "into_existing", "as", "as_new", "as_existing"])]
     as_fd: Option<i32>,
+    /// Internal SDK completion channel: EOF alone must not publish an upload.
+    #[arg(long, hide = true, requires = "src_fd", conflicts_with = "as_fd",
+        value_parser = clap::value_parser!(i32).range(3..))]
+    stream_commit_fd: Option<i32>,
     /// Internal: this argv was delegated by a remote-to-remote coordinator,
     /// and every path-valued operand is standard unpadded base64 of its raw
     /// bytes, so any filename survives the remote shell.
@@ -1718,6 +1722,7 @@ fn parse_descriptor_copy(
         if !matches!(
             id.as_str(),
             "src_fd"
+                | "stream_commit_fd"
                 | "as_fd"
                 | "sources"
                 | "src"
@@ -1780,6 +1785,10 @@ fn parse_descriptor_copy(
     };
     let upload = source.is_some();
     let as_fd = copy.as_fd;
+    anyhow::ensure!(
+        copy.stream_commit_fd.is_none() || copy.stream_commit_fd != src_fd,
+        "stream completion and payload descriptors must differ"
+    );
     if src_fd.is_some() && src_fd == as_fd {
         bail!("source and destination descriptors must differ");
     }
@@ -1889,6 +1898,7 @@ fn parse_descriptor_copy(
     args.descriptor_copy = Some(crate::descriptor_copy::Plan {
         source,
         as_fd,
+        commit_fd: copy.stream_commit_fd,
         key,
         location,
         follow: copy.selection.source.follow

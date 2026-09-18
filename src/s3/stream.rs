@@ -27,6 +27,7 @@ pub(crate) fn run(
     key: String,
     source: Option<Source>,
     as_fd: Option<i32>,
+    commit_fd: Option<i32>,
 ) -> Result<i32> {
     let mut plan = Plan { options, key };
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -38,6 +39,7 @@ pub(crate) fn run(
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let interrupt = async { tokio::select! { result = tokio::signal::ctrl_c() => { result?; }, _ = term.recv() => {} }; Ok::<_, anyhow::Error>(()) };
         tokio::pin!(interrupt);
+        let commit = commit_fd.map(|n| Descriptor::open(n, true, cancelled.clone())).transpose()?;
         let descriptor = tokio::select! {
             descriptor = async {
                 match source {
@@ -55,7 +57,7 @@ pub(crate) fn run(
         let mut upload_id = None;
         let result = {
             let operation = async {
-                if plan.options.route == crate::s3::Route::Upload { upload(&client, &plan, descriptor, &mut upload_id).await }
+                if plan.options.route == crate::s3::Route::Upload { upload(&client, &plan, descriptor, &mut upload_id, commit).await }
                 else { download(&client, &plan, descriptor).await }
             };
             tokio::select! {
@@ -95,12 +97,14 @@ async fn upload(
     plan: &Plan,
     input: Descriptor,
     upload_id: &mut Option<String>,
+    commit: Option<Descriptor>,
 ) -> Result<()> {
     let options = &plan.options;
     let size = usize::try_from(options.part_size)?;
     let algorithm = Algorithm::for_endpoint(options.endpoint.as_deref());
     let (mut input, first) = input.read_chunk(size).await?;
     if first.len() < size {
+        crate::descriptor_copy::fd::await_commit(commit).await?;
         let hash = digest(algorithm, &first);
         client
             .put_object()
@@ -169,6 +173,7 @@ async fn upload(
         completed.push(part);
     }
     completed.sort_by_key(|p| p.part_number());
+    crate::descriptor_copy::fd::await_commit(commit).await?;
     client
         .complete_multipart_upload()
         .bucket(&options.bucket)
