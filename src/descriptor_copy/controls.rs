@@ -87,9 +87,8 @@ impl Controls {
                 );
             } else {
                 crate::output::diagnostic!(
-                    "stream: up to {} bytes per request, {} requests per worker, {} payload checks",
+                    "stream: up to {} bytes per request, {} payload checks",
                     settings.request_size,
-                    tuning.pipeline_depth(),
                     if settings.verify {
                         settings.algorithm.to_string()
                     } else {

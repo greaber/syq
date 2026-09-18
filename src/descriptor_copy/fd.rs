@@ -11,6 +11,18 @@ use std::{
     },
 };
 
+// A small kernel pipe forces frequent producer/consumer wakeups and tiny
+// network requests even when both ends are fast. This bounded, best-effort
+// hint changes capacity only, never shared file status flags. Keep a larger
+// caller-selected capacity and keep copying if the per-user quota refuses it.
+#[cfg(target_os = "linux")]
+fn enlarge_pipe(file: &File) {
+    let size = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPIPE_SZ) };
+    if size > 0 && size < 1 << 20 {
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETPIPE_SZ, 1 << 20) };
+    }
+}
+
 /// A caller-owned descriptor, or an explicitly selected local FIFO.
 #[derive(Clone, Debug)]
 pub(crate) enum Source {
@@ -62,6 +74,8 @@ impl Source {
                             && actual.ino() == expected.ino,
                         "source FIFO changed while opening"
                     );
+                    #[cfg(target_os = "linux")]
+                    enlarge_pipe(&file);
                     Ok(Descriptor {
                         file,
                         original: -1,
@@ -104,6 +118,10 @@ impl Descriptor {
         let kind = metadata.file_type();
         if !(kind.is_file() || kind.is_fifo() || kind.is_socket() || kind.is_char_device()) {
             bail!("descriptor {fd} must refer to a file, pipe, socket, or character device");
+        }
+        #[cfg(target_os = "linux")]
+        if kind.is_fifo() {
+            enlarge_pipe(&file);
         }
         let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         let result = Self {
