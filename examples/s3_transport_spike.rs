@@ -12,7 +12,16 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::io::AsyncReadExt;
+// Reuse syq's buffered destination writer, with diagnostics disabled.
+#[allow(dead_code)]
+#[path = "../src/s3/writer.rs"]
+mod writer;
+mod diagnostics {
+    pub fn start() -> Option<std::time::Instant> {
+        None
+    }
+    pub fn elapsed(_: Option<std::time::Instant>, _: &str, _: u64) {}
+}
 
 #[derive(Clone, serde::Deserialize)]
 struct Object {
@@ -72,33 +81,39 @@ async fn async_get(
         .body(SdkBody::empty())?;
     let response = connector.call(request.try_into()?).await?;
     ensure!(response.status().as_u16() == 200, "GET failed");
-    let mut reader = ByteStream::new(response.into_body()).into_async_read();
-    let mut file = if dir == "-" {
+    let mut body = ByteStream::new(response.into_body());
+    let file = if dir == "-" {
         None
     } else {
         tokio::task::spawn_blocking(move || output(&dir, i)).await??
     };
+    let writer = file
+        .map(|f| writer::Writer::with_readback(Arc::new(f), object.size as u64, true))
+        .transpose()?;
     let mut hash = blake3::Hasher::new();
-    let mut buffer = vec![0; CHUNK];
     let mut bytes = 0;
-    while bytes < object.size {
-        let n = CHUNK.min(object.size - bytes);
-        reader.read_exact(&mut buffer[..n]).await?;
-        hash.update(&buffer[..n]);
-        if let Some(mut f) = file.take() {
-            (f, buffer) = tokio::task::spawn_blocking(move || -> Result<_> {
-                f.write_all(&buffer[..n])?;
-                Ok((f, buffer))
-            })
-            .await??;
-            file = Some(f);
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0;
+    while let Some(frame) = body.next().await {
+        let frame = frame?;
+        hash.update(&frame);
+        bytes += frame.len();
+        if let Some(w) = &writer {
+            batch_bytes += frame.len();
+            batch.push(frame);
+            if batch_bytes >= CHUNK {
+                w.write_batch(std::mem::take(&mut batch), (bytes - batch_bytes) as u64)
+                    .await?;
+                batch_bytes = 0;
+            }
         }
-        bytes += n;
     }
-    ensure!(
-        reader.read(&mut buffer[..1]).await? == 0,
-        "extra body bytes"
-    );
+    if let Some(w) = &writer {
+        if !batch.is_empty() {
+            w.write_batch(batch, (bytes - batch_bytes) as u64).await?;
+        }
+        w.finish().await?;
+    }
     finish(hash, &object, bytes)
 }
 fn main() -> Result<()> {
@@ -180,8 +195,11 @@ fn main() -> Result<()> {
                     let c = connector.clone();
                     let dir = a[4].clone();
                     async move {
-                        tokio::time::timeout(Duration::from_secs(60), async_get(c, o, dir, i))
-                            .await?
+                        tokio::spawn(async move {
+                            tokio::time::timeout(Duration::from_secs(60), async_get(c, o, dir, i))
+                                .await?
+                        })
+                        .await?
                     }
                 })
                 .buffer_unordered(concurrency)

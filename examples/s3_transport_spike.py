@@ -39,17 +39,18 @@ try:
         digest=subprocess.check_output([BIN,'digest',source],text=True).strip(); sha=hashlib.sha256(data).hexdigest()
         def put(i): checks.request('PUT',f'{name}/{i}',data)
         with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool: list(pool.map(put,range(count)))
-        manifest=[{'url':presign(f'{name}/{i}'),'size':size,'blake3':digest} for i in range(count)]
-        (D/(name+'.json')).write_text(json.dumps(manifest)); fixtures[name]={'count':count,'size':size,'sha256':sha}
+        manifest=[{'url':presign(f'{name}/{i}'),'size':size,'blake3':digest} for i in range(count)] * 8
+        (D/(name+'.json')).write_text(json.dumps(manifest)); fixtures[name]={'count':count*8,'size':size,'sha256':sha}
         print(f'Prepared {name}: {count} x {size} bytes',flush=True)
-    jobs=[(name,sink,c) for name in fixtures for sink in ('memory','file') for c in (1,16,64)]
+    jobs=[(name,sink,c) for name in fixtures for sink in ('memory','file') for c in (16,64)]
     random.Random(841).shuffle(jobs)
     for rep in range(3):
         for name,sink,c in jobs:
-            modes=['async','sync'] if rep%2==0 else ['sync','async']
-            for mode in modes:
+            variants=[('async',32),('async',4),('sync',32)]
+            variants=variants[rep:]+variants[:rep]
+            for mode,workers in variants:
                 out=D/'output'; out.mkdir()
-                timing=D/'timing.json'; command=['/usr/bin/time','-f','{"user":%U,"system":%S,"rss_kib":%M,"wall":%e,"voluntary":%w,"involuntary":%c}','-o',str(timing),str(BIN),mode,str(D/(name+'.json')),str(c),str(out) if sink=='file' else '-',str(CERT/'public.crt'),'32']
+                timing=D/'timing.json'; command=['/usr/bin/time','-f','{"user":%U,"system":%S,"rss_kib":%M,"wall":%e,"voluntary":%w,"involuntary":%c}','-o',str(timing),str(BIN),mode,str(D/(name+'.json')),str(c),str(out) if sink=='file' else '-',str(CERT/'public.crt'),str(workers)]
                 p=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
                 try: stdout,stderr=p.communicate(timeout=180)
                 except BaseException:
