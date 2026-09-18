@@ -4642,16 +4642,25 @@ fn parallel_map_init<T: Sync, R: Send, S>(
         let mut state = init();
         return items.iter().map(|item| f(&mut state, item)).collect();
     }
-    let chunk = items.len().div_ceil(PAR_THREADS).max(1);
     use rayon::prelude::*;
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     let pool = POOL.get_or_init(|| {
+        let placement = crate::placement::compact();
+        let threads = placement
+            .as_ref()
+            .map_or(PAR_THREADS, |(threads, _)| *threads);
         rayon::ThreadPoolBuilder::new()
-            .num_threads(PAR_THREADS)
+            .start_handler(move |_| {
+                if let Some((_, mask)) = &placement {
+                    mask.apply();
+                }
+            })
+            .num_threads(threads)
             .thread_name(|index| format!("syq-metadata-{index}"))
             .build()
             .expect("metadata worker pool")
     });
+    let chunk = items.len().div_ceil(pool.current_num_threads()).max(1);
     pool.install(|| {
         items
             .par_chunks(chunk)
@@ -11573,9 +11582,9 @@ mod tests {
         assert_eq!(observations.len(), items.len());
         // Catch accidentally selecting a single-thread or host-sized pool.
         // Its size is static within the batch, so inspect it only once.
-        assert_eq!(
-            observations[0].3, PAR_THREADS,
-            "metadata pool must retain its configured parallelism"
+        assert!(
+            matches!(observations[0].3, 16 | PAR_THREADS),
+            "metadata pool must keep bounded parallelism"
         );
         observations
             .into_iter()

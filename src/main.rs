@@ -28,6 +28,7 @@ mod native_map;
 mod native_rm;
 mod output;
 mod persistence;
+mod placement;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod private_broker;
 mod process_group;
