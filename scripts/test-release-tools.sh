@@ -1,7 +1,21 @@
 #!/usr/bin/env bash
 # Exercise complete release assembly and Ed25519 signing with small stand-in
-# binaries.
+# binaries. Optionally reuse a candidate already built by the caller:
+# scripts/test-release-tools.sh --syq /absolute/path/to/syq
 set -euo pipefail
+
+canonicalizer=
+if [ "$#" -ne 0 ]; then
+  if [ "$#" -ne 2 ] || [ "$1" != --syq ]; then
+    echo 'usage: scripts/test-release-tools.sh [--syq PATH]' >&2
+    exit 2
+  fi
+  canonicalizer=$2
+  if [ ! -f "$canonicalizer" ] || [ ! -x "$canonicalizer" ]; then
+    echo "missing executable syq canonicalizer: $canonicalizer" >&2
+    exit 1
+  fi
+fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH='' cd -- "$script_dir/.." && pwd)
@@ -23,10 +37,12 @@ trap cleanup EXIT HUP INT TERM
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_dir/Cargo.toml" | head -1)
 tag="v$version"
-cargo build --locked --manifest-path "$repo_dir/Cargo.toml" --bin syq
-target_dir=$(cargo metadata --no-deps --format-version 1 \
-  --manifest-path "$repo_dir/Cargo.toml" | jq -r .target_directory)
-canonicalizer="$target_dir/debug/syq"
+if [ -z "$canonicalizer" ]; then
+  cargo build --locked --manifest-path "$repo_dir/Cargo.toml" --bin syq
+  target_dir=$(cargo metadata --no-deps --format-version 1 \
+    --manifest-path "$repo_dir/Cargo.toml" | jq -r .target_directory)
+  canonicalizer="$target_dir/debug/syq"
+fi
 
 # Portable SHA-256 of one file: GNU coreutils on Linux, Perl shasum on macOS.
 sha256_file() {
@@ -357,7 +373,8 @@ done
 # reports it as verified. Use an ephemeral test key, never a maintainer secret.
 ssh-keygen -q -t ed25519 -N '' -f "$work/other-tag-key"
 jq -j '.verification.payload' <<<"$tag_json" >"$work/other-tag-payload"
-ssh-keygen -Y sign -f "$work/other-tag-key" -n git "$work/other-tag-payload"
+# This fixture uses its local private key, never an inherited agent.
+SSH_AUTH_SOCK='' ssh-keygen -Y sign -f "$work/other-tag-key" -n git "$work/other-tag-payload"
 other_signer=$(jq --rawfile signature "$work/other-tag-payload.sig" \
   '.verification.signature = $signature' <<<"$tag_json")
 expect_failure 'not signed by the pinned maintainer key' env \
