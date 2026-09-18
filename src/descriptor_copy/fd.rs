@@ -240,6 +240,19 @@ impl Drop for Descriptor {
     }
 }
 
+/// The SDK sends C followed by EOF only after its producer succeeds. A
+/// disconnect, exception, or malformed completion message aborts publication.
+pub(crate) async fn await_commit(control: Option<Descriptor>) -> Result<()> {
+    if let Some(control) = control {
+        let (_, message) = control.read_chunk(2).await?;
+        anyhow::ensure!(
+            &message[..] == b"C",
+            "stream producer did not commit the upload"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

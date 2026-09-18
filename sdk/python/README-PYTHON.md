@@ -150,6 +150,37 @@ destination untouched. See
 For a complete program built on mappings, see
 [Pull and push DVC data](https://greaber.github.io/syq/dvc.html).
 
+## Generated data and binary streams
+
+Use `open_writer` to generate one file or object without a temporary payload
+file. A successful context exit commits the upload; an exception aborts it.
+For example, the standard library can write an archive directly to S3:
+
+```python
+import tarfile
+import syq
+
+with syq.open_writer(to="s3://backups", as_="dataset.tar") as output:
+    with tarfile.open(fileobj=output, mode="w|") as archive:
+        archive.add("dataset", arcname="dataset")
+```
+
+`open_reader` supplies the contents of one local file, SSH file, or S3 object:
+
+```python
+with syq.open_reader("dataset.tar", from_="s3://backups") as source:
+    while chunk := source.read(65536):
+        consume(chunk)
+```
+
+The streams use bounded transport buffers. Reading without a size requests
+all remaining bytes into Python memory. Reader context exit drains unread
+bytes and checks transfer success, so archive readers may stop at their own
+end marker. Call `abort()` to cancel instead. If a consumer publishes files,
+keep them staged until both decoding and the reader context finish successfully.
+See [byte streams](https://greaber.github.io/syq/python-reference.html#byte-streams)
+for lifecycle, timeout, and async behavior.
+
 ## Use asyncio
 
 Await operations on `AsyncClient`. Its arguments and results match `Client`:

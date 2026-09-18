@@ -70,7 +70,7 @@ class NativeApiInventoryTests(unittest.TestCase):
 
         sync = public_methods(syq.Client)
         async_ = public_methods(syq.AsyncClient)
-        self.assertEqual(set(sync), {"cp", "rm", "map", "run", "version"})
+        self.assertEqual(set(sync), {"cp", "rm", "map", "run", "version", "open_reader", "open_writer"})
         self.assertEqual(set(async_), set(sync))
         for name in sync:
             with self.subTest(method=name):

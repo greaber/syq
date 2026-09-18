@@ -288,6 +288,27 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
             configured['SYQ_CP_OPTIONS'] = '--as other'
             result = run(put, input=b'', env=configured)
             assert result.returncode == 2
+        elif CASE == 'managed-commit':
+            for data in (b'', b'small', DATA):
+                for commit in (b'', b'X', b'C'):
+                    STATE.pop('published', None)
+                    STATE['completed'] = False
+                    read_fd, write_fd = os.pipe()
+                    os.write(write_fd, commit)
+                    os.close(write_fd)
+                    try:
+                        result = run(put + ['--stream-commit-fd', str(read_fd)],
+                                     input=data, pass_fds=(read_fd,), env=env)
+                    finally:
+                        os.close(read_fd)
+                    if commit == b'C':
+                        success(result)
+                        assert STATE.get('published') == data
+                    else:
+                        failure(result)
+                        assert 'published' not in STATE
+                        assert not STATE['completed']
+            assert STATE['aborts'] >= 2
         elif CASE == 'pipe-sources':
             for selector in ('--src', '--src-non-dir'):
                 fifo = Path(temp) / ('fifo' + selector)

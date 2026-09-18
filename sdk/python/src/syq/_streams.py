@@ -1,0 +1,368 @@
+"""Managed payload streams. Payload bytes never enter the results decoder."""
+from __future__ import annotations
+
+import asyncio
+import os
+import math
+import signal
+import subprocess
+import threading
+from collections.abc import Mapping, Callable, Awaitable
+
+from ._paths import PathArgument
+
+Argument = str | bytes
+from .errors import SyqInvocationError, SyqProcessError
+
+
+def arguments(*, executable: str, writing: bool, path: PathArgument,
+              endpoint: str | None, options: Mapping[str, object]) -> list[Argument]:
+    from .client import _append_path_option, _argument, _text_arg
+    argv: list[Argument] = [executable, "cp"]
+    if writing:
+        argv += ["--src-fd", "0"]
+        if endpoint is not None:
+            argv += ["--to", _text_arg(endpoint, label="to")]
+        _append_path_option(argv, "--as", _argument(path, label="as_"))
+    else:
+        if endpoint is not None:
+            argv += ["--from", _text_arg(endpoint, label="from_")]
+        _append_path_option(argv, "--src", _argument(path, label="src"))
+        argv += ["--as-fd", "1"]
+    for name, value in options.items():
+        if value is None or value is False:
+            continue
+        option = "--" + name.replace("_", "-")
+        if name == "s3_header":
+            for header in ([value] if isinstance(value, str) else value):
+                _append_path_option(argv, option, _text_arg(header, label=name))
+            continue
+        if name in {"no_bootstrap", "no_compress", "follow_src", "follow_dst"}:
+            if not isinstance(value, bool):
+                raise SyqInvocationError(f"{name} must be a boolean")
+            argv.append(option)
+        else:
+            _append_path_option(argv, option, _argument(value, label=name))
+    return argv
+
+
+def _signal_group(process: subprocess.Popen[bytes], sig: int) -> None:
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # Darwin may report EPERM for a group containing only zombies.
+        if process.poll() is None:
+            raise
+        process.wait()
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+
+
+class _Process:
+    def __init__(self, argv: list[Argument], *, writing: bool,
+                 cwd: PathArgument | None, env: Mapping[str, str] | None,
+                 timeout: float | None) -> None:
+        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                                    or not math.isfinite(timeout) or timeout < 0):
+            raise SyqInvocationError("timeout must be a finite non-negative number or None")
+        self.timeout = timeout
+        self.expired = False
+        self.done = threading.Event()
+        self.control = None
+        self.stderr = bytearray()
+        self._release_lock = threading.Lock()
+        self._abort_lock = threading.Lock()
+        self._released = False
+        read_fd = write_fd = None
+        try:
+            if writing:
+                from .client import _results_pipe
+                read_fd, write_fd = _results_pipe()
+                argv = [*argv, "--stream-commit-fd", str(read_fd)]
+            self.argv = tuple(argv)
+            self.process = subprocess.Popen(
+                argv, cwd=cwd, env=env, start_new_session=True,
+                stdin=subprocess.PIPE if writing else subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL if writing else subprocess.PIPE,
+                stderr=subprocess.PIPE, pass_fds=() if read_fd is None else (read_fd,),
+                bufsize=0,
+            )
+            if write_fd is not None:
+                self.control = os.fdopen(write_fd, "wb", buffering=0)
+                write_fd = None
+        finally:
+            for fd in (read_fd, write_fd):
+                if fd is not None:
+                    os.close(fd)
+        self.payload = self.process.stdin if writing else self.process.stdout
+        assert self.payload is not None and self.process.stderr is not None
+        self.drain = threading.Thread(target=self._drain, daemon=True, name="syq-stream-stderr")
+        self.drain.start()
+        self.watchdog = None
+        if timeout is not None:
+            self.watchdog = threading.Thread(target=self._deadline, daemon=True, name="syq-stream-timeout")
+            self.watchdog.start()
+
+    def _drain(self) -> None:
+        while chunk := self.process.stderr.read(8192):
+            self.stderr.extend(chunk)
+            del self.stderr[:-8192]
+
+    def _deadline(self) -> None:
+        if not self.done.wait(self.timeout):
+            self.expired = True
+            _signal_group(self.process, signal.SIGTERM)
+            if not self.done.wait(6):
+                _signal_group(self.process, signal.SIGKILL)
+
+    def _release(self) -> None:
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+            self.done.set()
+            if self.watchdog is not None:
+                self.watchdog.join()
+            self.drain.join()
+            self.process.stderr.close()
+            control, self.control = self.control, None
+            if control is not None:
+                control.close()
+            self.payload.close()
+
+    def finish(self) -> None:
+        self.process.wait()
+        self._release()
+        if self.expired:
+            raise subprocess.TimeoutExpired(self.argv, self.timeout, stderr=bytes(self.stderr))
+        if self.process.returncode:
+            from .client import Result
+            raise SyqProcessError(Result(self.argv, self.process.returncode, b"", bytes(self.stderr)))
+
+    def abort(self) -> None:
+        with self._abort_lock:
+            if self.done.is_set():
+                return
+            # EOF on this channel cannot authorize publication.
+            control, self.control = self.control, None
+            if control is not None:
+                control.close()
+            _signal_group(self.process, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                _signal_group(self.process, signal.SIGKILL)
+                self.process.wait()
+                self._release()
+
+
+class StreamWriter:
+    """Sequential binary writer. close() commits; abort() discards the upload."""
+    def __init__(self, process: _Process) -> None:
+        self._process = process
+        self.closed = False
+
+    def __del__(self) -> None:
+        try:
+            self.abort()
+        except Exception:
+            pass
+
+    def __enter__(self) -> StreamWriter:
+        self._check_open()
+        return self
+
+    def __exit__(self, typ, value, traceback) -> None:
+        if typ is None:
+            self.close()
+        else:
+            self.abort()
+
+    def _check_open(self) -> None:
+        if self.closed:
+            raise ValueError("I/O operation on closed stream")
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        self._check_open()
+        remaining = memoryview(data).cast("B")
+        total = len(remaining)
+        try:
+            while remaining:
+                written = self._process.payload.write(remaining)
+                if not written:
+                    raise BrokenPipeError("stream writer made no progress")
+                remaining = remaining[written:]
+        except OSError:
+            self.closed = True
+            self._process.abort()
+            if self._process.expired:
+                raise subprocess.TimeoutExpired(self._process.argv, self._process.timeout,
+                                                stderr=bytes(self._process.stderr)) from None
+            from .client import Result
+            raise SyqProcessError(Result(self._process.argv, self._process.process.returncode,
+                                         b"", bytes(self._process.stderr))) from None
+        return total
+
+    def flush(self) -> None:
+        self._check_open()  # Writes go directly to the transport's bounded pipe.
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self._process.payload.close()
+            if not self._process.expired:
+                assert self._process.control is not None
+                self._process.control.write(b"C")
+            self._process.control.close()
+            self._process.control = None
+            self._process.finish()
+        except OSError:
+            self._process.abort()
+            if self._process.expired:
+                raise subprocess.TimeoutExpired(self._process.argv, self._process.timeout,
+                                                stderr=bytes(self._process.stderr)) from None
+            from .client import Result
+            raise SyqProcessError(Result(self._process.argv, self._process.process.returncode,
+                                         b"", bytes(self._process.stderr))) from None
+        except BaseException:
+            if not self._process.done.is_set():
+                self._process.abort()
+            raise
+
+    def abort(self) -> None:
+        self.closed = True
+        if not self._process.done.is_set():
+            self._process.abort()
+
+
+class StreamReader:
+    """Sequential binary reader. close() drains and checks; abort() cancels."""
+    def __init__(self, process: _Process) -> None:
+        self._process = process
+        self.closed = False
+        self._ended = False
+
+    def __del__(self) -> None:
+        try:
+            self.abort()
+        except Exception:
+            pass
+
+    def __enter__(self) -> StreamReader:
+        if self.closed:
+            raise ValueError("I/O operation on closed stream")
+        return self
+
+    def __exit__(self, typ, value, traceback) -> None:
+        if typ is None:
+            self.close()
+        else:
+            self.abort()
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def read(self, size: int = -1) -> bytes:
+        if self.closed:
+            raise ValueError("I/O operation on closed stream")
+        if self._ended:
+            return b""
+        data = self._process.payload.read(size)
+        if not data and size != 0:
+            self._ended = True
+            self._process.finish()
+        return data
+
+    def readinto(self, buffer) -> int:
+        data = self.read(len(buffer))
+        buffer[:len(data)] = data
+        return len(data)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            while self.read(65536):
+                pass
+            self.closed = True
+        except BaseException:
+            if not self._process.done.is_set():
+                self._process.abort()
+            self.closed = True
+            raise
+
+    def abort(self) -> None:
+        self.closed = True
+        if not self._process.done.is_set():
+            self._process.abort()
+
+
+async def _call(stream, method, *args):
+    try:
+        return await asyncio.to_thread(method, *args)
+    except BaseException:
+        # Cancellation must retire the process, releasing any blocking worker.
+        await asyncio.shield(asyncio.to_thread(stream.abort))
+        raise
+
+
+class _AsyncStream:
+    def __init__(self, factory: Callable[[], Awaitable[StreamReader | StreamWriter]]) -> None:
+        self._factory = factory
+        self._stream = None
+        self._entered = False
+
+    async def __aenter__(self):
+        if self._entered:
+            raise ValueError("stream context cannot be reused")
+        self._entered = True
+        self._stream = await self._factory()
+        return self
+
+    def _active(self):
+        if self._stream is None:
+            raise ValueError("use the stream inside async with")
+        return self._stream
+
+    async def __aexit__(self, typ, value, traceback) -> None:
+        if typ is None:
+            await self.close()
+        else:
+            await self.abort()
+
+    async def close(self) -> None:
+        stream = self._active()
+        await _call(stream, stream.close)
+
+    async def abort(self) -> None:
+        if self._stream is not None:
+            await asyncio.to_thread(self._stream.abort)
+
+
+class AsyncStreamWriter(_AsyncStream):
+    async def write(self, data: bytes | bytearray | memoryview) -> int:
+        stream = self._active()
+        return await _call(stream, stream.write, data)
+
+
+class AsyncStreamReader(_AsyncStream):
+    async def read(self, size: int = -1) -> bytes:
+        stream = self._active()
+        return await _call(stream, stream.read, size)

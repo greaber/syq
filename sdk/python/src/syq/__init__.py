@@ -2,6 +2,7 @@
 
 from importlib.metadata import version as distribution_version
 
+from ._streams import StreamReader, StreamWriter, AsyncStreamReader, AsyncStreamWriter
 from ._defaults import CLIENT_DEFAULT, Timeout
 from ._mapping import Mapping, AsyncMapping
 from .async_client import AsyncClient, AsyncMapStream
@@ -61,8 +62,12 @@ _default_client = Client()
 cp = _default_client.cp
 rm = _default_client.rm
 map = _default_client.map
+open_reader = _default_client.open_reader
+open_writer = _default_client.open_writer
 
 __all__ = [
+    "StreamReader", "StreamWriter", "AsyncStreamReader", "AsyncStreamWriter",
+    "open_reader", "open_writer",
     "CLIENT_DEFAULT",
     "Timeout",
     "PINNED_SYQ_VERSION",
