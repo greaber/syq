@@ -2178,7 +2178,11 @@ fn operator_directory_flags() -> libc::c_int {
     {
         libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        libc::O_SEARCH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
     }
@@ -2190,17 +2194,15 @@ fn open_operator_start(absolute: bool) -> Result<File> {
     open_operator_directory_fd(libc::AT_FDCWD, &name)
 }
 
-fn open_operator_directory_at(parent: &File, component: &[u8]) -> Result<File> {
+pub(crate) fn open_operator_directory_at(parent: &File, component: &[u8]) -> Result<File> {
     let component = operator_component_cstring(component)?;
     open_operator_directory_fd(parent.as_raw_fd(), &component)
 }
 
 fn open_operator_directory_fd(parent: RawFd, component: &CString) -> Result<File> {
-    let directory = open_at(parent, component, operator_directory_flags(), 0)?;
-    if !directory.metadata()?.is_dir() {
-        bail!("operator path component is not a directory");
-    }
-    Ok(directory)
+    // O_DIRECTORY is the kernel-enforced type check. Repeating it with
+    // fstat costs another metadata operation on network filesystems.
+    Ok(open_at(parent, component, operator_directory_flags(), 0)?)
 }
 
 fn open_operator_metadata_at(parent: RawFd, name: &CString) -> io::Result<File> {
