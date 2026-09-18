@@ -20,7 +20,11 @@ import urllib.request
 ROOT = Path.cwd()
 assert subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip() == str(ROOT)
 PLAIN_HTTP = os.environ.get('SYQ_STRESS_HTTP') == '1'
+QUEUE_SWEEP = os.environ.get('SYQ_STRESS_QUEUES')
+QUEUES = [int(q) for q in QUEUE_SWEEP.split(',')] if QUEUE_SWEEP else []
 D = ROOT / ('target/transport-stress-http-v2' if PLAIN_HTTP else 'target/transport-stress-v2')
+if QUEUE_SWEEP:
+    D = ROOT / 'target/transport-queue-sweep-v1'
 D.mkdir(exist_ok=True)
 STAGE = D / 'stage'
 STAGE.mkdir(exist_ok=True)
@@ -29,7 +33,10 @@ CERT.mkdir(exist_ok=True)
 IMAGE = 'ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b'
 MINIO = 'minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e'
 BIN = ROOT / 'target/release/examples/s3_transport_spike'
+if QUEUE_SWEEP:
+    BIN = ROOT / 'target/transport-queue-build/client'
 shutil.copy2(BIN, STAGE / 'client')
+BINARY_SHA256 = hashlib.sha256(BIN.read_bytes()).hexdigest()
 subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
                 '-keyout', str(CERT / 'private.key'), '-out', str(CERT / 'public.crt'),
                 '-days', '1', '-subj', '/CN=localhost', '-addext', 'basicConstraints=critical,CA:FALSE',
@@ -81,16 +88,18 @@ def remove_container(cid):
 def run(case, mode, repeats, label):
     global active
     for row in results:
-        if row['case'] == case and row['mode'] == mode and row['label'] == label:
+        if row['case'] == case and row['mode'] == mode and row['label'] == label and row['repeats'] == repeats and (not QUEUE_SWEEP or row.get('binary_sha256') == BINARY_SHA256):
             print(f"Reusing recorded {case['name']}-{mode}-{label} at {row['commit'][:8]}", flush=True)
             return row
     tag = f"{case['name']}-{mode}-{label}"
     out = D / (tag + '-output')
     out.mkdir()
+    memory = case.get('memory', '1g')
     args = ['docker', 'create', '--network', 'host', '--cpuset-cpus', case['cpus'],
-            '--memory', '1g', '--memory-swap', '1g', '--pids-limit', '512',
+            '--memory', memory, '--memory-swap', memory, '--pids-limit', '512',
             '-v', str(STAGE) + ':/bench:ro', '-v', str(out) + ':/output:rw',
-            IMAGE, '/bench/client', mode, '/bench/' + case['fixture'] + '.json',
+            *(['-e', 'SYQ_SPIKE_QUEUE=' + mode.removeprefix('queue-')] if QUEUE_SWEEP else []),
+            IMAGE, '/bench/client', 'async' if QUEUE_SWEEP else mode, '/bench/' + case['fixture'] + '.json',
             str(case['concurrency']), '/output', '/bench/cert/public.crt', 'auto', str(repeats)]
     active = command(args)
     process = subprocess.Popen(['docker', 'start', '-a', active], stdout=subprocess.PIPE,
@@ -111,7 +120,7 @@ def run(case, mode, repeats, label):
         (D / (tag + '.stderr')).write_text(stderr)
         if state['OOMKilled']:
             row = {'case': case, 'mode': mode, 'label': label, 'repeats': repeats,
-                   'commit': COMMIT, 'status': 'oom', 'elapsed': time.monotonic()-started,
+                   'commit': COMMIT, 'binary_sha256': BINARY_SHA256, 'status': 'oom', 'elapsed': time.monotonic()-started,
                    'bytes': fixtures[case['fixture']]['count'] * fixtures[case['fixture']]['size'] * repeats}
             results.append(row)
             (D / 'results.json').write_text(json.dumps(results, indent=2))
@@ -119,7 +128,7 @@ def run(case, mode, repeats, label):
             return row
         assert process.returncode == 0 and state['ExitCode'] == 0, (tag, state, stderr)
         row = json.loads(stdout)
-        row.update(case=case, label=label, repeats=repeats, commit=COMMIT)
+        row.update(case=case, mode=mode, label=label, repeats=repeats, commit=COMMIT, binary_sha256=BINARY_SHA256)
         (D / (tag + '.json')).write_text(json.dumps(row, indent=2))
         print(f"{tag}: {row['bytes']/2**30:.1f} GiB in {row['elapsed']:.2f}s, "
               f"CPU {row['user']+row['system']:.2f}s, RSS {row['rss_kib']/1024:.1f} MiB", flush=True)
@@ -200,7 +209,23 @@ try:
         cases = [{'name': 'one-core-http', 'fixture': 'large', 'cpus': '0', 'concurrency': 64}]
     if not PLAIN_HTTP:
         cases = [cases[2], cases[0], cases[1], cases[3]]
+    if QUEUE_SWEEP:
+        cases.append({'name': 'writeback-roomy', 'fixture': 'large', 'cpus': '0-7',
+                      'concurrency': 64, 'memory': '4g'})
+        requested = os.environ.get('SYQ_STRESS_CASES', 'writeback-pressure').split(',')
+        cases = [case for case in cases if case['name'] in requested]
+        assert len(cases) == len(requested), requested
     for case in cases:
+        if QUEUE_SWEEP:
+            # Same sustained workloads as the previous experiment; never pilot-sized.
+            repeats = {'writeback-pressure': 53, 'writeback-roomy': 64,
+                       'single-stream': 32, 'two-core-fanout': 46,
+                       'small-file-fanout': 400}[case['name']]
+            for rep in range(2):
+                for queue in (QUEUES if rep == 0 else list(reversed(QUEUES))):
+                    row = run(case, f'queue-{queue}', repeats, f'measured-{rep}')
+                    assert row.get('status') == 'oom' or row['elapsed'] >= 30, 'measured trial too short'
+            continue
         unit = fixtures[case['fixture']]['count'] * fixtures[case['fixture']]['size']
         pilot_bytes = 8 * 1024**3 if case['fixture'] == 'large' else 512 * 1024**2
         pilot_repeats = max(1, pilot_bytes // unit)
