@@ -26,8 +26,7 @@ struct Object {
     blake3: String,
 }
 const CHUNK: usize = 128 * 1024;
-// Only sequential implementations use this setting; queued production batching
-// stays unchanged as a reference.
+// Reusable-buffer implementations use this setting; queued batching has its own cap.
 fn sequential_chunk() -> usize {
     static SIZE: OnceLock<usize> = OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -37,6 +36,24 @@ fn sequential_chunk() -> usize {
         assert!((4096..=8 * 1024 * 1024).contains(&size));
         size
     })
+}
+// Vary only the buffered writer's batch cap; the production reference is 128 KiB.
+fn queued_chunk() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let n = std::env::var("SYQ_SPIKE_BATCH_BYTES")
+            .map(|s| s.parse::<usize>().expect("invalid batch size"))
+            .unwrap_or(CHUNK);
+        assert!((4096..=8 * 1024 * 1024).contains(&n));
+        n
+    })
+}
+fn direct_chunk() -> usize {
+    let size = std::env::var("SYQ_SPIKE_DIRECT_CHUNK")
+        .map(|s| s.parse::<usize>().expect("invalid direct chunk size"))
+        .unwrap_or(1024 * 1024);
+    assert!((4096..=8 * 1024 * 1024).contains(&size));
+    size
 }
 fn output(dir: &str, i: usize) -> Result<Option<File>> {
     Ok(if dir == "-" {
@@ -201,6 +218,58 @@ async fn async_sequential_get(
     drop(request_probe);
     finish(hash, &object, bytes)
 }
+// Follow production's aligned, single-buffer direct-write sequence. The build
+// helper can lower only its eligibility threshold for this isolated experiment.
+async fn async_direct_get(
+    connector: Arc<aws_smithy_http_client::Connector>,
+    object: Object,
+    dir: String,
+    i: usize,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let request_probe = RequestProbe::start();
+    let request = http::Request::builder()
+        .uri(&object.url)
+        .body(SdkBody::empty())?;
+    let response = connector.call(request.try_into()?).await?;
+    ensure!(response.status().as_u16() == 200, "GET failed");
+    let mut reader = ByteStream::new(response.into_body()).into_async_read();
+    let size = object.size as u64;
+    let writer = tokio::task::spawn_blocking(move || {
+        writer::Writer::with_readback(
+            Arc::new(output(&dir, i)?.expect("direct needs output")),
+            size,
+            false,
+        )
+    })
+    .await??;
+    ensure!(
+        writer.direct(),
+        "direct I/O unavailable; refusing mislabeled benchmark"
+    );
+    let chunk = direct_chunk();
+    ensure!(chunk.is_multiple_of(4096), "unaligned direct chunk");
+    let mut buffer = writer::Aligned::new(chunk)?;
+    let mut hash = blake3::Hasher::new();
+    let mut bytes = 0;
+    while bytes < object.size {
+        let n = buffer.bytes().len().min(object.size - bytes);
+        let started = diagnostics::start();
+        reader.read_exact(&mut buffer.bytes_mut()[..n]).await?;
+        diagnostics::elapsed(started, "read", n as u64);
+        let started = diagnostics::start();
+        hash.update(&buffer.bytes()[..n]);
+        diagnostics::elapsed(started, "hash", n as u64);
+        let padded = n.next_multiple_of(4096);
+        buffer.bytes_mut()[n..padded].fill(0);
+        buffer = writer.write_direct(buffer, bytes as u64, padded).await?;
+        bytes += n;
+    }
+    ensure!(reader.read(&mut [0]).await? == 0, "extra body bytes");
+    writer.finish().await?;
+    drop(request_probe);
+    finish(hash, &object, bytes)
+}
 async fn async_get(
     connector: Arc<aws_smithy_http_client::Connector>,
     object: Object,
@@ -208,6 +277,7 @@ async fn async_get(
     i: usize,
     destination: Option<(writer::Writer, u64)>,
 ) -> Result<()> {
+    let batch_limit = queued_chunk();
     let request_probe = RequestProbe::start();
     let request = http::Request::builder()
         .uri(&object.url)
@@ -244,15 +314,15 @@ async fn async_get(
         hash.update(&frame);
         diagnostics::elapsed(started, "hash", frame.len() as u64);
         if let Some(w) = &writer {
-            // Match download_fast_range's 128 KiB cap and fragment packing.
+            // Keep production fragment packing; vary only the batch cap.
             while !frame.is_empty() {
-                if batch_bytes == 0 && frame.len() >= CHUNK {
-                    w.write(frame.split_to(CHUNK), base_offset + bytes as u64)
+                if batch_bytes == 0 && frame.len() >= batch_limit {
+                    w.write(frame.split_to(batch_limit), base_offset + bytes as u64)
                         .await?;
-                    bytes += CHUNK;
+                    bytes += batch_limit;
                     continue;
                 }
-                let n = frame.len().min(CHUNK - batch_bytes);
+                let n = frame.len().min(batch_limit - batch_bytes);
                 let chunk = frame.split_to(n);
                 if n < 4096 {
                     fragments.extend_from_slice(&chunk);
@@ -262,7 +332,9 @@ async fn async_get(
                 }
                 batch_bytes += n;
                 bytes += n;
-                if batch_bytes == CHUNK || batch.len() + usize::from(!fragments.is_empty()) >= 16 {
+                if batch_bytes == batch_limit
+                    || batch.len() + usize::from(!fragments.is_empty()) >= 16
+                {
                     flush_fragments(&mut batch, &mut fragments);
                     w.write_batch(
                         std::mem::take(&mut batch),
@@ -362,7 +434,11 @@ fn main() -> Result<()> {
         .unwrap_or(0);
     ensure!(serial_tail < groups, "tail consumes every group");
     ensure!(
-        serial_tail == 0 || a[1] == "async" || a[1] == "async-sequential" || a[1] == "async-double",
+        serial_tail == 0
+            || a[1] == "async"
+            || a[1] == "async-sequential"
+            || a[1] == "async-double"
+            || a[1] == "async-direct",
         "tail probe requires async"
     );
     let mut phase_elapsed = Vec::new();
@@ -414,9 +490,13 @@ fn main() -> Result<()> {
         })?;
     } else {
         ensure!(
-            a[1] == "async" || a[1] == "async-sequential" || a[1] == "async-double",
+            a[1] == "async"
+                || a[1] == "async-sequential"
+                || a[1] == "async-double"
+                || a[1] == "async-direct",
             "unknown mode"
         );
+        let direct = a[1] == "async-direct";
         let sequential = a[1] != "async";
         let buffers = if a[1] == "async-double" { 2 } else { 1 };
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -456,7 +536,9 @@ fn main() -> Result<()> {
                         async move {
                             tokio::spawn(async move {
                                 tokio::time::timeout(Duration::from_secs(60), async move {
-                                    if sequential {
+                                    if direct {
+                                        async_direct_get(c, o, dir, i).await
+                                    } else if sequential {
                                         async_sequential_get(c, o, dir, i, buffers).await
                                     } else {
                                         async_group(c, o, dir, i, readers).await
@@ -484,7 +566,7 @@ fn main() -> Result<()> {
     let cpu = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     println!(
         "{}",
-        serde_json::json!({"stages":stages,"mode":a[1],"chunk_bytes":if a[1] == "async" {CHUNK} else {sequential_chunk()},"objects":groups,"requests":jobs,"readers_per_writer":readers,"serial_tail":serial_tail,"phase_elapsed":phase_elapsed,"bytes":total,"concurrency":concurrency,"workers":workers,"elapsed":start.elapsed().as_secs_f64(),"user":cpu(usage.ru_utime),"system":cpu(usage.ru_stime),"rss_kib":usage.ru_maxrss,"voluntary":usage.ru_nvcsw,"involuntary":usage.ru_nivcsw,"io_before":io_before,"io_after":std::fs::read_to_string("/sys/fs/cgroup/io.stat").unwrap_or_default(),"memory_stat":std::fs::read_to_string("/sys/fs/cgroup/memory.stat").unwrap_or_default(),"memory_events":std::fs::read_to_string("/sys/fs/cgroup/memory.events").unwrap_or_default()})
+        serde_json::json!({"stages":stages,"mode":a[1],"chunk_bytes":if a[1] == "async" {queued_chunk()} else if a[1] == "async-direct" {direct_chunk()} else {sequential_chunk()},"objects":groups,"requests":jobs,"readers_per_writer":readers,"serial_tail":serial_tail,"phase_elapsed":phase_elapsed,"bytes":total,"concurrency":concurrency,"workers":workers,"elapsed":start.elapsed().as_secs_f64(),"user":cpu(usage.ru_utime),"system":cpu(usage.ru_stime),"rss_kib":usage.ru_maxrss,"voluntary":usage.ru_nvcsw,"involuntary":usage.ru_nivcsw,"io_before":io_before,"io_after":std::fs::read_to_string("/sys/fs/cgroup/io.stat").unwrap_or_default(),"memory_stat":std::fs::read_to_string("/sys/fs/cgroup/memory.stat").unwrap_or_default(),"memory_events":std::fs::read_to_string("/sys/fs/cgroup/memory.events").unwrap_or_default()})
     );
     Ok(())
 }

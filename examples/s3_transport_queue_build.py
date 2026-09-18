@@ -20,6 +20,10 @@ replacement = '''static CAPACITY: OnceLock<usize> = OnceLock::new();
             let (send, mut recv) = mpsc::channel::<Message>(capacity);'''
 assert original.count(needle) == 1
 modified = original.replace(needle, replacement)
+# Only the explicit diagnostic environment can alter direct-I/O eligibility.
+needle = 'if size >= 256 * 1024 * 1024 {'
+assert modified.count(needle) == 1
+modified = modified.replace(needle, 'if size >= std::env::var("SYQ_SPIKE_DIRECT_MIN").ok().map(|s| s.parse::<u64>().unwrap()).unwrap_or(256 * 1024 * 1024) {')
 # Probe the otherwise unchanged production writer only in the disposable build.
 for needle, replacement in [
     ('let result = tokio::task::spawn_blocking(move || {',
@@ -47,7 +51,7 @@ try:
         'original_writer_sha256': digest(original.encode()),
         'experimental_writer_sha256': digest(modified.encode()),
         'binary_sha256': digest((destination / 'client').read_bytes()),
-        'change': 'Writer queue capacity from SYQ_SPIKE_QUEUE; opt-in dispatch and queue-send probes',
+        'change': 'Writer queue capacity from SYQ_SPIKE_QUEUE; opt-in dispatch and queue-send probes; diagnostic direct-I/O size threshold',
         'source_sha256': {str(p.relative_to(root)): digest(p.read_bytes()) for p in [root / 'examples/s3_transport_spike.rs', root / 'examples/support/s3_stage_metrics.rs', Path(__file__).resolve()]},
         'profile_environment': {k: v for k, v in os.environ.items() if k.startswith('CARGO_PROFILE_')},
     }, indent=2))

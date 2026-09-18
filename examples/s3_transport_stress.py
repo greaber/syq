@@ -9,12 +9,14 @@ import json
 import math
 import os
 from pathlib import Path
+import re
+import select
 import shutil
 import signal
-import select
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 import urllib.parse
@@ -252,8 +254,18 @@ def run(case, mode, repeats, label):
             print(f"Reusing recorded {case['name']}-{mode}-{label} at {row['commit'][:8]}", flush=True)
             return row
     tag = f"{case['name']}-{mode}-{label}"
-    out = D / (tag + '-output')
-    out.mkdir()
+    if case.get('destination') == 'tmpfs':
+        out = Path(tempfile.mkdtemp(prefix='syq-s3-spike-', dir='/dev/shm'))
+        inventory = D / 'temporary_outputs.json'
+        paths = json.loads(inventory.read_text()) if inventory.exists() else []
+        paths.append(str(out))
+        inventory.write_text(json.dumps(paths))
+    else:
+        out = D / (tag + '-output')
+        out.mkdir()
+    queue = re.fullmatch(r'queue-(\d+)(?:-batch-(\d+))?', mode)
+    assert not mode.startswith('queue-') or queue, 'invalid queue mode'
+    batch = int(queue[2]) if queue and queue[2] else 128 * 1024
     memory = case.get('memory', '1g')
     args = ['docker', 'create', '--network', 'container:' + receiver if RECEIVER_NETEM else 'host',
             *(['--add-host', 's3-spike.test:' + server_ip] if NETEM_MS and not RECEIVER_NETEM else []),
@@ -264,10 +276,14 @@ def run(case, mode, repeats, label):
             '-e', 'SYQ_SPIKE_STAGES=' + str(int(STAGES)),
             '-e', 'SYQ_SPIKE_READERS_PER_WRITER=' + str(case.get('readers', 1)),
             '-e', 'SYQ_SPIKE_SERIAL_TAIL=' + str(case.get('serial_tail', 0)),
+            '-e', 'SYQ_SPIKE_BATCH_BYTES=' + str(batch),
+            '-e', 'SYQ_SPIKE_DIRECT_MIN=' + str(case['direct_min']),
+            '-e', 'SYQ_SPIKE_HTTP_READ_MAX=' + str(case.get('http_read_max', 0)),
+            '-e', 'SYQ_SPIKE_DIRECT_CHUNK=' + str(case.get('chunk_bytes', 1024 * 1024)),
             '-e', 'SYQ_SPIKE_CHUNK=' + str(case.get('chunk_bytes', 128 * 1024)),
             *(['--cpus', str(case['cpu_quota'])] if 'cpu_quota' in case else []),
             *(['--device-write-bps', case['write_bps']] if 'write_bps' in case else []),
-            *(['-e', 'SYQ_SPIKE_QUEUE=' + mode.removeprefix('queue-')] if mode.startswith('queue-') else []),
+            *(['-e', 'SYQ_SPIKE_QUEUE=' + queue[1]] if mode.startswith('queue-') else []),
             IMAGE, '/bench/client', 'async' if mode.startswith('queue-') else mode, '/bench/' + case['fixture'] + '.json',
             str(case['concurrency']), '/output', '/bench/cert/public.crt', 'auto', str(repeats)]
     if HEAP_PROBE:
@@ -425,7 +441,10 @@ try:
     spec.loader.exec_module(checks)
     checks.request('PUT')
     fixtures = {}
-    for name, count, size in [('large', 8, 128 * 1024 * 1024), ('small', 1024, 64 * 1024)]:
+    large_count = int(os.environ.get('SYQ_STRESS_LARGE_COUNT', 8))
+    large_size = int(os.environ.get('SYQ_STRESS_LARGE_BYTES', 128 * 1024 * 1024))
+    assert large_count > 0 and large_size > 0
+    for name, count, size in [('large', large_count, large_size), ('small', 1024, 64 * 1024)]:
         source = STAGE / (name + '.source')
         data = source.read_bytes() if source.exists() else os.urandom(size)
         assert len(data) == size
@@ -499,8 +518,14 @@ try:
     if os.environ.get('SYQ_STRESS_CHUNKS'):
         cases = [dict(case, chunk_bytes=int(value)) for case in cases
                  for value in os.environ['SYQ_STRESS_CHUNKS'].split(',')]
+    if os.environ.get('SYQ_STRESS_HTTP_READ_MAXES'):
+        cases = [dict(case, http_read_max=int(value), http_trial=index) for case in cases
+                 for index, value in enumerate(os.environ['SYQ_STRESS_HTTP_READ_MAXES'].split(','))]
     for case in cases:
-        case.update(stage_metrics=STAGES, perf=PERF, kernel_capture=KERNEL, client_uid=os.getuid())
+        case.update(stage_metrics=STAGES, perf=PERF, kernel_capture=KERNEL, client_uid=os.getuid(),
+                    destination=os.environ.get('SYQ_STRESS_DESTINATION', 'disk'),
+                    direct_min=int(os.environ.get('SYQ_STRESS_DIRECT_MIN', 256 * 1024 * 1024)))
+        assert case['destination'] in ('disk', 'tmpfs')
         if os.environ.get('SYQ_STRESS_CPUS'):
             case['cpus'] = os.environ['SYQ_STRESS_CPUS']
         if os.environ.get('SYQ_STRESS_MEMORY_LIMIT'):
@@ -527,6 +552,8 @@ try:
                 label += '-rcv' + str(case['receive_buffer'])
             if os.environ.get('SYQ_STRESS_RCVBUDGETS'):
                 label += '-budget' + str(case['receive_budget'])
+            if 'http_read_max' in case:
+                label += '-http' + str(case['http_read_max']) + '-trial' + str(case['http_trial'])
             if 'chunk_bytes' in case:
                 label += '-chunk' + str(case['chunk_bytes'])
             minimum = float(os.environ.get('SYQ_STRESS_MIN_SECONDS', 30))

@@ -5,10 +5,11 @@ use std::{
     sync::{Mutex, OnceLock},
     time::Instant,
 };
-const NAMES: [&str; 7] = [
+const NAMES: [&str; 8] = [
     "read",
     "hash",
     "buffered_write",
+    "direct_write",
     "dispatch",
     "write_completion",
     "queue_send",
@@ -23,7 +24,7 @@ struct Histogram {
     // Bucket 0: <1us; bucket n>0: [2^(n-1), 2^n) us. Last bucket saturates.
     log2_microseconds: [u64; 32],
 }
-type Stats = [Histogram; 7];
+type Stats = [Histogram; NAMES.len()];
 static TOTAL: OnceLock<Mutex<Stats>> = OnceLock::new();
 #[derive(Default)]
 struct Local(Stats);
