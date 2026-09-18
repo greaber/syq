@@ -215,8 +215,12 @@ def validate_ledger(manifest: dict, inventory: dict[str, tuple[str, str | None]]
 
 def validate_regressions(regressions: dict, manifest: dict) -> None:
     compat_tests = {test["name"] for test in manifest.get("tests", [])}
-    local_source = (ROOT / "tests" / "local.rs").read_text()
-    local_tests = set(re.findall(r"(?m)^fn ([a-z0-9_]+)\(\)", local_source))
+    local_sources = [ROOT / "tests" / "local.rs", *sorted((ROOT / "tests" / "local").glob("*.rs"))]
+    local_tests = {
+        name
+        for source in local_sources
+        for name in re.findall(r"(?m)^fn ([a-z0-9_]+)\(\)", source.read_text())
+    }
     seen: set[str] = set()
     for item in regressions.get("regressions", []):
         regression_id = item.get("id", "")

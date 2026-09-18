@@ -4149,7 +4149,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
             usize::from(delegation::MAX_CONNECTIONS)
         );
     }
-    crate::transfer::parse_ports(&args.tcp_ports)?;
+    crate::conn::parse_ports(&args.tcp_ports)?;
     if let Some(maximum) = args.max_size.as_deref() {
         crate::cli::parse_size(maximum)?;
     }
@@ -4244,7 +4244,7 @@ fn grant_for(
     } else {
         ExistingDestinationPolicy::Replace
     };
-    let (tcp_port_lo, tcp_port_hi) = crate::transfer::parse_ports(&args.tcp_ports)?;
+    let (tcp_port_lo, tcp_port_hi) = crate::conn::parse_ports(&args.tcp_ports)?;
     let grant = Grant {
         enrollment_id: id,
         target_login: login.to_owned(),

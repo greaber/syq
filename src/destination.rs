@@ -165,21 +165,38 @@ struct Route {
 }
 
 pub(crate) fn write_message(writer: &mut impl Write, message: &impl Serialize) -> Result<()> {
+    write_framed(writer, message, MAX_MESSAGE, "named destination message")
+}
+pub(crate) fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
+    read_framed(reader, MAX_MESSAGE, "named destination message")
+}
+/// One JSON value behind a four-byte big-endian length. `what` names the
+/// message in size errors.
+pub(crate) fn write_framed(
+    writer: &mut impl Write,
+    message: &impl Serialize,
+    limit: usize,
+    what: &str,
+) -> Result<()> {
     let bytes = serde_json::to_vec(message)?;
-    if bytes.len() > MAX_MESSAGE {
-        bail!("named destination message exceeds size limit");
+    if bytes.len() > limit {
+        bail!("{what} exceeds size limit");
     }
     writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
     writer.write_all(&bytes)?;
     writer.flush()?;
     Ok(())
 }
-pub(crate) fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
+pub(crate) fn read_framed<T: DeserializeOwned>(
+    reader: &mut impl Read,
+    limit: usize,
+    what: &str,
+) -> Result<T> {
     let mut length = [0; 4];
     reader.read_exact(&mut length)?;
     let length = u32::from_be_bytes(length) as usize;
-    if length == 0 || length > MAX_MESSAGE {
-        bail!("invalid named destination message size");
+    if length == 0 || length > limit {
+        bail!("invalid {what} size");
     }
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes)?;

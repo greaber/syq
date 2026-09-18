@@ -456,25 +456,10 @@ fn query_retry(
 // profile. Keep its local-only bound separate from the remote request envelope.
 const MAX_STATUS: usize = 16 * 1024 * 1024;
 fn read_status(reader: &mut impl Read) -> Result<Status> {
-    let mut length = [0; 4];
-    reader.read_exact(&mut length)?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length == 0 || length > MAX_STATUS {
-        bail!("invalid receiving status size");
-    }
-    let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes)?;
-    Ok(serde_json::from_slice(&bytes)?)
+    crate::destination::read_framed(reader, MAX_STATUS, "receiving status")
 }
 fn write_status(writer: &mut impl Write, status: &Status) -> Result<()> {
-    let bytes = serde_json::to_vec(status)?;
-    if bytes.len() > MAX_STATUS {
-        bail!("receiving status exceeds size limit");
-    }
-    writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
-    writer.write_all(&bytes)?;
-    writer.flush()?;
-    Ok(())
+    crate::destination::write_framed(writer, status, MAX_STATUS, "receiving status")
 }
 
 fn try_lock(control: &Path, create: bool) -> Result<Option<File>> {

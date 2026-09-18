@@ -1,7 +1,7 @@
 # Local compatibility test references
 
 The [user guide](../../docs/rsync-compat.md) describes behavior. This file maps
-those claims to tests in [`tests/local.rs`](../local.rs), alongside the
+those claims to tests in the `local` target ([`tests/local/`](../local/)), alongside the
 upstream suite's [generated ledger](LEDGER.md). A test reference is evidence
 for its named behavior, not a score for compatibility as a whole.
 

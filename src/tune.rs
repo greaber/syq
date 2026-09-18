@@ -263,7 +263,7 @@ pub fn remember(key: &str, connections: usize) {
         return;
     };
     if let Err(error) = remember_at(&path, key, connections) {
-        if crate::transfer::debug() {
+        if crate::output::debug() {
             crate::output::diagnostic!("syq: tuning cache {}: {error}", path.display());
         }
     }
@@ -902,7 +902,7 @@ pub fn run(
             sampler.reset();
             last = (meter.bytes(), meter.files());
             sample_start = std::time::Instant::now();
-            if crate::transfer::debug() {
+            if crate::output::debug() {
                 crate::output::diagnostic!(
                     "syq: tune: {before} -> {requested} workers (direct copy needs userspace transfer)"
                 );
@@ -923,7 +923,7 @@ pub fn run(
             collapse_samples = 0;
             last = (meter.bytes(), meter.files());
             sample_start = std::time::Instant::now();
-            if crate::transfer::debug() {
+            if crate::output::debug() {
                 crate::output::diagnostic!(
                     "syq: tune: {before} -> {active} workers (state {:?})",
                     policy.state
@@ -963,7 +963,7 @@ pub fn run(
                 collapse_samples = 0;
                 last = (meter.bytes(), meter.files());
                 sample_start = std::time::Instant::now();
-                if crate::transfer::debug() {
+                if crate::output::debug() {
                     crate::output::diagnostic!(
                         "syq: tune: {before} -> {active} workers (candidate ready, state {:?})",
                         policy.state
@@ -999,7 +999,7 @@ pub fn run(
                 }
                 if let Some(score) = sampler.push(rate) {
                     policy.refresh_warming_baseline(score);
-                    if crate::transfer::debug() {
+                    if crate::output::debug() {
                         crate::output::diagnostic!(
                             "syq: tune: refreshed {active}-worker baseline to {:.1} MB/s while {} workers warm",
                             score / 1e6,
@@ -1087,7 +1087,7 @@ pub fn run(
         policy.observe(score);
         if policy.n != before {
             sampler.reset();
-            if crate::transfer::debug() {
+            if crate::output::debug() {
                 crate::output::diagnostic!(
                     "syq: tune: candidate {before} -> {} workers (measured {:.1} MB/s at {before}, state {:?})",
                     policy.n,

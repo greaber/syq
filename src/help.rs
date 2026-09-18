@@ -266,11 +266,11 @@ pub(crate) fn filesystem(command: Command) -> Command {
 /// Group copy options by the decisions a user makes, independently of parser layout.
 fn copy_heading(id: &str) -> (&'static str, usize) {
     match id {
-        "sources" | "src_fd" | "src" | "srcs_in" | "src_non_dir" | "src_dir" | "src_non_dirs"
-        | "src_dirs" | "srcs" | "from" | "cwd" | "root" | "ignore" | "ignore_from" | "min_size"
+        "sources" | "src" | "srcs_in" | "src_non_dir" | "src_dir" | "src_non_dirs" | "src_dirs"
+        | "srcs" | "src_fd" | "from" | "cwd" | "root" | "ignore" | "ignore_from" | "min_size"
         | "max_size" => ("Sources and filtering", 0),
-        "as_fd" | "to" | "into" | "into_new" | "into_existing" | "as" | "as_new"
-        | "as_existing" | "mapping" => ("Destination and mapping", 1),
+        "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
+        | "as_fd" | "mapping" => ("Destination and mapping", 1),
         "ignore_existing" | "existing" | "update" | "inplace" | "prune" | "max_delete" => {
             ("Updates and deletion", 2)
         }

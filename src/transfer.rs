@@ -6,14 +6,15 @@ use crate::cli::{
     Location, Placement, SourceSelection,
 };
 use crate::conn::{
-    endpoint_error, ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec,
-    SshMultiplexer, TcpCandidate, TcpPairStats,
+    data_address, endpoint_error, ok, parse_ports, Conn, DataAddressSource, DataTransport,
+    Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate, TcpPairStats,
 };
+use crate::copy_policy::FreshCapacityAssessment;
 #[cfg(test)]
 use crate::fsops::content_digest;
 use crate::fsops::{destination_fraction_matches, is_partial_name, is_recovery_name, join};
-pub(crate) use crate::mapping::validate_manifest_path;
 use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
+use crate::output::debug;
 use crate::progress::{commas, human, Progress};
 use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
@@ -338,30 +339,6 @@ fn configure_hashing(connection: &mut dyn Conn, policy: crate::hashing::HashPoli
         "configure hashing",
     )?;
     Ok(())
-}
-
-pub(crate) fn parse_ports(s: &str) -> Result<(u16, u16)> {
-    let (a, b) = s.split_once('-').unwrap_or((s, s));
-    let lo: u16 = a
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
-    let hi: u16 = b
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
-    if hi < lo {
-        bail!("bad port range {s:?}");
-    }
-    Ok((lo, hi))
-}
-
-pub(crate) fn data_address(address: &str, port: u16) -> String {
-    if address.contains(':') {
-        format!("[{address}]:{port}")
-    } else {
-        format!("{address}:{port}")
-    }
 }
 
 fn link_speed(speed_mbps: u32) -> String {
@@ -1258,10 +1235,6 @@ struct DestinationAnchor {
 }
 type DestinationAnchorSlot = std::sync::Arc<std::sync::OnceLock<DestinationAnchor>>;
 type SourceRootsSlot = std::sync::Arc<std::sync::OnceLock<Vec<RegisteredSourceRoot>>>;
-
-pub fn debug() -> bool {
-    std::env::var_os("SYQ_DEBUG").is_some()
-}
 
 fn handle_tcp_setup_error(
     args: &Args,
@@ -4369,31 +4342,6 @@ struct FreshCapacityPlan {
     logical_bytes: u64,
     objects: u64,
     overflowed: bool,
-}
-
-/// The fresh-destination capacity rule, shared with the receiver's one-turn
-/// small copy so both refuse the same copies.
-#[derive(Clone, Copy)]
-pub(crate) struct FreshCapacityAssessment {
-    pub(crate) logical_bytes: u64,
-    pub(crate) objects: u64,
-    pub(crate) available_bytes: u64,
-    pub(crate) available_inodes: Option<u64>,
-}
-
-impl FreshCapacityAssessment {
-    fn byte_shortage(self) -> bool {
-        self.logical_bytes > self.available_bytes
-    }
-
-    fn inode_shortage(self) -> bool {
-        self.available_inodes
-            .is_some_and(|available| self.objects.saturating_add(64) > available)
-    }
-
-    pub(crate) fn sufficient(self) -> bool {
-        !self.byte_shortage() && !self.inode_shortage()
-    }
 }
 
 fn fresh_capacity_error(capacity: FreshCapacityAssessment) -> anyhow::Error {
