@@ -959,6 +959,8 @@ for transport in tcp ssh; do
         syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
             --as "/tmp/syq-real-ssh/limited-$transport-$coordinator" \
             --coordinate-at "$coordinator" --resource-limits workers=1 --no-progress -vv "$@"
+        # These loop variables select the remote filename on the client.
+        # shellcheck disable=SC2029
         ssh destination cat "/tmp/syq-real-ssh/limited-$transport-$coordinator" > /tmp/syq-real-ssh-limited-check
         cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-limited-check
     done
