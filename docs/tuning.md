@@ -92,13 +92,10 @@ than 130 GiB; exceeding that limit fails the comparison rather than falling
 back to a full copy. Increase `comparison-block-size` for larger files. Doubling
 it doubles the size limit; increasing `request-size` does not change this limit.
 
-Syq fills available request windows with changed ranges from the same file,
-leaving queued work for other workers. This can help on high-latency links,
-though the result depends on the edits and connection. Both endpoints still
-read the full file to compare it. By default, syq builds the updated file beside
-the destination and then replaces it. It copies and checks reused destination
-bytes before applying changes, skipping final-file blocks already known to
-differ. With `--inplace`, changes are written directly to the destination instead.
+Both endpoints still read the full file to compare it. By default, syq builds
+the updated file beside the destination, reusing matching bytes, and replaces
+it when complete. Use [in-place writes](reference.md#in-place-writes) only when
+you can accept an incomplete destination during the update.
 
 A later copy can reuse matching bytes from an interrupted copy even if you
 change the comparison block size; syq checks them using the new size.

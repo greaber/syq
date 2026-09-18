@@ -5,7 +5,7 @@ especially on long-distance links or when syq must carry data over SSH.
 
 ## Make TCP reachable
 
-Allowing syq's encrypted TCP connections often gives the biggest improvement.
+Allow syq's encrypted TCP connections so file data can use TCP instead of SSH.
 The server listens on one available port in `47600–47699` for the duration of
 the copy. Choose another range with `--tcp-ports LO-HI`.
 

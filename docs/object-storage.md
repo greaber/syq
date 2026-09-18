@@ -152,17 +152,10 @@ bucket policies or lifecycle rules.
 
 ## Parallelism
 
-Uploads use multipart requests and downloads use concurrent byte ranges. Syq
-chooses starting settings from file sizes, the backend and observed request
-latency. For batches where each object fits in one request, syq tests higher and
-lower object concurrency when there is enough work to measure a change. After
-finding a good setting, syq probes less often, while continuing to check for
-changed conditions. For batches of small downloads, the search range also
-accounts for object sizes and available file descriptors.
-Multipart batches adjust their shared data-request budget instead. Downloads of
-small files over high-latency paths start with more simultaneous requests,
-because short copies may finish before the budget can grow. These choices
-apply independently of integrity checking, and S3 tuning writes no cache files.
+Syq transfers objects in parallel, splitting large uploads into parts and
+large downloads into byte ranges. It chooses settings automatically and adjusts
+concurrency as the copy runs. Start with the defaults; short copies may finish
+before syq can measure a better setting. S3 tuning is not saved between runs.
 
 For deliberate overrides, use `--performance-tuning`. These settings choose
 parallelism rather than bounding the process's total resource use:
@@ -285,18 +278,15 @@ ending in `/` is treated as a directory marker. Unknown syq metadata versions
 fail explicitly; syq does not guess how to restore them.
 
 Uploads send checksums for the service to validate: SHA-256, or Content-MD5
-with Cloudflare R2 endpoints. These provider checks remain active regardless of
-`--integrity-checking transfer=blake3`. Syq reuses their part checksums to identify interrupted
-uploads, without computing another whole-file hash by default. ETags identify
-objects; syq does not assume they are content hashes.
+with Cloudflare R2 endpoints. These provider checks stay active regardless of
+syq's optional integrity settings. ETags identify objects; syq does not assume
+they are content hashes.
 
 `--integrity-checking transfer=blake3` records a whole-file digest on upload and
-checks that digest, when present, before publishing a download. Choose its
-algorithm in the `transfer` value, for example `transfer=sha256`. A single-part upload shares this computation
-with the provider checksum when their algorithms match. Multipart provider
-checksums cover individual parts and cannot replace an expected whole-file hash.
-When an upload has an expected digest, syq stores and reuses that digest for
-whole-file checks, avoiding a second whole-file hash with another algorithm.
+checks that digest, when present, before publishing a download. Choose another
+[hash algorithm](reference.md#check-file-contents) in the `transfer` value, for
+example `transfer=sha256`. Multipart provider checksums cover individual parts
+and do not replace a whole-file check.
 
 `--expected-hash ALGORITHM:HEX` checks one selected regular file, including an
 existing destination that passes the usual size/time quick check. Explicit
@@ -314,10 +304,8 @@ Existing BLAKE3 object metadata remains readable. Other digest algorithms use
 metadata format 2; older syq binaries reject those objects explicitly rather
 than interpreting the digest as BLAKE3.
 
-Large downloads can use direct I/O when supported, so their data may not
-populate the page cache. This does not promise crash durability. Downloads
-requiring an assembled-file digest use buffered writes to avoid an expensive
-disk readback. Buffered writes share one bounded queue per file.
+Large downloads can bypass the page cache when supported. Completion does not
+guarantee durability after a machine crash.
 
 `--hash` uses contents to decide whether an existing file needs copying.
 `--verify-only` reads both sides and reports differences without copying.
@@ -342,12 +330,10 @@ duration or stall deadline. A slow or paused request can continue when the
 provider resumes responding. If it never responds, cancel the copy to stop
 waiting. Connection attempts still have a timeout.
 
-Within the `s3-retries` budget, syq can replace a download range that is much
-slower than comparable reads completing in the same copy. The replacement
-checks the object's identity and reuses the portion already processed. Only
-one such recovery runs at a time. Actual transport and provider errors can
-also trigger retries; other read failures restart the entire range. Setting
-`s3-retries=0` disables retries.
+Syq retries transient transport and provider errors within the `s3-retries`
+budget. It can also retry a download range that is much slower than comparable
+reads in the same copy, checking object identity before reusing received bytes.
+Set `s3-retries=0` to disable retries.
 
 Use `--prune` to mirror selected directories or prefixes in either direction:
 
@@ -362,9 +348,8 @@ destination. Deleting from a versioned bucket uses normal S3 deletion semantics;
 it does not remove historical versions. See [mirroring](reference.md#mirror-a-directory)
 for scopes, exclusions, error handling, and `--max-delete`.
 
-Rerun an interrupted copy with the same endpoint, keys,
-destination and options to resume completed multipart uploads or download ranges. Recovery records live
-in `$XDG_CACHE_HOME/syq/s3`, or `~/.cache/syq/s3`. Download partials live beside
+Rerun an interrupted copy with the same endpoint, keys, destination and options
+to reuse completed upload parts or download ranges. Recovery records live in `$XDG_CACHE_HOME/syq/s3`, or `~/.cache/syq/s3`. Download partials live beside
 the destination. Syq checks their identity and rehashes saved ranges before
 reuse. Single-request downloads restart and discard their temporary file on
 failure or cancellation. Existing destination files remain visible until a

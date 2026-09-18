@@ -7,23 +7,10 @@ syq cp project --into backup
 This copies `project` to `backup/project`. Existing files are updated when
 needed; unrelated files stay.
 
-On macOS, eligible local files use filesystem cloning when both paths are on
-the same APFS volume. The copy initially shares disk blocks with the source;
-later changes to either file are independent. Reported bytes count the file's
-size, so the displayed rate can exceed the disk's physical throughput.
-Other filesystems and cross-volume copies use normal copying. Syq also uses
-normal copying when the open-file limit leaves no room for cloning.
-
-Syq groups small files into requests to reduce per-file overhead; larger files
-can use cloning. See [batch sizes](tuning.md#batch-size-and-splitting) for how
-tuning affects this choice.
-
-Cloning keeps the usual overwrite and metadata rules. Writing in place,
-comparing checksums, or setting a bandwidth limit uses normal copying. So does explicitly
-selecting [range transfers](tuning.md). Destination directories with
-inheritable access control entries, filesystem-compressed files, and files
-whose metadata cannot be safely removed also use normal copying. Cloned copies
-omit source extended attributes and file flags, just as normal copies do.
+Local copies use filesystem copy optimizations when available. On the same
+APFS volume, eligible files can share disk blocks while remaining independently
+writable. See [local copies and NFS](speed.md#local-copies-and-nfs) for what this
+means for storage use and reported speed.
 
 The final summary shows what was copied or skipped, how long it took, and any
 errors. Add `-v` to list copied paths. For connection and performance details,
@@ -36,11 +23,6 @@ time limits, and
 [restricted server-to-server copies](remote-reference.md#limits-and-unsupported-options)
 must finish before their signed authorization expires. SDK callers can also
 set their own deadlines.
-
-On Linux, syq asks the kernel to read ahead in source files when reads show
-storage activity or waits. This works for local and remote copies and uses a
-small, bounded number of helper threads. Local copies can also use faster
-filesystem copy operations when available.
 
 ## See where files go
 

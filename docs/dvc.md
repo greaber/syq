@@ -1,11 +1,8 @@
 # Pull and push DVC data
 
 [`dvc_syq.py`](https://github.com/greaber/syq/blob/master/examples/dvc-syq/dvc_syq.py)
-does the work of `dvc pull` and `dvc push` with syq, and can be faster. DVC
-coordinates its transfers from a single Python process, which keeps it to
-about one CPU core however many jobs it runs. The script works out every copy
-in advance and hands the whole list to syq, which spreads the work over
-several cores.
+pulls and pushes DVC data with syq. It plans the copies and passes them to syq
+as a batch. Use it to try syq's transfers with your existing DVC repository.
 
 It is a short program written with the [Python SDK](python.md), meant to be
 used, read, and adapted. DVC keeps working alongside it: both use the same
@@ -52,14 +49,14 @@ And two are the script's own:
 
 | Option | Meaning |
 |---|---|
-| `--verify` | Check every download against its MD5. A file that does not match is kept out of the cache |
+| `--verify` | Check downloaded files against their DVC MD5 and reject mismatches |
 | `--dry-run` | Show what would be copied |
 
 ## How it works
 
-DVC names every stored file after its MD5 and lays out its cache exactly like
-its remote. An object therefore has the same relative path in both places,
-and only the last step, writing the workspace, gives files their real names.
+DVC's current cache layout names objects after their MD5. The same relative
+path identifies an object in the cache and remote; a separate checkout step
+gives workspace files their original names.
 
 ```python
 def object_path(md5):
@@ -77,8 +74,10 @@ client.cp(mapping=checkout, cwd=".dvc/cache", into=".")
 Each list is a [mapping](mappings.md): pairs of source and destination paths
 that syq copies in one run. A push is the first copy in reverse, and
 `only_new` makes it skip objects the remote already has. With `--verify`,
-each download entry also carries the MD5 the file must have, and syq checks
-it as the bytes arrive.
+download mappings carry the expected MD5 so syq can check the completed file
+before adding it to the cache. Older DVC text objects can use a newline-normalized
+MD5; the script checks those after download and removes mismatches. Files already
+in the cache are skipped.
 
 ## Differences from DVC
 
