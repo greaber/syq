@@ -6,7 +6,7 @@
 
 - [Install and setup](install.md)
 - [Copy files](reference.md)
-- [Copy to and from object storage](object-storage.md)
+- [Copy to, from, and between S3 buckets](object-storage.md)
 - [Remove files](remove.md)
 - [Send files home from a server](receive.md)
 - [Run commands on your receiving machine](exec.md)

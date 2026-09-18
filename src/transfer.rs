@@ -1515,8 +1515,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if args.interface == Interface::NativeCp {
         crate::destination::prepare(&mut args)?;
     }
-    // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
-    let block = parse_size(&args.block_size)?.clamp(MIN_HASH_BLOCK_BYTES, MAX_HASH_BLOCK_BYTES);
+    let block = args.block_size;
     args.tuning_options
         .unwrap_or_default()
         .validate(args.bwlimit_bytes)?;
