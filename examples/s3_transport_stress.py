@@ -43,8 +43,11 @@ original_urlopen = urllib.request.urlopen
 urllib.request.urlopen = lambda *a, **k: original_urlopen(*a, context=context, **k)
 server = None
 active = None
-results = []
-cleanup = []
+results = json.loads((D / "results.json").read_text()) if (D / "results.json").exists() else []
+for previous in results:
+    previous.setdefault("commit", "d8e5585f")
+COMMIT = command_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+cleanup = json.loads((D / "cleanup.json").read_text()) if (D / "cleanup.json").exists() else []
 
 def command(args, **kwargs):
     return subprocess.check_output(args, text=True, timeout=60, **kwargs).strip()
@@ -76,6 +79,10 @@ def remove_container(cid):
 
 def run(case, mode, repeats, label):
     global active
+    for row in results:
+        if row['case'] == case and row['mode'] == mode and row['label'] == label:
+            print(f"Reusing verified {case['name']}-{mode}-{label} at {row['commit'][:8]}", flush=True)
+            return row
     tag = f"{case['name']}-{mode}-{label}"
     out = D / (tag + '-output')
     out.mkdir()
@@ -103,7 +110,7 @@ def run(case, mode, repeats, label):
         (D / (tag + '.stderr')).write_text(stderr)
         assert process.returncode == 0 and state['ExitCode'] == 0, (tag, state, stderr)
         row = json.loads(stdout)
-        row.update(case=case, label=label, repeats=repeats)
+        row.update(case=case, label=label, repeats=repeats, commit=COMMIT)
         (D / (tag + '.json')).write_text(json.dumps(row, indent=2))
         print(f"{tag}: {row['bytes']/2**30:.1f} GiB in {row['elapsed']:.2f}s, "
               f"CPU {row['user']+row['system']:.2f}s, RSS {row['rss_kib']/1024:.1f} MiB", flush=True)
@@ -111,13 +118,15 @@ def run(case, mode, repeats, label):
         assert len(files) == row['objects']
         verify_start = time.monotonic()
         next_progress = verify_start + 10
-        for count, path in enumerate(files, 1):
+        def verify(path):
             with path.open('rb') as f:
                 digest = hashlib.file_digest(f, 'sha256').hexdigest()
             assert digest == fixtures[case['fixture']]['sha256'], (tag, path)
-            if time.monotonic() >= next_progress:
-                print(f'{tag}: independently verified {count}/{len(files)} files', flush=True)
-                next_progress = time.monotonic() + 10
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            for count, _ in enumerate(pool.map(verify, files), 1):
+                if time.monotonic() >= next_progress:
+                    print(f'{tag}: independently verified {count}/{len(files)} files', flush=True)
+                    next_progress = time.monotonic() + 10
         row['independently_verified_files'] = len(files)
         row['verification_seconds'] = time.monotonic() - verify_start
         results.append(row)
@@ -160,8 +169,9 @@ try:
     checks.request('PUT')
     fixtures = {}
     for name, count, size in [('large', 8, 128 * 1024 * 1024), ('small', 1024, 64 * 1024)]:
-        data = os.urandom(size)
         source = STAGE / (name + '.source')
+        data = source.read_bytes() if source.exists() else os.urandom(size)
+        assert len(data) == size
         source.write_bytes(data)
         digest = command([str(BIN), 'digest', str(source)])
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
