@@ -18,34 +18,24 @@ pub(crate) enum Source {
     Pipe {
         path: std::path::PathBuf,
         follow: bool,
+        root: Option<Vec<u8>>,
     },
 }
 impl Source {
     pub async fn open(self, cancelled: Arc<AtomicBool>) -> Result<Descriptor> {
         match self {
             Self::Descriptor(number) => Descriptor::open(number, true, cancelled),
-            Self::Pipe { path, follow } => {
+            Self::Pipe { path, follow, root } => {
                 tokio::task::spawn_blocking(move || {
-                    use crate::{
-                        proto::OperatorSymlinkPolicy,
-                        rooted::{OperatorFinalComponent, OperatorResolver, PinnedPath},
-                    };
+                    use crate::rooted::PinnedPath;
                     use std::os::unix::{
                         ffi::OsStrExt,
                         fs::{FileTypeExt, MetadataExt},
                     };
-                    let selected = OperatorResolver::resolve_process(
+                    let selected = super::resolve_source(
                         path.as_os_str().as_bytes(),
-                        if follow {
-                            OperatorSymlinkPolicy::FollowAll
-                        } else {
-                            OperatorSymlinkPolicy::Refuse
-                        },
-                        OperatorFinalComponent::Entry {
-                            follow_symlink: follow,
-                        },
-                        false,
-                        &mut Vec::new(),
+                        root.as_deref(),
+                        follow,
                     )?;
                     let PinnedPath::Leaf(leaf) = selected else {
                         bail!("pipe source is not a FIFO");

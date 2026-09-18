@@ -8654,6 +8654,8 @@ esac
                 path: path_bytes(&root.join("file")),
                 write: true,
                 follow: false,
+                root: None,
+                placement: crate::descriptor_copy::StreamPlacement::default(),
             },
             crate::descriptor_copy::Operation::Read,
             crate::descriptor_copy::Operation::Write {

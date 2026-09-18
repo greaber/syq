@@ -1,5 +1,5 @@
 //! One pinned regular file per connection, with private staging for writes.
-use super::{Operation, CHUNK};
+use super::{Operation, StreamPlacement, CHUNK};
 use crate::{
     proto::{OperatorSymlinkPolicy, Response},
     rooted::{OperatorFinalComponent, OperatorResolver, PinnedPath, RelativePath, Root},
@@ -33,22 +33,126 @@ impl Drop for Destination {
         let _ = self.root.unlink(&self.temporary);
     }
 }
-impl Session {
-    fn open(path: &[u8], write: bool, follow: bool) -> Result<Self> {
-        let path = crate::fsops::resolve(path);
-        let selected = OperatorResolver::resolve_process(
-            path.as_os_str().as_bytes(),
-            if follow {
-                OperatorSymlinkPolicy::FollowAll
-            } else {
-                OperatorSymlinkPolicy::Refuse
-            },
-            OperatorFinalComponent::Entry {
-                follow_symlink: !write && follow,
-            },
-            write,
+pub(crate) fn resolve_source(path: &[u8], root: Option<&[u8]>, follow: bool) -> Result<PinnedPath> {
+    let policy = if follow {
+        OperatorSymlinkPolicy::FollowAll
+    } else {
+        OperatorSymlinkPolicy::Refuse
+    };
+    let final_component = OperatorFinalComponent::Entry {
+        follow_symlink: follow,
+    };
+    let path = crate::fsops::resolve(path);
+    if let Some(root) = root {
+        let root = crate::fsops::resolve(root);
+        let PinnedPath::Directory(directory) = OperatorResolver::resolve_process(
+            root.as_os_str().as_bytes(),
+            policy,
+            OperatorFinalComponent::Directory,
+            false,
             &mut Vec::new(),
-        )?;
+        )?
+        else {
+            bail!("source root must be a directory");
+        };
+        OperatorResolver::beneath(&directory.into_parts().0, true, policy)?.resolve(
+            path.as_os_str().as_bytes(),
+            final_component,
+            false,
+            &mut Vec::new(),
+        )
+    } else {
+        OperatorResolver::resolve_process(
+            path.as_os_str().as_bytes(),
+            policy,
+            final_component,
+            false,
+            &mut Vec::new(),
+        )
+    }
+}
+
+fn resolve_destination(
+    path: &[u8],
+    follow: bool,
+    placement: &StreamPlacement,
+) -> Result<PinnedPath> {
+    let path = crate::fsops::resolve(path);
+    let policy = if follow {
+        OperatorSymlinkPolicy::FollowAll
+    } else {
+        OperatorSymlinkPolicy::Refuse
+    };
+    let selected = OperatorResolver::resolve_process(
+        path.as_os_str().as_bytes(),
+        policy,
+        if placement.name.is_some() {
+            OperatorFinalComponent::Directory
+        } else {
+            OperatorFinalComponent::Entry {
+                follow_symlink: false,
+            }
+        },
+        true,
+        &mut Vec::new(),
+    )?;
+    let exists = !matches!(&selected, PinnedPath::Missing(_));
+    use crate::cli::Existence;
+    if (placement.existence == Existence::New && exists)
+        || (placement.existence == Existence::Existing && !exists)
+    {
+        bail!(
+            "destination existence condition failed for {}",
+            path.display()
+        );
+    }
+    let Some(name) = &placement.name else {
+        return Ok(selected);
+    };
+    // The name is one source basename, not another operator path.
+    anyhow::ensure!(
+        !name.is_empty() && !name.contains(&b'/') && name != b"." && name != b"..",
+        "invalid stream source basename"
+    );
+    let directory = match selected {
+        PinnedPath::Directory(directory) => directory.into_parts().0,
+        PinnedPath::Missing(missing) => {
+            let (parent, components) = missing.into_parts();
+            let root = Root::from_directory(parent)?;
+            let path = RelativePath::new(&components.into_iter().collect::<Vec<_>>().join(&b'/'))?;
+            root.create_missing_parents(&path, 0o777)?;
+            root.create_directory(&path, 0o777)?;
+            root.open_directory(&path)?
+        }
+        _ => bail!("--into destination must be a directory"),
+    };
+    OperatorResolver::beneath(&directory, true, policy)?.resolve(
+        name,
+        OperatorFinalComponent::Entry {
+            follow_symlink: false,
+        },
+        true,
+        &mut Vec::new(),
+    )
+}
+
+impl Session {
+    fn open(
+        path: &[u8],
+        write: bool,
+        follow: bool,
+        root: Option<&[u8]>,
+        placement: &StreamPlacement,
+    ) -> Result<Self> {
+        let selected = if write {
+            anyhow::ensure!(
+                root.is_none(),
+                "source root does not apply to a destination"
+            );
+            resolve_destination(path, follow, placement)?
+        } else {
+            resolve_source(path, root, follow)?
+        };
         let (file, destination) = if write {
             let (root, target, mode) = match selected {
                 PinnedPath::Leaf(leaf) => {
@@ -156,10 +260,18 @@ impl Session {
             path,
             write,
             follow,
+            root,
+            placement,
         } = operation
         {
             anyhow::ensure!(slot.is_none(), "descriptor stream already open");
-            *slot = Some(Self::open(path, *write, *follow)?);
+            *slot = Some(Self::open(
+                path,
+                *write,
+                *follow,
+                root.as_deref(),
+                placement,
+            )?);
             return Ok(Response::Ok);
         }
         let stream = slot.as_mut().context("no descriptor stream is open")?;
@@ -243,6 +355,8 @@ mod tests {
                     path: target.as_os_str().as_bytes().to_vec(),
                     write: true,
                     follow: false,
+                    root: None,
+                    placement: StreamPlacement::default(),
                 },
             )
             .unwrap();
@@ -274,6 +388,8 @@ mod tests {
                 path: target.as_os_str().as_bytes().to_vec(),
                 write: true,
                 follow: false,
+                root: None,
+                placement: StreamPlacement::default(),
             },
         )
         .unwrap();
@@ -293,6 +409,8 @@ mod tests {
                 path: source.as_os_str().as_bytes().to_vec(),
                 write: false,
                 follow: false,
+                root: None,
+                placement: StreamPlacement::default(),
             },
         )
         .unwrap();

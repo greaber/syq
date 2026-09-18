@@ -22871,3 +22871,21 @@ fn managed_descriptor_upload_requires_commit() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn stream_placement_and_source_roots() {
+    let output = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/stream-placement.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .output()
+        .expect("run stream placement fixture");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

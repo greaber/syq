@@ -26,6 +26,16 @@ pub(crate) struct Plan {
     pub location: Option<Location>,
     pub key: Option<String>,
     pub follow: bool,
+    pub root: Option<Vec<u8>>,
+    pub placement: StreamPlacement,
+}
+
+/// The destination operand remains separate from the source basename so that
+/// existence conditions apply to the container for --into-* placement.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct StreamPlacement {
+    pub name: Option<Vec<u8>>,
+    pub existence: crate::cli::Existence,
 }
 
 // Append-only member of Request. Only unrestricted control sessions may use
@@ -36,6 +46,8 @@ pub(crate) enum Operation {
         path: Vec<u8>,
         write: bool,
         follow: bool,
+        root: Option<Vec<u8>>,
+        placement: StreamPlacement,
     },
     Read,
     Write {
@@ -49,7 +61,7 @@ pub(crate) enum Operation {
         hash: [u8; 32],
     },
 }
-pub(crate) use file::Session;
+pub(crate) use file::{resolve_source, Session};
 
 type Reply = tokio::sync::oneshot::Sender<Result<Vec<Response>>>;
 struct Connection {
@@ -140,6 +152,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             plan.source,
             plan.as_fd,
             plan.commit_fd,
+            plan.placement,
         );
     }
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -191,6 +204,8 @@ async fn copy(
                 path: plan.location.as_ref().unwrap().path.clone(),
                 write: input.is_some(),
                 follow: plan.follow,
+                root: plan.root.clone(),
+                placement: plan.placement.clone(),
             })
             .await?
         {

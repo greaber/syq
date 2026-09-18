@@ -27,6 +27,46 @@ class StreamTests(unittest.TestCase):
         self.env['HOME'] = str(self.root)
         self.client = syq.Client(executable=SYQ, env=self.env, timeout=10)
 
+    def test_writer_placement_and_reader_source_bases(self):
+        rsh = self.root / "rsh"
+        rsh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$1"\n')
+        rsh.chmod(0o700)
+        for remote in (False, True):
+            options = dict(rsh=str(rsh), syq_path=str(SYQ)) if remote else {}
+            to = dict(to="fixture") if remote else {}
+            from_ = dict(from_="fixture") if remote else {}
+            base = self.root / ("remote" if remote else "local")
+            base.mkdir()
+            target = base / "object"
+            with self.client.open_writer(as_new=target, **options, **to) as out:
+                out.write(b"new")
+            with self.assertRaises(syq.SyqProcessError):
+                with self.client.open_writer(as_new=target, **options, **to) as out:
+                    out.write(b"replacement")
+            self.assertEqual(target.read_bytes(), b"new")
+            with self.client.open_writer(as_existing=target, **options, **to) as out:
+                out.write(b"updated")
+            with self.assertRaises(ValueError):
+                with self.client.open_writer(as_existing=target, **options, **to) as out:
+                    out.write(b"aborted")
+                    raise ValueError("producer failed")
+            self.assertEqual(target.read_bytes(), b"updated")
+            with self.assertRaises(syq.SyqProcessError):
+                with self.client.open_writer(as_existing=base / "missing", **options, **to):
+                    pass
+            for name in ("cwd", "root"):
+                with self.client.open_reader("object", **{name: base}, **options, **from_) as input:
+                    self.assertEqual(input.read(), b"updated")
+            with self.assertRaises(syq.SyqProcessError):
+                with self.client.open_reader("../rsh", root=base, **options, **from_) as input:
+                    input.read()
+        with self.assertRaises(syq.SyqInvocationError):
+            self.client.open_writer()
+        with self.assertRaises(syq.SyqInvocationError):
+            self.client.open_writer(as_=target, as_new=target)
+        with self.assertRaises(syq.SyqInvocationError):
+            self.client.open_reader("object", cwd=base, root=base)
+
     def test_streaming_tar_round_trip_and_early_archive_eof(self):
         source = self.root / 'source'
         source.mkdir()
@@ -227,6 +267,28 @@ class StreamTests(unittest.TestCase):
 
 
 class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_placement_and_confined_reader(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            target = root / "object"
+            client = syq.AsyncClient(executable=SYQ, timeout=10,
+                                     env={k: v for k, v in os.environ.items() if not k.startswith("SYQ_")})
+            async with client.open_writer(as_new=target) as out:
+                await out.write(b"new")
+            with self.assertRaises(syq.SyqProcessError):
+                async with client.open_writer(as_new=target) as out:
+                    await out.write(b"no")
+            async with client.open_writer(as_existing=target) as out:
+                await out.write(b"existing")
+            async with client.open_reader("object", root=root) as input:
+                self.assertEqual(await input.read(), b"existing")
+            with self.assertRaises(syq.SyqInvocationError):
+                async with client.open_writer(as_=target, as_new=target):
+                    pass
+            with self.assertRaises(syq.SyqProcessError):
+                async with client.open_reader("../outside", root=root) as input:
+                    await input.read()
+
     async def test_round_trip_and_cancelled_reader(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()

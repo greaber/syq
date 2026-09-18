@@ -33,7 +33,7 @@ are copied, including when a shell glob expands to both files and a FIFO.
 A named FIFO has a basename:
 `--into saved` puts `incoming.fifo` at `saved/incoming.fifo` as a regular file.
 An inherited descriptor or process-substitution path has no usable name;
-choose `--as PATH` or `--as-fd FD`. Syq never uses a descriptor number as an
+choose `--as PATH`, `--as-new PATH`, `--as-existing PATH`, or `--as-fd FD`. Syq never uses a descriptor number as an
 output name. `--src-fd` replaces source paths and `--from`; `--as-fd` replaces
 `--to` and destination placement. Both together copy between descriptors.
 Put source arguments before destination arguments. A literal `-` is a filename.
@@ -58,6 +58,14 @@ written and checked. Existing regular-file permission bits are kept; new
 files use `0666` filtered by the destination process's umask. Ownership follows
 normal destination creation rules, and modification time is the time of writing.
 Source metadata is not copied. Parent directories are created if needed.
+The `-new` and `-existing` placement variants apply the same conditions as
+other copies: `--as-new` and `--as-existing` check the destination entry;
+`--into-new` and `--into-existing` check the container, not the file inside it.
+Filesystem conditions are checked before transfer. S3 new-object writes also
+refuse replacement if an object appears before publication.
+Use `--cwd` to resolve a relative pathname source, or `--root` to confine it
+beneath a directory (an S3 key prefix for S3 sources). An inherited descriptor
+already refers to an open object and cannot be confined with `--root`.
 Directly supplied symlink parents require `--follow-src` or `--follow-dst`;
 a destination's final symlink is replaced, never followed.
 

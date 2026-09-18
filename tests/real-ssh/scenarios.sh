@@ -131,8 +131,17 @@ path = "/tmp/syq-real-ssh/stream 'with spaces'"
 subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path], input=payload, check=True, timeout=60)
 result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'], stdout=subprocess.PIPE, check=True, timeout=60)
 assert result.stdout == payload
+result = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as-new', path],
+                        input=b'no', capture_output=True, timeout=30)
+assert result.returncode != 0, result.stderr
+result = subprocess.run(['syq', 'cp', '--from', 'destination', '--root', '/tmp/syq-real-ssh',
+                         "stream 'with spaces'", '--as-fd', '1'], capture_output=True, timeout=60)
+assert result.returncode == 0 and result.stdout == payload, result.stderr
+result = subprocess.run(['syq', 'cp', '--from', 'destination', '--root', '/tmp/syq-real-ssh',
+                         '../dev-helper-upload.txt', '--as-fd', '1'], capture_output=True, timeout=30)
+assert result.returncode != 0, result.stderr
 # Empty EOF must publish an empty file rather than leave the previous object.
-subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path], input=b'', check=True, timeout=30)
+subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as-existing', path], input=b'', check=True, timeout=30)
 result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'], stdout=subprocess.PIPE, check=True, timeout=30)
 assert result.stdout == b''
 subprocess.run(['bash', '-c',
