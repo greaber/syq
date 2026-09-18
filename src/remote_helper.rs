@@ -173,7 +173,7 @@ download() {{
         exit {install_failed_exit}
     fi
     if command -v curl >/dev/null 2>&1; then
-        curl --fail --silent --show-error --location --connect-timeout 5 --proto '=https' --proto-redir '=https' --output "$destination" "$source"
+        curl --fail --silent --show-error --location --connect-timeout 5 --max-time 30 --speed-limit 1024 --speed-time 10 --proto '=https' --proto-redir '=https' --output "$destination" "$source"
         status=$?
         if [ "$status" -ne 0 ]; then
             if [ "$status" -eq 23 ]; then
@@ -184,7 +184,7 @@ download() {{
             exit {remote_download_fallback_exit}
         fi
     elif command -v wget >/dev/null 2>&1; then
-        wget -q --dns-timeout=10 --connect-timeout=10 --read-timeout=0 --tries=1 -O "$destination" "$source"
+        wget -q --timeout=10 --tries=1 -O "$destination" "$source"
         status=$?
         if [ "$status" -ne 0 ]; then
             if [ "$status" -eq 3 ]; then

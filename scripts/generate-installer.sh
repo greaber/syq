@@ -97,7 +97,7 @@ fetch() {
     curl --fail --silent --show-error --location --retry 2 --connect-timeout 10 \
       --proto '=https' --proto-redir '=https' --output "$2" "$1"
   elif command -v wget >/dev/null 2>&1; then
-    wget --quiet --https-only --dns-timeout=10 --connect-timeout=10 --read-timeout=0 --tries=3 -O "$2" "$1"
+    wget --quiet --https-only --timeout=10 --tries=3 -O "$2" "$1"
   else
     echo 'install.sh: downloading syq requires curl or wget' >&2
     return 1
