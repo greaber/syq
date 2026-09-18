@@ -1,5 +1,6 @@
 mod fast;
 mod pruning;
+mod server_copy;
 
 use super::{
     admission::parallel,
@@ -45,6 +46,8 @@ pub(super) struct Engine {
     progress: Arc<Progress>,
     pace: Mutex<tokio::time::Instant>,
     upload_keys: OnceLock<HashMap<String, u64>>,
+    copy_checksum_unsupported: std::sync::atomic::AtomicBool,
+    copy_tagging_unsupported: std::sync::atomic::AtomicBool,
     tuning: super::tuning::Tuning,
     cancelled: std::sync::atomic::AtomicBool,
     cancel_wake: tokio::sync::Notify,
@@ -62,6 +65,7 @@ struct Download {
     path: String,
     size: u64,
     expected_digest: Option<Digest>,
+    copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
@@ -130,6 +134,8 @@ impl Engine {
             progress,
             pace: Mutex::new(tokio::time::Instant::now()),
             upload_keys: OnceLock::new(),
+            copy_checksum_unsupported: Default::default(),
+            copy_tagging_unsupported: Default::default(),
         }))
     }
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -155,6 +161,9 @@ impl Engine {
     }
 
     async fn copy(self: Arc<Self>) -> Result<()> {
+        if self.options.source_bucket.is_some() {
+            return self.server_copy().await;
+        }
         if self.options.upload {
             let scanning = super::diagnostics::start();
             let args = self.args.clone();
@@ -165,50 +174,10 @@ impl Engine {
             {
                 bail!("an expected digest requires exactly one regular file");
             }
-            self.check_upload_placement(&plan).await?;
-            if plan.len() > 1 && !self.args.existing && !self.args.ignore_existing {
-                let target = local::key_path(&self.args.locations.last().unwrap().path)?;
-                let prefix = if target.is_empty() {
-                    String::new()
-                } else {
-                    format!("{target}/")
-                };
-                let listing = if self.args.delete {
-                    // Pruning needs every destination key, including keys absent
-                    // from the upload plan. Only this complete cache is reusable
-                    // by the deletion planner.
-                    client::list(
-                        &self.client,
-                        &self.options.bucket,
-                        &prefix,
-                        None,
-                        &mut HashSet::new(),
-                    )
-                    .await
-                    .map(|listing| Some(listing.objects.into_iter().collect()))
-                } else {
-                    let source_keys = plan.iter().map(|source| source.key.as_str()).collect();
-                    client::upload_listing(
-                        &self.client,
-                        &self.options.bucket,
-                        &prefix,
-                        &source_keys,
-                    )
-                    .await
-                };
-                match listing {
-                    Ok(Some(keys)) => {
-                        let _ = self.upload_keys.set(keys);
-                    }
-                    Ok(None) => {}
-                    Err(error) if self.args.delete => {
-                        self.progress
-                            .error(&format!("list S3 destination: {error:#}"));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-
+            self.check_upload_placement(plan.first().map(|s| s.kind() != "dir"))
+                .await?;
+            self.discover_destination(plan.iter().map(|s| s.key.as_str()).collect())
+                .await?;
             let workers = self.object_workers(plan.iter().map(|s| s.meta.len))?;
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress.bytes_total.store(
@@ -240,7 +209,7 @@ impl Engine {
             self.prune(prune, None).await?;
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
-            let (plan, prune) = self.download_plan(&destination).await?;
+            let (plan, prune) = self.download_plan(&destination.prefix).await?;
             let workers = self.object_workers(plan.iter().map(|s| s.size))?;
             if self.args.expected_digest.is_some() && plan.len() != 1 {
                 bail!("an expected digest requires exactly one regular file");
@@ -434,7 +403,53 @@ impl Engine {
         )
         .into_bytes()
     }
-    async fn check_upload_placement(&self, plan: &[Source]) -> Result<()> {
+    async fn discover_destination(&self, keys: HashSet<&str>) -> Result<()> {
+        if keys.len() > 1 && !self.args.existing && !self.args.ignore_existing {
+            let target = local::key_path(&self.args.locations.last().unwrap().path)?;
+            let prefix = if target.is_empty() {
+                String::new()
+            } else {
+                format!("{target}/")
+            };
+            let listing = if self.args.delete {
+                // Pruning needs every destination key, including keys absent
+                // from the upload plan. Only this complete cache is reusable
+                // by the deletion planner.
+                client::list(
+                    &self.client,
+                    &self.options.bucket,
+                    &prefix,
+                    None,
+                    &mut HashSet::new(),
+                )
+                .await
+                .map(|listing| Some(listing.objects.into_iter().collect()))
+            } else {
+                client::upload_listing(&self.client, &self.options.bucket, &prefix, &keys).await
+            };
+            match listing {
+                Ok(Some(keys)) => {
+                    let _ = self.upload_keys.set(keys);
+                }
+                Ok(None) => {}
+                Err(error)
+                    if error
+                        .downcast_ref::<client::RequestFailure>()
+                        .is_some_and(|failure| failure.region_mismatch()) =>
+                {
+                    return Err(error);
+                }
+                Err(error) if self.args.delete => {
+                    self.progress
+                        .error(&format!("list S3 destination: {error:#}"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(())
+    }
+    async fn check_upload_placement(&self, single_object: Option<bool>) -> Result<()> {
         if self.args.target_existence == Existence::Any {
             return Ok(());
         }
@@ -451,17 +466,16 @@ impl Engine {
         } else {
             format!("{target}/")
         };
-        let present =
-            exact || client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
+        let needs_prefix = self.args.target_existence == Existence::Existing
+            && (self.args.placement != Placement::As || single_object == Some(false));
+        let present = (!needs_prefix && exact)
+            || client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
         if (self.args.target_existence == Existence::New && present)
             || (self.args.target_existence == Existence::Existing && !present)
         {
             bail!("S3 destination existence condition failed");
         }
-        if self.args.placement == Placement::As
-            && plan.first().is_some_and(|s| s.kind() == "file")
-            && present
-            && !exact
+        if self.args.placement == Placement::As && single_object == Some(true) && present && !exact
         {
             bail!("S3 destination is a prefix, not an object");
         }
@@ -1118,7 +1132,7 @@ impl Engine {
     }
     async fn download_plan(
         &self,
-        destination: &Destination,
+        destination_prefix: &str,
     ) -> Result<(Vec<Download>, super::prune::Plan)> {
         let mut prune = super::prune::Plan::default();
         let count = self.args.locations.len() - 1;
@@ -1154,7 +1168,7 @@ impl Engine {
             for (_, entry) in manifest.entries {
                 selectors.push((
                     local::join(&base, &local::key_path(&entry.src)?),
-                    local::join(&destination.prefix, &local::key_path(&entry.dst)?),
+                    local::join(destination_prefix, &local::key_path(&entry.dst)?),
                     match entry.kind.map(|k| k.label()) {
                         Some("dir") => SourceSelection::Directory,
                         Some("file" | "symlink") => SourceSelection::File,
@@ -1168,10 +1182,10 @@ impl Engine {
             for location in &self.args.locations[..count] {
                 let key = local::join(&base, &local::key_path(&location.path)?);
                 let path = if self.args.placement == Placement::As || location.copies_contents() {
-                    destination.prefix.clone()
+                    destination_prefix.to_owned()
                 } else {
                     local::join(
-                        &destination.prefix,
+                        destination_prefix,
                         &local::key_path(
                             crate::cli::native_basename(&location.path)
                                 .context("source has no basename")?,
@@ -1180,6 +1194,9 @@ impl Engine {
                 };
                 selectors.push((key, path, location.selection, None, None));
             }
+        }
+        if self.options.source_bucket.is_some() && selectors.iter().any(|s| s.4.is_some()) {
+            bail!("S3-to-S3 copies stay server-side; mapping expected digests require reading object contents and are not supported");
         }
         let matcher = crate::scan::build_ignore(&self.args.ignore_lines)?;
         let min = self
@@ -1196,10 +1213,38 @@ impl Engine {
             .map(crate::cli::parse_size)
             .transpose()?
             .unwrap_or(u64::MAX);
+        let source_bucket = self
+            .options
+            .source_bucket
+            .as_deref()
+            .unwrap_or(&self.options.bucket);
         let mut out = Vec::new();
         let mut claims = BTreeMap::new();
         let mut excluded_subtrees = HashSet::new();
-        for (key, path, selection, declared_kind, expected_digest) in selectors {
+        let same_bucket =
+            self.options.source_bucket.as_deref() == Some(self.options.bucket.as_str());
+        let mut copy_sources = Vec::new();
+        let mut copy_targets = Vec::new();
+        // Keep selector order for claims, but overlap bounded source metadata reads.
+        let mut selectors = stream::iter(selectors)
+            .map(|selector| async move {
+                let prefix = self.args.native_mapping.is_none()
+                    && matches!(
+                        selector.2,
+                        SourceSelection::Contents | SourceSelection::Directory
+                    );
+                let head =
+                    if self.options.source_bucket.is_some() && !selector.0.is_empty() && !prefix {
+                        self.copy_head(source_bucket, &selector.0).await?
+                    } else {
+                        None
+                    };
+                Ok::<_, anyhow::Error>((selector, head))
+            })
+            .buffered(32);
+        while let Some(selector) = selectors.next().await {
+            let ((key, path, selection, declared_kind, expected_digest), mut copy_source) =
+                selector?;
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
                 selection,
@@ -1213,8 +1258,12 @@ impl Engine {
             let exact = async {
                 let exact = if key.is_empty() {
                     None
+                } else if self.options.source_bucket.is_some()
+                    && !(directory && self.args.native_mapping.is_none())
+                {
+                    copy_source.as_ref().map(|(object, _)| object.clone())
                 } else {
-                    client::head(&self.client, &self.options.bucket, &key).await?
+                    client::head(&self.client, source_bucket, &key).await?
                 };
                 if exact.is_some() && directory && self.args.native_mapping.is_none() {
                     bail!("S3 selector requires a prefix but an object exists at {key:?}");
@@ -1229,7 +1278,7 @@ impl Engine {
                     exact,
                     client::list(
                         &self.client,
-                        &self.options.bucket,
+                        source_bucket,
                         &prefix,
                         matcher.as_ref(),
                         &mut excluded_subtrees
@@ -1245,9 +1294,16 @@ impl Engine {
                 // copies its marker, while explicit child entries copy children.
                 let object = match exact {
                     Some(object) => object,
-                    None => client::head(&self.client, &self.options.bucket, &format!("{key}/"))
-                        .await?
-                        .context("S3 mapping source object or directory marker is missing")?,
+                    None => {
+                        let marker = format!("{key}/");
+                        let object = if self.options.source_bucket.is_some() {
+                            copy_source = self.copy_head(source_bucket, &marker).await?;
+                            copy_source.as_ref().map(|(object, _)| object.clone())
+                        } else {
+                            client::head(&self.client, source_bucket, &marker).await?
+                        };
+                        object.context("S3 mapping source object or directory marker is missing")?
+                    }
                 };
                 if declared_kind.is_some_and(|kind| kind != object.kind()) {
                     bail!("S3 source type does not match mapping");
@@ -1267,7 +1323,7 @@ impl Engine {
                     None => {
                         client::list(
                             &self.client,
-                            &self.options.bucket,
+                            source_bucket,
                             &prefix,
                             matcher.as_ref(),
                             &mut excluded_subtrees,
@@ -1281,6 +1337,17 @@ impl Engine {
                 self.progress
                     .files_excluded
                     .fetch_add(listed.excluded, Relaxed);
+                if same_bucket {
+                    copy_sources.push((prefix.clone(), true));
+                    copy_targets.push((
+                        if path.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{path}/")
+                        },
+                        true,
+                    ));
+                }
                 if self.args.delete {
                     prune.scope(path.as_bytes(), key.as_bytes());
                 }
@@ -1322,10 +1389,26 @@ impl Engine {
                 if path.is_empty() && !directory {
                     bail!("cannot replace the destination directory with an object");
                 }
+                if same_bucket && !already_filtered {
+                    copy_sources.push((key.clone(), false));
+                    copy_targets.push((
+                        if directory {
+                            format!("{path}/")
+                        } else {
+                            path.clone()
+                        },
+                        false,
+                    ));
+                }
                 local::claim(&mut claims, &path, directory)?;
                 if self.args.delete {
                     if directory {
                         prune.claim(path.as_bytes());
+                    } else if self.options.source_bucket.is_some()
+                        && !self.args.ignore_existing
+                        && !self.args.existing
+                    {
+                        prune.claim_file(path.as_bytes());
                     } else {
                         prune.protect(path.as_bytes());
                     }
@@ -1335,8 +1418,12 @@ impl Engine {
                     path,
                     size,
                     expected_digest: expected_digest.clone(),
+                    copy_source: copy_source.take().map(Box::new),
                 });
             }
+        }
+        if same_bucket {
+            server_copy::check_overlap(&copy_sources, &copy_targets)?;
         }
         Ok((out, prune))
     }

@@ -1,4 +1,4 @@
-//! Native local/S3 copies. The S3 client and its durable formats are independent
+//! Native local/S3 and server-side S3 copies. The S3 client and its durable formats are independent
 //! of the filesystem helper protocol: credentials never enter an SSH request.
 mod admission;
 mod checksum;
@@ -59,7 +59,9 @@ impl std::str::FromStr for Header {
                 | "x-amz-content-sha256"
                 | "x-amz-date"
                 | "x-amz-security-token"
-        ) || name.starts_with("x-amz-checksum-")
+        ) || name.starts_with("x-amz-copy-source")
+            || matches!(name, "x-amz-metadata-directive" | "x-amz-tagging-directive")
+            || name.starts_with("x-amz-checksum-")
             || name.starts_with("x-amz-meta-syq-")
         {
             return Err(format!("header {name} is managed by syq"));
@@ -79,7 +81,7 @@ pub(crate) struct Flags {
     /// AWS shared configuration/credentials profile
     #[arg(long, value_name = "NAME", help_heading = "Object storage")]
     s3_profile: Option<String>,
-    /// Add a header before signing every S3 request (repeatable)
+    /// Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused)
     #[arg(long, value_name = "NAME: VALUE", help_heading = "Object storage")]
     s3_header: Vec<Header>,
 }
@@ -87,6 +89,7 @@ pub(crate) struct Flags {
 #[derive(Clone, Debug)]
 pub(crate) struct Options {
     pub bucket: String,
+    pub source_bucket: Option<String>,
     pub upload: bool,
     pub endpoint: Option<String>,
     pub region: Option<String>,
@@ -137,9 +140,6 @@ impl Options {
             }
             return Ok(None);
         }
-        if from.is_some() && to.is_some() {
-            bail!("S3 copies require one local endpoint");
-        }
         for id in [
             "inplace",
             "auth_from",
@@ -168,13 +168,33 @@ impl Options {
                 );
             }
         }
-        let bucket = from.or(to).unwrap().strip_prefix("s3://").unwrap();
-        if bucket.is_empty()
-            || bucket
-                .bytes()
-                .any(|c| !c.is_ascii_alphanumeric() && !b".-_".contains(&c))
-        {
-            bail!(
+        if from.is_some() && to.is_some() {
+            for Header(name, _) in &flags.s3_header {
+                if name.starts_with("x-amz-meta-")
+                    || matches!(
+                        name.as_str(),
+                        "content-type"
+                            | "content-encoding"
+                            | "content-language"
+                            | "content-disposition"
+                            | "cache-control"
+                            | "expires"
+                            | "x-amz-tagging"
+                            | "x-amz-website-redirect-location"
+                    )
+                {
+                    bail!("--s3-header {name} is not supported for S3-to-S3 copies: metadata and tag overrides behave differently for single-request and multipart copies");
+                }
+            }
+        }
+        let bucket = to.or(from).unwrap().strip_prefix("s3://").unwrap();
+        for endpoint in [from, to].into_iter().flatten() {
+            let name = endpoint.strip_prefix("s3://").unwrap();
+            anyhow::ensure!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b".-_".contains(&c)),
                 "S3 endpoints must be s3://BUCKET; select keys with source and placement options"
             );
         }
@@ -200,6 +220,9 @@ impl Options {
         }
         Ok(Some(Self {
             bucket: bucket.to_owned(),
+            source_bucket: from
+                .filter(|_| to.is_some())
+                .map(|s| s.strip_prefix("s3://").unwrap().to_owned()),
             upload: to.is_some(),
             endpoint: flags.s3_endpoint,
             region: flags.s3_region,

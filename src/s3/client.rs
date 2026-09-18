@@ -164,26 +164,45 @@ fn response_region(
         .map(str::to_owned)
 }
 
-/// Describe a failed request. A bodyless redirect otherwise reads as an
-/// "unhandled error", although S3 says where the bucket is.
+#[derive(Debug)]
+pub(super) struct RequestFailure {
+    operation: String,
+    status: Option<u16>,
+    region: Option<String>,
+}
+impl RequestFailure {
+    pub(super) fn region_mismatch(&self) -> bool {
+        self.status == Some(301) && self.region.is_some()
+    }
+}
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed", self.operation)?;
+        if let Some(status) = self.status {
+            write!(f, " (HTTP {status})")?;
+        }
+        if let (Some(301), Some(region)) = (self.status, &self.region) {
+            write!(
+                f,
+                ": the bucket is in region {region}; pass --s3-region {region} or set AWS_REGION"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Preserve structured region information for the two-endpoint copy diagnostic.
 pub(super) fn failure<E>(
     operation: &str,
     error: &aws_sdk_s3::error::SdkError<
         E,
         aws_smithy_runtime_api::client::orchestrator::HttpResponse,
     >,
-) -> String {
-    let response = error.raw_response();
-    match (
-        response.map(|r| r.status().as_u16()),
-        response_region(response),
-    ) {
-        (Some(301), Some(region)) => format!(
-            "{operation} failed (HTTP 301): the bucket is in region {region}; \
-             pass --s3-region {region} or set AWS_REGION"
-        ),
-        (Some(status), _) => format!("{operation} failed (HTTP {status})"),
-        (None, _) => format!("{operation} failed"),
+) -> RequestFailure {
+    RequestFailure {
+        operation: operation.into(),
+        status: error.raw_response().map(|r| r.status().as_u16()),
+        region: response_region(error.raw_response()),
     }
 }
 
@@ -434,20 +453,69 @@ impl Object {
 }
 
 pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Option<Object>> {
-    let output = match client.head_object().bucket(bucket).key(key).send().await {
-        Ok(output) => output,
-        Err(error)
-            if error
-                .raw_response()
-                .is_some_and(|r| r.status().as_u16() == 404) =>
-        {
-            return Ok(None)
-        }
-        Err(error) => {
-            let message = failure("S3 HEAD", &error);
-            return Err(error.into_service_error()).context(message);
-        }
+    head_output(client, bucket, key, None)
+        .await?
+        .map(|output| from_head(key, &output))
+        .transpose()
+}
+
+/// Read metadata, optionally probing checksum support for server-copy comparisons.
+/// Admission is controlled by the caller so ordinary HEAD behavior is unchanged.
+pub(super) async fn head_output(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    unsupported: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Option<aws_sdk_s3::operation::head_object::HeadObjectOutput>> {
+    use aws_sdk_s3::types::ChecksumMode;
+    use std::sync::atomic::Ordering::Relaxed;
+    let request = client.head_object().bucket(bucket).key(key);
+    let checksums = unsupported.is_some_and(|flag| !flag.load(Relaxed));
+    let result = if checksums {
+        request
+            .clone()
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+    } else {
+        request.clone().send().await
     };
+    let result = match result {
+        Err(e)
+            if checksums
+                && e.raw_response()
+                    .is_some_and(|r| matches!(r.status().as_u16(), 400 | 403 | 501)) =>
+        {
+            // Only NotImplemented establishes an unsupported capability. Generic
+            // bad requests and access denials can depend on the object or request.
+            if e.raw_response().is_some_and(|r| r.status().as_u16() == 501) {
+                if let Some(flag) = unsupported {
+                    flag.store(true, Relaxed);
+                }
+            }
+            request.send().await
+        }
+        result => result,
+    };
+    match result {
+        Ok(output) => Ok(Some(output)),
+        Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => Ok(None),
+        Err(e) => {
+            let operation = if unsupported.is_some() {
+                "S3 copy HEAD"
+            } else {
+                "S3 HEAD"
+            };
+            let detail = failure(operation, &e);
+            Err(anyhow::Error::new(e.into_service_error()).context(detail))
+        }
+    }
+}
+
+pub(super) fn from_head(
+    key: &str,
+    output: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+) -> Result<Object> {
     let size = u64::try_from(
         output
             .content_length()
@@ -458,14 +526,14 @@ pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Opt
     if metadata.as_ref().is_some_and(|m| m.kind == "dir") && (!key.ends_with('/') || size != 0) {
         bail!("invalid syq directory marker");
     }
-    Ok(Some(Object {
+    Ok(Object {
         key: key.to_owned(),
         size,
         etag,
         version: output.version_id().map(str::to_owned),
         metadata,
         mtime: output.last_modified().map_or(0, |t| t.secs()),
-    }))
+    })
 }
 
 /// Existence needs only one object, regardless of the size of the prefix.

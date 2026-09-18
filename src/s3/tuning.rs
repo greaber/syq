@@ -24,21 +24,22 @@ impl Tuning {
         Self {
             control_ns: control,
             reads: crate::s3::read_recovery::Recovery::default(),
-            upload: options.upload,
+            upload: options.upload && options.source_bucket.is_none(),
             fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
             // These measured seeds describe provider request behavior; they do
             // not change the data route, integrity policy, or explicit overrides.
-            tigris: options
-                .endpoint
-                .as_deref()
-                .and_then(|s| url::Url::parse(s).ok())
-                .and_then(|u| u.host_str().map(str::to_owned))
-                .is_some_and(|host| {
-                    host == "t3.storage.dev"
-                        || host == "fly.storage.tigris.dev"
-                        || host.ends_with(".tigris.dev")
-                }),
+            tigris: options.source_bucket.is_none()
+                && options
+                    .endpoint
+                    .as_deref()
+                    .and_then(|s| url::Url::parse(s).ok())
+                    .and_then(|u| u.host_str().map(str::to_owned))
+                    .is_some_and(|host| {
+                        host == "t3.storage.dev"
+                            || host == "fly.storage.tigris.dev"
+                            || host.ends_with(".tigris.dev")
+                    }),
             requests: Arc::new(Budget::new(
                 args.tuning_options
                     .and_then(|t| t.s3_requests)
@@ -61,6 +62,10 @@ impl Tuning {
     pub fn configure(&self, tiny: bool, request_cap: usize, seed: usize) {
         let request_cap = request_cap.max(self.fixed_requests.unwrap_or(1));
         let mut s = self.requests.state.lock().unwrap();
+        // Configuration separates completed planning from transfer admission.
+        // Planning HEADs use permits but supply no transfer-throughput samples.
+        s.since = None;
+        s.saturated = false;
         s.max = request_cap;
         s.limit = self.fixed_requests.unwrap_or(seed).min(request_cap);
         if self.fixed_requests.is_none() && tiny && self.high_latency() {
@@ -71,6 +76,10 @@ impl Tuning {
     }
     pub fn tigris(&self) -> bool {
         self.tigris
+    }
+    pub fn request_capacity(&self) -> usize {
+        self.fixed_requests
+            .unwrap_or_else(|| self.requests.state.lock().unwrap().max)
     }
     pub fn request_limit(&self) -> usize {
         self.requests.state.lock().unwrap().limit
@@ -405,6 +414,45 @@ mod tests {
         let _next = budget.acquire().await;
         let next_since = budget.state.lock().unwrap().since;
         assert_eq!(next_since, since);
+    }
+
+    #[tokio::test]
+    async fn transfer_configuration_discards_planning_admission_time() {
+        let tuning = Tuning {
+            control_ns: Arc::new(AtomicU64::new(u64::MAX)),
+            reads: crate::s3::read_recovery::Recovery::default(),
+            fixed_requests: None,
+            tigris: false,
+            upload: false,
+            requests: Arc::new(Budget::new(1, true)),
+            upload_buffers: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let planning = tuning.requests.acquire().await;
+        let mut waiting = Box::pin(tuning.requests.acquire());
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        drop(waiting);
+        drop(planning);
+        {
+            let state = tuning.requests.state.lock().unwrap();
+            assert!(state.since.is_some());
+            assert!(state.saturated);
+            assert_eq!(state.active, 0);
+        }
+        tuning.configure(false, 256, 64);
+        {
+            let state = tuning.requests.state.lock().unwrap();
+            assert!(state.since.is_none());
+            assert!(!state.saturated);
+        }
+        let started = Instant::now();
+        let _transfer = tuning.requests.acquire().await;
+        assert!(tuning.requests.state.lock().unwrap().since.unwrap() >= started);
+        for _ in 0..16 {
+            tuning.requests.completed(1024);
+        }
+        let state = tuning.requests.state.lock().unwrap();
+        assert_eq!(state.limit, 64);
+        assert!(state.previous.is_none());
     }
 
     #[test]
