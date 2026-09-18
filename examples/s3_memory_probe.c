@@ -24,6 +24,20 @@ static int budget_active_requests;
 static int budget_window_clamp;
 static int actual_configured[4096];
 static _Atomic unsigned active_requests;
+static unsigned reserved_requests;
+static double below_since;
+static _Atomic unsigned long resize_calls;
+
+static double monotonic_seconds(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec + now.tv_nsec / 1e9;
+}
+static unsigned rounded_requests(unsigned count) {
+    unsigned step = 1;
+    for (unsigned n = count; n > 16; n >>= 1) step <<= 1;
+    return (count + step - 1) / step * step;
+}
 static unsigned socket_count;
 static _Atomic unsigned tracked_sockets;
 static _Atomic unsigned long configured_total;
@@ -36,12 +50,7 @@ static _Atomic unsigned long configured_total;
 static void rebudget(void) {
     unsigned long total = 0;
     if (socket_count) {
-        unsigned count = budget_active_requests ? atomic_load(&active_requests) : socket_count;
-        // Round concurrency upward by at most 12.5% to avoid touching every
-        // socket for each request completion/replacement at high concurrency.
-        unsigned step = 1;
-        for (unsigned n = count; n > 16; n >>= 1) step <<= 1;
-        unsigned divisor = (count + step - 1) / step * step;
+        unsigned divisor = budget_active_requests ? reserved_requests : socket_count;
         unsigned long allowance = divisor ? receive_budget / (2 * divisor) : 16384;
         if (allowance < 16384) allowance = 16384;
         if (allowance > 64 * 1024 * 1024) allowance = 64 * 1024 * 1024;
@@ -53,6 +62,7 @@ static void rebudget(void) {
             }
             if (setsockopt(sockets[i], SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes))) _exit(115);
             configured[i] = bytes;
+            atomic_fetch_add(&resize_calls, 1);
             int actual;
             socklen_t size = sizeof(actual);
             if (getsockopt(sockets[i], SOL_SOCKET, SO_RCVBUF, &actual, &size)) _exit(116);
@@ -66,6 +76,28 @@ static void rebudget(void) {
     atomic_store(&configured_total, total);
 }
 
+// Tighten immediately when request concurrency rises; only expand after
+// lower concurrency persists for 100 ms. Short request turnover must not cause
+// an O(socket_count) series of setsockopt calls at every completion.
+static void update_active_budget(int allow_expand) {
+    unsigned wanted = rounded_requests(atomic_load(&active_requests));
+    if (wanted > reserved_requests) {
+        reserved_requests = wanted;
+        below_since = 0;
+        rebudget();
+    } else if (wanted < reserved_requests) {
+        double now = monotonic_seconds();
+        if (!below_since) below_since = now;
+        if (allow_expand && now - below_since >= .1) {
+            reserved_requests = wanted;
+            below_since = 0;
+            rebudget();
+        }
+    } else {
+        below_since = 0;
+    }
+}
+
 // Called by an RAII guard in the Rust experiment, including cancellation/error
 // paths. The guard starts before HTTP dispatch and ends after consuming the body.
 void syq_spike_request_delta(int delta) {
@@ -76,7 +108,7 @@ void syq_spike_request_delta(int delta) {
     else if (delta == -1 && current) --current;
     else _exit(119);
     atomic_store(&active_requests, current);
-    rebudget();
+    update_active_budget(0);
     pthread_mutex_unlock(&sockets_lock);
 }
 
@@ -108,10 +140,15 @@ static void *sample_heap(void *unused) {
     (void)unused;
     FILE *out = fopen("/output/.allocator.csv", "w");
     if (!out) _exit(110);
-    fprintf(out, "seconds,arena,uordblks,fordblks,hblkhd,connections,initial_rcvbuf,rtt_us,current_rcvbuf,tracked_sockets,configured_total,active_requests,window_clamp,rcv_ssthresh\n");
+    fprintf(out, "seconds,arena,uordblks,fordblks,hblkhd,connections,initial_rcvbuf,rtt_us,current_rcvbuf,tracked_sockets,configured_total,active_requests,window_clamp,rcv_ssthresh,resize_calls\n");
     struct timespec start, now, interval = {.tv_nsec = 100000000};
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int i = 0; i < 6000; ++i) {
+        if (receive_budget && budget_active_requests) {
+            pthread_mutex_lock(&sockets_lock);
+            update_active_budget(1);
+            pthread_mutex_unlock(&sockets_lock);
+        }
         struct mallinfo2 m = mallinfo2();
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed = now.tv_sec - start.tv_sec + (now.tv_nsec - start.tv_nsec) / 1e9;
@@ -124,11 +161,11 @@ static void *sample_heap(void *unused) {
         int clamp = 0;
         socklen_t clamp_size = sizeof(clamp);
         if (getsockopt(fd, IPPROTO_TCP, TCP_WINDOW_CLAMP, &clamp, &clamp_size)) clamp = 0;
-        fprintf(out, "%.6f,%zu,%zu,%zu,%zu,%u,%d,%u,%d,%u,%lu,%u,%d,%u\n", elapsed,
+        fprintf(out, "%.6f,%zu,%zu,%zu,%zu,%u,%d,%u,%d,%u,%lu,%u,%d,%u,%lu\n", elapsed,
                 m.arena, m.uordblks, m.fordblks, m.hblkhd,
                 atomic_load(&connections), atomic_load(&observed_receive_bytes),
                 info.tcpi_rtt, current_receive, atomic_load(&tracked_sockets),
-                atomic_load(&configured_total), atomic_load(&active_requests), clamp, info.tcpi_rcv_ssthresh);
+                atomic_load(&configured_total), atomic_load(&active_requests), clamp, info.tcpi_rcv_ssthresh, atomic_load(&resize_calls));
         fflush(out);
         nanosleep(&interval, NULL);
     }
@@ -181,4 +218,8 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {
     }
     errno = saved_errno;
     return result;
+}
+
+__attribute__((destructor)) static void check_request_balance(void) {
+    if (receive_budget && budget_active_requests && atomic_load(&active_requests)) _exit(121);
 }
