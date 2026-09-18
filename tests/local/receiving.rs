@@ -605,6 +605,7 @@ fn owned_receiver_wait_respects_deadline_with_partial_identity_reply() {
         write(&path, &serde_json::to_vec(&value).unwrap());
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let responder = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut socket = loop {
@@ -628,9 +629,14 @@ fn owned_receiver_wait_respects_deadline_with_partial_identity_reply() {
             if socket.write_all(&[byte]).is_err() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            if stop_rx
+                .recv_timeout(std::time::Duration::from_millis(400))
+                .is_ok()
+            {
+                return;
+            }
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = stop_rx.recv_timeout(std::time::Duration::from_secs(2));
     });
     let start = std::time::Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
@@ -647,6 +653,9 @@ fn owned_receiver_wait_respects_deadline_with_partial_identity_reply() {
         .output()
         .unwrap();
     let elapsed = start.elapsed();
+    // The reply stays incomplete until the client exits; fixture cleanup does
+    // not need to consume the rest of the artificial server delay.
+    let _ = stop_tx.send(());
     responder.join().unwrap();
     assert!(!output.status.success());
     assert!(
