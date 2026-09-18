@@ -15,12 +15,26 @@ done
 docker compose version >/dev/null 2>&1 || die 'real-SSH tests need Docker Compose'
 
 profile=default
-if [ "$#" -gt 0 ]; then
-  if [ "$#" -ne 2 ] || [ "$1" != --profile ]; then
-    die 'usage: scripts/test-real-ssh.sh [--profile max-sessions-1]'
-  fi
-  profile=$2
-fi
+suite=core
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --profile|--suite)
+      [ "$#" -ge 2 ] || die "missing value for $1"
+      case "$1" in
+        --profile) profile=$2 ;;
+        --suite) suite=$2 ;;
+      esac
+      shift 2
+      ;;
+    *) die 'usage: scripts/test-real-ssh.sh [--profile max-sessions-1] [--suite core|benchmark]' ;;
+  esac
+done
+case "$suite" in
+  core|benchmark) ;;
+  *) die "unknown real-SSH test suite: $suite" ;;
+esac
+[ "$suite" != benchmark ] || [ "$profile" = default ] ||
+  die 'the benchmark suite requires the default SSH profile'
 
 root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'run this from a syq checkout'
 cd "$root"
@@ -42,6 +56,7 @@ token=${state##*.}
 project="syq-real-ssh-${token,,}"
 export SYQ_REAL_SSH_IMAGE="$project-node"
 export SYQ_REAL_SSH_STATE=$state
+export SYQ_REAL_SSH_SUITE=$suite
 
 compose=(docker compose --project-name "$project" "${compose_files[@]}")
 passed=false
@@ -76,11 +91,15 @@ revision=$(git rev-parse --short=12 HEAD)
 if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
   revision="$revision (dirty)"
 fi
-printf 'building real-SSH lab for syq %s (profile %s)\n' "$revision" "$profile"
+printf 'building real-SSH lab for syq %s (profile %s, suite %s)\n' "$revision" "$profile" "$suite"
 "${compose[@]}" config --quiet
+build_started=$SECONDS
 "${compose[@]}" build runner
+printf 'real-SSH build: %ss\n' "$((SECONDS - build_started))"
+execution_started=$SECONDS
 "${compose[@]}" up --detach --wait --wait-timeout 60 source destination
 "${compose[@]}" run --rm --no-deps runner
 
 passed=true
-printf 'real-SSH integration tests passed for syq %s (profile %s)\n' "$revision" "$profile"
+printf 'real-SSH integration tests passed for syq %s (profile %s, suite %s) in %ss excluding build\n' \
+  "$revision" "$profile" "$suite" "$((SECONDS - execution_started))"
