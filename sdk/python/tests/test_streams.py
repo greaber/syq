@@ -151,6 +151,17 @@ class StreamTests(unittest.TestCase):
                 output.abort()
         self.assertFalse(list(self.root.glob('.syq-stream-*')))
 
+    def test_explicit_abort_inside_context_cancels_normal_exit(self):
+        target = self.root / 'abort-in-context'
+        target.write_bytes(b'old')
+        with self.client.open_writer(as_=target) as output:
+            output.write(b'new')
+            output.close()
+            output.abort()
+        self.assertEqual(target.read_bytes(), b'old')
+        with self.assertRaises(ValueError):
+            output.commit()
+
     def test_text_reader_and_failed_read_all(self):
         target = self.root / 'text-input'
         target.write_text('one\ntwo\n', encoding='utf-8')
@@ -258,6 +269,19 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                 await output.write(b'explicit')
                 await output.commit()
                 self.assertEqual(target.read_bytes(), b'explicit')
+
+    async def test_explicit_abort_inside_context_cancels_normal_exit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp).resolve() / 'target'
+            target.write_bytes(b'old')
+            client = syq.AsyncClient(executable=SYQ, timeout=10)
+            async with client.open_writer(as_=target) as output:
+                await output.write(b'new')
+                await output.close()
+                await output.abort()
+            self.assertEqual(target.read_bytes(), b'old')
+            with self.assertRaises(ValueError):
+                await output.commit()
 
     async def test_failed_read_all_reports_transfer_error(self):
         with tempfile.TemporaryDirectory() as temp:

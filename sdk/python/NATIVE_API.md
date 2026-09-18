@@ -155,7 +155,8 @@ after closing the payload; EOF alone cannot publish a managed upload. An
 exception in the writer body before commit aborts without replacing the destination.
 `close()` only ends payload input, so a buffered or text wrapper can close it
 while unwinding an exception without publishing partial data. Successful
-context exit commits even if a wrapper already closed the payload.
+context exit commits even if a wrapper already closed the payload. Calling
+`abort()` explicitly cancels that automatic commit.
 
 Outside a context, finish with `commit()` or `abort()`; `close()` alone leaves
 the transfer pending. `commit()` can follow payload closure, is repeatable

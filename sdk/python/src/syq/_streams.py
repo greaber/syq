@@ -184,7 +184,8 @@ class StreamWriter:
 
     def __exit__(self, typ, value, traceback) -> None:
         if typ is None:
-            self.commit()
+            if not self._aborted:
+                self.commit()
         else:
             self.abort()
 
@@ -384,10 +385,8 @@ class _AsyncStream:
 
 class AsyncStreamWriter(_AsyncStream):
     async def __aexit__(self, typ, value, traceback) -> None:
-        if typ is None:
-            await self.commit()
-        else:
-            await self.abort()
+        stream = self._active()
+        await _call(stream, stream.__exit__, typ, value, traceback)
 
     async def commit(self) -> None:
         stream = self._active()
