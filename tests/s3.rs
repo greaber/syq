@@ -186,17 +186,6 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
-    if fault == "upload-region-discovery" {
-        assert_eq!(method, "GET", "mutation followed failed region discovery");
-        reply(
-            &mut socket,
-            301,
-            &[("x-amz-bucket-region".into(), "eu-central-1".into())],
-            b"",
-            false,
-        );
-        return;
-    }
     if fault == "marker-head-failure" {
         let path = first.split_whitespace().nth(1).unwrap();
         if method == "HEAD" {
@@ -4175,7 +4164,7 @@ fn server_copy_filters_exact_and_mapping_overlap() {
 #[test]
 fn upload_region_discovery_failure_stops_with_and_without_prune() {
     for prune in [false, true] {
-        let server = Server::start("upload-region-discovery");
+        let server = Server::start("wrong-region");
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("source")).unwrap();
         for name in ["a", "b"] {
@@ -4204,41 +4193,34 @@ fn upload_region_discovery_failure_stops_with_and_without_prune() {
 }
 
 #[test]
-fn server_copy_failed_marker_reports_directory_action() {
-    let server = Server::start("marker-head-failure");
-    let temp = tempfile::tempdir().unwrap();
-    let output = server.cp(
-        temp.path(),
-        &[
-            "--from",
-            "s3://source",
-            "--srcs-in",
-            "data",
-            "--to",
-            "s3://destination",
-            "--into",
-            "out",
-            "--results",
-            "results.jsonl",
-        ],
-    );
-    assert!(!output.status.success(), "{}", output_text(&output));
-    let results = std::fs::read_to_string(temp.path().join("results.jsonl")).unwrap();
-    let records: Vec<serde_json::Value> = results
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert!(
-        records
-            .iter()
-            .any(|record| record["action"] == "create_directory"
-                && record["disposition"] == "failed"),
-        "{results}"
-    );
-    assert!(
-        !records
-            .iter()
-            .any(|record| record["action"] == "transfer_file"),
-        "{results}"
-    );
+fn failed_marker_reports_directory_action_on_both_routes() {
+    for server_copy in [false, true] {
+        let server = Server::start("marker-head-failure");
+        let temp = tempfile::tempdir().unwrap();
+        let mut args = vec!["--from", "s3://source", "--srcs-in", "data"];
+        if server_copy {
+            args.extend(["--to", "s3://destination"]);
+        }
+        args.extend(["--into", "out", "--results", "results.jsonl"]);
+        let output = server.cp(temp.path(), &args);
+        assert!(!output.status.success(), "{}", output_text(&output));
+        let results = std::fs::read_to_string(temp.path().join("results.jsonl")).unwrap();
+        let records: Vec<serde_json::Value> = results
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            records
+                .iter()
+                .any(|record| record["action"] == "create_directory"
+                    && record["disposition"] == "failed"),
+            "{results}"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["action"] == "transfer_file"),
+            "{results}"
+        );
+    }
 }

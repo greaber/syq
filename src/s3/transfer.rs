@@ -162,7 +162,7 @@ impl Engine {
     }
 
     async fn copy(self: Arc<Self>) -> Result<()> {
-        if matches!(self.options.route, Route::ServerCopy { .. }) {
+        if self.options.route.is_server_copy() {
             return self.server_copy().await;
         }
         if self.options.route == Route::Upload {
@@ -229,7 +229,11 @@ impl Engine {
                 let dirs = directories.clone();
                 async move {
                     engine.check_cancelled()?;
-                    let mut kind = "file";
+                    let mut kind = if client::is_directory_marker(&job.key, job.size) {
+                        "dir"
+                    } else {
+                        "file"
+                    };
                     let result = engine.download(&job, &dst, dirs, &mut kind).await;
                     engine.settle(
                         job.key.as_bytes(),
@@ -1196,9 +1200,7 @@ impl Engine {
                 selectors.push((key, path, location.selection, None, None));
             }
         }
-        if matches!(self.options.route, Route::ServerCopy { .. })
-            && selectors.iter().any(|s| s.4.is_some())
-        {
+        if self.options.route.is_server_copy() && selectors.iter().any(|s| s.4.is_some()) {
             bail!("S3-to-S3 copies stay server-side; mapping expected digests require reading object contents and are not supported");
         }
         let matcher = crate::scan::build_ignore(&self.args.ignore_lines)?;
@@ -1235,14 +1237,12 @@ impl Engine {
                         selector.2,
                         SourceSelection::Contents | SourceSelection::Directory
                     );
-                let head = if matches!(self.options.route, Route::ServerCopy { .. })
-                    && !selector.0.is_empty()
-                    && !prefix
-                {
-                    self.copy_head(source_bucket, &selector.0).await?
-                } else {
-                    None
-                };
+                let head =
+                    if self.options.route.is_server_copy() && !selector.0.is_empty() && !prefix {
+                        self.copy_head(source_bucket, &selector.0).await?
+                    } else {
+                        None
+                    };
                 Ok::<_, anyhow::Error>((selector, head))
             })
             .buffered(32);
@@ -1262,7 +1262,7 @@ impl Engine {
             let exact = async {
                 let exact = if key.is_empty() {
                     None
-                } else if matches!(self.options.route, Route::ServerCopy { .. })
+                } else if self.options.route.is_server_copy()
                     && !(directory && self.args.native_mapping.is_none())
                 {
                     copy_source.as_ref().map(|(object, _)| object.clone())
@@ -1300,7 +1300,7 @@ impl Engine {
                     Some(object) => object,
                     None => {
                         let marker = format!("{key}/");
-                        let object = if matches!(self.options.route, Route::ServerCopy { .. }) {
+                        let object = if self.options.route.is_server_copy() {
                             copy_source = self.copy_head(source_bucket, &marker).await?;
                             copy_source.as_ref().map(|(object, _)| object.clone())
                         } else {
@@ -1363,7 +1363,7 @@ impl Engine {
                     if suffix.is_empty() && contents {
                         continue;
                     }
-                    let suffix = if object.ends_with('/') && size == 0 {
+                    let suffix = if client::is_directory_marker(&object, size) {
                         suffix.trim_end_matches('/')
                     } else {
                         suffix
@@ -1374,7 +1374,7 @@ impl Engine {
                 objects
             };
             for (key, size, path) in objects {
-                let directory = key.ends_with('/') && size == 0;
+                let directory = client::is_directory_marker(&key, size);
                 if !already_filtered {
                     if let Some(excluded) =
                         client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
@@ -1408,7 +1408,7 @@ impl Engine {
                 if self.args.delete {
                     if directory {
                         prune.claim(path.as_bytes());
-                    } else if matches!(self.options.route, Route::ServerCopy { .. })
+                    } else if self.options.route.is_server_copy()
                         && !self.args.ignore_existing
                         && !self.args.existing
                     {

@@ -1802,7 +1802,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         if args.devices {
             bail!("--preserve=specials is not supported for S3 copies");
         }
-        if matches!(options.route, crate::s3::Route::ServerCopy { .. })
+        if options.route.is_server_copy()
             && (args.checksum
                 || args.verify_only
                 || args.expected_digest.is_some()
@@ -1810,22 +1810,21 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         {
             bail!("S3-to-S3 copies stay server-side; content hash and verification options require reading object contents and are not supported");
         }
-        let index = if options.route != crate::s3::Route::Download {
-            args.locations.len() - 1
-        } else {
-            0
-        };
-        args.locations[index].host = Some(format!("s3://{}", options.bucket));
-        if let Some(bucket) = options.route.source_bucket() {
-            let count = args.locations.len() - 1;
-            for location in &mut args.locations[..count] {
-                location.host = Some(format!("s3://{bucket}"));
+        let (destination, sources) = args.locations.split_last_mut().unwrap();
+        match &options.route {
+            crate::s3::Route::Upload => {
+                destination.host = Some(format!("s3://{}", options.bucket));
             }
-        }
-        if options.route == crate::s3::Route::Download {
-            let count = args.locations.len() - 1;
-            for location in &mut args.locations[..count] {
-                location.host = Some(format!("s3://{}", options.bucket));
+            crate::s3::Route::Download => {
+                for source in sources {
+                    source.host = Some(format!("s3://{}", options.bucket));
+                }
+            }
+            crate::s3::Route::ServerCopy { source_bucket } => {
+                destination.host = Some(format!("s3://{}", options.bucket));
+                for source in sources {
+                    source.host = Some(format!("s3://{source_bucket}"));
+                }
             }
         }
     }

@@ -60,7 +60,7 @@ fn unchanged(source: &Object, old: &Object, a: &HeadObjectOutput, b: &HeadObject
 }
 
 fn copy_destination_key(job: &Download) -> String {
-    if job.key.ends_with('/') && job.size == 0 {
+    if client::is_directory_marker(&job.key, job.size) {
         format!("{}/", job.path)
     } else {
         job.path.clone()
@@ -195,7 +195,7 @@ impl Engine {
             let engine = self.clone();
             async move {
                 engine.check_cancelled()?;
-                let mut kind = if job.size == 0 && job.key.ends_with('/') {
+                let mut kind = if client::is_directory_marker(&job.key, job.size) {
                     "dir"
                 } else {
                     "file"
@@ -220,8 +220,7 @@ impl Engine {
     ) -> Result<Option<u64>> {
         let source_bucket = self.options.route.source_bucket().unwrap();
         let key = copy_destination_key(job);
-        if job.path.is_empty() && job.key.ends_with('/') {
-            *kind = "dir";
+        if job.path.is_empty() && client::is_directory_marker(&job.key, job.size) {
             return Ok(None);
         }
         local::key_path(key.trim_end_matches('/').as_bytes())?;

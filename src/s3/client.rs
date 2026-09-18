@@ -439,10 +439,14 @@ pub(super) struct Object {
     pub metadata: Option<Metadata>,
     pub mtime: i64,
 }
+pub(super) fn is_directory_marker(key: &str, size: u64) -> bool {
+    size == 0 && key.ends_with('/')
+}
+
 impl Object {
     pub fn kind(&self) -> &str {
         self.metadata.as_ref().map_or(
-            if self.key.ends_with('/') && self.size == 0 {
+            if is_directory_marker(&self.key, self.size) {
                 "dir"
             } else {
                 "file"
@@ -523,7 +527,7 @@ pub(super) fn from_head(
     )?;
     let etag = output.e_tag().context("S3 HEAD omitted ETag")?.to_owned();
     let metadata = Metadata::decode(output.metadata())?;
-    if metadata.as_ref().is_some_and(|m| m.kind == "dir") && (!key.ends_with('/') || size != 0) {
+    if metadata.as_ref().is_some_and(|m| m.kind == "dir") && !is_directory_marker(key, size) {
         bail!("invalid syq directory marker");
     }
     Ok(Object {
@@ -716,7 +720,10 @@ pub(super) async fn list(
                         if let Some(Exclusion::Subtree(boundary)) = exclusion(
                             matcher,
                             key,
-                            key.ends_with('/') && object.size() == Some(0),
+                            object
+                                .size()
+                                .and_then(|size| u64::try_from(size).ok())
+                                .is_some_and(|size| is_directory_marker(key, size)),
                             excluded_subtrees,
                         ) {
                             reachable_exclusion |=
@@ -804,7 +811,7 @@ pub(super) async fn list(
                     "S3 listing returned a key outside the requested prefix"
                 );
                 let size = u64::try_from(object.size().context("S3 listing omitted size")?)?;
-                let directory = key.ends_with('/') && size == 0;
+                let directory = is_directory_marker(key, size);
                 if let Some(excluded) = exclusion(matcher, key, directory, excluded_subtrees) {
                     // A filename-only exclusion still encounters the key and
                     // preserves its path validation. Pruned descendants do not.
@@ -868,7 +875,7 @@ pub(super) fn from_get(
         metadata: Metadata::decode(output.metadata())?,
         mtime: output.last_modified().map_or(0, |t| t.secs()),
     };
-    if object.kind() == "dir" && (!key.ends_with('/') || size != 0) {
+    if object.kind() == "dir" && !is_directory_marker(key, size) {
         bail!("invalid syq directory marker");
     }
     Ok(object)

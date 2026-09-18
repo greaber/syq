@@ -94,6 +94,10 @@ pub(crate) enum Route {
     ServerCopy { source_bucket: String },
 }
 impl Route {
+    pub fn is_server_copy(&self) -> bool {
+        matches!(self, Self::ServerCopy { .. })
+    }
+
     pub fn source_bucket(&self) -> Option<&str> {
         match self {
             Self::ServerCopy { source_bucket } => Some(source_bucket),

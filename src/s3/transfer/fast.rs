@@ -23,7 +23,7 @@ impl Engine {
         let average = bytes / count;
         let tiny = average < 1024 * 1024;
         let single_request = largest
-            <= if matches!(self.options.route, Route::ServerCopy { .. }) {
+            <= if self.options.route.is_server_copy() {
                 self.copy_request_limit(largest)
             } else {
                 self.part_size(largest)
@@ -81,7 +81,7 @@ impl Engine {
             && !self.args.verify_only
             && single_request
         {
-            let capacity = if matches!(self.options.route, Route::ServerCopy { .. }) {
+            let capacity = if self.options.route.is_server_copy() {
                 256
             } else if self.options.route == Route::Upload {
                 let buffer_size = if self.tuning.tigris() {
