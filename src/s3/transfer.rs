@@ -2043,7 +2043,7 @@ impl std::error::Error for Permanent {}
 /// throttling and transient conditions: dispatch failures without a response,
 /// retryable statuses, and the error codes S3 can send with other statuses,
 /// such as `RequestTimeout` with HTTP 400.
-fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
+pub(super) fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
     error: &aws_sdk_s3::error::SdkError<
         E,
         aws_smithy_runtime_api::client::orchestrator::HttpResponse,

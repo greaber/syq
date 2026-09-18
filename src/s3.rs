@@ -12,6 +12,7 @@ pub(crate) use remove::RemoveFlags;
 mod prune;
 mod read_recovery;
 mod state;
+pub(crate) mod stream;
 mod transfer;
 mod tuning;
 mod upload_http;

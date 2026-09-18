@@ -452,17 +452,18 @@ pub struct Args {
 }
 
 /// Extra command-line arguments taken from the environment, for adjusting a
-/// `syq cp`, `syq rsync`, or `syq rm` invocation inside a script or program
-/// that does not expose its own settings. Each variable holds one shell-style
+/// `syq cp`, `syq rsync`, `syq rm`, or `syq stream` invocation inside a script
+/// or program that does not expose its own settings. Each variable holds one shell-style
 /// word list that is inserted right after the command name, so the caller's
 /// own arguments come later.
 pub struct EnvironmentOptions(Vec<(&'static str, OsString)>);
 
 impl EnvironmentOptions {
-    pub const VARIABLES: [(&'static str, &'static str); 3] = [
+    pub const VARIABLES: [(&'static str, &'static str); 4] = [
         ("cp", "SYQ_CP_OPTIONS"),
         ("rsync", "SYQ_RSYNC_OPTIONS"),
         ("rm", "SYQ_RM_OPTIONS"),
+        ("stream", "SYQ_STREAM_OPTIONS"),
     ];
 
     /// Read the variables and remove them from the process environment. The
@@ -886,6 +887,9 @@ fn print_root_help(full: bool) {
 /// spelling and hidden flags in one place.
 pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
     match name {
+        "stream" => {
+            Some(crate::help::configure(crate::s3::stream::command()).bin_name("syq stream"))
+        }
         "rsync" => Some(crate::help::filesystem(Args::command())),
         "cp" => Some(crate::help::filesystem(NativeCopyCommand::command())),
         "rm" => Some(crate::help::filesystem(NativeRmCommand::command())),

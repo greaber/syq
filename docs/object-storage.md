@@ -24,6 +24,67 @@ rules can let syq skip entire object subtrees. Download exclusion totals count
 individual excluded files and count each ignored subtree once, without counting
 its descendants. Keys inside ignored subtrees are not validated.
 
+## Shell pipelines
+
+`syq stream` transfers one object's contents without creating a local temporary
+file. Upload from stdin, or download to stdout:
+
+```sh
+gzip -c data | syq stream --to s3://backups --as data.gz
+pg_dump -Fc appdb | syq stream --to s3://backups --as appdb.dump
+syq stream --from s3://backups data.gz | gzip -dc > data
+```
+
+Generation and uploading can overlap, as can downloading and consumption.
+Keys are exact UTF-8 object names: no prefix selection, wildcard expansion by
+syq, or filesystem path normalization. Quote keys containing shell metacharacters.
+The command transfers raw contents, without applying syq file metadata.
+Credentials, profiles, endpoints, regions, and custom headers work as for `cp`.
+[`SYQ_STREAM_OPTIONS`](reference.md#environment-variables-and-local-files) supplies
+extra options when you cannot change a script's command line.
+
+To use a descriptor your application already opened, pass `--read-fd N` for
+uploads or `--write-fd N` for downloads:
+
+```sh
+syq stream --from s3://backups data.gz --write-fd 3 3>data.gz
+```
+
+The descriptor must be inherited by syq and open for the requested direction.
+No descriptor range is reserved; descriptor 2 is reserved for diagnostics.
+Dedicate the descriptor to this transfer while syq runs. Syq leaves its blocking
+or nonblocking mode unchanged. Regular-file descriptors use their current offset and
+are not truncated, renamed, or given copied metadata. Progress and summaries
+are not written; stdout contains only payload when it is the selected output.
+
+Uploads replace the destination object on completion. EOF ends the upload;
+syq cannot distinguish a successful producer from one that exited early.
+In Bash, `set -o pipefail` makes a producer or consumer failure fail the pipeline,
+but it cannot undo an object already uploaded. Downloads can leave partial bytes
+in the consumer after failure. Require a successful exit status before treating
+the transfer as complete; a consumer closing early makes syq fail.
+
+Streams use four parallel parts of 16 MiB by default. Payload buffering is
+bounded by approximately one part per worker plus one input/output part, with
+additional memory for HTTP/TLS. Slow producers or consumers apply backpressure.
+Override these settings with `--performance-tuning s3-part-size=SIZE`,
+`s3-max-concurrent-parts-per-object=N`, or `s3-retries=N`; other tuning keys
+are not accepted for streams. Increasing part size or concurrency increases
+memory use. These settings do not use the file-copy adaptive controller.
+
+An unknown-length upload can contain at most 10,000 parts. With the default
+16 MiB part size that is 156.25 GiB; choose a larger part size before starting a
+larger stream. An oversized upload fails instead of publishing a truncated
+object. Provider object-size limits also apply.
+
+Buffered upload parts and incomplete download ranges can be retried within the
+configured retry budget. There is no saved state for restarting a stream after
+syq exits. On a handled failure or interruption, syq attempts to abort its
+multipart upload. Forced termination or a lost cleanup response can leave an
+incomplete upload; use the provider's incomplete-upload cleanup facilities.
+A lost completion response can mean the object was published even though syq
+reported failure. Streams do not launch remote programs or support SSH endpoints.
+
 ## Credentials and providers
 
 Syq uses the AWS SDK credential chain, including environment variables, shared
