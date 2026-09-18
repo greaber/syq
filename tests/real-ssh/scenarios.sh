@@ -61,7 +61,7 @@ ssh destination 'install -d -m 0755 /tmp/syq-real-ssh'
 case "${SYQ_REAL_SSH_SUITE:-core}" in
     core) ;;
     benchmark)
-        . /usr/local/libexec/syq-real-ssh-benchmark
+        sh /usr/local/libexec/syq-real-ssh-benchmark
         exit 0
         ;;
     *) echo 'unknown real-SSH suite' >&2; exit 2 ;;

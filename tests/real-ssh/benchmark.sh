@@ -1,5 +1,7 @@
 #!/bin/sh
-# Sourced after the disposable lab SSH setup in scenarios.sh.
+# Run after the disposable lab SSH setup in scenarios.sh.
+set -eu
+home=/home/syq
 
 # Exercise the user-facing script against real remote rsync and syq helpers.
 # Quoted scratch names must survive both SSH and rsync's remote argument parsing.
