@@ -775,8 +775,8 @@ pub enum Request {
         attempt: u32,
         guard: Option<ContainerGuard>,
     },
-    /// Receiver-side copy of a same-machine file (copy_file_range when
-    /// possible, otherwise an eligible sequential userspace fallback).
+    /// Receiver-side copy of a same-machine file (Linux copy_file_range,
+    /// macOS cloning, or an eligible sequential userspace fallback).
     /// Local and NFS fallback policies are independent. `CopyLocalUnsupported`
     /// tells the caller to use the normal streaming path.
     CopyLocal {
@@ -2257,6 +2257,17 @@ mod tests {
 
     #[test]
     fn copy_local_fallback_has_a_structured_wire_response() {
+        // Released v0.5.2's postcard encoding: response discriminant 32,
+        // no payload. Keep this fixed fixture independent of today's encoder.
+        const V052_UNSUPPORTED: &[u8] = &[32];
+        assert!(matches!(
+            postcard::from_bytes::<Response>(V052_UNSUPPORTED).unwrap(),
+            Response::CopyLocalUnsupported
+        ));
+        assert_eq!(
+            postcard::to_stdvec(&Response::CopyLocalUnsupported).unwrap(),
+            V052_UNSUPPORTED
+        );
         let mut frame = Vec::new();
         FrameWriter::new(&mut frame, false)
             .write_msg(&Response::CopyLocalUnsupported)

@@ -763,6 +763,12 @@ def _rm_arguments(
     src_non_dir: Selector | None,
     src_dir: Selector | None,
     on: str | None,
+    s3_endpoint: str | None = None,
+    s3_region: str | None = None,
+    s3_profile: str | None = None,
+    s3_header: Iterable[str] | None = None,
+    s3_all_versions: bool = False,
+    s3_version_id: str | None = None,
     cwd: PathArgument | None,
     root: PathArgument | None,
     follow: bool,
@@ -819,6 +825,24 @@ def _rm_arguments(
         _append_path_option(
             argv, "--pscope", _argument(pscope, label="pscope")
         )
+    is_s3 = on is not None and on.startswith("s3://")
+    if not is_s3 and (
+        s3_all_versions or s3_version_id is not None
+        or any(v is not None for v in (s3_endpoint, s3_region, s3_profile, s3_header))
+    ):
+        raise SyqInvocationError("S3 removal options require on='s3://BUCKET'")
+    if s3_all_versions and s3_version_id is not None:
+        raise SyqInvocationError("s3_all_versions and s3_version_id are mutually exclusive")
+    if s3_version_id is not None and (
+        not s3_version_id or source_count != 1
+        or src_dir is not None or srcs_in is not None
+    ):
+        raise SyqInvocationError("s3_version_id requires one exact key and a nonempty version ID")
+    _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
+    if s3_all_versions:
+        argv.append("--s3-all-versions")
+    if s3_version_id is not None:
+        argv.append("--s3-version-id=" + _text_arg(s3_version_id, label="s3_version_id"))
     return argv, source_count
 
 
@@ -1225,6 +1249,12 @@ class Client:
         src_non_dir: Selector | None = None,
         src_dir: Selector | None = None,
         on: str | None = None,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
+        s3_all_versions: bool = False,
+        s3_version_id: str | None = None,
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow: bool = False,
@@ -1247,6 +1277,12 @@ class Client:
             src_non_dir=src_non_dir,
             src_dir=src_dir,
             on=on,
+            s3_endpoint=s3_endpoint,
+            s3_region=s3_region,
+            s3_profile=s3_profile,
+            s3_header=s3_header,
+            s3_all_versions=s3_all_versions,
+            s3_version_id=s3_version_id,
             cwd=cwd,
             root=root,
             follow=follow,

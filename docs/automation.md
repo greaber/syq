@@ -224,6 +224,11 @@ is non-retryable. Do not construct a retry source from its destination name.
 
 ### Removal records
 
+For S3 version removal, `removal_trace` and `removal_result` include optional
+`s3_version_id` (string) and `s3_delete_marker` (boolean) fields. Each record and
+entry count refers to one version or delete marker. Ordinary S3 removal omits
+these fields.
+
 | Type | Meaning |
 |---|---|
 | `selection_result` | One explicit selector resolved or found missing |

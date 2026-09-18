@@ -3539,42 +3539,12 @@ impl Endpoint {
     ) -> Result<Box<dyn Conn>> {
         match self {
             Endpoint::Local { descriptor_session } => {
-                // Every connection clone for this logical local endpoint uses
-                // the control connection's process-local session slot. Once
-                // the control registers roots, workers clone those retained
-                // descriptors in process instead of claiming SCM_RIGHTS from
-                // the broker after worker threads exist (unsupported on
-                // Darwin).
+                // run_transfer substitutes an isolated receiver for every
+                // destination before opening workers, on every platform.
                 let mut conn = LocalConn::new(&role, descriptor_session.clone());
                 match role {
-                    ConnectionRole::DestinationWorker {
-                        destination: Some(destination),
-                        copy_sources,
-                    } => {
-                        conn.ops
-                            .initialize_destination(&destination)
-                            .map_err(|error| {
-                                WorkerInitializationError(format!(
-                                    "initialize local destination worker: {error:#}"
-                                ))
-                            })?;
-                        if !copy_sources.is_empty() {
-                            conn.ops
-                                .initialize_copy_sources(&copy_sources)
-                                .map_err(|error| {
-                                    WorkerInitializationError(format!(
-                                        "initialize local copy sources: {error:#}"
-                                    ))
-                                })?;
-                        }
-                    }
-                    ConnectionRole::DestinationWorker {
-                        destination: None, ..
-                    } => {
-                        return Err(WorkerInitializationError(
-                            "local destination worker requires a registered root".into(),
-                        )
-                        .into())
+                    ConnectionRole::DestinationWorker { .. } => {
+                        unreachable!("destination workers require an isolated receiver")
                     }
                     ConnectionRole::SourceWorker { roots } => {
                         conn.ops.initialize_sources(&roots).map_err(|error| {

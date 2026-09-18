@@ -768,10 +768,13 @@ fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
     message.msg_controllen = FD_CONTROL_LEN as _;
     #[cfg(target_os = "linux")]
     let flags = libc::MSG_CMSG_CLOEXEC;
-    // Darwin does not expose an atomic close-on-exec receive flag. The future
-    // worker protocol must therefore request its roots during single-threaded
-    // initialization, before it can spawn children, and acknowledge startup
-    // only after this function has applied FD_CLOEXEC.
+    // Darwin cannot apply close-on-exec atomically with recvmsg. Workers claim
+    // their roots synchronously in serve's Hello initialization; this function
+    // sets FD_CLOEXEC before HelloOk or the worker's request-reader startup.
+    // Other connections may be initializing concurrently, so the whole receiver
+    // process must remain free of child launches. run_transfer isolates local
+    // destinations, and the macOS receiver modules deny subprocess APIs through
+    // Clippy (see main.rs and clippy.toml). The Linux network probe is cfg-gated.
     #[cfg(not(target_os = "linux"))]
     let flags = 0;
     loop {

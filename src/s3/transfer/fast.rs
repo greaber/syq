@@ -61,8 +61,9 @@ impl Engine {
         } else {
             workers
         };
-        // Keep the initial network load conservative; preparation follows the
-        // request budget until its measurements justify the larger object seed.
+        // Object size and control latency do not establish available bandwidth.
+        // Start whole-object batches conservatively and measure before growing;
+        // preparation follows the same request budget.
         self.tuning.configure(
             tiny,
             if small_upload { workers } else { 256 },
@@ -73,8 +74,8 @@ impl Engine {
         } else {
             workers
         };
-        // A short batch may fit the object target while exceeding the initial
-        // request budget. It still needs bounded preparation during the ramp.
+        // Batches larger than the starting concurrency can use the object
+        // controller, with preparation bounded by its current request limit.
         let maximum = if count > starting as u64
             && fixed_workers.is_none()
             && !self.args.dry_run
@@ -102,7 +103,9 @@ impl Engine {
         } else {
             None
         };
-        let initial = workers.min(maximum.unwrap_or(workers));
+        // Let the object controller measure fresh generations immediately,
+        // rather than first running a second, request-level concurrency search.
+        let initial = starting.min(maximum.unwrap_or(starting));
         self.tuning.report(initial);
         Ok(Concurrency {
             initial,
@@ -803,21 +806,51 @@ mod buffer_tests {
     }
 
     #[tokio::test]
-    async fn short_whole_object_batches_keep_request_preparation_bounded() {
-        for count in [32, 33, 128, 4096] {
+    async fn whole_object_batches_start_conservatively_and_can_tune_higher() {
+        for count in [16, 32, 33, 128, 4096] {
             let engine = planning_engine(&[]);
             let concurrency = engine
                 .object_workers(std::iter::repeat_n(1024 * 1024, count))
                 .unwrap();
             assert_eq!(engine.tuning.request_limit(), 32);
             assert_eq!(concurrency.maximum, (count > 32).then_some(count.min(256)));
+            assert_eq!(concurrency.initial, 32);
             if count > 32 {
-                assert_eq!(concurrency.initial, count.min(256));
                 let requests = concurrency.requests.unwrap();
                 assert_eq!(requests.preparation_limit(), 33);
-                assert_eq!(requests.begin_objects(concurrency.initial), None);
+                assert_eq!(requests.begin_objects(concurrency.initial), Some(32));
+                requests.finish_objects(concurrency.maximum.unwrap());
+                assert_eq!(requests.preparation_limit(), count.min(256) + 1);
             }
         }
+        for size_mib in [1, 2, 4, 8] {
+            let engine = planning_engine(&[]);
+            engine.tuning.observe_control(Duration::from_millis(100));
+            let concurrency = engine
+                .object_workers(std::iter::repeat_n(size_mib * 1024 * 1024, 512))
+                .unwrap();
+            assert_eq!(concurrency.initial, 32);
+            assert_eq!(engine.tuning.request_limit(), 32);
+            assert_eq!(concurrency.maximum, Some(256));
+            let requests = concurrency.requests.unwrap();
+            assert_eq!(requests.preparation_limit(), 33);
+            assert_eq!(requests.begin_objects(concurrency.initial), Some(32));
+        }
+        for mode in ["--verify-only", "--dry-run"] {
+            let engine = planning_engine(&[mode]);
+            let concurrency = engine
+                .object_workers(std::iter::repeat_n(1024 * 1024, 512))
+                .unwrap();
+            assert_eq!(concurrency.initial, 32);
+            assert_eq!(engine.tuning.request_limit(), 32);
+            assert!(concurrency.maximum.is_none());
+        }
+        let engine = planning_engine(&["--performance-tuning", "s3-max-concurrent-requests=64"]);
+        let concurrency = engine
+            .object_workers(std::iter::repeat_n(1024 * 1024, 512))
+            .unwrap();
+        assert_eq!(concurrency.initial, 64);
+        assert_eq!(engine.tuning.request_limit(), 64);
         let engine = planning_engine(&["--performance-tuning", "s3-max-concurrent-objects=8"]);
         let concurrency = engine
             .object_workers(std::iter::repeat_n(1024 * 1024, 128))

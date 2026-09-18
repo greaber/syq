@@ -62,6 +62,21 @@ const COMMON_NAME_MAX: usize = 255;
 const NAME_MAX_CACHE_CAP: usize = 1024;
 
 #[cfg(debug_assertions)]
+pub(crate) fn record_test_event(variable: &str, event: std::fmt::Arguments<'_>) -> io::Result<()> {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os(variable) {
+        // Format the whole record before writing so concurrent event fields
+        // are not emitted as separate writes.
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?
+            .write_all(format!("{event}\n").as_bytes())?;
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
 pub(crate) fn test_race_barrier(ready_env: &str, continue_env: &str, label: &str) -> Result<()> {
     let ready = std::env::var_os(ready_env);
     let continuation = std::env::var_os(continue_env);
@@ -138,8 +153,7 @@ enum FileSystemKey {
     Device(u64),
 }
 
-// The same-machine copy fast path exists only on Linux; other platforms
-// report every request as unsupported without reading the policy.
+// Whole-file copying uses Linux offload or macOS cloning.
 #[derive(Clone, Copy)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct CopyLocalPolicy {
@@ -148,9 +162,9 @@ struct CopyLocalPolicy {
     allow_sequential_local_fallback: bool,
 }
 
-#[derive(Clone, Copy)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-enum CopyLocalOutcome {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) enum CopyLocalOutcome {
     Copied,
     Unsupported,
 }
@@ -177,13 +191,21 @@ fn discard_rooted_copy_partial(
     Ok(())
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 fn hold_copy_local_before_destination_open_for_test() -> Result<()> {
     test_race_barrier(
         "SYQ_TEST_COPY_LOCAL_READY_FILE",
         "SYQ_TEST_COPY_LOCAL_OPEN_CONTINUE_FILE",
         "local-copy destination open",
     )
+}
+
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+fn reject_copy_source_claim_for_test() -> Result<()> {
+    if std::env::var_os("SYQ_TEST_REJECT_COPY_SOURCES").is_some() {
+        bail!("test rejected unnecessary copy-source capabilities");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1434,7 +1456,7 @@ pub(crate) fn current_open_descriptor_count(soft_limit: libc::rlim_t) -> Result<
     Ok(open)
 }
 
-fn require_source_descriptor_capacity(
+pub(crate) fn require_source_descriptor_capacity(
     root_count: usize,
     shared_workers: usize,
     independent_workers: usize,
@@ -2316,11 +2338,13 @@ impl FsOps {
     /// intentionally belong to the source endpoint session rather than this
     /// destination endpoint, so claim their exact descriptors from that
     /// session's private broker during worker initialization.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn initialize_copy_sources(
         &mut self,
         sources: &[RegisteredSourceRoot],
     ) -> Result<()> {
+        #[cfg(debug_assertions)]
+        reject_copy_source_claim_for_test()?;
         if self.destination_root.is_none() {
             bail!("local copy sources require a registered destination root");
         }
@@ -2330,12 +2354,12 @@ impl FsOps {
         self.initialize_source_capabilities(sources, true)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn initialize_copy_sources(
         &mut self,
         _sources: &[RegisteredSourceRoot],
     ) -> Result<()> {
-        bail!("same-machine local copy capabilities require Linux")
+        bail!("same-machine local copy capabilities require Linux or macOS")
     }
 
     fn initialize_source_capabilities(
@@ -2640,16 +2664,10 @@ impl FsOps {
         let available_inodes = (files != 0 && files_available <= files).then_some(files_available);
         #[cfg(target_os = "macos")]
         let available_inodes = available_inodes.and_then(|available| {
-            let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
-            if unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
-                return None;
-            }
-            let filesystem = unsafe { filesystem.assume_init() };
-            let name = unsafe { CStr::from_ptr(filesystem.f_fstypename.as_ptr()) };
             // macOS exFAT reports f_files=1 and f_favail=0 even while new
             // files can be created. That is unavailable inode accounting,
             // not exhaustion. Keep zero authoritative on other filesystems.
-            (name.to_bytes() != b"exfat").then_some(available)
+            (!crate::rooted::filesystem_is(&directory, b"exfat").ok()?).then_some(available)
         });
         #[cfg(debug_assertions)]
         let available_bytes = match std::env::var_os("SYQ_TEST_AVAILABLE_BYTES") {
@@ -5573,42 +5591,18 @@ impl FsOps {
         Ok(hashes)
     }
 
-    /// Copy a whole same-machine file without routing its bytes through the
-    /// transport. Prefer copy_file_range; eligible local filesystems and the
-    /// measured asynchronous NFS destination case use a sequential userspace
-    /// writer when offload is unsupported. File workers still run in parallel;
-    /// other filesystem pairs retain the adaptive range path.
-    #[cfg(target_os = "linux")]
-    fn copy_local(
-        &mut self,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn prepare_local_copy(
+        &self,
         source: &RegisteredPath,
         dst: &[u8],
-        policy: CopyLocalPolicy,
-        copy_id: &CopyId,
-        size: u64,
-        mode: u32,
-    ) -> Result<CopyLocalOutcome> {
-        let _copy = self
-            .operation
-            .span(crate::transfer_observations::Stage::FilesystemCopy);
-        let CopyLocalPolicy {
-            inplace,
-            allow_sequential_nfs_fallback,
-            allow_sequential_local_fallback,
-        } = policy;
+    ) -> Result<(File, fs::Metadata, RootedTarget)> {
         let source_target = self
             .registered_source_target(source)
             .context("resolve registered local-copy source")?;
         let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
         let s = open_registered_source(&source_target)
             .with_context(|| format!("open registered source {}", source_label.display()))?;
-        // The kernel copy reads the source through the page cache, so the
-        // larger readahead window this hint enables is what keeps a cold
-        // source disk streaming (cp does the same; measured 10-20 % faster
-        // on a cold 4 GiB file). Advisory only: a failure changes nothing.
-        unsafe {
-            libc::posix_fadvise(s.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-        }
         let destination_root = self
             .destination_root
             .clone()
@@ -5636,17 +5630,53 @@ impl FsOps {
                 destination_label.display()
             );
         }
-        let source_key = file_system_key(&s, source_metadata.dev());
-        self.uncache_rooted(&destination_root, &destination_relative);
-        let (target_relative, target_label) = if inplace {
-            (destination_relative, destination_label)
-        } else {
-            let target = RootedTarget {
-                root: destination_root.clone(),
+        Ok((
+            s,
+            source_metadata,
+            RootedTarget {
+                root: destination_root,
                 relative: destination_relative,
                 label: destination_label,
                 create_missing_parents: false,
-            };
+            },
+        ))
+    }
+
+    /// Copy a whole same-machine file without routing its bytes through the
+    /// transport. Prefer copy_file_range; eligible local filesystems and the
+    /// measured asynchronous NFS destination case use a sequential userspace
+    /// writer when offload is unsupported. File workers still run in parallel;
+    /// other filesystem pairs retain the adaptive range path.
+    #[cfg(target_os = "linux")]
+    fn copy_local(
+        &mut self,
+        source: &RegisteredPath,
+        dst: &[u8],
+        policy: CopyLocalPolicy,
+        copy_id: &CopyId,
+        size: u64,
+        mode: u32,
+    ) -> Result<CopyLocalOutcome> {
+        let _copy = self
+            .operation
+            .span(crate::transfer_observations::Stage::FilesystemCopy);
+        let CopyLocalPolicy {
+            inplace,
+            allow_sequential_nfs_fallback,
+            allow_sequential_local_fallback,
+        } = policy;
+        let (s, source_metadata, target) = self.prepare_local_copy(source, dst)?;
+        let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
+        // Advisory sequential readahead for the kernel copy on Linux.
+        unsafe {
+            libc::posix_fadvise(s.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        }
+        let destination_root = target.root.clone();
+        let source_key = file_system_key(&s, source_metadata.dev());
+        self.uncache_rooted(&destination_root, &target.relative);
+        let (target_relative, target_label) = if inplace {
+            (target.relative, target.label)
+        } else {
             rooted_partial_target(&target, copy_id)?
         };
         self.uncache_rooted(&destination_root, &target_relative);
@@ -5956,7 +5986,41 @@ impl FsOps {
         Ok(CopyLocalOutcome::Copied)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn copy_local(
+        &mut self,
+        source: &RegisteredPath,
+        dst: &[u8],
+        policy: CopyLocalPolicy,
+        copy_id: &CopyId,
+        size: u64,
+        _mode: u32,
+    ) -> Result<CopyLocalOutcome> {
+        let _copy = self
+            .operation
+            .span(crate::transfer_observations::Stage::FilesystemCopy);
+        #[cfg(debug_assertions)]
+        record_test_event("SYQ_TEST_COPY_LOCAL_REQUESTS", format_args!("copy-local"))?;
+        // This operation stages a new inode; callers must stream in-place
+        // writes even if a future coordinator bypasses copy selection.
+        if policy.inplace {
+            return Ok(CopyLocalOutcome::Unsupported);
+        }
+        let (source, source_metadata, target) = self.prepare_local_copy(source, dst)?;
+        let root = target.root.clone();
+        let (partial, _) = rooted_partial_target(&target, copy_id)?;
+        self.uncache_rooted(&root, &target.relative);
+        self.uncache_rooted(&root, &partial);
+        let outcome = root.clone_file(&source, &source_metadata, &partial, size)?;
+        if outcome == CopyLocalOutcome::Copied {
+            _copy.bytes(size);
+        }
+        // Like Linux offload, leave no writer-cache entry. CopyLocal has no
+        // attempt field; finalize opens and checks the named partial normally.
+        Ok(outcome)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn copy_local(
         &mut self,
         _source: &RegisteredPath,
@@ -7956,6 +8020,41 @@ mod tests {
         // Return the control endpoint so tests retain the complete session
         // lifecycle in addition to each worker's own root and leaf clones.
         (worker, selections, control)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_receiver_refuses_inplace_copy_without_touching_files() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::write(&source, b"new bytes").unwrap();
+        fs::create_dir(&destination).unwrap();
+        let existing = destination.join("existing");
+        fs::write(&existing, b"old bytes").unwrap();
+        let original_inode = existing.metadata().unwrap().ino();
+        let (mut worker, sources, _control) = registered_source_worker(&[&source], false);
+        worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
+        for name in [b"existing".as_slice(), b"missing"] {
+            let response = worker.handle(&Request::CopyLocal {
+                source: sources[0].clone(),
+                dst: name.to_vec(),
+                inplace: true,
+                allow_sequential_nfs_fallback: false,
+                allow_sequential_local_fallback: false,
+                copy_id: [38; 16],
+                size: 9,
+                mode: 0o600,
+            });
+            assert!(
+                matches!(response, Response::CopyLocalUnsupported),
+                "{response:?}"
+            );
+        }
+        assert_eq!(fs::read(&existing).unwrap(), b"old bytes");
+        assert_eq!(existing.metadata().unwrap().ino(), original_inode);
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+        assert_eq!(fs::read(&source).unwrap(), b"new bytes");
     }
 
     #[cfg(target_os = "linux")]

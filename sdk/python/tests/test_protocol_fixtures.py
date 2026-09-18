@@ -88,6 +88,21 @@ class AutomationFixtureTests(unittest.TestCase):
         with self.assertRaises(syq.SyqProtocolError):
             AutomationDecoder(prune=False, mapping=True, dry_run=False).feed(json.dumps(records[0]).encode())
 
+    def test_s3_removal_version_fields_are_optional_and_preserved(self) -> None:
+        for name, dry_run, total in [("rm-success.ndjson", False, 2), ("rm-dry-run.ndjson", True, 1)]:
+            records = [json.loads(line) for line in (FIXTURES / name).read_bytes().splitlines()]
+            records[0]["endpoints"] = [{"role": "source", "kind": "s3", "host": "s3://bucket"}]
+            for record in records:
+                if record["type"] in {"removal_result", "removal_trace"}:
+                    record["s3_version_id"] = "version/with+symbols"
+                    record["s3_delete_marker"] = True
+            decoder = AutomationDecoder(mode="rm", dry_run=dry_run, selectors_total=total)
+            events = [decoder.feed(json.dumps(record).encode()) for record in records]
+            removals = [event for event in events if isinstance(event, (syq.RemovalResult, syq.RemovalTrace))]
+            self.assertTrue(removals)
+            self.assertTrue(all(event.s3_version_id == "version/with+symbols" and event.s3_delete_marker for event in removals))
+            decoder.finish(0)
+
     def test_rm_progress_and_dry_run_failures_are_valid_events(self) -> None:
         decoder = AutomationDecoder(mode="rm", dry_run=True, selectors_total=1)
         events = [

@@ -469,6 +469,8 @@ class AutomationDecoder:
                 path=_tagged(record.get("path"), label="path"),
                 kind=_enum(record, "kind", EntryKind),
                 disposition=disposition,
+                s3_version_id=_optional_string(record, "s3_version_id"),
+                s3_delete_marker=_boolean(record, "s3_delete_marker") if "s3_delete_marker" in record else None,
             )
         if record_type == "removal_result":
             if self.run.mode != "rm":
@@ -516,6 +518,8 @@ class AutomationDecoder:
                 class_=class_,
                 os_kind=os_kind,
                 message=message,
+                s3_version_id=_optional_string(record, "s3_version_id"),
+                s3_delete_marker=_boolean(record, "s3_delete_marker") if "s3_delete_marker" in record else None,
             )
         if record_type == "error":
             provenance = _attested_provenance(record, "error record")

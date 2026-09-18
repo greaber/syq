@@ -387,19 +387,40 @@ impl ResultsWriter {
     }
 
     pub fn emit_removal_trace(&self, removal: &RemovalRecord) {
+        self.emit_removal_trace_s3(removal, None);
+    }
+
+    pub(crate) fn emit_removal_trace_s3(
+        &self,
+        removal: &RemovalRecord,
+        version: Option<(&str, bool)>,
+    ) {
         let kind = removal
             .kind
             .expect("a planned removal always has a resolved object kind");
-        self.write(serde_json::json!({
+        let mut record = serde_json::json!({
             "type": "removal_trace",
             "selector": removal.selector,
             "path": tagged(removal.path),
             "kind": kind,
             "disposition": "would_remove",
-        }));
+        });
+        if let Some((id, marker)) = version {
+            record["s3_version_id"] = id.into();
+            record["s3_delete_marker"] = marker.into();
+        }
+        self.write(record);
     }
 
     pub fn emit_removal_result(&self, removal: &RemovalRecord) {
+        self.emit_removal_result_s3(removal, None);
+    }
+
+    pub(crate) fn emit_removal_result_s3(
+        &self,
+        removal: &RemovalRecord,
+        version: Option<(&str, bool)>,
+    ) {
         let mut record = serde_json::json!({
             "type": "removal_result",
             "selector": removal.selector,
@@ -424,6 +445,10 @@ impl ResultsWriter {
         }
         if let Some(message) = removal.message {
             object.insert("message".into(), message.into());
+        }
+        if let Some((id, marker)) = version {
+            object.insert("s3_version_id".into(), id.into());
+            object.insert("s3_delete_marker".into(), marker.into());
         }
         self.write(record);
     }

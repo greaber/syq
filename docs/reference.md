@@ -7,6 +7,24 @@ syq cp project --into backup
 This copies `project` to `backup/project`. Existing files are updated when
 needed; unrelated files stay.
 
+On macOS, eligible local files use filesystem cloning when both paths are on
+the same APFS volume. The copy initially shares disk blocks with the source;
+later changes to either file are independent. Reported bytes count the file's
+size, so the displayed rate can exceed the disk's physical throughput.
+Other filesystems and cross-volume copies use normal copying. Syq also uses
+normal copying when the open-file limit leaves no room for cloning.
+
+Syq groups small files into requests to reduce per-file overhead; larger files
+can use cloning. See [batch sizes](tuning.md#batch-size-and-splitting) for how
+tuning affects this choice.
+
+Cloning keeps the usual overwrite and metadata rules. Writing in place,
+comparing checksums, or setting a bandwidth limit uses normal copying. So does explicitly
+selecting [range transfers](tuning.md). Destination directories with
+inheritable access control entries, filesystem-compressed files, and files
+whose metadata cannot be safely removed also use normal copying. Cloned copies
+omit source extended attributes and file flags, just as normal copies do.
+
 The final summary shows what was copied or skipped, how long it took, and any
 errors. Add `-v` to list copied paths. For connection and performance details,
 see [diagnosing a slow copy](speed.md#diagnose-a-slow-copy).
@@ -213,10 +231,11 @@ local copies and remote paths with the same host name, user, and port, but
 cannot detect overlap through different SSH aliases, local-to-SSH connections,
 or shared storage across hosts.
 
-Pruning keeps syq's partial files and `.syq-swap-...` recovery entries, including
-their contents and parent directories. Use `-v` to see files kept because their
-names match the partial-file format. If different filename spellings resolve
-to a copied file, syq protects it; this can also keep extra hard links to it.
+Pruning keeps syq's partial files and [recovery entries](#resume-an-interrupted-copy),
+including their contents and parent directories. Use `-v` to see files kept
+because their names match the partial-file format. If different filename
+spellings resolve to a copied file, syq protects it; this can also keep extra
+hard links to it.
 
 ## Ignoring paths
 
@@ -288,6 +307,12 @@ Use `--root DIR` to confine traversal and `--results FILE` for the same
 A regular file deliberately named like a partial is also selected. Old partial
 formats are neither reused nor selected by this command; remove those manually.
 
+Interrupted replacements and macOS clones can also leave `.syq-swap-...`
+entries beside the destination. These may contain displaced originals or
+temporary clone data. Stop all copies using the destination, inspect each
+entry, and recover anything you want to keep before removing it. Neither
+`clean-partials` nor pruning removes these recovery entries.
+
 ## Conflicting names and file types
 
 Some filesystems treat names that differ only in case or Unicode spelling as
@@ -301,9 +326,9 @@ reports an error and skips that directory's contents. Move or remove the
 conflicting destination before retrying.
 
 Other replacements can fail if the filesystem lacks the operation needed to
-replace the old entry safely; the old entry is kept. An interruption can leave
-it beside its replacement under a `.syq-swap-...` name. Inspect that entry before
-removing it; `clean-partials` does not remove recovery entries.
+replace the old entry safely; the old entry is kept. See
+[interrupted-copy recovery](#resume-an-interrupted-copy) for entries left beside
+the destination.
 
 ## Check file contents
 

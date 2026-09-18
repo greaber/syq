@@ -264,7 +264,8 @@
               "kind": {
                 "enum": [
                   "local",
-                  "ssh"
+                  "ssh",
+                  "s3"
                 ]
               },
               "host": {
@@ -583,6 +584,13 @@
         },
         "disposition": {
           "const": "would_remove"
+        },
+        "s3_version_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "s3_delete_marker": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -688,6 +696,13 @@
         },
         "message": {
           "type": "string"
+        },
+        "s3_version_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "s3_delete_marker": {
+          "type": "boolean"
         }
       },
       "required": [

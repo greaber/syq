@@ -92,32 +92,6 @@ fn initial_fast_workers(
     max_connections.min(file_batches.max(byte_batches).max(1))
 }
 
-#[cfg(debug_assertions)]
-fn record_worker_event_for_test(event: &str, worker: usize, files: usize) -> Result<()> {
-    use std::io::Write;
-    if let Some(path) = std::env::var_os("SYQ_TEST_WORKER_EVENTS") {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        file.write_all(format!("{event} {worker} {files}\n").as_bytes())?;
-    }
-    Ok(())
-}
-
-#[cfg(debug_assertions)]
-fn record_setup_event_for_test(event: &str) -> Result<()> {
-    use std::io::Write;
-    if let Some(path) = std::env::var_os("SYQ_TEST_SETUP_EVENTS") {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(file, "{event}")?;
-    }
-    Ok(())
-}
-
 // Keep tiny files batched, but let eligible local medium files reach the
 // guarded receiver-side copy path without shrinking ordinary range requests.
 const LOCAL_FAST_FILE_BYTES: u64 = 64 * 1024;
@@ -143,6 +117,8 @@ pub struct Opts {
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
+    /// Settled before sharing these options; clone claims must fit preflight.
+    local_copy_fd_budget: bool,
     pub flags: u8,
     pub recursive: bool,
     pub links: bool,
@@ -222,6 +198,12 @@ impl Opts {
             checksum: self.checksum,
             force_ranges: self.tuning.force_ranges(),
             bandwidth_limited,
+            receiver_copy_disabled: !cfg!(any(target_os = "linux", target_os = "macos"))
+                || !self.local_copy_fd_budget
+                || self.verify_only
+                || self.dry_run
+                || self.restricted_receiver
+                || (cfg!(target_os = "macos") && self.inplace),
         }
     }
 }
@@ -1700,6 +1682,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
+    // Every destination worker runs in a receiver process. On Darwin this
+    // also keeps foreign descriptor claims out of the spawning coordinator;
+    // the receiver itself has no child-process launch paths on that platform.
     if matches!(dst_ep, Endpoint::Local { .. }) {
         let mut receiver = RemoteSpec::local_receiver(args.quiet);
         receiver.read_ahead = args.tuning_options.unwrap_or_default().pipeline_depth();
@@ -1730,7 +1715,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
-    let opts = Arc::new(Opts {
+    let mut opts = Opts {
+        local_copy_fd_budget: true,
         hash_policy: crate::hashing::HashPolicy {
             algorithm: args.hash_algorithm,
             transfer_integrity: args.transfer_integrity,
@@ -1786,7 +1772,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         operator_symlink_policy: destination_operator_symlink_policy(&args, !dst_ep.is_remote()),
         max_size,
         min_size,
-    });
+    };
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
             "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}, job-storage={}",
@@ -1800,6 +1786,97 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
     let mapping_contents = args.mapping_contents.clone();
+    let t0 = std::time::Instant::now();
+    // Pooled sessions are received as descriptors; take them on this thread
+    // before the parallel connect can spawn a child beside the receipt.
+    for endpoint in [&src_ep, &dst_ep] {
+        if let Endpoint::Remote(spec) = endpoint {
+            spec.prime_pooled_control(args.compress);
+        }
+    }
+    let (mut src_ctl, mut dst_ctl) = {
+        let (a, b) = (src_ep.clone(), args.clone());
+        let t = std::thread::spawn(move || connect_ctl(&a, &b));
+        let dst_ctl = connect_ctl(&dst_ep, &args);
+        let src_ctl = t
+            .join()
+            .map_err(|_| anyhow::anyhow!("connect thread panicked"))?;
+        match (src_ctl, dst_ctl) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(e), _) | (_, Err(e)) => {
+                progress.stop();
+                return Err(e);
+            }
+        }
+    };
+    if debug() {
+        crate::output::diagnostic!(
+            "syq: control connections up in {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    if args.restricted_grant.is_some() {
+        if let Some(contents) = &mapping_contents {
+            crate::mapping::send(&contents.contents, &mut *dst_ctl)?;
+        }
+    }
+    let destination_supports_confined_socket_nodes = match &dst_ep {
+        Endpoint::Remote(spec) => {
+            spec.diagnostics()
+                .peer
+                .context("destination handshake did not report receiver capabilities")?
+                .supports_confined_socket_nodes
+        }
+        Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
+    };
+    let maximum_workers = if autotune {
+        tune::MAX
+    } else {
+        args.connections
+    };
+    let source_shared_workers = match &src_ep {
+        Endpoint::Local { .. } => maximum_workers,
+        Endpoint::Remote(_) if use_tcp => maximum_workers,
+        Endpoint::Remote(_) => 0,
+    };
+    // Only workers that can attempt local offload need foreign source claims.
+    // Actual local destinations live in a separate receiver process.
+    let mut copy_local_claim_workers = if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy()
+    {
+        maximum_workers
+    } else {
+        0
+    };
+    // macOS cloning is optional. Its source is in this process, so use the
+    // same admission check as registration before reserving foreign claims.
+    // If those claims do not fit, keep the normal worker budget and byte-copy
+    // path on every filesystem, including APFS. Registration still rejects
+    // a budget that cannot accommodate the ordinary copy itself.
+    if cfg!(target_os = "macos")
+        && copy_local_claim_workers > 0
+        && crate::fsops::require_source_descriptor_capacity(
+            srcs.len(),
+            source_shared_workers,
+            copy_local_claim_workers,
+        )
+        .is_err()
+    {
+        opts.local_copy_fd_budget = false;
+        copy_local_claim_workers = 0;
+        if debug() {
+            crate::output::diagnostic!(
+                "syq: macOS cloning disabled: source descriptor budget leaves no room for clone claims"
+            );
+        }
+    }
+    let source_independent_handoff_workers = copy_local_claim_workers
+        .checked_add(match &src_ep {
+            Endpoint::Local { .. } => 0,
+            Endpoint::Remote(_) => maximum_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
+        })
+        .context("source worker count overflow")?;
+    // Admission is complete before worker closures receive shared options.
+    let opts = Arc::new(opts);
     let sched = Arc::new(Sched::with_job_storage(
         block,
         opts.tuning.split_min_size(block),
@@ -1911,7 +1988,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .connect_with_sources(compress, initial_sources.clone(), reuse_control)
                         .and_then(|src| {
                             let copy_sources =
-                                if opts.copy_policy(bwlimit.is_some()).receiver_source_claims() {
+                                if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() {
                                     initial_sources.clone()
                                 } else {
                                     Vec::new()
@@ -1975,7 +2052,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         setup_elapsed: t0.elapsed(),
                     };
                     #[cfg(debug_assertions)]
-                    record_worker_event_for_test("connected", id, 0)?;
+                    crate::fsops::record_test_event(
+                        "SYQ_TEST_WORKER_EVENTS",
+                        format_args!("connected {id} 0"),
+                    )?;
                     if debug() {
                         crate::output::diagnostic!(
                             "syq: worker {id} connected in {:.2}s",
@@ -2044,76 +2124,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }));
         }
     };
-    let t0 = std::time::Instant::now();
-    // Pooled sessions are received as descriptors; take them on this thread
-    // before the parallel connect can spawn a child beside the receipt.
-    for endpoint in [&src_ep, &dst_ep] {
-        if let Endpoint::Remote(spec) = endpoint {
-            spec.prime_pooled_control(args.compress);
-        }
-    }
-    let (mut src_ctl, mut dst_ctl) = {
-        let (a, b) = (src_ep.clone(), args.clone());
-        let t = std::thread::spawn(move || connect_ctl(&a, &b));
-        let dst_ctl = connect_ctl(&dst_ep, &args);
-        let src_ctl = t
-            .join()
-            .map_err(|_| anyhow::anyhow!("connect thread panicked"))?;
-        match (src_ctl, dst_ctl) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Err(e), _) | (_, Err(e)) => {
-                sched.abort();
-                progress.stop();
-                return Err(e);
-            }
-        }
-    };
-    if debug() {
-        crate::output::diagnostic!(
-            "syq: control connections up in {:.2}s",
-            t0.elapsed().as_secs_f64()
-        );
-    }
-    if args.restricted_grant.is_some() {
-        if let Some(contents) = &mapping_contents {
-            crate::mapping::send(&contents.contents, &mut *dst_ctl)?;
-        }
-    }
-    let destination_supports_confined_socket_nodes = match &dst_ep {
-        Endpoint::Remote(spec) => {
-            spec.diagnostics()
-                .peer
-                .context("destination handshake did not report receiver capabilities")?
-                .supports_confined_socket_nodes
-        }
-        Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
-    };
-    let maximum_workers = if autotune {
-        tune::MAX
-    } else {
-        args.connections
-    };
-    let source_shared_workers = match &src_ep {
-        Endpoint::Local { .. } => maximum_workers,
-        Endpoint::Remote(_) if use_tcp => maximum_workers,
-        Endpoint::Remote(_) => 0,
-    };
-    let source_independent_handoff_workers = match &src_ep {
-        Endpoint::Local { .. } => 0,
-        Endpoint::Remote(_) => maximum_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
-    };
-    // On Linux, each same-machine destination worker also claims the exact
-    // source capabilities from the source endpoint's broker before reporting
-    // ready. These are foreign-session claims even when both logical endpoints
-    // are local to the coordinator process.
-    let copy_local_claim_workers = if opts.copy_policy(bwlimit.is_some()).receiver_source_claims() {
-        maximum_workers
-    } else {
-        0
-    };
-    let source_independent_handoff_workers = source_independent_handoff_workers
-        .checked_add(copy_local_claim_workers)
-        .context("source worker count overflow")?;
     let registered_sources = register_source_roots(
         &mut *src_ctl,
         srcs,
@@ -2792,7 +2802,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
         #[cfg(debug_assertions)]
-        record_setup_event_for_test("transport_ready")?;
+        crate::fsops::record_test_event("SYQ_TEST_SETUP_EVENTS", format_args!("transport_ready"))?;
         announce_detached_ready()?;
         let all_remote_endpoints_use_tcp = use_tcp
             && [&src_ep, &dst_ep]
@@ -3021,7 +3031,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     #[cfg(debug_assertions)]
-    record_setup_event_for_test("scan_complete")?;
+    crate::fsops::record_test_event("SYQ_TEST_SETUP_EVENTS", format_args!("scan_complete"))?;
     if transport_setup.is_none() {
         transport_setup = Some(finish_transport_setup(&mut args)?);
     }
@@ -3170,10 +3180,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // instead discovers a partial or an unsupported offload,
                     // the first worker wakes the tuner to restore the ordinary
                     // local starting count immediately.
-                    let single_direct_candidate = autotune
-                        && opts.copy_policy(bwlimit.is_some()).allows_receiver_copy()
-                        && !opts.verify_only
-                        && {
+                    let single_direct_candidate =
+                        autotune && opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() && {
                             let jobs = sched.jobs.lock().unwrap();
                             jobs.len() == 1 && jobs[0].container_guard.is_none()
                         };
@@ -8132,7 +8140,10 @@ impl Worker {
 
     fn fast_batch(&mut self, batch: &mut Vec<usize>) -> Result<()> {
         #[cfg(debug_assertions)]
-        record_worker_event_for_test("batch", self.id, batch.len())?;
+        crate::fsops::record_test_event(
+            "SYQ_TEST_WORKER_EVENTS",
+            format_args!("batch {} {}", self.id, batch.len()),
+        )?;
         let mut jobs: Vec<WorkerJob> = {
             let all = self.sched.jobs.lock().unwrap();
             batch.iter().map(|&i| all.snapshot(i)).collect()
@@ -9588,6 +9599,7 @@ mod tests {
         streaming: bool,
     ) -> Worker {
         let opts = Arc::new(Opts {
+            local_copy_fd_budget: true,
             hash_policy: Default::default(),
             expected_digest: None,
             mapping_expected_digests: Default::default(),

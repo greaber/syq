@@ -100,7 +100,13 @@
         "syq-path",
         "no-bootstrap",
         "pscope",
-        "performance-tuning"
+        "performance-tuning",
+        "s3-endpoint",
+        "s3-region",
+        "s3-profile",
+        "s3-header",
+        "s3-all-versions",
+        "s3-version-id"
       ],
       "internal": [
         "results-fd"
