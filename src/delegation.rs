@@ -72,7 +72,7 @@ const MAX_UNIX_TIMESTAMP: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
 pub(crate) const MAX_ENTRIES: u64 = 1_000_000_000_000;
 // Keep later accounting representable in both signed and unsigned counters.
 pub(crate) const MAX_COPY_BYTES: u64 = i64::MAX as u64;
-const MAX_CONNECTIONS: u16 = 64;
+pub(crate) const MAX_CONNECTIONS: u16 = 64;
 const MAX_FILTER_RULES: usize = 4096;
 const MAX_FILTER_RULE_BYTES: usize = 4096;
 const MAX_FILTER_ROOTS: usize = 1024;

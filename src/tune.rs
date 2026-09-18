@@ -48,8 +48,6 @@ pub const START_LOCAL: usize = 32;
 /// enough I/O concurrency for high-latency filesystems while avoiding half of
 /// the speculative worker setup on one- and two-CPU systems.
 pub const START_LOCAL_LOW_CPU: usize = 16;
-/// Never auto-tune beyond this many workers.
-pub const MAX: usize = 64;
 /// Never auto-tune below this many.
 pub const MIN: usize = 1;
 /// Multiplicative step between worker counts, up or down.
@@ -227,11 +225,7 @@ fn cached_at(path: &Path, key: &str) -> Option<usize> {
     // a complete file. Not being able to create the lock, as on a read-only
     // home, must not hide a cache that is there.
     let _lock = lock_file(path, false).ok();
-    read_cache(path)
-        .paths
-        .get(key)
-        .copied()
-        .map(|n| n.clamp(MIN, MAX))
+    read_cache(path).paths.get(key).copied().map(|n| n.max(MIN))
 }
 
 fn remember_at(path: &Path, key: &str, connections: usize) -> std::io::Result<()> {
@@ -242,9 +236,7 @@ fn remember_at(path: &Path, key: &str, connections: usize) -> std::io::Result<()
     std::fs::create_dir_all(parent)?;
     let _lock = lock_file(path, true)?;
     let mut cache = read_cache(path);
-    cache
-        .paths
-        .insert(key.to_string(), connections.clamp(MIN, MAX));
+    cache.paths.insert(key.to_string(), connections.max(MIN));
     let temporary = parent.join(format!(
         ".{}.{}.tmp",
         path.file_name()
@@ -279,7 +271,7 @@ pub fn remember(key: &str, connections: usize) {
 
 /// Next count up / down by `factor`, always moving by at least one.
 pub fn step_up_by(n: usize, factor: f64) -> usize {
-    ((n as f64 * factor).round() as usize).max(n + 1)
+    ((n as f64 * factor).round() as usize).max(n.saturating_add(1))
 }
 pub fn step_up(n: usize) -> usize {
     step_up_by(n, STEP)
@@ -1112,6 +1104,9 @@ pub fn run(
 mod tests {
     use super::*;
 
+    // A finite domain for the existing policy simulations, not a runtime limit.
+    const MAX: usize = 64;
+
     #[test]
     fn cache_lock_refuses_symlinks_and_non_regular_files() {
         let dir = crate::test_support::tempdir().unwrap();
@@ -1198,6 +1193,7 @@ mod tests {
     fn steps_are_geometric_and_move() {
         assert_eq!(step_up(8), 10);
         assert_eq!(step_up(2), 3);
+        assert_eq!(step_up(usize::MAX), usize::MAX);
         assert_eq!(step_down(8), 6);
         assert_eq!(step_down(2), 1);
         let mut n = START_SSH;
@@ -1207,6 +1203,32 @@ mod tests {
             steps += 1;
         }
         assert!((7..=9).contains(&steps), "{steps} steps");
+    }
+
+    #[test]
+    fn automatic_growth_can_explore_above_64() {
+        let mut policy = Policy::new(START_SSH, MIN, usize::MAX);
+        for _ in 0..100 {
+            let rate = policy.n.min(128) as f64 * 10e6;
+            measure(&mut policy, rate);
+        }
+        assert!(
+            (65..=128).contains(&policy.settled()),
+            "{:?}",
+            policy.history
+        );
+        assert!(policy.history.iter().any(|&count| count > 64));
+    }
+
+    #[test]
+    fn explicit_ceiling_above_64_bounds_automatic_growth() {
+        let mut policy = Policy::new(START_SSH, MIN, 1000);
+        for _ in 0..100 {
+            let rate = policy.n as f64 * 10e6;
+            measure(&mut policy, rate);
+        }
+        assert!(policy.history.contains(&1000), "{:?}", policy.history);
+        assert!(policy.history.iter().all(|&count| count <= 1000));
     }
 
     #[test]
@@ -1365,13 +1387,15 @@ mod tests {
     }
 
     #[test]
-    fn cache_remembers_only_the_named_path_and_clamps_values() {
+    fn cache_preserves_counts_above_64_and_clamps_only_zero() {
         let dir = temporary_cache("roundtrip");
         let path = dir.join("tuning.json");
         remember_at(&path, "a>b|tcp", 13).unwrap();
         remember_at(&path, "a>b|ssh", MAX + 100).unwrap();
         assert_eq!(cached_at(&path, "a>b|tcp"), Some(13));
-        assert_eq!(cached_at(&path, "a>b|ssh"), Some(MAX));
+        assert_eq!(cached_at(&path, "a>b|ssh"), Some(MAX + 100));
+        remember_at(&path, "zero", 0).unwrap();
+        assert_eq!(cached_at(&path, "zero"), Some(MIN));
         assert_eq!(cached_at(&path, "b>a|tcp"), None);
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -38,10 +38,11 @@ even when the values match. Controls for different quantities can combine:
 for example, a fixed request size with a worker ceiling. Unknown keys,
 duplicate keys, zero counts, and out-of-range values are rejected.
 
-A ceiling only constrains automatic choices; it does not raise their normal
-upper bounds or force syq to use that many slots. Filesystem copies currently
-auto-tune up to 64 workers. S3 choices depend on the route and workload. The
-S3 ceilings are nested: object and per-object part counts also share the
+A ceiling does not force syq to use that many slots. Filesystem copies have no
+default tuning ceiling; syq adjusts the count from measured throughput.
+[Restricted receiver limits](remote-reference.md#limits-and-unsupported-options)
+still apply. S3 ceilings constrain the route's normal automatic range without
+raising it. They are nested: object and per-object part counts also share the
 aggregate request ceiling. A fixed setting for one count still operates within
 ceilings on the other counts.
 

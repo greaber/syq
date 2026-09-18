@@ -699,11 +699,18 @@ impl Args {
     }
 
     pub fn automatic_worker_limit(&self) -> usize {
-        self.resource_limits
+        let requested = self
+            .resource_limits
             .as_ref()
             .and_then(|limits| limits.workers)
-            .unwrap_or(crate::tune::MAX)
-            .min(crate::tune::MAX)
+            .unwrap_or(usize::MAX);
+        // Removing the tuner's default ceiling does not expand signed
+        // receiver authority. The receiver still enforces its specific grant.
+        if self.restricted_grant.is_some() {
+            requested.min(usize::from(crate::delegation::MAX_CONNECTIONS))
+        } else {
+            requested
+        }
     }
 
     pub fn meta_flags(&self) -> u8 {
@@ -3029,6 +3036,33 @@ mod tests {
                 assert!(message.contains(reason), "{message}");
             }
         }
+    }
+
+    #[test]
+    fn automatic_workers_have_only_the_requested_ceiling() {
+        for (extra, expected) in [
+            (None, usize::MAX),
+            (Some("--resource-limits=workers=1000"), 1000),
+            (Some("--resource-limits=workers=65536"), 65536),
+        ] {
+            let mut argv: Vec<_> = ["source", "--as", "target"].map(OsString::from).into();
+            argv.extend(extra.map(OsString::from));
+            let args = parse_native_copy(&argv).unwrap();
+            assert!(args.connections_default);
+            assert_eq!(args.automatic_worker_limit(), expected);
+        }
+    }
+
+    #[test]
+    fn automatic_workers_still_respect_restricted_receiver_authority() {
+        let mut args = native_engine_defaults();
+        args.restricted_grant = Some("signed grant".into());
+        assert_eq!(args.automatic_worker_limit(), 64);
+        args.resource_limits = Some(crate::advanced::ResourceLimits {
+            workers: Some(3),
+            ..Default::default()
+        });
+        assert_eq!(args.automatic_worker_limit(), 3);
     }
 
     #[test]

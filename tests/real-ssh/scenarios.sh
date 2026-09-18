@@ -999,7 +999,7 @@ for benchmark_mode in push pull; do
 import json, pathlib, sys
 cache = json.loads(pathlib.Path(sys.argv[1]).read_text())
 key = 'local>destination|ssh' if sys.argv[2] == 'push' else 'destination>local|ssh'
-assert 1 <= cache['paths'][key] <= 64, cache
+assert cache['paths'][key] >= 1, cache
 print('Verified a learned starting count for', key)
 PY
     rm -f "$benchmark_cache" "$benchmark_cache.lock"

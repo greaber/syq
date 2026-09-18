@@ -633,18 +633,15 @@ fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
     ])
 }
 
-fn broker_connection_limit(connections_opt: Option<usize>, connections: usize) -> Result<usize> {
-    // A direct transfer keeps one destination control connection open beside
-    // its data workers. Automatic tuning may grow beyond the initial worker
-    // count, while an explicit -j is a fixed user-selected upper bound.
-    let data_connections = if connections_opt.is_some() {
-        connections
-    } else {
-        crate::tune::MAX
-    };
-    data_connections
-        .checked_add(1)
-        .context("SSH connection count is too large for the constrained agent broker")
+fn broker_connection_limit(worker_limit: Option<usize>) -> Result<usize> {
+    // Include the destination control connection when the user supplies a
+    // worker ceiling. Otherwise the broker must allow the tuner to grow.
+    match worker_limit {
+        Some(workers) => workers
+            .checked_add(1)
+            .context("SSH connection count is too large for the constrained agent broker"),
+        None => Ok(usize::MAX),
+    }
 }
 
 fn automatic_enrollment_allowed(dry_run: bool, verify_only: bool) -> bool {
@@ -827,7 +824,11 @@ fn run_remote(
                 "prepare command-restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
             )?;
         let policy = crate::agent_broker::BrokerPolicy::new(coordinator_policy, peer_policy);
-        let limit = broker_connection_limit(args.connections_opt, args.connections)?;
+        let limit = broker_connection_limit(args.connections_opt.or_else(|| {
+            args.resource_limits
+                .as_ref()
+                .and_then(|limits| limits.workers)
+        }))?;
         let broker = if let Some(prepared) = prepared {
             restricted_destination_path = Some(prepared.canonical_destination);
             restricted_grant = Some(prepared.grant);
@@ -1489,9 +1490,9 @@ mod tests {
 
     #[test]
     fn broker_capacity_covers_control_and_planned_workers() {
-        assert_eq!(broker_connection_limit(None, 8).unwrap(), 65);
-        assert_eq!(broker_connection_limit(Some(128), 128).unwrap(), 129);
-        assert!(broker_connection_limit(Some(usize::MAX), usize::MAX).is_err());
+        assert_eq!(broker_connection_limit(None).unwrap(), usize::MAX);
+        assert_eq!(broker_connection_limit(Some(128)).unwrap(), 129);
+        assert!(broker_connection_limit(Some(usize::MAX)).is_err());
     }
 
     #[test]

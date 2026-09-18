@@ -4139,10 +4139,11 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
             "--max-size with deletion is not yet independently enforceable by the command-restricted receiver"
         );
     }
-    if args.connections_opt.is_some() && args.connections > crate::tune::MAX {
+    if args.connections_opt.is_some() && args.connections > usize::from(delegation::MAX_CONNECTIONS)
+    {
         bail!(
             "command-restricted transfers support at most {} connections",
-            crate::tune::MAX
+            usize::from(delegation::MAX_CONNECTIONS)
         );
     }
     crate::transfer::parse_ports(&args.tcp_ports)?;
@@ -4287,7 +4288,7 @@ fn grant_for(
                 max_connections: u16::try_from(if args.connections_opt.is_some() {
                     args.connections
                 } else {
-                    crate::tune::MAX
+                    usize::from(delegation::MAX_CONNECTIONS)
                 })
                 .context("connection maximum exceeds grant representation")?,
                 max_deletions,
