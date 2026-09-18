@@ -114,7 +114,7 @@ syq cp [OPTIONS] SOURCE... [PLACEMENT]
 | Argument / option | Meaning |
 |---|---|
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
-| `--resource-limits <KEY=VALUE,...>` | [Bandwidth limit](../resource-limits.md) |
+| `--resource-limits <KEY=VALUE,...>` | [Bandwidth and concurrency ceilings](../resource-limits.md) |
 
 ## Preview, progress, and results
 

@@ -907,6 +907,19 @@ EOF
     cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-tuning-check
 done
 
+printf 'case: adaptive worker ceilings through each remote coordinator\n'
+for transport in tcp ssh; do
+    for coordinator in src dst local; do
+        if [ "$transport" = ssh ]; then set -- --no-tcp; else set --; fi
+        if [ "$coordinator" = dst ]; then set -- "$@" --peer-auth broker; fi
+        syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
+            --as "/tmp/syq-real-ssh/limited-$transport-$coordinator" \
+            --coordinate-at "$coordinator" --resource-limits workers=1 --no-progress -vv "$@"
+        ssh destination cat "/tmp/syq-real-ssh/limited-$transport-$coordinator" > /tmp/syq-real-ssh-limited-check
+        cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-limited-check
+    done
+done
+
 printf 'case: experimental streaming over TCP/SSH and each coordinator\n'
 streaming=copy-path=streaming,request-size=128K,split-min-size=1M,bw-pacing=average
 for transport in tcp ssh; do

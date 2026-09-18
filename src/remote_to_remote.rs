@@ -937,7 +937,7 @@ fn run_remote(
     let mut limits = args.resource_limits.clone().unwrap_or_default();
     // The rsync-compatible --bwlimit also lowers to the native coordinator group.
     limits.bandwidth = args.bwlimit.clone();
-    if limits.bandwidth.is_some() {
+    if limits != crate::advanced::ResourceLimits::default() {
         remote.push(format!("--resource-limits={limits}"));
     }
 
