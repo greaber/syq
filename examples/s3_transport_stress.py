@@ -382,6 +382,8 @@ try:
         cases = [dict(case, receive_budget=int(value)) for case in cases
                  for value in os.environ['SYQ_STRESS_RCVBUDGETS'].split(',')]
     for case in cases:
+        if os.environ.get('SYQ_STRESS_MEMORY_LIMIT'):
+            case['memory'] = os.environ['SYQ_STRESS_MEMORY_LIMIT']
         if HEAP_PROBE:
             case.update(heap_probe=True, budget_active=os.environ.get('SYQ_STRESS_BUDGET_ACTIVE') == '1',
                         window_clamp=os.environ.get('SYQ_STRESS_WINDOW_CLAMP') == '1',
