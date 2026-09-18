@@ -42,10 +42,11 @@ if QUEUE_SWEEP:
     BIN = ROOT / os.environ.get('SYQ_STRESS_BINARY', 'target/transport-queue-build/client')
 shutil.copy2(BIN, STAGE / 'client')
 BINARY_SHA256 = hashlib.sha256(BIN.read_bytes()).hexdigest()
-# Delay/rate are applied only inside the owned MinIO network namespace.
+# Delay/rate are applied only inside owned container network namespaces.
 NETEM_MS = int(os.environ.get('SYQ_STRESS_NETEM_MS', 0))
 NETEM_RATE = os.environ.get('SYQ_STRESS_NETEM_RATE', '1gbit')
 SENDER_MAX = int(os.environ.get('SYQ_STRESS_SENDER_MAX', 0))
+RECEIVER_NETEM = NETEM_MS and os.environ.get('SYQ_STRESS_NETEM_PLACEMENT', 'receiver') == 'receiver'
 NETLAB = 'sha256:04a80a4748e69b7ee5a46a4e3424f536c17d1ee384791bdf301a128c4e704e3d'
 HEAP_PROBE = os.environ.get('SYQ_STRESS_HEAP') == '1'
 if HEAP_PROBE:
@@ -63,6 +64,7 @@ context = ssl.create_default_context(cafile=str(CERT / 'public.crt'))
 original_urlopen = urllib.request.urlopen
 urllib.request.urlopen = lambda *a, **k: original_urlopen(*a, context=context, **k)
 server = None
+receiver = None
 active = None
 results = json.loads((D / "results.json").read_text()) if (D / "results.json").exists() else []
 for previous in results:
@@ -98,8 +100,8 @@ def remove_container(cid):
     cleanup.append(cid)
     (D / 'cleanup.json').write_text(json.dumps(cleanup))
 
-def network_command(args):
-    helper = command(['docker', 'create', '--network', 'container:' + server,
+def network_command(args, namespace=None):
+    helper = command(['docker', 'create', '--network', 'container:' + (namespace or server),
                       '--cap-add', 'NET_ADMIN', NETLAB, *args])
     try:
         return command(['docker', 'start', '-a', helper])
@@ -161,8 +163,8 @@ def run(case, mode, repeats, label):
     out = D / (tag + '-output')
     out.mkdir()
     memory = case.get('memory', '1g')
-    args = ['docker', 'create', '--network', 'host',
-            *(['--add-host', 's3-spike.test:' + server_ip] if NETEM_MS else []),
+    args = ['docker', 'create', '--network', 'container:' + receiver if RECEIVER_NETEM else 'host',
+            *(['--add-host', 's3-spike.test:' + server_ip] if NETEM_MS and not RECEIVER_NETEM else []),
             '--cpuset-cpus', case['cpus'],
             '--memory', memory, '--memory-swap', memory, '--pids-limit', '512',
             '-v', str(STAGE) + ':/bench:ro', '-v', str(out) + ':/output:rw',
@@ -208,7 +210,8 @@ def run(case, mode, repeats, label):
         if HEAP_PROBE:
             shutil.move(out / '.allocator.csv', D / (tag + '.allocator.csv'))
         if NETEM_MS:
-            stats = json.loads(network_command(['tc', '-j', '-s', 'qdisc', 'show', 'dev', 'eth0']))
+            stats = json.loads(network_command(['tc', '-j', '-s', 'qdisc', 'show', 'dev',
+                                                 'ifb0' if RECEIVER_NETEM else 'eth0'], receiver))
             (D / (tag + '.netem.json')).write_text(json.dumps(stats, indent=2))
             assert all(q.get('drops', 0) == 0 for q in stats), stats
         state = json.loads(command(['docker', 'inspect', '--format', '{{json .State}}', active]))
@@ -339,13 +342,25 @@ try:
     if NETEM_MS:
         sender_tcp = network_command(['cat', '/proc/sys/net/ipv4/tcp_wmem'])
         (D / 'sender-tcp-wmem.txt').write_text(sender_tcp + '\n')
-        network_command(['tc', 'qdisc', 'replace', 'dev', 'eth0', 'root', 'netem',
-                         'limit', '100000', 'delay', str(NETEM_MS) + 'ms',
-                         'rate', NETEM_RATE])
-        print(f'Isolated server egress: delay {NETEM_MS}ms, rate {NETEM_RATE}', flush=True)
+        if RECEIVER_NETEM:
+            receiver = command(['docker', 'run', '--detach', '--rm',
+                                '--add-host', 's3-spike.test:' + server_ip,
+                                '--sysctl', 'net.ipv4.tcp_rmem=4096 131072 67108864',
+                                NETLAB, 'sleep', '3600'])
+            network_command(['ip', 'link', 'add', 'ifb0', 'type', 'ifb'], receiver)
+            network_command(['ip', 'link', 'set', 'ifb0', 'up'], receiver)
+            network_command(['tc', 'qdisc', 'add', 'dev', 'eth0', 'handle', 'ffff:', 'ingress'], receiver)
+            network_command(['tc', 'filter', 'add', 'dev', 'eth0', 'parent', 'ffff:',
+                             'protocol', 'ip', 'u32', 'match', 'ip', 'src', server_ip + '/32',
+                             'action', 'mirred', 'egress', 'redirect', 'dev', 'ifb0'], receiver)
+        network_command(['tc', 'qdisc', 'replace', 'dev', 'ifb0' if RECEIVER_NETEM else 'eth0',
+                         'root', 'netem', 'limit', '100000', 'delay', str(NETEM_MS) + 'ms',
+                         'rate', NETEM_RATE], receiver)
+        placement = 'receiver ingress' if RECEIVER_NETEM else 'sender egress'
+        print(f'Isolated {placement}: delay {NETEM_MS}ms, rate {NETEM_RATE}', flush=True)
         for case in cases:
             case.update(netem_ms=NETEM_MS, netem_rate=NETEM_RATE, netlab_image=NETLAB,
-                        sender_tcp_wmem=sender_tcp)
+                        sender_tcp_wmem=sender_tcp, netem_placement=placement)
     if os.environ.get('SYQ_STRESS_RCVBUFS'):
         assert HEAP_PROBE
         cases = [dict(case, receive_buffer=int(value)) for case in cases
@@ -399,5 +414,7 @@ try:
 finally:
     if active:
         remove_container(active)
+    if receiver:
+        remove_container(receiver)
     if server:
         remove_container(server)
