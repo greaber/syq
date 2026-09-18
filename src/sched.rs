@@ -427,8 +427,40 @@ impl FileOrder {
     }
 }
 
+/// Keep queue size accounting at the mutation boundary for tuner samples.
+#[derive(Default)]
+struct FileQueue {
+    heap: BinaryHeap<(u64, Reverse<FileOrder>)>,
+    bytes: u64,
+}
+
+impl FileQueue {
+    fn push(&mut self, item: (u64, Reverse<FileOrder>)) {
+        self.heap.push(item);
+        self.bytes += item.0;
+    }
+
+    fn pop(&mut self) -> Option<(u64, Reverse<FileOrder>)> {
+        let item = self.heap.pop()?;
+        self.bytes -= item.0;
+        Some(item)
+    }
+
+    fn peek(&self) -> Option<&(u64, Reverse<FileOrder>)> {
+        self.heap.peek()
+    }
+
+    fn len(&self) -> usize {
+        self.heap.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+}
+
 struct Inner {
-    files: BinaryHeap<(u64, Reverse<FileOrder>)>,
+    files: FileQueue,
     ranges: RangeQueue,
     finishes: Vec<(usize, bool)>,
     inflight: Vec<RangeHandle>,
@@ -488,7 +520,7 @@ impl Sched {
     pub fn with_job_storage(block: u64, min_split: u64, storage: JobStorage) -> Self {
         Sched {
             inner: Mutex::new(Inner {
-                files: BinaryHeap::new(),
+                files: FileQueue::default(),
                 ranges: RangeQueue::default(),
                 finishes: Vec::new(),
                 inflight: Vec::new(),
@@ -536,7 +568,7 @@ impl Sched {
     pub fn clear_finished_work(&self) {
         self.jobs.lock().unwrap().release();
         let mut inner = self.inner.lock().unwrap();
-        inner.files = BinaryHeap::new();
+        inner.files = FileQueue::default();
         inner.ranges = RangeQueue::default();
         inner.finishes = Vec::new();
         inner.inflight = Vec::new();
@@ -764,7 +796,7 @@ impl Sched {
         if !g.scan_done {
             return false;
         }
-        let mut bytes: u64 = g.files.iter().map(|(s, _)| *s).sum();
+        let mut bytes = g.files.bytes;
         bytes += g.ranges.bytes;
         bytes += g
             .inflight
@@ -1278,7 +1310,12 @@ pub(crate) mod tests {
             assert_eq!(retry.dst_entry.unwrap().size, 7);
             assert_eq!(before.done.load(Relaxed), 3);
             drop(jobs);
+            assert_eq!(
+                sched.inner.lock().unwrap().files.bytes,
+                7 * (2 * JOBS_PER_CHUNK as u64 + 1)
+            );
             sched.clear_finished_work();
+            assert_eq!(sched.inner.lock().unwrap().files.bytes, 0);
             let jobs = sched.jobs.lock().unwrap();
             assert!(jobs.is_empty());
             match &*jobs {
@@ -1652,6 +1689,44 @@ pub(crate) mod tests {
         };
         empty.scan_done();
         assert!(!waiter.join().unwrap());
+    }
+
+    #[test]
+    fn queued_file_bytes_follow_claims_retries_and_stolen_groups() {
+        let sched = Sched::new(64, 128);
+        let big = sched.push_file(test_job(b"big", 1024));
+        let small = sched.push_file(test_job(b"small", 256));
+        let sibling = sched.push_file(test_job(b"sibling", 256));
+        sched.scan_done();
+        assert!(sched.work_left_for(2, 1536, 0));
+        assert!(!sched.work_left_for(2, 1537, 0));
+        assert!(matches!(sched.next(), Item::File(idx) if idx == big));
+        assert_eq!(sched.inner.lock().unwrap().files.bytes, 512);
+        assert_eq!(sched.take_small(256, 2, 512).len(), 2);
+        assert!(!sched.work_left_for(1, 1, 0));
+        sched.requeue(big);
+        sched.ranges_ready(big, Vec::new());
+        assert!(sched.work_left_for(1, 1024, 0));
+        assert!(matches!(sched.next(), Item::File(idx) if idx == big));
+        sched.begin_fast_batch(1, 128);
+        sched.mark_fast(2);
+        let (_, handle) = sched.share_fast_groups(
+            vec![(1024, big), (256, small), (256, sibling)],
+            [0..1, 1..3].into(),
+        );
+        assert_eq!(
+            sched.steal_fast_group(&mut sched.inner.lock().unwrap()),
+            Some(small)
+        );
+        assert!(sched.work_left_for(1, 256, 0));
+        assert!(!sched.work_left_for(1, 257, 0));
+        assert!(matches!(sched.next(), Item::File(idx) if idx == sibling));
+        sched.ranges_ready(small, Vec::new());
+        sched.ranges_ready(sibling, Vec::new());
+        assert_eq!(sched.finish_fast_groups(&handle), vec![true, false, false]);
+        sched.complete_fast_batch(1);
+        assert!(sched.finished());
+        assert_eq!(sched.inner.lock().unwrap().files.bytes, 0);
     }
 
     #[test]

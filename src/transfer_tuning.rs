@@ -241,6 +241,15 @@ fn set_once<T>(slot: &mut Option<T>, value: T, key: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn parse_comparison_block_size(value: &str) -> Result<u64> {
+    size(
+        value,
+        "comparison-block-size",
+        crate::proto::MIN_HASH_BLOCK_BYTES,
+        crate::proto::MAX_HASH_BLOCK_BYTES,
+    )
+}
+
 fn size(value: &str, key: &str, min: u64, max: u64) -> Result<u64> {
     let bytes = crate::cli::parse_size(value).with_context(|| key.to_string())?;
     if !(min..=max).contains(&bytes) {
@@ -296,12 +305,7 @@ impl FromStr for TransferTuning {
                 )?,
                 "comparison-block-size" => set_once(
                     &mut tuning.comparison_block_size,
-                    size(
-                        value,
-                        key,
-                        crate::proto::MIN_HASH_BLOCK_BYTES,
-                        crate::proto::MAX_HASH_BLOCK_BYTES,
-                    )?,
+                    parse_comparison_block_size(value)?,
                     key,
                 )?,
                 "request-size" => set_once(

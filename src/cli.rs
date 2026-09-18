@@ -229,9 +229,9 @@ pub struct Args {
     pub connections: usize,
     #[arg(skip)]
     pub connections_default: bool,
-    /// Comparison and reuse block size (e.g. 4M)
-    #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE")]
-    pub block_size: String,
+    /// Comparison and reuse block size (64K through 64M; default 4M)
+    #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE", value_parser = crate::transfer_tuning::parse_comparison_block_size)]
+    pub block_size: u64,
     /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
     pub performance_tuning: Vec<String>,
@@ -509,15 +509,10 @@ impl EnvironmentOptions {
 
 impl Args {
     /// Resolve both interfaces to the same supported comparison granularity.
-    pub(crate) fn comparison_block_size(&self) -> Result<u64> {
-        let block = match self.tuning_options.and_then(|t| t.comparison_block_size) {
-            Some(block) => block,
-            None => parse_size(&self.block_size)?,
-        };
-        Ok(block.clamp(
-            crate::proto::MIN_HASH_BLOCK_BYTES,
-            crate::proto::MAX_HASH_BLOCK_BYTES,
-        ))
+    pub(crate) fn comparison_block_size(&self) -> u64 {
+        self.tuning_options
+            .and_then(|t| t.comparison_block_size)
+            .unwrap_or(self.block_size)
     }
 
     pub(crate) fn only_new_native_entries(&self) -> bool {
@@ -2932,8 +2927,8 @@ mod tests {
             .map(OsString::from),
         )
         .unwrap();
-        assert_eq!(args.comparison_block_size().unwrap(), 64 << 10);
-        assert_eq!(args.block_size, "4M");
+        assert_eq!(args.comparison_block_size(), 64 << 10);
+        assert_eq!(args.block_size, 4 << 20);
         assert_eq!(args.tuning_options.unwrap().request_size, Some(4 << 20));
         let error = parse_native_copy(
             &[
@@ -2955,7 +2950,7 @@ mod tests {
             let args =
                 Args::parse_rsync(&["source", "destination", spelling, "128K"].map(OsString::from))
                     .unwrap();
-            assert_eq!(args.comparison_block_size().unwrap(), 128 << 10);
+            assert_eq!(args.comparison_block_size(), 128 << 10);
             let error = Args::parse_rsync(
                 &[
                     "source",
@@ -2972,19 +2967,19 @@ mod tests {
     }
 
     #[test]
-    fn comparison_block_size_resolves_and_clamps_once() {
-        let mut args = native_engine_defaults();
-        for (raw, expected) in [("1K", 64 << 10), ("4M", 4 << 20), ("1G", 64 << 20)] {
-            args.block_size = raw.to_owned();
-            assert_eq!(args.comparison_block_size().unwrap(), expected);
+    fn rsync_comparison_block_size_validates_during_argument_parsing() {
+        for spelling in ["-B", "--block-size"] {
+            for (raw, expected) in [("64K", 64 << 10), ("4M", 4 << 20), ("64M", 64 << 20)] {
+                let args =
+                    Args::try_parse_from(["syq rsync", spelling, raw, "src", "dst"]).unwrap();
+                assert_eq!(args.comparison_block_size(), expected);
+            }
+            for raw in ["0", "32K", "65M", "invalid"] {
+                let error =
+                    Args::try_parse_from(["syq rsync", spelling, raw, "src", "dst"]).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            }
         }
-        args.block_size = "invalid".to_owned();
-        assert!(args.comparison_block_size().is_err());
-        args.tuning_options = Some(crate::transfer_tuning::TransferTuning {
-            comparison_block_size: Some(128 << 10),
-            ..Default::default()
-        });
-        assert_eq!(args.comparison_block_size().unwrap(), 128 << 10);
     }
 
     #[test]

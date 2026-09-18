@@ -4283,7 +4283,7 @@ fn grant_for(
                 max_entries,
                 max_total_bytes,
                 max_file_bytes,
-                hash_block_bytes: args.comparison_block_size()?,
+                hash_block_bytes: args.comparison_block_size(),
                 max_connections: u16::try_from(if args.connections_opt.is_some() {
                     args.connections
                 } else {
