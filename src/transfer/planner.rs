@@ -312,6 +312,11 @@ pub(super) struct Planned {
     pub(super) contested: bool,
 }
 
+/// A directory that passed the filters, with what the destination held at
+/// its path: destination path, path below the destination root, source
+/// entry, destination stat.
+type PlannedDir = (PathBytes, PathBytes, Entry, Option<Entry>);
+
 /// One scanned batch after the mapping loop: every destination claimed,
 /// nothing touched yet. With several sources these are held until all of
 /// them have been scanned, so a conflict between sources is reported before
@@ -1340,7 +1345,7 @@ impl Planner<'_> {
             } else {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
-            let mut planned: Vec<(PathBytes, PathBytes, Entry, Option<Entry>)> = Vec::new();
+            let mut planned: Vec<PlannedDir> = Vec::new();
             for ((p, dst_rel, e), st) in dirs.into_iter().zip(stats) {
                 if self.fail_blocked_mapping_entry(&p, &dst_rel, e.kind) {
                     continue;
@@ -1613,62 +1618,7 @@ impl Planner<'_> {
                         return Err(endpoint_error(error)).context("apply destination changes");
                     }
                 }
-                let mut flags = opts.flags;
-                if !opts.perms {
-                    flags &= !flags::MODE;
-                }
-                for (p, _, e, s) in &planned {
-                    // New implicit parents already have their final modes.
-                    // Restore only those temporarily reopened for writing.
-                    if self.implicit_dirs.contains(p) {
-                        if reopened_dirs.contains(p) {
-                            let existing = s.as_ref().expect("reopened directory was observed");
-                            self.implicit_restorations.push((
-                                p.clone(),
-                                existing.meta(),
-                                if opts.restricted_receiver {
-                                    flags::RECEIVER_MODE
-                                } else {
-                                    flags::MODE
-                                },
-                                p.iter().filter(|&&c| c == b'/').count(),
-                                self.metadata_condition_for(p),
-                            ));
-                        }
-                        continue;
-                    }
-                    if opts.preserve_existing_directory_metadata && !self.created_dirs.contains(p) {
-                        continue;
-                    }
-                    let depth = p.iter().filter(|&&c| c == b'/').count();
-                    let mut meta = e.meta();
-                    let mut flags = flags;
-                    // Without -p, existing directories retain their mode and
-                    // new directories receive the source mode through the
-                    // receiving side's umask. Only a signed receiver needs to
-                    // replace the proposal: an ordinary receiver's Mkdir has
-                    // already applied its local umask and any kernel-inherited
-                    // setgid bit, which a follow-up chmod must not clear.
-                    if flags & flags::MODE == 0 {
-                        if opts.restricted_receiver {
-                            meta.mode = s
-                                .as_ref()
-                                .filter(|d| d.kind == Kind::Dir)
-                                .map_or(e.mode & 0o777 & !opts.umask, |d| d.mode & 0o7777);
-                            flags |= flags::RECEIVER_MODE;
-                        } else if let Some(existing) = s.as_ref().filter(|d| d.kind == Kind::Dir) {
-                            meta.mode = existing.mode & 0o7777;
-                            flags |= flags::MODE;
-                        }
-                    }
-                    self.deferred.push((
-                        p.clone(),
-                        meta,
-                        flags,
-                        depth,
-                        self.metadata_condition_for(p),
-                    ));
-                }
+                self.defer_directory_metadata(&planned, &reopened_dirs);
             }
         }
 
@@ -2093,6 +2043,72 @@ impl Planner<'_> {
         }
         self.flush_meta_fixes(meta_fixes)?;
         self.flush_leaf_ops(ops, &op_names)
+    }
+
+    /// Queue the final metadata of this batch's directories, applied once
+    /// their contents are written.
+    fn defer_directory_metadata(
+        &mut self,
+        planned: &[PlannedDir],
+        reopened_dirs: &std::collections::HashSet<PathBytes>,
+    ) {
+        let opts = self.opts;
+        let mut flags = opts.flags;
+        if !opts.perms {
+            flags &= !flags::MODE;
+        }
+        for (p, _, e, s) in planned {
+            // New implicit parents already have their final modes.
+            // Restore only those temporarily reopened for writing.
+            if self.implicit_dirs.contains(p) {
+                if reopened_dirs.contains(p) {
+                    let existing = s.as_ref().expect("reopened directory was observed");
+                    self.implicit_restorations.push((
+                        p.clone(),
+                        existing.meta(),
+                        if opts.restricted_receiver {
+                            flags::RECEIVER_MODE
+                        } else {
+                            flags::MODE
+                        },
+                        p.iter().filter(|&&c| c == b'/').count(),
+                        self.metadata_condition_for(p),
+                    ));
+                }
+                continue;
+            }
+            if opts.preserve_existing_directory_metadata && !self.created_dirs.contains(p) {
+                continue;
+            }
+            let depth = p.iter().filter(|&&c| c == b'/').count();
+            let mut meta = e.meta();
+            let mut flags = flags;
+            // Without -p, existing directories retain their mode and
+            // new directories receive the source mode through the
+            // receiving side's umask. Only a signed receiver needs to
+            // replace the proposal: an ordinary receiver's Mkdir has
+            // already applied its local umask and any kernel-inherited
+            // setgid bit, which a follow-up chmod must not clear.
+            if flags & flags::MODE == 0 {
+                if opts.restricted_receiver {
+                    meta.mode = s
+                        .as_ref()
+                        .filter(|d| d.kind == Kind::Dir)
+                        .map_or(e.mode & 0o777 & !opts.umask, |d| d.mode & 0o7777);
+                    flags |= flags::RECEIVER_MODE;
+                } else if let Some(existing) = s.as_ref().filter(|d| d.kind == Kind::Dir) {
+                    meta.mode = existing.mode & 0o7777;
+                    flags |= flags::MODE;
+                }
+            }
+            self.deferred.push((
+                p.clone(),
+                meta,
+                flags,
+                depth,
+                self.metadata_condition_for(p),
+            ));
+        }
     }
 
     /// Apply metadata corrections for files whose content is already current.
