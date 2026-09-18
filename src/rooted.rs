@@ -1032,7 +1032,7 @@ impl Root {
             return Ok(CopyLocalOutcome::Unsupported);
         }
         let fallback = |error: anyhow::Error| {
-            if crate::transfer::debug() {
+            if crate::output::debug() {
                 crate::output::diagnostic!(
                     "syq: clone {} unavailable; using byte copying: {error:#}",
                     path.label()

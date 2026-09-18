@@ -14,6 +14,7 @@ use crate::fsops::content_digest;
 use crate::fsops::{destination_fraction_matches, is_partial_name, is_recovery_name, join};
 pub(crate) use crate::mapping::validate_manifest_path;
 use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
+use crate::output::debug;
 use crate::progress::{commas, human, Progress};
 use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
@@ -1258,10 +1259,6 @@ struct DestinationAnchor {
 }
 type DestinationAnchorSlot = std::sync::Arc<std::sync::OnceLock<DestinationAnchor>>;
 type SourceRootsSlot = std::sync::Arc<std::sync::OnceLock<Vec<RegisteredSourceRoot>>>;
-
-pub fn debug() -> bool {
-    std::env::var_os("SYQ_DEBUG").is_some()
-}
 
 fn handle_tcp_setup_error(
     args: &Args,
