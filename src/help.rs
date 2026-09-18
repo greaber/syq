@@ -143,6 +143,7 @@ fn configure_at(mut command: Command, path: &str) -> Command {
 /// Presentation metadata references parser IDs, never a separate option list.
 /// Unclassified public options remain visible in the complete reference.
 pub(crate) fn filesystem(command: Command) -> Command {
+    let cp = command.get_name() == "syq cp";
     let rsync = command.get_name() == "syq rsync";
     let map = command.get_name() == "syq map";
     let clean = command.get_name() == "syq clean-partials";
@@ -197,7 +198,9 @@ pub(crate) fn filesystem(command: Command) -> Command {
             ) || (rm && id == "root")
                 || (clean && matches!(id, "trees" | "on"))
         };
-        let heading =
+        let heading = if cp {
+            copy_heading(id).0
+        } else {
             match id {
                 "sources" | "trees" | "on" | "paths" | "src" | "srcs_in" | "src_non_dir"
                 | "src_dir" | "src_non_dirs" | "src_dirs" | "srcs" | "from" | "cwd" | "root"
@@ -221,7 +224,8 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 "help" | "version" => "Help and version",
                 "dry_run" | "verbose" | "quiet" => "Preview and output",
                 _ => "Copy policy and filtering",
-            };
+            }
+        };
         let mut arg = arg.hide_short_help(!common).help_heading(heading);
         // Keep detailed rsync semantics in the full reference.
         if rsync && matches!(id, "ignore" | "delete") {
@@ -246,7 +250,58 @@ pub(crate) fn filesystem(command: Command) -> Command {
         }
         arg
     });
+    // Clap emits custom headings in argument insertion order.
+    let command = if cp {
+        let mut args: Vec<_> = command.get_arguments().cloned().collect();
+        args.sort_by_key(|arg| copy_heading(arg.get_id().as_str()).1);
+        let mut args = args.into_iter();
+        command.mut_args(|_| args.next().expect("one entry per argument"))
+    } else {
+        command
+    };
     configure(command)
+}
+
+/// Group copy options by the decisions a user makes, independently of parser layout.
+fn copy_heading(id: &str) -> (&'static str, usize) {
+    match id {
+        "sources" | "src" | "srcs_in" | "src_non_dir" | "src_dir" | "src_non_dirs" | "src_dirs"
+        | "srcs" | "from" | "cwd" | "root" | "ignore" | "ignore_from" | "min_size" | "max_size" => {
+            ("Sources and filtering", 0)
+        }
+        "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
+        | "mapping" => ("Destination and mapping", 1),
+        "ignore_existing" | "existing" | "update" | "inplace" | "prune" | "max_delete" => {
+            ("Updates and deletion", 2)
+        }
+        "preserve" | "follow" | "follow_src" | "follow_dst" => ("Metadata and symlinks", 3),
+        "verify_only" | "integrity_checking_arg" | "hash" | "expected_digest" => {
+            ("Verification", 4)
+        }
+        "auth_from"
+        | "via"
+        | "rsh"
+        | "syq_path"
+        | "no_bootstrap"
+        | "no_tcp"
+        | "tcp_plain"
+        | "tcp_ports"
+        | "tcp_congestion"
+        | "pscope"
+        | "no_compress"
+        | "coordinate_at"
+        | "detach"
+        | "peer_auth"
+        | "receiver_max_entries"
+        | "receiver_max_bytes"
+        | "receiver_receipt" => ("Connections and remote execution", 5),
+        "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" => ("S3 connection settings", 6),
+        "performance_tuning" | "resource_limits_arg" => ("Performance and resource limits", 7),
+        "dry_run" | "verbose" | "quiet" | "results" | "results_fd" | "progress" | "no_progress"
+        | "progress_json" | "stats" => ("Preview, progress, and results", 8),
+        "help" | "version" => ("Help and version", 9),
+        _ => ("Other options", 10),
+    }
 }
 
 pub(crate) fn root() -> Command {

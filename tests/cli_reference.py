@@ -103,11 +103,6 @@ def render(command, parsed, commands):
         if not command:
             out.append("| [`help`](#syq-help) | Show help for any command or nested command |")
         out.append("")
-    if command == ("cp",):
-        order = ["Sources and selection", "Destination placement", "Copy policy and filtering",
-                 "Integrity checking", "Performance tuning", "Resource limits", "SSH and transport",
-                 "Remote-to-remote transfers", "Progress and results", "Preview and output", "Help and version"]
-        groups = sorted(groups, key=lambda group: order.index(group[0]) if group[0] in order else len(order))
     for heading, rows in groups:
         if not rows:
             continue
