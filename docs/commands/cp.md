@@ -146,81 +146,67 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 ## File descriptors
 
-Use these options to connect a copy to another program without saving its
-output in a temporary file. `--src-fd 0` reads stdin; `--as-fd 1` writes stdout.
-The file at the other end can be local, on an SSH host, or in S3.
+Connect a copy to another program without saving its output in a temporary
+file. For example, compress while uploading, or decompress while downloading:
 
 ```sh
 gzip -c data | syq cp --src-fd 0 --to server --as data.gz
 syq cp --from server data.gz --as-fd 1 | gzip -dc > data
 ```
 
-Bash process substitution works too:
+`--src-fd 0` reads stdin; `--as-fd 1` writes stdout. The file can also be local
+or in S3. Bash process substitution works with ordinary source syntax:
+`syq cp --src <(gzip -c data) --to server --as data.gz`.
 
-```bash
-syq cp --src <(gzip -c data) --to server --as data.gz
-```
-
-A stream copy takes one source. Stdin and process substitution have no filename,
-so choose one with `--as PATH` (or `--as-new` / `--as-existing`), or write to a
-descriptor with `--as-fd`. A named pipe does have a name: `syq cp incoming.fifo
---into saved` reads its contents into the regular file `saved/incoming.fifo`.
-It waits for a writer. Selecting a pipe alongside other sources is an error,
-including when a shell glob selects it.
-
-Only explicitly selected local pipes are read. Pipes inside directory copies
-keep the usual special-file behavior; `--preserve=specials` copies the pipe
-itself. Use `--follow-src` to read through a symlink to a pipe. Named remote
-sources must be regular files.
+Each stream copy takes one source. Stdin and process substitution have no
+filename, so use `--as` to choose one, or `--as-fd` to write to a descriptor.
+A named pipe can use `--into`: `syq cp incoming.fifo --into saved` waits for a
+writer, then saves its bytes as the regular file `saved/incoming.fifo`.
+Selecting a pipe alongside other sources is an error. Directory copies never
+read pipes; `--preserve=specials` copies the pipe itself.
 
 ### Completion and failures
 
-For a named destination, syq writes a temporary file and replaces the final
-name only after the transfer succeeds. The placement conditions from `--as-new`,
-`--as-existing`, `--into-new`, and `--into-existing` apply as usual and are
-checked before opening a named pipe. S3 new-object writes also refuse replacement
-if an object appears during the upload.
+A named destination is replaced only after the transfer succeeds. The `-new`
+and `-existing` placement conditions apply as usual, before a named pipe is
+opened. S3 new-object writes also refuse replacement if an object appears
+during the upload.
 
-The end of a pipe only tells syq that no more bytes are coming. If the producer
-fails halfway through, syq can still successfully save those bytes. Bash's
-`set -o pipefail` lets your script detect a failed command in a pipeline, but
-cannot undo a file already saved. Process substitution needs a separate check
-of the producer's status. In Python, [managed streams](../python-reference.md)
-let you commit only after your producer succeeds.
+If the producer fails halfway through, syq can still successfully save the
+bytes it received: EOF does not tell it whether the producer succeeded.
+Bash's `set -o pipefail` detects failures in a pipeline but cannot undo a file
+already saved. Process substitution needs a separate check of the producer's
+status. In Python, [managed streams](../python-reference.md) let you commit
+only after your producer succeeds.
 
-An output descriptor exposes bytes as they arrive. It may contain incomplete
-data after a failure; check syq's exit status before treating it as complete.
-Syq reports an error if the consumer closes early. Cancelled uploads clean up
-their temporary files when possible; forced termination can leave a
-`.syq-stream-*` file beside the destination.
+An output descriptor may contain incomplete data after a failure. Check syq's
+exit status before using the result. A consumer closing early makes syq fail.
+Forced termination can leave a `.syq-stream-*` temporary file beside the
+destination.
 
-### Descriptor and file behavior
+### Options and file behavior
 
-You can use any inherited descriptor open in the right direction, except 2,
-which is reserved for diagnostics. For example, `syq cp data --as-fd 3 3>copy`
-writes through descriptor 3. Reads and writes start at its current offset;
-append mode is respected. Syq does not truncate it or change its metadata or
-blocking mode. Avoid using the same descriptor concurrently in another process.
-A literal `-` is a filename, not shorthand for stdin or stdout.
+Progress, `--stats`, and `-v` go to stderr, leaving stdout for payload.
+Statistics report bytes, elapsed time, and average rate; pipe lengths are
+unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput
+or an [expected hash](../integrity-checking.md#expected-digests) to check bytes
+during transfer without a second read.
 
-Streams carry bytes without source metadata. Existing destination files keep
-their permissions; new files use `0666` limited by the destination umask.
-Ownership follows normal file creation rules, and timestamps reflect the write.
-Parent directories are created as needed. Destination [symlinks](../reference.md#symlinks) and source
-`--cwd` / `--root` follow the usual copy rules, except that `--root` cannot
-confine a descriptor that is already open.
+Native streams accept `request-size`, `pipeline-depth`, and `bw-pacing` tuning.
+S3 uses its [multipart controls](../object-storage.md#descriptor-copies).
+Each stream uses one file or object worker; larger worker counts leave idle
+slots. SSH streams use one SSH connection. Restart recovery, named receiving
+destinations, detached execution, directory selection, comparison policies,
+metadata preservation, dry runs, and result records are unsupported.
 
-SSH streams use one SSH connection. These copies currently lack restart
-recovery, named receiving destinations, detached execution, directory selection,
-comparison policies, metadata preservation, dry runs, and result records;
-unsupported options report an error.
-Progress, `--stats`, and `-v` write to stderr, leaving stdout available for
-payload. For stdin and pipes, the total size is unknown until input ends.
-`--stats` reports bytes, elapsed time, and average rate.
+Other inherited descriptors work too, except 2, which is reserved for
+diagnostics. Dedicate each descriptor to the copy. Syq advances its offset,
+respects append mode, and leaves its blocking mode and metadata alone;
+it does not truncate it. A literal `-` is a filename.
 
-Use `--resource-limits bandwidth=RATE` to limit throughput. Native streams accept
-`request-size`, `pipeline-depth`, and `bw-pacing` tuning; S3 uses its
-[multipart controls](../object-storage.md#descriptor-copies). A stream uses one
-file or object worker, so larger worker counts leave unused slots.
-[Expected hashes](../integrity-checking.md#expected-digests) check bytes during
-the transfer without reading the input again.
+Streams carry no source metadata. Existing files keep their permissions;
+new files use `0666` limited by the destination umask. Ownership follows file
+creation rules and timestamps reflect the write. Parent directories are
+created as needed. The usual [symlink rules](../reference.md#symlinks) and
+source `--cwd` / `--root` options apply, but `--root` cannot confine a descriptor
+that is already open. Named remote sources must be regular files.

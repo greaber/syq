@@ -230,7 +230,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
         created = root / 'umask-output'
         run(['--src-fd', '0', '--as', str(created)], input=b'new', umask=0o027)
         assert created.stat().st_mode & 0o777 == 0o640
-        for option in ('--prune', '--dry-run', '--hash', '--verify-only', '--stats', '--detach'):
+        for option in ('--prune', '--dry-run', '--hash', '--verify-only', '--detach'):
             result = fail(['--src-fd', '0', '--as', str(root / 'forbidden'), option], input=b'')
             assert not (root / 'forbidden').exists(), option
         for args in (['--src-fd', '0'], ['--as-fd', '1'], ['--src-fd', '2', '--as', 'bad'],
