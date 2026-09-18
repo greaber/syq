@@ -90,8 +90,14 @@ def main():
             child.stdin.close()
             child.stdin = None
             deadline = time.monotonic() + 15
-            while not check.listing(uploads=True):
-                assert time.monotonic() < deadline, 'multipart preparation timed out'
+            # The pinned MinIO omits this upload from prefix-filtered listings.
+            # Match our exact key locally so the race and cleanup checks see it.
+            def pending_uploads():
+                return [upload for upload in check.listing(prefix='', uploads=True)
+                        if upload[0] == key]
+
+            while not pending_uploads():
+                assert time.monotonic() < deadline, f'no pending upload for {key}'
                 assert child.poll() is None, child.stderr.read()
                 print('Waiting for conditional multipart preparation', flush=True)
                 time.sleep(.2)
@@ -102,7 +108,7 @@ def main():
             _, error = child.communicate(timeout=30)
             assert child.returncode != 0, error
             assert check.request('GET', key)[1] == b'concurrent'
-            assert not check.listing(uploads=True)
+            assert not pending_uploads(), 'failed conditional upload was not aborted'
         finally:
             if commit_w is not None:
                 os.close(commit_w)
