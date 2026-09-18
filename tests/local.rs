@@ -6885,75 +6885,67 @@ fn progress_bar_is_opt_in_for_pipes_and_disabled_by_no_progress() {
 }
 
 #[test]
-fn tuning_options_job_storage_copies_and_updates_with_both_interfaces() {
-    for mode in ["compact", "inline", "combined"] {
-        for interface in ["cp", "rsync"] {
-            for engine in ["auto", "ranges"] {
-                let t = Tmp::new();
-                for (name, size) in [("empty", 0), ("small", 4194), ("nested/large", 2 << 20)] {
-                    write(&t.path(&format!("source/{name}")), &prng(size, 350));
-                }
-                let copy = || {
-                    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
-                    command.args([
-                        interface,
-                        "--no-progress",
-                        "--stats",
-                        "--performance-tuning",
-                        "workers=2",
-                        &format!("--performance-tuning=job-storage={mode},copy-path={engine}"),
-                    ]);
-                    if interface == "cp" {
-                        command.args(["--hash", "--preserve=permissions"]);
-                        command.args(["--srcs-in", &t.s("source"), "--into", &t.s("destination")]);
-                    } else {
-                        command.args(["-a", "--checksum", &t.s("source/"), &t.s("destination")]);
-                    }
-                    let out = command.run().unwrap();
-                    assert_output_ok(&out);
-                    assert!(
-                        stderr_of(&out).contains(&format!("job-storage={mode}")),
-                        "{out:?}"
-                    );
-                    assert_same_tree(&t.path("source"), &t.path("destination"));
-                };
-                copy(); // Fresh files, including batch-eligible and range work.
-                copy(); // Existing matching files.
-                write(&t.path("source/small"), &prng(4194, 351));
-                write(&t.path("source/nested/large"), &prng(2 << 20, 351));
-                copy(); // Same-size changed destinations require fresh metadata.
+fn copy_paths_copy_and_update_with_both_interfaces() {
+    for interface in ["cp", "rsync"] {
+        for engine in ["auto", "ranges"] {
+            let t = Tmp::new();
+            for (name, size) in [("empty", 0), ("small", 4194), ("nested/large", 2 << 20)] {
+                write(&t.path(&format!("source/{name}")), &prng(size, 350));
             }
+            let copy = || {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.args([
+                    interface,
+                    "--no-progress",
+                    "--stats",
+                    "--performance-tuning",
+                    "workers=2",
+                    &format!("--performance-tuning=copy-path={engine}"),
+                ]);
+                if interface == "cp" {
+                    command.args(["--hash", "--preserve=permissions"]);
+                    command.args(["--srcs-in", &t.s("source"), "--into", &t.s("destination")]);
+                } else {
+                    command.args(["-a", "--checksum", &t.s("source/"), &t.s("destination")]);
+                }
+                let out = command.run().unwrap();
+                assert_output_ok(&out);
+                assert_same_tree(&t.path("source"), &t.path("destination"));
+            };
+            copy(); // Fresh files, including batch-eligible and range work.
+            copy(); // Existing matching files.
+            write(&t.path("source/small"), &prng(4194, 351));
+            write(&t.path("source/nested/large"), &prng(2 << 20, 351));
+            copy(); // Same-size changed destinations require fresh metadata.
         }
     }
 }
 
 #[test]
-fn tuning_options_job_storage_inplace_preserves_hardlinks() {
-    for mode in ["compact", "inline", "combined"] {
-        for engine in ["auto", "ranges"] {
-            let t = Tmp::new();
-            write(&t.path("source"), &prng(4194, 351));
-            write(&t.path("destination"), b"old destination");
-            fs::hard_link(t.path("destination"), t.path("alias")).unwrap();
-            let inode = fs::metadata(t.path("destination")).unwrap().ino();
-            let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-                .args([
-                    "cp",
-                    &t.s("source"),
-                    "--as",
-                    &t.s("destination"),
-                    "--inplace",
-                    "--no-progress",
-                    "--performance-tuning",
-                    "workers=2",
-                    &format!("--performance-tuning=job-storage={mode},copy-path={engine}"),
-                ])
-                .run()
-                .unwrap();
-            assert_output_ok(&out);
-            assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
-            assert_eq!(read(&t.path("alias")), read(&t.path("source")));
-        }
+fn copy_paths_inplace_preserve_hardlinks() {
+    for engine in ["auto", "ranges"] {
+        let t = Tmp::new();
+        write(&t.path("source"), &prng(4194, 351));
+        write(&t.path("destination"), b"old destination");
+        fs::hard_link(t.path("destination"), t.path("alias")).unwrap();
+        let inode = fs::metadata(t.path("destination")).unwrap().ino();
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                &t.s("source"),
+                "--as",
+                &t.s("destination"),
+                "--inplace",
+                "--no-progress",
+                "--performance-tuning",
+                "workers=2",
+                &format!("--performance-tuning=copy-path={engine}"),
+            ])
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
+        assert_eq!(read(&t.path("alias")), read(&t.path("source")));
     }
 }
 
@@ -7602,15 +7594,15 @@ fn tuning_options_are_in_full_help_and_validate_before_copying() {
         assert_output_ok(&help);
         let text = String::from_utf8_lossy(&help.stdout);
         assert!(
-            text.contains("--performance-tuning")
-                && text.contains("pipeline-depth")
-                && text.contains("job-storage=combined|compact|inline"),
+            text.contains("--performance-tuning") && text.contains("pipeline-depth"),
             "{text}"
         );
+        assert!(!text.contains("job-storage"), "{text}");
         for options in [
             "typo=4",
-            "job-storage=unknown",
-            "job-storage=inline,job-storage=compact",
+            "job-storage=combined",
+            "job-storage=compact",
+            "job-storage=inline",
             "pipeline-depth=0",
             "request-size=65M",
             "pipeline-depth=4,pipeline-depth=8",
@@ -7645,7 +7637,6 @@ fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
         for pull in [false, true] {
             for (size, depth) in [(64 << 10, 1), (1 << 20, 8), (64 << 10, 64), (8 << 20, 8)] {
                 let destination = t.s(&format!("dst-{tcp}-{pull}-{size}-{depth}"));
-                let storage = if depth == 8 { "inline" } else { "compact" };
                 let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
                 command.args([
                     "cp",
@@ -7660,7 +7651,7 @@ fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
                     "--tcp-ports",
                     EPHEMERAL_TCP_PORTS,
                     "--performance-tuning",
-                    &format!("request-size={size},pipeline-depth={depth},job-storage={storage}"),
+                    &format!("request-size={size},pipeline-depth={depth}"),
                 ]);
                 if !tcp {
                     command.arg("--no-tcp");
@@ -10353,6 +10344,8 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
     for args in [
         ["cp", "-a", "source", "--into", "dest"].as_slice(),
         ["cp", "--delete", "source", "--into", "dest"].as_slice(),
+        ["cp", "-B", "64K", "source", "--into", "dest"].as_slice(),
+        ["cp", "--block-size", "64K", "source", "--into", "dest"].as_slice(),
         ["rm", "--syq-no-tcp", "source", "", ""].as_slice(),
         ["rm", "--bwlimit", "1M", "source", ""].as_slice(),
         ["rm", "--no-compress", "source", "", ""].as_slice(),
@@ -11700,13 +11693,30 @@ fn existing_updates_through_a_destination_root_symlink_to_a_dir() {
 }
 
 #[test]
+fn rsync_rejects_invalid_comparison_blocks_before_reading_inputs() {
+    let t = Tmp::new();
+    let out = syq(&[
+        "-B",
+        "32K",
+        "--files-from",
+        &t.s("missing-manifest"),
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    let error = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(2), "{error}");
+    assert!(!error.contains("missing-manifest"), "{error}");
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
 fn rsync_rejects_remote_to_remote() {
     for (source, destination) in [
         ("host-a.invalid:source", "host-b.invalid:destination"),
         ("same.invalid:source", "same.invalid:destination"),
     ] {
         let started = std::time::Instant::now();
-        let out = syq(&[source, destination]);
+        let out = syq(&["-B", "64K", source, destination]);
         assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
         assert!(
             stderr_of(&out).contains("source and destination cannot both be remote"),
@@ -12963,13 +12973,6 @@ fn impossible_sidecar_name_fails_one_file_and_continues() {
 #[cfg(debug_assertions)]
 #[test]
 fn changed_source_retry_uses_published_file_as_block_basis() {
-    for storage in ["compact", "inline", "combined"] {
-        changed_source_retry_uses_published_file_as_block_basis_with_storage(storage);
-    }
-}
-
-#[cfg(debug_assertions)]
-fn changed_source_retry_uses_published_file_as_block_basis_with_storage(storage: &str) {
     let t = Tmp::new();
     let original = vec![b'a'; 8 * 1024 * 1024];
     let mut changed = original.clone();
@@ -12982,7 +12985,6 @@ fn changed_source_retry_uses_published_file_as_block_basis_with_storage(storage:
     let ready = t.path("finalize-ready");
     let continuation = t.path("finalize-continue");
     let mut child = compat_command()
-        .arg(format!("--performance-tuning=job-storage={storage}"))
         .args([
             "-a",
             "--stats",
@@ -13044,13 +13046,6 @@ fn changed_source_retry_uses_published_file_as_block_basis_with_storage(storage:
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn changed_source_retry_still_uses_copy_file_range() {
-    for storage in ["compact", "inline", "combined"] {
-        changed_source_retry_still_uses_copy_file_range_with_storage(storage);
-    }
-}
-
-#[cfg(all(debug_assertions, target_os = "linux"))]
-fn changed_source_retry_still_uses_copy_file_range_with_storage(storage: &str) {
     let t = Tmp::new();
     let original = vec![b'a'; 8 * 1024 * 1024];
     let changed = vec![b'b'; 8 * 1024 * 1024];
@@ -13062,7 +13057,6 @@ fn changed_source_retry_still_uses_copy_file_range_with_storage(storage: &str) {
     let ready = t.path("finalize-ready");
     let continuation = t.path("finalize-continue");
     let mut child = compat_command()
-        .arg(format!("--performance-tuning=job-storage={storage}"))
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_TEST_FINALIZE_READY_FILE", &ready)
         .env("SYQ_TEST_FINALIZE_CONTINUE_FILE", &continuation)
@@ -14432,7 +14426,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "--inplace",
             "--prune",
             "--max-delete=1",
-            "--performance-tuning=job-storage=inline",
+            "--performance-tuning=workers=2",
             "--into-existing",
             &t.s("dst"),
             "-q",
@@ -14464,7 +14458,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
         "--inplace",
         "--prune",
         "--max-delete=1",
-        "--performance-tuning=job-storage=inline",
+        "--performance-tuning=workers=2",
     ] {
         assert!(
             log.contains(option),
@@ -16798,6 +16792,7 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
         &["syq", "help", ""],
         &[
             "cp",
+            "stream",
             "exec",
             "rm",
             "map",
@@ -16809,6 +16804,8 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
             "--self-update",
         ],
     );
+    assert_completion_candidates(&t, &["syq", "stream", "--write-f"], &["--write-fd"]);
+    assert_completion_candidates(&t, &["syq", "stream", "--read-f"], &["--read-fd"]);
     assert_completion_candidates(&t, &["syq", "help", "receiver", "e"], &["enroll"]);
     assert_completion_candidates(
         &t,
@@ -22596,6 +22593,7 @@ fn environment_options_apply_to_the_command_and_never_reach_children() {
         ])
         .env("SYQ_CP_OPTIONS", "--performance-tuning workers=1 --quiet")
         .env("SYQ_RM_OPTIONS", "--dry-run")
+        .env("SYQ_STREAM_OPTIONS", "--s3-region us-east-1")
         .env("RSH_ENV_DUMP", t.path("rsh.env"))
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
@@ -22610,6 +22608,7 @@ fn environment_options_apply_to_the_command_and_never_reach_children() {
     assert!(child_env.contains("RSH_ENV_DUMP="), "{child_env}");
     assert!(!child_env.contains("SYQ_CP_OPTIONS"), "{child_env}");
     assert!(!child_env.contains("SYQ_RM_OPTIONS"), "{child_env}");
+    assert!(!child_env.contains("SYQ_STREAM_OPTIONS"), "{child_env}");
 }
 
 #[test]

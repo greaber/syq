@@ -3,6 +3,11 @@ name: publish SDKs
 on:
   # Manual runs build and test Python distributions without publishing.
   workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Rebuild Python distributions and compare complete output bytes
+        type: boolean
+        default: false
   push:
     tags:
       - "sdk-python-v*"
@@ -44,21 +49,18 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            flags: "-C target-feature=+crt-static"
             sdist: true
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            flags: "-C target-feature=+crt-static"
             sdist: false
           - os: macos-26
             target: aarch64-apple-darwin
-            flags: ""
             sdist: false
           - os: macos-26-intel
             target: x86_64-apple-darwin
-            flags: ""
             sdist: false
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,7 +72,9 @@ jobs:
           python-version: "3.13.13"
       - name: Install pinned Python tooling
         run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
-      - name: Verify the pinned release and stage its native source
+      - name: Install checksum-pinned Nix
+        run: scripts/install-nix-ci.sh
+      - name: Verify the pinned native release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -84,31 +88,19 @@ jobs:
           test "$version" = "$(jq -er .version sdk/python/src/syq/syq-release-manifest.json)"
           test "$(gh release view "v$version" --json tagName,isDraft,isImmutable \
             --jq '[.tagName, .isDraft, .isImmutable] | @tsv')" = "v$version"$'\tfalse\ttrue'
-          python scripts/stage-python-sdk.py --out target/sdk-release-source
-          rustup target add '${{ matrix.target }}'
-      - name: Build distributions with pinned tooling
-        working-directory: target/sdk-release-source/sdk/python
-        env:
-          UV_PYTHON: ${{ steps.python.outputs.python-path }}
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/syq-sdk-python
-          RUSTFLAGS: ${{ matrix.flags }}
-          SYQ_RELEASE_PUBLIC_KEY: ${{ vars.SYQ_RELEASE_PUBLIC_KEY }}
-          SYQ_RELEASE_BUILD: "1"
-          CARGO_BUILD_TARGET: ${{ matrix.target }}
-          MATURIN_PEP517_ARGS: "--compatibility pypi --strip"
-        shell: bash
+          test "$(git rev-parse "refs/tags/v$version^{commit}")" = \
+            "$(jq -er .rev sdk/python/native-source.json)"
+      - name: Build distributions from locked inputs
         run: |
-          set -euo pipefail
-          test -n "$SYQ_RELEASE_PUBLIC_KEY"
-          export SOURCE_DATE_EPOCH
-          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
-          uv sync --frozen --no-install-project
-          uv run --no-sync python -m build --wheel --outdir "$GITHUB_WORKSPACE/sdk-dist"
-          if ${{ matrix.sdist }}; then
-            uv run --no-sync python -m build --sdist --outdir "$GITHUB_WORKSPACE/sdk-dist"
-            python "$GITHUB_WORKSPACE/scripts/normalize-python-sdist.py" \
-              --epoch "$SOURCE_DATE_EPOCH" "$GITHUB_WORKSPACE"/sdk-dist/*.tar.gz
+          scripts/build-python-dist.sh "$GITHUB_WORKSPACE/sdk-dist"
+          if ! ${{ matrix.sdist }}; then
+            rm sdk-dist/*.tar.gz
           fi
+      - name: Rebuild and compare complete distributions
+        if: github.event_name == 'workflow_dispatch' && inputs.rebuild
+        run: >-
+          nix --extra-experimental-features 'nix-command flakes' build
+          .#python-dist --rebuild --no-update-lock-file --no-link -L
       - name: Test the installed distribution
         shell: bash
         run: |
@@ -118,14 +110,36 @@ jobs:
           test "$#" -eq 1 && test -f "$1"
           uv venv "$RUNNER_TEMP/wheel-test"
           uv pip install --python "$RUNNER_TEMP/wheel-test/bin/python" --no-deps "$1"
+          uv export --project sdk/python --frozen --only-group dev --no-header --no-annotate |
+            awk '/^[^[:space:]]/ { keep = /^pyyaml==/ } keep' > "$RUNNER_TEMP/wheel-test-requirements.txt"
+          test -s "$RUNNER_TEMP/wheel-test-requirements.txt"
+          uv pip install --python "$RUNNER_TEMP/wheel-test/bin/python" --no-deps \
+            --require-hashes --only-binary :all: -r "$RUNNER_TEMP/wheel-test-requirements.txt"
           "$RUNNER_TEMP/wheel-test/bin/python" scripts/check-python-wheel.py \
             --version "$version" --identity "v$version"
           SYQ_CANDIDATE_EXECUTABLE=$("$RUNNER_TEMP/wheel-test/bin/python" -c \
             'from syq.bundled import bundled_executable; print(bundled_executable())')
           export SYQ_CANDIDATE_EXECUTABLE
+          if test "$(uname -s)" = Linux; then
+            readelf -l "$SYQ_CANDIDATE_EXECUTABLE" > "$RUNNER_TEMP/elf-headers"
+            if grep 'INTERP' "$RUNNER_TEMP/elf-headers"; then exit 1; fi
+          else
+            otool -L "$SYQ_CANDIDATE_EXECUTABLE"
+            if otool -L "$SYQ_CANDIDATE_EXECUTABLE" | grep '/nix/store/'; then exit 1; fi
+            minimum=$(otool -l "$SYQ_CANDIDATE_EXECUTABLE" | awk '$1 == "cmd" { command = $2 }
+              (command == "LC_BUILD_VERSION" && $1 == "minos") ||
+              (command == "LC_VERSION_MIN_MACOSX" && $1 == "version") { print $2 }')
+            if test "$(uname -m)" = arm64; then
+              test "$minimum" = 11.0
+              codesign --verify "$SYQ_CANDIDATE_EXECUTABLE"
+            else
+              test "$minimum" = 10.12
+            fi
+          fi
           SYQ_CANDIDATE_VERSION="$version" "$RUNNER_TEMP/wheel-test/bin/python" \
             -m unittest discover -s sdk/python/tests
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
         with:
           name: python-sdk-${{ matrix.target }}
           path: sdk-dist/*

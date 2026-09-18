@@ -20,7 +20,12 @@ pub const MAX_FRAME: usize = 65 * 1024 * 1024;
 pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME: usize = 1024 * 1024;
 const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
+/// Supported comparison granularity floor, enforced by receivers as well as the CLI.
+/// Smaller blocks increase the number of hashes per file; this is a protocol
+/// policy, not a minimum input size imposed by the hash algorithm.
 pub const MIN_HASH_BLOCK_BYTES: u64 = 64 * 1024;
+/// Requests default to the comparison block size. Keep their data plus metadata
+/// within MAX_FRAME, just as MAX_READ_BYTES does for explicit requests.
 pub const MAX_HASH_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 32;
 const HASH_RESPONSE_OVERHEAD: u64 = 24;

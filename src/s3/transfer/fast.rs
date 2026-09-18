@@ -22,10 +22,15 @@ impl Engine {
         }
         let average = bytes / count;
         let tiny = average < 1024 * 1024;
-        let single_request = largest <= self.part_size(largest);
+        let single_request = largest
+            <= if self.options.route.is_server_copy() {
+                self.copy_request_limit(largest)
+            } else {
+                self.part_size(largest)
+            };
         let fixed_workers = self.args.tuning_options.and_then(|t| t.s3_object_workers);
         let ramp_whole_objects = single_request && !tiny && fixed_workers.is_none();
-        let small_upload = self.options.upload && largest <= 1024 * 1024;
+        let small_upload = self.options.route == Route::Upload && largest <= 1024 * 1024;
         let capacity = if small_upload {
             super::super::tuning::small_object_capacity(largest)?
         } else {
@@ -76,7 +81,9 @@ impl Engine {
             && !self.args.verify_only
             && single_request
         {
-            let capacity = if self.options.upload {
+            let capacity = if self.options.route.is_server_copy() {
+                256
+            } else if self.options.route == Route::Upload {
                 let buffer_size = if self.tuning.tigris() {
                     8 * 1024 * 1024
                 } else {
@@ -113,34 +120,31 @@ impl Engine {
     pub(super) fn part_size(&self, size: u64) -> u64 {
         let seed = if !self.options.automatic_part_size {
             self.options.part_size
-        } else if self.options.upload {
-            if self.tuning.tigris() {
-                8 * 1024 * 1024
-            } else {
-                16 * 1024 * 1024
-            }
-        } else if self.tuning.local_latency() {
-            64 * 1024 * 1024
-        } else if self.tuning.tigris() {
-            16 * 1024 * 1024
         } else {
-            8 * 1024 * 1024
+            match self.options.route {
+                // No payload buffer: larger parts reduce provider round trips.
+                Route::ServerCopy { .. } => 256 * 1024 * 1024,
+                Route::Upload if self.tuning.tigris() => 8 * 1024 * 1024,
+                Route::Upload => 16 * 1024 * 1024,
+                Route::Download if self.tuning.local_latency() => 64 * 1024 * 1024,
+                Route::Download if self.tuning.tigris() => 16 * 1024 * 1024,
+                Route::Download => 8 * 1024 * 1024,
+            }
         };
         seed.max(size.div_ceil(10_000).next_multiple_of(1024 * 1024))
     }
     pub(super) fn part_workers(&self) -> usize {
         if !self.options.automatic_concurrency {
             self.options.concurrency
-        } else if !self.options.upload && self.tuning.local_latency() {
-            4
-        } else if self.tuning.tigris() {
-            if self.options.upload {
-                32
-            } else {
-                8
-            }
         } else {
-            64
+            match self.options.route {
+                // Every part still acquires a permit from the shared budget.
+                Route::ServerCopy { .. } => self.tuning.request_capacity(),
+                Route::Download if self.tuning.local_latency() => 4,
+                Route::Upload if self.tuning.tigris() => 32,
+                Route::Download if self.tuning.tigris() => 8,
+                Route::Upload | Route::Download => 64,
+            }
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -430,6 +434,86 @@ impl AsRef<[u8]> for UploadBuffer {
 mod buffer_tests {
     use super::*;
 
+    #[test]
+    fn server_copy_threshold_tracks_single_request_scheduling() {
+        let mut engine = planning_engine(&[]);
+        engine.options.route = Route::ServerCopy {
+            source_bucket: "source".into(),
+        };
+        let limit = 5 * 1024 * 1024 * 1024;
+        assert_eq!(engine.copy_request_limit(32 << 20), limit);
+        assert_eq!(engine.copy_request_limit(limit + 1), limit);
+        assert_eq!((6u64 << 30).div_ceil(engine.part_size(6u64 << 30)), 24);
+        assert_eq!(engine.part_workers(), engine.tuning.request_capacity());
+        assert!(engine
+            .object_workers([256 << 20; 100].into_iter())
+            .unwrap()
+            .maximum
+            .is_some());
+        assert!(engine
+            .object_workers([limit + 1; 100].into_iter())
+            .unwrap()
+            .maximum
+            .is_none());
+        let mut explicit = planning_engine(&["--performance-tuning", "s3-part-size=64M"]);
+        explicit.options.route = Route::ServerCopy {
+            source_bucket: "source".into(),
+        };
+        assert_eq!(explicit.copy_request_limit(32 << 20), 64 << 20);
+        assert!(explicit
+            .object_workers([256 << 20; 100].into_iter())
+            .unwrap()
+            .maximum
+            .is_none());
+    }
+
+    #[test]
+    fn server_copy_tuning_is_provider_neutral_and_respects_explicit_limits() {
+        let mut observed = Vec::new();
+        for endpoint in ["https://t3.storage.dev", "https://storage.example"] {
+            for extra in [
+                "",
+                "s3-max-concurrent-requests=1",
+                "s3-max-concurrent-requests=128",
+                "s3-max-concurrent-parts-per-object=7",
+            ] {
+                let mut flags = vec!["--to", "s3://destination", "--s3-endpoint", endpoint];
+                if !extra.is_empty() {
+                    flags.extend(["--performance-tuning", extra]);
+                }
+                let engine = planning_engine(&flags);
+                assert!(!engine.tuning.tigris());
+                engine.tuning.observe_control(Duration::from_millis(100));
+                let workers = engine.object_workers([32u64 << 30].into_iter()).unwrap();
+                let expected = match extra {
+                    "s3-max-concurrent-requests=1" => 1,
+                    "s3-max-concurrent-requests=128" => 128,
+                    "s3-max-concurrent-parts-per-object=7" => 7,
+                    _ => 256,
+                };
+                // A per-object queue follows the global exploration range,
+                // not the initial 64 permits; explicit limits remain binding.
+                assert_eq!(engine.part_workers(), expected);
+                observed.push((
+                    workers.initial,
+                    engine.part_size(32u64 << 30),
+                    engine.part_workers(),
+                    engine.tuning.request_limit(),
+                ));
+                engine.object_workers([1024u64; 512].into_iter()).unwrap();
+                assert_eq!(
+                    engine.tuning.request_limit(),
+                    match extra {
+                        "s3-max-concurrent-requests=1" => 1,
+                        "s3-max-concurrent-requests=128" => 128,
+                        _ => 256,
+                    }
+                );
+            }
+        }
+        assert_eq!(observed[..4], observed[4..]);
+    }
+
     #[tokio::test]
     async fn fragmented_downloads_release_receive_buffers_and_preserve_bytes() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -601,6 +685,8 @@ mod buffer_tests {
             progress: Progress::new(false, false, None, false),
             pace: Mutex::new(tokio::time::Instant::now()),
             upload_keys: OnceLock::new(),
+            copy_checksum_unsupported: Default::default(),
+            copy_tagging_unsupported: Default::default(),
             cancelled: Default::default(),
             cancel_wake: Default::default(),
             uploads: Default::default(),
@@ -625,7 +711,7 @@ mod buffer_tests {
                 let path = RelativePath::new(b"destination").unwrap();
                 let expected = Digest::hash_bytes(HashAlgorithm::Sha256, data);
                 let metadata = Metadata {
-                    kind: "file".into(),
+                    kind: crate::s3::client::ObjectKind::File,
                     mode: 0o644,
                     uid: unsafe { libc::geteuid() },
                     gid: unsafe { libc::getegid() },

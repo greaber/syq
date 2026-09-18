@@ -1,5 +1,5 @@
 {
-  description = "Reproducible standalone syq release binaries";
+  description = "Reproducible syq release binaries and Python distributions";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
@@ -64,6 +64,14 @@
               ${pkgs.gzip}/bin/gzip -9 -n -c "$out/bin/syq" > "$out/bin/syq.gz"
             '';
           };
-        in { inherit release; default = release; });
+        in {
+          inherit release;
+          default = release;
+          python-dist = import ./nix/python-dist.nix {
+            inherit pkgs release;
+            root = ./.;
+            epoch = self.lastModified;
+          };
+        });
     };
 }

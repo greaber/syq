@@ -4283,8 +4283,7 @@ fn grant_for(
                 max_entries,
                 max_total_bytes,
                 max_file_bytes,
-                hash_block_bytes: crate::cli::parse_size(&args.block_size)?
-                    .clamp(proto::MIN_HASH_BLOCK_BYTES, proto::MAX_HASH_BLOCK_BYTES),
+                hash_block_bytes: args.block_size,
                 max_connections: u16::try_from(if args.connections_opt.is_some() {
                     args.connections
                 } else {

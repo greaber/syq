@@ -1,5 +1,7 @@
 # Rsync compatibility
 
+See [`syq rsync`](commands/rsync.md) for the option list.
+
 `syq rsync` accepts common rsync commands for local copies, pushes, and pulls.
 It uses its own protocol: the remote program must be syq, not rsync.
 Run `syq rsync --help-all` for all accepted flags.
@@ -38,8 +40,8 @@ to be newer.
 Syq uses numeric IDs and always keeps partial files, so `--numeric-ids` and
 `--partial` are accepted no-ops. `-P` enables progress. Compression is on by
 default; `-z` does not enable anything extra. `-B` / `--block-size` changes
-syq's comparison and reuse block size. Interrupted copies can still be reused
-after changing it; syq compares their bytes using the new size.
+syq's comparison and reuse block size; see the [tuning table](tuning.md#transfer-controls)
+for its default and allowed range. Values outside that range are rejected.
 
 ## Unsupported features
 

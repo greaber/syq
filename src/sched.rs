@@ -1,7 +1,6 @@
 //! Work queue with largest-first file scheduling and range work-stealing.
 
 use crate::proto::{ContainerGuard, Entry, PathBytes, RegisteredPath};
-use crate::transfer_tuning::JobStorage;
 use std::borrow::{Borrow, BorrowMut};
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
@@ -55,12 +54,10 @@ pub struct FileJobData {
     pub src_rel: Option<PathBytes>,
 }
 
-// Compatibility modes own a deep copy. Combined snapshots retain a chunk or
-// a private retry version, preserving worker views while metadata changes.
+// Snapshots retain a chunk or a private retry version, preserving worker
+// views while metadata changes.
 #[derive(Clone, Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum SnapshotData {
-    Owned(FileJobData),
     Shared(Arc<FileJobData>),
     Chunk {
         slots: Arc<Vec<OnceLock<FileJobData>>>,
@@ -71,48 +68,20 @@ pub enum SnapshotData {
 impl Borrow<FileJobData> for SnapshotData {
     fn borrow(&self) -> &FileJobData {
         match self {
-            Self::Owned(data) => data,
             Self::Shared(data) => data,
             Self::Chunk { slots, slot } => slots[*slot].get().unwrap(),
         }
     }
 }
 
-// Keep compatibility snapshots owned without adding an allocation for the
-// record itself; the default mode shares immutable destination metadata.
-#[derive(Clone, Debug)]
-pub enum SnapshotEntry {
-    Owned(Entry),
-    Shared(Arc<Entry>),
-}
-
-impl Deref for SnapshotEntry {
-    type Target = Entry;
-    fn deref(&self) -> &Entry {
-        match self {
-            Self::Owned(entry) => entry,
-            Self::Shared(entry) => entry,
-        }
-    }
-}
-
-pub type WorkerJob = FileJob<Option<SnapshotEntry>, SnapshotData>;
+pub type WorkerJob = FileJob<Option<Arc<Entry>>, SnapshotData>;
 const JOBS_PER_CHUNK: usize = 1024;
-
-/// Select the retained representation once per command. Workers always receive
-/// a stable snapshot, so all layouts use identical transfer and retry logic.
-#[allow(clippy::vec_box)]
-pub enum Jobs {
-    Compact(Vec<Box<FileJob<Option<Box<Entry>>>>>),
-    Inline(Vec<FileJob>),
-    Combined(SharedChunks),
-}
 
 /// Published slots never change. OnceLock permits appending jobs to a partial
 /// chunk while workers hold earlier slots, without unsafe aliasing or chunk COW.
 /// Retry versions are sparse and owned independently of the original chunk.
 #[derive(Default)]
-pub struct SharedChunks {
+pub struct Jobs {
     chunks: Vec<Arc<Vec<OnceLock<FileJobData>>>>,
     destinations: Vec<Option<Arc<Entry>>>,
     retries: HashMap<usize, Arc<FileJobData>>,
@@ -143,7 +112,7 @@ impl<'a> CurrentJob<'a> {
     }
 }
 
-impl SharedChunks {
+impl Jobs {
     fn locate(idx: usize) -> (usize, usize) {
         (idx / JOBS_PER_CHUNK, idx % JOBS_PER_CHUNK)
     }
@@ -182,23 +151,9 @@ impl SharedChunks {
                 .or_insert_with(|| Arc::new(chunks[chunk][slot].get().unwrap().clone())),
         )
     }
-}
-
-impl Jobs {
-    fn new(storage: JobStorage) -> Self {
-        match storage {
-            JobStorage::Compact => Self::Compact(Vec::new()),
-            JobStorage::Inline => Self::Inline(Vec::new()),
-            JobStorage::Combined => Self::Combined(SharedChunks::default()),
-        }
-    }
 
     pub fn len(&self) -> usize {
-        match self {
-            Self::Compact(jobs) => jobs.len(),
-            Self::Inline(jobs) => jobs.len(),
-            Self::Combined(jobs) => jobs.destinations.len(),
-        }
+        self.destinations.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -209,75 +164,36 @@ impl Jobs {
         (0..self.len()).map(|idx| &self[idx])
     }
 
-    fn push(&mut self, job: FileJob) {
-        match self {
-            Self::Compact(jobs) => jobs.push(Box::new(FileJob {
-                data: job.data,
-                dst_entry: job.dst_entry.map(Box::new),
-            })),
-            Self::Inline(jobs) => jobs.push(job),
-            Self::Combined(jobs) => jobs.push(job),
-        }
-    }
-
     pub fn snapshot(&self, idx: usize) -> WorkerJob {
         FileJob {
-            data: match self {
-                Self::Combined(jobs) => jobs.current(idx).snapshot(),
-                _ => SnapshotData::Owned(self[idx].clone()),
-            },
-            dst_entry: match self {
-                Self::Combined(jobs) => jobs.destinations[idx]
-                    .as_ref()
-                    .map(|entry| SnapshotEntry::Shared(entry.clone())),
-                _ => self.destination(idx).cloned().map(SnapshotEntry::Owned),
-            },
+            data: self.current(idx).snapshot(),
+            dst_entry: self.destinations[idx].clone(),
         }
     }
 
     pub fn destination(&self, idx: usize) -> Option<&Entry> {
-        match self {
-            Self::Compact(jobs) => jobs[idx].dst_entry.as_deref(),
-            Self::Inline(jobs) => jobs[idx].dst_entry.as_ref(),
-            Self::Combined(jobs) => jobs.destinations[idx].as_deref(),
-        }
+        self.destinations[idx].as_deref()
     }
 
     pub fn set_destination(&mut self, idx: usize, entry: Entry) {
-        match self {
-            Self::Compact(jobs) => jobs[idx].dst_entry = Some(Box::new(entry)),
-            Self::Inline(jobs) => jobs[idx].dst_entry = Some(entry),
-            Self::Combined(jobs) => jobs.destinations[idx] = Some(Arc::new(entry)),
-        }
+        self.destinations[idx] = Some(Arc::new(entry));
     }
 
     fn release(&mut self) {
-        match self {
-            Self::Compact(jobs) => *jobs = Vec::new(),
-            Self::Inline(jobs) => *jobs = Vec::new(),
-            Self::Combined(jobs) => *jobs = SharedChunks::default(),
-        }
+        *self = Self::default();
     }
 }
 
 impl Index<usize> for Jobs {
     type Output = FileJobData;
     fn index(&self, idx: usize) -> &Self::Output {
-        match self {
-            Self::Compact(jobs) => &jobs[idx].data,
-            Self::Inline(jobs) => &jobs[idx].data,
-            Self::Combined(jobs) => jobs.current(idx).data(),
-        }
+        self.current(idx).data()
     }
 }
 
 impl IndexMut<usize> for Jobs {
     fn index_mut(&mut self, idx: usize) -> &mut Self::Output {
-        match self {
-            Self::Compact(jobs) => &mut jobs[idx].data,
-            Self::Inline(jobs) => &mut jobs[idx].data,
-            Self::Combined(jobs) => jobs.get_mut(idx),
-        }
+        self.get_mut(idx)
     }
 }
 
@@ -327,6 +243,7 @@ struct RangeQueue {
     largest: BTreeSet<(u64, usize, u64)>,
     by_file: HashMap<usize, BTreeSet<(u64, u64)>>,
     len: usize,
+    bytes: u64,
 }
 
 impl RangeQueue {
@@ -344,6 +261,7 @@ impl RangeQueue {
         let previous = file.last().copied();
         for &(off, end) in ranges {
             assert!(file.insert((end - off, off)));
+            self.bytes += end - off;
         }
         let maximum = file.last().copied();
         if previous != maximum {
@@ -370,6 +288,7 @@ impl RangeQueue {
             self.by_file.remove(&idx);
         }
         self.len -= 1;
+        self.bytes -= len;
         (idx, off, off + len)
     }
 
@@ -391,6 +310,7 @@ impl RangeQueue {
         self.len == 0
     }
 
+    #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = (usize, u64, u64)> + '_ {
         self.by_file
             .iter()
@@ -423,8 +343,40 @@ impl FileOrder {
     }
 }
 
+/// Keep queue size accounting at the mutation boundary for tuner samples.
+#[derive(Default)]
+struct FileQueue {
+    heap: BinaryHeap<(u64, Reverse<FileOrder>)>,
+    bytes: u64,
+}
+
+impl FileQueue {
+    fn push(&mut self, item: (u64, Reverse<FileOrder>)) {
+        self.heap.push(item);
+        self.bytes += item.0;
+    }
+
+    fn pop(&mut self) -> Option<(u64, Reverse<FileOrder>)> {
+        let item = self.heap.pop()?;
+        self.bytes -= item.0;
+        Some(item)
+    }
+
+    fn peek(&self) -> Option<&(u64, Reverse<FileOrder>)> {
+        self.heap.peek()
+    }
+
+    fn len(&self) -> usize {
+        self.heap.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+}
+
 struct Inner {
-    files: BinaryHeap<(u64, Reverse<FileOrder>)>,
+    files: FileQueue,
     ranges: RangeQueue,
     finishes: Vec<(usize, bool)>,
     inflight: Vec<RangeHandle>,
@@ -476,15 +428,10 @@ pub struct Sched {
 }
 
 impl Sched {
-    #[cfg(test)]
     pub fn new(block: u64, min_split: u64) -> Self {
-        Self::with_job_storage(block, min_split, JobStorage::default())
-    }
-
-    pub fn with_job_storage(block: u64, min_split: u64, storage: JobStorage) -> Self {
         Sched {
             inner: Mutex::new(Inner {
-                files: BinaryHeap::new(),
+                files: FileQueue::default(),
                 ranges: RangeQueue::default(),
                 finishes: Vec::new(),
                 inflight: Vec::new(),
@@ -504,7 +451,7 @@ impl Sched {
             direct_fallback_workers: AtomicUsize::new(0),
             initial_range_workers: AtomicUsize::new(0),
             tune_request: AtomicUsize::new(0),
-            jobs: Mutex::new(Jobs::new(storage)),
+            jobs: Mutex::new(Jobs::default()),
             block,
             min_split: min_split.max(2 * block),
         }
@@ -532,7 +479,7 @@ impl Sched {
     pub fn clear_finished_work(&self) {
         self.jobs.lock().unwrap().release();
         let mut inner = self.inner.lock().unwrap();
-        inner.files = BinaryHeap::new();
+        inner.files = FileQueue::default();
         inner.ranges = RangeQueue::default();
         inner.finishes = Vec::new();
         inner.inflight = Vec::new();
@@ -760,8 +707,7 @@ impl Sched {
         if !g.scan_done {
             return false;
         }
-        let mut bytes: u64 = g.files.iter().map(|(s, _)| *s).sum();
-        bytes += g.ranges.iter().map(|(_, o, e)| e - o).sum::<u64>();
+        let mut bytes = g.files.bytes + g.ranges.bytes;
         bytes += g
             .inflight
             .iter()
@@ -1127,8 +1073,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn combined_destination_snapshots_share_and_preserve_replaced_versions() {
-        let mut jobs = Jobs::new(JobStorage::Combined);
+    fn destination_snapshots_share_and_preserve_replaced_versions() {
+        // Worker batches should carry shared handles, not space for owned metadata.
+        assert!(size_of::<WorkerJob>() <= 4 * size_of::<usize>());
+        let mut jobs = Jobs::default();
         let mut job = test_job(b"source", 7);
         let mut original = job.entry.clone();
         original.path = b"destination/original".to_vec();
@@ -1136,9 +1084,7 @@ pub(crate) mod tests {
         jobs.push(job);
         let first = jobs.snapshot(0);
         let second = jobs.snapshot(0);
-        let (Some(SnapshotEntry::Shared(a)), Some(SnapshotEntry::Shared(b))) =
-            (&first.dst_entry, &second.dst_entry)
-        else {
+        let (Some(a), Some(b)) = (&first.dst_entry, &second.dst_entry) else {
             panic!("destination was deep-cloned");
         };
         assert!(Arc::ptr_eq(a, b));
@@ -1167,8 +1113,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn combined_chunks_allow_append_retry_and_release_with_live_snapshots() {
-        let mut jobs = Jobs::new(JobStorage::Combined);
+    fn chunks_allow_append_retry_and_release_with_live_snapshots() {
+        let mut jobs = Jobs::default();
         jobs.push(test_job(b"source", 7));
         let first = jobs.snapshot(0);
         let SnapshotData::Chunk { slots, .. } = &first.data else {
@@ -1194,11 +1140,8 @@ pub(crate) mod tests {
             panic!("expected chunk");
         };
         assert!(Arc::ptr_eq(slots, second_slots));
-        let Jobs::Combined(storage) = &jobs else {
-            unreachable!()
-        };
-        assert!(storage.retries.is_empty());
-        assert_eq!(storage.chunks.len(), 3);
+        assert!(jobs.retries.is_empty());
+        assert_eq!(jobs.chunks.len(), 3);
         jobs[0].entry.size = 11;
         let retry = jobs.snapshot(0);
         jobs[0].entry.size = 13;
@@ -1216,77 +1159,70 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn job_storage_preserves_indexes_snapshots_retries_and_releases_capacity() {
+    fn jobs_preserve_indexes_snapshots_retries_and_release_capacity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file");
         std::fs::write(&path, b"payload").unwrap();
         let entry = crate::fsops::lstat_entry(b"file".to_vec(), &path).unwrap();
-        for mode in [
-            JobStorage::Compact,
-            JobStorage::Inline,
-            JobStorage::Combined,
-        ] {
-            let sched = Sched::with_job_storage(4, 8, mode);
-            for i in 0..(2 * JOBS_PER_CHUNK + 1) {
-                let idx = sched.push_file(FileJob {
-                    dst_entry: (i % 2 == 0).then(|| entry.clone()),
-                    data: FileJobData {
-                        src: b"src/file".to_vec(),
-                        source: RegisteredPath::new(
-                            serde_json::from_str("0").unwrap(),
-                            b"file".to_vec(),
-                        )
-                        .unwrap(),
-                        dst: b"dst/file".to_vec(),
-                        rel: i.to_string(),
-                        entry: entry.clone(),
-                        target_condition: crate::proto::TargetCondition::Any,
-                        container_guard: None,
-                        attempt: 0,
-                        done: Arc::new(AtomicU64::new(0)),
-                        inplace: false,
-                        rel_bytes: i.to_string().into_bytes(),
-                        src_rel: None,
-                    },
-                });
-                assert_eq!(idx, i);
-            }
-            let mut jobs = sched.jobs.lock().unwrap();
-            assert_eq!(jobs.len(), 2 * JOBS_PER_CHUNK + 1);
-            for i in 0..jobs.len() {
-                assert_eq!(jobs[i].rel, i.to_string());
-                assert_eq!(jobs.destination(i).is_some(), i % 2 == 0);
-            }
-            let before = jobs.snapshot(1);
-            jobs[1].entry.size = 99;
-            jobs[1].attempt = 1;
-            jobs[1].inplace = true;
-            jobs[1].done.store(3, Relaxed);
-            jobs.set_destination(1, entry.clone());
-            let retry = jobs.snapshot(1);
-            assert_eq!(before.entry.size, 7);
-            assert_eq!(before.attempt, 0);
-            assert!(!before.inplace);
-            assert!(before.dst_entry.is_none());
-            assert_eq!(retry.entry.size, 99);
-            assert_eq!(retry.attempt, 1);
-            assert!(retry.inplace);
-            assert_eq!(retry.dst_entry.unwrap().size, 7);
-            assert_eq!(before.done.load(Relaxed), 3);
-            drop(jobs);
-            sched.clear_finished_work();
-            let jobs = sched.jobs.lock().unwrap();
-            assert!(jobs.is_empty());
-            match &*jobs {
-                Jobs::Compact(jobs) => assert_eq!(jobs.capacity(), 0),
-                Jobs::Inline(jobs) => assert_eq!(jobs.capacity(), 0),
-                Jobs::Combined(jobs) => {
-                    assert_eq!(jobs.chunks.capacity(), 0);
-                    assert_eq!(jobs.destinations.capacity(), 0);
-                    assert_eq!(jobs.retries.capacity(), 0);
-                }
-            }
+        let sched = Sched::new(4, 8);
+        for i in 0..(2 * JOBS_PER_CHUNK + 1) {
+            let idx = sched.push_file(FileJob {
+                dst_entry: (i % 2 == 0).then(|| entry.clone()),
+                data: FileJobData {
+                    src: b"src/file".to_vec(),
+                    source: RegisteredPath::new(
+                        serde_json::from_str("0").unwrap(),
+                        b"file".to_vec(),
+                    )
+                    .unwrap(),
+                    dst: b"dst/file".to_vec(),
+                    rel: i.to_string(),
+                    entry: entry.clone(),
+                    target_condition: crate::proto::TargetCondition::Any,
+                    container_guard: None,
+                    attempt: 0,
+                    done: Arc::new(AtomicU64::new(0)),
+                    inplace: false,
+                    rel_bytes: i.to_string().into_bytes(),
+                    src_rel: None,
+                },
+            });
+            assert_eq!(idx, i);
         }
+        let mut jobs = sched.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 2 * JOBS_PER_CHUNK + 1);
+        for i in 0..jobs.len() {
+            assert_eq!(jobs[i].rel, i.to_string());
+            assert_eq!(jobs.destination(i).is_some(), i % 2 == 0);
+        }
+        let before = jobs.snapshot(1);
+        jobs[1].entry.size = 99;
+        jobs[1].attempt = 1;
+        jobs[1].inplace = true;
+        jobs[1].done.store(3, Relaxed);
+        jobs.set_destination(1, entry.clone());
+        let retry = jobs.snapshot(1);
+        assert_eq!(before.entry.size, 7);
+        assert_eq!(before.attempt, 0);
+        assert!(!before.inplace);
+        assert!(before.dst_entry.is_none());
+        assert_eq!(retry.entry.size, 99);
+        assert_eq!(retry.attempt, 1);
+        assert!(retry.inplace);
+        assert_eq!(retry.dst_entry.unwrap().size, 7);
+        assert_eq!(before.done.load(Relaxed), 3);
+        drop(jobs);
+        assert_eq!(
+            sched.inner.lock().unwrap().files.bytes,
+            7 * (2 * JOBS_PER_CHUNK as u64 + 1)
+        );
+        sched.clear_finished_work();
+        assert_eq!(sched.inner.lock().unwrap().files.bytes, 0);
+        let jobs = sched.jobs.lock().unwrap();
+        assert!(jobs.is_empty());
+        assert_eq!(jobs.chunks.capacity(), 0);
+        assert_eq!(jobs.destinations.capacity(), 0);
+        assert_eq!(jobs.retries.capacity(), 0);
     }
 
     #[test]
@@ -1443,12 +1379,14 @@ pub(crate) mod tests {
         queue.push((1, 0, 2048));
         queue.push((2, 0, 512));
         assert_eq!(queue.len(), 5);
+        assert_eq!(queue.bytes, 7168);
         assert_eq!(queue.largest.len(), 3);
         assert_eq!(queue.iter().count(), 5);
         assert_eq!(queue.pop(), Some((1, 0, 2048)));
         assert_eq!(queue.take_short(0, 512), Some((0, 0, 512)));
         assert_eq!(queue.take_short(2, 512), Some((2, 0, 512)));
         assert_eq!(queue.largest.len(), 1);
+        assert_eq!(queue.bytes, 4096);
         assert_eq!(queue.take_short(0, 512), None);
         queue.push((0, 8192, 12288));
         queue.push((1, 8192, 10240));
@@ -1459,6 +1397,7 @@ pub(crate) mod tests {
         assert!(queue.is_empty());
         assert!(queue.by_file.is_empty());
         assert!(queue.largest.is_empty());
+        assert_eq!(queue.bytes, 0);
     }
 
     #[test]
@@ -1471,6 +1410,10 @@ pub(crate) mod tests {
             queue.extend(idx, &ranges);
         }
         assert_eq!(queue.len(), 200_000);
+        assert_eq!(
+            queue.bytes,
+            queue.iter().map(|(_, o, e)| e - o).sum::<u64>()
+        );
         assert_eq!(queue.largest.len(), 200);
         for idx in (0..200).rev() {
             for _ in 0..125 {
@@ -1479,8 +1422,12 @@ pub(crate) mod tests {
             }
             assert!(queue.take_short(idx, 512).is_none());
         }
+        let mut remaining: u64 = queue.iter().map(|(_, o, e)| e - o).sum();
+        assert_eq!(queue.bytes, remaining);
         let mut previous = u64::MAX;
         while let Some((_, off, end)) = queue.pop() {
+            remaining -= end - off;
+            assert_eq!(queue.bytes, remaining);
             assert!(end - off <= previous);
             previous = end - off;
         }
@@ -1637,6 +1584,44 @@ pub(crate) mod tests {
         };
         empty.scan_done();
         assert!(!waiter.join().unwrap());
+    }
+
+    #[test]
+    fn queued_file_bytes_follow_claims_retries_and_stolen_groups() {
+        let sched = Sched::new(64, 128);
+        let big = sched.push_file(test_job(b"big", 1024));
+        let small = sched.push_file(test_job(b"small", 256));
+        let sibling = sched.push_file(test_job(b"sibling", 256));
+        sched.scan_done();
+        assert!(sched.work_left_for(2, 1536, 0));
+        assert!(!sched.work_left_for(2, 1537, 0));
+        assert!(matches!(sched.next(), Item::File(idx) if idx == big));
+        assert_eq!(sched.inner.lock().unwrap().files.bytes, 512);
+        assert_eq!(sched.take_small(256, 2, 512).len(), 2);
+        assert!(!sched.work_left_for(1, 1, 0));
+        sched.requeue(big);
+        sched.ranges_ready(big, Vec::new());
+        assert!(sched.work_left_for(1, 1024, 0));
+        assert!(matches!(sched.next(), Item::File(idx) if idx == big));
+        sched.begin_fast_batch(1, 128);
+        sched.mark_fast(2);
+        let (_, handle) = sched.share_fast_groups(
+            vec![(1024, big), (256, small), (256, sibling)],
+            [0..1, 1..3].into(),
+        );
+        assert_eq!(
+            sched.steal_fast_group(&mut sched.inner.lock().unwrap()),
+            Some(small)
+        );
+        assert!(sched.work_left_for(1, 256, 0));
+        assert!(!sched.work_left_for(1, 257, 0));
+        assert!(matches!(sched.next(), Item::File(idx) if idx == sibling));
+        sched.ranges_ready(small, Vec::new());
+        sched.ranges_ready(sibling, Vec::new());
+        assert_eq!(sched.finish_fast_groups(&handle), vec![true, false, false]);
+        sched.complete_fast_batch(1);
+        assert!(sched.finished());
+        assert_eq!(sched.inner.lock().unwrap().files.bytes, 0);
     }
 
     #[test]

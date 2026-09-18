@@ -37,7 +37,7 @@ brew install greaber/tap/syq
 
 ## Build from source
 
-See [source builds](development.md) for Cargo builds, custom compilation options,
+See [source builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for Cargo builds, custom compilation options,
 and choosing between your own executable and compatible official SSH helpers.
 
 ## Try a benchmark
@@ -58,14 +58,15 @@ for workload sizes, warm-up time, and command-line options.
 <caption>Published example: Germany → US East Coast</caption>
 <thead><tr><th scope="col">Tool</th><th scope="col">Average speed</th></tr></thead>
 <tbody>
-<tr><th scope="row">syq</th><td>159.1 MB/s</td></tr>
-<tr><th scope="row">syq over SSH</th><td>87.2 MB/s</td></tr>
-<tr><th scope="row">rsync</th><td>18.0 MB/s</td></tr>
+<tr><th scope="row">syq</th><td>159.9 MB/s</td></tr>
+<tr><th scope="row">syq over SSH</th><td>88.3 MB/s</td></tr>
+<tr><th scope="row">rsync</th><td>18.3 MB/s</td></tr>
 </tbody>
 </table>
 <figcaption>One 1.07 GB file, held in memory at both ends; three runs per tool.
 From the separate <a href="https://greaber.github.io/syq-bench/all-results.html#public-wan-forward">syq-bench project</a>,
-which provides more extensive benchmarks. Your results will depend on your machines and connection.</figcaption>
+measured on September 13, 2026 (<a href="https://greaber.github.io/syq-bench/data/release-060-public-wan-forward.json">raw results</a>).
+Your results will depend on your machines and connection.</figcaption>
 </figure>
 
 ## Updates
@@ -89,6 +90,9 @@ verified against the signed release manifest, so the host cannot substitute
 files.
 
 ## Shell completion
+
+See the [completion command reference](commands/completion.md) for every command
+and cache-management option.
 
 Add the line for your shell to its startup file:
 

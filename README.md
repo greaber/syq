@@ -14,7 +14,7 @@ Quick links to docs for common tasks:
   Your laptop needs no SSH server or incoming network port.
 - [Run commands on your laptop from a server](https://greaber.github.io/syq/exec.html)
 - [Copy directly between servers without forwarding your SSH agent](https://greaber.github.io/syq/remote-to-remote.html)
-- [Upload and download with S3-compatible object storage](https://greaber.github.io/syq/object-storage.html)
+- [Copy to, from, and between S3-compatible buckets](https://greaber.github.io/syq/object-storage.html)
 - [Rename and reorganize files during a copy](https://greaber.github.io/syq/mappings.html)
 - Script syq using the [JSON API](https://greaber.github.io/syq/automation.html) or
   [Python SDK](https://greaber.github.io/syq/python.html).
@@ -53,9 +53,7 @@ examples.
 
 ## Developing syq
 
-For source builds, remote testing, and contribution checks, see
-[Developing syq](docs/development.md). For everyday use, install a release
-using the commands above.
+See [CONTRIBUTING.md](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for source builds and contribution checks.
 
 ## License
 

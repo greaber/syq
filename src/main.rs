@@ -258,6 +258,18 @@ fn main() {
             }
         }
     }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("stream") {
+        match s3::stream::run(&argv[1..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                if let Some(error) = error.downcast_ref::<clap::Error>() {
+                    error.exit();
+                }
+                crate::output::diagnostic!("syq stream: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("cat") {
         match janky_cat::run(&argv[2..]) {
             Ok(code) => std::process::exit(code),

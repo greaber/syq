@@ -229,9 +229,9 @@ pub struct Args {
     pub connections: usize,
     #[arg(skip)]
     pub connections_default: bool,
-    /// Comparison and reuse block size (e.g. 4M)
-    #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE")]
-    pub block_size: String,
+    /// Comparison and reuse block size (64K through 64M)
+    #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE", value_parser = parse_rsync_block_size)]
+    pub block_size: u64,
     /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
     pub performance_tuning: Vec<String>,
@@ -452,17 +452,18 @@ pub struct Args {
 }
 
 /// Extra command-line arguments taken from the environment, for adjusting a
-/// `syq cp`, `syq rsync`, or `syq rm` invocation inside a script or program
-/// that does not expose its own settings. Each variable holds one shell-style
+/// `syq cp`, `syq rsync`, `syq rm`, or `syq stream` invocation inside a script
+/// or program that does not expose its own settings. Each variable holds one shell-style
 /// word list that is inserted right after the command name, so the caller's
 /// own arguments come later.
 pub struct EnvironmentOptions(Vec<(&'static str, OsString)>);
 
 impl EnvironmentOptions {
-    pub const VARIABLES: [(&'static str, &'static str); 3] = [
+    pub const VARIABLES: [(&'static str, &'static str); 4] = [
         ("cp", "SYQ_CP_OPTIONS"),
         ("rsync", "SYQ_RSYNC_OPTIONS"),
         ("rm", "SYQ_RM_OPTIONS"),
+        ("stream", "SYQ_STREAM_OPTIONS"),
     ];
 
     /// Read the variables and remove them from the process environment. The
@@ -658,7 +659,7 @@ impl Args {
                 bail!("removal supports only performance-tuning workers");
             }
             if let Some(block) = tuning.comparison_block_size {
-                self.block_size = block.to_string();
+                self.block_size = block;
             }
             self.connections_opt = tuning.workers;
         }
@@ -886,6 +887,9 @@ fn print_root_help(full: bool) {
 /// spelling and hidden flags in one place.
 pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
     match name {
+        "stream" => {
+            Some(crate::help::configure(crate::s3::stream::command()).bin_name("syq stream"))
+        }
         "rsync" => Some(crate::help::filesystem(Args::command())),
         "cp" => Some(crate::help::filesystem(NativeCopyCommand::command())),
         "rm" => Some(crate::help::filesystem(NativeRmCommand::command())),
@@ -1277,9 +1281,9 @@ struct NativeSizeSelectionArgs {
 #[command(
     name = "syq cp",
     version,
-    about = "Copy files and directories locally, over SSH, or to/from S3.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
+    about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
     before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
-    long_about = "Copy files and directories locally, over SSH, or to/from S3.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
+    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]"
 )]
 struct NativeCopyCommand {
@@ -1632,7 +1636,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         if (s3_from.is_none() && copy.selection.from.is_some())
             || (s3_to.is_none() && copy.to.is_some())
         {
-            bail!("S3 copies require one local endpoint; run syq on the machine holding the files");
+            bail!("S3 copies with an SSH endpoint are not supported; run syq on the machine holding the files");
         }
         if s3_from.is_some() {
             copy.selection.from = None;
@@ -1798,16 +1802,29 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         if args.devices {
             bail!("--preserve=specials is not supported for S3 copies");
         }
-        let index = if options.upload {
-            args.locations.len() - 1
-        } else {
-            0
-        };
-        args.locations[index].host = Some(format!("s3://{}", options.bucket));
-        if !options.upload {
-            let count = args.locations.len() - 1;
-            for location in &mut args.locations[..count] {
-                location.host = Some(format!("s3://{}", options.bucket));
+        if options.route.is_server_copy()
+            && (args.checksum
+                || args.verify_only
+                || args.expected_digest.is_some()
+                || args.transfer_integrity)
+        {
+            bail!("S3-to-S3 copies stay server-side; content hash and verification options require reading object contents and are not supported");
+        }
+        let (destination, sources) = args.locations.split_last_mut().unwrap();
+        match &options.route {
+            crate::s3::Route::Upload => {
+                destination.host = Some(format!("s3://{}", options.bucket));
+            }
+            crate::s3::Route::Download => {
+                for source in sources {
+                    source.host = Some(format!("s3://{}", options.bucket));
+                }
+            }
+            crate::s3::Route::ServerCopy { source_bucket } => {
+                destination.host = Some(format!("s3://{}", options.bucket));
+                for source in sources {
+                    source.host = Some(format!("s3://{source_bucket}"));
+                }
             }
         }
     }
@@ -2635,6 +2652,11 @@ fn message_for_short(c: char) -> Option<&'static str> {
     })
 }
 
+fn parse_rsync_block_size(value: &str) -> std::result::Result<u64, String> {
+    crate::transfer_tuning::parse_comparison_block_size(value, None)
+        .map_err(|error| format!("{error:#}"))
+}
+
 /// Parse a whole-number duration with an optional `s`, `m`, or `h` suffix
 fn parse_max_delete(value: &str) -> std::result::Result<u64, String> {
     if value == "-1" {
@@ -2923,7 +2945,7 @@ mod tests {
             .map(OsString::from),
         )
         .unwrap();
-        assert_eq!(parse_size(&args.block_size).unwrap(), 64 << 10);
+        assert_eq!(args.block_size, 64 << 10);
         assert_eq!(args.tuning_options.unwrap().request_size, Some(4 << 20));
         let error = parse_native_copy(
             &[
@@ -2945,7 +2967,7 @@ mod tests {
             let args =
                 Args::parse_rsync(&["source", "destination", spelling, "128K"].map(OsString::from))
                     .unwrap();
-            assert_eq!(parse_size(&args.block_size).unwrap(), 128 << 10);
+            assert_eq!(args.block_size, 128 << 10);
             let error = Args::parse_rsync(
                 &[
                     "source",
@@ -2958,6 +2980,41 @@ mod tests {
             )
             .unwrap_err();
             assert!(error.to_string().contains("conflicts"), "{error}");
+        }
+        let args = Args::parse_rsync(
+            &[
+                "source",
+                "destination",
+                "--performance-tuning=comparison-block-size=128K",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap();
+        assert_eq!(args.block_size, 128 << 10);
+    }
+
+    #[test]
+    fn rsync_comparison_block_size_validates_during_argument_parsing() {
+        for spelling in ["-B", "--block-size"] {
+            for (raw, expected) in [("64K", 64 << 10), ("4M", 4 << 20), ("64M", 64 << 20)] {
+                let args =
+                    Args::try_parse_from(["syq rsync", spelling, raw, "src", "dst"]).unwrap();
+                assert_eq!(args.block_size, expected);
+            }
+            for raw in ["0", "32K", "65M", "invalid"] {
+                let error =
+                    Args::try_parse_from(["syq rsync", spelling, raw, "src", "dst"]).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+                let message = error.to_string();
+                assert_eq!(message.matches("--block-size").count(), 1, "{message}");
+                assert!(!message.contains("comparison-block-size"), "{message}");
+                let reason = if raw == "invalid" {
+                    "bad size suffix"
+                } else {
+                    "must be between 65536 and 67108864 bytes"
+                };
+                assert!(message.contains(reason), "{message}");
+            }
         }
     }
 

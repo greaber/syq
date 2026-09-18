@@ -170,7 +170,7 @@ impl Engine {
                     if !seen.insert(key.as_bytes().to_vec()) {
                         continue;
                     }
-                    let directory = key.ends_with('/') && size == 0;
+                    let directory = client::is_directory_marker(&key, size);
                     let path = if directory {
                         key.strip_suffix('/').unwrap()
                     } else {

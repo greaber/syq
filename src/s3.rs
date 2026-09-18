@@ -1,4 +1,4 @@
-//! Native local/S3 copies. The S3 client and its durable formats are independent
+//! Native local/S3 and server-side S3 copies. The S3 client and its durable formats are independent
 //! of the filesystem helper protocol: credentials never enter an SSH request.
 mod admission;
 mod checksum;
@@ -12,6 +12,7 @@ pub(crate) use remove::RemoveFlags;
 mod prune;
 mod read_recovery;
 mod state;
+pub(crate) mod stream;
 mod transfer;
 mod tuning;
 mod upload_http;
@@ -59,7 +60,9 @@ impl std::str::FromStr for Header {
                 | "x-amz-content-sha256"
                 | "x-amz-date"
                 | "x-amz-security-token"
-        ) || name.starts_with("x-amz-checksum-")
+        ) || name.starts_with("x-amz-copy-source")
+            || matches!(name, "x-amz-metadata-directive" | "x-amz-tagging-directive")
+            || name.starts_with("x-amz-checksum-")
             || name.starts_with("x-amz-meta-syq-")
         {
             return Err(format!("header {name} is managed by syq"));
@@ -79,15 +82,34 @@ pub(crate) struct Flags {
     /// AWS shared configuration/credentials profile
     #[arg(long, value_name = "NAME", help_heading = "Object storage")]
     s3_profile: Option<String>,
-    /// Add a header before signing every S3 request (repeatable)
+    /// Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused)
     #[arg(long, value_name = "NAME: VALUE", help_heading = "Object storage")]
     s3_header: Vec<Header>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    Upload,
+    Download,
+    ServerCopy { source_bucket: String },
+}
+impl Route {
+    pub fn is_server_copy(&self) -> bool {
+        matches!(self, Self::ServerCopy { .. })
+    }
+
+    pub fn source_bucket(&self) -> Option<&str> {
+        match self {
+            Self::ServerCopy { source_bucket } => Some(source_bucket),
+            Self::Upload | Self::Download => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Options {
     pub bucket: String,
-    pub upload: bool,
+    pub route: Route,
     pub endpoint: Option<String>,
     pub region: Option<String>,
     pub profile: Option<String>,
@@ -137,9 +159,6 @@ impl Options {
             }
             return Ok(None);
         }
-        if from.is_some() && to.is_some() {
-            bail!("S3 copies require one local endpoint");
-        }
         for id in [
             "inplace",
             "auth_from",
@@ -168,13 +187,33 @@ impl Options {
                 );
             }
         }
-        let bucket = from.or(to).unwrap().strip_prefix("s3://").unwrap();
-        if bucket.is_empty()
-            || bucket
-                .bytes()
-                .any(|c| !c.is_ascii_alphanumeric() && !b".-_".contains(&c))
-        {
-            bail!(
+        if from.is_some() && to.is_some() {
+            for Header(name, _) in &flags.s3_header {
+                if name.starts_with("x-amz-meta-")
+                    || matches!(
+                        name.as_str(),
+                        "content-type"
+                            | "content-encoding"
+                            | "content-language"
+                            | "content-disposition"
+                            | "cache-control"
+                            | "expires"
+                            | "x-amz-tagging"
+                            | "x-amz-website-redirect-location"
+                    )
+                {
+                    bail!("--s3-header {name} is not supported for S3-to-S3 copies: metadata and tag overrides behave differently for single-request and multipart copies");
+                }
+            }
+        }
+        let bucket = to.or(from).unwrap().strip_prefix("s3://").unwrap();
+        for endpoint in [from, to].into_iter().flatten() {
+            let name = endpoint.strip_prefix("s3://").unwrap();
+            anyhow::ensure!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b".-_".contains(&c)),
                 "S3 endpoints must be s3://BUCKET; select keys with source and placement options"
             );
         }
@@ -187,7 +226,6 @@ impl Options {
             || tuning.batch_bytes.is_some()
             || tuning.split_min_size.is_some()
             || tuning.bw_pacing.is_some()
-            || tuning.job_storage.is_some()
         {
             bail!(
                 "filesystem performance tuning is not supported for S3 {operation}; use the s3-* keys"
@@ -200,7 +238,14 @@ impl Options {
         }
         Ok(Some(Self {
             bucket: bucket.to_owned(),
-            upload: to.is_some(),
+            route: match (from, to) {
+                (Some(source), Some(_)) => Route::ServerCopy {
+                    source_bucket: source.strip_prefix("s3://").unwrap().to_owned(),
+                },
+                (None, Some(_)) => Route::Upload,
+                (Some(_), None) => Route::Download,
+                (None, None) => unreachable!("S3 route requires an S3 endpoint"),
+            },
             endpoint: flags.s3_endpoint,
             region: flags.s3_region,
             profile: flags.s3_profile,

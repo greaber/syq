@@ -98,14 +98,16 @@ In addition to the shared arguments above, it accepts:
 | `receiver_receipt` | `"sizes"` or `"digests"` |
 | `on_event`, `results`, `check` | See events and failures below |
 
-Option behavior is covered in [Copy files](https://greaber.github.io/syq/reference.html)
+Option behavior is covered in [Copy files](https://greaber.github.io/syq/reference.html),
 [Remote copy details](https://greaber.github.io/syq/remote-reference.html),
 and [Object storage](https://greaber.github.io/syq/object-storage.html).
 
 For example, `client.cp("data", to="s3://bucket", into="backup",
 s3_header=["X-Tigris-Consistent: true"])` uploads local data using credentials
-from the subprocess environment or AWS configuration. S3 copies require one
-local endpoint. S3 results use `EndpointKind.S3`; older SDKs reject this new
+from the subprocess environment or AWS configuration. Copies between two S3
+endpoints use server-side copying within the same service; content verification
+options that require reading object bodies are rejected. SSH/S3 combinations
+are not supported. S3 results use `EndpointKind.S3`; older SDKs reject this new
 endpoint kind instead of interpreting it as SSH.
 
 `pscope` selects an isolated scope for reusing SSH connections. For return
@@ -115,7 +117,7 @@ for setup and cleanup, and
 [Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility)
 for executable selection.
 
-Typed remote-to-remote copies require an enrolled receiver or
+Typed SSH-to-SSH copies require an enrolled receiver or
 `coordinate_at="local"`. With `dry_run=True` or `verify_only=True`, they require
 `coordinate_at="local"`. Use `run` for detached commands and human output options.
 
@@ -123,18 +125,11 @@ Typed remote-to-remote copies require an enrolled receiver or
 `bytes`, or `os.PathLike`). To interleave rule files and inline patterns:
 `ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`. The last matching rule wins.
 
-With `only_new=True`, existing directories keep their metadata while receiving
-missing children. They must be writable; syq does not change their permissions
-to add files. Adding children can change directory timestamps, and a dry run
-does not test write access. See the
-[overwrite policies](https://greaber.github.io/syq/reference.html#choose-which-existing-files-to-update)
-for interactions with other copy options.
-
 <a id="removal"></a>
 
 ## rm
 
-Positional sources, `src`, and `srcs` refuse directories. `src_dir` removes a
+Positional sources and `src` refuse directories. `src_dir` removes a
 tree recursively; `srcs_in` removes its contents recursively and keeps the root.
 
 `on="server"` selects the removal endpoint. A final selected symlink is
@@ -451,7 +446,9 @@ verify_only: bool
 
 Sampled progress for displays; use the terminal result for final totals.
 Byte fields measure file content (comparison work with `verify_only=True`),
-`scanned` counts scanned entries, and `elapsed_ms` is milliseconds.
+`scanned` counts scanned entries, and `elapsed_ms` is milliseconds. Optional
+`activity` contains [diagnostic measurements](https://greaber.github.io/syq/automation.html#progress)
+when the producer collects them; otherwise it is `None`.
 
 `protocol.type = "progress"`. Fields in addition to the common envelope:
 
@@ -466,6 +463,7 @@ files_excluded: int
 scanned: int
 scan_done: bool
 elapsed_ms: int
+activity: dict[str, Any] | None
 ```
 
 ### TraceEvent
@@ -611,7 +609,7 @@ Nested frozen dataclasses used by events:
 
 | Type | Fields | Meaning |
 |---|---|---|
-| `Endpoint` | `role: EndpointRole`, `kind: EndpointKind`, `host: str \| None`, `user: str \| None` | Source/destination and local/SSH identity; host and user are optional |
+| `Endpoint` | `role: EndpointRole`, `kind: EndpointKind`, `host: str \| None`, `user: str \| None` | Source/destination and local/SSH/S3 identity; host and user are optional |
 | `ObjectMetadata` | `mode: int`, `uid: int`, `gid: int`, `mtime: int`, `mtime_nsec: int`, `rdev: int` | Unix mode, owner/group IDs, modification time (seconds plus nanoseconds), and device ID |
 | `AttestedDigest` | `algorithm: str`, `value: str` | `"blake3"` and its 64 lowercase hexadecimal digest characters |
 
@@ -624,7 +622,7 @@ values use lowercase, for example `EntryKind.FILE.value == "file"`.
 | Type | Members |
 |---|---|
 | `EntryKind` | `FILE`, `DIR`, `SYMLINK`, `SPECIAL` |
-| `EndpointKind` | `LOCAL`, `SSH` |
+| `EndpointKind` | `LOCAL`, `SSH`, `S3` |
 | `EndpointRole` | `SOURCE`, `DESTINATION` |
 | `OperationAction` | `TRANSFER_FILE`, `CREATE_DIRECTORY`, `CREATE_SYMLINK`, `CREATE_SPECIAL`, `DELETE`, `SET_METADATA`, `OBSERVE_HASH` |
 | `Disposition` | `SUCCEEDED`, `FAILED`, `BLOCKED`, `INCOMPLETE`, `OBSERVED` |
