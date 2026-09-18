@@ -3200,6 +3200,7 @@ dependencies = [
  "md-5",
  "postcard",
  "rayon",
+ "rustls",
  "semver",
  "serde",
  "serde_bytes",
