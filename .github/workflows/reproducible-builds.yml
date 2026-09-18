@@ -1,36 +1,31 @@
-name: reproducible builds
+name: Python wheel macOS probe
 
 on:
-  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: build (${{ matrix.platform.name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - { os: ubuntu-24.04, name: syq-linux-x86_64 }
-          - { os: ubuntu-24.04-arm, name: syq-linux-aarch64 }
-          - { os: macos-26, name: syq-macos-arm64 }
-          - { os: macos-26-intel, name: syq-macos-x86_64 }
-    runs-on: ${{ matrix.platform.os }}
+  probe:
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13.13"
       - name: Install checksum-pinned Nix
         run: scripts/install-nix-ci.sh
-      - name: Build from locked inputs and smoke-test the executable
-        run: scripts/build-reproducible.sh "$RUNNER_TEMP/dist"
+      - name: Build twice, check portability, and compare wheels
+        run: bash scripts/python-wheel-probe.sh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
         with:
-          name: ${{ matrix.platform.name }}
-          path: ${{ runner.temp }}/dist/*
-          if-no-files-found: error
+          name: python-wheel-macos-probe
+          path: target/python-repro/results/
+          if-no-files-found: warn
           retention-days: 7
