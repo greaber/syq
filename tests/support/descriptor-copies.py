@@ -4,6 +4,8 @@ import fcntl
 import os
 from pathlib import Path
 import shlex
+import select
+import stat
 import signal
 import socket
 import subprocess
@@ -56,25 +58,25 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
             destination = ['--to', 'test-host'] if ssh else []
             target = directory / "nested/file 'with spaces'"
             for data in (b'', DATA):
-                run([*options, '--read-fd', '0', *destination, '--as', str(target)], input=data)
+                run([*options, '--src-fd', '0', *destination, '--as', str(target)], input=data)
                 assert target.read_bytes() == data
-                assert run([*options, *source, str(target), '--write-fd', '1']) == data
+                assert run([*options, *source, str(target), '--as-fd', '1']) == data
             target.chmod(0o640)
-            run([*options, '--read-fd', '0', *destination, '--as', str(target)], input=b'replaced')
+            run([*options, '--src-fd', '0', *destination, '--as', str(target)], input=b'replaced')
             assert target.stat().st_mode & 0o777 == 0o640
             link = directory / 'source-link'
             link.symlink_to(target)
-            fail([*options, *source, str(link), '--write-fd', '1'])
-            assert run([*options, '--follow-src', *source, str(link), '--write-fd', '1']) == b'replaced'
+            fail([*options, *source, str(link), '--as-fd', '1'])
+            assert run([*options, '--follow-src', *source, str(link), '--as-fd', '1']) == b'replaced'
             # Final destination symlinks are replaced, not followed.
-            run([*options, '--read-fd', '0', *destination, '--as', str(link)], input=b'link replacement')
+            run([*options, '--src-fd', '0', *destination, '--as', str(link)], input=b'link replacement')
             assert not link.is_symlink() and link.read_bytes() == b'link replacement'
             assert target.read_bytes() == b'replaced'
             parent_link = directory / 'parent-link'
             parent_link.symlink_to(target.parent, target_is_directory=True)
             linked_target = parent_link / 'through-link'
-            fail([*options, '--read-fd', '0', *destination, '--as', str(linked_target)], input=b'no')
-            run([*options, '--follow-dst', '--read-fd', '0', *destination, '--as', str(linked_target)], input=b'yes')
+            fail([*options, '--src-fd', '0', *destination, '--as', str(linked_target)], input=b'no')
+            run([*options, '--follow-dst', '--src-fd', '0', *destination, '--as', str(linked_target)], input=b'yes')
             assert (target.parent / 'through-link').read_bytes() == b'yes'
             # Caller-owned descriptors use current offsets and retain suffixes.
             input_path = directory / 'input'
@@ -84,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
             with input_path.open('rb') as file:
                 file.seek(6)
                 before = fcntl.fcntl(file, fcntl.F_GETFL)
-                run([*options, '--read-fd', str(file.fileno()), *destination, '--as', str(target)], pass_fds=(file.fileno(),))
+                run([*options, '--src-fd', str(file.fileno()), *destination, '--as', str(target)], pass_fds=(file.fileno(),))
                 assert file.tell() == len(DATA) + 6
                 assert fcntl.fcntl(file, fcntl.F_GETFL) == before
             with output_path.open('r+b') as file:
@@ -92,7 +94,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                 file.write(b'prefix')
                 file.flush()
                 before = fcntl.fcntl(file, fcntl.F_GETFL)
-                assert run([*options, *source, str(target), '--write-fd', str(file.fileno())], pass_fds=(file.fileno(),)) == b''
+                assert run([*options, *source, str(target), '--as-fd', str(file.fileno())], pass_fds=(file.fileno(),)) == b''
                 assert file.tell() == len(DATA) + 6
                 assert fcntl.fcntl(file, fcntl.F_GETFL) == before
             assert output_path.read_bytes() == b'prefix' + DATA + b'x' * 8
@@ -103,7 +105,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                 with a, b:
                     a.setblocking(not nonblocking)
                     before = fcntl.fcntl(a, fcntl.F_GETFL)
-                    command = [SYQ, 'cp', *options, '--read-fd', str(a.fileno()), *destination, '--as', str(target)]
+                    command = [SYQ, 'cp', *options, '--src-fd', str(a.fileno()), *destination, '--as', str(target)]
                     child = subprocess.Popen(command, pass_fds=(a.fileno(),), stdout=subprocess.PIPE,
                                              stderr=subprocess.PIPE, env=ENV, start_new_session=True)
                     CHILDREN.append(child)
@@ -115,8 +117,8 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                     assert fcntl.fcntl(a, fcntl.F_GETFL) == before
                     assert target.read_bytes() == DATA
                     wait_for(lambda: not list(target.parent.glob('.syq-stream-*')), 'staging cleanup')
-            # Broken consumers fail, and named FIFOs must not be opened for I/O.
-            child = subprocess.Popen([SYQ, 'cp', *options, *source, str(target), '--write-fd', '1'],
+            # Broken consumers fail. Remote path sources remain regular files.
+            child = subprocess.Popen([SYQ, 'cp', *options, *source, str(target), '--as-fd', '1'],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV, start_new_session=True)
             CHILDREN.append(child)
             child.stdout.close()
@@ -125,16 +127,82 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
             assert child.returncode != 0, error
             fifo = directory / 'fifo'
             os.mkfifo(fifo)
-            fail([*options, *source, str(fifo), '--write-fd', '1'])
+            if ssh:
+                fail([*options, *source, str(fifo), '--as-fd', '1'])
+            # Explicit local FIFOs work with positional and named selectors,
+            # retaining their basename for --into placement.
+            for selector in ([], ['--src'], ['--src-non-dir']):
+                writer = subprocess.Popen([sys.executable, '-c',
+                    'import sys; open(sys.argv[1], "wb").write(b"pipe contents")', str(fifo)],
+                    start_new_session=True)
+                CHILDREN.append(writer)
+                run([*options, *selector, str(fifo), *destination, '--into', str(directory / 'into')])
+                assert writer.wait(timeout=5) == 0
+                assert (directory / 'into' / 'fifo').read_bytes() == b'pipe contents'
+            # A shell descriptor path is consumed locally before starting the
+            # SSH helper; its generated number never becomes a destination name.
+            command = ['bash', '-c',
+                'exec "$1" cp --src <(printf "process substitution") "${@:2}"',
+                'descriptor-test', SYQ, *options, *destination, '--as', str(target)]
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env=ENV, timeout=15)
+            assert result.returncode == 0, result.stderr
+            assert target.read_bytes() == b'process substitution'
+            with input_path.open('rb') as file:
+                file.seek(6)
+                assert run(['--src-non-dir', f'/dev/fd/{file.fileno()}', '--as-fd', '1'],
+                           pass_fds=(file.fileno(),)) == DATA
+                result = fail(['--src', f'/dev/fd/{file.fileno()}', '--into', str(directory / 'anonymous')],
+                              pass_fds=(file.fileno(),))
+                assert b'anonymous input requires --as' in result.stderr
+                assert not (directory / 'anonymous').exists()
+            fail(['--src', str(fifo), '--src', str(input_path), '--into', str(directory / 'mixed')])
+            # A reader waiting for the first FIFO writer can be cancelled.
+            child = subprocess.Popen([SYQ, 'cp', '--src', str(fifo), *destination,
+                                     *options, '--as', str(target)], stderr=subprocess.PIPE,
+                                     env=ENV, start_new_session=True)
+            CHILDREN.append(child)
+            time.sleep(.2)
+            child.send_signal(signal.SIGTERM)
+            child.communicate(timeout=10)
+            assert child.returncode != 0
+            assert target.read_bytes() == b'process substitution'
+            # Explicit node preservation and recursive scans don't consume FIFOs.
+            node = directory / 'node'
+            run(['--src-non-dir', str(fifo), '--as', str(node), '--preserve=specials'])
+            assert stat.S_ISFIFO(node.stat().st_mode)
+            tree = directory / 'tree'
+            tree.mkdir()
+            os.mkfifo(tree / 'nested-pipe')
+            run([str(tree), '--as', str(directory / 'tree-copy')])
+            assert not (directory / 'tree-copy' / 'nested-pipe').exists()
             assert not list(target.parent.glob('.syq-stream-*'))
             print('descriptor file copies passed:', 'SSH helper' if ssh else 'local', flush=True)
-        assert run(['--read-fd', '0', '--write-fd', '1'], input=DATA) == DATA
+        # A producer can wait for a downstream response without filling a
+        # transfer block or closing its output first.
+        child = subprocess.Popen([SYQ, 'cp', '--src-fd', '0', '--as-fd', '1'],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, env=ENV, start_new_session=True)
+        CHILDREN.append(child)
+        for payload in (b'hello', b'again'):
+            child.stdin.write(payload)
+            child.stdin.flush()
+            assert select.select([child.stdout], [], [], 5)[0], 'small payload waited for EOF'
+            assert child.stdout.read(len(payload)) == payload
+        child.stdin.close()
+        child.stdin = None
+        output, error = child.communicate(timeout=10)
+        assert child.returncode == 0 and output == b'', error
+        assert run(['--src-fd', '0', '--as-fd', '1'], input=DATA) == DATA
+        created = root / 'umask-output'
+        run(['--src-fd', '0', '--as', str(created)], input=b'new', umask=0o027)
+        assert created.stat().st_mode & 0o777 == 0o640
         for option in ('--prune', '--dry-run', '--hash', '--verify-only', '--stats', '--detach'):
-            result = fail(['--read-fd', '0', '--as', str(root / 'forbidden'), option], input=b'')
+            result = fail(['--src-fd', '0', '--as', str(root / 'forbidden'), option], input=b'')
             assert not (root / 'forbidden').exists(), option
-        for args in (['--read-fd', '0'], ['--write-fd', '1'], ['--read-fd', '2', '--as', 'bad'],
-                     ['--read-fd', '0', '--write-fd', '0'], ['--read-fd', '0', 'file', '--as', 'bad'],
-                     ['file', 'other', '--write-fd', '1'], ['--read-fd', '0', '--to', '@named', '--as', 'bad']):
+        for args in (['--src-fd', '0'], ['--as-fd', '1'], ['--src-fd', '2', '--as', 'bad'],
+                     ['--src-fd', '0', '--as-fd', '0'], ['--src-fd', '0', 'file', '--as', 'bad'],
+                     ['file', 'other', '--as-fd', '1'], ['--src-fd', '0', '--to', '@named', '--as', 'bad']):
             fail(args, input=b'')
     finally:
         for child in CHILDREN:

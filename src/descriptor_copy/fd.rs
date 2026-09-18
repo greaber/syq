@@ -11,6 +11,80 @@ use std::{
     },
 };
 
+/// A caller-owned descriptor, or an explicitly selected local FIFO.
+#[derive(Clone, Debug)]
+pub(crate) enum Source {
+    Descriptor(i32),
+    Pipe {
+        path: std::path::PathBuf,
+        follow: bool,
+    },
+}
+impl Source {
+    pub async fn open(self, cancelled: Arc<AtomicBool>) -> Result<Descriptor> {
+        match self {
+            Self::Descriptor(number) => Descriptor::open(number, true, cancelled),
+            Self::Pipe { path, follow } => {
+                tokio::task::spawn_blocking(move || {
+                    use crate::{
+                        proto::OperatorSymlinkPolicy,
+                        rooted::{OperatorFinalComponent, OperatorResolver, PinnedPath},
+                    };
+                    use std::os::unix::{
+                        ffi::OsStrExt,
+                        fs::{FileTypeExt, MetadataExt},
+                    };
+                    let selected = OperatorResolver::resolve_process(
+                        path.as_os_str().as_bytes(),
+                        if follow {
+                            OperatorSymlinkPolicy::FollowAll
+                        } else {
+                            OperatorSymlinkPolicy::Refuse
+                        },
+                        OperatorFinalComponent::Entry {
+                            follow_symlink: follow,
+                        },
+                        false,
+                        &mut Vec::new(),
+                    )?;
+                    let PinnedPath::Leaf(leaf) = selected else {
+                        bail!("pipe source is not a FIFO");
+                    };
+                    anyhow::ensure!(leaf.metadata().is_fifo(), "pipe source is not a FIFO");
+                    let (parent, name, expected, _object) = leaf.into_parts();
+                    // This owned open waits for a writer. It runs outside the async
+                    // executor so SIGINT/SIGTERM can still cancel a quiet FIFO.
+                    let number = unsafe {
+                        libc::openat(
+                            parent.as_raw_fd(),
+                            name.as_ptr(),
+                            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY,
+                        )
+                    };
+                    if number < 0 {
+                        return Err(std::io::Error::last_os_error()).context("open source FIFO");
+                    }
+                    let file = unsafe { File::from_raw_fd(number) };
+                    let actual = file.metadata()?;
+                    anyhow::ensure!(
+                        actual.file_type().is_fifo()
+                            && actual.dev() == expected.dev
+                            && actual.ino() == expected.ino,
+                        "source FIFO changed while opening"
+                    );
+                    Ok(Descriptor {
+                        file,
+                        original: -1,
+                        descriptor_flags: 0,
+                        cancelled,
+                    })
+                })
+                .await?
+            }
+        }
+    }
+}
+
 pub(crate) struct Descriptor {
     file: File,
     original: i32,
@@ -86,7 +160,14 @@ impl Descriptor {
             }
         }
     }
-    pub async fn read_chunk(mut self, size: usize) -> Result<(Self, bytes::Bytes)> {
+    pub async fn read_chunk(self, size: usize) -> Result<(Self, bytes::Bytes)> {
+        self.read(size, true).await
+    }
+    /// Return available bytes promptly; only the first read waits for input.
+    pub async fn read_available(self, size: usize) -> Result<(Self, bytes::Bytes)> {
+        self.read(size, false).await
+    }
+    async fn read(mut self, size: usize, fill: bool) -> Result<(Self, bytes::Bytes)> {
         tokio::task::spawn_blocking(move || {
             let mut bytes = Vec::new();
             bytes
@@ -96,6 +177,24 @@ impl Descriptor {
             let mut used = 0;
             while used < size {
                 self.check_cancelled()?;
+                if used > 0 && !fill {
+                    let mut poll = libc::pollfd {
+                        fd: self.file.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+                    if ready == 0 {
+                        break;
+                    }
+                    if ready < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(error.into());
+                    }
+                }
                 match self.file.read(&mut bytes[used..]) {
                     Ok(0) => break,
                     Ok(n) => used += n,

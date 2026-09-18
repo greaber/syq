@@ -20,8 +20,8 @@ const PIPELINE: usize = 4;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
-    pub read_fd: Option<i32>,
-    pub write_fd: Option<i32>,
+    pub source: Option<fd::Source>,
+    pub as_fd: Option<i32>,
     pub location: Option<Location>,
     pub key: Option<String>,
     pub follow: bool,
@@ -133,31 +133,29 @@ impl Connection {
 pub(crate) fn run(mut args: Args) -> Result<i32> {
     let plan = args.descriptor_copy.take().unwrap();
     if let Some(options) = args.s3.take() {
-        return crate::s3::stream::run(
-            options,
-            plan.key.unwrap(),
-            plan.read_fd.or(plan.write_fd).unwrap(),
-        );
+        return crate::s3::stream::run(options, plan.key.unwrap(), plan.source, plan.as_fd);
     }
     let cancelled = Arc::new(AtomicBool::new(false));
-    // Validate and protect inherited descriptors before starting any children.
-    let input = plan
-        .read_fd
-        .map(|n| fd::Descriptor::open(n, true, cancelled.clone()))
-        .transpose()?;
-    let output = plan
-        .write_fd
-        .map(|n| fd::Descriptor::open(n, false, cancelled.clone()))
-        .transpose()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
     let result = runtime.block_on(async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let connection = plan.location.clone().map(|location| Connection::start(args, location));
+        let mut connection = None;
+        let operation = async {
+            // Protect inherited descriptors before starting any children. FIFO
+            // opening is also inside cancellation, including waits for writers.
+            let input = match plan.source.clone() {
+                Some(source) => Some(source.open(cancelled.clone()).await?),
+                None => None,
+            };
+            let output = plan.as_fd.map(|n| fd::Descriptor::open(n, false, cancelled.clone())).transpose()?;
+            connection = plan.location.clone().map(|location| Connection::start(args, location));
+            copy(&plan, input, output, connection.as_ref()).await
+        };
         let result = tokio::select! {
-            result = copy(&plan, input, output, connection.as_ref()) => result,
+            result = operation => result,
             result = tokio::signal::ctrl_c() => { result?; Err(anyhow::anyhow!("descriptor copy cancelled")) },
             _ = term.recv() => Err(anyhow::anyhow!("descriptor copy cancelled")),
         };
@@ -195,7 +193,7 @@ async fn copy(
     let mut hash = blake3::Hasher::new();
     loop {
         let blocks: Vec<bytes::Bytes> = if let Some(descriptor) = input.take() {
-            let (descriptor, data) = descriptor.read_chunk(CHUNK * PIPELINE).await?;
+            let (descriptor, data) = descriptor.read_available(CHUNK * PIPELINE).await?;
             input = Some(descriptor);
             (0..data.len())
                 .step_by(CHUNK)

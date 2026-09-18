@@ -80,8 +80,8 @@
         "progress-json",
         "stats",
         "detach",
-        "read-fd",
-        "write-fd"
+        "src-fd",
+        "as-fd"
       ],
       "follow_up": []
     },

@@ -1,7 +1,7 @@
 //! One raw S3 object and one inherited local byte stream. No filesystem
 //! metadata, helper protocol, or persistent upload identity is synthesized.
 use super::{checksum::Algorithm, client, Options};
-use crate::descriptor_copy::fd::Descriptor;
+use crate::descriptor_copy::fd::{Descriptor, Source};
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::{
     primitives::ByteStream,
@@ -21,16 +21,15 @@ use std::{
 struct Plan {
     options: Options,
     key: String,
-    fd: i32,
 }
-pub(crate) fn run(options: Options, key: String, fd: i32) -> Result<i32> {
-    let mut plan = Plan { options, key, fd };
+pub(crate) fn run(
+    options: Options,
+    key: String,
+    source: Option<Source>,
+    as_fd: Option<i32>,
+) -> Result<i32> {
+    let mut plan = Plan { options, key };
     let cancelled = Arc::new(AtomicBool::new(false));
-    let descriptor = Descriptor::open(
-        plan.fd,
-        plan.options.route == crate::s3::Route::Upload,
-        cancelled.clone(),
-    )?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -39,6 +38,15 @@ pub(crate) fn run(options: Options, key: String, fd: i32) -> Result<i32> {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let interrupt = async { tokio::select! { result = tokio::signal::ctrl_c() => { result?; }, _ = term.recv() => {} }; Ok::<_, anyhow::Error>(()) };
         tokio::pin!(interrupt);
+        let descriptor = tokio::select! {
+            descriptor = async {
+                match source {
+                    Some(source) => source.open(cancelled.clone()).await,
+                    None => Descriptor::open(as_fd.unwrap(), false, cancelled.clone()),
+                }
+            } => descriptor?,
+            value = &mut interrupt => { value?; bail!("stream cancelled"); }
+        };
         let cancellation = Arc::new(super::upload_http::Cancellation::default());
         let (client, _) = tokio::select! {
             value = client::connect(&mut plan.options, Arc::default(), cancellation.clone()) => value?,

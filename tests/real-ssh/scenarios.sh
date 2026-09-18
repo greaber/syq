@@ -128,13 +128,19 @@ python3 - <<'PY_DESCRIPTORS'
 import subprocess
 payload = bytes(range(256)) * 80000 + b'last\x00\xff'
 path = "/tmp/syq-real-ssh/stream 'with spaces'"
-subprocess.run(['syq', 'cp', '--read-fd', '0', '--to', 'destination', '--as', path], input=payload, check=True, timeout=60)
-result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--write-fd', '1'], stdout=subprocess.PIPE, check=True, timeout=60)
+subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path], input=payload, check=True, timeout=60)
+result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'], stdout=subprocess.PIPE, check=True, timeout=60)
 assert result.stdout == payload
 # Empty EOF must publish an empty file rather than leave the previous object.
-subprocess.run(['syq', 'cp', '--read-fd', '0', '--to', 'destination', '--as', path], input=b'', check=True, timeout=30)
-result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--write-fd', '1'], stdout=subprocess.PIPE, check=True, timeout=30)
+subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path], input=b'', check=True, timeout=30)
+result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'], stdout=subprocess.PIPE, check=True, timeout=30)
 assert result.stdout == b''
+subprocess.run(['bash', '-c',
+                'syq cp --src <(printf "local producer") --to destination --as "$1"',
+                'stream-test', path], check=True, timeout=30)
+result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'],
+                        stdout=subprocess.PIPE, check=True, timeout=30)
+assert result.stdout == b'local producer'
 PY_DESCRIPTORS
 
 printf 'case: pipelined prune lookup with a one-deep data pipeline\n'

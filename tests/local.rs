@@ -16803,8 +16803,8 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
             "--self-update",
         ],
     );
-    assert_completion_candidates(&t, &["syq", "cp", "--write-f"], &["--write-fd"]);
-    assert_completion_candidates(&t, &["syq", "cp", "--read-f"], &["--read-fd"]);
+    assert_completion_candidates(&t, &["syq", "cp", "--as-f"], &["--as-fd"]);
+    assert_completion_candidates(&t, &["syq", "cp", "--src-f"], &["--src-fd"]);
     assert_completion_candidates(&t, &["syq", "help", "receiver", "e"], &["enroll"]);
     assert_completion_candidates(
         &t,

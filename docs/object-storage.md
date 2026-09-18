@@ -27,7 +27,7 @@ See [S3 tuning](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 
 ## Descriptor copies
 
-With [`--read-fd` or `--write-fd`](commands/cp.md#file-descriptors), `cp`
+With [`--src-fd` or `--as-fd`](commands/cp.md#file-descriptors), `cp`
 transfers one exact UTF-8 key's raw contents, without path normalization,
 prefix selection, or syq file metadata. No local temporary file is created.
 

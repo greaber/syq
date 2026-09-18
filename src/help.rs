@@ -172,8 +172,8 @@ pub(crate) fn filesystem(command: Command) -> Command {
             matches!(
                 id,
                 "sources"
-                    | "read_fd"
-                    | "write_fd"
+                    | "src_fd"
+                    | "as_fd"
                     | "srcs_in"
                     | "from"
                     | "cwd"
@@ -202,9 +202,9 @@ pub(crate) fn filesystem(command: Command) -> Command {
             match id {
                 "sources" | "trees" | "on" | "paths" | "src" | "srcs_in" | "src_non_dir"
                 | "src_dir" | "src_non_dirs" | "src_dirs" | "srcs" | "from" | "cwd" | "root"
-                | "follow" | "follow_src" | "read_fd" => "Sources and selection",
+                | "follow" | "follow_src" | "src_fd" => "Sources and selection",
                 "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
-                | "follow_dst" | "write_fd" => "Destination placement",
+                | "follow_dst" | "as_fd" => "Destination placement",
                 "results" | "results_fd" | "progress" | "no_progress" | "progress_json"
                 | "stats" => "Progress and results",
                 "resource_limits_arg" => "Resource limits",

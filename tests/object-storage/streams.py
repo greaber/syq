@@ -11,13 +11,13 @@ def stream(args, **kwargs):
     args = list(args)
     if '--to' in args:
         fd = '0'
-        if '--read-fd' in args:
-            index = args.index('--read-fd')
+        if '--src-fd' in args:
+            index = args.index('--src-fd')
             fd = args[index + 1]
             del args[index:index + 2]
-        args[:0] = ['--read-fd', fd]
-    elif '--write-fd' not in args:
-        args += ['--write-fd', '1']
+        args[:0] = ['--src-fd', fd]
+    elif '--as-fd' not in args:
+        args += ['--as-fd', '1']
     result = subprocess.run([check.SYQ, 'cp', '--s3-region', check.REGION,
                              '--performance-tuning', 's3-part-size=5M,s3-max-concurrent-parts-per-object=3',
                              *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -50,12 +50,12 @@ def main():
             key = check.PREFIX + '/descriptors'
             with source.open('rb') as file:
                 file.seek(6)
-                stream(['--to', bucket, '--as', key, '--read-fd', str(file.fileno())],
+                stream(['--to', bucket, '--as', key, '--src-fd', str(file.fileno())],
                        pass_fds=(file.fileno(),))
             with (Path(temp) / 'output').open('w+b') as file:
                 file.write(b'prefix')
                 file.flush()
-                assert stream(['--from', bucket, key, '--write-fd', str(file.fileno())],
+                assert stream(['--from', bucket, key, '--as-fd', str(file.fileno())],
                               pass_fds=(file.fileno(),)) == b''
                 file.seek(0)
                 assert file.read() == b'prefix' + data
