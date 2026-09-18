@@ -13,6 +13,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 SITE = "/syq/"
+ORIGIN = "https://greaber.github.io"
 REPOSITORY = "greaber/syq"
 
 
@@ -57,22 +58,40 @@ def switcher(version, page, versions, pages):
             label += " (latest)"
         same_page = page in pages[target] and page != "404.html"
         destination = page if same_page else "index.html"
-        url = f"{SITE}{target}/{destination}"
+        prefix = SITE if target == versions[0] else f"{SITE}{target}/"
+        url = f"{prefix}{destination}"
         selected = " selected" if target == version else ""
         options.append(
             f'<option value="{html.escape(url, quote=True)}"'
             f' data-same-page="{str(same_page).lower()}"{selected}>{html.escape(label)}</option>'
         )
-        links.append(f'<a href="{SITE}{target}/">{html.escape(label)}</a>')
+        links.append(f'<a href="{prefix}">{html.escape(label)}</a>')
+    notice = ""
+    if version != versions[0]:
+        description = ("These docs describe unreleased changes on master." if version == "master"
+                       else f"You are reading documentation for an older release ({version}).")
+        stable_page = page if page in pages[versions[0]] and page != "404.html" else "index.html"
+        notice = (f'<p class="docs-version-notice">{description} '
+                  f'<a href="{SITE}{stable_page}">Read the latest stable documentation</a>.</p>')
     return (
         '<nav class="docs-version" aria-label="Documentation version">'
         '<label for="docs-version-select">Documentation</label>'
         '<select id="docs-version-select" autocomplete="off">' + "".join(options) + '</select>'
-        '<noscript><span>Choose a version: ' + " · ".join(links) + '</span></noscript></nav>'
+        '<noscript><span>Choose a version: ' + " · ".join(links) + '</span></noscript></nav>' + notice
     )
 
 
+def search_metadata(version, page, latest):
+    # Old/development books remain accessible, but search should lead to stable.
+    # Print is a duplicate of the whole book; 404 pages are not documentation.
+    if version != latest or page in {"404.html", "print.html"}:
+        return '<meta name="robots" content="noindex">', None
+    canonical = ORIGIN + SITE + ("" if page == "index.html" else page)
+    return f'<link rel="canonical" href="{html.escape(canonical, quote=True)}">', canonical
+
+
 def decorate(book, version, versions, pages):
+    canonical_urls = []
     for path in book.rglob("*.html"):
         text = path.read_text()
         # mdBook's redirect documents have no main element; leave them intact.
@@ -80,15 +99,28 @@ def decorate(book, version, versions, pages):
             continue
         page = path.relative_to(book).as_posix()
         text = text.replace("<main>", "<main>" + switcher(version, page, versions, pages), 1)
-        text = text.replace("</head>",
-                            f'<link rel="stylesheet" href="{SITE}version-selector.css">\n'
-                            f'<script src="{SITE}version-selector.js" defer></script>\n</head>', 1)
         # Keep the shared brand header inside the selected documentation version.
         home = SITE if book.name == "default" else f"{SITE}{version}/"
         # Included SDK Markdown also uses absolute documentation links so it
         # works on GitHub/PyPI. Keep those links within this version on the site.
         text = text.replace(f'href="https://greaber.github.io{SITE}', f'href="{home}')
+        metadata, canonical = search_metadata(version, page, versions[0])
+        if canonical:
+            canonical_urls.append(canonical)
+        text = text.replace("</head>", metadata + "\n" +
+                            f'<link rel="stylesheet" href="{SITE}version-selector.css">\n'
+                            f'<script src="{SITE}version-selector.js" defer></script>\n</head>', 1)
         path.write_text(text)
+    return canonical_urls
+
+
+def write_sitemap(destination, urls):
+    entries = "".join(f"  <url><loc>{html.escape(url)}</loc></url>\n" for url in sorted(set(urls)))
+    (destination / "sitemap.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        + entries + '</urlset>\n'
+    )
 
 
 def legacy_redirects(destination, pages, latest):
@@ -101,6 +133,7 @@ def legacy_redirects(destination, pages, latest):
         path.write_text(
             '<!doctype html><html lang="en"><meta charset="utf-8">'
             '<title>Development documentation</title>'
+            '<meta name="robots" content="noindex">'
             f'<meta http-equiv="refresh" content="0;url={target}">'
             f'<script>location.replace({json.dumps(target)} + location.search + location.hash);</script>'
             f'<p>This page documents an unreleased version. <a href="{target}">'
@@ -150,11 +183,12 @@ def build_site(destination, releases):
                            for p in (books / version).rglob("*.html")} for version in versions}
         for version in versions:
             decorate(books / version, version, versions, pages)
-        decorate(books / "default", latest, versions, pages)
+        canonical_urls = decorate(books / "default", latest, versions, pages)
         shutil.copytree(books / "default", destination)
         for version in versions:
             shutil.copytree(books / version, destination / version)
         legacy_redirects(destination, pages, latest)
+        write_sitemap(destination, canonical_urls)
         for name in ("version-selector.js", "version-selector.css"):
             shutil.copyfile(ROOT / "theme" / name, destination / name)
         print(f"Built {len(versions)} versions; default is {latest}: {destination}", flush=True)

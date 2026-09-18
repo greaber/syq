@@ -148,7 +148,10 @@ The published site defaults to the latest stable release, with tagged versions
 and `master` available through the documentation selector. Archives start at
 v0.2.0, the first release containing the mdBook sources. Each version uses its
 own documentation and search index. Existing unversioned links to pages only
-available on `master` redirect there.
+available on `master` redirect there. The latest selector option follows the
+unversioned site URL. Stable pages declare that URL as canonical and appear in
+`sitemap.xml`; older releases and `master` carry `noindex` metadata and a notice
+linking to stable. They remain available through the selector and direct links.
 
 To build the complete site, fetch release tags and run
 `python3 scripts/build-doc-site.py` with mdBook and the GitHub CLI available.
