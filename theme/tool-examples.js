@@ -50,7 +50,7 @@
         });
       });
       widget.querySelector(".tool-examples-status").textContent =
-        `${tool.value} and syq: ${task.value}.`;
+        tool.value === "syq" ? `syq: ${task.value}.` : `${tool.value} and syq: ${task.value}.`;
     }
     tool.addEventListener("change", update);
     task.addEventListener("change", update);

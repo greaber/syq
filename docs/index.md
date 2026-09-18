@@ -55,8 +55,8 @@ unless you request `--prune`.
 
 Choose a familiar command to see how to express the same task in syq.
 These examples explain file placement; comparison rules and metadata handling
-can differ between tools. Each task shows both approaches, including where to run the commands and
-whether files travel directly, through your laptop, or through S3.
+can differ between tools. Comparisons keep the task’s starting point, endpoints, and data route fixed.
+Choose syq to see tasks that the other commands do not provide directly.
 
 {{#include assets/tool-examples.html}}
 

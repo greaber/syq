@@ -32,7 +32,7 @@ class ComparisonCoverage(unittest.TestCase):
         self.groups = parser.groups
 
     def test_every_combination_is_an_example_or_an_explicit_limitation(self):
-        self.assertEqual(set(self.groups), {"rsync", "rclone", "s5cmd", "scp"})
+        self.assertEqual(set(self.groups), {"rsync", "rclone", "s5cmd", "scp", "syq"})
         titles = set().union(*(set(group["tasks"]) for group in self.groups.values()))
         for tool, group in self.groups.items():
             with self.subTest(tool=tool):
@@ -54,9 +54,19 @@ class ComparisonCoverage(unittest.TestCase):
         }
         for tool, tasks in expected.items():
             with self.subTest(tool=tool):
-                self.assertLessEqual(tasks | {"Choose destination names with a script", "Send files home without an SSH server",
-                                         "Copy between servers without agent forwarding"},
+                self.assertLessEqual(tasks | {"Choose destination names with a script"},
                                      set(self.groups[tool]["tasks"]))
+
+    def test_workarounds_do_not_enable_a_different_task(self):
+        exact_tasks = {
+            "Send from a server shell to a laptop with no SSH server",
+            "Copy directly between servers using only laptop logins",
+        }
+        self.assertLessEqual(exact_tasks, set(self.groups["syq"]["tasks"]))
+        for tool in ("rsync", "rclone", "s5cmd", "scp"):
+            with self.subTest(tool=tool):
+                self.assertLessEqual(exact_tasks, self.groups[tool]["unsupported"].keys())
+                self.assertFalse(exact_tasks & set(self.groups[tool]["tasks"]))
 
 
 if __name__ == "__main__":
