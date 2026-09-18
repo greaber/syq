@@ -23,9 +23,10 @@
     const examples = groups.map((group) => ({
       group,
       tool: group.dataset.tool,
+      unsupported: JSON.parse(group.dataset.unsupported || "{}"),
       tasks: [...group.querySelectorAll(".tool-example")],
     }));
-    for (const [label, syqOnly] of [["Compare familiar tasks", false], ["More with syq", true]]) {
+    for (const [label, syqOnly] of [["Compare familiar tasks", false], ["Workflow setup", true]]) {
       const group = document.createElement("optgroup");
       group.label = label;
       const titles = new Set(examples.filter((item) => (item.tool === "syq") === syqOnly)
@@ -35,15 +36,16 @@
     }
 
     function update() {
-      function available(name, title) {
-        return examples.some((item) => (item.tool === name || item.tool === "syq") &&
-          item.tasks.some((entry) => entry.dataset.title === title));
+      function reason(name, title) {
+        return examples.find((item) => item.tool === name).unsupported[title];
       }
       for (const option of tool.options) {
-        option.disabled = !available(option.value, task.value);
+        option.disabled = Boolean(reason(option.value, task.value));
+        option.title = reason(option.value, task.value) || "";
       }
       for (const option of task.options) {
-        option.disabled = !available(tool.value, option.value);
+        option.disabled = Boolean(reason(tool.value, option.value));
+        option.title = reason(tool.value, option.value) || "";
       }
       examples.forEach((item) => {
         item.group.hidden = (item.tool !== tool.value && item.tool !== "syq") ||
@@ -57,7 +59,7 @@
       const syqOnly = examples.some((item) => item.tool === "syq" &&
         item.tasks.some((entry) => entry.dataset.title === task.value));
       widget.querySelector(".tool-examples-status").textContent =
-        syqOnly ? `More with syq: ${task.value}.` : `${tool.value} and syq: ${task.value}.`;
+        syqOnly ? `Workflow setup: ${task.value}.` : `${tool.value} and syq: ${task.value}.`;
     }
     tool.addEventListener("change", update);
     task.addEventListener("change", update);

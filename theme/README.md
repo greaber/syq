@@ -78,9 +78,11 @@ The homepage leads with fast, programmable file transfer and examples that
 separate file selection, endpoints, and placement. Its tool comparison widget
 uses curated examples in `docs/assets/tool-examples.html`; all examples remain
 readable without JavaScript. Native selectors provide keyboard navigation. Both keep their selected value;
-choices without a matching tool/task example are disabled. Keep at least one
-shared task across all tools so readers can switch between them. The “More
-with syq” group shows standalone workflows without a comparison command.
+choices explicitly listed in each tool’s `data-unsupported` attribute are
+disabled, with a reason. Missing examples are not evidence of incompatibility. Run
+`python3 scripts/test-tool-examples.py` to check coverage and known supported tasks. Keep at least one
+shared task across all tools so readers can switch between them. The “Workflow setup”
+group describes syq alongside alternatives that use different setup or routes.
 Shared landing-actions buttons offer installation, benchmarks, sending files
 home, server-to-server copies and programmable file placement. Quickstart
 examples follow under Try a copy.

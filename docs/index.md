@@ -55,8 +55,8 @@ unless you request `--prune`.
 
 Choose a familiar command to see how to express the same task in syq.
 These examples explain file placement; comparison rules and metadata handling
-can differ between tools. Choose a task under “More with syq” to explore
-receiving files at home, direct server copies, and scripted destination names.
+can differ between tools. Scripted destination names are included in the comparisons. “Workflow setup”
+explains alternatives for receiving files at home and copying between servers.
 
 {{#include assets/tool-examples.html}}
 
