@@ -2091,67 +2091,82 @@ impl Planner<'_> {
                 Kind::Dir | Kind::Other => unreachable!("handled in the mapping loop"),
             }
         }
-        if !meta_fixes.is_empty() {
-            let errors = self.apply(meta_fixes)?;
-            let capacity_error = first_capacity_error(&errors);
-            for err in errors.into_iter().flatten() {
-                self.progress.error(&format!("syq: {err}"));
+        self.flush_meta_fixes(meta_fixes)?;
+        self.flush_leaf_ops(ops, &op_names)
+    }
+
+    /// Apply metadata corrections for files whose content is already current.
+    fn flush_meta_fixes(&mut self, meta_fixes: Vec<Op>) -> Result<()> {
+        if meta_fixes.is_empty() {
+            return Ok(());
+        }
+        let errors = self.apply(meta_fixes)?;
+        let capacity_error = first_capacity_error(&errors);
+        for err in errors.into_iter().flatten() {
+            self.progress.error(&format!("syq: {err}"));
+        }
+        if let Some(error) = capacity_error {
+            return Err(endpoint_error(error)).context("apply destination changes");
+        }
+        Ok(())
+    }
+
+    /// Apply the queued symlink and special-file operations and report each
+    /// item's outcome.
+    fn flush_leaf_ops(&mut self, ops: Vec<Op>, op_names: &[QueuedLeafOp]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let opts = self.opts;
+        let errs = self.apply(ops)?;
+        let capacity_error = first_capacity_error(&errs);
+        // Two ops per item: creation then metadata.
+        for (i, queued) in op_names.iter().enumerate() {
+            let e1 = errs.get(2 * i).cloned().flatten();
+            let e2 = errs.get(2 * i + 1).cloned().flatten();
+            let error = e1.or(e2);
+            let os_kind = error.as_ref().and_then(wire_os_kind);
+            if let Some(e) = &error {
+                self.progress
+                    .error_classified(&format!("syq: {e}"), Some("io"), os_kind);
+            } else {
+                // Counted only once the operation settles: a fatal
+                // unwind between queueing and applying must not leave
+                // phantom creations in the terminal aggregates.
+                match queued.action {
+                    "create_symlink" => {
+                        self.progress.symlinks_created.fetch_add(1, Relaxed);
+                    }
+                    _ => {
+                        self.progress.specials_created.fetch_add(1, Relaxed);
+                    }
+                }
+                if opts.verbose > 0 {
+                    self.progress.println(&queued.name);
+                }
             }
-            if let Some(error) = capacity_error {
-                return Err(endpoint_error(error)).context("apply destination changes");
+            if let Some(results) = self.progress.results_writer() {
+                results.emit_operation(&crate::results::OperationRecord {
+                    action: queued.action,
+                    dst: &queued.dst_rel,
+                    src: self.mapping_source_rel(&queued.dst_rel).as_deref(),
+                    kind: queued.kind,
+                    disposition: if error.is_none() {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    },
+                    bytes: None,
+                    attempts: None,
+                    retryable: error.is_some().then_some("unknown"),
+                    class: error.is_some().then_some("io"),
+                    os_kind,
+                    message: error.as_ref().map(WireError::as_str),
+                });
             }
         }
-        if !ops.is_empty() {
-            let errs = self.apply(ops)?;
-            let capacity_error = first_capacity_error(&errs);
-            // Two ops per item: creation then metadata.
-            for (i, queued) in op_names.iter().enumerate() {
-                let e1 = errs.get(2 * i).cloned().flatten();
-                let e2 = errs.get(2 * i + 1).cloned().flatten();
-                let error = e1.or(e2);
-                let os_kind = error.as_ref().and_then(wire_os_kind);
-                if let Some(e) = &error {
-                    self.progress
-                        .error_classified(&format!("syq: {e}"), Some("io"), os_kind);
-                } else {
-                    // Counted only once the operation settles: a fatal
-                    // unwind between queueing and applying must not leave
-                    // phantom creations in the terminal aggregates.
-                    match queued.action {
-                        "create_symlink" => {
-                            self.progress.symlinks_created.fetch_add(1, Relaxed);
-                        }
-                        _ => {
-                            self.progress.specials_created.fetch_add(1, Relaxed);
-                        }
-                    }
-                    if opts.verbose > 0 {
-                        self.progress.println(&queued.name);
-                    }
-                }
-                if let Some(results) = self.progress.results_writer() {
-                    results.emit_operation(&crate::results::OperationRecord {
-                        action: queued.action,
-                        dst: &queued.dst_rel,
-                        src: self.mapping_source_rel(&queued.dst_rel).as_deref(),
-                        kind: queued.kind,
-                        disposition: if error.is_none() {
-                            "succeeded"
-                        } else {
-                            "failed"
-                        },
-                        bytes: None,
-                        attempts: None,
-                        retryable: error.is_some().then_some("unknown"),
-                        class: error.is_some().then_some("io"),
-                        os_kind,
-                        message: error.as_ref().map(WireError::as_str),
-                    });
-                }
-            }
-            if let Some(error) = capacity_error {
-                return Err(endpoint_error(error)).context("apply destination changes");
-            }
+        if let Some(error) = capacity_error {
+            return Err(endpoint_error(error)).context("apply destination changes");
         }
         Ok(())
     }
