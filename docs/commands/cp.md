@@ -27,7 +27,10 @@ syq cp --src-non-dir incoming.fifo --into saved
 syq cp data.bin --as-fd 3 3>received.bin
 ```
 
-Each stream copy takes exactly one source. A named FIFO has a basename:
+Each stream copy takes exactly one source. Reading a FIFO waits for a writer.
+A FIFO or descriptor path among several sources is an error before any files
+are copied, including when a shell glob expands to both files and a FIFO.
+A named FIFO has a basename:
 `--into saved` puts `incoming.fifo` at `saved/incoming.fifo` as a regular file.
 An inherited descriptor or process-substitution path has no usable name;
 choose `--as PATH` or `--as-fd FD`. Syq never uses a descriptor number as an
@@ -66,11 +69,15 @@ descriptor can contain partial data after failure; require a successful syq
 exit before treating it as complete. A consumer closing early makes syq fail.
 
 Stream copies use bounded buffers and apply backpressure. File transfers over
-SSH use SSH data connections and the usual helper bootstrap and version checks.
+SSH use a single SSH connection and the usual helper bootstrap and version checks.
 They do not support named receiving destinations, detached execution, restart
 recovery, directory selection, comparison policies, metadata preservation,
 dry runs, result records, or file-copy tuning. Unsupported options are rejected
-before transferring. S3 has its own
+before transferring, whether supplied directly or through `SYQ_CP_OPTIONS`.
+For example, inherited `--stats` or `--performance-tuning workers=1` also
+cause an error. To run without inherited options, use
+`producer | env -u SYQ_CP_OPTIONS syq cp --src-fd 0 --as output.bin`;
+include any supported options you need explicitly. S3 has its own
 [part controls and limits](../object-storage.md#descriptor-copies).
 
 A cancelled file upload removes its temporary file when cleanup completes;

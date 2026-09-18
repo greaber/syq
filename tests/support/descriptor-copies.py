@@ -156,7 +156,17 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                               pass_fds=(file.fileno(),))
                 assert b'anonymous input requires --as' in result.stderr
                 assert not (directory / 'anonymous').exists()
-            fail(['--src', str(fifo), '--src', str(input_path), '--into', str(directory / 'mixed')])
+            # Reject mixed input before copying anything or waiting on the FIFO,
+            # and identify the pipe even if a regular file was listed first.
+            mixed = directory / 'mixed'
+            for inputs in ([str(input_path), str(fifo)],
+                           ['--src', str(fifo), '--src', str(input_path)]):
+                result = fail([*inputs, '--into', str(mixed)])
+                assert result.returncode == 2, result.stderr
+                assert os.fsencode(fifo) in result.stderr, result.stderr
+                assert b'must be the only source' in result.stderr, result.stderr
+                assert not mixed.exists()
+
             # A reader waiting for the first FIFO writer can be cancelled.
             child = subprocess.Popen([SYQ, 'cp', '--src', str(fifo), *destination,
                                      *options, '--as', str(target)], stderr=subprocess.PIPE,
@@ -178,6 +188,26 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
             assert not (directory / 'tree-copy' / 'nested-pipe').exists()
             assert not list(target.parent.glob('.syq-stream-*'))
             print('descriptor file copies passed:', 'SSH helper' if ssh else 'local', flush=True)
+        # Environment options have the same validation as explicit options.
+        # Reject unsupported settings before opening input or mutating output.
+        inherited_target = root / 'inherited-options'
+        inherited_target.write_bytes(b'old')
+        for options, diagnostic in (('--stats', b'--stats'),
+                                    ('--performance-tuning workers=1', b'workers')):
+            result = subprocess.run(
+                [SYQ, 'cp', '--src-fd', '0', '--as', str(inherited_target)],
+                input=b'new', stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=15, env={**ENV, 'SYQ_CP_OPTIONS': options})
+            assert result.returncode == 2, result.stderr
+            assert diagnostic in result.stderr, result.stderr
+            assert b'SYQ_CP_OPTIONS' in result.stderr, result.stderr
+            assert inherited_target.read_bytes() == b'old'
+        result = subprocess.run(
+            [SYQ, 'cp', '--src-fd', '0', '--as', str(inherited_target)],
+            input=b'new', stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=15, env={**ENV, 'SYQ_CP_OPTIONS': '--quiet --no-compress'})
+        assert result.returncode == 0, result.stderr
+        assert inherited_target.read_bytes() == b'new'
         # A producer can wait for a downstream response without filling a
         # transfer block or closing its output first.
         child = subprocess.Popen([SYQ, 'cp', '--src-fd', '0', '--as-fd', '1'],
