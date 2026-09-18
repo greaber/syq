@@ -200,7 +200,10 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                 timeout=15, env={**ENV, 'SYQ_CP_OPTIONS': options})
             assert result.returncode == 2, result.stderr
             assert diagnostic in result.stderr, result.stderr
-            assert b'SYQ_CP_OPTIONS' in result.stderr, result.stderr
+            explicit = fail([*shlex.split(options), '--src-fd', '0',
+                             '--as', str(inherited_target)], input=b'new')
+            assert explicit.returncode == result.returncode
+            assert explicit.stderr == result.stderr, (explicit.stderr, result.stderr)
             assert inherited_target.read_bytes() == b'old'
         result = subprocess.run(
             [SYQ, 'cp', '--src-fd', '0', '--as', str(inherited_target)],

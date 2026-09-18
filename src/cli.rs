@@ -1727,7 +1727,7 @@ fn parse_descriptor_copy(
                 | "follow_dst"
         ) {
             bail!(
-                "--{} is not supported with descriptor copies; check command arguments and SYQ_CP_OPTIONS",
+                "--{} is not supported with descriptor copies",
                 id.as_str().replace('_', "-")
             );
         }
@@ -1823,7 +1823,7 @@ fn parse_descriptor_copy(
                 "s3-part-size" | "s3-max-concurrent-parts-per-object" | "s3-retries"
             )
         {
-            bail!("performance control {key:?} is not supported with this descriptor copy; check --performance-tuning and SYQ_CP_OPTIONS");
+            bail!("performance control {key:?} is not supported with this descriptor copy");
         }
     }
     if let Some(options) = &mut s3 {
