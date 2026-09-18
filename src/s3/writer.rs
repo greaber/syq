@@ -39,9 +39,9 @@ impl Writer {
     fn sender(&self) -> &mpsc::Sender<Message> {
         self.send.get_or_init(|| {
             let file = self.file.clone();
-            // At most 64 batches of 128 KiB queued. SDK chunks can share
+            // At most eight batches of 128 KiB queued per destination. SDK chunks can share
             // larger backing allocations with the active response reader.
-            let (send, mut recv) = mpsc::channel::<Message>(64);
+            let (send, mut recv) = mpsc::channel::<Message>(8);
             tokio::spawn(async move {
                 let mut error = None;
                 while let Some(message) = recv.recv().await {
