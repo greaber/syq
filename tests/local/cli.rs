@@ -976,7 +976,38 @@ fn stream_placement_and_source_roots() {
     succeeds(&["--src-fd", "0", "--as-existing", "target"]);
     assert_eq!(read(&t.path("target")), b"stream");
 
-    for flag in ["--into-new", "--into-existing"] {
+    // Existence refers to the destination entry, including symlinks. Replacing
+    // one must leave its referent intact; a dangling link is still an entry.
+    write(&t.path("referent"), b"keep");
+    std::os::unix::fs::symlink("referent", t.path("link")).unwrap();
+    succeeds(&["--src-fd", "0", "--as-existing", "link"]);
+    assert!(fs::symlink_metadata(t.path("link")).unwrap().is_file());
+    assert_eq!(read(&t.path("link")), b"stream");
+    assert_eq!(read(&t.path("referent")), b"keep");
+    std::os::unix::fs::symlink("missing-referent", t.path("dangling")).unwrap();
+    fails(
+        &["--src-fd", "0", "--as-new", "dangling"],
+        "existence condition failed",
+    );
+    assert_eq!(
+        fs::read_link(t.path("dangling")).unwrap(),
+        Path::new("missing-referent")
+    );
+    assert!(!t.path("missing-referent").exists());
+
+    write(&t.path("directory/keep"), b"keep");
+    for flag in ["--as", "--as-new", "--as-existing"] {
+        let output = cp(&["--src-fd", "0", flag, "directory"]);
+        assert!(!output.status.success(), "{flag} accepted a directory");
+        assert_eq!(read(&t.path("directory/keep")), b"keep");
+    }
+
+    std::os::unix::fs::symlink("container", t.path("container-link")).unwrap();
+    for (flag, destination, follow) in [
+        ("--into-new", "container", false),
+        ("--into-existing", "container", false),
+        ("--into-existing", "container-link", true),
+    ] {
         let fifo = t.path("pipe");
         let writer = std::thread::spawn(move || {
             File::options()
@@ -984,7 +1015,11 @@ fn stream_placement_and_source_roots() {
                 .open(fifo)
                 .and_then(|mut file| file.write_all(b"fifo"))
         });
-        let output = cp(&["--root", ".", "--src-non-dir", "pipe", flag, "container"]);
+        let mut args = vec!["--root", ".", "--src-non-dir", "pipe", flag, destination];
+        if follow {
+            args.push("--follow-dst");
+        }
+        let output = cp(&args);
         // Release the owned writer even if a regression rejected the copy.
         let _rescue = OpenOptions::new()
             .read(true)
@@ -996,6 +1031,12 @@ fn stream_placement_and_source_roots() {
         assert_eq!(read(&t.path("container/pipe")), b"fifo");
         fs::remove_file(t.path("container/pipe")).unwrap();
     }
+    fails(&["pipe", "--into-existing", "container-link"], "symlink");
+    assert_eq!(
+        fs::read_link(t.path("container-link")).unwrap(),
+        Path::new("container")
+    );
+    assert!(!t.path("container/pipe").exists());
     fails(
         &["--src-fd", "0", "--into-new", "unnamed"],
         "needs a source name",
