@@ -87,11 +87,25 @@ pub(crate) struct Flags {
     s3_header: Vec<Header>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    Upload,
+    Download,
+    ServerCopy { source_bucket: String },
+}
+impl Route {
+    pub fn source_bucket(&self) -> Option<&str> {
+        match self {
+            Self::ServerCopy { source_bucket } => Some(source_bucket),
+            Self::Upload | Self::Download => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Options {
     pub bucket: String,
-    pub source_bucket: Option<String>,
-    pub upload: bool,
+    pub route: Route,
     pub endpoint: Option<String>,
     pub region: Option<String>,
     pub profile: Option<String>,
@@ -220,10 +234,14 @@ impl Options {
         }
         Ok(Some(Self {
             bucket: bucket.to_owned(),
-            source_bucket: from
-                .filter(|_| to.is_some())
-                .map(|s| s.strip_prefix("s3://").unwrap().to_owned()),
-            upload: to.is_some(),
+            route: match (from, to) {
+                (Some(source), Some(_)) => Route::ServerCopy {
+                    source_bucket: source.strip_prefix("s3://").unwrap().to_owned(),
+                },
+                (None, Some(_)) => Route::Upload,
+                (Some(_), None) => Route::Download,
+                (None, None) => unreachable!("S3 route requires an S3 endpoint"),
+            },
             endpoint: flags.s3_endpoint,
             region: flags.s3_region,
             profile: flags.s3_profile,

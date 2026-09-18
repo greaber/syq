@@ -23,15 +23,14 @@ impl Engine {
         let average = bytes / count;
         let tiny = average < 1024 * 1024;
         let single_request = largest
-            <= if self.options.source_bucket.is_some() {
+            <= if matches!(self.options.route, Route::ServerCopy { .. }) {
                 self.copy_request_limit(largest)
             } else {
                 self.part_size(largest)
             };
         let fixed_workers = self.args.tuning_options.and_then(|t| t.s3_object_workers);
         let ramp_whole_objects = single_request && !tiny && fixed_workers.is_none();
-        let small_upload =
-            self.options.upload && self.options.source_bucket.is_none() && largest <= 1024 * 1024;
+        let small_upload = self.options.route == Route::Upload && largest <= 1024 * 1024;
         let capacity = if small_upload {
             super::super::tuning::small_object_capacity(largest)?
         } else {
@@ -82,9 +81,9 @@ impl Engine {
             && !self.args.verify_only
             && single_request
         {
-            let capacity = if self.options.source_bucket.is_some() {
+            let capacity = if matches!(self.options.route, Route::ServerCopy { .. }) {
                 256
-            } else if self.options.upload {
+            } else if self.options.route == Route::Upload {
                 let buffer_size = if self.tuning.tigris() {
                     8 * 1024 * 1024
                 } else {
@@ -121,41 +120,31 @@ impl Engine {
     pub(super) fn part_size(&self, size: u64) -> u64 {
         let seed = if !self.options.automatic_part_size {
             self.options.part_size
-        } else if self.options.source_bucket.is_some() {
-            // Server copies allocate no payload buffer; use fewer, larger requests.
-            256 * 1024 * 1024
-        } else if self.options.upload {
-            if self.tuning.tigris() {
-                8 * 1024 * 1024
-            } else {
-                16 * 1024 * 1024
-            }
-        } else if self.tuning.local_latency() {
-            64 * 1024 * 1024
-        } else if self.tuning.tigris() {
-            16 * 1024 * 1024
         } else {
-            8 * 1024 * 1024
+            match self.options.route {
+                // No payload buffer: larger parts reduce provider round trips.
+                Route::ServerCopy { .. } => 256 * 1024 * 1024,
+                Route::Upload if self.tuning.tigris() => 8 * 1024 * 1024,
+                Route::Upload => 16 * 1024 * 1024,
+                Route::Download if self.tuning.local_latency() => 64 * 1024 * 1024,
+                Route::Download if self.tuning.tigris() => 16 * 1024 * 1024,
+                Route::Download => 8 * 1024 * 1024,
+            }
         };
         seed.max(size.div_ceil(10_000).next_multiple_of(1024 * 1024))
     }
     pub(super) fn part_workers(&self) -> usize {
         if !self.options.automatic_concurrency {
             self.options.concurrency
-        } else if self.options.source_bucket.is_some() {
-            // Queue enough parts for the shared tuner to explore its full range.
-            // Every part still acquires a permit from that shared budget.
-            self.tuning.request_capacity()
-        } else if !self.options.upload && self.tuning.local_latency() {
-            4
-        } else if self.tuning.tigris() {
-            if self.options.upload {
-                32
-            } else {
-                8
-            }
         } else {
-            64
+            match self.options.route {
+                // Every part still acquires a permit from the shared budget.
+                Route::ServerCopy { .. } => self.tuning.request_capacity(),
+                Route::Download if self.tuning.local_latency() => 4,
+                Route::Upload if self.tuning.tigris() => 32,
+                Route::Download if self.tuning.tigris() => 8,
+                Route::Upload | Route::Download => 64,
+            }
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -448,7 +437,9 @@ mod buffer_tests {
     #[test]
     fn server_copy_threshold_tracks_single_request_scheduling() {
         let mut engine = planning_engine(&[]);
-        engine.options.source_bucket = Some("source".into());
+        engine.options.route = Route::ServerCopy {
+            source_bucket: "source".into(),
+        };
         let limit = 5 * 1024 * 1024 * 1024;
         assert_eq!(engine.copy_request_limit(32 << 20), limit);
         assert_eq!(engine.copy_request_limit(limit + 1), limit);
@@ -465,7 +456,9 @@ mod buffer_tests {
             .maximum
             .is_none());
         let mut explicit = planning_engine(&["--performance-tuning", "s3-part-size=64M"]);
-        explicit.options.source_bucket = Some("source".into());
+        explicit.options.route = Route::ServerCopy {
+            source_bucket: "source".into(),
+        };
         assert_eq!(explicit.copy_request_limit(32 << 20), 64 << 20);
         assert!(explicit
             .object_workers([256 << 20; 100].into_iter())

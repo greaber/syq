@@ -1,5 +1,5 @@
 //! Process-local admission control. Samples are useful copies, not calibration traffic.
-use super::Options;
+use super::{Options, Route};
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering::Relaxed},
@@ -13,7 +13,7 @@ pub(super) struct Tuning {
     control_ns: Arc<AtomicU64>,
     fixed_requests: Option<usize>,
     tigris: bool,
-    upload: bool,
+    route: Route,
     pub requests: Arc<Budget>,
     pub reads: crate::s3::read_recovery::Recovery,
     pub upload_buffers: Arc<tokio::sync::Semaphore>,
@@ -24,12 +24,12 @@ impl Tuning {
         Self {
             control_ns: control,
             reads: crate::s3::read_recovery::Recovery::default(),
-            upload: options.upload && options.source_bucket.is_none(),
+            route: options.route.clone(),
             fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
             // These measured seeds describe provider request behavior; they do
             // not change the data route, integrity policy, or explicit overrides.
-            tigris: options.source_bucket.is_none()
+            tigris: !matches!(options.route, Route::ServerCopy { .. })
                 && options
                     .endpoint
                     .as_deref()
@@ -57,7 +57,7 @@ impl Tuning {
         // Tigris uploads keep their conservative seed. Downloads still need
         // enough requests in flight to cover a long round trip, regardless of
         // provider; short copies cannot recover time spent ramping from 64.
-        (!self.tigris || !self.upload) && ns != u64::MAX && ns >= 50_000_000
+        (!self.tigris || self.route != Route::Upload) && ns != u64::MAX && ns >= 50_000_000
     }
     pub fn configure(&self, tiny: bool, request_cap: usize, seed: usize) {
         let request_cap = request_cap.max(self.fixed_requests.unwrap_or(1));
@@ -423,7 +423,7 @@ mod tests {
             reads: crate::s3::read_recovery::Recovery::default(),
             fixed_requests: None,
             tigris: false,
-            upload: false,
+            route: Route::Download,
             requests: Arc::new(Budget::new(1, true)),
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(1)),
         };
@@ -1121,7 +1121,11 @@ mod tests {
                 reads: crate::s3::read_recovery::Recovery::default(),
                 fixed_requests: fixed,
                 tigris,
-                upload,
+                route: if upload {
+                    Route::Upload
+                } else {
+                    Route::Download
+                },
                 requests: Arc::new(Budget::new(fixed.unwrap_or(64), fixed.is_none())),
                 upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
             };

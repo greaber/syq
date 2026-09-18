@@ -132,7 +132,7 @@ impl Engine {
             .is_some_and(|e| e.region_mismatch())
         {
             error.context(format!("S3-to-S3 source bucket {:?} and destination bucket {:?} are configured with region {}; --s3-region applies to both endpoints: use the reported region if both buckets are there; buckets in different regions are not supported by this route",
-                self.options.source_bucket.as_deref().unwrap(), self.options.bucket,
+                self.options.route.source_bucket().unwrap(), self.options.bucket,
                 self.client.config().region().map_or("unknown", |region| region.as_ref())))
         } else {
             error
@@ -195,7 +195,11 @@ impl Engine {
             let engine = self.clone();
             async move {
                 engine.check_cancelled()?;
-                let mut kind = "file";
+                let mut kind = if job.size == 0 && job.key.ends_with('/') {
+                    "dir"
+                } else {
+                    "file"
+                };
                 let result = engine
                     .copy_object(&mut job, &mut kind)
                     .await
@@ -214,7 +218,7 @@ impl Engine {
         job: &mut Download,
         kind: &mut &'static str,
     ) -> Result<Option<u64>> {
-        let source_bucket = self.options.source_bucket.as_deref().unwrap();
+        let source_bucket = self.options.route.source_bucket().unwrap();
         let key = copy_destination_key(job);
         if job.path.is_empty() && job.key.ends_with('/') {
             *kind = "dir";
@@ -314,13 +318,12 @@ impl Engine {
         copy_source: &str,
         new: bool,
     ) -> Result<()> {
-        let bucket = self.options.source_bucket.as_deref().unwrap();
+        let bucket = self.options.route.source_bucket().unwrap();
         let part_size = self.part_size(source.size);
         anyhow::ensure!(
             part_size <= 5 * 1024 * 1024 * 1024,
             "object exceeds the S3 multipart size limit"
         );
-        let setup_slot = self.tuning.requests.acquire().await;
         self.check_cancelled()?;
         let tagging = if metadata.tag_count() == Some(0) {
             String::new()
@@ -333,6 +336,8 @@ impl Engine {
         } else {
             // A missing count is unknown. Only explicit lack of tagging support
             // permits copying without tags; permission failures remain fatal.
+            let tag_slot = self.tuning.requests.acquire().await;
+            self.check_cancelled()?;
             let tags = self
                 .client
                 .get_object_tagging()
@@ -341,6 +346,7 @@ impl Engine {
                 .set_version_id(source.version.clone())
                 .send()
                 .await;
+            drop(tag_slot);
             let tags = match tags {
                 Ok(tags) => Some(tags),
                 Err(e)
@@ -375,6 +381,8 @@ impl Engine {
             }
             serializer.finish().replace('+', "%20")
         };
+        let setup_slot = self.tuning.requests.acquire().await;
+        self.check_cancelled()?;
         let created = self
             .client
             .create_multipart_upload()

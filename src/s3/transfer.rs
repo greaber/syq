@@ -1,3 +1,4 @@
+use super::Route;
 mod fast;
 mod pruning;
 mod server_copy;
@@ -161,10 +162,10 @@ impl Engine {
     }
 
     async fn copy(self: Arc<Self>) -> Result<()> {
-        if self.options.source_bucket.is_some() {
+        if matches!(self.options.route, Route::ServerCopy { .. }) {
             return self.server_copy().await;
         }
-        if self.options.upload {
+        if self.options.route == Route::Upload {
             let scanning = super::diagnostics::start();
             let args = self.args.clone();
             let (plan, prune) =
@@ -288,7 +289,7 @@ impl Engine {
             Ok(Some(bytes)) => {
                 if kind == "file" {
                     self.progress.files_done.fetch_add(1, Relaxed);
-                } else if self.options.upload {
+                } else if self.options.route != Route::Download {
                     if kind == "dir" {
                         self.progress.directories_created.fetch_add(1, Relaxed);
                     } else {
@@ -1195,7 +1196,9 @@ impl Engine {
                 selectors.push((key, path, location.selection, None, None));
             }
         }
-        if self.options.source_bucket.is_some() && selectors.iter().any(|s| s.4.is_some()) {
+        if matches!(self.options.route, Route::ServerCopy { .. })
+            && selectors.iter().any(|s| s.4.is_some())
+        {
             bail!("S3-to-S3 copies stay server-side; mapping expected digests require reading object contents and are not supported");
         }
         let matcher = crate::scan::build_ignore(&self.args.ignore_lines)?;
@@ -1215,14 +1218,13 @@ impl Engine {
             .unwrap_or(u64::MAX);
         let source_bucket = self
             .options
-            .source_bucket
-            .as_deref()
+            .route
+            .source_bucket()
             .unwrap_or(&self.options.bucket);
         let mut out = Vec::new();
         let mut claims = BTreeMap::new();
         let mut excluded_subtrees = HashSet::new();
-        let same_bucket =
-            self.options.source_bucket.as_deref() == Some(self.options.bucket.as_str());
+        let same_bucket = self.options.route.source_bucket() == Some(self.options.bucket.as_str());
         let mut copy_sources = Vec::new();
         let mut copy_targets = Vec::new();
         // Keep selector order for claims, but overlap bounded source metadata reads.
@@ -1233,12 +1235,14 @@ impl Engine {
                         selector.2,
                         SourceSelection::Contents | SourceSelection::Directory
                     );
-                let head =
-                    if self.options.source_bucket.is_some() && !selector.0.is_empty() && !prefix {
-                        self.copy_head(source_bucket, &selector.0).await?
-                    } else {
-                        None
-                    };
+                let head = if matches!(self.options.route, Route::ServerCopy { .. })
+                    && !selector.0.is_empty()
+                    && !prefix
+                {
+                    self.copy_head(source_bucket, &selector.0).await?
+                } else {
+                    None
+                };
                 Ok::<_, anyhow::Error>((selector, head))
             })
             .buffered(32);
@@ -1258,7 +1262,7 @@ impl Engine {
             let exact = async {
                 let exact = if key.is_empty() {
                     None
-                } else if self.options.source_bucket.is_some()
+                } else if matches!(self.options.route, Route::ServerCopy { .. })
                     && !(directory && self.args.native_mapping.is_none())
                 {
                     copy_source.as_ref().map(|(object, _)| object.clone())
@@ -1296,7 +1300,7 @@ impl Engine {
                     Some(object) => object,
                     None => {
                         let marker = format!("{key}/");
-                        let object = if self.options.source_bucket.is_some() {
+                        let object = if matches!(self.options.route, Route::ServerCopy { .. }) {
                             copy_source = self.copy_head(source_bucket, &marker).await?;
                             copy_source.as_ref().map(|(object, _)| object.clone())
                         } else {
@@ -1404,7 +1408,7 @@ impl Engine {
                 if self.args.delete {
                     if directory {
                         prune.claim(path.as_bytes());
-                    } else if self.options.source_bucket.is_some()
+                    } else if matches!(self.options.route, Route::ServerCopy { .. })
                         && !self.args.ignore_existing
                         && !self.args.existing
                     {
