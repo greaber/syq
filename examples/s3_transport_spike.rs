@@ -124,15 +124,26 @@ fn main() -> Result<()> {
         return Ok(());
     }
     ensure!(
-        a.len() == 7,
-        "MODE MANIFEST CONCURRENCY OUTPUT_DIR_OR_DASH CERT WORKER_THREADS"
+        a.len() == 7 || a.len() == 8,
+        "MODE MANIFEST CONCURRENCY OUTPUT_DIR_OR_DASH CERT WORKER_THREADS [REPEATS]"
     );
-    let objects: Vec<Object> = serde_json::from_reader(File::open(&a[2])?)?;
+    let objects: Vec<Object> = serde_json::from_slice(&std::fs::read(&a[2])?)?;
+    ensure!(!objects.is_empty(), "empty manifest");
+    let repeats: usize = a.get(7).map(|s| s.parse()).transpose()?.unwrap_or(1);
+    let jobs = objects
+        .len()
+        .checked_mul(repeats)
+        .expect("job count overflow");
     let concurrency: usize = a[3].parse()?;
     ensure!(concurrency > 0, "zero concurrency");
     let pem = std::fs::read(&a[5])?;
-    let workers: usize = a[6].parse()?;
-    let total: usize = objects.iter().map(|o| o.size).sum();
+    let workers: usize = if a[6] == "auto" {
+        std::thread::available_parallelism()?.get().min(32)
+    } else {
+        a[6].parse()?
+    };
+    let total: usize = objects.iter().map(|o| o.size).sum::<usize>() * repeats;
+    let io_before = std::fs::read_to_string("/sys/fs/cgroup/io.stat").unwrap_or_default();
     let start = Instant::now();
     if a[1] == "sync" {
         let cert = ureq::tls::Certificate::from_pem(&pem)?;
@@ -155,10 +166,10 @@ fn main() -> Result<()> {
                     s.spawn(|| -> Result<()> {
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
-                            if i >= objects.len() {
+                            if i >= jobs {
                                 break;
                             }
-                            sync_get(&agent, &objects[i], &a[4], i)?;
+                            sync_get(&agent, &objects[i % objects.len()], &a[4], i)?;
                         }
                         Ok(())
                     })
@@ -190,8 +201,9 @@ fn main() -> Result<()> {
                     .pool_max_idle_per_host(concurrency)
                     .build(),
             );
-            stream::iter(objects.iter().cloned().enumerate())
-                .map(|(i, o)| {
+            stream::iter(0..jobs)
+                .map(|i| {
+                    let o = objects[i % objects.len()].clone();
                     let c = connector.clone();
                     let dir = a[4].clone();
                     async move {
@@ -208,9 +220,15 @@ fn main() -> Result<()> {
             Ok::<_, anyhow::Error>(())
         })?;
     }
+    let usage = unsafe {
+        let mut u: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut u);
+        u
+    };
+    let cpu = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     println!(
         "{}",
-        serde_json::json!({"mode":a[1],"objects":objects.len(),"bytes":total,"concurrency":concurrency,"workers":workers,"elapsed":start.elapsed().as_secs_f64()})
+        serde_json::json!({"mode":a[1],"objects":jobs,"bytes":total,"concurrency":concurrency,"workers":workers,"elapsed":start.elapsed().as_secs_f64(),"user":cpu(usage.ru_utime),"system":cpu(usage.ru_stime),"rss_kib":usage.ru_maxrss,"voluntary":usage.ru_nvcsw,"involuntary":usage.ru_nivcsw,"io_before":io_before,"io_after":std::fs::read_to_string("/sys/fs/cgroup/io.stat").unwrap_or_default(),"memory_stat":std::fs::read_to_string("/sys/fs/cgroup/memory.stat").unwrap_or_default(),"memory_events":std::fs::read_to_string("/sys/fs/cgroup/memory.events").unwrap_or_default()})
     );
     Ok(())
 }
