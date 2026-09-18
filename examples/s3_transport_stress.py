@@ -369,6 +369,10 @@ try:
         assert HEAP_PROBE
         cases = [dict(case, receive_buffer=int(value)) for case in cases
                  for value in os.environ['SYQ_STRESS_RCVBUFS'].split(',')]
+    if os.environ.get('SYQ_STRESS_RCVBUDGETS'):
+        assert HEAP_PROBE
+        cases = [dict(case, receive_budget=int(value)) for case in cases
+                 for value in os.environ['SYQ_STRESS_RCVBUDGETS'].split(',')]
     for case in cases:
         if HEAP_PROBE:
             case.update(heap_probe=True)
@@ -388,6 +392,8 @@ try:
             label = os.environ.get('SYQ_STRESS_LABEL', 'measured')
             if os.environ.get('SYQ_STRESS_RCVBUFS'):
                 label += '-rcv' + str(case['receive_buffer'])
+            if os.environ.get('SYQ_STRESS_RCVBUDGETS'):
+                label += '-budget' + str(case['receive_budget'])
             minimum = float(os.environ.get('SYQ_STRESS_MIN_SECONDS', 30))
             modes = [f'queue-{queue}' for queue in QUEUES]
             if os.environ.get('SYQ_STRESS_SYNC') == '1':
