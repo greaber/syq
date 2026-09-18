@@ -30,12 +30,17 @@
 #[cfg(target_os = "macos")]
 use crate::fsops::CopyLocalOutcome;
 use crate::proto::OperatorSymlinkPolicy;
+use crate::sys::{
+    absent_or_nondirectory, directory_names, get_errno, open_at, retry_zero, set_errno, stat_dev,
+    stat_mode, COMMON_NAME_MAX, MODE_DIRECTORY, MODE_FIFO, MODE_REGULAR, MODE_SYMLINK,
+    MODE_TYPE_MASK, NAME_MAX_CACHE_CAP,
+};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -47,31 +52,8 @@ use std::sync::{Mutex, OnceLock};
 mod macos_clone_support;
 
 static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
-const COMMON_NAME_MAX: usize = 255;
-const NAME_MAX_CACHE_CAP: usize = 1024;
 
 pub(crate) const OPERATOR_SYMLINK_FOLLOW_ADVICE: &str = "pass --follow-src for source paths, --follow-dst for destination paths, or --follow for all directly supplied filesystem paths";
-
-#[cfg(target_os = "linux")]
-const MODE_TYPE_MASK: u32 = libc::S_IFMT;
-#[cfg(not(target_os = "linux"))]
-const MODE_TYPE_MASK: u32 = libc::S_IFMT as u32;
-#[cfg(target_os = "linux")]
-const MODE_DIRECTORY: u32 = libc::S_IFDIR;
-#[cfg(not(target_os = "linux"))]
-const MODE_DIRECTORY: u32 = libc::S_IFDIR as u32;
-#[cfg(target_os = "linux")]
-const MODE_REGULAR: u32 = libc::S_IFREG;
-#[cfg(not(target_os = "linux"))]
-const MODE_REGULAR: u32 = libc::S_IFREG as u32;
-#[cfg(target_os = "linux")]
-const MODE_SYMLINK: u32 = libc::S_IFLNK;
-#[cfg(not(target_os = "linux"))]
-const MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
-#[cfg(target_os = "linux")]
-const MODE_FIFO: u32 = libc::S_IFIFO;
-#[cfg(not(target_os = "linux"))]
-const MODE_FIFO: u32 = libc::S_IFIFO as u32;
 
 /// Stable identity of an opened root. Independent helper processes can reopen
 /// the configured path and require this identity before serving requests.
@@ -1353,38 +1335,7 @@ impl Root {
         // O_PATH/O_SEARCH descriptor.
         let readable = open_readable_directory_at(directory, b".")
             .context("open readable confined directory")?;
-        let descriptor = readable.into_raw_fd();
-        let stream = unsafe { libc::fdopendir(descriptor) };
-        if stream.is_null() {
-            let error = io::Error::last_os_error();
-            let _ = unsafe { libc::close(descriptor) };
-            return Err(error).context("open confined directory stream");
-        }
-        struct DirectoryStream(*mut libc::DIR);
-        impl Drop for DirectoryStream {
-            fn drop(&mut self) {
-                let _ = unsafe { libc::closedir(self.0) };
-            }
-        }
-        let stream = DirectoryStream(stream);
-        let mut names = Vec::new();
-        loop {
-            set_errno(0);
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                let errno = get_errno();
-                if errno != 0 {
-                    return Err(io::Error::from_raw_os_error(errno))
-                        .context("read confined directory");
-                }
-                break;
-            }
-            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name != b"." && name != b".." {
-                names.push(name.to_vec());
-            }
-        }
-        Ok(names)
+        directory_names(readable).context("read confined directory")
     }
 
     /// Component limit for a sidecar beside `path`. Missing or non-directory
@@ -1460,7 +1411,7 @@ impl Root {
                     cache.insert(device, limit);
                     return Ok(limit);
                 }
-                Err(error) if missing_directory_suffix(&error) && !components.is_empty() => {
+                Err(error) if absent_or_nondirectory(&error) && !components.is_empty() => {
                     components.pop();
                 }
                 Err(error) => return Err(error),
@@ -2650,31 +2601,6 @@ fn open_readable_directory_at(parent: &File, component: &[u8]) -> io::Result<Fil
     )
 }
 
-fn missing_directory_suffix(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .and_then(io::Error::raw_os_error)
-            .is_some_and(|errno| matches!(errno, libc::ENOENT | libc::ENOTDIR | libc::ELOOP))
-    })
-}
-
-fn open_at(parent: RawFd, name: &CStr, flags: libc::c_int, mode: u32) -> io::Result<File> {
-    // `mode_t` is narrower than `int` on some platforms (including macOS),
-    // so C's default argument promotions require an `int` in this variadic
-    // position. Callers restrict ordinary creation modes before reaching here.
-    loop {
-        let fd = unsafe { libc::openat(parent, name.as_ptr(), flags, mode as libc::c_int) };
-        if fd >= 0 {
-            return Ok(unsafe { File::from_raw_fd(fd) });
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
 fn clear_nonblocking(file: &File) -> io::Result<()> {
     let flags = loop {
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
@@ -2703,18 +2629,6 @@ pub(crate) fn filesystem_is(file: &File, name: &[u8]) -> io::Result<bool> {
     retry_zero(|| unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) })?;
     let stats = unsafe { stats.assume_init() };
     Ok(unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes() == name)
-}
-
-fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {
-    loop {
-        if operation() == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
 }
 
 fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
@@ -2769,46 +2683,6 @@ fn stat_ctime(stat: &libc::stat) -> i64 {
 
 fn stat_ctime_nsec(stat: &libc::stat) -> u32 {
     stat.st_ctime_nsec as u32
-}
-
-#[cfg(target_os = "linux")]
-fn set_errno(value: libc::c_int) {
-    unsafe { *libc::__errno_location() = value };
-}
-
-#[cfg(target_os = "linux")]
-fn get_errno() -> libc::c_int {
-    unsafe { *libc::__errno_location() }
-}
-
-#[cfg(target_os = "macos")]
-fn set_errno(value: libc::c_int) {
-    unsafe { *libc::__error() = value };
-}
-
-#[cfg(target_os = "macos")]
-fn get_errno() -> libc::c_int {
-    unsafe { *libc::__error() }
-}
-
-#[cfg(target_os = "linux")]
-fn stat_dev(stat: &libc::stat) -> u64 {
-    stat.st_dev
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stat_dev(stat: &libc::stat) -> u64 {
-    stat.st_dev as u64
-}
-
-#[cfg(target_os = "linux")]
-fn stat_mode(stat: &libc::stat) -> u32 {
-    stat.st_mode
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stat_mode(stat: &libc::stat) -> u32 {
-    stat.st_mode as u32
 }
 
 /// `st_nlink` is `u64` on x86-64 Linux, `u32` on AArch64 Linux, and `u16`

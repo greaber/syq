@@ -54,6 +54,8 @@ mod sched;
 mod server;
 mod session_pool;
 mod streaming;
+#[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
+mod sys;
 mod tcp_records;
 #[cfg(test)]
 mod test_support;
