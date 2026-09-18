@@ -45,6 +45,7 @@ BINARY_SHA256 = hashlib.sha256(BIN.read_bytes()).hexdigest()
 # Delay/rate are applied only inside the owned MinIO network namespace.
 NETEM_MS = int(os.environ.get('SYQ_STRESS_NETEM_MS', 0))
 NETEM_RATE = os.environ.get('SYQ_STRESS_NETEM_RATE', '1gbit')
+SENDER_MAX = int(os.environ.get('SYQ_STRESS_SENDER_MAX', 0))
 NETLAB = 'sha256:04a80a4748e69b7ee5a46a4e3424f536c17d1ee384791bdf301a128c4e704e3d'
 HEAP_PROBE = os.environ.get('SYQ_STRESS_HEAP') == '1'
 if HEAP_PROBE:
@@ -265,6 +266,7 @@ def run(case, mode, repeats, label):
 
 try:
     server = command(['docker', 'run', '--detach', '--rm', '--cpuset-cpus', '8-15',
+                      *(['--sysctl', f'net.ipv4.tcp_wmem=4096 131072 {SENDER_MAX}'] if SENDER_MAX else []),
                       '--tmpfs', '/data:rw,size=2g', '-p', '127.0.0.1::9000',
                       '-v', str(CERT) + ':/certs:ro', '-e', 'MINIO_ROOT_USER=syq-test-user',
                       '-e', 'MINIO_ROOT_PASSWORD=syq-test-password', MINIO,
@@ -335,12 +337,15 @@ try:
         indexed = {case['name']: case for case in cases}
         cases = [dict(indexed[name], protocol='http' if PLAIN_HTTP else 'https') for name in requested]
     if NETEM_MS:
+        sender_tcp = network_command(['cat', '/proc/sys/net/ipv4/tcp_wmem'])
+        (D / 'sender-tcp-wmem.txt').write_text(sender_tcp + '\n')
         network_command(['tc', 'qdisc', 'replace', 'dev', 'eth0', 'root', 'netem',
                          'limit', '100000', 'delay', str(NETEM_MS) + 'ms',
                          'rate', NETEM_RATE])
         print(f'Isolated server egress: delay {NETEM_MS}ms, rate {NETEM_RATE}', flush=True)
         for case in cases:
-            case.update(netem_ms=NETEM_MS, netem_rate=NETEM_RATE, netlab_image=NETLAB)
+            case.update(netem_ms=NETEM_MS, netem_rate=NETEM_RATE, netlab_image=NETLAB,
+                        sender_tcp_wmem=sender_tcp)
     if os.environ.get('SYQ_STRESS_RCVBUFS'):
         assert HEAP_PROBE
         cases = [dict(case, receive_buffer=int(value)) for case in cases
