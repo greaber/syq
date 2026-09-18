@@ -74,8 +74,10 @@ blue Manrope wordmark above an Open Sans title. This adds character to the
 homepages while retaining the compact navigation and normal article headings.
 The docs homepage preserves its copy-files-with-syq fragment for existing links.
 
-The homepage leads with fast, programmable file transfer and a short
-description of copying, reorganizing, removing, resuming and automation.
+The homepage leads with fast, programmable file transfer and examples that
+separate file selection, endpoints, and placement. Its tool comparison widget
+uses curated examples in `docs/assets/tool-examples.html`; all examples remain
+readable without JavaScript. Native selectors provide keyboard navigation.
 Shared landing-actions buttons offer installation, benchmarks, sending files
 home, server-to-server copies and programmable file placement. Quickstart
 examples follow under Try a copy.

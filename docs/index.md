@@ -4,9 +4,8 @@
 </h1>
 
 Copy, reorganize, and remove files across local filesystems, remote machines,
-and [S3-compatible storage](object-storage.md). Resume interrupted transfers,
-send files to your laptop or run commands there from a server’s remote shell, and script syq using the [JSON API](automation.md) or
-[Python SDK](python.md). Your laptop needs no SSH server or incoming network port.
+and [S3-compatible storage](object-storage.md). Choose which files to copy and
+where they should land, preview the changes, and rerun interrupted copies to resume.
 
 <nav class="landing-actions" aria-label="Explore syq">
 <a class="landing-primary" href="install.html">Install syq</a>
@@ -15,20 +14,30 @@ send files to your laptop or run commands there from a server’s remote shell, 
 <a href="exec.html">Run commands on your laptop</a>
 <a href="remote-to-remote.html">Copy directly between servers without forwarding your SSH agent</a>
 <a href="mappings.html">Rename and reorganize files during a copy</a>
-<a href="automation.html">JSON API</a>
+<a href="automation.html">Structured results</a>
 <a href="python.html">Python SDK</a>
 </nav>
 
 ## Try a copy
 
-Replace `server` with an SSH hostname or alias you normally connect to,
-and `project` with a local directory:
+Start with a local directory named `project`. The same copy can go to a local
+folder, an SSH server, or an S3 bucket:
 
 ```sh
+syq cp project --into backup
 syq cp project --to server --into backup
+syq cp project --to s3://backups --into backup
 ```
 
-This creates or updates `backup/project` in your home directory on the server.
+Each command puts `project` inside `backup`. Replace `server` with an SSH
+hostname or alias you normally use, or `backups` with an existing bucket.
+A relative SSH destination starts in your home directory on that server.
+See [S3 setup](object-storage.md#s3-options) for credentials and other providers.
+
+`--from` and `--to` choose the source and destination machines or buckets.
+Without them, paths are local. `--into` puts selected names inside a directory;
+`--as` chooses an exact destination name.
+
 To copy the contents of `project` directly into `backup`, use `--srcs-in`:
 
 ```sh
@@ -40,19 +49,30 @@ to list the planned changes by path.
 Existing destination files are updated when needed. Unrelated files stay
 unless you request `--prune`.
 
-## Already use rsync?
+<a id="already-use-rsync"></a>
 
-Start with your usual command, prefixed by `syq`:
+## Start with a tool you know
 
-```sh
-syq rsync -av project/ server:backup/project/
-syq rsync -av server:data/ ./data/
-```
+Choose a familiar command to see how to express the same task in syq.
+These examples explain file placement; comparison rules and metadata handling
+can differ between tools.
 
-Syq supports common rsync options, but uses its own protocol. Rsync filter
-rules, hard links, ACLs, xattrs, sparse files, and rolling-checksum deltas
-are not supported. Check [rsync compatibility](rsync-compat.md) before
-substituting it in an existing script.
+{{#include assets/tool-examples.html}}
+
+For a visual walkthrough, see [where files go](reference.md#see-where-files-go).
+You can also use familiar rsync syntax through `syq rsync`; check
+[rsync compatibility](rsync-compat.md) before substituting it in a script.
+
+## Put syq in your workflow
+
+Scripts can [choose files and destination names](mappings.md), preview a copy
+with `--dry-run`, and read [structured results](automation.md).
+The [Python SDK](python.md) provides copy and removal calls with typed results.
+
+Working in a server shell? [Send files to your laptop](receive.md) or
+[run a command there](exec.md), with approval on your laptop. It needs no SSH
+server or incoming network port. You can also [copy directly between servers](remote-to-remote.md)
+without forwarding your SSH agent.
 
 ## Common tasks
 

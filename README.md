@@ -18,7 +18,7 @@ Quick links to docs for common tasks:
 - [Copy directly between servers without forwarding your SSH agent](https://greaber.github.io/syq/remote-to-remote.html)
 - [Copy to, from, and between S3-compatible buckets](https://greaber.github.io/syq/object-storage.html)
 - [Rename and reorganize files during a copy](https://greaber.github.io/syq/mappings.html)
-- Script syq using the [JSON API](https://greaber.github.io/syq/automation.html) or
+- Script syq using the [structured results](https://greaber.github.io/syq/automation.html) or
   [Python SDK](https://greaber.github.io/syq/python.html).
 
 ## Install
