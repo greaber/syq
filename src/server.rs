@@ -440,6 +440,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
             destination: None, ..
         } => {}
     }
+    // All foreign descriptor claims and their close-on-exec setup are complete
+    // before readiness is acknowledged or this connection starts its reader.
     w.write_msg(&Response::HelloOk {
         identity: crate::identity::build().to_string(),
         platform: crate::identity::platform(),
@@ -921,12 +923,15 @@ fn local_addrs(families: BoundFamilies) -> Vec<(String, u32)> {
             .nth(2)
             .and_then(|ip| ip.parse::<IpAddr>().ok())
     });
-    let out = std::process::Command::new("ip")
+    // The Darwin receiver must not spawn children while receiving SCM_RIGHTS.
+    #[cfg(target_os = "linux")]
+    let text = std::process::Command::new("ip")
         .args(["-o", "addr", "show"])
-        .output();
-    let text = out
+        .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    let text = String::new();
     advertised_addrs(&text, ssh_ip, families, iface_speed)
 }
 

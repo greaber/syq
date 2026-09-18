@@ -1,0 +1,17 @@
+# Enforced in macOS receiver modules by src/main.rs. A new process launch
+# there needs a descriptor-inheritance design before it can pass Clippy.
+disallowed-methods = [
+    "std::process::Command::new",
+    "std::process::Command::spawn",
+    "std::process::Command::output",
+    "std::process::Command::status",
+    "std::os::unix::process::CommandExt::exec",
+    "libc::fork",
+    "libc::posix_spawn",
+    "libc::posix_spawnp",
+    "libc::system",
+    "libc::popen",
+    "libc::execve",
+    "libc::execv",
+    "libc::execvp",
+]

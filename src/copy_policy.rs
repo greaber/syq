@@ -7,6 +7,7 @@ pub(crate) struct CopyPolicy {
     pub checksum: bool,
     pub force_ranges: bool,
     pub bandwidth_limited: bool,
+    pub receiver_copy_disabled: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -16,18 +17,18 @@ pub(crate) enum FileOperation {
 }
 
 impl CopyPolicy {
-    /// Existing Linux receivers need source capabilities before accepting a
-    /// direct-copy request. This is about descriptor authority, not transport.
-    pub(crate) fn receiver_source_claims(self) -> bool {
-        cfg!(target_os = "linux") && self.same_host
-    }
-
     pub(crate) fn prefer_whole_files(self) -> bool {
-        self.receiver_source_claims() && !self.checksum && !self.bandwidth_limited
+        // Keep macOS batching unchanged when cloning is unavailable.
+        cfg!(target_os = "linux") && self.allows_receiver_copy()
     }
 
+    /// Also determines whether workers need receiver-side source claims.
     pub(crate) fn allows_receiver_copy(self) -> bool {
-        self.same_host && !self.force_ranges && !self.checksum && !self.bandwidth_limited
+        self.same_host
+            && !self.receiver_copy_disabled
+            && !self.force_ranges
+            && !self.checksum
+            && !self.bandwidth_limited
     }
 
     pub(crate) fn file_operation(self, size: u64, guarded: bool) -> FileOperation {
@@ -50,9 +51,14 @@ mod tests {
             checksum: false,
             force_ranges: false,
             bandwidth_limited: false,
+            receiver_copy_disabled: false,
         };
         assert_eq!(direct.file_operation(1, false), FileOperation::ReceiverCopy);
         for policy in [
+            CopyPolicy {
+                receiver_copy_disabled: true,
+                ..direct
+            },
             CopyPolicy {
                 same_host: false,
                 ..direct

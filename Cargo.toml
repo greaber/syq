@@ -94,3 +94,7 @@ jsonschema = { version = "0.56", default-features = false }
 # optimized in debug/test builds so hashing does not dominate race-test waits.
 [profile.dev.package.blake3]
 opt-level = 3
+
+[lints.clippy]
+# Receiver modules opt into the subprocess restrictions in clippy.toml.
+disallowed_methods = "allow"
