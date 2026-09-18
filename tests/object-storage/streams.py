@@ -65,7 +65,7 @@ def main():
         stream(['--to', bucket, '--as-new', prefix], input=b'no', success=False)
         stream(['--to', bucket, '--as-existing', prefix], input=b'no', success=False)
         with tempfile.TemporaryDirectory(prefix='syq-s3-placement-') as temporary:
-            fifo = Path(temporary) / 'pipe'
+            fifo = Path(temporary).resolve() / 'pipe'
             os.mkfifo(fifo)
             for flag, target, success in [('--into-new', prefix, False),
                                           ('--into-existing', prefix, True),

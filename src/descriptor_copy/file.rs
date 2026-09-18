@@ -35,7 +35,7 @@ pub(crate) fn resolve_source(path: &[u8], root: Option<&[u8]>, follow: bool) -> 
     } else {
         OperatorSymlinkPolicy::Refuse
     };
-    let final_component = OperatorFinalComponent::Entry {
+    let final_component = OperatorFinalComponent::StreamSource {
         follow_symlink: follow,
     };
     let path = crate::fsops::resolve(path);

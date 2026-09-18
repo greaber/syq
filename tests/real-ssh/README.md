@@ -131,13 +131,23 @@ direct TCP, cached and missing helper startup, a second approval during slow
 SSH setup, preview/verification, protected destination authority files,
 unreachable data ports, and revocation followed by an approved retry.
 
-The suite also runs the standalone interactive benchmark in noninteractive
-push and pull modes, with both synthetic workloads and scratch paths containing
-spaces and quotes. These are correctness and cleanup checks using the lab's
-debug binary, not performance measurements.
+The benchmark-script integration checks run separately:
 
-A cancellation case waits for an active remote partial file, interrupts the
-benchmark, and checks that scratch is removed while an unrelated file remains.
+```sh
+scripts/test-real-ssh.sh --suite benchmark
+```
+
+Run these when changing `scripts/try-benchmark.sh` or interfaces it uses, such
+as CLI arguments, results JSON, tuning output, or cancellation. They exercise
+push and pull with synthetic workloads and scratch paths containing spaces
+and quotes, plus cancellation cleanup that preserves unrelated files. They use
+the lab's debug binary to check correctness, not measure performance. This
+suite uses the default SSH profile and does not run the core scenarios.
+
+The default core suite retains the transfer and receiving checks. It collects
+source and destination manifests concurrently and runs the three isolated
+shell-completion checks concurrently. The runner reports image-build time
+separately from lab startup and test execution.
 
 
 Return command scenarios exercise local Allow/Deny even under automatic copy

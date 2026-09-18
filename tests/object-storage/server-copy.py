@@ -12,7 +12,7 @@ import check as c
 def check():
     remote = 's3://' + c.BUCKET
     with tempfile.TemporaryDirectory(prefix='syq-server-copy-') as temp:
-        root = Path(temp)
+        root = Path(temp).resolve()
         os.environ['XDG_CACHE_HOME'] = str(root / 'cache')
         source = root / 'source'
         source.mkdir()

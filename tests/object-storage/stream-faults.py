@@ -165,6 +165,8 @@ def stop(child):
 
 
 with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0.1', 0), Handler) as server:
+    # macOS TMPDIR may traverse /var, which native source paths reject.
+    temp = str(Path(temp).resolve())
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     env = {k: v for k, v in os.environ.items() if not k.startswith(('AWS_', 'SYQ_'))}

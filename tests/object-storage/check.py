@@ -148,7 +148,7 @@ def interrupted(args, threshold=5*1024*1024):
 
 def check():
     with tempfile.TemporaryDirectory(prefix='syq-s3-check-') as temp:
-        root = Path(temp)
+        root = Path(temp).resolve()
         os.environ['XDG_CACHE_HOME'] = str(root / 'cache')
         src = root / 'source'
         src.mkdir()

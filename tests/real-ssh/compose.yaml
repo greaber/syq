@@ -50,6 +50,7 @@ services:
     hostname: runner
     command: ["runner"]
     environment:
+      SYQ_REAL_SSH_SUITE: ${SYQ_REAL_SSH_SUITE:-core}
       SYQ_REAL_SSH_BLOCKED_TCP_PORT: "47800"
     volumes:
       - type: bind

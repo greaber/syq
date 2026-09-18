@@ -9,6 +9,11 @@ pub(crate) enum OperatorFinalComponent {
     Entry {
         follow_symlink: bool,
     },
+    /// A byte-stream source. On platforms without O_PATH, keep a FIFO's
+    /// parent and identity without opening a metadata handle that joins it.
+    StreamSource {
+        follow_symlink: bool,
+    },
     /// An input file whose final procfs magic link may be opened relative to
     /// its retained procfs parent instead of interpreting its synthetic target
     /// bytes as an ordinary symlink path.
@@ -346,6 +351,8 @@ impl OperatorResolver {
                         follow_symlink: true
                     } | OperatorFinalComponent::ReadableEntry {
                         follow_symlink: true
+                    } | OperatorFinalComponent::StreamSource {
+                        follow_symlink: true
                     }
                 );
 
@@ -494,13 +501,25 @@ impl OperatorResolver {
             if !final_name || matches!(final_component, OperatorFinalComponent::Directory) {
                 return Err(io::Error::from_raw_os_error(libc::ENOTDIR).into());
             }
-            let object = open_operator_metadata_at(current.directory.as_raw_fd(), &name)
-                .context("pin operator path leaf")?;
-            require_operator_identity(
-                metadata,
-                root_metadata_from_std(&object.metadata()?)?,
-                "operator leaf",
-            )?;
+            // Only Linux O_PATH pins a FIFO without joining it as a reader.
+            // In particular, macOS O_EVTONLY can release a waiting producer
+            // and discard its bytes before the stream's actual open. Elsewhere
+            // retain the parent and observed identity; the input open checks it.
+            let object = if metadata.is_fifo()
+                && !cfg!(target_os = "linux")
+                && matches!(final_component, OperatorFinalComponent::StreamSource { .. })
+            {
+                None
+            } else {
+                let object = open_operator_metadata_at(current.directory.as_raw_fd(), &name)
+                    .context("pin operator path leaf")?;
+                require_operator_identity(
+                    metadata,
+                    root_metadata_from_std(&object.metadata()?)?,
+                    "operator leaf",
+                )?;
+                Some(object)
+            };
             return Ok(PinnedPath::Leaf(PinnedLeaf {
                 parent: current
                     .directory
@@ -508,7 +527,7 @@ impl OperatorResolver {
                     .context("pin selected object parent")?,
                 name,
                 metadata,
-                object: Some(object),
+                object,
                 resolved_relative: append_operator_component(
                     current.resolved_relative.as_deref(),
                     &component,
