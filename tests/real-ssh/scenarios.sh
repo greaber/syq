@@ -141,6 +141,23 @@ subprocess.run(['bash', '-c',
 result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'],
                         stdout=subprocess.PIPE, check=True, timeout=30)
 assert result.stdout == b'local producer'
+# A producer exception closes the control pipe without authorizing publication.
+import os
+for commit in (b'', b'C'):
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, commit)
+    os.close(write_fd)
+    try:
+        result = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination',
+                                 '--as', path, '--stream-commit-fd', str(read_fd)],
+                                input=payload, pass_fds=(read_fd,), timeout=60,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    finally:
+        os.close(read_fd)
+    assert (result.returncode == 0) == (commit == b'C'), result.stderr
+    result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'],
+                            stdout=subprocess.PIPE, check=True, timeout=60)
+    assert result.stdout == (payload if commit else b'local producer')
 PY_DESCRIPTORS
 
 printf 'case: pipelined prune lookup with a one-deep data pipeline\n'

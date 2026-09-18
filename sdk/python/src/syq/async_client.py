@@ -550,12 +550,14 @@ class AsyncClient:
     ) -> AsyncStreamWriter:
         """Write one object, committing on successful context exit."""
         from ._streams import _Process, arguments, StreamWriter, AsyncStreamWriter
+
         async def start():
             argv = arguments(
                 executable=await self._executable_value(), writing=True, path=as_, endpoint=to,
                 options=dict(rsh=rsh, syq_path=syq_path, pscope=pscope,
                              no_bootstrap=no_bootstrap, no_compress=no_compress,
-                             s3_endpoint=s3_endpoint, s3_region=s3_region, s3_profile=s3_profile, s3_header=s3_header,
+                             s3_endpoint=s3_endpoint, s3_region=s3_region,
+                             s3_profile=s3_profile, s3_header=s3_header,
                              performance_tuning=performance_tuning, follow_dst=follow_dst),
             )
             stream = StreamWriter(_Process(argv, writing=True, cwd=self.process_cwd, env=self.env,
@@ -584,12 +586,14 @@ class AsyncClient:
     ) -> AsyncStreamReader:
         """Read one object; context exit drains and verifies the transfer."""
         from ._streams import _Process, arguments, StreamReader, AsyncStreamReader
+
         async def start():
             argv = arguments(
                 executable=await self._executable_value(), writing=False, path=src, endpoint=from_,
                 options=dict(rsh=rsh, syq_path=syq_path, pscope=pscope,
                              no_bootstrap=no_bootstrap, no_compress=no_compress,
-                             s3_endpoint=s3_endpoint, s3_region=s3_region, s3_profile=s3_profile, s3_header=s3_header,
+                             s3_endpoint=s3_endpoint, s3_region=s3_region,
+                             s3_profile=s3_profile, s3_header=s3_header,
                              performance_tuning=performance_tuning, follow_src=follow_src),
             )
             stream = StreamReader(_Process(argv, writing=False, cwd=self.process_cwd, env=self.env,

@@ -2,17 +2,17 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import math
+import os
 import signal
 import subprocess
 import threading
-from collections.abc import Mapping, Callable, Awaitable
+from collections.abc import Awaitable, Callable, Mapping
 
 from ._paths import PathArgument
+from .errors import SyqInvocationError, SyqProcessError
 
 Argument = str | bytes
-from .errors import SyqInvocationError, SyqProcessError
 
 
 def arguments(*, executable: str, writing: bool, path: PathArgument,
