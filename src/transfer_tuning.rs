@@ -241,10 +241,10 @@ fn set_once<T>(slot: &mut Option<T>, value: T, key: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn parse_comparison_block_size(value: &str) -> Result<u64> {
+pub(crate) fn parse_comparison_block_size(value: &str, key: &str) -> Result<u64> {
     size(
         value,
-        "comparison-block-size",
+        key,
         crate::proto::MIN_HASH_BLOCK_BYTES,
         crate::proto::MAX_HASH_BLOCK_BYTES,
     )
@@ -305,7 +305,7 @@ impl FromStr for TransferTuning {
                 )?,
                 "comparison-block-size" => set_once(
                     &mut tuning.comparison_block_size,
-                    parse_comparison_block_size(value)?,
+                    parse_comparison_block_size(value, key)?,
                     key,
                 )?,
                 "request-size" => set_once(

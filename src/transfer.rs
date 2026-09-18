@@ -1515,7 +1515,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if args.interface == Interface::NativeCp {
         crate::destination::prepare(&mut args)?;
     }
-    let block = args.comparison_block_size();
+    let block = args.block_size;
     args.tuning_options
         .unwrap_or_default()
         .validate(args.bwlimit_bytes)?;

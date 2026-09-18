@@ -113,10 +113,9 @@ destination. If the source changes between attempts, this can resend bytes
 that still match the old destination. With `--inplace`, changes are written
 directly to the destination instead.
 
-The smallest supported comparison block is 64 KiB. A later copy can reuse
-matching bytes from an interrupted copy even if you change the comparison block
-size; syq checks them using the new size. `-B` / `--block-size` are available
-only in `syq rsync`; native commands use
+A later copy can reuse matching bytes from an interrupted copy even if you
+change the comparison block size; syq checks them using the new size.
+`-B` / `--block-size` are available only in `syq rsync`; native commands use
 `--performance-tuning comparison-block-size=SIZE`. Do not combine the two
 controls in `syq rsync`.
 

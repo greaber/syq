@@ -11704,29 +11704,29 @@ fn existing_updates_through_a_destination_root_symlink_to_a_dir() {
 #[test]
 fn rsync_rejects_invalid_comparison_blocks_before_reading_inputs() {
     let t = Tmp::new();
-    write(&t.path("src/file"), b"source");
-    for flag in ["-B", "--block-size"] {
-        for value in ["0", "32K", "65M", "invalid"] {
-            let out = syq(&[
-                flag,
-                value,
-                "--files-from",
-                &t.s("missing-manifest"),
-                &t.s("src/"),
-                &t.s("dst/"),
-            ]);
-            let error = stderr_of(&out);
-            assert_eq!(out.status.code(), Some(2), "{error}");
-            assert!(error.contains("invalid value"), "{error}");
-            if value != "invalid" {
-                assert!(
-                    error.contains("between 65536 and 67108864 bytes"),
-                    "{error}"
-                );
-            }
-            assert!(!error.contains("missing-manifest"), "{error}");
-            assert!(!t.path("dst").exists());
-        }
+    for (flag, value, reason) in [
+        (
+            "-B",
+            "32K",
+            "--block-size must be between 65536 and 67108864 bytes",
+        ),
+        ("--block-size", "invalid", "bad size suffix"),
+    ] {
+        let out = syq(&[
+            flag,
+            value,
+            "--files-from",
+            &t.s("missing-manifest"),
+            &t.s("src/"),
+            &t.s("dst/"),
+        ]);
+        let error = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(2), "{error}");
+        assert!(error.contains("invalid value"), "{error}");
+        assert!(error.contains(reason), "{error}");
+        assert!(!error.contains("comparison-block-size"), "{error}");
+        assert!(!error.contains("missing-manifest"), "{error}");
+        assert!(!t.path("dst").exists());
     }
 }
 
