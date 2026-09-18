@@ -191,6 +191,36 @@ public verification key. Use the ordinary Cargo commands above for custom
 builds. Editing the source or updating either lock file changes the build inputs
 and is not a reproduction of the published release.
 
+## Reproduce a Python distribution
+
+Check out the Python release tag (`sdk-python-v<version>`) on the same OS and
+architecture as the wheel, then run:
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' build .#python-dist --no-update-lock-file
+```
+
+`result/` contains the wheel for your platform and a source archive. Compare the
+wheel with the downloaded PyPI file using `cmp`. The published source archive is
+built on Linux x86-64; use that platform when comparing its bytes. To force a
+fresh compilation and compare it with the first output, add `--rebuild`.
+
+Use a release tag containing the `python-dist` recipe. `flake.lock` pins the
+build environment, including Python and archive tools; `sdk/python/uv.lock`
+pins maturin. `sdk/python/native-source.json` pins the native source revision
+and tree hash separately from the Python SDK source. The native release's
+Rust toolchain and Cargo lock select its compiler and dependencies. As with
+standalone releases, input downloads and cached build tools are trusted inputs
+and must remain available to rebuild later.
+
+Publishing uses this same recipe and builds once per platform. The manual
+`publish SDKs` workflow can optionally rebuild and compare distributions without
+publishing. The wheel keeps its dependency inventory (SBOM); local source paths
+in that inventory are normalized so temporary build directories do not change
+its bytes. Installing from the source archive still uses maturin and does not
+require Nix; use the pinned recipe when you need the published wheel's bytes.
+
+
 ## Before a pull request
 
 For Rust changes, run:
