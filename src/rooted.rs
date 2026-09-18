@@ -1468,7 +1468,13 @@ impl Root {
             };
             match directory {
                 Ok(directory) => {
-                    let device = directory.metadata()?.dev();
+                    // The retained root's device cannot change while its
+                    // descriptor is open. Only newly opened descendants need
+                    // another stat to identify their filesystem.
+                    let device = match &directory {
+                        DirectoryHandle::Borrowed(_) => self.identity.dev,
+                        DirectoryHandle::Owned(directory) => directory.metadata()?.dev(),
+                    };
                     // Serialize the first query too: PartialPaths resolves a
                     // batch in parallel, and every worker must reuse the first
                     // fpathconf result instead of issuing the same filesystem
@@ -3590,6 +3596,15 @@ mod tests {
                 .unwrap(),
             143
         );
+        // Direct children and a completely missing parent suffix both use
+        // the retained root, whose filesystem identity is already known.
+        for path in [b"file".as_slice(), b"missing/parent/file"] {
+            assert_eq!(
+                root.name_max_for_parent_cached(&relative(path), &cache, &query)
+                    .unwrap(),
+                143
+            );
+        }
         assert_eq!(queries.load(Ordering::Relaxed), 1);
     }
 
