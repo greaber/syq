@@ -90,6 +90,10 @@ assert_scope "$scope" native true
 assert_scope "$scope" sdks true
 assert_scope "$scope" python_sdk true
 for sdk_script in \
+  nix/python-dist.nix \
+  scripts/build-python-dist.sh \
+  scripts/pin-python-native-source.sh \
+  scripts/normalize-python-wheel.py \
   scripts/check-python-api-sync.py \
   scripts/normalize-python-sdist.py \
   scripts/check-python-wheel.py \

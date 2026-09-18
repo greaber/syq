@@ -72,9 +72,8 @@ The copying interval includes waiting and per-file work, and can overlap
 planning and connection setup. Use it to diagnose syq, not to compare against
 another tool's total time. If the script flags a short copying interval or
 substantial time outside it, try a larger workload to investigate sustained
-throughput. The script requests syq statistics explicitly. Each verified trial prints changes
-in the dominant worker and endpoint states over time, followed by cumulative
-worker, endpoint-operation and CPU summaries. Other tools do not provide the same measurements here.
+throughput. Each verified syq trial also reports worker activity, endpoint
+operations, and CPU use; see [diagnostics](#diagnose-a-slow-copy) below.
 
 ## Benchmarks
 
@@ -130,10 +129,17 @@ copying every byte. You can also copy to or from a mounted NFS directory using
 its local path. See [storage placement](server-tuning.md#check-local-storage-placement)
 for how the source and destination filesystems affect performance.
 
-On macOS, APFS cloning within one volume can avoid copying file contents.
-Smaller files still travel together in batches. See [batch size and splitting](tuning.md#batch-size-and-splitting)
-for the cloning threshold and how tuning changes it, and [copy files](reference.md#copy-files)
-for the cases that use normal copying.
+On macOS, eligible copies within one APFS volume share disk blocks; later writes
+to either file are independent. Reported bytes count the file's size, so the
+displayed rate can exceed physical disk throughput. Small files travel together
+in batches; see [batch size and splitting](tuning.md#batch-size-and-splitting)
+for the cloning threshold and how tuning changes it.
+
+Cloning keeps the usual overwrite and metadata rules and omits source extended
+attributes and file flags. `--inplace`, checksum comparison, bandwidth limits,
+and explicit range transfers use normal copying. Syq also falls back to normal
+copying when cloning cannot preserve those rules, such as with inheritable
+access control entries on the destination directory.
 
 ## Limit bandwidth
 
@@ -145,6 +151,7 @@ syq cp data --to server --into /backup --resource-limits bandwidth=10M
 
 This limits file data to 10 MiB/s across the copy's workers. It controls the
 average copy rate; buffering and protocol overhead can cause network bursts.
+See [Resource limits](resource-limits.md) for all units and supported routes.
 
 <a id="options-that-change-the-tradeoff"></a>
 

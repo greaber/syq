@@ -52,6 +52,8 @@ jobs:
           test "$(jq -er .tag \
             "$RUNNER_TEMP/syq-release/syq-release-manifest.json")" = \
             "$RELEASE_TAG"
+      - name: Install checksum-pinned Nix
+        run: scripts/install-nix-ci.sh
       - name: Prepare the matching Python SDK release
         id: prepare
         env:
@@ -61,6 +63,7 @@ jobs:
           set -euo pipefail
           python3 scripts/prepare-python-sdk-release.py \
             --manifest "$RELEASE_MANIFEST"
+          scripts/pin-python-native-source.sh
           uv lock --project sdk/python
           if git diff --quiet; then
             echo 'changed=false' >> "$GITHUB_OUTPUT"
@@ -114,7 +117,7 @@ jobs:
             "Automated follow-up to the immutable syq v$SYQ_VERSION release." \
             "- sets the Python SDK version to match syq $SYQ_VERSION" \
             "- embeds the exact signed v$SYQ_VERSION release manifest" \
-            "- updates the managed executable cache documentation" \
+            "- pins the native source revision and tree hash for reproducible distributions" \
             "The preparation workflow ran the pinned SDK release-tool and unit-test suites before opening this pull request. It will explicitly run and await post-merge Python SDK validation on the exact merge commit. The release orchestrator will then sign sdk-python-v$PYTHON_VERSION, approve the protected pypi environment, and verify publication.")
           pr_url=$(gh pr create \
             --base master \

@@ -370,3 +370,22 @@ fn advanced_commands_are_discoverable_and_keep_their_full_descriptions() {
         }));
     }
 }
+
+#[test]
+fn command_reference_matches_public_help() {
+    let output = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "tests/cli_reference.py",
+            "--check",
+            env!("CARGO_BIN_EXE_syq"),
+        ])
+        .output()
+        .expect("python3 is required to check command-reference coverage");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

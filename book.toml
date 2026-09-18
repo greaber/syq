@@ -20,3 +20,5 @@ additional-js = ["theme/docs.js", "theme/copy-demo.js", "theme/sidebar.js", "the
 
 [output.html.redirect]
 "sdk-compatibility.html" = "python-reference.html#compatibility"
+"development.html" = "https://github.com/greaber/syq/blob/master/CONTRIBUTING.md"
+"commands/stream.html" = "index.html"

@@ -388,3 +388,17 @@ therefore do not normally trigger the warning seen for browser downloads. The
 current workflow does not hold an Apple Developer credential. If syq later
 offers browser downloads as a primary path, add Developer ID signing and Apple
 notarization in the macOS build jobs before advertising that path.
+
+### Python distribution inputs
+
+Python release preparation runs `scripts/pin-python-native-source.sh` after
+updating the embedded release manifest. It resolves that release tag to a commit
+and records its source-tree hash in `sdk/python/native-source.json`. When
+preparing the SDK manually, run that command with Nix installed and the native
+release tag fetched, and commit the pin alongside the SDK changes.
+
+`scripts/build-python-dist.sh OUTPUT_DIRECTORY` builds the same artifacts as
+the Python publisher. See [reproducing Python distributions](docs/development.md#reproduce-a-python-distribution)
+for the locked recipe and optional rebuild comparison. Updating the native pin
+or build inputs changes future outputs; it does not reproduce packages published
+with an earlier recipe.
