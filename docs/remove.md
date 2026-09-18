@@ -1,6 +1,6 @@
 # Remove files
 
-For every argument and option, see the [`rm` command reference](commands/rm.md).
+See [`syq rm`](commands/rm.md) for the option list.
 
 Remove a file or symlink:
 

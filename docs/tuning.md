@@ -1,25 +1,9 @@
 # Performance tuning
 
-`--performance-tuning` overrides syq's automatic choices. This page lists every
-key, its default, and where it applies. Use these controls to investigate copies
-where the defaults perform poorly; the keys and bounds are experimental and may
-change between releases.
-
-`--performance-tuning workers=N` fixes the number of filesystem copy-worker
-slots instead of adjusting it automatically. Workers process files or ranges;
-several workers can share a large file. Remote workers use data channels, SSH
-channels can share a TCP socket, and local workers need no network connection.
-Idle slots do no work, and shortcuts can finish a copy using fewer workers.
-This is not a limit on total sockets, file descriptors, CPU or memory.
-
-Both `syq cp` and `syq rsync` use this spelling. Leave it unset for everyday
-copies. S3 uses the object, part, and request controls below. `syq rm` and
-`syq clean-partials` accept only `workers`, which controls filesystem removal;
-it does not change S3 deletion batches. `syq stream` accepts only the three
-[S3 stream controls](#s3-streams).
-
-Use [resource limits](resource-limits.md) to cap bandwidth and
-[integrity checking](integrity-checking.md) to choose content checks.
+`--performance-tuning` overrides syq's automatic choices. Leave it unset for
+everyday copies. These experimental controls are available in `syq cp` and
+`syq rsync`; `syq rm` and `syq clean-partials` accept only `workers` for filesystem
+removal, and `syq stream` accepts the [S3 stream controls](#s3-streams).
 
 ## Transfer controls
 
@@ -34,7 +18,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 
 | Key | Default | Accepted values |
 |---|---|---|
-| `workers` | Automatic | 1 through 65536 filesystem worker slots; route-specific receiver limits also apply |
+| `workers` | Automatic | 1 through 65536 filesystem workers; route-specific receiver limits also apply |
 | `comparison-block-size` | 4 MiB | 64 KiB through 64 MiB; filesystem copies only |
 | `request-size` | Hash block size (normally 4 MiB) for ordinary requests; at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
@@ -50,8 +34,7 @@ coordinator too and are not saved.
 
 ## S3 copies
 
-These keys apply to `syq cp` with S3 endpoints. Filesystem worker and request
-controls above do not configure S3 concurrency. Start with the automatic defaults.
+Use these keys for `syq cp` with S3 endpoints.
 
 | Key | Default | Accepted values / meaning |
 |---|---|---|
@@ -69,26 +52,23 @@ syq cp data --to s3://backups --into archive \
 ```
 
 This allows four objects in progress and up to eight parts per object, with at
-most sixteen simultaneous data requests across them. It does not reserve eight
-slots per object. Small objects can use one request. Explicit maxima disable
-automatic adjustment of that setting; insufficient ready work can leave slots idle.
+most sixteen simultaneous data requests across them. An explicit maximum
+disables automatic adjustment of that setting.
 
 Part size grows when needed to stay within 10,000 upload parts. For server-side
 copies, an explicit part size also selects the multipart threshold, capped at
 5 GiB. Without an explicit part limit, server-side copies can use the shared
 request budget's full tuning range.
 
-These settings do not cap total memory or sockets. Small uploads share a
-256 MiB payload-buffer budget, and an object maximum beyond available capacity
-is rejected. See [S3 parallelism](object-storage.md#parallelism) for resource costs.
-S3 tuning is not saved between runs.
+See [S3 parallelism](object-storage.md#parallelism) for memory use and buffering
+limits. S3 tuning is not saved between runs.
 
 ## S3 streams
 
 `syq stream` accepts only `s3-part-size`, `s3-max-concurrent-parts-per-object`,
 and `s3-retries`, with the same ranges as above. Defaults are 16 MiB parts,
-four parallel parts, and ten retries. Stream concurrency does not tune itself.
-Larger parts or more concurrency increase buffering.
+four parallel parts, and ten retries. Larger parts or more concurrency increase
+buffering.
 
 An upload is limited to 10,000 parts: 156.25 GiB at the default size. Choose a
 larger part size before a larger stream; provider object-size limits still apply.

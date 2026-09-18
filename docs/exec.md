@@ -1,6 +1,6 @@
 # Run commands on your receiving machine
 
-For every argument and option, see the [`exec` command reference](commands/exec.md).
+See [`syq exec`](commands/exec.md) for the option list.
 
 From a server shell, ask your Mac or Linux desktop to run a command:
 

@@ -1,6 +1,6 @@
 # Rsync compatibility
 
-For every argument and option, see the [`rsync` command reference](commands/rsync.md).
+See [`syq rsync`](commands/rsync.md) for the option list.
 
 `syq rsync` accepts common rsync commands for local copies, pushes, and pulls.
 It uses its own protocol: the remote program must be syq, not rsync.

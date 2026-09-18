@@ -24,7 +24,7 @@ rules can let syq skip entire object subtrees. Download exclusion totals count
 individual excluded files and count each ignored subtree once, without counting
 its descendants. Keys inside ignored subtrees are not validated.
 
-For complete option lists, see [`cp`](commands/cp.md), [`rm`](commands/rm.md),
+For option lists, see [`cp`](commands/cp.md), [`rm`](commands/rm.md),
 and [`stream`](commands/stream.md).
 
 ## Shell pipelines
@@ -156,9 +156,8 @@ large downloads into byte ranges. It chooses settings automatically and adjusts
 concurrency as the copy runs. Start with the defaults; short copies may finish
 before syq can measure a better setting. S3 tuning is not saved between runs.
 
-Use the [S3 performance-tuning reference](tuning.md#s3-copies) for the complete
-object, part, request, and retry controls. Explicit limits override automatic
-choices; they do not cap total process memory or open sockets.
+Use [S3 performance tuning](tuning.md#s3-copies) to set object, part, request,
+and retry limits.
 
 Small uploads share a 256 MiB payload-buffer budget. TLS and request bookkeeping
 use additional memory. Large objects stream through bounded buffers. Discovery

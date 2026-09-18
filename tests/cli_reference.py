@@ -15,9 +15,9 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 BLOCK = re.compile(r"<!-- CLI: (.*?) -->\n(.*?)<!-- /CLI -->", re.S)
 GROUP_LINKS = {
-    "--performance-tuning": "Choose parallelism and transfer settings. See [Performance tuning](../tuning.md) for every key, default, and restriction.",
-    "--resource-limits": "Set resource ceilings. See [Resource limits](../resource-limits.md) for every key, unit, and restriction.",
-    "--integrity-checking": "Choose comparison and payload checks. See [Integrity checking](../integrity-checking.md) for every key, default, and algorithm.",
+    "--performance-tuning": "[Workers, request sizes, and copy methods](../tuning.md)",
+    "--resource-limits": "[Bandwidth limit](../resource-limits.md)",
+    "--integrity-checking": "[Comparison and transfer checksums](../integrity-checking.md)",
 }
 
 
@@ -89,7 +89,7 @@ def anchor(command):
     return "syq-" + "-".join(command)
 
 
-def render(command, parsed):
+def render(command, parsed, commands):
     usage, groups, children = parsed
     out = ["```text", *usage, "```", ""]
     if children:
@@ -109,6 +109,11 @@ def render(command, parsed):
     for heading, rows in groups:
         if not rows:
             continue
+        # The family's table covers identical help flags on nested commands.
+        if len(command) > 1 and heading == "Help and version" and (heading, rows) in commands[(command[0],)][1]:
+            continue
+        if len(command) == 1 and children and heading == "Help and version":
+            heading = "Help (also available on subcommands)"
         title = f"## {heading}" if len(command) == 1 and not children and not command[0].startswith("--") else f"**{heading}**"
         out += [title, "", "| Argument / option | Meaning |", "|---|---|"]
         for signature, description in rows:
@@ -116,6 +121,10 @@ def render(command, parsed):
             for flag, link in GROUP_LINKS.items():
                 if signature.startswith(flag + " "):
                     body = link
+                    if flag == "--performance-tuning" and command in (("rm",), ("clean-partials",)):
+                        body = "Filesystem removal workers: [workers=N](../tuning.md#transfer-controls)"
+                    elif flag == "--performance-tuning" and command == ("stream",):
+                        body = "[S3 stream part size, concurrency, and retries](../tuning.md#s3-streams)"
             # Some management arguments have no help string. Their usage and
             # command-specific prose supply meaning; never silently omit them.
             body = body or "See the command description above."
@@ -152,7 +161,7 @@ def main():
             if command in seen or command not in commands:
                 raise ValueError(f"duplicate or obsolete command block: {command}")
             seen.add(command)
-            return f"<!-- CLI: {match[1]} -->\n{render(command, commands[command])}<!-- /CLI -->"
+            return f"<!-- CLI: {match[1]} -->\n{render(command, commands[command], commands)}<!-- /CLI -->"
         updated = BLOCK.sub(replace, original)
         if updated != original:
             changed = True

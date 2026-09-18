@@ -1,25 +1,15 @@
 # syq rm
 
-Remove local files, remote filesystem entries, or S3 objects. This page lists
-every `rm` option; [Remove files](../remove.md) explains selection and failures.
+Remove local files, remote filesystem entries, or S3 objects.
+See [Remove files](../remove.md) for selection rules and
+[S3 removal](../object-storage.md#remove-objects-and-versions) for versioned objects.
 
 ```sh
 syq rm --src-dir old-output --dry-run -v
 ```
 
-Named sources and `--src` refuse directories. Use `--src-dir` for a whole tree or
-`--srcs-in` to empty one while keeping its root. Missing selections succeed.
-Final symlinks are removed as links, even with following enabled. Filesystem
-removal is permanent; preview first. Filters and detached removal are unsupported.
-
-For S3, ordinary deletion respects versioning. `--s3-all-versions` and
-`--s3-version-id` permanently remove selected versions and cannot combine.
-See [S3 removal](../object-storage.md#remove-objects-and-versions) before using them.
-
-Only `workers` is accepted in `--performance-tuning`; it controls filesystem
-removal workers, not S3 deletion batches. `SYQ_RM_OPTIONS` supplies extra arguments;
-see [environment variables](../reference.md#environment-variables-and-local-files).
-Use [removal results](../automation.md#removal-records) for scripted outcomes.
+For scripting, see [environment variables](../reference.md#environment-variables-and-local-files)
+and [removal results](../automation.md#removal-records).
 
 <!-- CLI: rm -->
 ```text
@@ -68,7 +58,7 @@ syq rm [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `--performance-tuning <KEY=VALUE,...>` | Choose parallelism and transfer settings. See [Performance tuning](../tuning.md) for every key, default, and restriction. |
+| `--performance-tuning <KEY=VALUE,...>` | Filesystem removal workers: [workers=N](../tuning.md#transfer-controls) |
 
 ## Progress and results
 
@@ -97,4 +87,3 @@ syq rm [OPTIONS] --srcs-in DIR
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
-

@@ -1,13 +1,8 @@
 # syq persist
 
-Manage reusable SSH connections and receiving profiles. Every public nested
-command and its options are listed here. For setup, start with
-[Send files home from a server](../receive.md); see
-[Persistence details](../persistence-reference.md) for names, limits, and upgrades.
-
-Durable persistence also enables receiving by default, with local approval for
-incoming requests. Connections have no idle expiry. Ephemeral scopes reuse only
-forward SSH logins; they do not enable receiving or command requests.
+Manage reusable SSH connections and receiving profiles. Start with
+[Send files home from a server](../receive.md) for setup, or see
+[Persistence details](../persistence-reference.md) for profiles and limits.
 
 <!-- CLI: persist -->
 ```text
@@ -23,7 +18,7 @@ syq persist <COMMAND>
 | [`persist off`](#syq-persist-off) | Disable persistence and close its live SSH control connections |
 | [`persist status`](#syq-persist-status) | Show connection readiness and any receiving problem |
 
-**Help and version**
+**Help (also available on subcommands)**
 
 | Argument / option | Meaning |
 |---|---|
@@ -33,8 +28,6 @@ syq persist <COMMAND>
 <!-- /CLI -->
 
 ## syq persist receive
-
-Run these commands on the receiving machine. Profiles control incoming copies and command requests.
 
 <!-- CLI: persist receive -->
 ```text
@@ -51,13 +44,6 @@ syq persist receive <COMMAND>
 | [`persist receive remove`](#syq-persist-receive-remove) | Remove a saved receiving profile and stop its connections |
 | [`persist receive status`](#syq-persist-receive-status) | Show receiving settings and background connection state |
 | [`persist receive wait`](#syq-persist-receive-wait) | Wait for a connection with a deadline |
-
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
 
 <!-- /CLI -->
 
@@ -78,13 +64,6 @@ syq persist receive pending [OPTIONS]
 | `--wait` | Wait for an incoming request, with a deadline |
 | `--timeout <TIMEOUT>` | [default: 30] |
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
 
 ## syq persist receive approve
@@ -102,18 +81,11 @@ syq persist receive approve <ID>
 |---|---|
 | `<ID>` | See the command description above. |
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
 
 ## syq persist receive deny
 
-`ID` is a pending request ID from `persist receive pending` on this machine. The requester receives the refusal.
+`ID` is a pending request ID from `persist receive pending` on this machine.
 
 <!-- CLI: persist receive deny -->
 ```text
@@ -126,18 +98,15 @@ syq persist receive deny <ID>
 |---|---|
 | `<ID>` | See the command description above. |
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
 
 ## syq persist receive on
 
-Create, enable, or update a profile. Omitted settings keep saved values. New profiles ask for approval, use desktop prompts, and start in the home directory without confinement. `--cwd` and `--root` cannot combine. The directory must exist. Changing settings cancels that profile’s active requests. See [profile settings](../persistence-reference.md#names-and-profiles) and [copy limits](../persistence-reference.md#copy-limits).
+Omitted settings keep saved values. New profiles ask for approval with desktop
+prompts and use the home directory. Set `--root` to confine copies to a directory.
+Changing settings cancels the profile’s active requests. See
+[profile settings](../persistence-reference.md#names-and-profiles) and
+[copy limits](../persistence-reference.md#copy-limits).
 
 <!-- CLI: persist receive on -->
 ```text
@@ -157,13 +126,6 @@ syq persist receive on [OPTIONS]
 | `--max-entries <MAX_ENTRIES>` | Maximum entries one transfer may touch (default: 1000000) |
 | `--max-delete <MAX_DELETE>` | Permit pruning up to N entries per transfer (default: 0) |
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
 
 ## syq persist receive off
@@ -180,13 +142,6 @@ syq persist receive off [OPTIONS]
 | Argument / option | Meaning |
 |---|---|
 | `--name <NAME>` | Stop only this profile; without --name, stop all profiles |
-
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
 
 <!-- /CLI -->
 
@@ -205,18 +160,11 @@ syq persist receive remove <NAME>
 |---|---|
 | `<NAME>` | See the command description above. |
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
 
 ## syq persist receive status
 
-Show all profiles, or select one with `--name`. `--json` requests structured output without starting a connection.
+Show all profiles, or select one with `--name`. Use `--json` for structured output.
 
 <!-- CLI: persist receive status -->
 ```text
@@ -229,13 +177,6 @@ syq persist receive status [OPTIONS]
 |---|---|
 | `--json` | See the command description above. |
 | `--name <NAME>` | See the command description above. |
-
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
 
 <!-- /CLI -->
 
@@ -261,18 +202,9 @@ syq persist receive wait [OPTIONS] <HOST>
 | `--name <NAME>` | Wait for this profile; otherwise wait for every enabled profile |
 | `--timeout <TIMEOUT>` | [default: 30] |
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
 
 ## syq persist destinations
-
-Run these commands on the server that receives the laptop’s connection. Names identify receiving machines, not SSH aliases.
 
 <!-- CLI: persist destinations -->
 ```text
@@ -285,36 +217,20 @@ syq persist destinations <COMMAND>
 | [`persist destinations forget`](#syq-persist-destinations-forget) | Remove an offline destination name so another laptop can register it |
 | [`persist destinations wait`](#syq-persist-destinations-wait) | Wait for a connection with a deadline |
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
 
 ## syq persist destinations list
-
-List assigned receiving names and whether their receiving machines respond.
 
 <!-- CLI: persist destinations list -->
 ```text
 syq persist destinations list
 ```
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
 
 ## syq persist destinations forget
 
-`NAME` is an offline receiving name to release before replacing its machine. Forgetting a live connection is refused. This does not remove a local receiving profile.
+`NAME` is an offline receiving name to release before replacing its machine. Forgetting a live connection is refused.
 
 <!-- CLI: persist destinations forget -->
 ```text
@@ -326,13 +242,6 @@ syq persist destinations forget <NAME>
 | Argument / option | Meaning |
 |---|---|
 | `<NAME>` | See the command description above. |
-
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
 
 <!-- /CLI -->
 
@@ -357,18 +266,13 @@ syq persist destinations wait [OPTIONS] <NAME>
 |---|---|
 | `--timeout <TIMEOUT>` | [default: 30] |
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
 
 ## syq persist connect
 
-Enable persistence and connect to `HOST`. With receiving enabled, wait until it is ready. `--timeout` limits that wait after SSH and helper setup; it does not limit authentication or installation. `--syq-path` and `--no-bootstrap` cannot combine. `--pscope` selects an existing ephemeral scope without enabling receiving.
+Connect to `HOST` and wait for receiving to be ready. `--timeout` applies to
+the receiving wait after SSH and helper setup. `--syq-path` and `--no-bootstrap`
+cannot combine. Use `--pscope` for an existing ephemeral scope.
 
 <!-- CLI: persist connect -->
 ```text
@@ -390,18 +294,9 @@ syq persist connect [OPTIONS] <HOST>
 | `--timeout <TIMEOUT>` | Wait this many seconds for receiving after SSH/helper setup<br><br>[default: 30] |
 | `--pscope <PATH>` | Reuse forward SSH in an existing ephemeral scope, without enabling receiving |
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
 
 ## syq persist on
-
-Enable persistence for future SSH connections. With `--ephemeral`, print a new scope path instead of changing the durable user setting. Pass that path with `--pscope` and close it with `persist off --pscope PATH` when finished.
 
 <!-- CLI: persist on -->
 ```text
@@ -414,18 +309,9 @@ syq persist on [OPTIONS]
 |---|---|
 | `--ephemeral` | Create an ephemeral scope and print its path instead of changing the user setting |
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
 
 ## syq persist off
-
-Close durable connections and disable persistence, or close only the ephemeral scope named by `--pscope`. Active requests using those connections are interrupted.
 
 <!-- CLI: persist off -->
 ```text
@@ -437,13 +323,6 @@ syq persist off [OPTIONS]
 | Argument / option | Meaning |
 |---|---|
 | `--pscope <PATH>` | Operate on this ephemeral persistence scope instead of the user setting |
-
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
 
 <!-- /CLI -->
 
@@ -463,12 +342,4 @@ syq persist status [OPTIONS]
 | `--json` | Print structured connection state |
 | `--pscope <PATH>` | Inspect this ephemeral persistence scope instead of the user setting |
 
-**Help and version**
-
-| Argument / option | Meaning |
-|---|---|
-| `-h, --help` | Show common usage and options |
-| `--help-all` | Show all options and details |
-
 <!-- /CLI -->
-

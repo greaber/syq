@@ -1,28 +1,16 @@
 # syq stream
 
-Transfer one S3 object's raw contents through stdin, stdout, or an inherited
-file descriptor. All arguments and options follow; see
-[shell pipelines](../object-storage.md#shell-pipelines) for recovery and size limits.
+Transfer one S3 object's contents through stdin, stdout, or an inherited
+file descriptor:
 
 ```sh
 syq stream --from s3://backups archive.tar > archive.tar
 syq stream --to s3://backups --as archive.tar < archive.tar
 ```
 
-Choose exactly one direction: downloads require `--from` and a source key;
-uploads require `--to` and `--as KEY`. Keys are exact object names. Descriptors
-must be open in the requested direction; descriptor 2 is reserved for diagnostics.
-
-EOF completes an upload even if its producer failed. Downloads can leave partial
-output on failure. Check the pipeline's exit status, and use Bash's `set -o pipefail`
-when you also need to detect producer or consumer failure. Streams have no saved
-resume state, copied filesystem metadata, progress display, or `--results` channel.
-
-`--performance-tuning` accepts only `s3-part-size`,
-`s3-max-concurrent-parts-per-object`, and `s3-retries`.
-[Stream defaults and limits](../tuning.md#s3-streams) differ from file copies.
-`SYQ_STREAM_OPTIONS` supplies extra arguments; see
-[environment variables](../reference.md#environment-variables-and-local-files).
+See [shell pipelines](../object-storage.md#shell-pipelines) for failure handling
+and size limits, and [environment variables](../reference.md#environment-variables-and-local-files)
+for `SYQ_STREAM_OPTIONS`.
 
 <!-- CLI: stream -->
 ```text
@@ -44,7 +32,7 @@ syq stream [OPTIONS] [KEY]
 | `--as <KEY>` | Exact destination object key |
 | `--read-fd <FD>` | Read an inherited descriptor instead of stdin |
 | `--write-fd <FD>` | Write an inherited descriptor instead of stdout (stderr is reserved) |
-| `--performance-tuning <KEY=VALUE>` | Choose parallelism and transfer settings. See [Performance tuning](../tuning.md) for every key, default, and restriction. |
+| `--performance-tuning <KEY=VALUE>` | [S3 stream part size, concurrency, and retries](../tuning.md#s3-streams) |
 
 ## Object storage
 
@@ -63,4 +51,3 @@ syq stream [OPTIONS] [KEY]
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
-

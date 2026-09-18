@@ -1,22 +1,14 @@
 # syq exec
 
-Request a command on a connected receiving machine. Every command needs approval
-on that machine, even when copies are automatically approved. See
-[Run commands on your receiving machine](../exec.md) for setup and cancellation.
+Run a command on a connected receiving machine, with approval on that machine:
 
 ```sh
 syq exec --on @laptop --cwd work/project -- cargo test
 ```
 
-`--on` is required. Put `--` before the program and its literal arguments; request
-`sh -c` explicitly for shell syntax. The program inherits the receiving service's
-environment and has closed stdin. It runs with the receiving user's permissions;
-receiving roots and copy limits do not confine it.
-
-Output streams back on stdout and stderr. Syq returns the program's exit code
-(or `128 + signal`), and reports setup or connection failures as nonzero.
-A lost connection cancels the command's process group, but detached processes
-can survive. Completed effects are not rolled back or retried. All options follow.
+Put `--` before the program and its arguments; use `sh -c` for shell syntax.
+The program runs with the receiving user's permissions. See
+[Run commands on your receiving machine](../exec.md) for setup, output, and cancellation.
 
 <!-- CLI: exec -->
 ```text
@@ -44,4 +36,3 @@ syq exec [OPTIONS] --on <@NAME> -- <PROGRAM>...
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
-

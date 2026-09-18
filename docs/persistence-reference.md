@@ -1,6 +1,6 @@
 # Persistence details
 
-For every argument and option, see the [`persist` command reference](commands/persist.md).
+See [`syq persist`](commands/persist.md) for the option list.
 
 For everyday setup, start with [Send files home from a server](receive.md).
 

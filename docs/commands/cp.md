@@ -1,39 +1,15 @@
 # syq cp
 
-Copy files, directories, and symlinks locally, over SSH, or to, from, and between
-S3 buckets. This page lists every `cp` option. For examples and copy behavior,
-see [Copy files](../reference.md); the [remote](../remote-reference.md) and
-[S3](../object-storage.md) references describe route-specific restrictions.
+Copy files, directories, and symlinks locally, over SSH, or with S3. See [Copy files](../reference.md) for examples and
+[remote](../remote-reference.md) and [S3](../object-storage.md) copy details.
 
 ```sh
 syq cp --srcs-in project --to server --into backup --dry-run -v
 ```
 
-Put source endpoints, source bases, selectors, and `--mapping` before the first
-`--to` or placement option. Other options may follow the destination.
-Use `--src=-name` or `--ignore=-pattern` when a value begins with a dash.
-
-Directories are recursive, symlinks are copied as links, and modification times
-are preserved. New files use source permissions filtered by the destination
-umask; existing files keep their permissions unless `--preserve` requests otherwise.
-Matching files are skipped by size and timestamp; selected files may be overwritten.
-Unrelated destination entries remain unless you request `--prune`.
-
-Local-only copies and pruning require a placement option. Without placement,
-`--to server` copies into the remote home directory and `--from server` fetches
-into the local current directory. [Receiving profiles](../receive.md#names-and-paths)
-and [S3 keys](../object-storage.md) have their own destination bases.
-
-`--mapping` replaces source selectors and cannot combine with `--as`, `--prune`,
-or `--detach`. See [mapping rules](../mappings.md#semantics-and-limits).
-The [overwrite policies](../reference.md#choose-which-existing-files-to-update)
-explain conflicts among `--only-new`, `--only-existing`, `--skip-newer`, and
-`--inplace`; [integrity checking](../integrity-checking.md) covers verification
-and expected hashes. The advanced tables below link to every supported key.
-
-`SYQ_CP_OPTIONS` supplies extra arguments before command-line arguments; see
-[environment variables](../reference.md#environment-variables-and-local-files).
-For exit codes and structured results, see [Automation results](../automation.md).
+Put source selectors and `--mapping` before `--to` or a placement option.
+For scripting, see [environment variables](../reference.md#environment-variables-and-local-files)
+and [results](../automation.md).
 
 <!-- CLI: cp -->
 ```text
@@ -99,19 +75,19 @@ syq cp [OPTIONS] SOURCE... [PLACEMENT]
 |---|---|
 | `--hash` | Hash existing source and destination files instead of trusting size and modification time |
 | `--expected-hash <ALGORITHM:HEX>` | Require one regular file to match ALGORITHM:HEX |
-| `--integrity-checking <KEY=VALUE,...>` | Choose comparison and payload checks. See [Integrity checking](../integrity-checking.md) for every key, default, and algorithm. |
+| `--integrity-checking <KEY=VALUE,...>` | [Comparison and transfer checksums](../integrity-checking.md) |
 
 ## Performance tuning
 
 | Argument / option | Meaning |
 |---|---|
-| `--performance-tuning <KEY=VALUE,...>` | Choose parallelism and transfer settings. See [Performance tuning](../tuning.md) for every key, default, and restriction. |
+| `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
 
 ## Resource limits
 
 | Argument / option | Meaning |
 |---|---|
-| `--resource-limits <KEY=VALUE,...>` | Set resource ceilings. See [Resource limits](../resource-limits.md) for every key, unit, and restriction. |
+| `--resource-limits <KEY=VALUE,...>` | [Bandwidth limit](../resource-limits.md) |
 
 ## SSH and transport
 
@@ -168,4 +144,3 @@ syq cp [OPTIONS] SOURCE... [PLACEMENT]
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
-

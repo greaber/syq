@@ -5,8 +5,7 @@ syq cp project --into backup
 ```
 
 This copies `project` to `backup/project`. Existing files are updated when
-needed; unrelated files stay. For every argument, option, and default, see the
-[`cp` command reference](commands/cp.md).
+needed; unrelated files stay. See [`syq cp`](commands/cp.md) for the option list.
 
 Local copies use filesystem copy optimizations when available. On the same
 APFS volume, eligible files can share disk blocks while remaining independently

@@ -1,23 +1,18 @@
 # Command reference
 
-These pages list every public command and option, including advanced options and
-nested subcommands. Start with [Copy files](../reference.md) for a guided introduction;
-use this reference to look up a command's complete argument list.
+The complete option lists for syq's public commands are below. For copy examples,
+start with [Copy files](../reference.md).
 
-The three advanced option groups have their own complete references:
+The advanced option groups have separate references:
 
-- [Performance tuning](../tuning.md): parallelism, request sizes, and copy methods.
-- [Resource limits](../resource-limits.md): bandwidth ceilings and units.
-- [Integrity checking](../integrity-checking.md): comparison and payload checks.
+- [Performance tuning](../tuning.md): workers, request sizes, and copy methods.
+- [Resource limits](../resource-limits.md): bandwidth.
+- [Integrity checking](../integrity-checking.md): comparisons and checksums.
 
-Options in the tables belong to the command whose usage appears above them.
-Angle brackets mark values you supply; square brackets in usage mark optional
-arguments, and `...` allows repetition. The tables list short spellings beside
-long spellings. Unset Boolean flags are off unless their description says otherwise.
+Angle brackets mark values you supply; square brackets mark optional arguments,
+and `...` allows repetition.
 
 ## syq
-
-Choose a command below, or use one of the standalone options.
 
 <!-- CLI: syq -->
 ```text
@@ -57,7 +52,8 @@ syq --self-update
 
 ## syq --self-update
 
-Update an installation registered by the standalone installer. Homebrew users run `brew upgrade syq`; source builds must be rebuilt or reinstalled. Downloads are verified against signed release metadata. See [installation updates](../install.md#updates).
+Update a standalone installation. For Homebrew and source installations, see
+[installation updates](../install.md#updates).
 
 <!-- CLI: --self-update -->
 ```text
@@ -87,11 +83,8 @@ syq help [COMMAND...] [--help-all]
 
 Show common help for a command or nested command, such as `syq help persist
 receive on`. Add `--help-all` for its complete help. With no command, show the
-root help. A trailing `--help` or `-h` selects common help. Help does not start
-the requested operation.
+root help. A trailing `--help` or `-h` selects common help.
 
 ## Build identity
 
-`syq --build-identity` prints the executable’s build identity. Use it to
-compare a source build with its SSH helper; matching version numbers alone do
-not establish compatibility. See [development builds](../development.md#another-platform-with-your-own-helpers).
+`syq --build-identity` prints the executable’s build identity. See [development builds](../development.md#another-platform-with-your-own-helpers).

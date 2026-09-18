@@ -1,22 +1,14 @@
 # syq map
 
-List local source/destination pairs as NDJSON for `syq cp --mapping`. No destination
-is contacted. For transformations and the record format, see
-[Rename and reorganize](../mappings.md).
+Print local source/destination pairs as NDJSON for `syq cp --mapping`:
 
 ```sh
 syq map --srcs-in photos > photos.ndjson
 syq cp --mapping photos.ndjson -C photos --into archive
 ```
 
-Named selectors must be relative to their source base; use `-C` or `--root` to
-choose it. `--srcs-in` must be the sole selector. `--as` requires one named
-selection and chooses its name within the future destination container.
-A directory emits separate entries for its descendants. Names must be UTF-8.
-Copy filters belong to the transformation or consuming `cp`, not to `map`.
-
-All arguments and options follow. See [producer failures](../mappings.md#check-the-producer-before-copying)
-before piping a transform directly into a copy.
+See [Rename and reorganize](../mappings.md) for selection rules, transformations,
+and the record format.
 
 <!-- CLI: map -->
 ```text
@@ -56,4 +48,3 @@ syq map [OPTIONS] --srcs-in DIR
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
-

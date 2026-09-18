@@ -1,25 +1,15 @@
 # syq rsync
 
-Use rsync-style arguments with syq's transfer engine and protocol. This page
-lists every accepted option. Check [Rsync compatibility](../rsync-compat.md)
-for behavior differences and unsupported rsync options before replacing a script.
+Copy with rsync-style arguments:
 
 ```sh
 syq rsync -av project/ server:backup/project/
 ```
 
-Trailing slashes follow rsync's rules. Two remote endpoints are not accepted;
-use [`syq cp`](cp.md) for those copies. The remote executable is syq, not rsync.
-Compression and syq partial-file retention are already enabled; `-z` and
-`--partial` do not enable additional behavior. `-h` means human-readable sizes;
-use `--help` to show help.
-
-The three advanced groups retain their native names:
-[performance tuning](../tuning.md), [resource limits](../resource-limits.md),
-and [integrity checking](../integrity-checking.md). The tables below include
-rsync aliases such as `--bwlimit`, `--checksum`, and `--block-size`.
-`SYQ_RSYNC_OPTIONS` supplies extra arguments; see
-[environment variables](../reference.md#environment-variables-and-local-files).
+Check [Rsync compatibility](../rsync-compat.md) before replacing a script.
+Trailing slashes follow rsync's rules. Here `-h` means human-readable sizes;
+use `--help` for help. `SYQ_RSYNC_OPTIONS` supplies
+[extra arguments](../reference.md#environment-variables-and-local-files).
 
 <!-- CLI: rsync -->
 ```text
@@ -90,19 +80,19 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | Argument / option | Meaning |
 |---|---|
 | `-B, --block-size <SIZE>` | Comparison and reuse block size (64K through 64M)<br><br>[default: 4M] |
-| `--performance-tuning <KEY=VALUE,...>` | Choose parallelism and transfer settings. See [Performance tuning](../tuning.md) for every key, default, and restriction. |
+| `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
 
 ## Resource limits
 
 | Argument / option | Meaning |
 |---|---|
-| `--resource-limits <KEY=VALUE,...>` | Set resource ceilings. See [Resource limits](../resource-limits.md) for every key, unit, and restriction. |
+| `--resource-limits <KEY=VALUE,...>` | [Bandwidth limit](../resource-limits.md) |
 
 ## Integrity checking
 
 | Argument / option | Meaning |
 |---|---|
-| `--integrity-checking <KEY=VALUE,...>` | Choose comparison and payload checks. See [Integrity checking](../integrity-checking.md) for every key, default, and algorithm. |
+| `--integrity-checking <KEY=VALUE,...>` | [Comparison and transfer checksums](../integrity-checking.md) |
 | `--syq-expected-hash <ALGORITHM:HEX>` | Require one regular file to match ALGORITHM:HEX |
 
 ## Progress and results
@@ -129,4 +119,3 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `--help` | Show common usage and options |
 
 <!-- /CLI -->
-

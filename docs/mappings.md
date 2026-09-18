@@ -1,6 +1,6 @@
 # Rename and reorganize during a copy
 
-For every argument and option, see the [`map` command reference](commands/map.md).
+See [`syq map`](commands/map.md) for the option list.
 
 `syq map` lists source/destination pairs as one JSON object per line.
 Transform that list with a script, then give it to `syq cp --mapping`.

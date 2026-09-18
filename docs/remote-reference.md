@@ -1,7 +1,7 @@
 # Remote copy reference
 
-For complete option lists, see the [`cp` command reference](commands/cp.md)
-and the [`receiver` enrollment commands](commands/receiver.md).
+See [`syq cp`](commands/cp.md) and [`syq receiver`](commands/receiver.md) for
+the option lists.
 
 For the usual setup and copy commands, start with
 [Copy between servers](remote-to-remote.md).

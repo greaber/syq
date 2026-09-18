@@ -1,21 +1,15 @@
 # syq clean-partials
 
-Remove leftover syq partial files below one or more local or SSH directory trees.
-Stop copies writing into those trees before previewing or deleting partials:
+Remove syq partial files below local or SSH directory trees. Stop copies writing
+into those trees before deleting partials:
 
 ```sh
 syq clean-partials --dry-run -v backup
 syq clean-partials backup
 ```
 
-The command selects regular files with the current partial-name format, including
-unrelated files deliberately given that name. It keeps directories and symlinks,
-does not follow symlinks, and does not select older partial formats or `.syq-swap-...`
-recovery entries. See [interrupted-copy recovery](../reference.md#resume-an-interrupted-copy)
-before removing recovery data manually.
-
-Only `workers` is accepted in `--performance-tuning`. Results use the
-[`rm` record format](../automation.md#removal-records). All options follow.
+See [interrupted-copy recovery](../reference.md#resume-an-interrupted-copy) for
+which files this removes. Results use the [`rm` record format](../automation.md#removal-records).
 
 <!-- CLI: clean-partials -->
 ```text
@@ -43,7 +37,7 @@ syq clean-partials [OPTIONS] <TREE>...
 
 | Argument / option | Meaning |
 |---|---|
-| `--performance-tuning <KEY=VALUE,...>` | Choose parallelism and transfer settings. See [Performance tuning](../tuning.md) for every key, default, and restriction. |
+| `--performance-tuning <KEY=VALUE,...>` | Filesystem removal workers: [workers=N](../tuning.md#transfer-controls) |
 
 ## Progress and results
 
@@ -71,4 +65,3 @@ syq clean-partials [OPTIONS] <TREE>...
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
-
