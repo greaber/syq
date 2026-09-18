@@ -313,7 +313,18 @@ fn serve(
                 "source class must not be preserved by default"
             );
         }
-        if method == "HEAD" {
+        if method == "GET"
+            && path.contains("list-type=2")
+            && fault == "server-copy-multipart-cached-unsupported"
+        {
+            reply(
+                &mut socket,
+                200,
+                &[],
+                b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+                false,
+            );
+        } else if method == "HEAD" {
             if fault == "server-copy-heads-overlap" && path.starts_with("/source/") {
                 let (mine, other) = if path == "/source/original" {
                     (&gate.0, &gate.1)
@@ -405,7 +416,7 @@ fn serve(
                 if fault.ends_with("zero-tags") {
                     fields.push(("x-amz-tagging-count".into(), "0".into()));
                 }
-                if fault.ends_with("tags-denied") {
+                if fault.ends_with("tags-denied") || fault.ends_with("-known-unsupported") {
                     fields.push(("x-amz-tagging-count".into(), "1".into()));
                 }
                 if fault == "server-copy-compare-metadata" {
@@ -420,6 +431,20 @@ fn serve(
             }
         } else if multipart && path.contains("tagging") {
             assert!(!fault.ends_with("zero-tags"));
+            if fault.ends_with("unsupported") {
+                assert!(
+                    !gate.0.swap(true, Ordering::Relaxed),
+                    "tag probe was not cached"
+                );
+                reply(
+                    &mut socket,
+                    501,
+                    &[],
+                    b"<Error><Code>NotImplemented</Code></Error>",
+                    false,
+                );
+                return;
+            }
             if fault.ends_with("denied") {
                 reply(
                     &mut socket,
@@ -463,11 +488,22 @@ fn serve(
             }
             reply(&mut socket, 204, &[], b"", false);
         } else if method == "PUT" {
-            assert_eq!(path.split('?').next().unwrap(), "/destination/copied");
+            if fault == "server-copy-multipart-cached-unsupported" {
+                assert!(matches!(
+                    path.split('?').next().unwrap(),
+                    "/destination/copied/original" | "/destination/copied/other"
+                ));
+            } else {
+                assert_eq!(path.split('?').next().unwrap(), "/destination/copied");
+            }
             assert_eq!(
                 headers["x-amz-copy-source"],
                 if fault == "server-copy-versioned" {
                     "source/original?versionId=snapshot-version"
+                } else if fault == "server-copy-multipart-cached-unsupported"
+                    && path.starts_with("/destination/copied/other?")
+                {
+                    "source/other"
                 } else {
                     "source/original"
                 }
@@ -2955,11 +2991,13 @@ fn server_copy_prune_protects_keys_under_skip_options() {
 }
 
 #[test]
-fn server_copy_only_skips_tag_reads_for_explicit_zero() {
+fn server_copy_tag_reads_handle_zero_denied_and_unsupported() {
     for (fault, success, requests) in [
         ("server-copy-multipart-zero-tags", true, 6),
         ("server-copy-multipart-tags-denied", false, 3),
         ("server-copy-multipart-unknown-denied", false, 3),
+        ("server-copy-multipart-unknown-unsupported", true, 7),
+        ("server-copy-multipart-known-unsupported", false, 3),
     ] {
         let server = Server::start(fault);
         let temp = tempfile::tempdir().unwrap();
@@ -2988,10 +3026,50 @@ fn server_copy_only_skips_tag_reads_for_explicit_zero() {
                 "{diagnostic}"
             );
             assert!(diagnostic.contains("s3:GetObjectTagging"), "{diagnostic}");
-            assert!(diagnostic.contains("HTTP 403"), "{diagnostic}");
+            let status = if fault.ends_with("unsupported") {
+                "HTTP 501"
+            } else {
+                "HTTP 403"
+            };
+            assert!(diagnostic.contains(status), "{diagnostic}");
         }
+        let diagnostic = output_text(&output);
+        assert_eq!(
+            diagnostic.contains("Tags may be omitted"),
+            success && fault.ends_with("unsupported"),
+            "{diagnostic}"
+        );
         assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
     }
+}
+
+#[test]
+fn server_copy_caches_unsupported_tag_reads() {
+    let server = Server::start("server-copy-multipart-cached-unsupported");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "original",
+            "other",
+            "--to",
+            "s3://destination",
+            "--into",
+            "copied",
+            "--performance-tuning",
+            "s3-max-concurrent-objects=1",
+        ],
+    );
+    let diagnostic = output_text(&output);
+    assert!(output.status.success(), "{diagnostic}");
+    assert_eq!(
+        diagnostic.matches("Tags may be omitted").count(),
+        1,
+        "{diagnostic}"
+    );
+    assert!(server.gate.0.load(Ordering::Relaxed));
 }
 
 #[test]

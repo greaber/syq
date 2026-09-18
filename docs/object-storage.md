@@ -82,7 +82,10 @@ recovery also needs permission to list uploaded parts and abort obsolete
 uploads. Server-side copies preserve tags. Multipart copies read source tags
 unless HEAD explicitly reports zero tags, so they can require tag-reading
 permission in addition to the permissions for a single-request copy. Missing
-tag counts are treated as unknown; syq fails rather than silently dropping tags.
+tag counts are treated as unknown. If the service returns HTTP 501 (tag reads
+unsupported), syq warns once and continues without tags for unknown counts,
+remembering that response for the rest of the run. A positive tag count still
+causes a failure rather than dropping known tags. Permission errors remain fatal.
 Writing copied tags requires the corresponding destination permission. Syq does not change
 bucket policies or lifecycle rules.
 

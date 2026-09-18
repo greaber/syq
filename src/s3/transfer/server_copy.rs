@@ -355,9 +355,15 @@ impl Engine {
         self.check_cancelled()?;
         let tagging = if metadata.tag_count() == Some(0) {
             String::new()
+        } else if self.copy_tagging_unsupported.load(Relaxed) {
+            anyhow::ensure!(
+                metadata.tag_count().is_none_or(|count| count <= 0),
+                "source has tags but S3 GetObjectTagging is unsupported; refusing to drop known tags"
+            );
+            String::new()
         } else {
-            // Missing tag count is unknown, not zero: permission and provider
-            // differences can omit it even when tags exist.
+            // A missing count is unknown. Only explicit lack of tagging support
+            // permits copying without tags; permission failures remain fatal.
             let tags = self
                 .client
                 .get_object_tagging()
@@ -365,8 +371,21 @@ impl Engine {
                 .key(&source.key)
                 .set_version_id(source.version.clone())
                 .send()
-                .await
-                .map_err(|e| {
+                .await;
+            let tags = match tags {
+                Ok(tags) => Some(tags),
+                Err(e)
+                    if e.raw_response().is_some_and(|r| r.status().as_u16() == 501)
+                        && metadata.tag_count().is_none_or(|count| count <= 0) =>
+                {
+                    if !self.copy_tagging_unsupported.swap(true, Relaxed) {
+                        self.progress.eprintln(
+                            "Warning: S3 GetObjectTagging is unsupported (HTTP 501); continuing without tags for objects with an unknown tag count. Tags may be omitted.",
+                        );
+                    }
+                    None
+                }
+                Err(e) => {
                     let permission = if source.version.is_some() {
                         "s3:GetObjectVersionTagging"
                     } else {
@@ -376,11 +395,14 @@ impl Engine {
                         "S3 GetObjectTagging for multipart copy (reading source tags requires {permission} on AWS)"
                     );
                     let detail = client::failure(&operation, &e);
-                    anyhow::Error::new(e.into_service_error()).context(detail)
-                })?;
+                    return Err(anyhow::Error::new(e.into_service_error()).context(detail));
+                }
+            };
             let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-            for tag in tags.tag_set() {
-                serializer.append_pair(tag.key(), tag.value());
+            if let Some(tags) = tags {
+                for tag in tags.tag_set() {
+                    serializer.append_pair(tag.key(), tag.value());
+                }
             }
             serializer.finish()
         };

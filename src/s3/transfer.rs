@@ -47,6 +47,7 @@ pub(super) struct Engine {
     pace: Mutex<tokio::time::Instant>,
     upload_keys: OnceLock<HashMap<String, u64>>,
     copy_checksum_unsupported: [std::sync::atomic::AtomicBool; 2],
+    copy_tagging_unsupported: std::sync::atomic::AtomicBool,
     tuning: super::tuning::Tuning,
     cancelled: std::sync::atomic::AtomicBool,
     cancel_wake: tokio::sync::Notify,
@@ -124,6 +125,7 @@ impl Engine {
             pace: Mutex::new(tokio::time::Instant::now()),
             upload_keys: OnceLock::new(),
             copy_checksum_unsupported: Default::default(),
+            copy_tagging_unsupported: Default::default(),
         }))
     }
     pub async fn run(self: Arc<Self>) -> Result<()> {

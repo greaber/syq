@@ -694,6 +694,7 @@ mod buffer_tests {
             pace: Mutex::new(tokio::time::Instant::now()),
             upload_keys: OnceLock::new(),
             copy_checksum_unsupported: Default::default(),
+            copy_tagging_unsupported: Default::default(),
             cancelled: Default::default(),
             cancel_wake: Default::default(),
         }
