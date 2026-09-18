@@ -185,8 +185,9 @@ It skips objects when these match and a common provider-reported whole-object
 checksum matches; otherwise it uses matching ETags or syq file metadata when no
 comparable checksum is available. This needs no local ETag cache or body reads.
 Composite checksums are not compared because they depend on part boundaries.
-ETags can also change with multipart layout or encryption, so unchanged objects
-may still be copied. Tags, ACLs, storage class and encryption settings are not
+ETags can also change with multipart layout or encryption. Without a comparable
+whole-object checksum or syq metadata, these objects can be copied again on every
+run even when their contents have not changed. Tags, ACLs, storage class and encryption settings are not
 part of this quick check; tag-only changes do not trigger a copy.
 
 S3 permits a key and keys beneath its corresponding prefix to coexist. Server-side

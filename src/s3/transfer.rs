@@ -46,7 +46,7 @@ pub(super) struct Engine {
     progress: Arc<Progress>,
     pace: Mutex<tokio::time::Instant>,
     upload_keys: OnceLock<HashMap<String, u64>>,
-    copy_checksum_unsupported: [std::sync::atomic::AtomicBool; 2],
+    copy_checksum_unsupported: std::sync::atomic::AtomicBool,
     copy_tagging_unsupported: std::sync::atomic::AtomicBool,
     tuning: super::tuning::Tuning,
     cancelled: std::sync::atomic::AtomicBool,
@@ -400,11 +400,6 @@ impl Engine {
             } else {
                 format!("{target}/")
             };
-            // A prefix listing can establish absence only for keys inside it.
-            // Mappings may name destinations outside the placement prefix.
-            if keys.iter().any(|key| !key.starts_with(&prefix)) {
-                return Ok(());
-            }
             let listing = if self.args.delete {
                 // Pruning needs every destination key, including keys absent
                 // from the upload plan. Only this complete cache is reusable
@@ -1229,7 +1224,7 @@ impl Engine {
                     );
                 let head =
                     if self.options.source_bucket.is_some() && !selector.0.is_empty() && !prefix {
-                        self.copy_head(source_bucket, &selector.0, 0).await?
+                        self.copy_head(source_bucket, &selector.0).await?
                     } else {
                         None
                     };
@@ -1291,7 +1286,7 @@ impl Engine {
                     None => {
                         let marker = format!("{key}/");
                         let object = if self.options.source_bucket.is_some() {
-                            copy_source = self.copy_head(source_bucket, &marker, 0).await?;
+                            copy_source = self.copy_head(source_bucket, &marker).await?;
                             copy_source.as_ref().map(|(object, _)| object.clone())
                         } else {
                             client::head(&self.client, source_bucket, &marker).await?
@@ -1365,17 +1360,6 @@ impl Engine {
             };
             for (key, size, path) in objects {
                 let directory = key.ends_with('/') && size == 0;
-                if same_bucket && !already_filtered {
-                    copy_sources.push((key.clone(), false));
-                    copy_targets.push((
-                        if directory {
-                            format!("{path}/")
-                        } else {
-                            path.clone()
-                        },
-                        false,
-                    ));
-                }
                 if !already_filtered {
                     if let Some(excluded) =
                         client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
@@ -1393,6 +1377,17 @@ impl Engine {
                 }
                 if path.is_empty() && !directory {
                     bail!("cannot replace the destination directory with an object");
+                }
+                if same_bucket && !already_filtered {
+                    copy_sources.push((key.clone(), false));
+                    copy_targets.push((
+                        if directory {
+                            format!("{path}/")
+                        } else {
+                            path.clone()
+                        },
+                        false,
+                    ));
                 }
                 local::claim(&mut claims, &path, directory)?;
                 if self.args.delete {

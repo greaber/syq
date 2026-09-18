@@ -2,7 +2,7 @@
 use super::*;
 use aws_sdk_s3::{
     operation::head_object::HeadObjectOutput,
-    types::{ChecksumMode, ChecksumType, MetadataDirective, TaggingDirective},
+    types::{ChecksumType, MetadataDirective, TaggingDirective},
 };
 
 // Compare only fields whose meaning survives a copy. LastModified, encryption,
@@ -152,48 +152,17 @@ impl Engine {
         &self,
         bucket: &str,
         key: &str,
-        side: usize,
     ) -> Result<Option<(Object, HeadObjectOutput)>> {
         let _slot = self.tuning.requests.acquire().await;
-        let unsupported = &self.copy_checksum_unsupported[side];
-        let request = self.client.head_object().bucket(bucket).key(key);
-        let checksums = !unsupported.load(Relaxed);
-        let result = if !checksums {
-            request.clone().send().await
-        } else {
-            request
-                .clone()
-                .checksum_mode(ChecksumMode::Enabled)
-                .send()
-                .await
-        };
-        // Checksums are an optional quick-check aid. Compatible providers may not
-        // support this mode; AWS KMS may deny checksum access while allowing HEAD.
-        // Retrying ordinary HEAD preserves that existing access, without body GETs.
-        let result = match result {
-            Err(e)
-                if checksums
-                    && e.raw_response()
-                        .is_some_and(|r| matches!(r.status().as_u16(), 400 | 403 | 501)) =>
-            {
-                // Only NotImplemented establishes a provider capability. A 403
-                // can be specific to one object's KMS key; do not cache it.
-                if e.raw_response().is_some_and(|r| r.status().as_u16() == 501) {
-                    unsupported.store(true, Relaxed);
-                }
-                request.send().await
-            }
-            result => result,
-        };
-        let output = match result {
-            Ok(output) => output,
-            Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => {
-                return Ok(None)
-            }
-            Err(e) => {
-                let detail = client::failure("S3 copy HEAD", &e);
-                return Err(anyhow::Error::new(e.into_service_error()).context(detail));
-            }
+        let Some(output) = client::head_output(
+            &self.client,
+            bucket,
+            key,
+            Some(&self.copy_checksum_unsupported),
+        )
+        .await?
+        else {
+            return Ok(None);
         };
         Ok(Some((client::from_head(key, &output)?, output)))
     }
@@ -261,13 +230,13 @@ impl Engine {
             {
                 Ok(None)
             } else {
-                self.copy_head(&self.options.bucket, &key, 1).await
+                self.copy_head(&self.options.bucket, &key).await
             }
         };
         let source = async {
             match job.copy_source.take() {
                 Some(source) => Ok(Some(*source)),
-                None => self.copy_head(source_bucket, &job.key, 0).await,
+                None => self.copy_head(source_bucket, &job.key).await,
             }
         };
         let (source, existing) = tokio::try_join!(source, destination)?;
@@ -404,7 +373,7 @@ impl Engine {
                     serializer.append_pair(tag.key(), tag.value());
                 }
             }
-            serializer.finish()
+            serializer.finish().replace('+', "%20")
         };
         let created = self
             .client

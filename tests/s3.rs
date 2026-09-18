@@ -367,10 +367,19 @@ fn serve(
                     "source planning HEADs did not overlap"
                 );
             }
-            if fault == "server-copy-compare-unavailable"
-                && headers.contains_key("x-amz-checksum-mode")
+            if matches!(
+                fault,
+                "server-copy-compare-unavailable"
+                    | "server-copy-compare-bad-request"
+                    | "server-copy-compare-unsupported"
+            ) && headers.contains_key("x-amz-checksum-mode")
             {
-                reply(&mut socket, 403, &[], b"", true);
+                let status = match fault {
+                    "server-copy-compare-bad-request" => 400,
+                    "server-copy-compare-unsupported" => 501,
+                    _ => 403,
+                };
+                reply(&mut socket, status, &[], b"", true);
                 return;
             }
             let source = path.starts_with("/source/");
@@ -486,10 +495,20 @@ fn serve(
                 &mut socket,
                 200,
                 &[],
-                b"<Tagging><TagSet/></Tagging>",
+                if fault == "server-copy-multipart-tag-encoding" {
+                    "<Tagging><TagSet><Tag><Key>project name</Key><Value>a b+c/é</Value></Tag></TagSet></Tagging>".as_bytes()
+                } else {
+                    b"<Tagging><TagSet/></Tagging>"
+                },
                 false,
             );
         } else if multipart && method == "POST" && path.contains("uploads") {
+            if fault == "server-copy-multipart-tag-encoding" {
+                assert_eq!(
+                    headers["x-amz-tagging"],
+                    "project%20name=a%20b%2Bc%2F%C3%A9"
+                );
+            }
             assert_eq!(headers.get("expires").map(String::as_str), Some("0"));
             reply(&mut socket, 200, &[], b"<InitiateMultipartUploadResult><UploadId>owned</UploadId></InitiateMultipartUploadResult>", false);
         } else if multipart && method == "POST" {
@@ -3664,6 +3683,8 @@ fn server_copy_compares_remote_checksums_etags_and_metadata_without_body_reads()
         ("server-copy-compare-conflict", 3),
         ("server-copy-compare-metadata", 3),
         ("server-copy-compare-unavailable", 4),
+        ("server-copy-compare-bad-request", 4),
+        ("server-copy-compare-unsupported", 3),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let server = Server::start(fault);
@@ -4042,4 +4063,72 @@ fn server_copy_reuses_versioned_source_snapshot() {
     );
     assert!(output.status.success(), "{}", output_text(&output));
     assert_eq!(server.requests.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn server_copy_multipart_preserves_tag_characters() {
+    let server = Server::start("server-copy-multipart-tag-encoding");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "original",
+            "--to",
+            "s3://destination",
+            "--as",
+            "copied",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+}
+
+#[test]
+fn server_copy_filters_exact_and_mapping_overlap() {
+    for mapping in [false, true] {
+        for filter in [
+            None,
+            Some(("--ignore", "original")),
+            Some(("--min-size", "5")),
+            Some(("--max-size", "3")),
+        ] {
+            let server = Server::start("server-copy");
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                temp.path().join("mapping"),
+                serde_json::json!({
+                    "src": {"encoding": "utf-8", "value": "original"},
+                    "dst": {"encoding": "utf-8", "value": "original"}, "kind": "file"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let mut args = vec!["--from", "s3://source"];
+            if mapping {
+                args.extend(["--mapping", "mapping"]);
+            } else {
+                args.push("original");
+            }
+            args.extend(["--to", "s3://source", "--dry-run"]);
+            if mapping {
+                args.extend(["--into", "."]);
+            } else {
+                args.extend(["--as", "original"]);
+            }
+            if let Some((name, value)) = filter {
+                args.extend([name, value]);
+            }
+            let output = server.cp(temp.path(), &args);
+            let diagnostic = output_text(&output);
+            assert_eq!(
+                output.status.success(),
+                filter.is_some(),
+                "mapping={mapping}, filter={filter:?}: {diagnostic}"
+            );
+            if filter.is_none() {
+                assert!(diagnostic.contains("overlap"), "{diagnostic}");
+            }
+        }
+    }
 }

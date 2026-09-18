@@ -445,21 +445,63 @@ impl Object {
 }
 
 pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Option<Object>> {
-    let output = match client.head_object().bucket(bucket).key(key).send().await {
-        Ok(output) => output,
-        Err(error)
-            if error
-                .raw_response()
-                .is_some_and(|r| r.status().as_u16() == 404) =>
-        {
-            return Ok(None)
-        }
-        Err(error) => {
-            let message = failure("S3 HEAD", &error);
-            return Err(error.into_service_error()).context(message);
-        }
+    head_output(client, bucket, key, None)
+        .await?
+        .map(|output| from_head(key, &output))
+        .transpose()
+}
+
+/// Read metadata, optionally probing checksum support for server-copy comparisons.
+/// Admission is controlled by the caller so ordinary HEAD behavior is unchanged.
+pub(super) async fn head_output(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    unsupported: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Option<aws_sdk_s3::operation::head_object::HeadObjectOutput>> {
+    use aws_sdk_s3::types::ChecksumMode;
+    use std::sync::atomic::Ordering::Relaxed;
+    let request = client.head_object().bucket(bucket).key(key);
+    let checksums = unsupported.is_some_and(|flag| !flag.load(Relaxed));
+    let result = if checksums {
+        request
+            .clone()
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+    } else {
+        request.clone().send().await
     };
-    Ok(Some(from_head(key, &output)?))
+    let result = match result {
+        Err(e)
+            if checksums
+                && e.raw_response()
+                    .is_some_and(|r| matches!(r.status().as_u16(), 400 | 403 | 501)) =>
+        {
+            // Only NotImplemented establishes an unsupported capability. Generic
+            // bad requests and access denials can depend on the object or request.
+            if e.raw_response().is_some_and(|r| r.status().as_u16() == 501) {
+                if let Some(flag) = unsupported {
+                    flag.store(true, Relaxed);
+                }
+            }
+            request.send().await
+        }
+        result => result,
+    };
+    match result {
+        Ok(output) => Ok(Some(output)),
+        Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => Ok(None),
+        Err(e) => {
+            let operation = if unsupported.is_some() {
+                "S3 copy HEAD"
+            } else {
+                "S3 HEAD"
+            };
+            let detail = failure(operation, &e);
+            Err(anyhow::Error::new(e.into_service_error()).context(detail))
+        }
+    }
 }
 
 pub(super) fn from_head(
