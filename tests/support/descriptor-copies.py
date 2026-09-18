@@ -33,12 +33,12 @@ def fail(args, **kwargs):
     return result
 
 
-def wait_for(predicate, description):
+def wait_for(predicate, description, interval=.05):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         if predicate():
             return
-        time.sleep(.05)
+        time.sleep(interval)
     raise AssertionError('timed out: ' + description)
 
 
@@ -109,14 +109,15 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                     child = subprocess.Popen(command, pass_fds=(a.fileno(),), stdout=subprocess.PIPE,
                                              stderr=subprocess.PIPE, env=ENV, start_new_session=True)
                     CHILDREN.append(child)
-                    wait_for(lambda: list(target.parent.glob('.syq-stream-*')), 'staging file')
+                    wait_for(lambda: list(target.parent.glob('.syq-stream-*')), 'staging file', interval=.0001)
                     assert target.read_bytes() == DATA
                     child.send_signal(signal.SIGTERM)
                     _, error = child.communicate(timeout=10)
                     assert child.returncode != 0, error
                     assert fcntl.fcntl(a, fcntl.F_GETFL) == before
                     assert target.read_bytes() == DATA
-                    wait_for(lambda: not list(target.parent.glob('.syq-stream-*')), 'staging cleanup')
+                    wait_for(lambda: not list(target.parent.glob('.syq-stream-*')),
+                             f'staging cleanup (remote={ssh}, nonblocking={nonblocking})')
             # Broken consumers fail. Remote path sources remain regular files.
             child = subprocess.Popen([SYQ, 'cp', *options, *source, str(target), '--as-fd', '1'],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV, start_new_session=True)

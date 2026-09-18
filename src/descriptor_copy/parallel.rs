@@ -34,9 +34,29 @@ struct Prepared {
     ticket: DescriptorTicket,
     size: Option<u64>,
     workers: usize,
+    _local_session: Option<LocalSession>,
+}
+struct LocalSession(crate::descriptor_broker::DescriptorSessionSlot);
+impl Drop for LocalSession {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Prepared> {
-    let endpoint = crate::transfer::endpoint(plan.location.as_ref().unwrap(), args)?;
+    let location = plan.location.as_ref().unwrap();
+    let local_session = location
+        .host
+        .is_none()
+        .then(crate::descriptor_broker::DescriptorSessionSlot::managed)
+        .transpose()?
+        .map(LocalSession);
+    let endpoint = if let Some(session) = &local_session {
+        Endpoint::Local {
+            descriptor_session: session.0.clone(),
+        }
+    } else {
+        crate::transfer::endpoint(location, args)?
+    };
     let mut control = endpoint.connect_control(args.compress)?;
     let (size, ticket) = match conn::ok(
         control.call(Request::DescriptorCopy(Operation::Open {
@@ -115,6 +135,7 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Prepared> {
         ticket,
         size,
         workers,
+        _local_session: local_session,
     })
 }
 
@@ -323,8 +344,15 @@ pub(super) async fn run(
         )
         .await;
     }
-    let (a, p, c) = (args.clone(), plan.clone(), controls.clone());
-    let prepared = tokio::task::spawn_blocking(move || prepare(&a, &p, &c)).await??;
+    let prepared = if plan.location.as_ref().unwrap().host.is_none() {
+        // Keep local staging owned by this future from the instant it exists.
+        // A detached blocking task could create it just as cancellation drops
+        // the receiver, then lose its cleanup when the CLI exits.
+        prepare(&args, &plan, &controls)?
+    } else {
+        let (a, p, c) = (args.clone(), plan.clone(), controls.clone());
+        tokio::task::spawn_blocking(move || prepare(&a, &p, &c)).await??
+    };
     if let Some(source @ fd::Source::Pipe { .. }) = plan.source.clone() {
         input = Some(source.open(cancelled.clone()).await?);
     }
@@ -513,10 +541,16 @@ pub(super) async fn run(
         while let Some(result) = tasks.join_next().await { result??; }
         fd::await_commit(commit).await?;
         let mut control = prepared.control;
-        tokio::task::spawn_blocking(move || {
+        let mut finish = move || {
             conn::ok(control.call(Request::DescriptorCopy(Operation::Finish { size }))?, "finish stream")?;
             Ok::<_, anyhow::Error>(())
-        }).await??;
+        };
+        if prepared.endpoint.is_remote() {
+            tokio::task::spawn_blocking(finish).await??;
+        } else {
+            // As with opening, local publication and cleanup stay owned here.
+            finish()?;
+        }
         Ok(())
     }.await;
     draining.store(true, Relaxed);
