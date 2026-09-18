@@ -1775,14 +1775,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}, job-storage={}",
+            "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
-            if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }, opts.tuning.job_storage()
+            if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
         );
     }
     let mapping_contents = args.mapping_contents.clone();
@@ -1877,11 +1877,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .context("source worker count overflow")?;
     // Admission is complete before worker closures receive shared options.
     let opts = Arc::new(opts);
-    let sched = Arc::new(Sched::with_job_storage(
-        block,
-        opts.tuning.split_min_size(block),
-        opts.tuning.job_storage(),
-    ));
+    let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
 
     // Workers connect on their own threads once the control connections are
     // up: everything waits on those, so they must never compete with worker
@@ -5625,10 +5621,8 @@ impl Planner<'_> {
         // Every source has passed the sidecar collision preflight. Applying
         // buffered entries does not consult these indexes; release them before
         // the scheduler grows so their allocations can be reused for jobs.
-        if self.opts.tuning.job_storage() != crate::transfer_tuning::JobStorage::Inline {
-            self.payload_paths = std::collections::HashMap::new();
-            self.sidecar_paths = std::collections::HashMap::new();
-        }
+        self.payload_paths = std::collections::HashMap::new();
+        self.sidecar_paths = std::collections::HashMap::new();
         let deferred = std::mem::take(&mut self.deferred_payloads);
         if let Some(buf) = &mut self.buffer {
             buf.extend(deferred);
@@ -5650,9 +5644,6 @@ impl Planner<'_> {
                 .into_iter()
                 .filter(|(path, ..)| self.implicit_dirs.contains(path)),
         );
-        // Inline mode preserves the previous collision-index lifetime.
-        self.payload_paths = std::collections::HashMap::new();
-        self.sidecar_paths = std::collections::HashMap::new();
         // These sets exist only to validate and apply mapped scan entries.
         // Jobs already own the source spelling needed by workers. Deletion
         // alone still needs the destination claims.
@@ -9799,8 +9790,8 @@ mod tests {
 
     fn pipeline_snapshot(job: FileJob) -> WorkerJob {
         WorkerJob {
-            data: crate::sched::SnapshotData::Owned(job.data),
-            dst_entry: job.dst_entry.map(crate::sched::SnapshotEntry::Owned),
+            data: crate::sched::SnapshotData::Shared(Arc::new(job.data)),
+            dst_entry: job.dst_entry.map(Arc::new),
         }
     }
 
