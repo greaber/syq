@@ -49,8 +49,10 @@ SENDER_MAX = int(os.environ.get('SYQ_STRESS_SENDER_MAX', 0))
 RECEIVER_NETEM = NETEM_MS and os.environ.get('SYQ_STRESS_NETEM_PLACEMENT', 'receiver') == 'receiver'
 NETLAB = 'sha256:04a80a4748e69b7ee5a46a4e3424f536c17d1ee384791bdf301a128c4e704e3d'
 HEAP_PROBE = os.environ.get('SYQ_STRESS_HEAP') == '1'
+PROBE_SHA256 = None
 if HEAP_PROBE:
     shutil.copy2(ROOT / 'target/memory-probe.so', STAGE / 'memory-probe.so')
+    PROBE_SHA256 = hashlib.sha256((STAGE / 'memory-probe.so').read_bytes()).hexdigest()
 subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
                 '-keyout', str(CERT / 'private.key'), '-out', str(CERT / 'public.crt'),
                 '-days', '1', '-subj', '/CN=localhost', '-addext', 'basicConstraints=critical,CA:FALSE',
@@ -156,7 +158,7 @@ class MemoryTrace:
 def run(case, mode, repeats, label):
     global active
     for row in results:
-        if row['case'] == case and row['mode'] == mode and row['label'] == label and row['repeats'] == repeats and (not QUEUE_SWEEP or row.get('binary_sha256') == BINARY_SHA256):
+        if row['case'] == case and row['mode'] == mode and row['label'] == label and row['repeats'] == repeats and row.get('probe_sha256') == PROBE_SHA256 and (not QUEUE_SWEEP or row.get('binary_sha256') == BINARY_SHA256):
             print(f"Reusing recorded {case['name']}-{mode}-{label} at {row['commit'][:8]}", flush=True)
             return row
     tag = f"{case['name']}-{mode}-{label}"
@@ -226,7 +228,7 @@ def run(case, mode, repeats, label):
         (D / (tag + '.stderr')).write_text(stderr)
         if state['OOMKilled']:
             row = {'case': case, 'mode': mode, 'label': label, 'repeats': repeats,
-                   'commit': COMMIT, 'binary_sha256': BINARY_SHA256, 'status': 'oom', 'elapsed': time.monotonic()-started,
+                   'commit': COMMIT, 'binary_sha256': BINARY_SHA256, 'probe_sha256': PROBE_SHA256, 'status': 'oom', 'elapsed': time.monotonic()-started,
                    'bytes': fixtures[case['fixture']]['count'] * fixtures[case['fixture']]['size'] * repeats}
             results.append(row)
             (D / 'results.json').write_text(json.dumps(results, indent=2))
@@ -234,7 +236,7 @@ def run(case, mode, repeats, label):
             return row
         assert process.returncode == 0 and state['ExitCode'] == 0, (tag, state, stderr)
         row = json.loads(stdout)
-        row.update(case=case, mode=mode, label=label, repeats=repeats, commit=COMMIT, binary_sha256=BINARY_SHA256)
+        row.update(case=case, mode=mode, label=label, repeats=repeats, commit=COMMIT, binary_sha256=BINARY_SHA256, probe_sha256=PROBE_SHA256)
         (D / (tag + '.json')).write_text(json.dumps(row, indent=2))
         print(f"{tag}: {row['bytes']/2**30:.1f} GiB in {row['elapsed']:.2f}s, "
               f"CPU {row['user']+row['system']:.2f}s, RSS {row['rss_kib']/1024:.1f} MiB", flush=True)
