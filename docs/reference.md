@@ -11,7 +11,7 @@ The final summary shows what was copied or skipped, how long it took, and any
 errors. Add `-v` to list copied paths. For connection and performance details,
 see [diagnosing a slow copy](speed.md#diagnose-a-slow-copy).
 
-File transfers have no automatic duration or stall deadline. They can continue
+File transfers have no fixed duration or stall deadline. They can continue
 through slowdowns and pauses; cancel the command if you no longer want to wait.
 Connection setup, SSH keepalives, and return-connection heartbeats still have
 time limits, and
