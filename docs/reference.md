@@ -168,6 +168,10 @@ children to existing directories. Those directories must be writable; syq
 does not change their permissions to add files. Adding children can still
 change directory timestamps. A dry run does not test write access.
 
+For S3 downloads with these flags, the summary's unchanged-file count includes
+skipped symlinks selected through a prefix, but excludes symlinks named
+directly or through `--mapping`.
+
 If a source directory meets an existing non-directory, `--only-new` skips that
 subtree. `--only-existing` skips a subtree when its destination is missing or
 is not a directory. It cannot combine with `--into-new` or `--as-new`.

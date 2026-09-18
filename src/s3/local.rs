@@ -71,7 +71,12 @@ impl Source {
     }
     pub fn metadata(&self, hash: Option<String>) -> Metadata {
         Metadata {
-            kind: self.kind().into(),
+            kind: match self.kind() {
+                "file" => super::client::ObjectKind::File,
+                "dir" => super::client::ObjectKind::Dir,
+                "symlink" => super::client::ObjectKind::Symlink,
+                _ => unreachable!("S3 sources support only files, directories and symlinks"),
+            },
             mode: self.meta.mode & 0o7777,
             uid: self.meta.uid,
             gid: self.meta.gid,
@@ -473,7 +478,7 @@ pub(super) fn apply_metadata(
     args: &Args,
     existing_mode: Option<u32>,
 ) -> Result<()> {
-    if metadata.kind == "file" {
+    if metadata.kind == super::client::ObjectKind::File {
         return apply_file_metadata(
             &root.open_regular_read(path)?,
             metadata,
@@ -488,8 +493,8 @@ pub(super) fn apply_metadata(
             args.group.then_some(metadata.gid),
         )?;
     }
-    if metadata.kind != "symlink" {
-        let file = if metadata.kind == "dir" {
+    if metadata.kind != super::client::ObjectKind::Symlink {
+        let file = if metadata.kind == super::client::ObjectKind::Dir {
             root.open_directory(path)?
         } else {
             root.open_regular_read(path)?

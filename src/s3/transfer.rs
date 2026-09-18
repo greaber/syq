@@ -1312,10 +1312,12 @@ impl Engine {
                     bail!("an expected digest requires a regular file");
                 }
                 let kind = object.kind();
-                vec![(object.key, object.size, path.clone(), kind)]
+                let directory = client::is_directory_marker(&object.key, object.size);
+                vec![(object.key, object.size, path.clone(), kind, directory)]
             } else if let Some(exact) = exact {
                 let kind = exact.kind();
-                vec![(exact.key, exact.size, path.clone(), kind)]
+                let directory = client::is_directory_marker(&exact.key, exact.size);
+                vec![(exact.key, exact.size, path.clone(), kind, directory)]
             } else {
                 if selection == SourceSelection::File {
                     bail!("S3 source object {key:?} is missing");
@@ -1369,14 +1371,11 @@ impl Engine {
                     };
                     let suffix = local::key_path(suffix.as_bytes())?;
                     let kind = if directory { "dir" } else { "file" };
-                    objects.push((object, size, local::join(&path, &suffix), kind));
+                    objects.push((object, size, local::join(&path, &suffix), kind, directory));
                 }
                 objects
             };
-            for (key, size, path, kind) in objects {
-                // Claims and pruning follow the key's directory-marker shape,
-                // even when an exact object's metadata declares another kind.
-                let directory = client::is_directory_marker(&key, size);
+            for (key, size, path, kind, directory) in objects {
                 if !already_filtered {
                     if let Some(excluded) =
                         client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
@@ -1501,7 +1500,11 @@ impl Engine {
         job.kind = object.kind();
         let mut initial = initial.map(|output| output.body);
         let metadata = object.metadata.clone().unwrap_or(Metadata {
-            kind: object.kind().into(),
+            kind: if client::is_directory_marker(&object.key, object.size) {
+                client::ObjectKind::Dir
+            } else {
+                client::ObjectKind::File
+            },
             mode: if object.kind() == "dir" { 0o777 } else { 0o666 },
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },

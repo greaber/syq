@@ -711,7 +711,7 @@ mod buffer_tests {
                 let path = RelativePath::new(b"destination").unwrap();
                 let expected = Digest::hash_bytes(HashAlgorithm::Sha256, data);
                 let metadata = Metadata {
-                    kind: "file".into(),
+                    kind: crate::s3::client::ObjectKind::File,
                     mode: 0o644,
                     uid: unsafe { libc::geteuid() },
                     gid: unsafe { libc::getegid() },

@@ -209,6 +209,8 @@ impl Engine {
     }
 
     async fn copy_object(&self, job: &mut Download) -> Result<Option<u64>> {
+        // A directory copied with --as . can plan its source marker here.
+        // The bucket root has no corresponding destination object.
         if job.path.is_empty() {
             return Ok(None);
         }

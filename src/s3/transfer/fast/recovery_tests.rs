@@ -170,7 +170,7 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
     });
     let bytes = data();
     let metadata = Metadata {
-        kind: "file".into(),
+        kind: crate::s3::client::ObjectKind::File,
         mode: 0o644,
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },

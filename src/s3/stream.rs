@@ -125,7 +125,11 @@ fn parse(argv: &[OsString]) -> Result<Plan> {
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let mut plan = parse(argv)?;
     let cancelled = Arc::new(AtomicBool::new(false));
-    let descriptor = Descriptor::open(plan.fd, plan.options.upload, cancelled.clone())?;
+    let descriptor = Descriptor::open(
+        plan.fd,
+        plan.options.route == crate::s3::Route::Upload,
+        cancelled.clone(),
+    )?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -142,7 +146,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         let mut upload_id = None;
         let result = {
             let operation = async {
-                if plan.options.upload { upload(&client, &plan, descriptor, &mut upload_id).await }
+                if plan.options.route == crate::s3::Route::Upload { upload(&client, &plan, descriptor, &mut upload_id).await }
                 else { download(&client, &plan, descriptor).await }
             };
             tokio::select! {
@@ -427,12 +431,12 @@ mod tests {
             "17",
         ])
         .unwrap();
-        assert!(!download.options.upload);
+        assert!(download.options.route == crate::s3::Route::Download);
         assert_eq!(download.key, "a//../literal*");
         assert_eq!(download.fd, 17);
         assert_eq!(download.options.concurrency, 4);
         let upload = plan(&["stream", "--to", "s3://bucket", "--as", "object"]).unwrap();
-        assert!(upload.options.upload);
+        assert_eq!(upload.options.route, crate::s3::Route::Upload);
         assert_eq!(upload.fd, 0);
         for args in [
             vec!["stream"],

@@ -328,11 +328,28 @@ pub(super) async fn connect(
     Ok((Client::from_conf(config.build()), note))
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum ObjectKind {
+    File,
+    Dir,
+    Symlink,
+}
+impl ObjectKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Dir => "dir",
+            Self::Symlink => "symlink",
+        }
+    }
+}
+
 /// Version 1 is an ordinary object body plus this small metadata record.
 /// Other tools can read regular-file contents without understanding syq.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct Metadata {
-    pub kind: String,
+    pub kind: ObjectKind,
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
@@ -357,7 +374,7 @@ impl Metadata {
                 }
                 .into(),
             ),
-            ("syq-kind".into(), self.kind.clone()),
+            ("syq-kind".into(), self.kind.as_str().into()),
             ("syq-mode".into(), self.mode.to_string()),
             ("syq-uid".into(), self.uid.to_string()),
             ("syq-gid".into(), self.gid.to_string()),
@@ -392,10 +409,8 @@ impl Metadata {
                 .get(name)
                 .with_context(|| format!("missing object metadata {name}"))
         };
-        let kind = get("syq-kind")?.clone();
-        if !matches!(kind.as_str(), "file" | "dir" | "symlink") {
-            bail!("unsupported syq object kind");
-        }
+        let kind = serde_json::from_value(serde_json::Value::String(get("syq-kind")?.clone()))
+            .context("unsupported syq object kind")?;
         let result = Self {
             kind,
             mode: get("syq-mode")?.parse()?,
@@ -451,12 +466,7 @@ impl Object {
             } else {
                 "file"
             },
-            |m| match m.kind.as_str() {
-                "dir" => "dir",
-                "symlink" => "symlink",
-                "file" => "file",
-                _ => unreachable!("object metadata kind was validated by the decoder"),
-            },
+            |m| m.kind.as_str(),
         )
     }
 }
@@ -532,7 +542,9 @@ pub(super) fn from_head(
     )?;
     let etag = output.e_tag().context("S3 HEAD omitted ETag")?.to_owned();
     let metadata = Metadata::decode(output.metadata())?;
-    if metadata.as_ref().is_some_and(|m| m.kind == "dir") && !is_directory_marker(key, size) {
+    if metadata.as_ref().is_some_and(|m| m.kind == ObjectKind::Dir)
+        && !is_directory_marker(key, size)
+    {
         bail!("invalid syq directory marker");
     }
     Ok(Object {
@@ -725,7 +737,7 @@ pub(super) async fn list(
                         if let Some(Exclusion::Subtree(boundary)) = exclusion(
                             matcher,
                             key,
-                            object.size() == Some(0) && is_directory_marker(key, 0),
+                            object.size() == Some(0) && key.ends_with('/'),
                             excluded_subtrees,
                         ) {
                             reachable_exclusion |=
@@ -984,9 +996,25 @@ mod tests {
     }
 
     #[test]
+    fn kind_enum_preserves_recovery_json_and_metadata_headers() {
+        // JSON emitted by the String-based Metadata representation.
+        for json in [
+            r#"{"kind":"file","mode":420,"uid":0,"gid":0,"mtime":0,"nsec":0,"hash":null}"#,
+            r#"{"kind":"dir","mode":420,"uid":0,"gid":0,"mtime":0,"nsec":0,"hash":null}"#,
+            r#"{"kind":"symlink","mode":420,"uid":0,"gid":0,"mtime":0,"nsec":0,"hash":null}"#,
+        ] {
+            let metadata: Metadata = serde_json::from_str(json).unwrap();
+            assert_eq!(serde_json::to_string(&metadata).unwrap(), json);
+            let headers = metadata.encode();
+            assert_eq!(headers["syq-kind"], metadata.kind.as_str());
+            assert_eq!(Metadata::decode(Some(&headers)).unwrap(), Some(metadata));
+        }
+    }
+
+    #[test]
     fn alternate_digest_metadata_has_explicit_version_and_algorithm() {
         let metadata = Metadata {
-            kind: "file".into(),
+            kind: ObjectKind::File,
             mode: 0o644,
             uid: 0,
             gid: 0,

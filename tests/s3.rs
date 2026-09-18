@@ -186,7 +186,7 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
-    if fault == "marker-head-failure" {
+    if matches!(fault, "marker-head-failure" | "copy-root-marker") {
         let path = first.split_whitespace().nth(1).unwrap();
         if method == "HEAD" {
             reply(
@@ -202,7 +202,9 @@ fn serve(
             );
         } else {
             assert_eq!(method, "GET", "mutation after failed source HEAD");
-            let body = if path.starts_with("/source/") {
+            let body = if fault == "copy-root-marker" {
+                "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>data/</Key><Size>0</Size></Contents></ListBucketResult>"
+            } else if path.starts_with("/source/") {
                 "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>data/marker/</Key><Size>0</Size></Contents></ListBucketResult>"
             } else {
                 "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"
@@ -4399,4 +4401,25 @@ fn skipped_download_symlinks_use_the_kind_known_from_selection() {
             );
         }
     }
+}
+
+#[test]
+fn server_copy_directory_to_bucket_root_skips_root_marker() {
+    let server = Server::start("copy-root-marker");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "--src-dir",
+            "data",
+            "--to",
+            "s3://destination",
+            "--as",
+            ".",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
 }
