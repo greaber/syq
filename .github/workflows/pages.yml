@@ -13,6 +13,7 @@ on:
       - 'scripts/check-doc-links.py'
       - 'scripts/build-doc-site.py'
       - 'scripts/test-doc-site.py'
+      - 'scripts/test-doc-selector.cjs'
       - '.github/workflows/pages.yml'
   # GITHUB_TOKEN publication does not emit a usable release event. Refresh even
   # if a later package/tap step failed: the GitHub release may already be public.
@@ -53,7 +54,9 @@ jobs:
           tar -xzf mdbook.tar.gz -C "$HOME/.local/bin" mdbook
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Test version selection
-        run: python3 scripts/test-doc-site.py
+        run: |
+          python3 scripts/test-doc-site.py
+          node --test scripts/test-doc-selector.cjs
       - name: Build all documentation versions
         env:
           GH_TOKEN: ${{ github.token }}

@@ -67,7 +67,7 @@ def switcher(version, page, versions, pages):
     return (
         '<nav class="docs-version" aria-label="Documentation version">'
         '<label for="docs-version-select">Documentation</label>'
-        '<select id="docs-version-select">' + "".join(options) + '</select>'
+        '<select id="docs-version-select" autocomplete="off">' + "".join(options) + '</select>'
         '<noscript><span>Choose a version: ' + " · ".join(links) + '</span></noscript></nav>'
     )
 

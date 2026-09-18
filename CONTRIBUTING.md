@@ -155,7 +155,8 @@ To build the complete site, fetch release tags and run
 It writes to a fresh `target/doc-site/` directory; use `--dest-dir` to choose
 another directory. The build reads published stable releases from GitHub and
 uses the current checkout for the `master` preview. Run
-`python3 scripts/test-doc-site.py` to check version selection and navigation.
+`python3 scripts/test-doc-site.py` and `node --test scripts/test-doc-selector.cjs`
+to check version selection and navigation.
 The Pages workflow rebuilds on documentation changes and after release
 publication. A manual run on a task branch produces an artifact without
 deploying it.

@@ -1,6 +1,9 @@
 (() => {
   const selector = document.getElementById('docs-version-select');
   if (!selector) return;
+  const current = Array.from(selector.options).find(option => option.defaultSelected);
+  // Back/Forward can restore the choice that navigated away from this page.
+  window.addEventListener('pageshow', () => { selector.value = current.value; });
   // mdBook's chapter/search shortcuts must not intercept native select keys.
   selector.addEventListener('keydown', event => event.stopPropagation());
   selector.addEventListener('change', () => {
