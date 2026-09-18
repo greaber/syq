@@ -533,6 +533,18 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(operation.disposition, syq.Disposition.SUCCEEDED)
         self.assertEqual(operation.kind, syq.EntryKind.FILE)
 
+    def test_s3_removal_arguments_and_validation(self) -> None:
+        self.client.rm("key", on="s3://bucket", s3_all_versions=True, s3_endpoint="http://localhost:9000", s3_header=["X-Test: yes"])
+        argv = self.argv()
+        self.assertIn("--s3-all-versions", argv)
+        self.assertIn("--s3-endpoint=http://localhost:9000", argv)
+        self.assertIn("--s3-header=X-Test: yes", argv)
+        self.client.rm("key", on="s3://bucket", s3_version_id="id/+=")
+        self.assertIn("--s3-version-id=id/+=", self.argv())
+        for kwargs in [dict(s3_all_versions=True), dict(on="s3://bucket", s3_all_versions=True, s3_version_id="id"), dict(on="s3://bucket", s3_version_id="")]:
+            with self.assertRaises(syq.SyqInvocationError):
+                self.client.rm("key", **kwargs)
+
     def test_s3_options_and_literal_headers(self) -> None:
         self.client.cp("source", to="s3://bucket", into="prefix",
                        s3_endpoint="https://storage.example", s3_region="auto",

@@ -3,9 +3,12 @@
 mod admission;
 mod checksum;
 mod client;
+mod delete;
 mod diagnostics;
 mod dns;
 mod local;
+mod remove;
+pub(crate) use remove::RemoveFlags;
 mod prune;
 mod read_recovery;
 mod state;
@@ -111,16 +114,26 @@ impl Options {
             })
             .transpose()?
             .unwrap_or_default();
-        let explicit = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+        let explicit = |id: &str| {
+            matches.try_contains_id(id).unwrap_or(false)
+                && matches.value_source(id) == Some(ValueSource::CommandLine)
+        };
+        let removal = matches.try_contains_id("s3_all_versions").unwrap_or(false);
+        let endpoint_help = if removal {
+            "--on s3://BUCKET"
+        } else {
+            "--from s3://BUCKET or --to s3://BUCKET"
+        };
+        let operation = if removal { "removal" } else { "copies" };
         if from.is_none() && to.is_none() {
             if tuning.has_s3_controls() {
-                bail!("S3 performance tuning requires --from s3://BUCKET or --to s3://BUCKET");
+                bail!("S3 performance tuning requires {endpoint_help}");
             }
             if ["s3_endpoint", "s3_region", "s3_profile", "s3_header"]
                 .iter()
                 .any(|id| explicit(id))
             {
-                bail!("S3 options require --from s3://BUCKET or --to s3://BUCKET");
+                bail!("S3 options require {endpoint_help}");
             }
             return Ok(None);
         }
@@ -149,7 +162,10 @@ impl Options {
             "suppress_summary",
         ] {
             if explicit(id) {
-                bail!("--{} is not supported for S3 copies", id.replace('_', "-"));
+                bail!(
+                    "--{} is not supported for S3 {operation}",
+                    id.replace('_', "-")
+                );
             }
         }
         let bucket = from.or(to).unwrap().strip_prefix("s3://").unwrap();
@@ -173,7 +189,7 @@ impl Options {
             || tuning.job_storage.is_some()
         {
             bail!(
-                "filesystem performance tuning is not supported for S3 copies; use the s3-* keys"
+                "filesystem performance tuning is not supported for S3 {operation}; use the s3-* keys"
             );
         }
         let concurrency = tuning.s3_part_workers.unwrap_or(64);
@@ -212,6 +228,9 @@ fn validate_endpoint(endpoint: &str) -> Result<()> {
 }
 
 pub(crate) fn run(mut args: Args) -> Result<i32> {
+    if args.rm {
+        return remove::run(args);
+    }
     let writer = crate::results::start(
         &args,
         crate::results::RunMode::Cp {

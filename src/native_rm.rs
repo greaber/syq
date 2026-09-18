@@ -299,7 +299,7 @@ fn require_kind(kind: NativeRemoveKind, identity: Identity, label: &[u8]) -> Res
             String::from_utf8_lossy(label)
         ),
         NativeRemoveKind::File if identity.is_dir() => bail!(
-            "selector {:?} must resolve to a non-directory",
+            "selector {:?} must resolve to a non-directory; use --src-dir to remove a tree or --srcs-in to remove its contents",
             String::from_utf8_lossy(label)
         ),
         _ => Ok(()),

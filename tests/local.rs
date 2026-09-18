@@ -9051,13 +9051,13 @@ fn native_cp_with_prune_matches_rsync_delete() {
 }
 
 #[test]
-fn native_rm_removes_named_tree_and_contents_keeps_root() {
+fn native_rm_explicit_tree_and_contents_keep_their_root_distinction() {
     let t = Tmp::new();
     for root in ["native", "contents"] {
         write(&t.path(&format!("{root}/sub/file")), b"data");
     }
 
-    run_native_ok(&["rm", "--cwd", &t.s(""), "--src", "native"]);
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--src-dir", "native"]);
     run_native_ok(&["rm", "--cwd", &t.s(""), "--srcs-in", "contents"]);
 
     assert!(!t.path("native").exists());
@@ -9080,7 +9080,7 @@ fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
         let output = Command::new(env!("CARGO_BIN_EXE_syq"))
             .arg("rm")
             .args(helper)
-            .args(["--on", "fake", "--cwd", &t.s(""), "--src", selected])
+            .args(["--on", "fake", "--cwd", &t.s(""), "--src-dir", selected])
             .args(["--results", &results, "-q"])
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
@@ -22537,5 +22537,42 @@ fn environment_options_never_reach_internal_server_entry_points() {
             !stderr_of(&out).contains("unexpected argument"),
             "{argv:?}: {out:?}"
         );
+    }
+}
+
+#[test]
+fn native_rm_named_directories_are_rejected_before_any_mutation_locally_and_remotely() {
+    for remote in [false, true] {
+        for dry_run in [false, true] {
+            for selector in [None, Some("--src"), Some("--srcs")] {
+                let t = Tmp::new();
+                write(&t.path("tree/nested/child"), b"keep");
+                write(&t.path("victim"), b"keep");
+                let ssh = fake_ssh(&t);
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.args(["rm", "--cwd", &t.s(""), "--src", "victim"]);
+                if remote {
+                    command.args(["--on", "fake", "--syq-path", env!("CARGO_BIN_EXE_syq")]);
+                    command.env(
+                        "PATH",
+                        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+                    );
+                }
+                if dry_run {
+                    command.arg("--dry-run");
+                }
+                if let Some(selector) = selector {
+                    command.arg(selector);
+                }
+                let out = command.arg("tree").run().unwrap();
+                assert!(
+                    !out.status.success(),
+                    "remote={remote}, dry_run={dry_run}, selector={selector:?}"
+                );
+                assert!(stderr_of(&out).contains("--src-dir"), "{}", stderr_of(&out));
+                assert_eq!(read(&t.path("tree/nested/child")), b"keep");
+                assert_eq!(read(&t.path("victim")), b"keep");
+            }
+        }
     }
 }

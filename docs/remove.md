@@ -1,25 +1,32 @@
 # Remove files
 
-Remove a file or a directory tree:
+Remove a file or symlink:
 
 ```sh
-syq rm old-output
+syq rm old-file
 ```
 
-Remove a directory's contents, leaving the directory itself:
+Named paths, `--src`, and `--srcs` refuse directories. Select a tree explicitly
+to remove it recursively:
+
+```sh
+syq rm --src-dir old-output
+```
+
+Remove a directory's contents recursively, leaving the directory itself:
 
 ```sh
 syq rm --srcs-in cache
 ```
 
 Add `--dry-run -v` to either command to see what would be removed first.
-Missing paths succeed. Removal is permanent; completed deletions cannot be
+Missing paths succeed. Filesystem removal is permanent; completed deletions cannot be
 rolled back.
 
 ## On another machine
 
 ```sh
-syq rm --on server /scratch/old-output
+syq rm --on server --src-dir /scratch/old-output
 ```
 
 This removes `/scratch/old-output` on `server`. Remote removal runs while your
@@ -27,10 +34,14 @@ connection stays open; there is no detached mode. With `--dry-run`, nothing is
 removed, but remote setup may still cache the helper or
 [install syq](install.md#automatic-installation-on-ssh-servers).
 
+For object storage, use `--on s3://BUCKET`. Ordinary removal respects bucket
+versioning; explicit version deletion is available with `--s3-all-versions` or
+`--s3-version-id`. See [S3 removal](object-storage.md#remove-objects-and-versions).
+
 ## Limit the selection
 
 ```sh
-syq rm --root /srv cache old-output
+syq rm --root /srv --src-dir cache --src-dir old-output
 ```
 
 This removes `/srv/cache` and `/srv/old-output`, with selection confined to
@@ -57,8 +68,11 @@ With `--root`, traversal must still stay inside that root.
 
 ## Results
 
-The command continues with independent entries after per-entry failures and
-exits 23. Fatal setup or connection failures exit 1. Use
+Removal continues with independent entries after per-entry failures and exits 23.
+S3 removal uses concurrent batches and reports each key or version separately.
+During permanent removal, a data-version failure preserves all selected delete
+markers; see [S3 removal](object-storage.md#remove-objects-and-versions).
+Fatal setup or connection failures exit 1. Use
 [`--results`](automation.md) for per-path outcomes in scripts.
 
 For the full option list, run `syq rm --help-all`.

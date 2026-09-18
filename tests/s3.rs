@@ -61,11 +61,26 @@ impl Server {
     fn command(&self, temp: &Path) -> Command {
         self.command_with_retries(temp, 0)
     }
+    fn command_for(&self, temp: &Path, mode: &str) -> Command {
+        self.command_mode(temp, mode, 0)
+    }
     fn command_with_retries(&self, temp: &Path, retries: u32) -> Command {
+        self.command_mode(temp, "cp", retries)
+    }
+    fn command_mode(&self, temp: &Path, mode: &str, retries: u32) -> Command {
         let retry_option = format!("s3-retries={retries}");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
-        command
-            .args([
+        if mode == "rm" {
+            command.args([
+                "rm",
+                "--s3-region",
+                "us-east-1",
+                "--s3-header",
+                "X-Tigris-Consistent: true",
+                "--no-progress",
+            ]);
+        } else {
+            command.args([
                 "cp",
                 "--s3-region",
                 "us-east-1",
@@ -78,7 +93,9 @@ impl Server {
                 "s3-part-size=5M",
                 "--performance-tuning",
                 "s3-max-concurrent-parts-per-object=3",
-            ])
+            ]);
+        }
+        command
             .env("AWS_ACCESS_KEY_ID", "test-access")
             .env("AWS_SECRET_ACCESS_KEY", "test-secret")
             .env_remove("AWS_SESSION_TOKEN")
@@ -153,6 +170,226 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault == "rm-explicit-collision" {
+        let body = if method == "HEAD" {
+            assert!(first.contains("/bucket/foo "));
+            ""
+        } else if first.contains("versions") {
+            if first.contains("delimiter=") {
+                "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>foo</Key><VersionId>file</VersionId><IsLatest>true</IsLatest></Version></ListVersionsResult>"
+            } else {
+                assert!(first.contains("prefix=foo%2F"));
+                "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>foo/</Key><VersionId>root</VersionId></Version><Version><Key>foo/nested/child</Key><VersionId>child</VersionId></Version></ListVersionsResult>"
+            }
+        } else {
+            assert!(first.contains("prefix=foo%2F"));
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>foo/</Key><Size>0</Size></Contents><Contents><Key>foo/nested/child</Key><Size>4</Size></Contents></ListBucketResult>"
+        };
+        reply(&mut socket, 200, &[], body.as_bytes(), method == "HEAD");
+        return;
+    }
+    if fault == "remove-planning-interrupt" {
+        assert_eq!(method, "GET");
+        gate.0.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !gate.1.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        // The client must exit before this response is released.
+        return;
+    }
+    if fault == "remove-exact-bounded" {
+        assert_eq!(method, "GET");
+        assert!(first.contains("delimiter="));
+        let body = if first.contains("version-id-marker=old") {
+            br#"<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>ghost-other/</NextKeyMarker><DeleteMarker><Key>ghost</Key><VersionId>hidden</VersionId><IsLatest>true</IsLatest></DeleteMarker><CommonPrefixes><Prefix>ghost-other/</Prefix></CommonPrefixes></ListVersionsResult>"#.as_slice()
+        } else {
+            assert!(!first.contains("key-marker="));
+            br#"<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>ghost[opaque-cache-state]</NextKeyMarker><NextVersionIdMarker>old</NextVersionIdMarker><Version><Key>ghost</Key><VersionId>old</VersionId><IsLatest>false</IsLatest></Version></ListVersionsResult>"#.as_slice()
+        };
+        reply(&mut socket, 200, &[], body, false);
+        return;
+    }
+    if fault == "remove-ghost" {
+        assert_eq!(method, "GET");
+        assert!(first.contains("versions"));
+        if first.contains("delimiter=") {
+            reply(&mut socket, 200, &[], br#"<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>ghost</Key><VersionId>old</VersionId><IsLatest>false</IsLatest></Version><DeleteMarker><Key>ghost</Key><VersionId>hidden</VersionId><IsLatest>true</IsLatest></DeleteMarker></ListVersionsResult>"#, false);
+            return;
+        }
+        reply(&mut socket, 200, &[], br#"<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>ghost/child</Key><VersionId>child</VersionId><IsLatest>true</IsLatest></Version></ListVersionsResult>"#, false);
+        return;
+    }
+    if fault == "remove-prefix-check" {
+        if method == "HEAD" {
+            reply(&mut socket, 404, &[], b"", true);
+        } else {
+            assert_eq!(method, "GET");
+            assert!(
+                first.contains("max-keys=1"),
+                "existence probe must be bounded"
+            );
+            assert!(first.contains("prefix=tree%2F"));
+            reply(&mut socket, 200, &[], b"<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>tree/child</Key><Size>0</Size></Contents></ListBucketResult>", false);
+        }
+        return;
+    }
+    if fault == "remove-head-throttle" {
+        assert_eq!(method, "HEAD");
+        if requests.load(Ordering::Relaxed) == 1 {
+            reply(&mut socket, 429, &[], b"", true);
+        } else {
+            // rm only needs existence; even metadata from a future format is removable.
+            reply(
+                &mut socket,
+                200,
+                &[("x-amz-meta-syq-format".into(), "999".into())],
+                b"",
+                true,
+            );
+        }
+        return;
+    }
+    if fault.starts_with("remove-bulk") && method == "GET" && !first.contains("delimiter=") {
+        let second = first.contains("version-id-marker=");
+        let range = if second { 1000..1001 } else { 0..1000 };
+        let mut entries = range.map(|i| format!("<Version><Key>tree/key</Key><VersionId>v{i}</VersionId><IsLatest>false</IsLatest></Version>")).collect::<String>();
+        if second {
+            entries.push_str("<DeleteMarker><Key>tree/key</Key><VersionId>marker</VersionId><IsLatest>true</IsLatest></DeleteMarker>");
+        }
+        let cursor = if second {
+            "<IsTruncated>false</IsTruncated>"
+        } else {
+            "<IsTruncated>true</IsTruncated><NextKeyMarker>tree/key</NextKeyMarker><NextVersionIdMarker>v999</NextVersionIdMarker>"
+        };
+        reply(
+            &mut socket,
+            200,
+            &[],
+            format!("<ListVersionsResult>{cursor}{entries}</ListVersionsResult>").as_bytes(),
+            false,
+        );
+        return;
+    }
+    if fault.starts_with("remove-") {
+        if method == "GET" && first.contains("delimiter=") {
+            reply(
+                &mut socket,
+                200,
+                &[],
+                b"<ListVersionsResult><IsTruncated>false</IsTruncated></ListVersionsResult>",
+                false,
+            );
+            return;
+        }
+        if method == "GET" {
+            assert!(first.contains("versions"));
+            let body = if fault == "remove-outside" {
+                "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>outside/key</Key><VersionId>v</VersionId></Version></ListVersionsResult>"
+            } else if fault == "remove-no-id" {
+                "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>tree/key</Key></Version></ListVersionsResult>"
+            } else if fault == "remove-no-cursor" {
+                "<ListVersionsResult><IsTruncated>true</IsTruncated><Version><Key>tree/key</Key><VersionId>v</VersionId></Version></ListVersionsResult>"
+            } else if first.contains("version-id-marker=v1") {
+                "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>tree/key</Key><VersionId>v2</VersionId></Version></ListVersionsResult>"
+            } else {
+                "<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>tree/key</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker><DeleteMarker><Key>tree/key</Key><VersionId>marker</VersionId></DeleteMarker><Version><Key>tree/key</Key><VersionId>v1</VersionId></Version></ListVersionsResult>"
+            };
+            let body = if fault.starts_with("remove-null") {
+                body.replace("<VersionId>v1</VersionId>", "<VersionId>null</VersionId>")
+            } else {
+                body.to_owned()
+            };
+            reply(&mut socket, 200, &[], body.as_bytes(), false);
+        } else {
+            assert_eq!(method, "POST");
+            assert!(first.contains("delete"));
+            let length: usize = headers["content-length"].parse().unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            let versions: Vec<_> = body
+                .split("<VersionId>")
+                .skip(1)
+                .map(|s| s.split("</VersionId>").next().unwrap())
+                .collect();
+            assert!(!versions.is_empty() && versions.len() <= 1000);
+            let markers = versions.contains(&"marker");
+            assert!(
+                !markers || versions.len() == 1,
+                "mixed data and marker phase"
+            );
+            if !matches!(fault, "remove-ok" | "remove-null" | "remove-bulk") {
+                assert!(!markers, "must preserve markers after data failure");
+            }
+            if fault == "remove-bulk-interrupt" {
+                gate.0.store(true, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !gate.1.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert!(
+                    gate.1.load(Ordering::SeqCst),
+                    "test did not release in-flight deletion"
+                );
+            }
+            if matches!(fault, "remove-bulk" | "remove-bulk-failure") && !markers {
+                let (arrived, peer) = if versions.len() == 1000 {
+                    (&gate.0, &gate.1)
+                } else {
+                    (&gate.1, &gate.0)
+                };
+                arrived.store(true, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !peer.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert!(peer.load(Ordering::SeqCst), "removal batches ran serially");
+                if versions.len() == 1000 {
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+            if fault == "remove-denied"
+                || (fault == "remove-bulk-failure" && versions.len() == 1000)
+            {
+                reply(
+                    &mut socket,
+                    403,
+                    &[],
+                    b"<Error><Code>AccessDenied</Code><Message>denied</Message></Error>",
+                    false,
+                );
+            } else {
+                let entries = versions.iter().rev().map(|version| {
+                    if fault == "remove-null-marker-created" && *version == "null" {
+                        "<Deleted><Key>tree/key</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>new-marker</DeleteMarkerVersionId></Deleted>".to_owned()
+                    } else if fault == "remove-null-marker-ambiguous" && *version == "null" {
+                        "<Deleted><Key>tree/key</Key><DeleteMarker>true</DeleteMarker></Deleted>".to_owned()
+                    } else if fault == "remove-marker-created" && *version == "v1" {
+                        "<Deleted><Key>tree/key</Key><VersionId>v1</VersionId><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>new-marker</DeleteMarkerVersionId></Deleted>".to_owned()
+                    } else if *version == "marker" {
+                        "<Deleted><Key>tree/key</Key><VersionId>marker</VersionId><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>marker</DeleteMarkerVersionId></Deleted>".to_owned()
+                    } else if fault == "remove-null" && *version == "null" {
+                        "<Deleted><Key>tree/key</Key></Deleted>".to_owned()
+                    } else if fault == "remove-mixed" && *version == "v1" {
+                        format!("<Error><Key>tree/key</Key><VersionId>{version}</VersionId><Code>AccessDenied</Code><Message>denied</Message></Error>")
+                    } else if fault == "remove-omitted" && *version == "v1" {
+                        String::new()
+                    } else {
+                        format!("<Deleted><Key>tree/key</Key><VersionId>{version}</VersionId></Deleted>")
+                    }
+                }).collect::<String>();
+                reply(
+                    &mut socket,
+                    200,
+                    &[],
+                    format!("<DeleteResult>{entries}</DeleteResult>").as_bytes(),
+                    false,
+                );
+            }
+        }
+        return;
+    }
     if fault == "latency-pages" {
         serve_latency_pages(&mut socket, first);
         return;
@@ -984,6 +1221,27 @@ fn s3_wrong_region_redirects_name_the_bucket_region() {
             text.contains("(HTTP 301): the bucket is in region eu-central-1")
                 && text.contains("--s3-region eu-central-1"),
             "{fault}: {text}"
+        );
+    }
+    let server = Server::start("wrong-region");
+    for flags in [vec![], vec!["--s3-all-versions"]] {
+        let output = server
+            .command_for(temp.path(), "rm")
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--on",
+                "s3://bucket",
+                "object",
+            ])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            output_text(&output).contains("--s3-region eu-central-1"),
+            "{}",
+            output_text(&output)
         );
     }
 }
@@ -2009,6 +2267,180 @@ fn s3_head_throttling_uses_the_retry_budget_and_keeps_permanent_errors_final() {
 }
 
 #[test]
+fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
+    for (fault, exit, requests) in [
+        ("remove-outside", 1, 1),
+        ("remove-no-id", 1, 1),
+        ("remove-no-cursor", 1, 1),
+        ("remove-denied", 23, 3),
+        ("remove-ok", 0, 4),
+        ("remove-null", 0, 4),
+        ("remove-null-marker-created", 23, 3),
+        ("remove-null-marker-ambiguous", 23, 3),
+        ("remove-marker-created", 23, 3),
+        ("remove-mixed", 23, 3),
+        ("remove-omitted", 23, 3),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_for(temp.path(), "rm")
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--on",
+                "s3://bucket",
+                "--src-dir",
+                "tree",
+                "--s3-all-versions",
+                "--results",
+                "results.ndjson",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
+        let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schemas/automation.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for line in records.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(validator.is_valid(&value), "{value}");
+            if fault == "remove-denied"
+                && value["type"] == "removal_result"
+                && value["s3_delete_marker"] == false
+            {
+                assert_eq!(value["class"], "io");
+                assert_eq!(value["os_kind"], "permission_denied");
+                assert_eq!(value["retryable"], "no");
+            }
+        }
+        let outcomes: Vec<serde_json::Value> = records
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|r: &serde_json::Value| r["type"] == "removal_result")
+            .collect();
+        if exit == 23 || exit == 0 {
+            assert_eq!(outcomes.len(), 3);
+        }
+        if exit == 23 {
+            let marker = outcomes
+                .iter()
+                .find(|r| r["s3_delete_marker"] == true)
+                .unwrap();
+            assert_eq!(marker["attempts"], 0);
+            assert_eq!(marker["retryable"], "unknown");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("S3 removal preserved 1 delete markers"));
+            assert!(!stderr.contains("delete marker preserved because"));
+            assert_eq!(marker["disposition"], "failed");
+            assert!(marker["message"].as_str().unwrap().contains("preserved"));
+        }
+        let result: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            result["entries_removed"],
+            match fault {
+                "remove-ok" | "remove-null" => 3,
+                "remove-mixed"
+                | "remove-omitted"
+                | "remove-null-marker-created"
+                | "remove-null-marker-ambiguous"
+                | "remove-marker-created" => 1,
+                _ => 0,
+            }
+        );
+        assert_eq!(
+            result["entries_failed"],
+            match fault {
+                "remove-denied" => 3,
+                "remove-mixed"
+                | "remove-omitted"
+                | "remove-null-marker-created"
+                | "remove-null-marker-ambiguous"
+                | "remove-marker-created" => 2,
+                _ => 0,
+            }
+        );
+    }
+}
+
+#[test]
+fn s3_remove_dry_run_and_usage_errors_do_not_delete() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("remove-ok");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "--src-dir",
+            "tree",
+            "--s3-all-versions",
+            "--dry-run",
+            "-v",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+    for options in [
+        vec![
+            "--on",
+            "s3://bucket",
+            "--s3-all-versions",
+            "--s3-version-id",
+            "v",
+            "key",
+        ],
+        vec![
+            "--on",
+            "s3://bucket",
+            "--s3-version-id",
+            "v",
+            "--src-dir",
+            "tree",
+        ],
+        vec!["--s3-all-versions", "local"],
+        vec!["--on", "s3://bucket", "--s3-version-id", "v", "a", "b"],
+        vec!["--on", "s3://bucket", "--pscope", "/missing", "key"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .arg("rm")
+            .args(options)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+}
+
+#[test]
+fn s3_remove_retries_bodyless_head_throttling_without_decoding_copy_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("remove-head-throttle");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args(["--s3-endpoint", &server.address])
+        .args(["--on", "s3://bucket", "key", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn s3_listing_costs_are_bounded_without_changing_selection() {
     for (fault, rules, expected_requests) in [
         ("listing-adaptive", vec!["--ignore", "archive/"], 4),
@@ -2178,6 +2610,337 @@ fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
     }
 }
 
+#[test]
+fn s3_remove_prefix_existence_is_bounded_and_usage_mentions_removal() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("remove-prefix-check");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "--src-non-dir",
+            "tree",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output_text(&output).contains("non-directory selector names a prefix"));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+    for (args, message) in [
+        (
+            vec!["--s3-region", "us-east-1", "key"],
+            "S3 options require --on s3://BUCKET",
+        ),
+        (
+            vec!["--on", "s3://bucket", "--pscope", "/missing", "key"],
+            "not supported for S3 removal",
+        ),
+        (
+            vec!["--on", "s3://bucket", "--follow-src", "key"],
+            "--follow-src is not supported for S3 removal",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .arg("rm")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            output_text(&output).contains(message),
+            "{}",
+            output_text(&output)
+        );
+    }
+}
+
+#[test]
+fn s3_remove_follow_still_allows_local_results_symlinks() {
+    let temp = tempfile::tempdir().unwrap();
+    let results = temp.path().join("results");
+    std::os::unix::fs::symlink("actual-results", &results).unwrap();
+    let server = Server::start("remove-head-throttle");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "key",
+            "--dry-run",
+            "--follow",
+            "--results",
+        ])
+        .arg(&results)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(std::fs::symlink_metadata(&results)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let records = std::fs::read_to_string(temp.path().join("actual-results")).unwrap();
+    assert!(records.contains("removal_trace"));
+}
+
+#[test]
+fn s3_remove_exact_history_and_tree_are_selected_explicitly() {
+    for (selector, expected) in [
+        (vec!["ghost"], vec!["old", "hidden"]),
+        (vec!["--src-dir", "ghost"], vec!["child"]),
+        (vec!["--srcs-in", "ghost"], vec!["child"]),
+        (vec!["--src-non-dir", "ghost"], vec!["old", "hidden"]),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start("remove-ghost");
+        let output = server
+            .command_for(temp.path(), "rm")
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--on",
+                "s3://bucket",
+                "--s3-all-versions",
+                "--dry-run",
+                "--results",
+                "results.ndjson",
+            ])
+            .args(selector)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let versions: Vec<String> = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|r| r["type"] == "removal_trace")
+            .map(|r| r["s3_version_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(versions, expected);
+        assert_eq!(server.requests.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn s3_remove_exact_versions_stops_before_unrelated_prefixes() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("remove-exact-bounded");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "--src-non-dir",
+            "ghost",
+            "--s3-all-versions",
+            "--dry-run",
+            "-v",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(output_text(&output).contains("old"));
+    assert!(output_text(&output).contains("hidden"));
+    assert!(output_text(&output).contains("2 entries"));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn s3_remove_batches_are_concurrent_and_preserve_markers_after_late_failure() {
+    for (fault, exit, requests, removed, failed) in [
+        ("remove-bulk", 0, 5, 1002, 0),
+        ("remove-bulk-failure", 23, 4, 1, 1001),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_for(temp.path(), "rm")
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--on",
+                "s3://bucket",
+                "--src-dir",
+                "tree",
+                "--s3-all-versions",
+                "--results",
+                "results.ndjson",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{}", output_text(&output));
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+        let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let records: Vec<serde_json::Value> = records
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let summary = records.last().unwrap();
+        assert_eq!(summary["entries_removed"], removed);
+        assert_eq!(summary["entries_failed"], failed);
+        let outcomes: Vec<_> = records
+            .iter()
+            .filter(|r| r["type"] == "removal_result")
+            .collect();
+        assert_eq!(outcomes.len(), 1002);
+        let ids: std::collections::HashSet<_> = outcomes
+            .iter()
+            .map(|r| r["s3_version_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1002);
+        let marker = outcomes
+            .iter()
+            .find(|r| r["s3_delete_marker"] == true)
+            .unwrap();
+        if failed != 0 {
+            assert_eq!(marker["attempts"], 0);
+            assert_eq!(marker["retryable"], "unknown");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("S3 removal preserved 1 delete markers"));
+            assert!(!stderr.contains("delete marker preserved because"));
+        }
+    }
+}
+
+#[test]
+fn s3_remove_interrupt_cancels_stalled_planning_without_deleting() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start("remove-planning-interrupt");
+        let mut child = server
+            .command_for(temp.path(), "rm")
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--on",
+                "s3://bucket",
+                "--src-dir",
+                "tree",
+                "--s3-all-versions",
+                "--results",
+                "results.ndjson",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !server.gate.0.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "rm exited before listing"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        if !server.gate.0.load(Ordering::SeqCst) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("planning request was not received before deadline");
+        }
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        server.gate.1.store(true, Ordering::SeqCst);
+        if status.is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(
+            status
+                .expect("rm waited for read-only planning after interruption")
+                .code(),
+            Some(1)
+        );
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let records: Vec<serde_json::Value> = records
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(!records.iter().any(|r| r["type"] == "removal_result"));
+        assert_eq!(records.last().unwrap()["entries_removed"], 0);
+        assert_eq!(records.last().unwrap()["exit_code"], 1);
+    }
+}
+
+#[test]
+fn s3_remove_interrupt_drains_in_flight_results_before_exiting() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("remove-bulk-interrupt");
+    let mut child = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "--src-dir",
+            "tree",
+            "--s3-all-versions",
+            "--results",
+            "results.ndjson",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while server.requests.load(Ordering::SeqCst) < 4 && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "rm exited before sending batches"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    if server.requests.load(Ordering::SeqCst) < 4 {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!(
+            "timed out waiting for removal requests: {}",
+            server.requests.load(Ordering::SeqCst)
+        );
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    thread::sleep(Duration::from_millis(100));
+    let premature = child.try_wait().unwrap();
+    server.gate.1.store(true, Ordering::SeqCst);
+    let status = child.wait().unwrap();
+    assert!(premature.is_none(), "rm discarded its in-flight requests");
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(server.requests.load(Ordering::SeqCst), 4);
+    let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+    let records: Vec<serde_json::Value> = records
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["type"] == "removal_result")
+            .count(),
+        1001
+    );
+    assert_eq!(records.last().unwrap()["entries_removed"], 1001);
+}
+
 // Keep real HTTP pagination and production interceptor wiring covered here.
 // Timing policy is tested separately with a virtual clock.
 fn serve_latency_pages(socket: &mut TcpStream, first: &str) {
@@ -2258,4 +3021,60 @@ fn s3_paginated_download_records_control_latency() {
     // runner to finish real HTTP requests within a wall-clock deadline.
     let expected_limit = if control >= 0.050 { 256 } else { 64 };
     assert_eq!(plan["request_limit"], expected_limit, "{plan}");
+}
+
+#[test]
+fn s3_remove_explicit_types_disambiguate_live_object_and_tree_without_extra_probes() {
+    for all_versions in [false, true] {
+        for (selector, paths) in [
+            (vec!["foo"], vec!["foo"]),
+            (vec!["--src-dir", "foo"], vec!["foo/", "foo/nested/child"]),
+            (vec!["--srcs-in", "foo"], vec!["foo/nested/child"]),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let server = Server::start("rm-explicit-collision");
+            let mut command = server.command_for(temp.path(), "rm");
+            command
+                .args([
+                    "--s3-endpoint",
+                    &server.address,
+                    "--on",
+                    "s3://bucket",
+                    "--dry-run",
+                    "--results",
+                    "results.ndjson",
+                ])
+                .args(selector);
+            if all_versions {
+                command.arg("--s3-all-versions");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{}", output_text(&output));
+            let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+            let selected: Vec<String> = records
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .filter(|r| r["type"] == "removal_trace")
+                .map(|r| r["path"]["value"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(selected, paths);
+            assert_eq!(server.requests.load(Ordering::Relaxed), 1);
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("rm-explicit-collision");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "foo/",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output_text(&output).contains("--src-dir"));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 0);
 }

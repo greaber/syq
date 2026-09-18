@@ -319,7 +319,7 @@ fn main() {
         return;
     }
     persistence::mark_explicit_scope(&mut args);
-    if args.interface != cli::Interface::NativeCp {
+    if args.interface != cli::Interface::NativeCp && args.s3.is_none() {
         if let Err(error) = destination::prepare(&mut args) {
             crate::output::diagnostic!("syq: {error:#}");
             std::process::exit(2);

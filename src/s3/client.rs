@@ -155,7 +155,7 @@ fn response_region(
 
 /// Describe a failed request. A bodyless redirect otherwise reads as an
 /// "unhandled error", although S3 says where the bucket is.
-fn failure<E>(
+pub(super) fn failure<E>(
     operation: &str,
     error: &aws_sdk_s3::error::SdkError<
         E,

@@ -226,5 +226,65 @@ not remove uploaded parts. Syq does not delete unrelated objects.
 
 S3 copies support `--results` and the Python `cp` API. Automation endpoints use
 `kind: "s3"` and `host: "s3://BUCKET"`, requiring an SDK that understands S3
-endpoints. SSH delegation, `--inplace`, `rm`, and S3-to-S3 copies are
+endpoints. SSH delegation, `--inplace`, and S3-to-S3 copies are
 not supported for object storage.
+
+## Remove objects and versions
+
+`syq rm --on s3://BUCKET` removes selected keys or explicitly selected prefix
+trees. Named paths, `--src`, and `--srcs` select only the exact object; they
+refuse a prefix tree. Use `--src-dir name` to recursively remove `name/`, or
+`--srcs-in name` to remove its contents while keeping its directory-marker
+object. If `name` and `name/` coexist, each selector removes only its selected
+object or tree. Use `--srcs-in .` for bucket contents. Removal never deletes the
+bucket itself. Selectors are literal paths, not wildcard patterns; `-C` and
+`--root` set a key prefix. Missing selections succeed without removing anything.
+`--follow-src` is unsupported for S3 removal. `--follow` applies only to symlinks
+in the local `--results` path; it does not follow links stored as S3 objects.
+
+```sh
+# Preview ordinary removal. Versioned buckets retain historical contents.
+syq rm --on s3://my-bucket --src-dir old-backup --dry-run -v
+
+# Permanently remove the tree's versions, including hidden keys and delete markers.
+syq rm --on s3://my-bucket --src-dir old-backup --s3-all-versions
+
+# Permanently remove one version of one exact key.
+syq rm --on s3://my-bucket report.txt --s3-version-id VERSION_ID
+```
+
+`--s3-all-versions` and `--s3-version-id` are mutually exclusive and apply only
+to S3 removal. With `--s3-all-versions`, named selectors include the exact
+key's hidden history. Explicit directory selectors include only the selected
+prefix's history, even when an exact key also has live or historical versions.
+
+A version ID requires one named or non-directory selector;
+a named key ending in `/` can identify a directory marker's version. Removing
+a delete marker alone can reveal an older version. `--dry-run -v` previews
+version IDs and identifies delete markers without sending deletion requests.
+The same endpoint, region, profile, and custom-header options work as for copies.
+
+All selectors and listings are checked before deletion begins. Overlapping
+selections remove each key/version once. Removal sends concurrent batches of up
+to 1,000 entries and continues after individual or batch failures, reporting
+partial failure with exit 23. It cannot undo earlier removals. With
+`--s3-all-versions`, all selected data versions are attempted before any delete
+markers. If any data version fails, all selected markers are preserved and
+reported as failed removals with zero attempts and unknown retryability. Resolve
+the data-version failures before retrying the purge. Preserving markers keeps
+hidden contents from being exposed after an incomplete purge. Interrupting
+planning cancels it without deleting anything. Once deletion starts, interruption
+stops new batches and waits for deletion requests already sent to finish.
+Stop concurrent writers when clearing a prefix: versions created after listing
+are not part of the removal plan. Version operations require permission to list
+and delete versions; retention rules may prevent permanent deletion.
+
+On recognized Tigris endpoints, versioned removal prints a compatibility warning:
+bulk deletion has been observed to ignore version IDs and create delete markers
+instead. The warning also appears in dry runs. It does not block removal or
+change the API requests; provider behavior may change. Check the resulting
+version history when using these options.
+
+The Python `rm` and `AsyncClient.rm` APIs accept `s3_all_versions=True` or
+`s3_version_id="..."`, along with `on="s3://BUCKET"` and the S3 connection options.
+Removal results count each version or delete marker as one entry.
