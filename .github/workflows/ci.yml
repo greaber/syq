@@ -140,7 +140,10 @@ jobs:
           needs.scope.outputs.tooling == 'true' ||
           (needs.scope.outputs.native == 'true' &&
            needs.scope.outputs.full_suite == 'true')
-        run: scripts/test-release-tools.sh
+        # The package-identity step above has the same condition and already
+        # built and verified this candidate. Reuse it instead of building the
+        # checkout again with Cargo's non-test dependency feature set.
+        run: scripts/test-release-tools.sh --syq "$GITHUB_WORKSPACE/target/package-identity/debug/syq"
       - name: Test release orchestration
         if: >-
           needs.scope.outputs.tooling == 'true' ||
