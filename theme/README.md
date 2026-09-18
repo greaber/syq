@@ -1,8 +1,11 @@
 # syq documentation theme
 
 As of 2026-09-05, docs and benchmarks share Open Sans headings and prose,
-a blue Manrope syq wordmark, IBM Plex Mono commands and numbers, and white/dark
-palettes. Main text is 20px. The same top navigation links both sites, while
+a Manrope syq wordmark, IBM Plex Mono commands and numbers, and white/dark
+palettes. Docs use a blue accent and benchmarks use orange. Shared chrome
+uses `--accent`; `--syq` remains the blue used for measured syq results.
+The favicons use the Manrope “s” in each site’s accent color.
+Main text is 20px. The same top navigation links both sites, while
 the docs retain mdBook's compact sidebar and benchmarks keep their own layout.
 
 The shared UI toolkit is inventoried in site-ui.json. Every mapped file must
@@ -66,7 +69,7 @@ and compact 15px Open Sans navigation with a 300px default sidebar width;
 their content layouts remain independent.
 
 The docs and benchmark homepages use the shared landing-title styles: a large
-blue Manrope wordmark above an Open Sans title. This adds character to the
+Manrope wordmark in each site’s accent above an Open Sans title. This adds character to the
 homepages while retaining the compact navigation and normal article headings.
 The docs homepage preserves its copy-files-with-syq fragment for existing links.
 
