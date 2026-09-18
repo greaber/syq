@@ -1,6 +1,5 @@
-//! Inherited byte streams. Nonblocking I/O lets cancellation interrupt a quiet
-//! pipe or a stopped consumer. Status flags belong to the open file description,
-//! so restore them before returning ownership to an embedding caller.
+//! Inherited byte streams without changing shared file status flags. Blocking
+//! workers may outlive cancellation; the CLI exits after network cleanup.
 use anyhow::{bail, Context, Result};
 use std::{
     fs::File,
@@ -14,7 +13,6 @@ use std::{
 
 pub(super) struct Descriptor {
     file: File,
-    flags: i32,
     original: i32,
     descriptor_flags: i32,
     cancelled: Arc<AtomicBool>,
@@ -43,16 +41,11 @@ impl Descriptor {
         if !(kind.is_file() || kind.is_fifo() || kind.is_socket() || kind.is_char_device()) {
             bail!("descriptor {fd} must refer to a file, pipe, socket, or character device");
         }
-        if unsafe { libc::fcntl(duplicate, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("make stream descriptor nonblocking");
-        }
         let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         let result = Self {
             file,
             original: fd,
             descriptor_flags,
-            flags,
             cancelled,
         };
         if fd > 2
@@ -63,6 +56,14 @@ impl Descriptor {
         }
         Ok(result)
     }
+    fn check_cancelled(&self) -> Result<()> {
+        if self.cancelled.load(Relaxed) {
+            bail!("stream cancelled");
+        }
+        Ok(())
+    }
+    // Only already-nonblocking descriptors need poll. Process exit ends a quiet
+    // wait, just as it ends a blocking read/write; no periodic wakeup is needed.
     fn wait(&self, events: i16) -> Result<()> {
         loop {
             if self.cancelled.load(Relaxed) {
@@ -73,7 +74,7 @@ impl Descriptor {
                 events,
                 revents: 0,
             };
-            let rc = unsafe { libc::poll(&mut poll, 1, 100) };
+            let rc = unsafe { libc::poll(&mut poll, 1, -1) };
             if rc > 0 {
                 return Ok(());
             }
@@ -94,15 +95,14 @@ impl Descriptor {
             bytes.resize(size, 0);
             let mut used = 0;
             while used < size {
-                self.wait(libc::POLLIN)?;
+                self.check_cancelled()?;
                 match self.file.read(&mut bytes[used..]) {
                     Ok(0) => break,
                     Ok(n) => used += n,
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                        ) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        self.wait(libc::POLLIN)?;
+                    }
                     Err(e) => return Err(e).context("read input stream"),
                 }
             }
@@ -115,15 +115,14 @@ impl Descriptor {
         tokio::task::spawn_blocking(move || {
             let mut remaining = &bytes[..];
             while !remaining.is_empty() {
-                self.wait(libc::POLLOUT)?;
+                self.check_cancelled()?;
                 match self.file.write(remaining) {
                     Ok(0) => bail!("output stream made no progress"),
                     Ok(n) => remaining = &remaining[n..],
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                        ) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        self.wait(libc::POLLOUT)?;
+                    }
                     Err(e) => return Err(e).context("write output stream"),
                 }
             }
@@ -135,7 +134,6 @@ impl Descriptor {
 impl Drop for Descriptor {
     fn drop(&mut self) {
         unsafe {
-            libc::fcntl(self.file.as_raw_fd(), libc::F_SETFL, self.flags);
             if self.original > 2 {
                 libc::fcntl(self.original, libc::F_SETFD, self.descriptor_flags);
             }
@@ -148,34 +146,39 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
     #[test]
-    fn stream_descriptor_cancellation_restores_flags() {
-        let (source, _producer) = UnixStream::pair().unwrap();
-        let original = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) };
-        let inherited_flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) };
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let input = Descriptor::open(source.as_raw_fd(), true, cancelled.clone()).unwrap();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let read = input.read_chunk(1024);
-            let cancel = async {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                cancelled.store(true, Relaxed);
-            };
-            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                tokio::join!(read, cancel)
-            })
-            .await
-            .unwrap();
-            assert!(result.is_err());
-        });
-        assert_eq!(
-            unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) },
-            inherited_flags
-        );
-        assert_eq!(
-            unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) },
-            original
-        );
+    fn stream_descriptor_preserves_flags_and_reads_blocking_or_nonblocking_input() {
+        for nonblocking in [false, true] {
+            let (source, mut producer) = UnixStream::pair().unwrap();
+            source.set_nonblocking(nonblocking).unwrap();
+            let original = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) };
+            let inherited_flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) };
+            let input = Descriptor::open(source.as_raw_fd(), true, Arc::default()).unwrap();
+            assert_eq!(
+                unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) },
+                original
+            );
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let read = input.read_chunk(1024);
+                let write = async {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    producer.write_all(b"payload").unwrap();
+                    producer.shutdown(std::net::Shutdown::Write).unwrap();
+                };
+                let (result, ()) = tokio::join!(read, write);
+                let (input, data) = result.unwrap();
+                assert_eq!(&data[..], b"payload");
+                drop(input);
+            });
+            assert_eq!(
+                unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) },
+                inherited_flags
+            );
+            assert_eq!(
+                unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) },
+                original
+            );
+        }
     }
     #[test]
     fn stream_descriptor_uses_current_offset_without_truncation() {

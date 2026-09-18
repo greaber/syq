@@ -516,8 +516,9 @@ Syq reads no configuration file. Besides the usual system variables such as
 endpoint variables described under
 [object storage](object-storage.md#credentials-and-providers), syq honors:
 
-- `SYQ_CP_OPTIONS`, `SYQ_RSYNC_OPTIONS`, and `SYQ_RM_OPTIONS` hold extra
-  arguments for `syq cp`, `syq rsync`, and `syq rm`. Use them to adjust a
+- `SYQ_CP_OPTIONS`, `SYQ_RSYNC_OPTIONS`, `SYQ_RM_OPTIONS`, and
+  `SYQ_STREAM_OPTIONS` hold extra arguments for `syq cp`, `syq rsync`,
+  `syq rm`, and `syq stream`, respectively. Use them to adjust a
   command inside a script or program that does not let you change its syq
   options. The value is split like a shell command line and inserted right
   after the command name, before the arguments the script supplies, so

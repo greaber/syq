@@ -452,17 +452,18 @@ pub struct Args {
 }
 
 /// Extra command-line arguments taken from the environment, for adjusting a
-/// `syq cp`, `syq rsync`, or `syq rm` invocation inside a script or program
-/// that does not expose its own settings. Each variable holds one shell-style
+/// `syq cp`, `syq rsync`, `syq rm`, or `syq stream` invocation inside a script
+/// or program that does not expose its own settings. Each variable holds one shell-style
 /// word list that is inserted right after the command name, so the caller's
 /// own arguments come later.
 pub struct EnvironmentOptions(Vec<(&'static str, OsString)>);
 
 impl EnvironmentOptions {
-    pub const VARIABLES: [(&'static str, &'static str); 3] = [
+    pub const VARIABLES: [(&'static str, &'static str); 4] = [
         ("cp", "SYQ_CP_OPTIONS"),
         ("rsync", "SYQ_RSYNC_OPTIONS"),
         ("rm", "SYQ_RM_OPTIONS"),
+        ("stream", "SYQ_STREAM_OPTIONS"),
     ];
 
     /// Read the variables and remove them from the process environment. The

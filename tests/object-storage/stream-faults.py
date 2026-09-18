@@ -2,10 +2,13 @@
 """Independent HTTP fixture; no credentials, packages or remote services needed."""
 import base64
 import hashlib
+import fcntl
 import http.server
 import os
 from pathlib import Path
 import signal
+import socket
+import shlex
 import socketserver
 import subprocess
 import sys
@@ -220,6 +223,47 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
             child.stdout = None
             stop(child)
             held_output.close()
+        elif CASE == 'descriptor-flags':
+            for upload in (True, False):
+                for nonblocking in (False, True):
+                    for sig in (signal.SIGTERM, signal.SIGKILL):
+                        shared, peer = socket.socketpair()
+                        with shared, peer:
+                            shared.setblocking(not nonblocking)
+                            peer.settimeout(15)
+                            original = fcntl.fcntl(shared, fcntl.F_GETFL)
+                            PART_UPLOADED.clear()
+                            child = spawn(put if upload else get,
+                                          stdin=shared if upload else subprocess.DEVNULL,
+                                          stdout=subprocess.DEVNULL if upload else shared,
+                                          stderr=subprocess.PIPE, env=env)
+                            if upload:
+                                peer.sendall(DATA[:PART])
+                                assert PART_UPLOADED.wait(10), 'upload did not start'
+                            else:
+                                assert peer.recv(1) == DATA[:1], 'download did not start'
+                            assert fcntl.fcntl(shared, fcntl.F_GETFL) == original
+                            aborts = STATE['aborts']
+                            child.send_signal(sig)
+                            _, error = child.communicate(timeout=8)
+                            assert child.returncode != 0, error
+                            if upload and sig == signal.SIGTERM:
+                                assert STATE['aborts'] == aborts + 1
+                            assert fcntl.fcntl(shared, fcntl.F_GETFL) == original
+        elif CASE == 'environment-options':
+            # Quoted keys and endpoint options must reach the stream parser.
+            configured = env | {'SYQ_STREAM_OPTIONS': shlex.join(base[2:] + ['--as', 'key with spaces'])}
+            result = run([SYQ, 'stream', '--to', 's3://bucket'], input=b'from environment', env=configured)
+            success(result)
+            assert STATE['published'] == b'from environment'
+            configured['SYQ_STREAM_OPTIONS'] = "--as 'unterminated"
+            result = run(put, input=b'', env=configured)
+            assert result.returncode == 2
+            assert b'SYQ_STREAM_OPTIONS is not a valid shell word list' in result.stderr
+            # Existing commands reject duplicate scalar options; stream does too.
+            configured['SYQ_STREAM_OPTIONS'] = '--as other'
+            result = run(put, input=b'', env=configured)
+            assert result.returncode == 2
         elif CASE == 'descriptors':
             result = run(get + ['--write-fd', '99999'], env=env)
             failure(result)

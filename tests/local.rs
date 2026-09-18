@@ -22599,6 +22599,7 @@ fn environment_options_apply_to_the_command_and_never_reach_children() {
         ])
         .env("SYQ_CP_OPTIONS", "--performance-tuning workers=1 --quiet")
         .env("SYQ_RM_OPTIONS", "--dry-run")
+        .env("SYQ_STREAM_OPTIONS", "--s3-region us-east-1")
         .env("RSH_ENV_DUMP", t.path("rsh.env"))
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
@@ -22613,6 +22614,7 @@ fn environment_options_apply_to_the_command_and_never_reach_children() {
     assert!(child_env.contains("RSH_ENV_DUMP="), "{child_env}");
     assert!(!child_env.contains("SYQ_CP_OPTIONS"), "{child_env}");
     assert!(!child_env.contains("SYQ_RM_OPTIONS"), "{child_env}");
+    assert!(!child_env.contains("SYQ_STREAM_OPTIONS"), "{child_env}");
 }
 
 #[test]

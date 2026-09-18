@@ -164,7 +164,10 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         result
     });
     cancelled.store(true, Relaxed);
-    drop(runtime); // Polling descriptor workers observe cancellation before shutdown.
+    // A quiet inherited pipe can keep a blocking worker alive indefinitely.
+    // This entry point is CLI-only: main exits immediately after reporting the
+    // result. Finish multipart cleanup above, then let process exit stop I/O.
+    runtime.shutdown_background();
     result.map(|()| 0)
 }
 

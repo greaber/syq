@@ -55,3 +55,12 @@ fn truncated_range_failure_is_not_success() {
 fn upload_retries_replay_buffered_parts() {
     scenario("upload-retry");
 }
+
+#[test]
+fn descriptor_flags_survive_cancellation_and_forced_exit() {
+    scenario("descriptor-flags");
+}
+#[test]
+fn environment_options_apply_to_streams() {
+    scenario("environment-options");
+}

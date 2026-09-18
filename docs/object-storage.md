@@ -40,6 +40,8 @@ Keys are exact UTF-8 object names: no prefix selection, wildcard expansion by
 syq, or filesystem path normalization. Quote keys containing shell metacharacters.
 The command transfers raw contents, without applying syq file metadata.
 Credentials, profiles, endpoints, regions, and custom headers work as for `cp`.
+[`SYQ_STREAM_OPTIONS`](reference.md#environment-variables-and-local-files) supplies
+extra options when you cannot change a script's command line.
 
 To use a descriptor your application already opened, pass `--read-fd N` for
 uploads or `--write-fd N` for downloads:
@@ -50,9 +52,8 @@ syq stream --from s3://backups data.gz --write-fd 3 3>data.gz
 
 The descriptor must be inherited by syq and open for the requested direction.
 No descriptor range is reserved; descriptor 2 is reserved for diagnostics.
-Dedicate the descriptor to this transfer while syq runs. Syq temporarily enables
-nonblocking I/O on its shared open-file description and restores the previous
-flags on normal exit. Regular-file descriptors use their current offset and
+Dedicate the descriptor to this transfer while syq runs. Syq leaves its blocking
+or nonblocking mode unchanged. Regular-file descriptors use their current offset and
 are not truncated, renamed, or given copied metadata. Progress and summaries
 are not written; stdout contains only payload when it is the selected output.
 
