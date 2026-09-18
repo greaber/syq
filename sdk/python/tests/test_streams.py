@@ -19,7 +19,7 @@ class StreamTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.env = {k: v for k, v in os.environ.items() if not k.startswith('SYQ_')}
         self.env['HOME'] = str(self.root)
         self.client = syq.Client(executable=SYQ, env=self.env, timeout=10)
@@ -126,7 +126,7 @@ class StreamTests(unittest.TestCase):
 class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_round_trip_and_cancelled_reader(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             client = syq.AsyncClient(executable=SYQ, timeout=10)
             async with client.open_writer(as_=root / 'file') as output:
                 await output.write(b'async bytes')
@@ -147,7 +147,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_close_reaps_process(self):
         with tempfile.TemporaryDirectory() as temp:
-            fake = Path(temp) / 'slow-syq'
+            fake = Path(temp).resolve() / 'slow-syq'
             fake.write_text('#!/bin/sh\nexec sleep 60\n')
             fake.chmod(0o700)
             output = syq.AsyncClient(executable=fake).open_writer(as_='ignored')

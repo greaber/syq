@@ -8,7 +8,7 @@ import tempfile
 
 syq = str(Path(sys.argv[1]).resolve())
 with tempfile.TemporaryDirectory() as temp:
-    root = Path(temp)
+    root = Path(temp).resolve()
     target = root / 'target'
     target.write_bytes(b'old')
     env = {k: v for k, v in os.environ.items() if not k.startswith('SYQ_')}
