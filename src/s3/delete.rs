@@ -7,7 +7,7 @@ use aws_sdk_s3::{
     Client,
 };
 use futures_util::{stream, StreamExt};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(super) struct Target {
@@ -153,10 +153,10 @@ impl Deleter<'_> {
                     .iter()
                     .filter_map(|e| e.key().map(|key| ((key, e.version_id()), e)))
                     .collect();
-                let deleted: HashSet<_> = output
+                let deleted: HashMap<_, _> = output
                     .deleted()
                     .iter()
-                    .filter_map(|d| d.key().map(|key| (key, d.version_id())))
+                    .filter_map(|d| d.key().map(|key| ((key, d.version_id()), d)))
                     .collect();
                 targets
                     .iter()
@@ -166,7 +166,7 @@ impl Deleter<'_> {
                         // version. Do not relax identity matching for other versions.
                         if target.version.as_deref() == Some("null")
                             && !errors.contains_key(&id)
-                            && !deleted.contains(&id)
+                            && !deleted.contains_key(&id)
                         {
                             id = (target.key.as_str(), None);
                         }
@@ -180,7 +180,28 @@ impl Deleter<'_> {
                                 error.code(),
                                 None,
                             ))
-                        } else if deleted.contains(&id) {
+                        } else if let Some(deleted) = deleted.get(&id) {
+                            if let Some(version) = target.version.as_deref() {
+                                let marker_version = deleted.delete_marker_version_id();
+                                // DeleteMarker=true can acknowledge purging an existing
+                                // marker. It must not identify a different/new marker,
+                                // or turn the null-version fallback into a key-only
+                                // acknowledgment of an ambiguous marker operation.
+                                if marker_version.is_some_and(|id| id != version)
+                                    || (deleted.delete_marker() == Some(true)
+                                        && deleted.version_id() != Some(version)
+                                        && marker_version != Some(version))
+                                {
+                                    return Err(Failure::new(
+                                        format!(
+                                            "S3 deletion returned a delete-marker outcome inconsistent with requested key {:?} version {:?}",
+                                            target.key, version
+                                        ),
+                                        None,
+                                        None,
+                                    ));
+                                }
+                            }
                             Ok(())
                         } else {
                             Err(Failure::new(

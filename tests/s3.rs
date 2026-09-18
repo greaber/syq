@@ -295,7 +295,7 @@ fn serve(
             } else {
                 "<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>tree/key</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker><DeleteMarker><Key>tree/key</Key><VersionId>marker</VersionId></DeleteMarker><Version><Key>tree/key</Key><VersionId>v1</VersionId></Version></ListVersionsResult>"
             };
-            let body = if fault == "remove-null" {
+            let body = if fault.starts_with("remove-null") {
                 body.replace("<VersionId>v1</VersionId>", "<VersionId>null</VersionId>")
             } else {
                 body.to_owned()
@@ -361,7 +361,15 @@ fn serve(
                 );
             } else {
                 let entries = versions.iter().rev().map(|version| {
-                    if fault == "remove-null" && *version == "null" {
+                    if fault == "remove-null-marker-created" && *version == "null" {
+                        "<Deleted><Key>tree/key</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>new-marker</DeleteMarkerVersionId></Deleted>".to_owned()
+                    } else if fault == "remove-null-marker-ambiguous" && *version == "null" {
+                        "<Deleted><Key>tree/key</Key><DeleteMarker>true</DeleteMarker></Deleted>".to_owned()
+                    } else if fault == "remove-marker-created" && *version == "v1" {
+                        "<Deleted><Key>tree/key</Key><VersionId>v1</VersionId><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>new-marker</DeleteMarkerVersionId></Deleted>".to_owned()
+                    } else if *version == "marker" {
+                        "<Deleted><Key>tree/key</Key><VersionId>marker</VersionId><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>marker</DeleteMarkerVersionId></Deleted>".to_owned()
+                    } else if fault == "remove-null" && *version == "null" {
                         "<Deleted><Key>tree/key</Key></Deleted>".to_owned()
                     } else if fault == "remove-mixed" && *version == "v1" {
                         format!("<Error><Key>tree/key</Key><VersionId>{version}</VersionId><Code>AccessDenied</Code><Message>denied</Message></Error>")
@@ -2267,6 +2275,9 @@ fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
         ("remove-denied", 23, 3),
         ("remove-ok", 0, 4),
         ("remove-null", 0, 4),
+        ("remove-null-marker-created", 23, 3),
+        ("remove-null-marker-ambiguous", 23, 3),
+        ("remove-marker-created", 23, 3),
         ("remove-mixed", 23, 3),
         ("remove-omitted", 23, 3),
     ] {
@@ -2337,7 +2348,11 @@ fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
             result["entries_removed"],
             match fault {
                 "remove-ok" | "remove-null" => 3,
-                "remove-mixed" | "remove-omitted" => 1,
+                "remove-mixed"
+                | "remove-omitted"
+                | "remove-null-marker-created"
+                | "remove-null-marker-ambiguous"
+                | "remove-marker-created" => 1,
                 _ => 0,
             }
         );
@@ -2345,7 +2360,11 @@ fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
             result["entries_failed"],
             match fault {
                 "remove-denied" => 3,
-                "remove-mixed" | "remove-omitted" => 2,
+                "remove-mixed"
+                | "remove-omitted"
+                | "remove-null-marker-created"
+                | "remove-null-marker-ambiguous"
+                | "remove-marker-created" => 2,
                 _ => 0,
             }
         );
