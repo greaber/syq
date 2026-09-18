@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import select
 import ssl
 import subprocess
 import sys
@@ -24,6 +25,9 @@ assert subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=Tru
 PLAIN_HTTP = os.environ.get('SYQ_STRESS_HTTP') == '1'
 QUEUE_SWEEP = os.environ.get('SYQ_STRESS_QUEUES')
 MEMORY_TRACE = os.environ.get('SYQ_STRESS_MEMORY') == '1'
+PERF = os.environ.get('SYQ_STRESS_PERF') == '1'
+STAGES = os.environ.get('SYQ_STRESS_STAGES') == '1'
+assert not PERF or MEMORY_TRACE, 'profiling requires startup gate and memory trace'
 QUEUES = [int(q) for q in QUEUE_SWEEP.split(',')] if QUEUE_SWEEP else []
 D = ROOT / ('target/transport-stress-http-v2' if PLAIN_HTTP else 'target/transport-stress-v2')
 if QUEUE_SWEEP:
@@ -110,6 +114,46 @@ def network_command(args, namespace=None):
     finally:
         remove_container(helper)
 
+class PerfTrace:
+    """Attach only to this owned, same-UID client; never request kernel access."""
+    def __init__(self, pid, tag):
+        self.log = (D / (tag + '.perf.log')).open('w')
+        control_read, self.control_write = os.pipe()
+        self.ack_read, ack_write = os.pipe()
+        args = ['perf', 'record', '-e', 'cycles:u', '-F', '99', '--call-graph', 'dwarf,8192',
+                '-D', '-1', '--control', f'fd:{control_read},{ack_write}',
+                '-o', str(D / (tag + '.perf.data')), '-p', str(pid)]
+        self.process = subprocess.Popen(args, pass_fds=(control_read, ack_write),
+                                        stdout=self.log, stderr=self.log, start_new_session=True)
+        self.stopped = False
+        os.close(control_read)
+        os.close(ack_write)
+        try:
+            os.write(self.control_write, b'enable\n')
+            ready, _, _ = select.select([self.ack_read], [], [], 8)
+            assert ready and os.read(self.ack_read, 64).rstrip(b'\x00') == b'ack\n', 'perf failed to acknowledge attach; inspect perf log'
+        except BaseException:
+            self.stop()
+            raise
+
+    def stop(self):
+        if self.stopped:
+            return
+        self.stopped = True
+        if self.process.poll() is None:
+            os.killpg(self.process.pid, signal.SIGINT)
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(self.process.pid, signal.SIGKILL)
+            self.process.wait(timeout=10)
+            raise
+        finally:
+            self.log.close()
+            os.close(self.control_write)
+            os.close(self.ack_read)
+        assert self.process.returncode in (0, -signal.SIGINT), 'perf capture failed; inspect perf log'
+
 class MemoryTrace:
     def __init__(self, cid, tag):
         self.samples = []
@@ -137,6 +181,19 @@ class MemoryTrace:
                 for name in ('memory.stat', 'memory.events', 'cpu.stat'):
                     row[name] = {k: int(v) for k, v in
                                  (line.split() for line in (self.group / name).read_text().splitlines())}
+                for name in ('cpu.pressure', 'io.pressure', 'memory.pressure'):
+                    row[name] = (self.group / name).read_text()
+                # Slower /proc thread sampling every 100ms; record per-TID deltas later.
+                if not self.samples or row['seconds'] - getattr(self, 'last_threads', -1) >= .1:
+                    threads = {}
+                    for task in Path(f'/proc/{self.pid}/task').iterdir():
+                        try:
+                            threads[task.name] = {'schedstat': (task / 'schedstat').read_text().strip(),
+                                                   'comm': (task / 'comm').read_text().strip()}
+                        except FileNotFoundError:
+                            pass  # A worker exited between listing and reading.
+                    row['threads'] = threads
+                    self.last_threads = row['seconds']
                 wanted = {'VmRSS', 'VmHWM', 'RssAnon', 'RssFile', 'VmSize', 'Threads'}
                 row['process'] = {k: int(v.split()[0]) for k, v in
                                   (line.split(':', 1) for line in Path(f'/proc/{self.pid}/status').read_text().splitlines())
@@ -167,9 +224,11 @@ def run(case, mode, repeats, label):
     memory = case.get('memory', '1g')
     args = ['docker', 'create', '--network', 'container:' + receiver if RECEIVER_NETEM else 'host',
             *(['--add-host', 's3-spike.test:' + server_ip] if NETEM_MS and not RECEIVER_NETEM else []),
+            '--user', f'{os.getuid()}:{os.getgid()}',
             '--cpuset-cpus', case['cpus'],
             '--memory', memory, '--memory-swap', memory, '--pids-limit', '512',
             '-v', str(STAGE) + ':/bench:ro', '-v', str(out) + ':/output:rw',
+            '-e', 'SYQ_SPIKE_STAGES=' + str(int(STAGES)),
             '-e', 'SYQ_SPIKE_READERS_PER_WRITER=' + str(case.get('readers', 1)),
             '-e', 'SYQ_SPIKE_SERIAL_TAIL=' + str(case.get('serial_tail', 0)),
             '-e', 'SYQ_SPIKE_CHUNK=' + str(case.get('chunk_bytes', 128 * 1024)),
@@ -195,14 +254,28 @@ def run(case, mode, repeats, label):
                       'for i in $(seq 1 200); do if [ -f /bench/start-client ]; then exec "$@"; fi; sleep .05; done; exit 124',
                       'gate']
     active = command(args)
+    if PERF:
+        symbols = D / 'symbols'
+        (symbols / 'bench').mkdir(parents=True, exist_ok=True)
+        shutil.copy2(STAGE / 'client', symbols / 'bench/client')
+        if HEAP_PROBE:
+            shutil.copy2(STAGE / 'memory-probe.so', symbols / 'bench/memory-probe.so')
+        libraries = symbols / 'usr/lib/x86_64-linux-gnu'
+        libraries.mkdir(parents=True, exist_ok=True)
+        for name in ('libc.so.6', 'ld-linux-x86-64.so.2', 'libm.so.6'):
+            if not (libraries / name).exists():
+                command(['docker', 'cp', active + ':/usr/lib/x86_64-linux-gnu/' + name, str(libraries / name)])
     process = subprocess.Popen(['docker', 'start', '-a', active], stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, start_new_session=True)
     deadline = time.monotonic() + 600
     started = time.monotonic()
     monitor = None
+    profiler = None
     try:
         if MEMORY_TRACE:
             monitor = MemoryTrace(active, tag)
+            if PERF:
+                profiler = PerfTrace(monitor.pid, tag)
             gate.touch()
         while True:
             try:
@@ -215,6 +288,9 @@ def run(case, mode, repeats, label):
                         trace.write(network_command(['ss', '-tin', 'state', 'established']) + '\n')
                 if time.monotonic() > deadline:
                     raise TimeoutError(f'{tag}: 600s deadline exceeded')
+        if profiler:
+            profiler.stop()
+            profiler = None
         if monitor:
             monitor.stop()
             monitor = None
@@ -268,6 +344,9 @@ def run(case, mode, repeats, label):
         (D / 'results.json').write_text(json.dumps(results, indent=2))
         return row
     finally:
+        if profiler:
+            profiler.stop()
+            profiler = None
         if monitor:
             monitor.stop()
         if process.poll() is None:
@@ -386,6 +465,7 @@ try:
         cases = [dict(case, chunk_bytes=int(value)) for case in cases
                  for value in os.environ['SYQ_STRESS_CHUNKS'].split(',')]
     for case in cases:
+        case.update(stage_metrics=STAGES, perf=PERF, client_uid=os.getuid())
         if os.environ.get('SYQ_STRESS_CPUS'):
             case['cpus'] = os.environ['SYQ_STRESS_CPUS']
         if os.environ.get('SYQ_STRESS_MEMORY_LIMIT'):

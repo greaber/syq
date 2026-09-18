@@ -12,7 +12,7 @@ assert '.worktrees' in root.parts, 'run in the task worktree'
 writer = root / 'src/s3/writer.rs'
 assert not subprocess.check_output(['git', 'status', '--porcelain', '--', str(writer)], text=True)
 original = writer.read_text()
-needle = 'let (send, mut recv) = mpsc::channel::<Message>(64);'
+needle = 'let (send, mut recv) = mpsc::channel::<Message>(8);'
 replacement = '''static CAPACITY: OnceLock<usize> = OnceLock::new();
             let capacity = *CAPACITY.get_or_init(|| {
                 std::env::var("SYQ_SPIKE_QUEUE").unwrap().parse::<usize>().unwrap()
@@ -20,6 +20,20 @@ replacement = '''static CAPACITY: OnceLock<usize> = OnceLock::new();
             let (send, mut recv) = mpsc::channel::<Message>(capacity);'''
 assert original.count(needle) == 1
 modified = original.replace(needle, replacement)
+# Probe the otherwise unchanged production writer only in the disposable build.
+for needle, replacement in [
+    ('let result = tokio::task::spawn_blocking(move || {',
+     'let submitted = super::diagnostics::start();\n                    let result = tokio::task::spawn_blocking(move || {\n                        super::diagnostics::elapsed(submitted, "dispatch", 0);'),
+    ('self.sender()\n            .send(Message::Write(bytes, offset))',
+     'let started = super::diagnostics::start();\n        let result = self.sender()\n            .send(Message::Write(bytes, offset))'),
+    ('self.sender()\n            .send(Message::WriteBatch(bytes, offset))',
+     'let started = super::diagnostics::start();\n        let result = self.sender()\n            .send(Message::WriteBatch(bytes, offset))'),
+]:
+    assert modified.count(needle) == 1
+    modified = modified.replace(needle, replacement)
+needle = '.context("S3 destination writer stopped")\n    }'
+assert modified.count(needle) == 2
+modified = modified.replace(needle, '.context("S3 destination writer stopped");\n        super::diagnostics::elapsed(started, "queue_send", 0);\n        result\n    }')
 destination = root / 'target' / os.environ.get('SYQ_QUEUE_BUILD_RUN', 'transport-queue-build')
 destination.mkdir(exist_ok=True)
 (destination / 'writer.rs').write_text(modified)
@@ -33,7 +47,9 @@ try:
         'original_writer_sha256': digest(original.encode()),
         'experimental_writer_sha256': digest(modified.encode()),
         'binary_sha256': digest((destination / 'client').read_bytes()),
-        'change': 'Writer queue capacity read once from SYQ_SPIKE_QUEUE; no other source changes',
+        'change': 'Writer queue capacity from SYQ_SPIKE_QUEUE; opt-in dispatch and queue-send probes',
+        'source_sha256': {str(p.relative_to(root)): digest(p.read_bytes()) for p in [root / 'examples/s3_transport_spike.rs', root / 'examples/support/s3_stage_metrics.rs', Path(__file__).resolve()]},
+        'profile_environment': {k: v for k, v in os.environ.items() if k.startswith('CARGO_PROFILE_')},
     }, indent=2))
 finally:
     assert subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip() == str(root)

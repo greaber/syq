@@ -12,16 +12,12 @@ use std::{
     },
     time::{Duration, Instant},
 };
-// Reuse syq's buffered destination writer, with diagnostics disabled.
+// Reuse the production writer; optional probes are isolated to this example.
+#[path = "support/s3_stage_metrics.rs"]
+mod diagnostics;
 #[allow(dead_code)]
 #[path = "../src/s3/writer.rs"]
 mod writer;
-mod diagnostics {
-    pub fn start() -> Option<std::time::Instant> {
-        None
-    }
-    pub fn elapsed(_: Option<std::time::Instant>, _: &str, _: u64) {}
-}
 
 #[derive(Clone, serde::Deserialize)]
 struct Object {
@@ -73,10 +69,16 @@ fn sync_get(agent: &ureq::Agent, object: &Object, dir: &str, i: usize) -> Result
     let mut bytes = 0;
     while bytes < object.size {
         let n = buffer.len().min(object.size - bytes);
+        let started = diagnostics::start();
         reader.read_exact(&mut buffer[..n])?;
+        diagnostics::elapsed(started, "read", n as u64);
+        let started = diagnostics::start();
         hash.update(&buffer[..n]);
+        diagnostics::elapsed(started, "hash", n as u64);
         if let Some(f) = &mut file {
+            let started = diagnostics::start();
             f.write_all(&buffer[..n])?;
+            diagnostics::elapsed(started, "buffered_write", n as u64);
         }
         bytes += n;
     }
@@ -113,14 +115,29 @@ impl Drop for RequestProbe {
         }
     }
 }
-// Exactly one explicit reusable data buffer per download, with no next read
-// until its write completes. HTTP/TLS and kernel buffers are separate. The
-// blocking worker owns file and buffer during the write, then returns them.
+// One or two reusable buffers per download. With two, the next read/hash can
+// overlap the previous write; at most one blocking write is outstanding. Errors
+// still propagate, and runtime shutdown joins outstanding blocking jobs on failure.
+struct PendingWrite {
+    submitted: Option<Instant>,
+    bytes: u64,
+    task: tokio::task::JoinHandle<std::io::Result<(File, Vec<u8>)>>,
+}
+impl PendingWrite {
+    async fn finish(self) -> Result<(File, Vec<u8>)> {
+        let waiting = diagnostics::start();
+        let result = self.task.await??;
+        diagnostics::elapsed(waiting, "write_join", self.bytes);
+        diagnostics::elapsed(self.submitted, "write_completion", self.bytes);
+        Ok(result)
+    }
+}
 async fn async_sequential_get(
     connector: Arc<aws_smithy_http_client::Connector>,
     object: Object,
     dir: String,
     i: usize,
+    buffers: usize,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
     let request_probe = RequestProbe::start();
@@ -132,26 +149,55 @@ async fn async_sequential_get(
     let mut reader = ByteStream::new(response.into_body()).into_async_read();
     let mut file = tokio::task::spawn_blocking(move || output(&dir, i)).await??;
     let mut hash = blake3::Hasher::new();
-    let mut buffer = vec![0; sequential_chunk()];
+    let mut available: Vec<_> = (0..buffers).map(|_| vec![0; sequential_chunk()]).collect();
+    let mut pending: Option<PendingWrite> = None;
     let mut bytes = 0;
     while bytes < object.size {
-        let n = buffer.len().min(object.size - bytes);
-        reader.read_exact(&mut buffer[..n]).await?;
-        hash.update(&buffer[..n]);
-        if let Some(mut destination) = file.take() {
-            (destination, buffer) = tokio::task::spawn_blocking(move || {
-                destination.write_all(&buffer[..n])?;
-                Ok::<_, std::io::Error>((destination, buffer))
-            })
-            .await??;
+        if available.is_empty() {
+            let (destination, buffer) = pending
+                .take()
+                .expect("buffer owned by writer")
+                .finish()
+                .await?;
             file = Some(destination);
+            available.push(buffer);
+        }
+        let mut buffer = available.pop().unwrap();
+        let n = buffer.len().min(object.size - bytes);
+        let started = diagnostics::start();
+        reader.read_exact(&mut buffer[..n]).await?;
+        diagnostics::elapsed(started, "read", n as u64);
+        let started = diagnostics::start();
+        hash.update(&buffer[..n]);
+        diagnostics::elapsed(started, "hash", n as u64);
+        if let Some(write) = pending.take() {
+            let (destination, returned) = write.finish().await?;
+            file = Some(destination);
+            available.push(returned);
+        }
+        if let Some(mut destination) = file.take() {
+            let submitted = diagnostics::start();
+            let task = tokio::task::spawn_blocking(move || {
+                diagnostics::elapsed(submitted, "dispatch", 0);
+                let started = diagnostics::start();
+                destination.write_all(&buffer[..n])?;
+                diagnostics::elapsed(started, "buffered_write", n as u64);
+                Ok((destination, buffer))
+            });
+            pending = Some(PendingWrite {
+                submitted,
+                bytes: n as u64,
+                task,
+            });
+        } else {
+            available.push(buffer);
         }
         bytes += n;
     }
-    ensure!(
-        reader.read(&mut buffer[..1]).await? == 0,
-        "extra body bytes"
-    );
+    if let Some(write) = pending {
+        write.finish().await?;
+    }
+    ensure!(reader.read(&mut [0]).await? == 0, "extra body bytes");
     drop(request_probe);
     finish(hash, &object, bytes)
 }
@@ -187,9 +233,16 @@ async fn async_get(
     let mut batch = Vec::new();
     let mut batch_bytes = 0;
     let mut fragments = bytes::BytesMut::new();
-    while let Some(frame) = body.next().await {
+    loop {
+        let started = diagnostics::start();
+        let Some(frame) = body.next().await else {
+            break;
+        };
         let mut frame = frame?;
+        diagnostics::elapsed(started, "read", frame.len() as u64);
+        let started = diagnostics::start();
         hash.update(&frame);
+        diagnostics::elapsed(started, "hash", frame.len() as u64);
         if let Some(w) = &writer {
             // Match download_fast_range's 128 KiB cap and fragment packing.
             while !frame.is_empty() {
@@ -309,7 +362,7 @@ fn main() -> Result<()> {
         .unwrap_or(0);
     ensure!(serial_tail < groups, "tail consumes every group");
     ensure!(
-        serial_tail == 0 || a[1] == "async" || a[1] == "async-sequential",
+        serial_tail == 0 || a[1] == "async" || a[1] == "async-sequential" || a[1] == "async-double",
         "tail probe requires async"
     );
     let mut phase_elapsed = Vec::new();
@@ -361,10 +414,11 @@ fn main() -> Result<()> {
         })?;
     } else {
         ensure!(
-            a[1] == "async" || a[1] == "async-sequential",
+            a[1] == "async" || a[1] == "async-sequential" || a[1] == "async-double",
             "unknown mode"
         );
-        let sequential = a[1] == "async-sequential";
+        let sequential = a[1] != "async";
+        let buffers = if a[1] == "async-double" { 2 } else { 1 };
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
             .enable_all()
@@ -403,7 +457,7 @@ fn main() -> Result<()> {
                             tokio::spawn(async move {
                                 tokio::time::timeout(Duration::from_secs(60), async move {
                                     if sequential {
-                                        async_sequential_get(c, o, dir, i).await
+                                        async_sequential_get(c, o, dir, i, buffers).await
                                     } else {
                                         async_group(c, o, dir, i, readers).await
                                     }
@@ -421,6 +475,7 @@ fn main() -> Result<()> {
             Ok::<_, anyhow::Error>(())
         })?;
     }
+    let stages = diagnostics::snapshot();
     let usage = unsafe {
         let mut u: libc::rusage = std::mem::zeroed();
         libc::getrusage(libc::RUSAGE_SELF, &mut u);
@@ -429,7 +484,7 @@ fn main() -> Result<()> {
     let cpu = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     println!(
         "{}",
-        serde_json::json!({"mode":a[1],"chunk_bytes":if a[1] == "async" {CHUNK} else {sequential_chunk()},"objects":groups,"requests":jobs,"readers_per_writer":readers,"serial_tail":serial_tail,"phase_elapsed":phase_elapsed,"bytes":total,"concurrency":concurrency,"workers":workers,"elapsed":start.elapsed().as_secs_f64(),"user":cpu(usage.ru_utime),"system":cpu(usage.ru_stime),"rss_kib":usage.ru_maxrss,"voluntary":usage.ru_nvcsw,"involuntary":usage.ru_nivcsw,"io_before":io_before,"io_after":std::fs::read_to_string("/sys/fs/cgroup/io.stat").unwrap_or_default(),"memory_stat":std::fs::read_to_string("/sys/fs/cgroup/memory.stat").unwrap_or_default(),"memory_events":std::fs::read_to_string("/sys/fs/cgroup/memory.events").unwrap_or_default()})
+        serde_json::json!({"stages":stages,"mode":a[1],"chunk_bytes":if a[1] == "async" {CHUNK} else {sequential_chunk()},"objects":groups,"requests":jobs,"readers_per_writer":readers,"serial_tail":serial_tail,"phase_elapsed":phase_elapsed,"bytes":total,"concurrency":concurrency,"workers":workers,"elapsed":start.elapsed().as_secs_f64(),"user":cpu(usage.ru_utime),"system":cpu(usage.ru_stime),"rss_kib":usage.ru_maxrss,"voluntary":usage.ru_nvcsw,"involuntary":usage.ru_nivcsw,"io_before":io_before,"io_after":std::fs::read_to_string("/sys/fs/cgroup/io.stat").unwrap_or_default(),"memory_stat":std::fs::read_to_string("/sys/fs/cgroup/memory.stat").unwrap_or_default(),"memory_events":std::fs::read_to_string("/sys/fs/cgroup/memory.events").unwrap_or_default()})
     );
     Ok(())
 }
