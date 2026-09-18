@@ -2,7 +2,7 @@ import concurrent.futures, datetime, hashlib, hmac, importlib.util, json, os, pa
 ROOT=pathlib.Path.cwd(); D=ROOT/'target/transport-spike'; BIN=ROOT/'target/release/examples/s3_transport_spike'
 assert subprocess.check_output(['git','rev-parse','--show-toplevel'],text=True).strip()==str(ROOT)
 CERT=D/'cert'; CERT.mkdir(exist_ok=True)
-subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(CERT/'private.key'),'-out',str(CERT/'public.crt'),'-days','1','-subj','/CN=localhost','-addext','subjectAltName=IP:127.0.0.1,DNS:localhost'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(CERT/'private.key'),'-out',str(CERT/'public.crt'),'-days','1','-subj','/CN=localhost','-addext','basicConstraints=critical,CA:FALSE','-addext','subjectAltName=IP:127.0.0.1,DNS:localhost'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 os.environ.update(AWS_ACCESS_KEY_ID='syq-test-user',AWS_SECRET_ACCESS_KEY='syq-test-password',AWS_REGION='us-east-1',AWS_EC2_METADATA_DISABLED='true',SYQ_TEST_BUCKET='transport-spike')
 for k in ('AWS_SESSION_TOKEN','AWS_PROFILE'): os.environ.pop(k,None)
 container=None; results=[]
