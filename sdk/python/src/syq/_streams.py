@@ -137,6 +137,8 @@ class _Process:
     def finish(self) -> None:
         self.process.wait()
         self._release()
+        if self.process.returncode == 0:
+            return
         if self.expired:
             raise subprocess.TimeoutExpired(self.argv, self.timeout, stderr=bytes(self.stderr))
         if self.process.returncode:
@@ -163,10 +165,12 @@ class _Process:
 
 
 class StreamWriter:
-    """Sequential binary writer. close() commits; abort() discards the upload."""
+    """Sequential binary writer. close() ends input; commit() publishes it."""
     def __init__(self, process: _Process) -> None:
         self._process = process
         self.closed = False
+        self._committed = False
+        self._aborted = False
 
     def __del__(self) -> None:
         try:
@@ -180,13 +184,16 @@ class StreamWriter:
 
     def __exit__(self, typ, value, traceback) -> None:
         if typ is None:
-            self.close()
+            self.commit()
         else:
             self.abort()
 
     def _check_open(self) -> None:
         if self.closed:
             raise ValueError("I/O operation on closed stream")
+
+    def readable(self) -> bool:
+        return False
 
     def writable(self) -> bool:
         return True
@@ -205,8 +212,7 @@ class StreamWriter:
                     raise BrokenPipeError("stream writer made no progress")
                 remaining = remaining[written:]
         except OSError:
-            self.closed = True
-            self._process.abort()
+            self.abort()
             if self._process.expired:
                 raise subprocess.TimeoutExpired(self._process.argv, self._process.timeout,
                                                 stderr=bytes(self._process.stderr)) from None
@@ -219,19 +225,28 @@ class StreamWriter:
         self._check_open()  # Writes go directly to the transport's bounded pipe.
 
     def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        try:
+        """End payload input, leaving publication to commit() or context exit."""
+        if not self.closed:
+            self.closed = True
             self._process.payload.close()
+
+    def commit(self) -> None:
+        """End input, authorize publication, and check transfer completion."""
+        if self._committed:
+            return
+        if self._aborted:
+            raise ValueError("cannot commit an aborted stream")
+        try:
+            self.close()
+            assert self._process.control is not None
             if not self._process.expired:
-                assert self._process.control is not None
                 self._process.control.write(b"C")
             self._process.control.close()
             self._process.control = None
             self._process.finish()
+            self._committed = True
         except OSError:
-            self._process.abort()
+            self.abort()
             if self._process.expired:
                 raise subprocess.TimeoutExpired(self._process.argv, self._process.timeout,
                                                 stderr=bytes(self._process.stderr)) from None
@@ -239,14 +254,15 @@ class StreamWriter:
             raise SyqProcessError(Result(self._process.argv, self._process.process.returncode,
                                          b"", bytes(self._process.stderr))) from None
         except BaseException:
-            if not self._process.done.is_set():
-                self._process.abort()
+            self.abort()
             raise
 
     def abort(self) -> None:
         self.closed = True
-        if not self._process.done.is_set():
-            self._process.abort()
+        if not self._committed:
+            self._aborted = True
+            if not self._process.done.is_set():
+                self._process.abort()
 
 
 class StreamReader:
@@ -276,16 +292,23 @@ class StreamReader:
     def readable(self) -> bool:
         return True
 
+    def writable(self) -> bool:
+        return False
+
     def seekable(self) -> bool:
         return False
 
-    def read(self, size: int = -1) -> bytes:
+    def flush(self) -> None:
+        if self.closed:
+            raise ValueError("I/O operation on closed stream")
+
+    def read(self, size: int | None = -1) -> bytes:
         if self.closed:
             raise ValueError("I/O operation on closed stream")
         if self._ended:
             return b""
         data = self._process.payload.read(size)
-        if not data and size != 0:
+        if size is None or size < 0 or (not data and size != 0):
             self._ended = True
             self._process.finish()
         return data
@@ -360,12 +383,22 @@ class _AsyncStream:
 
 
 class AsyncStreamWriter(_AsyncStream):
+    async def __aexit__(self, typ, value, traceback) -> None:
+        if typ is None:
+            await self.commit()
+        else:
+            await self.abort()
+
+    async def commit(self) -> None:
+        stream = self._active()
+        await _call(stream, stream.commit)
+
     async def write(self, data: bytes | bytearray | memoryview) -> int:
         stream = self._active()
         return await _call(stream, stream.write, data)
 
 
 class AsyncStreamReader(_AsyncStream):
-    async def read(self, size: int = -1) -> bytes:
+    async def read(self, size: int | None = -1) -> bytes:
         stream = self._active()
         return await _call(stream, stream.read, size)

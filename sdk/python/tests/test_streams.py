@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from array import array
+import io
+import json
 import os
 from pathlib import Path
-import signal
+import sys
+import threading
 import subprocess
 import tarfile
 import tempfile
@@ -92,6 +95,95 @@ class StreamTests(unittest.TestCase):
                 input.read()
         self.assertTrue(caught.exception.result.stderr)
 
+    def test_wrappers_close_payload_without_committing_on_success_or_exception(self):
+        for remote in (False, True):
+            rsh = self.root / 'wrapper-rsh'
+            rsh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$1"\n')
+            rsh.chmod(0o700)
+            options = dict(to='fixture', rsh=str(rsh), syq_path=str(SYQ)) if remote else {}
+            for text in (False, True):
+                for fail in (False, True):
+                    with self.subTest(remote=remote, text=text, fail=fail):
+                        target = self.root / 'wrapped'
+                        target.write_bytes(b'old')
+                        error = ValueError('producer failed')
+                        try:
+                            with self.client.open_writer(as_=target, **options) as output:
+                                wrapper = (io.TextIOWrapper(output, encoding='utf-8') if text
+                                           else io.BufferedWriter(output))
+                                with wrapper:
+                                    wrapper.write('partial' if text else b'partial')
+                                    if fail:
+                                        raise error
+                                self.assertTrue(output.closed)
+                                self.assertEqual(target.read_bytes(), b'old')
+                        except ValueError as caught:
+                            self.assertTrue(fail)
+                            self.assertIs(caught, error)
+                        else:
+                            self.assertFalse(fail)
+                        self.assertEqual(target.read_bytes(), b'old' if fail else b'partial')
+                        self.assertIsNotNone(output._process.process.poll())
+                        self.assertFalse(list(self.root.glob('.syq-stream-*')))
+
+    def test_explicit_commit_and_abort_after_payload_close(self):
+        target = self.root / 'explicit'
+        target.write_bytes(b'old')
+        for commit in (False, True):
+            output = self.client.open_writer(as_=target)
+            try:
+                with io.BufferedWriter(output) as buffered:
+                    buffered.write(b'new')
+                output.close()  # Idempotent payload closure.
+                self.assertEqual(target.read_bytes(), b'old')
+                with self.assertRaises(ValueError):
+                    output.write(b'too late')
+                if commit:
+                    output.commit()
+                    output.commit()
+                    self.assertEqual(target.read_bytes(), b'new')
+                else:
+                    output.abort()
+                    with self.assertRaises(ValueError):
+                        output.commit()
+                    self.assertEqual(target.read_bytes(), b'old')
+            finally:
+                output.abort()
+        self.assertFalse(list(self.root.glob('.syq-stream-*')))
+
+    def test_text_reader_and_failed_read_all(self):
+        target = self.root / 'text-input'
+        target.write_text('one\ntwo\n', encoding='utf-8')
+        with self.client.open_reader(target) as source:
+            with io.TextIOWrapper(source, encoding='utf-8') as text:
+                self.assertEqual(list(text), ['one\n', 'two\n'])
+        fake = self.root / 'broken-reader'
+        fake.write_text('#!/bin/sh\nprintf \'{"a": 1\'\nexit 1\n')
+        fake.chmod(0o700)
+        for size in (-1, None):
+            with self.subTest(size=size), self.assertRaises(syq.SyqProcessError):
+                with syq.Client(executable=fake).open_reader('unused') as source:
+                    json.loads(source.read(size))
+            self.assertEqual(source._process.process.returncode, 1)
+
+    def test_successful_exit_is_not_overridden_by_deadline(self):
+        fake = self.root / 'finished-reader'
+        # The deadline can race with a successful exit. Arrange a child
+        # that returns success on TERM, and arm the watchdog after it is ready.
+        fake.write_text(f'#!{sys.executable}\nimport signal, sys\n'
+                        'signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n'
+                        'print("ready", end="", flush=True)\nsignal.pause()\n')
+        fake.chmod(0o700)
+        with syq.Client(executable=fake).open_reader('unused') as source:
+            self.assertEqual(source.read(5), b'ready')
+            process = source._process
+            process.timeout = 0
+            process.watchdog = threading.Thread(target=process._deadline, daemon=True)
+            process.watchdog.start()
+            self.assertEqual(source.read(), b'')
+            self.assertTrue(process.expired)
+            self.assertEqual(process.process.returncode, 0)
+
     def test_completion_eof_aborts_even_after_payload_eof(self):
         target = self.root / 'uncommitted'
         for message in (b'', b'X', b'CC', b'C'):
@@ -145,14 +237,45 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(task, 10)
             self.assertIsNotNone(input._stream._process.process.poll())
 
-    async def test_cancelled_close_reaps_process(self):
+    async def test_closed_payload_commits_only_after_successful_context(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp).resolve() / 'target'
+            client = syq.AsyncClient(executable=SYQ, timeout=10)
+            for fail in (False, True):
+                target.write_bytes(b'old')
+                try:
+                    async with client.open_writer(as_=target) as output:
+                        await output.write(b'new')
+                        await output.close()
+                        self.assertEqual(target.read_bytes(), b'old')
+                        if fail:
+                            raise ValueError('producer failed')
+                except ValueError:
+                    self.assertTrue(fail)
+                self.assertEqual(target.read_bytes(), b'old' if fail else b'new')
+                self.assertIsNotNone(output._stream._process.process.poll())
+            async with client.open_writer(as_=target) as output:
+                await output.write(b'explicit')
+                await output.commit()
+                self.assertEqual(target.read_bytes(), b'explicit')
+
+    async def test_failed_read_all_reports_transfer_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fake = Path(temp).resolve() / 'broken-reader'
+            fake.write_text('#!/bin/sh\nprintf \'{"a": 1\'\nexit 1\n')
+            fake.chmod(0o700)
+            with self.assertRaises(syq.SyqProcessError):
+                async with syq.AsyncClient(executable=fake).open_reader('unused') as source:
+                    json.loads(await source.read())
+
+    async def test_cancelled_commit_reaps_process(self):
         with tempfile.TemporaryDirectory() as temp:
             fake = Path(temp).resolve() / 'slow-syq'
             fake.write_text('#!/bin/sh\nexec sleep 60\n')
             fake.chmod(0o700)
             output = syq.AsyncClient(executable=fake).open_writer(as_='ignored')
             await output.__aenter__()
-            task = asyncio.create_task(output.close())
+            task = asyncio.create_task(output.commit())
             await asyncio.sleep(.05)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):

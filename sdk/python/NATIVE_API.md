@@ -147,25 +147,36 @@ is attempted. S3 can retry buffered multipart parts.
 
 | Object | Operations |
 |---|---|
-| `StreamWriter` | `write(bytes)` writes the complete buffer and returns its length; `flush()` has no Python buffer to flush; `close()` commits and checks completion; `abort()` cancels |
+| `StreamWriter` | `write(bytes)` writes the complete buffer and returns its length; `flush()` has no Python buffer to flush; `close()` ends payload input; `commit()` publishes and checks completion; `abort()` cancels |
 | `StreamReader` | `read(size=-1)`, `readinto(buffer)`; `close()` drains remaining bytes in bounded chunks and checks completion; `abort()` cancels |
 
 Use a `with` block. Successful writer exit sends a separate commit signal
 after closing the payload; EOF alone cannot publish a managed upload. An
-exception in the writer body before commit aborts without replacing the destination. Explicitly calling
-`close()` commits immediately, so later application errors cannot undo it.
+exception in the writer body before commit aborts without replacing the destination.
+`close()` only ends payload input, so a buffered or text wrapper can close it
+while unwinding an exception without publishing partial data. Successful
+context exit commits even if a wrapper already closed the payload.
+
+Outside a context, finish with `commit()` or `abort()`; `close()` alone leaves
+the transfer pending. `commit()` can follow payload closure, is repeatable
+after success, and fails after an abort. Explicit commit publishes immediately,
+so later application errors cannot undo it. Closing an outer wrapper flushes
+its buffered data; do that before committing the underlying writer.
 A timeout or connection loss during commit can leave the outcome uncertain;
 the method reports failure rather than claiming rollback. Whole datasets
 need their own final publication step after all object transfers succeed.
 
-A reader can yield partial data before a later transfer error. Successful
-reader exit establishes transfer completion, not that downstream application
+A bounded reader call can yield partial data before a later transfer error.
+An unbounded `read()` checks transfer completion before returning its bytes.
+Successful reader exit establishes transfer completion, not that downstream application
 work was successful. An exception inside either context cancels the transfer
-and preserves the original exception. Unclosed writers are aborted, never
-committed, during garbage collection; use explicit contexts for timely cleanup.
+and preserves the original exception. Writers that have not committed are
+aborted during garbage collection, including after payload closure; cleanup
+can block, so use explicit contexts for timely cleanup.
 
 `timeout` covers the stream's lifetime, including blocked reads/writes. Timeout
-raises `subprocess.TimeoutExpired`; transfer failures raise `SyqProcessError`,
+raises `subprocess.TimeoutExpired` unless the transfer has completed successfully;
+transfer failures raise `SyqProcessError`,
 whose result contains the exit status and the last 8 KiB of diagnostics, without
 capturing payload bytes.
 
@@ -183,6 +194,8 @@ async with client.open_reader("generated.bin", from_="server") as source:
 Async streams start on context entry. Cancellation terminates the owned
 transfer process and releases blocked I/O. `AsyncStreamReader` and
 `AsyncStreamWriter` expose async `read`/`write`, `close`, and `abort` methods.
+`AsyncStreamWriter.commit()` explicitly publishes, with the same semantics
+as its synchronous counterpart; successful async context exit commits automatically.
 
 ## rm
 

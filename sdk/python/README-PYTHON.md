@@ -173,8 +173,13 @@ with syq.open_reader("dataset.tar", from_="s3://backups") as source:
         consume(chunk)
 ```
 
+Writers work with `io.BufferedWriter` and `io.TextIOWrapper`. Closing a wrapper
+ends payload input; the outer syq context commits only on successful exit.
+Outside a context, explicitly call `commit()` or `abort()` to finish the transfer.
+
 The streams use bounded transport buffers. Reading without a size requests
-all remaining bytes into Python memory. Reader context exit drains unread
+all remaining bytes into Python memory and checks transfer completion before
+returning them. Reader context exit drains unread
 bytes and checks transfer success, so archive readers may stop at their own
 end marker. Call `abort()` to cancel instead. If a consumer publishes files,
 keep them staged until both decoding and the reader context finish successfully.
