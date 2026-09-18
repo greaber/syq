@@ -464,12 +464,15 @@ impl Sched {
             jobs.push(job);
             jobs.len() - 1
         };
-        self.inner
-            .lock()
-            .unwrap()
-            .files
-            .push((size, Reverse(FileOrder::new(idx))));
-        self.cv.notify_one();
+        let mut inner = self.inner.lock().unwrap();
+        inner.files.push((size, Reverse(FileOrder::new(idx))));
+        // Workers cannot consume queued files until namespace planning finishes.
+        // scan_done wakes them together when that work becomes runnable.
+        let runnable = inner.scan_done;
+        drop(inner);
+        if runnable {
+            self.cv.notify_one();
+        }
         idx
     }
 
@@ -535,8 +538,13 @@ impl Sched {
     /// Let speculative TCP workers warm while the planner performs remote
     /// namespace and directory work for a batch that contains regular files.
     pub fn anticipate_file_work(&self) {
-        self.inner.lock().unwrap().file_work_anticipated = true;
-        self.cv.notify_all();
+        let mut inner = self.inner.lock().unwrap();
+        let first = !inner.file_work_anticipated;
+        inner.file_work_anticipated = true;
+        drop(inner);
+        if first {
+            self.cv.notify_all();
+        }
     }
 
     /// Wait to learn whether planning found any regular files. False means the
