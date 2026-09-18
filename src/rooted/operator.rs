@@ -9,6 +9,11 @@ pub(crate) enum OperatorFinalComponent {
     Entry {
         follow_symlink: bool,
     },
+    /// A byte-stream source. On platforms without O_PATH, keep a FIFO's
+    /// parent and identity without opening a metadata handle that joins it.
+    StreamSource {
+        follow_symlink: bool,
+    },
     /// An input file whose final procfs magic link may be opened relative to
     /// its retained procfs parent instead of interpreting its synthetic target
     /// bytes as an ordinary symlink path.
@@ -346,6 +351,8 @@ impl OperatorResolver {
                         follow_symlink: true
                     } | OperatorFinalComponent::ReadableEntry {
                         follow_symlink: true
+                    } | OperatorFinalComponent::StreamSource {
+                        follow_symlink: true
                     }
                 );
 
@@ -498,7 +505,10 @@ impl OperatorResolver {
             // In particular, macOS O_EVTONLY can release a waiting producer
             // and discard its bytes before the stream's actual open. Elsewhere
             // retain the parent and observed identity; the input open checks it.
-            let object = if metadata.is_fifo() && !cfg!(target_os = "linux") {
+            let object = if metadata.is_fifo()
+                && !cfg!(target_os = "linux")
+                && matches!(final_component, OperatorFinalComponent::StreamSource { .. })
+            {
                 None
             } else {
                 let object = open_operator_metadata_at(current.directory.as_raw_fd(), &name)

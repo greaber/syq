@@ -836,7 +836,7 @@ fn selecting_fifo_metadata_does_not_connect_a_writer() {
     let selected = resolver
         .resolve(
             b"pipe",
-            OperatorFinalComponent::Entry {
+            OperatorFinalComponent::StreamSource {
                 follow_symlink: false,
             },
             false,
