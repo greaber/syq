@@ -178,6 +178,7 @@ def run(case, mode, repeats, label):
         at = args.index(IMAGE) + 1
         args[at:at] = ['/usr/bin/env', 'LD_PRELOAD=/bench/memory-probe.so',
                       'SYQ_SPIKE_RCVBUF=' + str(case.get('receive_buffer', 0)),
+                      'SYQ_SPIKE_RCVBUDGET=' + str(case.get('receive_budget', 0)),
                       *(['MALLOC_ARENA_MAX=' + str(case['malloc_arenas'])] if 'malloc_arenas' in case else [])]
     gate = STAGE / 'start-client'
     if MEMORY_TRACE:
@@ -372,6 +373,8 @@ try:
         if HEAP_PROBE:
             case.update(heap_probe=True)
             case.setdefault('receive_buffer', int(os.environ.get('SYQ_STRESS_RCVBUF', 0)))
+            if os.environ.get('SYQ_STRESS_RCVBUDGET'):
+                case['receive_budget'] = int(os.environ['SYQ_STRESS_RCVBUDGET'])
             if os.environ.get('SYQ_STRESS_MALLOC_ARENAS'):
                 case['malloc_arenas'] = int(os.environ['SYQ_STRESS_MALLOC_ARENAS'])
         if QUEUE_SWEEP:
