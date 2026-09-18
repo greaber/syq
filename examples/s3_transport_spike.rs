@@ -75,6 +75,7 @@ async fn async_get(
     object: Object,
     dir: String,
     i: usize,
+    destination: Option<(writer::Writer, u64)>,
 ) -> Result<()> {
     let request = http::Request::builder()
         .uri(&object.url)
@@ -82,14 +83,19 @@ async fn async_get(
     let response = connector.call(request.try_into()?).await?;
     ensure!(response.status().as_u16() == 200, "GET failed");
     let mut body = ByteStream::new(response.into_body());
-    let file = if dir == "-" {
-        None
+    let (writer, base_offset) = if let Some((writer, offset)) = destination {
+        (Some(writer), offset)
     } else {
-        tokio::task::spawn_blocking(move || output(&dir, i)).await??
+        let file = if dir == "-" {
+            None
+        } else {
+            tokio::task::spawn_blocking(move || output(&dir, i)).await??
+        };
+        let writer = file
+            .map(|f| writer::Writer::with_readback(Arc::new(f), object.size as u64, true))
+            .transpose()?;
+        (writer, 0)
     };
-    let writer = file
-        .map(|f| writer::Writer::with_readback(Arc::new(f), object.size as u64, true))
-        .transpose()?;
     let mut hash = blake3::Hasher::new();
     let mut bytes = 0;
     let mut batch = Vec::new();
@@ -102,7 +108,8 @@ async fn async_get(
             // Match download_fast_range's 128 KiB cap and fragment packing.
             while !frame.is_empty() {
                 if batch_bytes == 0 && frame.len() >= CHUNK {
-                    w.write(frame.split_to(CHUNK), bytes as u64).await?;
+                    w.write(frame.split_to(CHUNK), base_offset + bytes as u64)
+                        .await?;
                     bytes += CHUNK;
                     continue;
                 }
@@ -118,8 +125,11 @@ async fn async_get(
                 bytes += n;
                 if batch_bytes == CHUNK || batch.len() + usize::from(!fragments.is_empty()) >= 16 {
                     flush_fragments(&mut batch, &mut fragments);
-                    w.write_batch(std::mem::take(&mut batch), (bytes - batch_bytes) as u64)
-                        .await?;
+                    w.write_batch(
+                        std::mem::take(&mut batch),
+                        base_offset + (bytes - batch_bytes) as u64,
+                    )
+                    .await?;
                     batch_bytes = 0;
                 }
             }
@@ -130,11 +140,43 @@ async fn async_get(
     if let Some(w) = &writer {
         flush_fragments(&mut batch, &mut fragments);
         if !batch.is_empty() {
-            w.write_batch(batch, (bytes - batch_bytes) as u64).await?;
+            w.write_batch(batch, base_offset + (bytes - batch_bytes) as u64)
+                .await?;
         }
         w.finish().await?;
     }
     finish(hash, &object, bytes)
+}
+// Model several range readers sharing one destination queue. Each reader fetches
+// a complete fixture object into a disjoint extent; this isolates writer contention.
+async fn async_group(
+    connector: Arc<aws_smithy_http_client::Connector>,
+    object: Object,
+    dir: String,
+    i: usize,
+    readers: usize,
+) -> Result<()> {
+    if readers == 1 {
+        return async_get(connector, object, dir, i, None).await;
+    }
+    let file = tokio::task::spawn_blocking(move || output(&dir, i)).await??;
+    let writer = writer::Writer::with_readback(
+        Arc::new(file.expect("shared-writer probe requires files")),
+        (object.size * readers) as u64,
+        true,
+    )?;
+    let requests = (0..readers).map(|part| {
+        let c = connector.clone();
+        let o = object.clone();
+        let w = writer.clone();
+        async move {
+            let offset = (part * o.size) as u64;
+            tokio::spawn(async move { async_get(c, o, String::new(), 0, Some((w, offset))).await })
+                .await?
+        }
+    });
+    futures_util::future::try_join_all(requests).await?;
+    writer.finish().await
 }
 fn flush_fragments(batch: &mut Vec<bytes::Bytes>, fragments: &mut bytes::BytesMut) {
     if !fragments.is_empty() {
@@ -159,6 +201,20 @@ fn main() -> Result<()> {
         .len()
         .checked_mul(repeats)
         .expect("job count overflow");
+    let readers: usize = std::env::var("SYQ_SPIKE_READERS_PER_WRITER")
+        .ok()
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or(1);
+    ensure!(
+        readers > 0 && jobs.is_multiple_of(readers),
+        "incomplete reader group"
+    );
+    ensure!(
+        a[1] == "async" || readers == 1,
+        "shared writers require async"
+    );
+    let groups = jobs / readers;
     let concurrency: usize = a[3].parse()?;
     ensure!(concurrency > 0, "zero concurrency");
     let pem = std::fs::read(&a[5])?;
@@ -226,15 +282,18 @@ fn main() -> Result<()> {
                     .pool_max_idle_per_host(concurrency)
                     .build(),
             );
-            stream::iter(0..jobs)
+            stream::iter(0..groups)
                 .map(|i| {
-                    let o = objects[i % objects.len()].clone();
+                    let o = objects[(i * readers) % objects.len()].clone();
                     let c = connector.clone();
                     let dir = a[4].clone();
                     async move {
                         tokio::spawn(async move {
-                            tokio::time::timeout(Duration::from_secs(60), async_get(c, o, dir, i))
-                                .await?
+                            tokio::time::timeout(
+                                Duration::from_secs(60),
+                                async_group(c, o, dir, i, readers),
+                            )
+                            .await?
                         })
                         .await?
                     }
@@ -253,7 +312,7 @@ fn main() -> Result<()> {
     let cpu = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     println!(
         "{}",
-        serde_json::json!({"mode":a[1],"objects":jobs,"bytes":total,"concurrency":concurrency,"workers":workers,"elapsed":start.elapsed().as_secs_f64(),"user":cpu(usage.ru_utime),"system":cpu(usage.ru_stime),"rss_kib":usage.ru_maxrss,"voluntary":usage.ru_nvcsw,"involuntary":usage.ru_nivcsw,"io_before":io_before,"io_after":std::fs::read_to_string("/sys/fs/cgroup/io.stat").unwrap_or_default(),"memory_stat":std::fs::read_to_string("/sys/fs/cgroup/memory.stat").unwrap_or_default(),"memory_events":std::fs::read_to_string("/sys/fs/cgroup/memory.events").unwrap_or_default()})
+        serde_json::json!({"mode":a[1],"objects":groups,"requests":jobs,"readers_per_writer":readers,"bytes":total,"concurrency":concurrency,"workers":workers,"elapsed":start.elapsed().as_secs_f64(),"user":cpu(usage.ru_utime),"system":cpu(usage.ru_stime),"rss_kib":usage.ru_maxrss,"voluntary":usage.ru_nvcsw,"involuntary":usage.ru_nivcsw,"io_before":io_before,"io_after":std::fs::read_to_string("/sys/fs/cgroup/io.stat").unwrap_or_default(),"memory_stat":std::fs::read_to_string("/sys/fs/cgroup/memory.stat").unwrap_or_default(),"memory_events":std::fs::read_to_string("/sys/fs/cgroup/memory.events").unwrap_or_default()})
     );
     Ok(())
 }

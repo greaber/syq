@@ -1,6 +1,7 @@
 """Build an isolated queue-depth experiment, restoring production source afterward."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,7 +20,7 @@ replacement = '''static CAPACITY: OnceLock<usize> = OnceLock::new();
             let (send, mut recv) = mpsc::channel::<Message>(capacity);'''
 assert original.count(needle) == 1
 modified = original.replace(needle, replacement)
-destination = root / 'target/transport-queue-build'
+destination = root / 'target' / os.environ.get('SYQ_QUEUE_BUILD_RUN', 'transport-queue-build')
 destination.mkdir(exist_ok=True)
 (destination / 'writer.rs').write_text(modified)
 try:

@@ -36,7 +36,7 @@ IMAGE = 'ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194eb
 MINIO = 'minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e'
 BIN = ROOT / 'target/release/examples/s3_transport_spike'
 if QUEUE_SWEEP:
-    BIN = ROOT / 'target/transport-queue-build/client'
+    BIN = ROOT / os.environ.get('SYQ_STRESS_BINARY', 'target/transport-queue-build/client')
 shutil.copy2(BIN, STAGE / 'client')
 BINARY_SHA256 = hashlib.sha256(BIN.read_bytes()).hexdigest()
 subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
@@ -100,6 +100,7 @@ def run(case, mode, repeats, label):
     args = ['docker', 'create', '--network', 'host', '--cpuset-cpus', case['cpus'],
             '--memory', memory, '--memory-swap', memory, '--pids-limit', '512',
             '-v', str(STAGE) + ':/bench:ro', '-v', str(out) + ':/output:rw',
+            '-e', 'SYQ_SPIKE_READERS_PER_WRITER=' + str(case.get('readers', 1)),
             *(['--cpus', str(case['cpu_quota'])] if 'cpu_quota' in case else []),
             *(['--device-write-bps', case['write_bps']] if 'write_bps' in case else []),
             *(['-e', 'SYQ_SPIKE_QUEUE=' + mode.removeprefix('queue-')] if QUEUE_SWEEP else []),
@@ -140,10 +141,17 @@ def run(case, mode, repeats, label):
         assert len(files) == row['objects']
         verify_start = time.monotonic()
         next_progress = verify_start + 10
+        expected_hash = fixtures[case['fixture']]['sha256']
+        if case.get('readers', 1) > 1:
+            data = (STAGE / (case['fixture'] + '.source')).read_bytes()
+            combined = hashlib.sha256()
+            for _ in range(case['readers']):
+                combined.update(data)
+            expected_hash = combined.hexdigest()
         def verify(path):
             with path.open('rb') as f:
                 digest = hashlib.file_digest(f, 'sha256').hexdigest()
-            assert digest == fixtures[case['fixture']]['sha256'], (tag, path)
+            assert digest == expected_hash, (tag, path)
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             for count, _ in enumerate(pool.map(verify, files), 1):
                 if time.monotonic() >= next_progress:
@@ -217,6 +225,8 @@ try:
         cases.append({'name': 'writeback-roomy', 'fixture': 'large', 'cpus': '0-7',
                       'concurrency': 64, 'memory': '4g'})
         cases.extend([
+            {'name': 'shared-writer', 'fixture': 'large', 'cpus': '0-7',
+             'concurrency': 8, 'memory': '4g', 'readers': 8},
             {'name': 'many-cores', 'fixture': 'large', 'cpus': '0-7,16-39',
              'concurrency': 64, 'memory': '4g'},
             {'name': 'cpu-quota', 'fixture': 'large', 'cpus': '0-7',
@@ -233,7 +243,7 @@ try:
             repeats = {'writeback-pressure': 53, 'writeback-roomy': 64,
                        'single-stream': 32, 'two-core-fanout': 46,
                        'small-file-fanout': 400, 'many-cores': 64,
-                       'cpu-quota': 32, 'disk-limited': 64}[case['name']]
+                       'cpu-quota': 32, 'disk-limited': 64, 'shared-writer': 64}[case['name']]
             repeats = int(os.environ.get('SYQ_STRESS_REPEATS', repeats))
             rounds = int(os.environ.get('SYQ_STRESS_ROUNDS', 2))
             label = os.environ.get('SYQ_STRESS_LABEL', 'measured')
