@@ -373,7 +373,8 @@ done
 # reports it as verified. Use an ephemeral test key, never a maintainer secret.
 ssh-keygen -q -t ed25519 -N '' -f "$work/other-tag-key"
 jq -j '.verification.payload' <<<"$tag_json" >"$work/other-tag-payload"
-ssh-keygen -Y sign -f "$work/other-tag-key" -n git "$work/other-tag-payload"
+# This fixture uses its local private key, never an inherited agent.
+SSH_AUTH_SOCK='' ssh-keygen -Y sign -f "$work/other-tag-key" -n git "$work/other-tag-payload"
 other_signer=$(jq --rawfile signature "$work/other-tag-payload.sig" \
   '.verification.signature = $signature' <<<"$tag_json")
 expect_failure 'not signed by the pinned maintainer key' env \
