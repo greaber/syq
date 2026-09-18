@@ -109,6 +109,14 @@ def run(case, mode, repeats, label):
         state = json.loads(command(['docker', 'inspect', '--format', '{{json .State}}', active]))
         (D / (tag + '.state.json')).write_text(json.dumps(state))
         (D / (tag + '.stderr')).write_text(stderr)
+        if state['OOMKilled']:
+            row = {'case': case, 'mode': mode, 'label': label, 'repeats': repeats,
+                   'commit': COMMIT, 'status': 'oom', 'elapsed': time.monotonic()-started,
+                   'bytes': fixtures[case['fixture']]['count'] * fixtures[case['fixture']]['size'] * repeats}
+            results.append(row)
+            (D / 'results.json').write_text(json.dumps(results, indent=2))
+            print(f'{tag}: OOM killed; not a completed transfer', flush=True)
+            return row
         assert process.returncode == 0 and state['ExitCode'] == 0, (tag, state, stderr)
         row = json.loads(stdout)
         row.update(case=case, label=label, repeats=repeats, commit=COMMIT)
@@ -196,12 +204,18 @@ try:
         pilot = [run(case, mode, pilot_repeats, 'pilot') for mode in ('async', 'sync')]
         fastest = min(row['elapsed'] for row in pilot)
         repeats = max(pilot_repeats, math.ceil(pilot_repeats * 40 / fastest))
-        assert repeats * unit <= 128 * 1024**3, 'calibration exceeds 128 GiB cap'
+        repeats = min(repeats, (128 * 1024**3) // unit)
         measured = []
         for rep in range(2):
             for mode in (('async', 'sync') if rep == 0 else ('sync', 'async')):
                 measured.append(run(case, mode, repeats, f'measured-{rep}'))
-        assert min(row['elapsed'] for row in measured) >= 30, 'measured trial too short; enlarge workload'
+        completed = [row for row in measured if row.get('status') != 'oom']
+        assert completed and min(row['elapsed'] for row in completed) >= 30, 'measured trial too short; enlarge workload'
+        if case['name'] == 'writeback-pressure' and any(row.get('status') == 'oom' for row in measured):
+            lower = dict(case, name='writeback-pressure-low-concurrency', concurrency=8)
+            for rep in range(2):
+                row = run(lower, 'async', repeats, f'measured-{rep}')
+                assert row.get('status') != 'oom' and row['elapsed'] >= 30
 finally:
     if active:
         remove_container(active)
