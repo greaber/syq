@@ -1,11 +1,11 @@
-<h1 class="landing-title" id="copy-files-with-syq" aria-label="syq: Fast, programmable file operations">
+<h1 class="landing-title" id="copy-files-with-syq" aria-label="syq: Fast, programmable file transfer">
 <span class="landing-wordmark">syq</span>
-<span class="landing-subtitle">Fast, programmable file operations.</span>
+<span class="landing-subtitle">Fast, programmable file transfer.</span>
 </h1>
 
-Copy, reorganize and remove files—locally or across machines. Resume interrupted
-transfers, send files to your laptop or run commands there from a server’s
-remote shell, and script syq using the [JSON API](automation.md) or
+Copy, reorganize, and remove files across local filesystems, remote machines,
+and [S3-compatible storage](object-storage.md). Resume interrupted transfers,
+send files to your laptop or run commands there from a server’s remote shell, and script syq using the [JSON API](automation.md) or
 [Python SDK](python.md). Your laptop needs no SSH server or incoming network port.
 
 <nav class="landing-actions" aria-label="Explore syq">

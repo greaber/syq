@@ -1,6 +1,6 @@
 [book]
 title = "syq"
-description = "Fast, safe, programmable file motion"
+description = "Fast, programmable file transfer"
 language = "en"
 src = "docs"
 

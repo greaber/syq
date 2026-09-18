@@ -1,7 +1,9 @@
 # syq
 
-Syq (pronounced "sick") copies, reorganizes, and removes files—locally or
-across machines.
+Fast, programmable file transfer.
+
+Syq (pronounced "sick") copies, reorganizes, and removes files across local
+filesystems, remote machines, and S3-compatible storage.
 It aims to perform well across file sizes, directory sizes, and network speeds.
 
 [Documentation](https://greaber.github.io/syq/) ·
