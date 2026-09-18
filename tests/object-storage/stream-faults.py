@@ -231,6 +231,11 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                         with shared, peer:
                             shared.setblocking(not nonblocking)
                             peer.settimeout(15)
+                            # Darwin exposes its kernel FWASWRITTEN bookkeeping
+                            # bit through F_GETFL after write(2) returns. Prime it
+                            # before the snapshot, retaining the full comparison.
+                            os.write(shared.fileno(), b'x')
+                            assert peer.recv(1) == b'x'
                             original = fcntl.fcntl(shared, fcntl.F_GETFL)
                             PART_UPLOADED.clear()
                             child = spawn(put if upload else get,
@@ -242,14 +247,16 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                                 assert PART_UPLOADED.wait(10), 'upload did not start'
                             else:
                                 assert peer.recv(1) == DATA[:1], 'download did not start'
-                            assert fcntl.fcntl(shared, fcntl.F_GETFL) == original
+                            actual = fcntl.fcntl(shared, fcntl.F_GETFL)
+                            assert actual == original, (upload, nonblocking, sig, hex(original), hex(actual))
                             aborts = STATE['aborts']
                             child.send_signal(sig)
                             _, error = child.communicate(timeout=8)
                             assert child.returncode != 0, error
                             if upload and sig == signal.SIGTERM:
                                 assert STATE['aborts'] == aborts + 1
-                            assert fcntl.fcntl(shared, fcntl.F_GETFL) == original
+                            actual = fcntl.fcntl(shared, fcntl.F_GETFL)
+                            assert actual == original, (upload, nonblocking, sig, hex(original), hex(actual))
         elif CASE == 'environment-options':
             # Quoted keys and endpoint options must reach the stream parser.
             configured = env | {'SYQ_STREAM_OPTIONS': shlex.join(base[2:] + ['--as', 'key with spaces'])}
