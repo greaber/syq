@@ -165,7 +165,15 @@ impl Descriptor {
         .await?
     }
     pub(crate) fn read_bytes(&mut self, size: usize, fill: bool) -> Result<Vec<u8>> {
-        let mut bytes = Vec::<u8>::new();
+        self.read_reusing(size, fill, Vec::new())
+    }
+    pub(crate) fn read_reusing(
+        &mut self,
+        size: usize,
+        fill: bool,
+        mut bytes: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        bytes.clear();
         bytes
             .try_reserve_exact(size)
             .context("allocate stream part")?;

@@ -126,6 +126,7 @@ struct Workers {
     controls: Arc<Controls>,
     jobs: Arc<Mutex<mpsc::Receiver<Job>>>,
     results: mpsc::Sender<Job>,
+    buffers: std::sync::mpsc::SyncSender<Vec<u8>>,
     gate: Arc<tune::Gate>,
     cancelled: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
@@ -182,7 +183,7 @@ impl Workers {
                     connection.check_streaming_writes()?;
                 }
                 let hash = self.controls.settings.hash(&job.data);
-                connection.send(Request::WriteRange {
+                let buffer = connection.send_recycling(Request::WriteRange {
                     path: Vec::new(),
                     inplace: true,
                     copy_id: [0; 16],
@@ -192,6 +193,9 @@ impl Workers {
                     data: job.data,
                     guard: None,
                 })?;
+                if let Some(buffer) = buffer {
+                    let _ = self.buffers.try_send(buffer);
+                }
                 sent += 1;
                 bytes += job.len as u64;
                 if !streaming {
@@ -327,6 +331,10 @@ pub(super) async fn run(
     let budget = Arc::new(Semaphore::new(BUFFER_BYTES / GRANULE));
     let (jobs_tx, jobs_rx) = mpsc::channel(64);
     let (results_tx, mut results_rx) = mpsc::channel(64);
+    // Return buffers before releasing their memory credits. The reader can
+    // reuse them without another allocation or zeroing newly mapped pages.
+    let (buffers_tx, buffers_rx) =
+        std::sync::mpsc::sync_channel(BUFFER_BYTES / controls.settings.request_size);
     let gate = tune::Gate::new(prepared.workers);
     let draining = Arc::new(AtomicBool::new(false));
     let workers = Workers {
@@ -336,6 +344,7 @@ pub(super) async fn run(
         controls: controls.clone(),
         jobs: Arc::new(Mutex::new(jobs_rx)),
         results: results_tx,
+        buffers: buffers_tx,
         gate: gate.clone(),
         cancelled: cancelled.clone(),
         draining: draining.clone(),
@@ -392,7 +401,11 @@ pub(super) async fn run(
                     // bytes actually read become initialized buffer contents.
                     let permit =
                         runtime.block_on(credit(&budget, controls.settings.request_size))?;
-                    let data = input.read_bytes(controls.settings.request_size, false)?;
+                    let data = input.read_reusing(
+                        controls.settings.request_size,
+                        false,
+                        buffers_rx.try_recv().unwrap_or_default(),
+                    )?;
                     if data.is_empty() {
                         break;
                     }
