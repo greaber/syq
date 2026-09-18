@@ -27,6 +27,8 @@ QUEUE_SWEEP = os.environ.get('SYQ_STRESS_QUEUES')
 MEMORY_TRACE = os.environ.get('SYQ_STRESS_MEMORY') == '1'
 PERF = os.environ.get('SYQ_STRESS_PERF') == '1'
 STAGES = os.environ.get('SYQ_STRESS_STAGES') == '1'
+KERNEL = os.environ.get('SYQ_STRESS_KERNEL') == '1'
+assert not KERNEL or (MEMORY_TRACE and not PERF), 'kernel collector requires memory trace and separate perf mode'
 assert not PERF or MEMORY_TRACE, 'profiling requires startup gate and memory trace'
 QUEUES = [int(q) for q in QUEUE_SWEEP.split(',')] if QUEUE_SWEEP else []
 D = ROOT / ('target/transport-stress-http-v2' if PLAIN_HTTP else 'target/transport-stress-v2')
@@ -154,6 +156,37 @@ class PerfTrace:
             os.close(self.ack_read)
         assert self.process.returncode in (0, -signal.SIGINT), 'perf capture failed; inspect perf log'
 
+class KernelTrace:
+    """Request the separately authenticated, bounded collector; no sudo in harness."""
+    def __init__(self, pid, cid, tag):
+        self.tag, self.pid = tag, pid
+        self.stopped = False
+        stat = Path(f'/proc/{pid}/stat').read_text()
+        start = stat[stat.rfind(')') + 2:].split()[19]
+        path = D / (tag + '.kernel-request.json')
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(dict(pid=pid, container=cid, start_ticks=start)))
+        temporary.rename(path)
+        self.wait('ready', 8)
+
+    def wait(self, suffix, seconds):
+        path = D / (self.tag + '.kernel-' + suffix + '.json')
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if path.exists():
+                reply = json.loads(path.read_text())
+                assert reply['pid'] == self.pid
+                assert reply.get('status', 'complete') == 'complete', reply
+                return
+            time.sleep(.05)
+        raise TimeoutError(f'kernel collector did not provide {suffix} for PID {self.pid} within {seconds}s; last state: file absent')
+
+    def stop(self):
+        if not self.stopped:
+            self.stopped = True
+            (D / (self.tag + '.kernel-stop')).touch()
+            self.wait('done', 10)
+
 class MemoryTrace:
     def __init__(self, cid, tag):
         self.samples = []
@@ -174,7 +207,7 @@ class MemoryTrace:
 
     def sample(self):
         while not self.done.is_set() and time.monotonic() - self.started < 600:
-            row = {'seconds': time.monotonic() - self.started}
+            row = {'seconds': time.monotonic() - self.started, 'monotonic_ns': time.monotonic_ns()}
             try:
                 for name in ('memory.current', 'memory.peak'):
                     row[name] = int((self.group / name).read_text())
@@ -276,6 +309,8 @@ def run(case, mode, repeats, label):
             monitor = MemoryTrace(active, tag)
             if PERF:
                 profiler = PerfTrace(monitor.pid, tag)
+            if KERNEL:
+                profiler = KernelTrace(monitor.pid, active, tag)
             gate.touch()
         while True:
             try:
@@ -465,7 +500,7 @@ try:
         cases = [dict(case, chunk_bytes=int(value)) for case in cases
                  for value in os.environ['SYQ_STRESS_CHUNKS'].split(',')]
     for case in cases:
-        case.update(stage_metrics=STAGES, perf=PERF, client_uid=os.getuid())
+        case.update(stage_metrics=STAGES, perf=PERF, kernel_capture=KERNEL, client_uid=os.getuid())
         if os.environ.get('SYQ_STRESS_CPUS'):
             case['cpus'] = os.environ['SYQ_STRESS_CPUS']
         if os.environ.get('SYQ_STRESS_MEMORY_LIMIT'):
