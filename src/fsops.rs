@@ -3441,10 +3441,6 @@ impl FsOps {
         }
         out
     }
-
-    fn _unused_apply_one(&mut self, op: &Op) -> Result<()> {
-        apply_one(op, None, None, None)
-    }
 }
 
 fn op_path(op: &Op) -> &[u8] {
