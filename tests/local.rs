@@ -58,6 +58,11 @@ fn filesystem_accepts_non_utf8_names() -> bool {
 struct Tmp(PathBuf);
 
 impl Tmp {
+    fn expose_remote_syq(&self) {
+        fs::create_dir_all(self.path("remote-bin")).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), self.path("remote-bin/syq")).unwrap();
+    }
+
     fn new() -> Tmp {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let p = temp_dir().join(format!("syq-test-{}-{}", std::process::id(), n));
@@ -138,8 +143,7 @@ fn native_syq(args: &[&str]) -> Output {
 #[cfg(debug_assertions)]
 fn confinement_remote_command(t: &Tmp, tcp: bool) -> Command {
     let rsh = fake_rsh(t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
 
     let mut command = compat_command();
     command
@@ -326,8 +330,7 @@ fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creatio
 fn source_fd_preflight_accounts_for_independent_ssh_broker_claims() {
     let t = Tmp::new();
     let ssh = fake_ssh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
     write(&t.path("source"), &vec![b'x'; 8 * 1024 * 1024]);
     let cache = t.path("tuning.json");
     write(
@@ -1874,6 +1877,38 @@ fn native_hash_repairs_equal_metadata_content_mismatches() {
             assert!(!t.path(&format!("{destination}/extra")).exists());
         }
     }
+}
+
+#[test]
+fn native_comparison_blocks_reuse_only_verified_matching_bytes() {
+    let t = Tmp::new();
+    let block = 64 * 1024;
+    let original = vec![17; 8 * block + 7];
+    let mut edited = original.clone();
+    for index in [1, 3, 4, 7] {
+        edited[index * block] = 91;
+    }
+    write(&t.path("src"), &edited);
+    write(&t.path("dst"), &original);
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--hash",
+            "--stats",
+            "--performance-tuning=comparison-block-size=64K,request-size=4M,copy-path=ranges",
+            &t.s("src"),
+            "--as",
+            &t.s("dst"),
+        ])
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), edited);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("bytes transferred: 262,144"), "{stdout}");
+    assert!(stdout.contains("bytes unchanged: 262,151"), "{stdout}");
+    assert!(partial_files(&t.0).is_empty());
 }
 
 #[test]
@@ -4786,8 +4821,7 @@ fn development_build_does_not_install_an_unrunnable_upload() {
 fn no_bootstrap_uses_remote_path_without_managed_cache() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
 
     write(&t.path("src"), b"preinstalled");
     let remote = format!("fake:{}", t.s("dst"));
@@ -4839,8 +4873,7 @@ fn rsync_subcommand_wrapper_can_start_the_remote_server() {
 fn remote_retained_basis_handles_matching_and_changed_files() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
     let original = vec![b'a'; 5 * 1024 * 1024];
     let mut changed = original.clone();
     changed[2 * 1024 * 1024] = b'b';
@@ -5563,8 +5596,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
 fn dropped_write_connection_is_reopened_and_uncertain_range_is_retried() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
     let data: Vec<u8> = (0..2 * 1024 * 1024)
         .map(|offset| (offset % 251) as u8)
         .collect();
@@ -5598,6 +5630,50 @@ fn dropped_write_connection_is_reopened_and_uncertain_range_is_retried() {
     );
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn sparse_updates_recover_batched_reads_and_writes_without_losing_unchanged_bytes() {
+    for (pull, drop_request) in [(false, "write"), (true, "read")] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        t.expose_remote_syq();
+        let original = vec![17; 2 * 1024 * 1024];
+        let mut edited = original.clone();
+        for offset in (0..edited.len()).step_by(256 * 1024) {
+            edited[offset..offset + 4096].fill(91);
+        }
+        write(&t.path("src"), &edited);
+        write(&t.path("dst"), &original);
+        let marker = t.path("drop-once");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args(["cp", "--hash", "--stats", "--no-progress", "--rsh", rsh.to_str().unwrap(), "--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-tcp", "--performance-tuning=comparison-block-size=64K,request-size=4M,copy-path=ranges,workers=1"]);
+        if pull {
+            command.args(["--from", "fake"]);
+        }
+        command.arg(t.path("src"));
+        if !pull {
+            command.args(["--to", "fake"]);
+        }
+        let output = command
+            .args(["--as", &t.s("dst")])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("SYQ_TEST_DROP_AFTER_REQUEST", drop_request)
+            .env("SYQ_TEST_DROP_MARKER", &marker)
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert!(marker.exists());
+        assert_eq!(read(&t.path("dst")), edited);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("connection dropped; reopening"),
+            "{output:?}"
+        );
+    }
+}
+
 // The expected tuner trajectory depends on measured loopback throughput and
 // is calibrated for Linux runners.
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -5605,8 +5681,7 @@ fn dropped_write_connection_is_reopened_and_uncertain_range_is_retried() {
 fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
     let data: Vec<u8> = (0..2 * 1024 * 1024)
         .map(|offset| (offset % 251) as u8)
         .collect();
@@ -5681,8 +5756,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
 fn lost_finalize_response_is_verified_after_reconnect() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
     let data = vec![b'z'; 2 * 1024 * 1024];
     write(&t.path("src"), &data);
     let remote = format!("fake:{}", t.s("dst"));
@@ -7252,8 +7326,7 @@ fn streaming_and_default_copies_share_resume_partials() {
 fn streaming_reopens_a_dropped_write_connection() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
     let data = prng(2 << 20, 953);
     write(&t.path("src"), &data);
     let marker = t.path("drop-streaming-write-once");
@@ -9080,8 +9153,7 @@ fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
     for name in ["explicit", "path"] {
         write(&t.path(&format!("{name}/file")), b"remove");
     }
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
 
     let run = |helper: &[&str], selected: &str| {
         let results = t.s(&format!("{selected}-results.ndjson"));
@@ -11132,8 +11204,7 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
 fn insecure_links_never_reaches_a_remote_endpoint() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
     write(&t.path("outside/secret"), b"secret");
     fs::create_dir_all(t.path("src/a")).unwrap();
     std::os::unix::fs::symlink("../outside", t.path("src/link")).unwrap();
@@ -13096,8 +13167,7 @@ fn foreign_owned_destination_root_symlink_is_refused() {
     // The opt-out is local only: a remote destination keeps refusing the link.
     fs::remove_file(t.path("outside/f")).unwrap();
     let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
     let remote = format!("fake:{}/", t.s("dst"));
     let refused = remote_syq(
         &t,
@@ -21317,8 +21387,7 @@ fn native_ignores_internal_rsh_environment() {
         let t = Tmp::new();
         let ssh = fake_ssh(&t);
         let rsh = fake_rsh(&t);
-        fs::create_dir_all(t.path("remote-bin")).unwrap();
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+        t.expose_remote_syq();
         write(&t.path("source"), b"data");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command.args([
@@ -22500,8 +22569,7 @@ fn environment_options_apply_to_the_command_and_never_reach_children() {
     // Over a remote shell the options still apply, and neither the command's
     // own variable nor another command's variable reaches the child.
     let fake_rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    t.expose_remote_syq();
     let recorder = t.path("recording-rsh");
     executable(
         &recorder,

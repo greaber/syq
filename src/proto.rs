@@ -771,6 +771,9 @@ pub enum Request {
         path: PathBytes,
         copy_id: CopyId,
         len: u64,
+        /// Matching byte ranges in the final file, or None when it has not
+        /// been compared. These hints never limit partial/retry donor reuse.
+        final_ranges: Option<Vec<(u64, u64)>>,
         block: u64,
         attempt: u32,
         guard: Option<ContainerGuard>,
@@ -1146,6 +1149,16 @@ pub enum Response {
     ReadStreamDone,
     WriteStreamDone,
     Prepared(Preparation),
+    SeededBasis(SeededBasis),
+}
+
+/// Hashes of the exact bytes copied (or existing retry bytes read).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SeededBasis {
+    pub hashes: Vec<ContentDigest>,
+    /// Hashes follow the requested final ranges rather than every file block.
+    /// Missing trailing hashes always mean those blocks must be transferred.
+    pub selected_final: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1245,15 +1258,19 @@ impl SizeHint for Request {
     fn frame_limit(&self) -> usize {
         match self {
             Request::Hello { .. } => MAX_HANDSHAKE_FRAME,
-            Request::WriteRange { .. } | Request::PutSmallBatch(_) | Request::CopySmallFiles(_) => {
-                MAX_FRAME
-            }
+            Request::WriteRange { .. }
+            | Request::PutSmallBatch(_)
+            | Request::CopySmallFiles(_)
+            | Request::SeedBasis { .. } => MAX_FRAME,
             _ => MAX_METADATA_FRAME,
         }
     }
     fn size_hint(&self) -> usize {
         match self {
             Request::WriteRange { data, path, .. } => data.len() + path.len() + 64,
+            Request::SeedBasis {
+                path, final_ranges, ..
+            } => path.len() + final_ranges.as_ref().map_or(0, |ranges| ranges.len() * 16) + 128,
             Request::ReadSmallBatch(reads) => {
                 reads.iter().map(|read| read.path.len() + 16).sum::<usize>() + 16
             }
@@ -1312,7 +1329,8 @@ impl SizeHint for Response {
             Response::Block { .. }
             | Response::SmallBlocks(_)
             | Response::Hashes(_)
-            | Response::HeldHashes { .. } => MAX_FRAME,
+            | Response::HeldHashes { .. }
+            | Response::SeededBasis(_) => MAX_FRAME,
             _ => MAX_METADATA_FRAME,
         }
     }
@@ -1362,6 +1380,7 @@ impl SizeHint for Response {
                     + 32
             }
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 32 + 24,
+            Response::SeededBasis(seed) => seed.hashes.len() * 32 + 24,
             Response::Receipt(v) => v.len() + 16,
             _ => 256,
         }
@@ -1772,6 +1791,56 @@ mod tests {
         bytes.push(flag);
         bytes.extend_from_slice(body);
         bytes
+    }
+
+    #[test]
+    fn selected_seed_frames_accommodate_large_comparisons() {
+        // Alternating matches need one range per two blocks. A large supported
+        // comparison can exceed the ordinary metadata frame limit.
+        let count = (MAX_FRAME - HASH_RESPONSE_OVERHEAD as usize - 1) / 64;
+        let ranges: Vec<_> = (0..count as u64)
+            .map(|i| {
+                (
+                    2 * i * MIN_HASH_BLOCK_BYTES,
+                    (2 * i + 1) * MIN_HASH_BLOCK_BYTES,
+                )
+            })
+            .collect();
+        let request = Request::SeedBasis {
+            path: b"file".to_vec(),
+            copy_id: [0; 16],
+            len: 2 * count as u64 * MIN_HASH_BLOCK_BYTES,
+            final_ranges: Some(ranges),
+            block: MIN_HASH_BLOCK_BYTES,
+            attempt: 0,
+            guard: None,
+        };
+        let Request::SeedBasis { len, block, .. } = &request else {
+            unreachable!()
+        };
+        assert!(hash_response_fits(*block, *len));
+        let encoded = postcard::to_stdvec(&request).unwrap();
+        assert!(encoded.len() > MAX_METADATA_FRAME && encoded.len() < MAX_FRAME);
+        let mut wire = Vec::new();
+        FrameWriter::new(&mut wire, false)
+            .write_msg(&request)
+            .unwrap();
+        let decoded: Request = FrameReader::new(wire.as_slice()).read_msg().unwrap();
+        assert!(
+            matches!(decoded, Request::SeedBasis { final_ranges: Some(ranges), .. } if ranges.len() == count)
+        );
+        let response = Response::SeededBasis(SeededBasis {
+            hashes: vec![[1; 32]; MAX_METADATA_FRAME / 32 + 1],
+            selected_final: true,
+        });
+        let mut wire = Vec::new();
+        FrameWriter::new(&mut wire, false)
+            .write_msg(&response)
+            .unwrap();
+        let decoded: Response = FrameReader::new(wire.as_slice()).read_msg().unwrap();
+        assert!(
+            matches!(decoded, Response::SeededBasis(seed) if seed.selected_final && seed.hashes.len() == MAX_METADATA_FRAME / 32 + 1)
+        );
     }
 
     #[test]

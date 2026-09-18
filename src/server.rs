@@ -1332,6 +1332,7 @@ fn drop_after_handling_for_test(request: &Request) -> bool {
         return false;
     };
     let matches = match kind.to_string_lossy().as_ref() {
+        "read" => matches!(request, Request::ReadRange { .. }),
         "write" => matches!(request, Request::WriteRange { .. }),
         "finalize" => matches!(request, Request::Finalize { .. }),
         _ => false,

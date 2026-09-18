@@ -1,5 +1,5 @@
-//! Per-command transfer experiments. Settings never enter resume identities,
-//! signed grants, or the remembered connection-count cache.
+//! Per-command transfer overrides. Comparison granularity also sets the existing
+//! signed receiver hash-block limit. Overrides are not saved in the tuning cache.
 
 use anyhow::{bail, Context, Result};
 use std::str::FromStr;
@@ -10,7 +10,7 @@ const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
 pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\nworkers=N: fixed filesystem copy-worker slots, 1..65536. Workers process files or ranges; remote workers use data channels, SSH channels can share a TCP socket, and local workers need no network connection.\ns3-max-concurrent-requests=N: maximum simultaneous data requests across all objects, 1..65536; excludes metadata requests and idle pooled sockets.\ns3-max-concurrent-objects=N: maximum objects in progress, including preparation and finalization, 1..65536.\ns3-max-concurrent-parts-per-object=N: maximum simultaneous parts or ranges for each object, 1..1024. Small objects use fewer parts; every data request also needs a shared request slot. These are nested concurrency limits, not thread counts.\ns3-part-size=SIZE: part size, 5M..5G.\ns3-retries=N: transient retry budget, 0..100; default 10.\njob-storage=combined|compact|inline: default combined shares job metadata in chunks to reduce allocation and cloning. compact restores individually allocated jobs and deep-cloned worker snapshots; inline also restores the previous inline job layout and collision-index lifetime.\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 2M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Auto streams remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires resource-limits bandwidth. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. A fixed count disables automatic adjustment of that count; unused slots can remain idle. Counts do not bound total sockets, CPU or memory. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
+pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\nworkers=N: fixed filesystem copy-worker slots, 1..65536. Workers process files or ranges; remote workers use data channels, SSH channels can share a TCP socket, and local workers need no network connection.\ns3-max-concurrent-requests=N: maximum simultaneous data requests across all objects, 1..65536; excludes metadata requests and idle pooled sockets.\ns3-max-concurrent-objects=N: maximum objects in progress, including preparation and finalization, 1..65536.\ns3-max-concurrent-parts-per-object=N: maximum simultaneous parts or ranges for each object, 1..1024. Small objects use fewer parts; every data request also needs a shared request slot. These are nested concurrency limits, not thread counts.\ns3-part-size=SIZE: part size, 5M..5G.\ns3-retries=N: transient retry budget, 0..100; default 10.\njob-storage=combined|compact|inline: default combined shares job metadata in chunks to reduce allocation and cloning. compact restores individually allocated jobs and deep-cloned worker snapshots; inline also restores the previous inline job layout and collision-index lifetime.\ncomparison-block-size=SIZE: comparison and reuse granularity, 64K..64M; default 4M. Smaller blocks can reuse more unchanged bytes in files with scattered edits, at the cost of more hashes. At 64K, block comparison and resume require files smaller than 130 GiB; exceeding the hash-response limit fails the copy. Increase comparison-block-size for larger files; doubling it doubles the limit. Filesystem copies only.\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 2M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Auto streams remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires resource-limits bandwidth. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Request-size overrides do not change comparison blocks. A fixed count disables automatic adjustment of that count; unused slots can remain idle. Counts do not bound total sockets, CPU or memory. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
 
 /// Retained job layout and lifetime of collision-preflight indexes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -103,6 +103,7 @@ pub(crate) struct TransferTuning {
     pub s3_part_workers: Option<usize>,
     pub s3_part_size: Option<u64>,
     pub s3_retries: Option<usize>,
+    pub comparison_block_size: Option<u64>,
     pub request_size: Option<u64>,
     pub pipeline_depth: Option<usize>,
     pub copy_path: Option<CopyPath>,
@@ -140,14 +141,21 @@ impl TransferTuning {
     /// Local copies have no network credit latency to hide. A short remote
     /// range fits in one ordinary window, so streaming would only add fences.
     /// Explicit depth/range controls retain the old engine for experiments.
-    pub fn stream_range(self, same_host: bool, bytes: u64, block: u64) -> bool {
+    pub fn ordinary_range_limit(self, same_host: bool, block: u64) -> u64 {
         if self.streaming() {
-            return true;
+            0
+        } else if same_host
+            || self.copy_path == Some(CopyPath::Ranges)
+            || self.pipeline_depth.is_some()
+        {
+            u64::MAX
+        } else {
+            block.saturating_mul(DEFAULT_PIPELINE_DEPTH as u64)
         }
-        if same_host || self.copy_path == Some(CopyPath::Ranges) || self.pipeline_depth.is_some() {
-            return false;
-        }
-        bytes > block.saturating_mul(DEFAULT_PIPELINE_DEPTH as u64)
+    }
+
+    pub fn stream_range(self, same_host: bool, bytes: u64, block: u64) -> bool {
+        self.streaming() || bytes > self.ordinary_range_limit(same_host, block)
     }
     /// This line describes selection policy before ranges have been planned,
     /// not an observed engine. Use the actual range predicate at its bounds
@@ -159,7 +167,7 @@ impl TransferTuning {
             format!(
                 "{}(ordinary ranges only; streaming above {} bytes)",
                 self.pipeline_depth(),
-                block.saturating_mul(DEFAULT_PIPELINE_DEPTH as u64)
+                self.ordinary_range_limit(same_host, block)
             )
         } else {
             format!("{}(ordinary ranges only)", self.pipeline_depth())
@@ -286,6 +294,16 @@ impl FromStr for TransferTuning {
                         .ok_or_else(|| anyhow::anyhow!("s3-retries must be 0..100"))?,
                     key,
                 )?,
+                "comparison-block-size" => set_once(
+                    &mut tuning.comparison_block_size,
+                    size(
+                        value,
+                        key,
+                        crate::proto::MIN_HASH_BLOCK_BYTES,
+                        crate::proto::MAX_HASH_BLOCK_BYTES,
+                    )?,
+                    key,
+                )?,
                 "request-size" => set_once(
                     &mut tuning.request_size,
                     size(value, key, 512, MAX_REQUEST_BYTES)?,
@@ -352,6 +370,7 @@ impl std::fmt::Display for TransferTuning {
         pair!("s3-max-concurrent-parts-per-object", self.s3_part_workers);
         pair!("s3-part-size", self.s3_part_size);
         pair!("s3-retries", self.s3_retries);
+        pair!("comparison-block-size", self.comparison_block_size);
         pair!("request-size", self.request_size);
         pair!("pipeline-depth", self.pipeline_depth);
         pair!("copy-path", self.copy_path);
@@ -420,6 +439,27 @@ mod tests {
             "job-storage=",
             "job-storage=other",
             "job-storage=inline,job-storage=compact",
+        ] {
+            assert!(value.parse::<TransferTuning>().is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn comparison_granularity_validates_and_survives_forwarding() {
+        for (value, bytes) in [("64K", 64 << 10), ("64M", 64 << 20)] {
+            let tuning: TransferTuning = format!("comparison-block-size={value},request-size=4M")
+                .parse()
+                .unwrap();
+            assert_eq!(tuning.comparison_block_size, Some(bytes));
+            assert_eq!(
+                tuning.to_string().parse::<TransferTuning>().unwrap(),
+                tuning
+            );
+        }
+        for value in [
+            "comparison-block-size=32K",
+            "comparison-block-size=65M",
+            "comparison-block-size=64K,comparison-block-size=128K",
         ] {
             assert!(value.parse::<TransferTuning>().is_err(), "{value}");
         }

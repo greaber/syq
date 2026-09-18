@@ -178,7 +178,8 @@ impl Options {
                 "S3 endpoints must be s3://BUCKET; select keys with source and placement options"
             );
         }
-        if tuning.workers.is_some()
+        if tuning.comparison_block_size.is_some()
+            || tuning.workers.is_some()
             || tuning.request_size.is_some()
             || tuning.pipeline_depth.is_some()
             || tuning.copy_path.is_some()

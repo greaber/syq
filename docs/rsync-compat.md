@@ -38,7 +38,8 @@ to be newer.
 Syq uses numeric IDs and always keeps partial files, so `--numeric-ids` and
 `--partial` are accepted no-ops. `-P` enables progress. Compression is on by
 default; `-z` does not enable anything extra. `-B` / `--block-size` changes
-syq's fixed hash and resume block size.
+syq's comparison and reuse block size. Interrupted copies can still be reused
+after changing it; syq compares their bytes using the new size.
 
 ## Unsupported features
 
