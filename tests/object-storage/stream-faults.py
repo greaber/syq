@@ -118,8 +118,25 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
+def descriptor_command(command):
+    command = list(command)
+    if '--to' in command and any(flag in command for flag in ('--src', '--src-non-dir')):
+        return command
+    if '--to' in command:
+        if '--src-fd' in command:
+            index = command.index('--src-fd')
+            fd = command[index + 1]
+            del command[index:index + 2]
+        else:
+            fd = '0'
+        command[2:2] = ['--src-fd', fd]
+    elif '--as-fd' not in command:
+        command += ['--as-fd', '1']
+    return command
+
+
 def run(command, **kwargs):
-    return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, **kwargs)
+    return subprocess.run(descriptor_command(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, **kwargs)
 
 
 def success(result):
@@ -131,7 +148,7 @@ def failure(result):
 
 
 def spawn(*args, **kwargs):
-    child = subprocess.Popen(*args, **kwargs, start_new_session=True)
+    child = subprocess.Popen(descriptor_command(args[0]), *args[1:], **kwargs, start_new_session=True)
     CHILDREN.append(child)
     return child
 
@@ -154,7 +171,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
     env.update(AWS_ACCESS_KEY_ID='test-access', AWS_SECRET_ACCESS_KEY='test-secret',
                AWS_EC2_METADATA_DISABLED='true', AWS_CONFIG_FILE=os.devnull,
                AWS_SHARED_CREDENTIALS_FILE=os.devnull, HOME=temp)
-    base = [SYQ, 'stream', '--s3-endpoint', f'http://127.0.0.1:{server.server_port}',
+    base = [SYQ, 'cp', '--s3-endpoint', f'http://127.0.0.1:{server.server_port}',
             '--s3-region', 'us-east-1', '--performance-tuning',
             's3-part-size=5M,s3-max-concurrent-parts-per-object=2,s3-retries=1']
     get = base + ['--from', 's3://bucket', 'object']
@@ -178,7 +195,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 with open(Path(temp) / 'output', 'w+b') as output:
                     output.write(b'prefix')
                     output.flush()
-                    result = run(get + ['--write-fd', str(output.fileno())], env=env, pass_fds=(output.fileno(),))
+                    result = run(get + ['--as-fd', str(output.fileno())], env=env, pass_fds=(output.fileno(),))
                     success(result)
                     assert result.stdout == b''
                     output.seek(0)
@@ -195,7 +212,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
             with open(Path(temp) / 'input', 'w+b') as source:
                 source.write(b'skip' + DATA)
                 source.seek(4)
-                result = run(put + ['--read-fd', str(source.fileno())], env=env, pass_fds=(source.fileno(),))
+                result = run(put + ['--src-fd', str(source.fileno())], env=env, pass_fds=(source.fileno(),))
                 success(result)
                 assert STATE['published'] == DATA
         elif CASE == 'upload-error':
@@ -259,24 +276,49 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                             assert actual == original, (upload, nonblocking, sig, hex(original), hex(actual))
         elif CASE == 'environment-options':
             # Quoted keys and endpoint options must reach the stream parser.
-            configured = env | {'SYQ_STREAM_OPTIONS': shlex.join(base[2:] + ['--as', 'key with spaces'])}
-            result = run([SYQ, 'stream', '--to', 's3://bucket'], input=b'from environment', env=configured)
+            configured = env | {'SYQ_CP_OPTIONS': shlex.join(base[2:] + ['--src-fd', '0', '--to', 's3://bucket', '--as', 'key with spaces'])}
+            result = subprocess.run([SYQ, 'cp'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, input=b'from environment', env=configured)
             success(result)
             assert STATE['published'] == b'from environment'
-            configured['SYQ_STREAM_OPTIONS'] = "--as 'unterminated"
+            configured['SYQ_CP_OPTIONS'] = "--as 'unterminated"
             result = run(put, input=b'', env=configured)
             assert result.returncode == 2
-            assert b'SYQ_STREAM_OPTIONS is not a valid shell word list' in result.stderr
+            assert b'SYQ_CP_OPTIONS is not a valid shell word list' in result.stderr
             # Existing commands reject duplicate scalar options; stream does too.
-            configured['SYQ_STREAM_OPTIONS'] = '--as other'
+            configured['SYQ_CP_OPTIONS'] = '--as other'
             result = run(put, input=b'', env=configured)
             assert result.returncode == 2
+        elif CASE == 'pipe-sources':
+            for selector in ('--src', '--src-non-dir'):
+                fifo = Path(temp) / ('fifo' + selector)
+                os.mkfifo(fifo)
+                writer = subprocess.Popen([sys.executable, '-c',
+                    'import sys; open(sys.argv[1], "wb").write(b"named pipe")', str(fifo)],
+                    start_new_session=True)
+                CHILDREN.append(writer)
+                success(run(base + [selector, str(fifo), '--to', 's3://bucket', '--into', 'prefix'], env=env))
+                assert writer.wait(timeout=5) == 0
+                assert STATE['published'] == b'named pipe'
+            result = subprocess.run(['bash', '-c',
+                'exec "$@" --src <(printf "substitution") --to s3://bucket --as object',
+                'pipe-source-test', *base], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=15)
+            success(result)
+            assert STATE['published'] == b'substitution'
+            before = STATE['requests']
+            child = spawn(base + ['--src', str(fifo), '--to', 's3://bucket', '--as', 'object'],
+                          stderr=subprocess.PIPE, env=env)
+            time.sleep(.2)
+            child.send_signal(signal.SIGTERM)
+            child.communicate(timeout=10)
+            assert child.returncode != 0
+            assert STATE['requests'] == before
         elif CASE == 'descriptors':
-            result = run(get + ['--write-fd', '99999'], env=env)
+            result = run(get + ['--as-fd', '99999'], env=env)
             failure(result)
             assert STATE['requests'] == 0
             with open(os.devnull, 'rb') as source:
-                failure(run(get + ['--write-fd', str(source.fileno())], env=env, pass_fds=(source.fileno(),)))
+                failure(run(get + ['--as-fd', str(source.fileno())], env=env, pass_fds=(source.fileno(),)))
             child = spawn(get, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
             child.stdout.close()
             child.stdout = None

@@ -494,6 +494,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             && matches!(
                 &req,
                 Request::TcpListen { .. }
+                    | Request::DescriptorCopy(_)
                     | Request::ListDir { .. }
                     | Request::ListDirDetails { .. }
                     | Request::ListDirNoFollowFinal { .. }

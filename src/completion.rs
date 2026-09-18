@@ -560,7 +560,7 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let args_before = &words[2..index];
     match command {
-        "completion" | "persist" | "receiver" | "exec" | "stream" => {
+        "completion" | "persist" | "receiver" | "exec" => {
             management_candidates(command, args_before, current)
         }
         "help" => Ok(help_candidates(args_before, current)),
@@ -706,7 +706,6 @@ fn bash_replacement_candidates(
 fn root_candidates(current: &[u8]) -> Vec<Candidate> {
     [
         "cp",
-        "stream",
         "exec",
         "rm",
         "clean-partials",
@@ -934,7 +933,14 @@ fn option_name(arg: &clap::Arg) -> Vec<u8> {
 fn selector_id(id: &str) -> bool {
     matches!(
         id,
-        "src" | "srcs_in" | "src_non_dir" | "src_dir" | "srcs" | "src_non_dirs" | "src_dirs"
+        "src"
+            | "srcs_in"
+            | "src_non_dir"
+            | "src_dir"
+            | "srcs"
+            | "src_non_dirs"
+            | "src_dirs"
+            | "src_fd"
     )
 }
 
@@ -1066,6 +1072,7 @@ impl<'a> CompletionContext<'a> {
 
     fn destination_started(&self) -> bool {
         [
+            "as_fd",
             "to",
             "into",
             "into_new",
@@ -1079,7 +1086,10 @@ impl<'a> CompletionContext<'a> {
     }
 
     fn sources_allowed(&self, command: &str) -> bool {
-        !(command == "cp" && (self.destination_started() || self.present.contains("mapping"))
+        !(command == "cp"
+            && (self.destination_started()
+                || self.present.contains("mapping")
+                || self.present.contains("src_fd"))
             || command == "map"
                 && (self.present.contains("srcs_in")
                     || self.present.contains("as") && self.selector_count >= 1))
@@ -1201,6 +1211,7 @@ fn native_copy_source_option(option: &[u8]) -> bool {
     matches!(
         option.split(|byte| *byte == b'=').next().unwrap_or(option),
         b"--from"
+            | b"--src-fd"
             | b"-C"
             | b"--cwd"
             | b"--root"

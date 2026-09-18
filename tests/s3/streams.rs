@@ -64,3 +64,8 @@ fn descriptor_flags_survive_cancellation_and_forced_exit() {
 fn environment_options_apply_to_streams() {
     scenario("environment-options");
 }
+
+#[test]
+fn named_pipes_and_process_substitution_upload() {
+    scenario("pipe-sources");
+}

@@ -79,7 +79,9 @@
         "no-progress",
         "progress-json",
         "stats",
-        "detach"
+        "detach",
+        "src-fd",
+        "as-fd"
       ],
       "follow_up": []
     },

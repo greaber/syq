@@ -47,7 +47,6 @@ fn configure_at(mut command: Command, path: &str) -> Command {
                 || arg.is_required_set()
                 || matches!(arg.get_id().as_str(), "help" | "version" | "self_update")
                 || match path {
-                    "syq stream" => true,
                     "syq exec" => matches!(arg.get_id().as_str(), "on" | "cwd"),
                     "syq persist connect" => arg.get_id() == "timeout",
                     "syq persist receive on" => matches!(
@@ -174,6 +173,8 @@ pub(crate) fn filesystem(command: Command) -> Command {
             matches!(
                 id,
                 "sources"
+                    | "src_fd"
+                    | "as_fd"
                     | "srcs_in"
                     | "from"
                     | "cwd"
@@ -204,9 +205,9 @@ pub(crate) fn filesystem(command: Command) -> Command {
             match id {
                 "sources" | "trees" | "on" | "paths" | "src" | "srcs_in" | "src_non_dir"
                 | "src_dir" | "src_non_dirs" | "src_dirs" | "srcs" | "from" | "cwd" | "root"
-                | "follow" | "follow_src" => "Sources and selection",
+                | "follow" | "follow_src" | "src_fd" => "Sources and selection",
                 "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
-                | "follow_dst" => "Destination placement",
+                | "follow_dst" | "as_fd" => "Destination placement",
                 "results" | "results_fd" | "progress" | "no_progress" | "progress_json"
                 | "stats" => "Progress and results",
                 "resource_limits_arg" => "Resource limits",
@@ -315,7 +316,6 @@ pub(crate) fn root() -> Command {
             .help("Install the newest signed release (standalone installs); Homebrew: brew upgrade syq"))
         .disable_help_subcommand(true)
         .subcommand(Command::new("cp").about("Copy files and directories, optionally removing destination-only files"))
-        .subcommand(Command::new("stream").about("Stream S3 object contents to or from stdin, stdout, or an inherited descriptor"))
         .subcommand(Command::new("exec").about("Run a command on a named receiving machine after local approval"))
         .subcommand(Command::new("rm").about("Remove selected files and directory trees"))
         .subcommand(Command::new("clean-partials").about("Delete syq partial files in directory trees"))
@@ -395,7 +395,6 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
     }
     let mut command = match topics.first().copied() {
         None => root(),
-        Some("stream") => configure(crate::s3::stream::command()).bin_name("syq stream"),
         Some("exec") => crate::destination::exec::command_for_help(),
         Some("persist") => crate::persistence::command_for_help(),
         Some("completion") => crate::completion::command_for_help(),

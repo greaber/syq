@@ -16876,7 +16876,6 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
         &["syq", "help", ""],
         &[
             "cp",
-            "stream",
             "exec",
             "rm",
             "map",
@@ -16888,8 +16887,8 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
             "--self-update",
         ],
     );
-    assert_completion_candidates(&t, &["syq", "stream", "--write-f"], &["--write-fd"]);
-    assert_completion_candidates(&t, &["syq", "stream", "--read-f"], &["--read-fd"]);
+    assert_completion_candidates(&t, &["syq", "cp", "--as-f"], &["--as-fd"]);
+    assert_completion_candidates(&t, &["syq", "cp", "--src-f"], &["--src-fd"]);
     assert_completion_candidates(&t, &["syq", "help", "receiver", "e"], &["enroll"]);
     assert_completion_candidates(
         &t,
@@ -22677,7 +22676,6 @@ fn environment_options_apply_to_the_command_and_never_reach_children() {
         ])
         .env("SYQ_CP_OPTIONS", "--performance-tuning workers=1 --quiet")
         .env("SYQ_RM_OPTIONS", "--dry-run")
-        .env("SYQ_STREAM_OPTIONS", "--s3-region us-east-1")
         .env("RSH_ENV_DUMP", t.path("rsh.env"))
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
@@ -22692,7 +22690,6 @@ fn environment_options_apply_to_the_command_and_never_reach_children() {
     assert!(child_env.contains("RSH_ENV_DUMP="), "{child_env}");
     assert!(!child_env.contains("SYQ_CP_OPTIONS"), "{child_env}");
     assert!(!child_env.contains("SYQ_RM_OPTIONS"), "{child_env}");
-    assert!(!child_env.contains("SYQ_STREAM_OPTIONS"), "{child_env}");
 }
 
 #[test]
@@ -22751,4 +22748,22 @@ fn native_rm_named_directories_are_rejected_before_any_mutation_locally_and_remo
             }
         }
     }
+}
+
+#[test]
+fn descriptor_copies_preserve_bytes_offsets_flags_and_publication() {
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/descriptor-copies.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .output()
+        .expect("run descriptor-copy fixture");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

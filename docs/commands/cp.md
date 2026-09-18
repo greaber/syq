@@ -11,15 +11,86 @@ Put source selectors and `--mapping` before `--to` or a placement option.
 For scripting, see [environment variables](../reference.md#environment-variables-and-local-files)
 and [results](../automation.md).
 
+## File descriptors
+
+Use a pipe or process substitution as an explicit local source. `--src`,
+`--src-non-dir`, and positional sources accept these inputs. Use `--src-fd 0`
+to read stdin, or `--as-fd 1` to send one file's contents to stdout. The other
+endpoint can be a local file, an SSH file, or an
+[S3 object](../object-storage.md#descriptor-copies):
+
+```sh
+gzip -c data | syq cp --src-fd 0 --to server --as data.gz
+syq cp --src <(gzip -c data) --to server --as data.gz
+syq cp --from server data.gz --as-fd 1 | gzip -dc > data
+syq cp --src-non-dir incoming.fifo --into saved
+syq cp data.bin --as-fd 3 3>received.bin
+```
+
+Each stream copy takes exactly one source. Reading a FIFO waits for a writer.
+A FIFO or descriptor path among several sources is an error before any files
+are copied, including when a shell glob expands to both files and a FIFO.
+A named FIFO has a basename:
+`--into saved` puts `incoming.fifo` at `saved/incoming.fifo` as a regular file.
+An inherited descriptor or process-substitution path has no usable name;
+choose `--as PATH` or `--as-fd FD`. Syq never uses a descriptor number as an
+output name. `--src-fd` replaces source paths and `--from`; `--as-fd` replaces
+`--to` and destination placement. Both together copy between descriptors.
+Put source arguments before destination arguments. A literal `-` is a filename.
+
+Only explicitly selected local FIFOs are consumed. Recursive copies keep the
+normal special-file behavior, and `--preserve=specials` copies FIFO nodes
+instead of reading their contents. Ordinary source symlinks retain their usual
+behavior; use `--follow-src` to read a symlink to a FIFO. Descriptor paths such
+as `/dev/fd/N` and `/proc/self/fd/N` refer to the invoking process and are read
+locally before data is sent to a helper. Remote path sources must be regular files.
+
+Descriptors must be inherited and open in the requested direction. Descriptor
+2 is reserved for diagnostics. Dedicate each descriptor to the transfer. Reads
+and writes advance its current offset; append mode is respected. Syq preserves
+its blocking or nonblocking mode and does not truncate, rename, or apply
+metadata to a descriptor. Small native stream writes are forwarded without
+waiting for a full transfer block or EOF. No progress or summary is emitted,
+so stdout contains only payload when selected as the output.
+
+Named file destinations are published after the complete input has been
+written and checked. Existing regular-file permission bits are kept; new
+files use `0666` filtered by the destination process's umask. Ownership follows
+normal destination creation rules, and modification time is the time of writing.
+Source metadata is not copied. Parent directories are created if needed.
+Directly supplied symlink parents require `--follow-src` or `--follow-dst`;
+a destination's final symlink is replaced, never followed.
+
+EOF finishes input. Syq cannot distinguish a successful producer from one
+that exited early. In Bash, `set -o pipefail` reports a pipeline producer or
+consumer failure, but cannot undo a destination already published. Process
+substitutions run separately; check their exit status separately. An output
+descriptor can contain partial data after failure; require a successful syq
+exit before treating it as complete. A consumer closing early makes syq fail.
+
+Stream copies use bounded buffers and apply backpressure. File transfers over
+SSH use a single SSH connection and the usual helper bootstrap and version checks.
+They do not support named receiving destinations, detached execution, restart
+recovery, directory selection, comparison policies, metadata preservation,
+dry runs, result records, statistics, or file-copy tuning. Unsupported options
+are rejected before transferring. S3 has its own
+[part controls and limits](../object-storage.md#descriptor-copies).
+
+A cancelled file upload removes its temporary file when cleanup completes;
+forced termination can leave a `.syq-stream-*` file in the destination directory.
+
 <!-- CLI: cp -->
 ```text
 syq cp [OPTIONS] SOURCE... [PLACEMENT]
+syq cp [OPTIONS] --src-fd FD --as PATH
+syq cp [OPTIONS] SOURCE --as-fd FD
 ```
 
 ## Sources and filtering
 
 | Argument / option | Meaning |
 |---|---|
+| `--src-fd <FD>` | Read raw bytes from an inherited local descriptor (0 for stdin), instead of a source path |
 | `--from <ENDPOINT>` | Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local |
 | `-C, --cwd <DIR>` | Resolve relative source selectors from DIR |
 | `--root <DIR>` | Resolve source selectors beneath DIR and refuse any escape |
@@ -40,6 +111,7 @@ syq cp [OPTIONS] SOURCE... [PLACEMENT]
 
 | Argument / option | Meaning |
 |---|---|
+| `--as-fd <FD>` | Write raw bytes to an inherited local descriptor (1 for stdout), instead of a destination path |
 | `--to <ENDPOINT>` | Destination SSH endpoint, @NAME, or s3://BUCKET; placement defaults to --into |
 | `--into <DIR>` | Put selected names inside DIR, creating it if necessary |
 | `--into-new <DIR>` | Put selected names inside DIR, which must not exist |

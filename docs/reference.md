@@ -24,6 +24,21 @@ time limits, and
 must finish before their signed authorization expires. SDK callers can also
 set their own deadlines.
 
+## Shell pipelines and file descriptors
+
+Use `--src-fd 0` for stdin or `--as-fd 1` for stdout. The file can be
+local, on an SSH host, or in S3:
+
+```sh
+gzip -c data | syq cp --src-fd 0 --to server --as data.gz
+syq cp --from s3://backups data.gz --as-fd 1 | gzip -dc > data
+```
+
+These copies transfer raw bytes without source metadata or restart recovery.
+EOF ends input even if the producer failed; output can be partial after a
+failure. See [file descriptors](commands/cp.md#file-descriptors) for the full
+contract and restrictions.
+
 ## See where files go
 
 A named directory brings its name along. `--srcs-in` copies its contents;

@@ -1,7 +1,7 @@
 //! One raw S3 object and one inherited local byte stream. No filesystem
 //! metadata, helper protocol, or persistent upload identity is synthesized.
-mod fd;
 use super::{checksum::Algorithm, client, Options};
+use crate::descriptor_copy::fd::{Descriptor, Source};
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::{
     primitives::ByteStream,
@@ -9,11 +9,8 @@ use aws_sdk_s3::{
     Client,
 };
 use bytes::Bytes;
-use clap::{CommandFactory, FromArgMatches, Parser};
-use fd::Descriptor;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use std::{
-    ffi::OsString,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
         Arc,
@@ -21,115 +18,18 @@ use std::{
     time::Duration,
 };
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "syq stream",
-    bin_name = "syq stream",
-    about = "Stream one S3 object's bytes to or from a local descriptor",
-    long_about = "Stream one S3 object's bytes to or from a local descriptor. Downloads write stdout by default; uploads read stdin. Parallel parts use bounded memory. No local temporary file is created. EOF finishes an upload; syq cannot determine whether the upstream producer succeeded. Existing destination objects are replaced only when the upload completes. Output descriptors may contain partial data after failure.",
-    before_help = "Examples:\n  gzip -c data | syq stream --to s3://bucket --as data.gz\n  syq stream --from s3://bucket data.gz | gzip -dc\n  syq stream --from s3://bucket data --write-fd 3 3>data"
-)]
-struct Command {
-    /// Download from this S3 bucket
-    #[arg(
-        long,
-        value_name = "s3://BUCKET",
-        required_unless_present = "to",
-        conflicts_with = "to"
-    )]
-    from: Option<String>,
-    /// Upload to this S3 bucket
-    #[arg(
-        long,
-        value_name = "s3://BUCKET",
-        required_unless_present = "from",
-        conflicts_with = "from"
-    )]
-    to: Option<String>,
-    /// Exact source object key (no wildcard expansion)
-    #[arg(value_name = "KEY", requires = "from", conflicts_with = "to")]
-    source: Option<String>,
-    /// Exact destination object key
-    #[arg(
-        long = "as",
-        value_name = "KEY",
-        requires = "to",
-        conflicts_with = "from"
-    )]
-    destination: Option<String>,
-    /// Read an inherited descriptor instead of stdin
-    #[arg(long, value_name="FD", requires="to", conflicts_with="from", value_parser=clap::value_parser!(i32).range(0..))]
-    read_fd: Option<i32>,
-    /// Write an inherited descriptor instead of stdout (stderr is reserved)
-    #[arg(long, value_name="FD", requires="from", conflicts_with="to", value_parser=clap::value_parser!(i32).range(0..))]
-    write_fd: Option<i32>,
-    #[command(flatten)]
-    s3: super::Flags,
-    /// S3 part controls: s3-part-size, s3-max-concurrent-parts-per-object, s3-retries
-    #[arg(long, value_name="KEY=VALUE", action=clap::ArgAction::Append)]
-    performance_tuning: Vec<String>,
-}
-
-pub(crate) fn command() -> clap::Command {
-    Command::command()
-}
-
 struct Plan {
     options: Options,
     key: String,
-    fd: i32,
 }
-fn parse(argv: &[OsString]) -> Result<Plan> {
-    let matches = crate::help::configure(command()).try_get_matches_from(argv)?;
-    let args = Command::from_arg_matches(&matches)?;
-    for control in args.performance_tuning.iter().flat_map(|s| s.split(',')) {
-        let key = control.split('=').next().unwrap_or("").trim();
-        if !matches!(
-            key,
-            "s3-part-size" | "s3-max-concurrent-parts-per-object" | "s3-retries"
-        ) {
-            bail!("performance control {key:?} is not supported for streams");
-        }
-    }
-    let upload = args.to.is_some();
-    let endpoint = args.to.as_deref().or(args.from.as_deref()).unwrap();
-    if !endpoint.starts_with("s3://") {
-        bail!("stream currently requires an s3://BUCKET endpoint");
-    }
-    let key = if upload {
-        args.destination.context("uploads require --as KEY")?
-    } else {
-        args.source.context("downloads require a source KEY")?
-    };
-    if key.is_empty() || key.as_bytes().contains(&0) {
-        bail!("object key must be nonempty and contain no NUL bytes");
-    }
-    let mut options =
-        Options::parse(args.s3, args.from.as_deref(), args.to.as_deref(), &matches)?.unwrap();
-    // Four parts overlap network work without the much larger memory footprint
-    // of the file engine's automatic worker ceiling.
-    if options.automatic_concurrency {
-        options.concurrency = 4;
-    }
-    let fd = if upload {
-        args.read_fd.unwrap_or(0)
-    } else {
-        args.write_fd.unwrap_or(1)
-    };
-    if fd == 2 {
-        bail!("descriptor 2 is reserved for diagnostics");
-    }
-    Ok(Plan { options, key, fd })
-}
-
-pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
-    let mut plan = parse(argv)?;
+pub(crate) fn run(
+    options: Options,
+    key: String,
+    source: Option<Source>,
+    as_fd: Option<i32>,
+) -> Result<i32> {
+    let mut plan = Plan { options, key };
     let cancelled = Arc::new(AtomicBool::new(false));
-    let descriptor = Descriptor::open(
-        plan.fd,
-        plan.options.route == crate::s3::Route::Upload,
-        cancelled.clone(),
-    )?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -138,6 +38,15 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let interrupt = async { tokio::select! { result = tokio::signal::ctrl_c() => { result?; }, _ = term.recv() => {} }; Ok::<_, anyhow::Error>(()) };
         tokio::pin!(interrupt);
+        let descriptor = tokio::select! {
+            descriptor = async {
+                match source {
+                    Some(source) => source.open(cancelled.clone()).await,
+                    None => Descriptor::open(as_fd.unwrap(), false, cancelled.clone()),
+                }
+            } => descriptor?,
+            value = &mut interrupt => { value?; bail!("stream cancelled"); }
+        };
         let cancellation = Arc::new(super::upload_http::Cancellation::default());
         let (client, _) = tokio::select! {
             value = client::connect(&mut plan.options, Arc::default(), cancellation.clone()) => value?,
@@ -160,7 +69,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 let abort = client.abort_multipart_upload().bucket(&plan.options.bucket).key(&plan.key).upload_id(&id).send();
                 match tokio::time::timeout(Duration::from_secs(5), abort).await {
                     Ok(Ok(_)) => {},
-                    _ => crate::output::diagnostic!("syq stream: could not confirm multipart cleanup; inspect incomplete uploads for this object"),
+                    _ => crate::output::diagnostic!("syq cp: could not confirm multipart cleanup; inspect incomplete uploads for this object"),
                 }
             }
         }
@@ -411,51 +320,4 @@ async fn read_part(
         super::backoff(attempt).await;
     }
     unreachable!()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn plan(args: &[&str]) -> Result<Plan> {
-        parse(&args.iter().map(OsString::from).collect::<Vec<_>>())
-    }
-    #[test]
-    fn stream_cli_selects_one_exact_object_and_descriptor() {
-        command().debug_assert();
-        let download = plan(&[
-            "stream",
-            "--from",
-            "s3://bucket",
-            "a//../literal*",
-            "--write-fd",
-            "17",
-        ])
-        .unwrap();
-        assert!(download.options.route == crate::s3::Route::Download);
-        assert_eq!(download.key, "a//../literal*");
-        assert_eq!(download.fd, 17);
-        assert_eq!(download.options.concurrency, 4);
-        let upload = plan(&["stream", "--to", "s3://bucket", "--as", "object"]).unwrap();
-        assert_eq!(upload.options.route, crate::s3::Route::Upload);
-        assert_eq!(upload.fd, 0);
-        for args in [
-            vec!["stream"],
-            vec!["stream", "--from", "s3://bucket"],
-            vec!["stream", "--to", "s3://bucket"],
-            vec!["stream", "--from", "server", "file"],
-            vec!["stream", "--from", "s3://bucket", "file", "--read-fd", "3"],
-            vec!["stream", "--from", "s3://bucket", "file", "--write-fd", "2"],
-            vec![
-                "stream",
-                "--to",
-                "s3://bucket",
-                "--as",
-                "file",
-                "--performance-tuning",
-                "s3-max-concurrent-objects=2",
-            ],
-        ] {
-            assert!(plan(&args).is_err(), "{args:?}");
-        }
-    }
 }

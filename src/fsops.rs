@@ -1482,6 +1482,7 @@ pub(crate) fn require_source_descriptor_capacity(
 }
 
 pub struct FsOps {
+    descriptor_copy: Option<crate::descriptor_copy::Session>,
     hash_policy: crate::hashing::HashPolicy,
     pub(crate) observations: Arc<crate::transfer_observations::Registry>,
     operation: Arc<crate::transfer_observations::Actor>,
@@ -1657,6 +1658,7 @@ impl FsOps {
         let observations = Arc::new(crate::transfer_observations::Registry::default());
         let operation = observations.actor("filesystem");
         FsOps {
+            descriptor_copy: None,
             hash_policy: crate::hashing::HashPolicy {
                 algorithm: crate::hashing::HashAlgorithm::Blake3,
                 transfer_integrity: true,
@@ -2813,6 +2815,9 @@ impl FsOps {
             Ok(())
         };
         match req {
+            Request::DescriptorCopy(_) => {
+                bail!("descriptor copies require a separate unrestricted control session")
+            }
             Request::Scan { root, guard, .. } => {
                 if guard.is_none() {
                     map(root)?;
@@ -6849,6 +6854,15 @@ impl FsOps {
         // Any other request means the controller abandoned that comparison
         // (for example because the source hash failed), so release it here.
         let r: Result<Response> = match &req {
+            Request::DescriptorCopy(operation) => {
+                if !self.source_roots.is_empty() || self.destination_root.is_some() {
+                    Err(anyhow::anyhow!(
+                        "descriptor copies require a separate unrestricted control session"
+                    ))
+                } else {
+                    crate::descriptor_copy::Session::handle(&mut self.descriptor_copy, operation)
+                }
+            }
             Request::ConfigureHashing(policy) => {
                 self.hash_policy = *policy;
                 Ok(Response::Ok)

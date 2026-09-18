@@ -65,6 +65,8 @@ pub enum CoordinateAt {
     override_usage = "syq rsync [OPTIONS] SRC... DEST\n       syq rsync [OPTIONS] [USER@]HOST:SRC... DEST\n       syq rsync [OPTIONS] SRC... [USER@]HOST:DEST"
 )]
 pub struct Args {
+    #[arg(skip)]
+    pub(crate) descriptor_copy: Option<crate::descriptor_copy::Plan>,
     /// Process-local S3 transfer settings; never serialized into helper requests.
     #[arg(skip)]
     pub(crate) s3: Option<crate::s3::Options>,
@@ -452,18 +454,17 @@ pub struct Args {
 }
 
 /// Extra command-line arguments taken from the environment, for adjusting a
-/// `syq cp`, `syq rsync`, `syq rm`, or `syq stream` invocation inside a script
+/// `syq cp`, `syq rsync`, or `syq rm` invocation inside a script
 /// or program that does not expose its own settings. Each variable holds one shell-style
 /// word list that is inserted right after the command name, so the caller's
 /// own arguments come later.
 pub struct EnvironmentOptions(Vec<(&'static str, OsString)>);
 
 impl EnvironmentOptions {
-    pub const VARIABLES: [(&'static str, &'static str); 4] = [
+    pub const VARIABLES: [(&'static str, &'static str); 3] = [
         ("cp", "SYQ_CP_OPTIONS"),
         ("rsync", "SYQ_RSYNC_OPTIONS"),
         ("rm", "SYQ_RM_OPTIONS"),
-        ("stream", "SYQ_STREAM_OPTIONS"),
     ];
 
     /// Read the variables and remove them from the process environment. The
@@ -900,9 +901,6 @@ fn print_root_help(full: bool) {
 /// spelling and hidden flags in one place.
 pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
     match name {
-        "stream" => {
-            Some(crate::help::configure(crate::s3::stream::command()).bin_name("syq stream"))
-        }
         "rsync" => Some(crate::help::filesystem(Args::command())),
         "cp" => Some(crate::help::filesystem(NativeCopyCommand::command())),
         "rm" => Some(crate::help::filesystem(NativeRmCommand::command())),
@@ -1234,6 +1232,14 @@ enum NativePreserve {
 
 #[derive(clap::Args, Debug)]
 struct NativeCopyFields {
+    /// Read raw bytes from an inherited local descriptor (0 for stdin), instead of a source path
+    #[arg(long, value_name="FD", value_parser=clap::value_parser!(i32).range(0..),
+        conflicts_with_all = ["sources", "src", "srcs", "src_non_dir", "src_non_dirs", "src_dir", "src_dirs", "srcs_in", "from", "mapping"])]
+    src_fd: Option<i32>,
+    /// Write raw bytes to an inherited local descriptor (1 for stdout), instead of a destination path
+    #[arg(long, value_name="FD", value_parser=clap::value_parser!(i32).range(0..),
+        conflicts_with_all = ["to", "into", "into_new", "into_existing", "as", "as_new", "as_existing"])]
+    as_fd: Option<i32>,
     /// Internal: this argv was delegated by a remote-to-remote coordinator,
     /// and every path-valued operand is standard unpadded base64 of its raw
     /// bytes, so any filename survives the remote shell.
@@ -1294,10 +1300,10 @@ struct NativeSizeSelectionArgs {
 #[command(
     name = "syq cp",
     version,
-    about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
+    about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.\nExplicit local pipe sources and --src-fd FD read raw bytes; --as-fd FD writes them.",
     before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
-    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
-    override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]"
+    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --preserve=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH or --as-fd FD. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. These copies use no restart state or file metadata, and emit no progress or summary. SSH streams use a single SSH connection. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
+    override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]\n       syq cp [OPTIONS] --src-fd FD --as PATH\n       syq cp [OPTIONS] SOURCE --as-fd FD"
 )]
 struct NativeCopyCommand {
     #[command(flatten)]
@@ -1322,6 +1328,7 @@ struct NativeCopyCommand {
 
 fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()> {
     const DESTINATION_ARGUMENTS: &[(&str, &str)] = &[
+        ("as_fd", "--as-fd"),
         ("to", "--to"),
         ("into", "--into"),
         ("into_new", "--into-new"),
@@ -1331,6 +1338,7 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
         ("as_existing", "--as-existing"),
     ];
     const SOURCE_ARGUMENTS: &[(&str, &str)] = &[
+        ("src_fd", "--src-fd"),
         ("from", "--from"),
         ("cwd", "--cwd"),
         ("root", "--root"),
@@ -1610,6 +1618,287 @@ fn decode_delegated_operands(copy: &mut NativeCopyFields) -> Result<()> {
     Ok(())
 }
 
+// Descriptor paths are process-local handles even when they name a regular
+// file. Resolve them here, before a helper can reinterpret /dev/fd/N.
+fn descriptor_path(path: &std::path::Path) -> Option<i32> {
+    let bytes = path.as_os_str().as_bytes();
+    match bytes {
+        b"/dev/stdin" => return Some(0),
+        b"/dev/stdout" => return Some(1),
+        b"/dev/stderr" => return Some(2),
+        _ => {}
+    }
+    let number = bytes
+        .strip_prefix(b"/dev/fd/")
+        .or_else(|| bytes.strip_prefix(b"/proc/self/fd/"))?;
+    if number.is_empty() || !number.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(number).ok()?.parse().ok()
+}
+
+fn selected_stream_source(
+    copy: &NativeCopyFields,
+) -> Result<Option<(crate::descriptor_copy::fd::Source, Option<OsString>)>> {
+    use crate::descriptor_copy::fd::Source;
+    use std::os::unix::fs::FileTypeExt;
+    if copy.selection.from.is_some()
+        || copy.delegated_operands_b64
+        || copy
+            .operational
+            .preserve
+            .contains(&NativePreserve::Specials)
+    {
+        return Ok(None);
+    }
+    let source = &copy.selection.source;
+    let paths = source
+        .sources
+        .iter()
+        .chain(&source.src)
+        .chain(&source.srcs)
+        .chain(&source.src_non_dir)
+        .chain(&source.src_non_dirs)
+        .collect::<Vec<_>>();
+    let count = paths.len() + source.src_dir.len() + source.src_dirs.len() + source.srcs_in.len();
+    let base = source
+        .cwd
+        .as_ref()
+        .or(source.root.as_ref())
+        .map(|base| crate::fsops::resolve(base.as_bytes()));
+    for supplied in paths {
+        let path = crate::fsops::resolve(supplied.as_bytes());
+        let path = base
+            .as_ref()
+            .map_or_else(|| path.clone(), |base| base.join(&path));
+        let follow = source.follow || source.follow_src;
+        let candidate = if let Some(fd) = descriptor_path(&path) {
+            Some((Source::Descriptor(fd), None))
+        } else {
+            let metadata = if follow {
+                std::fs::metadata(&path)
+            } else {
+                std::fs::symlink_metadata(&path)
+            };
+            metadata.ok().filter(|m| m.file_type().is_fifo()).map(|_| {
+                let name = path.file_name().map(OsStr::to_os_string);
+                (Source::Pipe { path, follow }, name)
+            })
+        };
+        if candidate.is_some() {
+            anyhow::ensure!(
+                count == 1,
+                "pipe or descriptor source {supplied:?} must be the only source"
+            );
+            return Ok(candidate);
+        }
+    }
+    Ok(None)
+}
+
+fn parse_descriptor_copy(
+    parsed: NativeCopyCommand,
+    matches: &clap::ArgMatches,
+    selected: Option<(crate::descriptor_copy::fd::Source, Option<OsString>)>,
+) -> Result<Args> {
+    // Fail before opening descriptors, contacting endpoints, or reading auxiliary
+    // inputs. File-copy policies must not be silently ignored for a byte stream.
+    for argument in NativeCopyCommand::command().get_arguments() {
+        let id = argument.get_id();
+        if matches.value_source(id.as_str()) != Some(clap::parser::ValueSource::CommandLine) {
+            continue;
+        }
+        if !matches!(
+            id.as_str(),
+            "src_fd"
+                | "as_fd"
+                | "sources"
+                | "src"
+                | "srcs"
+                | "src_non_dir"
+                | "src_non_dirs"
+                | "cwd"
+                | "follow"
+                | "into"
+                | "from"
+                | "to"
+                | "as"
+                | "s3_endpoint"
+                | "s3_region"
+                | "s3_profile"
+                | "s3_header"
+                | "performance_tuning"
+                | "rsh"
+                | "syq_path"
+                | "no_bootstrap"
+                | "no_tcp"
+                | "pscope"
+                | "no_compress"
+                | "quiet"
+                | "no_progress"
+                | "follow_src"
+                | "follow_dst"
+        ) {
+            bail!(
+                "--{} is not supported with descriptor copies",
+                id.as_str().replace('_', "-")
+            );
+        }
+    }
+    let copy = parsed.copy;
+    let source_paths = copy
+        .selection
+        .source
+        .sources
+        .iter()
+        .chain(&copy.selection.source.src)
+        .chain(&copy.selection.source.srcs)
+        .chain(&copy.selection.source.src_non_dir)
+        .chain(&copy.selection.source.src_non_dirs)
+        .collect::<Vec<_>>();
+    if copy.src_fd.is_some() && (!source_paths.is_empty() || copy.selection.from.is_some()) {
+        bail!("--src-fd replaces source paths and --from");
+    }
+    let (source, name) = match selected {
+        Some((source, name)) => (Some(source), name),
+        None => (
+            copy.src_fd
+                .map(crate::descriptor_copy::fd::Source::Descriptor),
+            None,
+        ),
+    };
+    let src_fd = match &source {
+        Some(crate::descriptor_copy::fd::Source::Descriptor(fd)) => Some(*fd),
+        _ => None,
+    };
+    let upload = source.is_some();
+    let as_fd = copy.as_fd;
+    if src_fd.is_some() && src_fd == as_fd {
+        bail!("source and destination descriptors must differ");
+    }
+    for fd in [src_fd, as_fd].into_iter().flatten() {
+        if fd == 2 {
+            bail!("descriptor 2 is reserved for diagnostics");
+        }
+    }
+    if as_fd.is_some() && (copy.to.is_some() || copy.r#as.is_some() || copy.into.is_some()) {
+        bail!("--as-fd replaces --to and destination placement");
+    }
+    let (endpoint, path) = if as_fd.is_none() {
+        let destination = match (copy.r#as.clone(), copy.into.as_ref()) {
+            (Some(path), _) => path,
+            (None, into) => {
+                let name = name.context(
+                    "anonymous input requires --as PATH or --as-fd; --into needs a source name",
+                )?;
+                let directory = into
+                    .cloned()
+                    .or_else(|| copy.to.as_ref().map(|_| OsString::from(".")))
+                    .context("pipe input requires --as PATH, --into DIR, or --as-fd")?;
+                // S3's implicit destination is the bucket root, not a './' key.
+                if into.is_none() && copy.to.as_ref().is_some_and(|to| to.starts_with("s3://")) {
+                    name
+                } else {
+                    PathBuf::from(directory).join(name).into_os_string()
+                }
+            }
+        };
+        (copy.to.as_deref(), Some(destination))
+    } else if !upload {
+        if source_paths.len() != 1 {
+            bail!("--as-fd requires exactly one source file or --src-fd");
+        }
+        let path = if let Some(base) = &copy.selection.source.cwd {
+            PathBuf::from(base).join(source_paths[0]).into_os_string()
+        } else {
+            source_paths[0].clone()
+        };
+        (copy.selection.from.as_deref(), Some(path))
+    } else {
+        (None, None)
+    };
+    if endpoint.is_some_and(|e| e.starts_with('@')) {
+        bail!("descriptor copies require a local path, SSH host, or S3 bucket; named receiving destinations are not supported");
+    }
+    let s3_endpoint = endpoint.filter(|s| s.starts_with("s3://"));
+    let mut s3 = crate::s3::Options::parse(
+        parsed.s3,
+        if as_fd.is_some() { s3_endpoint } else { None },
+        if upload { s3_endpoint } else { None },
+        matches,
+    )?;
+    let tuning = &copy.operational.common.performance_tuning;
+    for control in tuning.iter().flat_map(|s| s.split(',')) {
+        let key = control.split('=').next().unwrap_or("").trim();
+        if s3.is_none()
+            || !matches!(
+                key,
+                "s3-part-size" | "s3-max-concurrent-parts-per-object" | "s3-retries"
+            )
+        {
+            bail!("performance control {key:?} is not supported with this descriptor copy");
+        }
+    }
+    if let Some(options) = &mut s3 {
+        if options.automatic_concurrency {
+            options.concurrency = 4;
+        }
+    }
+    let path = path.map(OsStringExt::into_vec);
+    if path
+        .as_ref()
+        .is_some_and(|p| p.is_empty() || p.contains(&0))
+    {
+        bail!("path must be nonempty and contain no NUL bytes");
+    }
+    if s3.is_some() {
+        std::str::from_utf8(path.as_ref().unwrap()).context("S3 keys must be UTF-8")?;
+        if copy.selection.source.follow || copy.selection.source.follow_src || copy.follow_dst {
+            bail!("symlink options require a filesystem endpoint");
+        }
+    }
+    let key = if s3.is_some() {
+        Some(String::from_utf8(path.clone().unwrap()).context("S3 key must be UTF-8")?)
+    } else {
+        None
+    };
+    let location = if s3.is_none() {
+        path.map(|path| {
+            Ok::<_, anyhow::Error>(Location::native(
+                parse_native_endpoint(endpoint)?,
+                path,
+                SourceSelection::File,
+            ))
+        })
+        .transpose()?
+    } else {
+        None
+    };
+    if parsed.pscope.is_some() && parsed.remote.rsh.is_some() {
+        bail!("--pscope cannot be used with --rsh");
+    }
+    let mut args = native_engine_defaults();
+    args.interface = Interface::NativeCp;
+    args.descriptor_copy = Some(crate::descriptor_copy::Plan {
+        source,
+        as_fd,
+        key,
+        location,
+        follow: copy.selection.source.follow
+            || if upload {
+                copy.follow_dst
+            } else {
+                copy.selection.source.follow_src
+            },
+    });
+    args.s3 = s3;
+    args.pscope = parsed.pscope;
+    args.quiet = true;
+    args.compress = !copy.operational.no_compress;
+    apply_native_remote(&mut args, parsed.remote)?;
+    Ok(args)
+}
+
 fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
@@ -1618,6 +1907,10 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         .unwrap_or_else(|error| error.exit());
     validate_native_copy_argument_order(&matches)?;
     let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
+    let stream = selected_stream_source(&parsed.copy)?;
+    if parsed.copy.src_fd.is_some() || parsed.copy.as_fd.is_some() || stream.is_some() {
+        return parse_descriptor_copy(parsed, &matches, stream);
+    }
     let NativeCopyCommand {
         s3,
         mut copy,

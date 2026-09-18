@@ -14,8 +14,6 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 BLOCK = re.compile(r"<!-- CLI: (.*?) -->\n(.*?)<!-- /CLI -->", re.S)
-# Streaming is omitted from the site while its interface matures.
-DOCS_EXCLUDED_COMMANDS = {("stream",)}
 GROUP_LINKS = {
     "--performance-tuning": "[Workers, request sizes, and copy methods](../tuning.md)",
     "--resource-limits": "[Bandwidth and concurrency ceilings](../resource-limits.md)",
@@ -25,7 +23,7 @@ GROUP_LINKS = {
 
 def read_help(binary, command):
     env = {key: value for key, value in os.environ.items()
-           if key not in ("SYQ_CP_OPTIONS", "SYQ_RM_OPTIONS", "SYQ_RSYNC_OPTIONS", "SYQ_STREAM_OPTIONS")}
+           if key not in ("SYQ_CP_OPTIONS", "SYQ_RM_OPTIONS", "SYQ_RSYNC_OPTIONS")}
     env.update(NO_COLOR="1", COLUMNS="100", SYQ_NO_UPDATE_CHECK="1")
     return subprocess.run([str(binary), "help", *command, "--help-all"], env=env,
                           check=True, text=True, capture_output=True, timeout=10).stdout
@@ -132,8 +130,6 @@ def collect(binary):
     commands = {}
     def visit(command):
         usage, groups, children = parse_help(read_help(binary, command))
-        children = [(name, description) for name, description in children
-                    if (*command, name) not in DOCS_EXCLUDED_COMMANDS]
         parsed = usage, groups, children
         commands[command] = parsed
         for name, _ in parsed[2]:
