@@ -30,12 +30,17 @@ def stop(children):
         except ProcessLookupError:
             pass
         child.wait(timeout=5)
-        try:
-            os.killpg(child.pid, 0)
-        except ProcessLookupError:
-            pass
-        else:
-            raise RuntimeError(f'S3 worker process group {child.pid} survived cleanup')
+        # Reaping the group leader does not mean every member has finished
+        # exiting. Allow the kernel and other parents time to reap them too.
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                os.killpg(child.pid, 0)
+            except ProcessLookupError:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f'S3 worker process group {child.pid} survived cleanup')
+            time.sleep(.01)
 
 
 def main():
