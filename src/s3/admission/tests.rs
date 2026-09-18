@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn exercise(controller: &mut Controller, optimum: usize) {

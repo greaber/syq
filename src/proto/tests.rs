@@ -1,4 +1,3 @@
-
 #[test]
 fn streaming_request_bounds_are_checked_before_starting() {
     let valid = super::ReadStreamRequest {

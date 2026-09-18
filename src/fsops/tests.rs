@@ -1,4 +1,3 @@
-
 #[test]
 fn replacement_names_preserve_existing_recovery_format() {
     assert_eq!(recovery_name(123, 456), ".syq-swap-123-456");

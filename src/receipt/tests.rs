@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn key(seed: u8) -> PrivateKey {

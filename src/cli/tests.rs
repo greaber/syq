@@ -1,4 +1,3 @@
-
 use super::{
     native_engine_defaults, parse_native_copy, parse_native_endpoint, parse_native_rm, parse_size,
     read_files_from_reader, rsync_operator_symlink_policy, Args, EnvironmentOptions,

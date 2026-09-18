@@ -1,4 +1,3 @@
-
 #[test]
 fn bootstrap_notices_exclude_ssh_noise_and_preserve_individual_lines() {
     let stderr = b"Warning: new host key\nsshd banner\n\nsyq-remote-install-notice:installed syq\n\nrc noise\n\nsyq-remote-install-notice:check SSH PATH\r\n";

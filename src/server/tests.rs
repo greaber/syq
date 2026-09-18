@@ -1,4 +1,3 @@
-
 #[test]
 fn read_stream_shrinks_before_the_next_read_and_fences_late_updates() {
     use std::sync::mpsc;

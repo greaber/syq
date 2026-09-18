@@ -1,4 +1,3 @@
-
 use super::*;
 use signature::{Signer, Verifier};
 use ssh_agent_lib::proto::{Extension, Request};

@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn values(candidates: Vec<Candidate>) -> Vec<Vec<u8>> {
