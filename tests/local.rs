@@ -10353,6 +10353,8 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
     for args in [
         ["cp", "-a", "source", "--into", "dest"].as_slice(),
         ["cp", "--delete", "source", "--into", "dest"].as_slice(),
+        ["cp", "-B", "64K", "source", "--into", "dest"].as_slice(),
+        ["cp", "--block-size", "64K", "source", "--into", "dest"].as_slice(),
         ["rm", "--syq-no-tcp", "source", "", ""].as_slice(),
         ["rm", "--bwlimit", "1M", "source", ""].as_slice(),
         ["rm", "--no-compress", "source", "", ""].as_slice(),
@@ -11706,7 +11708,7 @@ fn rsync_rejects_remote_to_remote() {
         ("same.invalid:source", "same.invalid:destination"),
     ] {
         let started = std::time::Instant::now();
-        let out = syq(&[source, destination]);
+        let out = syq(&["-B", "64K", source, destination]);
         assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
         assert!(
             stderr_of(&out).contains("source and destination cannot both be remote"),

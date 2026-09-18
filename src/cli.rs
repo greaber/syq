@@ -508,6 +508,18 @@ impl EnvironmentOptions {
 }
 
 impl Args {
+    /// Resolve both interfaces to the same supported comparison granularity.
+    pub(crate) fn comparison_block_size(&self) -> Result<u64> {
+        let block = match self.tuning_options.and_then(|t| t.comparison_block_size) {
+            Some(block) => block,
+            None => parse_size(&self.block_size)?,
+        };
+        Ok(block.clamp(
+            crate::proto::MIN_HASH_BLOCK_BYTES,
+            crate::proto::MAX_HASH_BLOCK_BYTES,
+        ))
+    }
+
     pub(crate) fn only_new_native_entries(&self) -> bool {
         self.interface == Interface::NativeCp && self.ignore_existing
     }
@@ -656,9 +668,6 @@ impl Args {
                     })
             {
                 bail!("removal supports only performance-tuning workers");
-            }
-            if let Some(block) = tuning.comparison_block_size {
-                self.block_size = block.to_string();
             }
             self.connections_opt = tuning.workers;
         }
@@ -2923,7 +2932,8 @@ mod tests {
             .map(OsString::from),
         )
         .unwrap();
-        assert_eq!(parse_size(&args.block_size).unwrap(), 64 << 10);
+        assert_eq!(args.comparison_block_size().unwrap(), 64 << 10);
+        assert_eq!(args.block_size, "4M");
         assert_eq!(args.tuning_options.unwrap().request_size, Some(4 << 20));
         let error = parse_native_copy(
             &[
@@ -2945,7 +2955,7 @@ mod tests {
             let args =
                 Args::parse_rsync(&["source", "destination", spelling, "128K"].map(OsString::from))
                     .unwrap();
-            assert_eq!(parse_size(&args.block_size).unwrap(), 128 << 10);
+            assert_eq!(args.comparison_block_size().unwrap(), 128 << 10);
             let error = Args::parse_rsync(
                 &[
                     "source",
@@ -2959,6 +2969,22 @@ mod tests {
             .unwrap_err();
             assert!(error.to_string().contains("conflicts"), "{error}");
         }
+    }
+
+    #[test]
+    fn comparison_block_size_resolves_and_clamps_once() {
+        let mut args = native_engine_defaults();
+        for (raw, expected) in [("1K", 64 << 10), ("4M", 4 << 20), ("1G", 64 << 20)] {
+            args.block_size = raw.to_owned();
+            assert_eq!(args.comparison_block_size().unwrap(), expected);
+        }
+        args.block_size = "invalid".to_owned();
+        assert!(args.comparison_block_size().is_err());
+        args.tuning_options = Some(crate::transfer_tuning::TransferTuning {
+            comparison_block_size: Some(128 << 10),
+            ..Default::default()
+        });
+        assert_eq!(args.comparison_block_size().unwrap(), 128 << 10);
     }
 
     #[test]

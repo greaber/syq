@@ -327,6 +327,7 @@ struct RangeQueue {
     largest: BTreeSet<(u64, usize, u64)>,
     by_file: HashMap<usize, BTreeSet<(u64, u64)>>,
     len: usize,
+    bytes: u64,
 }
 
 impl RangeQueue {
@@ -344,6 +345,7 @@ impl RangeQueue {
         let previous = file.last().copied();
         for &(off, end) in ranges {
             assert!(file.insert((end - off, off)));
+            self.bytes += end - off;
         }
         let maximum = file.last().copied();
         if previous != maximum {
@@ -370,6 +372,7 @@ impl RangeQueue {
             self.by_file.remove(&idx);
         }
         self.len -= 1;
+        self.bytes -= len;
         (idx, off, off + len)
     }
 
@@ -391,6 +394,7 @@ impl RangeQueue {
         self.len == 0
     }
 
+    #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = (usize, u64, u64)> + '_ {
         self.by_file
             .iter()
@@ -761,7 +765,7 @@ impl Sched {
             return false;
         }
         let mut bytes: u64 = g.files.iter().map(|(s, _)| *s).sum();
-        bytes += g.ranges.iter().map(|(_, o, e)| e - o).sum::<u64>();
+        bytes += g.ranges.bytes;
         bytes += g
             .inflight
             .iter()
@@ -1443,12 +1447,14 @@ pub(crate) mod tests {
         queue.push((1, 0, 2048));
         queue.push((2, 0, 512));
         assert_eq!(queue.len(), 5);
+        assert_eq!(queue.bytes, 7168);
         assert_eq!(queue.largest.len(), 3);
         assert_eq!(queue.iter().count(), 5);
         assert_eq!(queue.pop(), Some((1, 0, 2048)));
         assert_eq!(queue.take_short(0, 512), Some((0, 0, 512)));
         assert_eq!(queue.take_short(2, 512), Some((2, 0, 512)));
         assert_eq!(queue.largest.len(), 1);
+        assert_eq!(queue.bytes, 4096);
         assert_eq!(queue.take_short(0, 512), None);
         queue.push((0, 8192, 12288));
         queue.push((1, 8192, 10240));
@@ -1459,6 +1465,7 @@ pub(crate) mod tests {
         assert!(queue.is_empty());
         assert!(queue.by_file.is_empty());
         assert!(queue.largest.is_empty());
+        assert_eq!(queue.bytes, 0);
     }
 
     #[test]
@@ -1471,6 +1478,10 @@ pub(crate) mod tests {
             queue.extend(idx, &ranges);
         }
         assert_eq!(queue.len(), 200_000);
+        assert_eq!(
+            queue.bytes,
+            queue.iter().map(|(_, o, e)| e - o).sum::<u64>()
+        );
         assert_eq!(queue.largest.len(), 200);
         for idx in (0..200).rev() {
             for _ in 0..125 {
@@ -1479,8 +1490,12 @@ pub(crate) mod tests {
             }
             assert!(queue.take_short(idx, 512).is_none());
         }
+        let mut remaining: u64 = queue.iter().map(|(_, o, e)| e - o).sum();
+        assert_eq!(queue.bytes, remaining);
         let mut previous = u64::MAX;
         while let Some((_, off, end)) = queue.pop() {
+            remaining -= end - off;
+            assert_eq!(queue.bytes, remaining);
             assert!(end - off <= previous);
             previous = end - off;
         }
