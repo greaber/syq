@@ -725,10 +725,7 @@ pub(super) async fn list(
                         if let Some(Exclusion::Subtree(boundary)) = exclusion(
                             matcher,
                             key,
-                            object
-                                .size()
-                                .and_then(|size| u64::try_from(size).ok())
-                                .is_some_and(|size| is_directory_marker(key, size)),
+                            object.size() == Some(0) && is_directory_marker(key, 0),
                             excluded_subtrees,
                         ) {
                             reachable_exclusion |=

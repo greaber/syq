@@ -1548,7 +1548,7 @@ fn output_text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     )
 }
-fn validate_results(temp: &Path) {
+fn parsed_results(temp: &Path) -> Vec<serde_json::Value> {
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../schemas/automation.schema.json")).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
@@ -1565,6 +1565,10 @@ fn validate_results(temp: &Path) {
         assert!(errors.is_empty(), "{value}: {errors:?}");
     }
     assert_eq!(values.last().unwrap()["type"], "result");
+    values
+}
+fn validate_results(temp: &Path) {
+    let values = parsed_results(temp);
     assert!(values[0]["endpoints"]
         .as_array()
         .unwrap()
@@ -4245,11 +4249,8 @@ fn failed_marker_reports_directory_action_on_both_routes() {
         args.extend(["--into", "out", "--results", "results.jsonl"]);
         let output = server.cp(temp.path(), &args);
         assert!(!output.status.success(), "{}", output_text(&output));
-        let results = std::fs::read_to_string(temp.path().join("results.jsonl")).unwrap();
-        let records: Vec<serde_json::Value> = results
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let records = parsed_results(temp.path());
+        let results = serde_json::to_string(&records).unwrap();
         assert!(
             records
                 .iter()
@@ -4290,12 +4291,8 @@ fn failed_transfers_report_known_symlink_action_on_both_routes() {
             args.extend(["--results", "results.jsonl"]);
             let output = server.cp(temp.path(), &args);
             assert!(!output.status.success(), "{}", output_text(&output));
-            let results = std::fs::read_to_string(temp.path().join("results.jsonl"))
-                .unwrap_or_else(|e| panic!("{e}: {}", output_text(&output)));
-            let records: Vec<serde_json::Value> = results
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
+            let records = parsed_results(temp.path());
+            let results = serde_json::to_string(&records).unwrap();
             assert!(
                 records
                     .iter()
@@ -4336,11 +4333,8 @@ fn skipped_download_markers_do_not_count_as_unchanged_files() {
             ],
         );
         assert!(output.status.success(), "{}", output_text(&output));
-        let results = std::fs::read_to_string(temp.path().join("results.jsonl")).unwrap();
-        let records: Vec<serde_json::Value> = results
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let records = parsed_results(temp.path());
+        let results = serde_json::to_string(&records).unwrap();
         assert!(
             records.iter().any(|r| r["type"] == "progress"
                 && r["files_total"] == 1
@@ -4384,11 +4378,8 @@ fn skipped_download_symlinks_use_the_kind_known_from_selection() {
                 "{selection} {flag}: {}",
                 output_text(&output)
             );
-            let results = std::fs::read_to_string(temp.path().join("results.jsonl")).unwrap();
-            let records: Vec<serde_json::Value> = results
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
+            let records = parsed_results(temp.path());
+            let results = serde_json::to_string(&records).unwrap();
             assert!(
                 records.iter().any(|r| r["type"] == "progress"
                     && r["files_total"] == 1

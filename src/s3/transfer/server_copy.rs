@@ -195,12 +195,11 @@ impl Engine {
             let engine = self.clone();
             async move {
                 engine.check_cancelled()?;
-                let mut kind = job.kind;
                 let result = engine
-                    .copy_object(&mut job, &mut kind)
+                    .copy_object(&mut job)
                     .await
                     .map_err(|error| engine.copy_error(error));
-                engine.settle(job.key.as_bytes(), &job.path, kind, &result, None);
+                engine.settle(job.key.as_bytes(), &job.path, job.kind, &result, None);
                 Ok(result.ok().flatten())
             }
         })
@@ -209,11 +208,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn copy_object(
-        &self,
-        job: &mut Download,
-        kind: &mut &'static str,
-    ) -> Result<Option<u64>> {
+    async fn copy_object(&self, job: &mut Download) -> Result<Option<u64>> {
         if job.path.is_empty() {
             return Ok(None);
         }
@@ -244,7 +239,7 @@ impl Engine {
             source.size == job.size,
             "S3 source size changed after planning"
         );
-        *kind = source.kind();
+        job.kind = source.kind();
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {

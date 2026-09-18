@@ -224,18 +224,17 @@ impl Engine {
             // Directory metadata is applied after descendants, so creating
             // children cannot change the restored times or require final modes.
             let directories = Arc::new(Mutex::new(Vec::new()));
-            parallel(plan, workers, |job| {
+            parallel(plan, workers, |mut job| {
                 let engine = self.clone();
                 let dst = destination.clone();
                 let dirs = directories.clone();
                 async move {
                     engine.check_cancelled()?;
-                    let mut kind = job.kind;
-                    let result = engine.download(&job, &dst, dirs, &mut kind).await;
+                    let result = engine.download(&mut job, &dst, dirs).await;
                     engine.settle(
                         job.key.as_bytes(),
                         &job.path,
-                        kind,
+                        job.kind,
                         &result,
                         job.expected_digest
                             .as_ref()
@@ -1375,6 +1374,8 @@ impl Engine {
                 objects
             };
             for (key, size, path, kind) in objects {
+                // Claims and pruning follow the key's directory-marker shape,
+                // even when an exact object's metadata declares another kind.
                 let directory = client::is_directory_marker(&key, size);
                 if !already_filtered {
                     if let Some(excluded) =
@@ -1435,10 +1436,9 @@ impl Engine {
     }
     async fn download(
         self: &Arc<Self>,
-        job: &Download,
+        job: &mut Download,
         destination: &Destination,
         directories: DirectoryMetadata,
-        kind: &mut &'static str,
     ) -> Result<Option<u64>> {
         let part_size = self.part_size(job.size);
         let expected_digest = job
@@ -1498,7 +1498,7 @@ impl Engine {
                 .await?
                 .context("S3 source disappeared after listing")?
         };
-        *kind = object.kind();
+        job.kind = object.kind();
         let mut initial = initial.map(|output| output.body);
         let metadata = object.metadata.clone().unwrap_or(Metadata {
             kind: object.kind().into(),
