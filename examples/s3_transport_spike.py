@@ -31,6 +31,7 @@ try:
         except Exception as e:
             if time.monotonic()>deadline: raise RuntimeError(f'MinIO readiness timeout: {e}')
             print(f'Waiting for MinIO: {e}',flush=True); time.sleep(2)
+    sys.argv=[sys.argv[0],str(BIN)]
     spec=importlib.util.spec_from_file_location('checks',ROOT/'tests/object-storage/check.py'); checks=importlib.util.module_from_spec(spec); spec.loader.exec_module(checks); checks.request('PUT')
     fixtures={}
     for name,count,size in [('small',1024,64*1024),('large',16,16*1024*1024)]:
