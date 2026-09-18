@@ -1362,17 +1362,14 @@ impl Engine {
                     if suffix.is_empty() && contents {
                         continue;
                     }
-                    let suffix = if client::is_directory_marker(&object, size) {
+                    let directory = client::is_directory_marker(&object, size);
+                    let suffix = if directory {
                         suffix.trim_end_matches('/')
                     } else {
                         suffix
                     };
                     let suffix = local::key_path(suffix.as_bytes())?;
-                    let kind = if client::is_directory_marker(&object, size) {
-                        "dir"
-                    } else {
-                        "file"
-                    };
+                    let kind = if directory { "dir" } else { "file" };
                     objects.push((object, size, local::join(&path, &suffix), kind));
                 }
                 objects

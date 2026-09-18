@@ -214,11 +214,11 @@ impl Engine {
         job: &mut Download,
         kind: &mut &'static str,
     ) -> Result<Option<u64>> {
-        let source_bucket = self.options.route.source_bucket().unwrap();
-        let key = copy_destination_key(job);
-        if job.path.is_empty() && client::is_directory_marker(&job.key, job.size) {
+        if job.path.is_empty() {
             return Ok(None);
         }
+        let source_bucket = self.options.route.source_bucket().unwrap();
+        let key = copy_destination_key(job);
         local::key_path(key.trim_end_matches('/').as_bytes())?;
         anyhow::ensure!(key.len() <= 1024, "S3 key exceeds 1024 bytes");
         let destination = async {

@@ -454,7 +454,8 @@ impl Object {
             |m| match m.kind.as_str() {
                 "dir" => "dir",
                 "symlink" => "symlink",
-                _ => "file",
+                "file" => "file",
+                _ => unreachable!("object metadata kind was validated by the decoder"),
             },
         )
     }
