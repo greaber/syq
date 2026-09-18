@@ -1681,6 +1681,11 @@ impl FsOps {
         let _handling = self
             .operation
             .span(crate::transfer_observations::Stage::Handling);
+        if let Some(worker) = &self.stream_worker {
+            return worker
+                .handle(req)
+                .unwrap_or_else(|e| Response::Err(format!("{e:#}")));
+        }
         if let Err(error) = self
             .validate_source_session_request(req)
             .and_then(|()| self.validate_destination_session_request(req))
@@ -1700,7 +1705,11 @@ impl FsOps {
                         "descriptor copies require a separate unrestricted control session"
                     ))
                 } else {
-                    crate::descriptor_copy::Session::handle(&mut self.descriptor_copy, operation)
+                    crate::descriptor_copy::Session::handle(
+                        &mut self.descriptor_copy,
+                        operation,
+                        &self.descriptor_session,
+                    )
                 }
             }
             Request::ConfigureHashing(policy) => {

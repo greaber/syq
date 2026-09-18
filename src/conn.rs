@@ -2191,6 +2191,20 @@ impl Endpoint {
         self.connect_with_role(compress, ConnectionRole::Control, false)
     }
 
+    pub(crate) fn connect_stream(
+        &self,
+        compress: bool,
+        ticket: crate::descriptor_broker::DescriptorTicket,
+        settings: crate::descriptor_copy::Settings,
+        first_worker: bool,
+    ) -> Result<Box<dyn Conn>> {
+        self.connect_with_role(
+            compress,
+            ConnectionRole::StreamWorker { ticket, settings },
+            first_worker,
+        )
+    }
+
     pub(crate) fn connect_with_sources(
         &self,
         compress: bool,
@@ -2242,6 +2256,9 @@ impl Endpoint {
                                 "initialize local source worker: {error:#}"
                             ))
                         })?
+                    }
+                    ConnectionRole::StreamWorker { ticket, settings } => {
+                        conn.ops.initialize_stream(&ticket, settings)?
                     }
                     ConnectionRole::Control => {}
                 }

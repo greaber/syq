@@ -3808,16 +3808,7 @@ fn receiver_rejects_descriptor_copy_operations() {
             placement: Default::default(),
             settings: Default::default(),
         },
-        crate::descriptor_copy::Operation::Read,
-        crate::descriptor_copy::Operation::Write {
-            off: 0,
-            hash: [0; 32],
-            data: vec![1],
-        },
-        crate::descriptor_copy::Operation::Finish {
-            size: 0,
-            hash: [0; 32],
-        },
+        crate::descriptor_copy::Operation::Finish { size: 0 },
     ] {
         let mut request = Request::DescriptorCopy(operation);
         assert!(authority.authorize(&mut request, true).is_err());

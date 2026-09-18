@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use std::{
     fs::File,
-    io::{Read, Write},
+    io::Write,
     os::fd::{AsRawFd, FromRawFd},
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
@@ -159,46 +159,63 @@ impl Descriptor {
     }
     async fn read(mut self, size: usize, fill: bool) -> Result<(Self, bytes::Bytes)> {
         tokio::task::spawn_blocking(move || {
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(size)
-                .context("allocate stream part")?;
-            bytes.resize(size, 0);
-            let mut used = 0;
-            while used < size {
-                self.check_cancelled()?;
-                if used > 0 && !fill {
-                    let mut poll = libc::pollfd {
-                        fd: self.file.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let ready = unsafe { libc::poll(&mut poll, 1, 0) };
-                    if ready == 0 {
-                        break;
-                    }
-                    if ready < 0 {
-                        let error = std::io::Error::last_os_error();
-                        if error.kind() == std::io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        return Err(error.into());
-                    }
-                }
-                match self.file.read(&mut bytes[used..]) {
-                    Ok(0) => break,
-                    Ok(n) => used += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        self.wait(libc::POLLIN)?;
-                    }
-                    Err(e) => return Err(e).context("read input stream"),
-                }
-            }
-            bytes.truncate(used);
-            Ok((self, bytes::Bytes::from(bytes)))
+            let data = self.read_bytes(size, fill)?;
+            Ok((self, bytes::Bytes::from(data)))
         })
         .await?
+    }
+    pub(crate) fn read_bytes(&mut self, size: usize, fill: bool) -> Result<Vec<u8>> {
+        let mut bytes = Vec::<u8>::new();
+        bytes
+            .try_reserve_exact(size)
+            .context("allocate stream part")?;
+        while bytes.len() < size {
+            self.check_cancelled()?;
+            if !bytes.is_empty() && !fill {
+                let mut poll = libc::pollfd {
+                    fd: self.file.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+                if ready == 0 {
+                    break;
+                }
+                if ready < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            }
+            let used = bytes.len();
+            // read initializes exactly the returned number of bytes in spare
+            // capacity. Unread capacity is never exposed, hashed or sent.
+            let n = unsafe {
+                libc::read(
+                    self.file.as_raw_fd(),
+                    bytes.as_mut_ptr().add(used).cast(),
+                    size - used,
+                )
+            };
+            if n == 0 {
+                break;
+            }
+            if n > 0 {
+                unsafe {
+                    bytes.set_len(used + n as usize);
+                }
+            } else {
+                let e = std::io::Error::last_os_error();
+                match e.kind() {
+                    std::io::ErrorKind::Interrupted => continue,
+                    std::io::ErrorKind::WouldBlock => self.wait(libc::POLLIN)?,
+                    _ => return Err(e).context("read input stream"),
+                }
+            }
+        }
+        Ok(bytes)
     }
     pub async fn write_chunk(mut self, bytes: bytes::Bytes) -> Result<Self> {
         tokio::task::spawn_blocking(move || {
@@ -246,6 +263,7 @@ pub(crate) async fn await_commit(control: Option<Descriptor>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::os::unix::net::UnixStream;
     #[test]
     fn stream_descriptor_preserves_flags_and_reads_blocking_or_nonblocking_input() {

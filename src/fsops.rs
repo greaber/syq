@@ -376,6 +376,7 @@ fn is_superuser() -> bool {
 
 pub struct FsOps {
     descriptor_copy: Option<crate::descriptor_copy::Session>,
+    stream_worker: Option<crate::descriptor_copy::FileWorker>,
     hash_policy: crate::hashing::HashPolicy,
     pub(crate) observations: Arc<crate::transfer_observations::Registry>,
     operation: Arc<crate::transfer_observations::Actor>,
@@ -552,6 +553,7 @@ impl FsOps {
         let operation = observations.actor("filesystem");
         FsOps {
             descriptor_copy: None,
+            stream_worker: None,
             hash_policy: crate::hashing::HashPolicy {
                 algorithm: crate::hashing::HashAlgorithm::Blake3,
                 transfer_integrity: true,
@@ -1041,6 +1043,19 @@ impl FsOps {
     /// Install the exact control-session root delivered during worker
     /// initialization. A same-process TCP worker clones it from the shared
     /// registry; an independent worker claims it with SCM_RIGHTS.
+    pub(crate) fn initialize_stream(
+        &mut self,
+        ticket: &crate::descriptor_broker::DescriptorTicket,
+        settings: crate::descriptor_copy::Settings,
+    ) -> Result<()> {
+        let write = ticket.stream_write()?;
+        let file = self.descriptor_session.acquire(ticket)?;
+        self.stream_worker = Some(crate::descriptor_copy::FileWorker::new(
+            file, write, settings,
+        )?);
+        Ok(())
+    }
+
     pub(crate) fn initialize_destination(&mut self, destination: &DestinationRoot) -> Result<()> {
         let directory = self.descriptor_session.acquire(&destination.ticket)?;
         self.install_destination(directory, &destination.request_prefix)

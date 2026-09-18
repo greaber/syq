@@ -65,7 +65,8 @@ impl Controls {
         let limit = (args.bwlimit_bytes != 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(args.bwlimit_bytes));
         let settings = Settings {
-            request_size: tuning.request_size(super::CHUNK as u64, limit.as_ref(), false) as usize,
+            request_size: tuning.streaming_request_size(super::CHUNK as u64, limit.as_ref(), false)
+                as usize,
             algorithm: args.transfer_hash_type.unwrap_or_default(),
         };
         let mut progress = Progress::new(
@@ -84,7 +85,12 @@ impl Controls {
                     options.part_size
                 );
             } else {
-                crate::output::diagnostic!("stream: one copy worker, {} bytes per request, {} outstanding requests, {} payload checks", settings.request_size, tuning.pipeline_depth(), settings.algorithm);
+                crate::output::diagnostic!(
+                    "stream: up to {} bytes per request, {} requests per worker, {} payload checks",
+                    settings.request_size,
+                    tuning.pipeline_depth(),
+                    settings.algorithm
+                );
             }
             if args.bwlimit_bytes > 0 {
                 crate::output::diagnostic!(
@@ -106,6 +112,11 @@ impl Controls {
     pub fn set_size(&self, size: u64) {
         self.progress.bytes_total.store(size, Relaxed);
         self.progress.scan_done.store(true, Relaxed);
+    }
+    pub fn pace_blocking(&self, bytes: u64) {
+        if let Some(limit) = &self.limit {
+            limit.wait_prepaid(bytes);
+        }
     }
     pub async fn pace(&self, bytes: u64) {
         if let Some(limit) = &self.limit {

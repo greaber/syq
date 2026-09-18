@@ -16,6 +16,7 @@ pub(super) enum LocalConnectionRole {
     Control,
     SourceWorker,
     DestinationWorker,
+    StreamWorker,
 }
 
 impl From<&ConnectionRole> for LocalConnectionRole {
@@ -24,6 +25,7 @@ impl From<&ConnectionRole> for LocalConnectionRole {
             ConnectionRole::Control => Self::Control,
             ConnectionRole::SourceWorker { .. } => Self::SourceWorker,
             ConnectionRole::DestinationWorker { .. } => Self::DestinationWorker,
+            ConnectionRole::StreamWorker { .. } => Self::StreamWorker,
         }
     }
 }

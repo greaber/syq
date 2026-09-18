@@ -579,6 +579,11 @@ pub enum ConnectionRole {
         destination: Option<DestinationRoot>,
         copy_sources: Vec<RegisteredSourceRoot>,
     },
+    /// Data workers share one exact file pinned by a stream control session.
+    StreamWorker {
+        ticket: DescriptorTicket,
+        settings: crate::descriptor_copy::Settings,
+    },
 }
 
 /// An existing private output and an optional donor are separate states.
@@ -1158,7 +1163,10 @@ pub enum Response {
     Prepared(Preparation),
     SeededBasis(SeededBasis),
     /// A pinned stream source length, or None for a destination.
-    DescriptorOpened(Option<u64>),
+    DescriptorOpened {
+        size: Option<u64>,
+        ticket: DescriptorTicket,
+    },
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
@@ -1277,9 +1285,6 @@ impl SizeHint for Request {
     }
     fn size_hint(&self) -> usize {
         match self {
-            Request::DescriptorCopy(crate::descriptor_copy::Operation::Write { data, .. }) => {
-                data.len() + 128
-            }
             Request::WriteRange { data, path, .. } => data.len() + path.len() + 64,
             Request::SeedBasis {
                 path, final_ranges, ..
