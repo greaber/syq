@@ -2694,6 +2694,9 @@ impl RestrictedAuthority {
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a command-restricted destination")
             }
+            Request::DescriptorCopy(_) => {
+                bail!("descriptor copies are not valid on a command-restricted receiver")
+            }
             Request::Hello { .. } => bail!("unexpected second receiver handshake"),
             Request::Receipt => {
                 if !over_ssh {
@@ -8633,6 +8636,35 @@ esac
             guard: None,
         };
         assert!(wrong_range.authorize(&mut metadata, false).is_err());
+    }
+
+    #[test]
+    fn receiver_rejects_descriptor_copy_operations() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+        for operation in [
+            crate::descriptor_copy::Operation::Open {
+                path: path_bytes(&root.join("file")),
+                write: true,
+                follow: false,
+            },
+            crate::descriptor_copy::Operation::Read,
+            crate::descriptor_copy::Operation::Write {
+                off: 0,
+                hash: [0; 32],
+                data: vec![1],
+            },
+            crate::descriptor_copy::Operation::Finish {
+                size: 0,
+                hash: [0; 32],
+            },
+        ] {
+            let mut request = Request::DescriptorCopy(operation);
+            assert!(authority.authorize(&mut request, true).is_err());
+            assert!(!request.allowed_on_source_worker());
+        }
     }
 
     #[test]

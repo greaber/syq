@@ -624,6 +624,7 @@ impl Conn for LocalConn {
             && matches!(
                 &req,
                 Request::TcpListen { .. }
+                    | Request::DescriptorCopy(_)
                     | Request::ListDir { .. }
                     | Request::ListDirDetails { .. }
                     | Request::ListDirNoFollowFinal { .. }

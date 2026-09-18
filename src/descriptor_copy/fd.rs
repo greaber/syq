@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-pub(super) struct Descriptor {
+pub(crate) struct Descriptor {
     file: File,
     original: i32,
     descriptor_flags: i32,

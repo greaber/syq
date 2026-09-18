@@ -1,5 +1,4 @@
 <a id="copy-to-and-from-object-storage"></a>
-<a id="shell-pipelines"></a>
 
 # S3 options and behavior
 
@@ -23,6 +22,25 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
 
 See [S3 tuning](tuning.md#s3-copies) for concurrency, part sizes, and retries.
+
+<a id="shell-pipelines"></a>
+
+## Descriptor copies
+
+With [`--read-fd` or `--write-fd`](commands/cp.md#file-descriptors), `cp`
+transfers one exact UTF-8 key's raw contents, without path normalization,
+prefix selection, or syq file metadata. No local temporary file is created.
+
+S3 descriptor copies default to four parallel 16 MiB parts, with about one
+part of payload buffering per worker plus one input/output part. The supported
+tuning keys are `s3-part-size`, `s3-max-concurrent-parts-per-object`, and
+`s3-retries`. Unknown-length uploads stop at 10,000 parts: 156.25 GiB at the
+default part size. Select a larger part size before starting a larger upload.
+
+Buffered parts can be retried, but there is no restart recovery. Uploads
+replace the object only on completion. On failure, syq attempts to abort the
+multipart upload; unconfirmed cleanup may need provider tools. A lost
+completion response can mean an upload was published despite a reported failure.
 
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>

@@ -8,7 +8,17 @@ import check
 
 
 def stream(args, **kwargs):
-    result = subprocess.run([check.SYQ, 'stream', '--s3-region', check.REGION,
+    args = list(args)
+    if '--to' in args:
+        fd = '0'
+        if '--read-fd' in args:
+            index = args.index('--read-fd')
+            fd = args[index + 1]
+            del args[index:index + 2]
+        args[:0] = ['--read-fd', fd]
+    elif '--write-fd' not in args:
+        args += ['--write-fd', '1']
+    result = subprocess.run([check.SYQ, 'cp', '--s3-region', check.REGION,
                              '--performance-tuning', 's3-part-size=5M,s3-max-concurrent-parts-per-object=3',
                              *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             timeout=60, **kwargs)

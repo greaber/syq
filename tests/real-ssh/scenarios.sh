@@ -123,6 +123,20 @@ done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null
 
+printf 'case: descriptor upload and download over real SSH\n'
+python3 - <<'PY_DESCRIPTORS'
+import subprocess
+payload = bytes(range(256)) * 80000 + b'last\x00\xff'
+path = "/tmp/syq-real-ssh/stream 'with spaces'"
+subprocess.run(['syq', 'cp', '--read-fd', '0', '--to', 'destination', '--as', path], input=payload, check=True, timeout=60)
+result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--write-fd', '1'], stdout=subprocess.PIPE, check=True, timeout=60)
+assert result.stdout == payload
+# Empty EOF must publish an empty file rather than leave the previous object.
+subprocess.run(['syq', 'cp', '--read-fd', '0', '--to', 'destination', '--as', path], input=b'', check=True, timeout=30)
+result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--write-fd', '1'], stdout=subprocess.PIPE, check=True, timeout=30)
+assert result.stdout == b''
+PY_DESCRIPTORS
+
 printf 'case: pipelined prune lookup with a one-deep data pipeline\n'
 python3 - <<'PY_PRUNE'
 import pathlib

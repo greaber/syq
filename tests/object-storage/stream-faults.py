@@ -118,8 +118,23 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
+def descriptor_command(command):
+    command = list(command)
+    if '--to' in command:
+        if '--read-fd' in command:
+            index = command.index('--read-fd')
+            fd = command[index + 1]
+            del command[index:index + 2]
+        else:
+            fd = '0'
+        command[2:2] = ['--read-fd', fd]
+    elif '--write-fd' not in command:
+        command += ['--write-fd', '1']
+    return command
+
+
 def run(command, **kwargs):
-    return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, **kwargs)
+    return subprocess.run(descriptor_command(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, **kwargs)
 
 
 def success(result):
@@ -131,7 +146,7 @@ def failure(result):
 
 
 def spawn(*args, **kwargs):
-    child = subprocess.Popen(*args, **kwargs, start_new_session=True)
+    child = subprocess.Popen(descriptor_command(args[0]), *args[1:], **kwargs, start_new_session=True)
     CHILDREN.append(child)
     return child
 
@@ -154,7 +169,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
     env.update(AWS_ACCESS_KEY_ID='test-access', AWS_SECRET_ACCESS_KEY='test-secret',
                AWS_EC2_METADATA_DISABLED='true', AWS_CONFIG_FILE=os.devnull,
                AWS_SHARED_CREDENTIALS_FILE=os.devnull, HOME=temp)
-    base = [SYQ, 'stream', '--s3-endpoint', f'http://127.0.0.1:{server.server_port}',
+    base = [SYQ, 'cp', '--s3-endpoint', f'http://127.0.0.1:{server.server_port}',
             '--s3-region', 'us-east-1', '--performance-tuning',
             's3-part-size=5M,s3-max-concurrent-parts-per-object=2,s3-retries=1']
     get = base + ['--from', 's3://bucket', 'object']
@@ -259,16 +274,16 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                             assert actual == original, (upload, nonblocking, sig, hex(original), hex(actual))
         elif CASE == 'environment-options':
             # Quoted keys and endpoint options must reach the stream parser.
-            configured = env | {'SYQ_STREAM_OPTIONS': shlex.join(base[2:] + ['--as', 'key with spaces'])}
-            result = run([SYQ, 'stream', '--to', 's3://bucket'], input=b'from environment', env=configured)
+            configured = env | {'SYQ_CP_OPTIONS': shlex.join(base[2:] + ['--read-fd', '0', '--to', 's3://bucket', '--as', 'key with spaces'])}
+            result = subprocess.run([SYQ, 'cp'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, input=b'from environment', env=configured)
             success(result)
             assert STATE['published'] == b'from environment'
-            configured['SYQ_STREAM_OPTIONS'] = "--as 'unterminated"
+            configured['SYQ_CP_OPTIONS'] = "--as 'unterminated"
             result = run(put, input=b'', env=configured)
             assert result.returncode == 2
-            assert b'SYQ_STREAM_OPTIONS is not a valid shell word list' in result.stderr
+            assert b'SYQ_CP_OPTIONS is not a valid shell word list' in result.stderr
             # Existing commands reject duplicate scalar options; stream does too.
-            configured['SYQ_STREAM_OPTIONS'] = '--as other'
+            configured['SYQ_CP_OPTIONS'] = '--as other'
             result = run(put, input=b'', env=configured)
             assert result.returncode == 2
         elif CASE == 'descriptors':

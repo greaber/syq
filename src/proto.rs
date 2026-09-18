@@ -921,6 +921,7 @@ pub enum Request {
         expected: crate::hashing::Digest,
         guard: Option<ContainerGuard>,
     },
+    DescriptorCopy(crate::descriptor_copy::Operation),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1263,7 +1264,8 @@ impl SizeHint for Request {
     fn frame_limit(&self) -> usize {
         match self {
             Request::Hello { .. } => MAX_HANDSHAKE_FRAME,
-            Request::WriteRange { .. }
+            Request::DescriptorCopy(_)
+            | Request::WriteRange { .. }
             | Request::PutSmallBatch(_)
             | Request::CopySmallFiles(_)
             | Request::SeedBasis { .. } => MAX_FRAME,
@@ -1272,6 +1274,9 @@ impl SizeHint for Request {
     }
     fn size_hint(&self) -> usize {
         match self {
+            Request::DescriptorCopy(crate::descriptor_copy::Operation::Write { data, .. }) => {
+                data.len() + 128
+            }
             Request::WriteRange { data, path, .. } => data.len() + path.len() + 64,
             Request::SeedBasis {
                 path, final_ranges, ..
