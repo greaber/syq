@@ -32,9 +32,9 @@ other copies. A literal `-` remains a filename.
 
 Descriptors belong to the invoking process and must be inherited and open in
 the requested direction. Descriptor 2 is reserved for diagnostics. Dedicate
-each descriptor to the transfer. Syq preserves its blocking or nonblocking
-mode and uses its current offset; it does not truncate, rename, or apply
-metadata to a descriptor. No progress or summary is emitted, so stdout
+each descriptor to the transfer. Reads and writes advance its current offset;
+append mode is respected. Syq preserves its blocking or nonblocking mode and
+does not truncate, rename, or apply metadata to a descriptor. No progress or summary is emitted, so stdout
 contains only payload when selected as the output.
 
 Named file destinations are published after the complete input has been
