@@ -229,9 +229,9 @@ pub struct Args {
     pub connections: usize,
     #[arg(skip)]
     pub connections_default: bool,
-    /// Comparison and reuse block size (e.g. 4M)
-    #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE")]
-    pub block_size: String,
+    /// Comparison and reuse block size (64K through 64M)
+    #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE", value_parser = parse_rsync_block_size)]
+    pub block_size: u64,
     /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
     pub performance_tuning: Vec<String>,
@@ -658,7 +658,7 @@ impl Args {
                 bail!("removal supports only performance-tuning workers");
             }
             if let Some(block) = tuning.comparison_block_size {
-                self.block_size = block.to_string();
+                self.block_size = block;
             }
             self.connections_opt = tuning.workers;
         }
@@ -2649,6 +2649,11 @@ fn message_for_short(c: char) -> Option<&'static str> {
     })
 }
 
+fn parse_rsync_block_size(value: &str) -> std::result::Result<u64, String> {
+    crate::transfer_tuning::parse_comparison_block_size(value, None)
+        .map_err(|error| format!("{error:#}"))
+}
+
 /// Parse a whole-number duration with an optional `s`, `m`, or `h` suffix
 fn parse_max_delete(value: &str) -> std::result::Result<u64, String> {
     if value == "-1" {
@@ -2937,7 +2942,7 @@ mod tests {
             .map(OsString::from),
         )
         .unwrap();
-        assert_eq!(parse_size(&args.block_size).unwrap(), 64 << 10);
+        assert_eq!(args.block_size, 64 << 10);
         assert_eq!(args.tuning_options.unwrap().request_size, Some(4 << 20));
         let error = parse_native_copy(
             &[
@@ -2959,7 +2964,7 @@ mod tests {
             let args =
                 Args::parse_rsync(&["source", "destination", spelling, "128K"].map(OsString::from))
                     .unwrap();
-            assert_eq!(parse_size(&args.block_size).unwrap(), 128 << 10);
+            assert_eq!(args.block_size, 128 << 10);
             let error = Args::parse_rsync(
                 &[
                     "source",
@@ -2972,6 +2977,41 @@ mod tests {
             )
             .unwrap_err();
             assert!(error.to_string().contains("conflicts"), "{error}");
+        }
+        let args = Args::parse_rsync(
+            &[
+                "source",
+                "destination",
+                "--performance-tuning=comparison-block-size=128K",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap();
+        assert_eq!(args.block_size, 128 << 10);
+    }
+
+    #[test]
+    fn rsync_comparison_block_size_validates_during_argument_parsing() {
+        for spelling in ["-B", "--block-size"] {
+            for (raw, expected) in [("64K", 64 << 10), ("4M", 4 << 20), ("64M", 64 << 20)] {
+                let args =
+                    Args::try_parse_from(["syq rsync", spelling, raw, "src", "dst"]).unwrap();
+                assert_eq!(args.block_size, expected);
+            }
+            for raw in ["0", "32K", "65M", "invalid"] {
+                let error =
+                    Args::try_parse_from(["syq rsync", spelling, raw, "src", "dst"]).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+                let message = error.to_string();
+                assert_eq!(message.matches("--block-size").count(), 1, "{message}");
+                assert!(!message.contains("comparison-block-size"), "{message}");
+                let reason = if raw == "invalid" {
+                    "bad size suffix"
+                } else {
+                    "must be between 65536 and 67108864 bytes"
+                };
+                assert!(message.contains(reason), "{message}");
+            }
         }
     }
 

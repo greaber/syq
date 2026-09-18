@@ -10353,6 +10353,8 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
     for args in [
         ["cp", "-a", "source", "--into", "dest"].as_slice(),
         ["cp", "--delete", "source", "--into", "dest"].as_slice(),
+        ["cp", "-B", "64K", "source", "--into", "dest"].as_slice(),
+        ["cp", "--block-size", "64K", "source", "--into", "dest"].as_slice(),
         ["rm", "--syq-no-tcp", "source", "", ""].as_slice(),
         ["rm", "--bwlimit", "1M", "source", ""].as_slice(),
         ["rm", "--no-compress", "source", "", ""].as_slice(),
@@ -11700,13 +11702,30 @@ fn existing_updates_through_a_destination_root_symlink_to_a_dir() {
 }
 
 #[test]
+fn rsync_rejects_invalid_comparison_blocks_before_reading_inputs() {
+    let t = Tmp::new();
+    let out = syq(&[
+        "-B",
+        "32K",
+        "--files-from",
+        &t.s("missing-manifest"),
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
+    let error = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(2), "{error}");
+    assert!(!error.contains("missing-manifest"), "{error}");
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
 fn rsync_rejects_remote_to_remote() {
     for (source, destination) in [
         ("host-a.invalid:source", "host-b.invalid:destination"),
         ("same.invalid:source", "same.invalid:destination"),
     ] {
         let started = std::time::Instant::now();
-        let out = syq(&[source, destination]);
+        let out = syq(&["-B", "64K", source, destination]);
         assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
         assert!(
             stderr_of(&out).contains("source and destination cannot both be remote"),

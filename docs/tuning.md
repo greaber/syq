@@ -108,13 +108,13 @@ though the result depends on the edits and connection. Both endpoints still
 read the full file to compare it. By default, syq builds the updated file beside
 the destination and then replaces it. It copies and checks reused destination
 bytes before applying changes, skipping final-file blocks already known to
-differ. An interrupted copy can supply other reusable bytes. With `--inplace`,
-changes are written directly to the destination instead.
+differ. With `--inplace`, changes are written directly to the destination instead.
 
-The smallest supported comparison block is 64 KiB. A later copy can reuse
-matching bytes from an interrupted copy even if you change the comparison block
-size; syq checks them using the new size. The rsync compatibility command also
-accepts `-B` / `--block-size`; do not combine it with `comparison-block-size`.
+A later copy can reuse matching bytes from an interrupted copy even if you
+change the comparison block size; syq checks them using the new size.
+`-B` / `--block-size` are available only in `syq rsync`; native commands use
+`--performance-tuning comparison-block-size=SIZE`. Do not combine the two
+controls in `syq rsync`.
 
 ### Streaming and request windows
 
