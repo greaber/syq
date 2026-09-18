@@ -61,8 +61,9 @@ Source metadata is not copied. Parent directories are created if needed.
 The `-new` and `-existing` placement variants apply the same conditions as
 other copies: `--as-new` and `--as-existing` check the destination entry;
 `--into-new` and `--into-existing` check the container, not the file inside it.
-Filesystem conditions are checked before transfer. S3 new-object writes also
-refuse replacement if an object appears before publication.
+Placement conditions are checked before opening a named FIFO or transferring
+bytes. S3 new-object writes also refuse replacement if an object appears before
+publication.
 Use `--cwd` to resolve a relative pathname source, or `--root` to confine it
 beneath a directory (an S3 key prefix for S3 sources). An inherited descriptor
 already refers to an open object and cannot be confined with `--root`.

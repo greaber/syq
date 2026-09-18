@@ -56,14 +56,12 @@ pub(crate) fn run(
         let interrupt = async { tokio::select! { result = tokio::signal::ctrl_c() => { result?; }, _ = term.recv() => {} }; Ok::<_, anyhow::Error>(()) };
         tokio::pin!(interrupt);
         let commit = commit_fd.map(|n| Descriptor::open(n, true, cancelled.clone())).transpose()?;
-        let descriptor = tokio::select! {
-            descriptor = async {
-                match source {
-                    Some(source) => source.open(cancelled.clone()).await,
-                    None => Descriptor::open(as_fd.unwrap(), false, cancelled.clone()),
-                }
-            } => descriptor?,
-            value = &mut interrupt => { value?; bail!("stream cancelled"); }
+        // Protect caller-owned FDs before connecting. Defer opening a named
+        // FIFO until the destination conditions have been checked.
+        let descriptor = match &source {
+            Some(Source::Descriptor(number)) => Some(Descriptor::open(*number, true, cancelled.clone())?),
+            Some(Source::Pipe { .. }) => None,
+            None => Some(Descriptor::open(as_fd.unwrap(), false, cancelled.clone())?),
         };
         let cancellation = Arc::new(super::upload_http::Cancellation::default());
         let (client, _) = tokio::select! {
@@ -73,6 +71,13 @@ pub(crate) fn run(
         let mut upload_id = None;
         let result = {
             let operation = async {
+                if plan.options.route == crate::s3::Route::Upload {
+                    check_placement(&client, &plan).await?;
+                }
+                let descriptor = match descriptor {
+                    Some(descriptor) => descriptor,
+                    None => source.unwrap().open(cancelled.clone()).await?,
+                };
                 if plan.options.route == crate::s3::Route::Upload { upload(&client, &plan, descriptor, &mut upload_id, commit).await }
                 else { download(&client, &plan, descriptor).await }
             };
@@ -164,7 +169,6 @@ async fn upload(
     upload_id: &mut Option<String>,
     commit: Option<Descriptor>,
 ) -> Result<()> {
-    check_placement(client, plan).await?;
     let options = &plan.options;
     let size = usize::try_from(options.part_size)?;
     let algorithm = Algorithm::for_endpoint(options.endpoint.as_deref());

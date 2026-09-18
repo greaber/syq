@@ -38,8 +38,9 @@ pub(crate) struct StreamPlacement {
     pub existence: crate::cli::Existence,
 }
 
-// Append-only member of Request. Only unrestricted control sessions may use
-// this protocol; it never interprets grants or existing recovery records.
+// Carried by the trailing DescriptorCopy request, behind the exact-build
+// handshake. Only unrestricted control sessions may use this protocol;
+// it never interprets grants or existing recovery records.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Operation {
     Open {
@@ -164,16 +165,34 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let mut connection = None;
         let operation = async {
-            // Protect inherited descriptors before starting any children. FIFO
-            // opening is also inside cancellation, including waits for writers.
+            // Protect inherited descriptors before starting any children, but
+            // check the destination before waiting for a named FIFO writer.
             let commit = plan.commit_fd.map(|n| fd::Descriptor::open(n, true, cancelled.clone())).transpose()?;
-            let input = match plan.source.clone() {
-                Some(source) => Some(source.open(cancelled.clone()).await?),
-                None => None,
+            let mut input = match &plan.source {
+                Some(fd::Source::Descriptor(number)) => Some(fd::Descriptor::open(*number, true, cancelled.clone())?),
+                _ => None,
             };
             let output = plan.as_fd.map(|n| fd::Descriptor::open(n, false, cancelled.clone())).transpose()?;
             connection = plan.location.clone().map(|location| Connection::start(args, location));
-            copy(&plan, input, output, connection.as_ref(), commit).await
+            if let Some(connection) = connection.as_ref() {
+                match connection
+                    .call(Operation::Open {
+                        path: plan.location.as_ref().unwrap().path.clone(),
+                        write: plan.source.is_some(),
+                        follow: plan.follow,
+                        root: plan.root.clone(),
+                        placement: plan.placement.clone(),
+                    })
+                    .await?
+                {
+                    Response::Ok => {}
+                    _ => bail!("unexpected stream open response"),
+                }
+            }
+            if let Some(source @ fd::Source::Pipe { .. }) = plan.source.clone() {
+                input = Some(source.open(cancelled.clone()).await?);
+            }
+            copy(input, output, connection.as_ref(), commit).await
         };
         let result = tokio::select! {
             result = operation => result,
@@ -192,27 +211,11 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
 }
 
 async fn copy(
-    plan: &Plan,
     mut input: Option<fd::Descriptor>,
     mut output: Option<fd::Descriptor>,
     connection: Option<&Connection>,
     commit: Option<fd::Descriptor>,
 ) -> Result<()> {
-    if let Some(connection) = connection {
-        match connection
-            .call(Operation::Open {
-                path: plan.location.as_ref().unwrap().path.clone(),
-                write: input.is_some(),
-                follow: plan.follow,
-                root: plan.root.clone(),
-                placement: plan.placement.clone(),
-            })
-            .await?
-        {
-            Response::Ok => {}
-            _ => bail!("unexpected stream open response"),
-        }
-    }
     let mut off = 0u64;
     let mut hash = blake3::Hasher::new();
     loop {

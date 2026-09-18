@@ -64,17 +64,18 @@ def main():
                                           ('--into-existing', prefix + '-missing', False),
                                           ('--into-new', prefix + '-new', True)]:
                 writer = subprocess.Popen(['python3', '-c',
-                    'import sys; open(sys.argv[1], "wb").write(b"fifo")', str(fifo)])
+                    'import sys; open(sys.argv[1], "wb").write(b"fifo")', str(fifo)]) if success else None
                 try:
                     result = subprocess.run([check.SYQ, 'cp', '--src', str(fifo),
                         '--s3-region', check.REGION, '--to', bucket, flag, target],
                         capture_output=True, timeout=30)
                     assert (result.returncode == 0) == success, result.stderr
-                    assert writer.wait(timeout=5) == 0
+                    if writer is not None:
+                        assert writer.wait(timeout=5) == 0
                     if success:
                         assert check.request('GET', target + '/pipe')[1] == b'fifo'
                 finally:
-                    if writer.poll() is None:
+                    if writer is not None and writer.poll() is None:
                         writer.kill()
                         writer.wait()
         # A destination created after preparation must survive --as-new.
