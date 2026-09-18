@@ -42,6 +42,10 @@ if QUEUE_SWEEP:
     BIN = ROOT / os.environ.get('SYQ_STRESS_BINARY', 'target/transport-queue-build/client')
 shutil.copy2(BIN, STAGE / 'client')
 BINARY_SHA256 = hashlib.sha256(BIN.read_bytes()).hexdigest()
+# Delay/rate are applied only inside the owned MinIO network namespace.
+NETEM_MS = int(os.environ.get('SYQ_STRESS_NETEM_MS', 0))
+NETEM_RATE = os.environ.get('SYQ_STRESS_NETEM_RATE', '1gbit')
+NETLAB = 'sha256:04a80a4748e69b7ee5a46a4e3424f536c17d1ee384791bdf301a128c4e704e3d'
 HEAP_PROBE = os.environ.get('SYQ_STRESS_HEAP') == '1'
 if HEAP_PROBE:
     shutil.copy2(ROOT / 'target/memory-probe.so', STAGE / 'memory-probe.so')
@@ -92,6 +96,14 @@ def remove_container(cid):
     assert not command(['docker', 'ps', '-aq', '--filter', 'id=' + cid])
     cleanup.append(cid)
     (D / 'cleanup.json').write_text(json.dumps(cleanup))
+
+def network_command(args):
+    helper = command(['docker', 'create', '--network', 'container:' + server,
+                      '--cap-add', 'NET_ADMIN', NETLAB, *args])
+    try:
+        return command(['docker', 'start', '-a', helper])
+    finally:
+        remove_container(helper)
 
 class MemoryTrace:
     def __init__(self, cid, tag):
@@ -192,6 +204,10 @@ def run(case, mode, repeats, label):
             monitor = None
         if HEAP_PROBE:
             shutil.move(out / '.allocator.csv', D / (tag + '.allocator.csv'))
+        if NETEM_MS:
+            stats = json.loads(network_command(['tc', '-j', '-s', 'qdisc', 'show', 'dev', 'eth0']))
+            (D / (tag + '.netem.json')).write_text(json.dumps(stats, indent=2))
+            assert all(q.get('drops', 0) == 0 for q in stats), stats
         state = json.loads(command(['docker', 'inspect', '--format', '{{json .State}}', active]))
         (D / (tag + '.state.json')).write_text(json.dumps(state))
         (D / (tag + '.stderr')).write_text(stderr)
@@ -311,9 +327,21 @@ try:
         requested = os.environ.get('SYQ_STRESS_CASES', 'writeback-pressure').split(',')
         indexed = {case['name']: case for case in cases}
         cases = [dict(indexed[name], protocol='http' if PLAIN_HTTP else 'https') for name in requested]
+    if NETEM_MS:
+        network_command(['tc', 'qdisc', 'replace', 'dev', 'eth0', 'root', 'netem',
+                         'limit', '100000', 'delay', str(NETEM_MS) + 'ms',
+                         'rate', NETEM_RATE])
+        print(f'Isolated server egress: delay {NETEM_MS}ms, rate {NETEM_RATE}', flush=True)
+        for case in cases:
+            case.update(netem_ms=NETEM_MS, netem_rate=NETEM_RATE, netlab_image=NETLAB)
+    if os.environ.get('SYQ_STRESS_RCVBUFS'):
+        assert HEAP_PROBE
+        cases = [dict(case, receive_buffer=int(value)) for case in cases
+                 for value in os.environ['SYQ_STRESS_RCVBUFS'].split(',')]
     for case in cases:
         if HEAP_PROBE:
-            case.update(heap_probe=True, receive_buffer=int(os.environ.get('SYQ_STRESS_RCVBUF', 0)))
+            case.update(heap_probe=True)
+            case.setdefault('receive_buffer', int(os.environ.get('SYQ_STRESS_RCVBUF', 0)))
             if os.environ.get('SYQ_STRESS_MALLOC_ARENAS'):
                 case['malloc_arenas'] = int(os.environ['SYQ_STRESS_MALLOC_ARENAS'])
         if QUEUE_SWEEP:
@@ -325,6 +353,8 @@ try:
             repeats = int(os.environ.get('SYQ_STRESS_REPEATS', repeats))
             rounds = int(os.environ.get('SYQ_STRESS_ROUNDS', 2))
             label = os.environ.get('SYQ_STRESS_LABEL', 'measured')
+            if os.environ.get('SYQ_STRESS_RCVBUFS'):
+                label += '-rcv' + str(case['receive_buffer'])
             minimum = float(os.environ.get('SYQ_STRESS_MIN_SECONDS', 30))
             modes = [f'queue-{queue}' for queue in QUEUES]
             if os.environ.get('SYQ_STRESS_SYNC') == '1':
