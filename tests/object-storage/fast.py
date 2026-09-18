@@ -6,6 +6,8 @@ events = []
 scenario = "upload"
 upload_started = threading.Event()
 uploads_finished = threading.Condition()
+download_started = threading.Event()
+download_finished = threading.Event()
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def respond(self, status, body=b"", headers=None):
@@ -23,6 +25,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.respond(200,b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>")
         else:
             self.send_response(200); self.send_header("Content-Length","11"); self.send_header("ETag",'"fixture"'); self.end_headers()
+            if scenario == "download-interrupted":
+                self.wfile.write(b"hello")
+                self.wfile.flush()
+                download_started.set()
+                assert self.rfile.read(1) == b""
+                download_finished.set()
+                return
             self.wfile.write(b"bad" if scenario=="download-truncated" else b"hello world")
             self.close_connection=True
     def do_POST(self):
@@ -69,19 +78,24 @@ try:
         root=pathlib.Path(temp); source=root/"source"; source.write_bytes(os.urandom(11*2**20))
         env={**os.environ,"AWS_ACCESS_KEY_ID":"fixture","AWS_SECRET_ACCESS_KEY":"fixture","AWS_REGION":"us-east-1","AWS_EC2_METADATA_DISABLED":"true","AWS_ENDPOINT_URL_S3":"http://127.0.0.1:"+str(server.server_address[1]),"XDG_CACHE_HOME":str(root/"cache")}
         base=[binary,"cp","--no-progress","--performance-tuning", "s3-retries=0,s3-part-size=5M,s3-max-concurrent-parts-per-object=2"]
-        for scenario in ["upload", "upload-delayed", "upload-single", "upload-single-delayed", "upload-single-failure", "upload-failure", "upload-interrupted", "download", "download-truncated"]:
+        for scenario in ["upload", "upload-delayed", "upload-single", "upload-single-delayed", "upload-single-failure", "upload-failure", "upload-interrupted", "download", "download-truncated", "download-interrupted"]:
             shutil.rmtree(root/"cache",ignore_errors=True)
             events.clear(); destination=root/"download"; destination.unlink(missing_ok=True)
             upload_started.clear()
             command=base+([str(source),"--to","s3://fixture","--as","object"] if scenario.startswith("upload") else ["--from","s3://fixture","object","--as",str(destination)])
             if scenario.startswith("upload-single"): command[command.index("--performance-tuning")+1]="s3-retries=0,s3-part-size=16M,s3-max-concurrent-parts-per-object=2"
-            if scenario=="upload-interrupted":
+            if scenario in ("upload-interrupted", "download-interrupted"):
                 child=subprocess.Popen(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
                 try:
-                    assert upload_started.wait(10), "upload did not start"
+                    started = upload_started if scenario.startswith("upload") else download_started
+                    assert started.wait(10), "transfer did not start"
                     child.send_signal(signal.SIGTERM);out,err=child.communicate(timeout=20);code=child.returncode
-                    with uploads_finished:
-                        assert uploads_finished.wait_for(lambda: sorted(e[2] for e in events if e[0]=="put-start")==sorted(e[2] for e in events if e[0]=="put-end"),10),events
+                    if scenario.startswith("upload"):
+                        with uploads_finished:
+                            assert uploads_finished.wait_for(lambda: sorted(e[2] for e in events if e[0]=="put-start")==sorted(e[2] for e in events if e[0]=="put-end"),10),events
+                    else:
+                        assert download_finished.wait(10), "cancelled download socket remained open"
+                        assert b"terminated" in err, err
                 finally:
                     if child.poll() is None:
                         os.killpg(child.pid,signal.SIGKILL)
@@ -104,7 +118,7 @@ try:
                 assert not any(e[0]=="abort" for e in events),events
                 if scenario=="upload-delayed": assert sum(e[0]=="complete" for e in events)==1,events
             if scenario=="download": assert destination.read_bytes()==b"hello world"
-            if scenario=="download-truncated": assert not destination.exists()
+            if scenario in ("download-truncated", "download-interrupted"): assert not destination.exists()
             assert not list(root.glob(".syq-s3-*.partial")),list(root.iterdir())
             if expected: assert not list((root/"cache"/"syq"/"s3").glob("*.json"))
             print(scenario,"passed",flush=True)
