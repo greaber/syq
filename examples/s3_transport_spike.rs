@@ -94,27 +94,52 @@ async fn async_get(
     let mut bytes = 0;
     let mut batch = Vec::new();
     let mut batch_bytes = 0;
+    let mut fragments = bytes::BytesMut::new();
     while let Some(frame) = body.next().await {
-        let frame = frame?;
+        let mut frame = frame?;
         hash.update(&frame);
-        bytes += frame.len();
         if let Some(w) = &writer {
-            batch_bytes += frame.len();
-            batch.push(frame);
-            if batch_bytes >= CHUNK {
-                w.write_batch(std::mem::take(&mut batch), (bytes - batch_bytes) as u64)
-                    .await?;
-                batch_bytes = 0;
+            // Match download_fast_range's 128 KiB cap and fragment packing.
+            while !frame.is_empty() {
+                if batch_bytes == 0 && frame.len() >= CHUNK {
+                    w.write(frame.split_to(CHUNK), bytes as u64).await?;
+                    bytes += CHUNK;
+                    continue;
+                }
+                let n = frame.len().min(CHUNK - batch_bytes);
+                let chunk = frame.split_to(n);
+                if n < 4096 {
+                    fragments.extend_from_slice(&chunk);
+                } else {
+                    flush_fragments(&mut batch, &mut fragments);
+                    batch.push(chunk);
+                }
+                batch_bytes += n;
+                bytes += n;
+                if batch_bytes == CHUNK || batch.len() + usize::from(!fragments.is_empty()) >= 16 {
+                    flush_fragments(&mut batch, &mut fragments);
+                    w.write_batch(std::mem::take(&mut batch), (bytes - batch_bytes) as u64)
+                        .await?;
+                    batch_bytes = 0;
+                }
             }
+        } else {
+            bytes += frame.len();
         }
     }
     if let Some(w) = &writer {
+        flush_fragments(&mut batch, &mut fragments);
         if !batch.is_empty() {
             w.write_batch(batch, (bytes - batch_bytes) as u64).await?;
         }
         w.finish().await?;
     }
     finish(hash, &object, bytes)
+}
+fn flush_fragments(batch: &mut Vec<bytes::Bytes>, fragments: &mut bytes::BytesMut) {
+    if !fragments.is_empty() {
+        batch.push(std::mem::take(fragments).freeze());
+    }
 }
 fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

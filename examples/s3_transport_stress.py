@@ -20,7 +20,7 @@ import urllib.request
 ROOT = Path.cwd()
 assert subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip() == str(ROOT)
 PLAIN_HTTP = os.environ.get('SYQ_STRESS_HTTP') == '1'
-D = ROOT / ('target/transport-stress-http' if PLAIN_HTTP else 'target/transport-stress')
+D = ROOT / ('target/transport-stress-http-v2' if PLAIN_HTTP else 'target/transport-stress-v2')
 D.mkdir(exist_ok=True)
 STAGE = D / 'stage'
 STAGE.mkdir(exist_ok=True)
@@ -82,7 +82,7 @@ def run(case, mode, repeats, label):
     global active
     for row in results:
         if row['case'] == case and row['mode'] == mode and row['label'] == label:
-            print(f"Reusing verified {case['name']}-{mode}-{label} at {row['commit'][:8]}", flush=True)
+            print(f"Reusing recorded {case['name']}-{mode}-{label} at {row['commit'][:8]}", flush=True)
             return row
     tag = f"{case['name']}-{mode}-{label}"
     out = D / (tag + '-output')
@@ -198,11 +198,14 @@ try:
     ]
     if PLAIN_HTTP:
         cases = [{'name': 'one-core-http', 'fixture': 'large', 'cpus': '0', 'concurrency': 64}]
+    if not PLAIN_HTTP:
+        cases = [cases[2], cases[0], cases[1], cases[3]]
     for case in cases:
         unit = fixtures[case['fixture']]['count'] * fixtures[case['fixture']]['size']
-        pilot_repeats = max(1, (2 * 1024**3) // unit)
+        pilot_bytes = 8 * 1024**3 if case['fixture'] == 'large' else 512 * 1024**2
+        pilot_repeats = max(1, pilot_bytes // unit)
         pilot = [run(case, mode, pilot_repeats, 'pilot') for mode in ('async', 'sync')]
-        fastest = min(row['elapsed'] for row in pilot)
+        fastest = min(row['elapsed'] for row in pilot if row.get('status') != 'oom')
         repeats = max(pilot_repeats, math.ceil(pilot_repeats * 40 / fastest))
         repeats = min(repeats, (128 * 1024**3) // unit)
         measured = []
