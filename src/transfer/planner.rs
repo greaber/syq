@@ -1345,65 +1345,7 @@ impl Planner<'_> {
             } else {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
-            let mut planned: Vec<PlannedDir> = Vec::new();
-            for ((p, dst_rel, e), st) in dirs.into_iter().zip(stats) {
-                if self.fail_blocked_mapping_entry(&p, &dst_rel, e.kind) {
-                    continue;
-                }
-                let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
-                if opts.verify_only {
-                    if !is_dir {
-                        self.progress.error(&format!(
-                            "{} {}/ (directory)",
-                            if st.is_none() { "MISSING" } else { "DIFFERS" },
-                            display(&p)
-                        ));
-                    }
-                    continue;
-                }
-                // --existing creates nothing. A non-directory at the path (a
-                // file, a symlink even to a directory — in-tree symlinks are
-                // never traversed) counts as missing: we won't
-                // replace it and won't write through it, and since entries
-                // come parent-first, everything below is skipped too.
-                // --ignore-existing never touches what exists either: an
-                // existing non-directory where a directory maps stays, and the
-                // mapped directory with its whole subtree is skipped, visibly
-                // (rsync would unlink the file; see docs/rsync-compat.md).
-                let conflict = opts.ignore_existing && !is_dir && st.is_some();
-                if conflict
-                    || (opts.existing && !is_dir)
-                    || ((opts.existing || opts.ignore_existing)
-                        && self.under_missing_dir(&p, dst_root))
-                {
-                    if conflict && !opts.quiet {
-                        self.progress.eprintln(&format!(
-                            "syq: keeping existing {}; skipping the directory mapped onto it",
-                            display(&p)
-                        ));
-                    }
-                    self.missing_dirs.insert(p);
-                    continue;
-                }
-                if opts.restricted_receiver
-                    && st.is_some()
-                    && !is_dir
-                    && self.implicit_dirs.contains(&p)
-                    && !self.mapping_explicit_parents.contains(&dst_rel)
-                {
-                    // Parent creation does not grant permission to replace a
-                    // file or symlink. Use the stat already in this batch to
-                    // fail affected entries before sending any mkdir request.
-                    self.blocked_mapping_parents.insert(p);
-                    continue;
-                }
-                if st.as_ref().is_some_and(|d| d.kind != Kind::Dir) {
-                    self.fail_directory_type_change(&p, &dst_rel, Kind::Dir);
-                    self.blocked_directory_paths.insert(p);
-                    continue;
-                }
-                planned.push((p, dst_rel, e, st));
-            }
+            let planned = self.filter_dirs(dirs, stats, dst_root);
             if opts.dry_run {
                 self.trace_dry_run_dirs(&planned, dst_root);
             } else if !opts.verify_only {
@@ -1835,6 +1777,76 @@ impl Planner<'_> {
         }
         self.flush_meta_fixes(meta_fixes)?;
         self.flush_leaf_ops(ops, &op_names)
+    }
+
+    /// Decide from its stat what happens to each mapped directory, and keep
+    /// the ones to create or update.
+    fn filter_dirs(
+        &mut self,
+        dirs: Vec<(PathBytes, PathBytes, Entry)>,
+        stats: Vec<Option<Entry>>,
+        dst_root: &[u8],
+    ) -> Vec<PlannedDir> {
+        let opts = self.opts;
+        let mut planned: Vec<PlannedDir> = Vec::new();
+        for ((p, dst_rel, e), st) in dirs.into_iter().zip(stats) {
+            if self.fail_blocked_mapping_entry(&p, &dst_rel, e.kind) {
+                continue;
+            }
+            let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
+            if opts.verify_only {
+                if !is_dir {
+                    self.progress.error(&format!(
+                        "{} {}/ (directory)",
+                        if st.is_none() { "MISSING" } else { "DIFFERS" },
+                        display(&p)
+                    ));
+                }
+                continue;
+            }
+            // --existing creates nothing. A non-directory at the path (a
+            // file, a symlink even to a directory — in-tree symlinks are
+            // never traversed) counts as missing: we won't
+            // replace it and won't write through it, and since entries
+            // come parent-first, everything below is skipped too.
+            // --ignore-existing never touches what exists either: an
+            // existing non-directory where a directory maps stays, and the
+            // mapped directory with its whole subtree is skipped, visibly
+            // (rsync would unlink the file; see docs/rsync-compat.md).
+            let conflict = opts.ignore_existing && !is_dir && st.is_some();
+            if conflict
+                || (opts.existing && !is_dir)
+                || ((opts.existing || opts.ignore_existing) && self.under_missing_dir(&p, dst_root))
+            {
+                if conflict && !opts.quiet {
+                    self.progress.eprintln(&format!(
+                        "syq: keeping existing {}; skipping the directory mapped onto it",
+                        display(&p)
+                    ));
+                }
+                self.missing_dirs.insert(p);
+                continue;
+            }
+            if opts.restricted_receiver
+                && st.is_some()
+                && !is_dir
+                && self.implicit_dirs.contains(&p)
+                && !self.mapping_explicit_parents.contains(&dst_rel)
+            {
+                // Parent creation does not grant permission to replace a
+                // file or symlink. Use the stat already in this batch to
+                // fail affected entries before sending any mkdir request.
+                self.blocked_mapping_parents.insert(p);
+                continue;
+            }
+            if st.as_ref().is_some_and(|d| d.kind != Kind::Dir) {
+                self.fail_directory_type_change(&p, &dst_rel, Kind::Dir);
+                self.blocked_directory_paths.insert(p);
+                continue;
+            }
+            planned.push((p, dst_rel, e, st));
+        }
+        planned
     }
 
     /// Create this batch's missing directories and reopen existing ones that
