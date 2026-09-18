@@ -367,6 +367,20 @@ fn serve(
                 "source class must not be preserved by default"
             );
         }
+        if fault == "server-copy-symlink-head-denied" {
+            if method == "GET" && path.contains("list-type=2") {
+                reply(
+                    &mut socket, 200, &[],
+                    b"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>data/original</Key><Size>4</Size></Contents></ListBucketResult>",
+                    false,
+                );
+                return;
+            }
+            if method == "HEAD" && path == "/source/data" {
+                reply(&mut socket, 404, &[], b"", true);
+                return;
+            }
+        }
         if method == "GET" && fault == "server-copy-symlink-head-denied" {
             reply(
                 &mut socket,
@@ -4334,5 +4348,64 @@ fn skipped_download_markers_do_not_count_as_unchanged_files() {
             "{results}"
         );
         assert_eq!(records.last().unwrap()["files_unchanged"], 0, "{results}");
+    }
+}
+
+#[test]
+fn skipped_download_symlinks_use_the_kind_known_from_selection() {
+    for selection in ["exact", "mapping", "prefix"] {
+        for flag in ["--only-new", "--only-existing"] {
+            let server = Server::start("server-copy-symlink-head-denied");
+            let temp = tempfile::tempdir().unwrap();
+            if flag == "--only-new" {
+                std::fs::create_dir(temp.path().join("out")).unwrap();
+                std::os::unix::fs::symlink("target", temp.path().join("out/original")).unwrap();
+            }
+            let mut args = vec!["--from", "s3://source"];
+            match selection {
+                "exact" => args.extend(["data/original", "--as", "out/original"]),
+                "mapping" => {
+                    let entry = serde_json::json!({
+                        "src": {"encoding": "utf-8", "value": "data/original"},
+                        "dst": {"encoding": "utf-8", "value": "original"},
+                        "kind": "symlink"
+                    });
+                    std::fs::write(temp.path().join("mapping.jsonl"), format!("{entry}\n"))
+                        .unwrap();
+                    args.extend(["--mapping", "mapping.jsonl", "--into", "out"]);
+                }
+                "prefix" => args.extend(["--srcs-in", "data", "--into", "out"]),
+                _ => unreachable!(),
+            }
+            args.extend([flag, "--results", "results.jsonl"]);
+            let output = server.cp(temp.path(), &args);
+            assert!(
+                output.status.success(),
+                "{selection} {flag}: {}",
+                output_text(&output)
+            );
+            let results = std::fs::read_to_string(temp.path().join("results.jsonl")).unwrap();
+            let records: Vec<serde_json::Value> = results
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(
+                records.iter().any(|r| r["type"] == "progress"
+                    && r["files_total"] == 1
+                    && r["scan_done"] == true),
+                "{results}"
+            );
+            let expected = u64::from(selection == "prefix");
+            assert_eq!(
+                records.last().unwrap()["files_unchanged"],
+                expected,
+                "{selection} {flag}: {results}"
+            );
+            assert_eq!(
+                server.requests.load(Ordering::Relaxed),
+                if selection == "prefix" { 2 } else { 1 },
+                "skipped objects must not trigger transfer-time metadata requests"
+            );
+        }
     }
 }
