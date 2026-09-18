@@ -241,7 +241,7 @@ fn set_once<T>(slot: &mut Option<T>, value: T, key: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn parse_comparison_block_size(value: &str, key: &str) -> Result<u64> {
+pub(crate) fn parse_comparison_block_size(value: &str, key: Option<&str>) -> Result<u64> {
     size(
         value,
         key,
@@ -250,10 +250,14 @@ pub(crate) fn parse_comparison_block_size(value: &str, key: &str) -> Result<u64>
     )
 }
 
-fn size(value: &str, key: &str, min: u64, max: u64) -> Result<u64> {
-    let bytes = crate::cli::parse_size(value).with_context(|| key.to_string())?;
+fn size(value: &str, key: Option<&str>, min: u64, max: u64) -> Result<u64> {
+    let bytes = crate::cli::parse_size(value).map_err(|error| match key {
+        Some(key) => error.context(key.to_owned()),
+        None => error,
+    })?;
     if !(min..=max).contains(&bytes) {
-        bail!("{key} must be between {min} and {max} bytes");
+        let prefix = key.map(|key| format!("{key} ")).unwrap_or_default();
+        bail!("{prefix}must be between {min} and {max} bytes");
     }
     Ok(bytes)
 }
@@ -291,7 +295,7 @@ impl FromStr for TransferTuning {
                 }
                 "s3-part-size" => set_once(
                     &mut tuning.s3_part_size,
-                    size(value, key, 5 << 20, 5 << 30)?,
+                    size(value, Some(key), 5 << 20, 5 << 30)?,
                     key,
                 )?,
                 "s3-retries" => set_once(
@@ -305,12 +309,12 @@ impl FromStr for TransferTuning {
                 )?,
                 "comparison-block-size" => set_once(
                     &mut tuning.comparison_block_size,
-                    parse_comparison_block_size(value, key)?,
+                    parse_comparison_block_size(value, Some(key))?,
                     key,
                 )?,
                 "request-size" => set_once(
                     &mut tuning.request_size,
-                    size(value, key, 512, MAX_REQUEST_BYTES)?,
+                    size(value, Some(key), 512, MAX_REQUEST_BYTES)?,
                     key,
                 )?,
                 "pipeline-depth" => set_once(
@@ -332,12 +336,12 @@ impl FromStr for TransferTuning {
                 "batch-files" => set_once(&mut tuning.batch_files, count(value, key, 4096)?, key)?,
                 "batch-bytes" => set_once(
                     &mut tuning.batch_bytes,
-                    size(value, key, 512, 64 << 20)?,
+                    size(value, Some(key), 512, 64 << 20)?,
                     key,
                 )?,
                 "split-min-size" => set_once(
                     &mut tuning.split_min_size,
-                    size(value, key, 1, 1 << 30)?,
+                    size(value, Some(key), 1, 1 << 30)?,
                     key,
                 )?,
                 "job-storage" => set_once(

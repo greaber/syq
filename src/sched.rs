@@ -796,8 +796,7 @@ impl Sched {
         if !g.scan_done {
             return false;
         }
-        let mut bytes = g.files.bytes;
-        bytes += g.ranges.bytes;
+        let mut bytes = g.files.bytes + g.ranges.bytes;
         bytes += g
             .inflight
             .iter()

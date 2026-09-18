@@ -2636,7 +2636,7 @@ fn message_for_short(c: char) -> Option<&'static str> {
 }
 
 fn parse_rsync_block_size(value: &str) -> std::result::Result<u64, String> {
-    crate::transfer_tuning::parse_comparison_block_size(value, "--block-size")
+    crate::transfer_tuning::parse_comparison_block_size(value, None)
         .map_err(|error| format!("{error:#}"))
 }
 
@@ -2989,12 +2989,12 @@ mod tests {
                     Args::try_parse_from(["syq rsync", spelling, raw, "src", "dst"]).unwrap_err();
                 assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
                 let message = error.to_string();
-                assert!(message.contains("--block-size"), "{message}");
+                assert_eq!(message.matches("--block-size").count(), 1, "{message}");
                 assert!(!message.contains("comparison-block-size"), "{message}");
                 let reason = if raw == "invalid" {
                     "bad size suffix"
                 } else {
-                    "--block-size must be between 65536 and 67108864 bytes"
+                    "must be between 65536 and 67108864 bytes"
                 };
                 assert!(message.contains(reason), "{message}");
             }

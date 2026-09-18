@@ -40,8 +40,6 @@ Syq uses numeric IDs and always keeps partial files, so `--numeric-ids` and
 default; `-z` does not enable anything extra. `-B` / `--block-size` changes
 syq's comparison and reuse block size; see the [tuning table](tuning.md#transfer-controls)
 for its default and allowed range. Values outside that range are rejected.
-Interrupted copies can still be reused after changing it; syq compares their
-bytes using the new size.
 
 ## Unsupported features
 
