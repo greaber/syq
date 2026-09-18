@@ -11,8 +11,10 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 // Full serialization delayed local copies. A few contenders preserve the
 // create/rename pipeline without letting every transfer worker spin in the
-// kernel on one directory. Independent directories have independent capacity.
-const MUTATORS: usize = 4;
+// kernel on one directory. Eight retains the CPU saving while avoiding the
+// short-copy latency cost measured with four. Independent directories have
+// independent capacity.
+const MUTATORS: usize = 8;
 
 #[derive(Eq, Hash, PartialEq)]
 struct Directory {
@@ -93,14 +95,15 @@ impl Registry {
 
 pub(super) fn acquire(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+    let key = Directory {
+        root,
+        parents: parents.to_vec(),
+    };
     let gate = REGISTRY
         .get_or_init(|| Mutex::new(Registry::new()))
         .lock()
         .unwrap()
-        .gate(Directory {
-            root,
-            parents: parents.to_vec(),
-        });
+        .gate(key);
     // The caller keeps its root descriptor alive throughout the operation,
     // preventing root inode reuse while a permit or its waiter is live.
     // Never hold the registry lock while waiting or performing filesystem I/O.
