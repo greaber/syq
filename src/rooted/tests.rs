@@ -827,6 +827,37 @@ fn selected_fifo_fails_closed_without_an_exact_reopen() {
 }
 
 #[test]
+fn selecting_fifo_metadata_does_not_connect_a_writer() {
+    let tree = TestDir::new("operator-fifo-metadata");
+    let fifo = CString::new(tree.path().join("pipe").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let base = File::open(tree.path()).unwrap();
+    let resolver = OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
+    let selected = resolver
+        .resolve(
+            b"pipe",
+            OperatorFinalComponent::Entry {
+                follow_symlink: false,
+            },
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert!(matches!(&selected, PinnedPath::Leaf(leaf) if leaf.metadata().is_fifo()));
+    // A nonblocking writer must still see no reader while metadata is held.
+    let writer = unsafe { libc::open(fifo.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+    let error = io::Error::last_os_error();
+    if writer >= 0 {
+        unsafe {
+            libc::close(writer);
+        }
+    }
+    assert_eq!(writer, -1, "metadata selection connected a FIFO reader");
+    assert_eq!(error.raw_os_error(), Some(libc::ENXIO));
+    drop(selected);
+}
+
+#[test]
 fn confined_operator_resolver_rejects_relative_and_absolute_link_escapes() {
     let tree = TestDir::new("operator-confined");
     let base_path = tree.path().join("base");

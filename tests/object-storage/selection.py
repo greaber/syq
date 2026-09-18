@@ -24,7 +24,7 @@ def check():
     with ThreadPoolExecutor(max_workers=16) as workers:
         list(workers.map(lambda item: checks.request('PUT', item[0], item[1]), objects.items()))
     with tempfile.TemporaryDirectory(prefix='syq-s3-selection-') as temp:
-        root = Path(temp)
+        root = Path(temp).resolve()
         for name, rules, archive, selected, excluded in [
             ('pruned', ['--ignore', 'archive/'], False, prefix, 1),
             ('flat', ['--ignore', 'archive/'], False, prefix, 1),

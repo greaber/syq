@@ -366,7 +366,7 @@ def main():
     save()
     try:
         with tempfile.TemporaryDirectory(prefix='syq-s3-benchmark-') as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             os.environ['XDG_CACHE_HOME'] = str(root / 'cache')
             for workload in args.workloads:
                 if workload in TRANSFER:
