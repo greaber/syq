@@ -186,6 +186,51 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault == "copy-root-marker" {
+        let path = first.split_whitespace().nth(1).unwrap();
+        match (method, path.split('?').next().unwrap()) {
+            ("HEAD", "/source/data" | "/destination/child") =>
+                reply(&mut socket, 404, &[], b"", true),
+            ("GET", "/source/") if path.contains("list-type=2") => reply(&mut socket, 200, &[],
+                b"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>data/</Key><Size>0</Size></Contents><Contents><Key>data/child</Key><Size>4</Size></Contents></ListBucketResult>", false),
+            ("HEAD", "/source/data/") => reply(&mut socket, 200,
+                &[("Content-Length".into(), "0".into()), ("ETag".into(), "\"marker\"".into()),
+                  ("Last-Modified".into(), "Wed, 01 Jan 2020 00:00:00 GMT".into())], b"", true),
+            ("GET", "/source/data/child") => reply(&mut socket, 200,
+                &[("ETag".into(), "\"source\"".into())], b"data", false),
+            ("HEAD", "/source/data/child") => reply(&mut socket, 200,
+                &[("Content-Length".into(), "4".into()), ("ETag".into(), "\"source\"".into())], b"", true),
+            ("PUT", "/destination/child") => reply(&mut socket, 200, &[],
+                b"<CopyObjectResult><ETag>&quot;copied&quot;</ETag></CopyObjectResult>", false),
+            _ => panic!("unexpected root-marker request: {first}"),
+        }
+        return;
+    }
+    if fault == "marker-head-failure" {
+        let path = first.split_whitespace().nth(1).unwrap();
+        if method == "HEAD" {
+            reply(
+                &mut socket,
+                if path == "/source/data/marker/" {
+                    403
+                } else {
+                    404
+                },
+                &[],
+                b"",
+                true,
+            );
+        } else {
+            assert_eq!(method, "GET", "mutation after failed source HEAD");
+            let body = if path.starts_with("/source/") {
+                "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>data/marker/</Key><Size>0</Size></Contents></ListBucketResult>"
+            } else {
+                "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"
+            };
+            reply(&mut socket, 200, &[], body.as_bytes(), false);
+        }
+        return;
+    }
     if fault == "server-tree-region"
         && first
             .split_whitespace()
@@ -327,6 +372,42 @@ fn serve(
             );
         } else {
             panic!("unexpected server-copy request: {first}");
+        }
+        return;
+    }
+    if fault == "symlink-transfer-denied" {
+        let path = first.split_whitespace().nth(1).unwrap();
+        if method == "GET" && path.contains("list-type=2") {
+            reply(&mut socket, 200, &[],
+                b"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>data/original</Key><Size>4</Size></Contents></ListBucketResult>", false);
+        } else if method == "HEAD" && path == "/source/data" {
+            reply(&mut socket, 404, &[], b"", true);
+        } else if method == "HEAD" && path.starts_with("/source/") {
+            let mut fields = vec![
+                ("Content-Length".into(), "4".into()),
+                ("ETag".into(), "\"source-etag\"".into()),
+            ];
+            for (name, value) in [
+                ("syq-format", "1"),
+                ("syq-kind", "symlink"),
+                ("syq-mode", "511"),
+                ("syq-uid", "0"),
+                ("syq-gid", "0"),
+                ("syq-mtime", "1700000000"),
+                ("syq-mtime-nsec", "0"),
+            ] {
+                fields.push((format!("x-amz-meta-{name}"), value.into()));
+            }
+            reply(&mut socket, 200, &fields, b"", true);
+        } else {
+            assert!(method == "HEAD" || method == "GET", "{first}");
+            reply(
+                &mut socket,
+                403,
+                &[],
+                b"<Error><Code>AccessDenied</Code></Error>",
+                method == "HEAD",
+            );
         }
         return;
     }
@@ -1482,7 +1563,7 @@ fn output_text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     )
 }
-fn validate_results(temp: &Path) {
+fn parsed_results(temp: &Path) -> Vec<serde_json::Value> {
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../schemas/automation.schema.json")).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
@@ -1499,6 +1580,10 @@ fn validate_results(temp: &Path) {
         assert!(errors.is_empty(), "{value}: {errors:?}");
     }
     assert_eq!(values.last().unwrap()["type"], "result");
+    values
+}
+fn validate_results(temp: &Path) {
+    let values = parsed_results(temp);
     assert!(values[0]["endpoints"]
         .as_array()
         .unwrap()
@@ -4134,4 +4219,250 @@ fn server_copy_filters_exact_and_mapping_overlap() {
             }
         }
     }
+}
+
+#[test]
+fn upload_region_discovery_failure_stops_with_and_without_prune() {
+    for prune in [false, true] {
+        let server = Server::start("wrong-region");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("source")).unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(temp.path().join("source").join(name), b"data").unwrap();
+        }
+        let mut args = vec![
+            "--srcs-in",
+            "source",
+            "--to",
+            "s3://destination",
+            "--into",
+            "out",
+        ];
+        if prune {
+            args.push("--prune");
+        }
+        let output = server.cp(temp.path(), &args);
+        assert!(!output.status.success());
+        assert!(
+            output_text(&output).contains("pass --s3-region eu-central-1"),
+            "{}",
+            output_text(&output)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn failed_marker_reports_directory_action_on_both_routes() {
+    for server_copy in [false, true] {
+        let server = Server::start("marker-head-failure");
+        let temp = tempfile::tempdir().unwrap();
+        let mut args = vec!["--from", "s3://source", "--srcs-in", "data"];
+        if server_copy {
+            args.extend(["--to", "s3://destination"]);
+        }
+        args.extend(["--into", "out", "--results", "results.jsonl"]);
+        let output = server.cp(temp.path(), &args);
+        assert!(!output.status.success(), "{}", output_text(&output));
+        let records = parsed_results(temp.path());
+        let results = serde_json::to_string(&records).unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record["action"] == "create_directory"
+                    && record["disposition"] == "failed"),
+            "{results}"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["action"] == "transfer_file"),
+            "{results}"
+        );
+    }
+}
+
+#[test]
+fn failed_transfers_report_known_symlink_action_on_both_routes() {
+    for server_copy in [false, true] {
+        for mapping in [false, true] {
+            let server = Server::start("symlink-transfer-denied");
+            let temp = tempfile::tempdir().unwrap();
+            let mut args = vec!["--from", "s3://source"];
+            if mapping {
+                let entry = serde_json::json!({
+                    "src": {"encoding": "utf-8", "value": "original"},
+                    "dst": {"encoding": "utf-8", "value": "copied"},
+                    "kind": "symlink"
+                });
+                std::fs::write(temp.path().join("mapping.jsonl"), format!("{entry}\n")).unwrap();
+                args.extend(["--mapping", "mapping.jsonl", "--into", "."]);
+            } else {
+                args.extend(["original", "--as", "copied"]);
+            }
+            if server_copy {
+                args.extend(["--to", "s3://destination"]);
+            }
+            args.extend(["--results", "results.jsonl"]);
+            let output = server.cp(temp.path(), &args);
+            assert!(!output.status.success(), "{}", output_text(&output));
+            let records = parsed_results(temp.path());
+            let results = serde_json::to_string(&records).unwrap();
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record["action"] == "create_symlink"
+                        && record["disposition"] == "failed"),
+                "{results}"
+            );
+            assert!(
+                !records
+                    .iter()
+                    .any(|record| record["action"] == "transfer_file"),
+                "{results}"
+            );
+        }
+    }
+}
+
+#[test]
+fn skipped_download_markers_do_not_count_as_unchanged_files() {
+    let flag = "--only-existing";
+    let server = Server::start("marker-head-failure");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "--srcs-in",
+            "data",
+            "--into",
+            "out",
+            flag,
+            "--results",
+            "results.jsonl",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    let records = parsed_results(temp.path());
+    let results = serde_json::to_string(&records).unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|r| r["type"] == "progress" && r["files_total"] == 1 && r["scan_done"] == true),
+        "{results}"
+    );
+    assert_eq!(records.last().unwrap()["files_unchanged"], 0, "{results}");
+}
+
+#[test]
+fn skipped_download_symlinks_use_the_kind_known_from_selection() {
+    for (selection, flag) in [
+        ("exact", "--only-new"),
+        ("mapping", "--only-existing"),
+        ("prefix", "--only-existing"),
+    ] {
+        let server = Server::start("symlink-transfer-denied");
+        let temp = tempfile::tempdir().unwrap();
+        if flag == "--only-new" {
+            std::fs::create_dir(temp.path().join("out")).unwrap();
+            std::os::unix::fs::symlink("target", temp.path().join("out/original")).unwrap();
+        }
+        let mut args = vec!["--from", "s3://source"];
+        match selection {
+            "exact" => args.extend(["data/original", "--as", "out/original"]),
+            "mapping" => {
+                let entry = serde_json::json!({
+                    "src": {"encoding": "utf-8", "value": "data/original"},
+                    "dst": {"encoding": "utf-8", "value": "original"},
+                    "kind": "symlink"
+                });
+                std::fs::write(temp.path().join("mapping.jsonl"), format!("{entry}\n")).unwrap();
+                args.extend(["--mapping", "mapping.jsonl", "--into", "out"]);
+            }
+            "prefix" => args.extend(["--srcs-in", "data", "--into", "out"]),
+            _ => unreachable!(),
+        }
+        args.extend([flag, "--results", "results.jsonl"]);
+        let output = server.cp(temp.path(), &args);
+        assert!(
+            output.status.success(),
+            "{selection} {flag}: {}",
+            output_text(&output)
+        );
+        let records = parsed_results(temp.path());
+        let results = serde_json::to_string(&records).unwrap();
+        assert!(
+            records.iter().any(|r| r["type"] == "progress"
+                && r["files_total"] == 1
+                && r["scan_done"] == true),
+            "{results}"
+        );
+        let expected = u64::from(selection == "prefix");
+        assert_eq!(
+            records.last().unwrap()["files_unchanged"],
+            expected,
+            "{selection} {flag}: {results}"
+        );
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            if selection == "prefix" { 2 } else { 1 },
+            "skipped objects must not trigger transfer-time metadata requests"
+        );
+    }
+}
+
+#[test]
+fn server_copy_directory_to_bucket_root_skips_root_marker() {
+    let server = Server::start("copy-root-marker");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "--src-dir",
+            "data",
+            "--to",
+            "s3://destination",
+            "--as",
+            ".",
+            "--results",
+            "results.jsonl",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 5);
+    let records = parsed_results(temp.path());
+    assert!(records
+        .iter()
+        .any(|r| r["type"] == "progress" && r["scan_done"] == true && r["files_total"] == 1));
+    assert_eq!(records.last().unwrap()["files_transferred"], 1);
+}
+
+#[test]
+fn download_directory_to_root_keeps_root_metadata() {
+    use std::os::unix::fs::MetadataExt;
+    let server = Server::start("copy-root-marker");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "--src-dir",
+            "data",
+            "--as",
+            ".",
+            "--results",
+            "results.jsonl",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(std::fs::read(temp.path().join("child")).unwrap(), b"data");
+    assert_eq!(std::fs::metadata(temp.path()).unwrap().mtime(), 1577836800);
+    assert_eq!(server.requests.load(Ordering::Relaxed), 4);
+    let records = parsed_results(temp.path());
+    assert!(records.iter().any(|r| r["action"] == "create_directory"));
 }

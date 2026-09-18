@@ -1,5 +1,5 @@
 //! Process-local admission control. Samples are useful copies, not calibration traffic.
-use super::Options;
+use super::{Options, Route};
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering::Relaxed},
@@ -24,12 +24,12 @@ impl Tuning {
         Self {
             control_ns: control,
             reads: crate::s3::read_recovery::Recovery::default(),
-            upload: options.upload && options.source_bucket.is_none(),
+            upload: options.route == Route::Upload,
             fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
             // These measured seeds describe provider request behavior; they do
             // not change the data route, integrity policy, or explicit overrides.
-            tigris: options.source_bucket.is_none()
+            tigris: !options.route.is_server_copy()
                 && options
                     .endpoint
                     .as_deref()

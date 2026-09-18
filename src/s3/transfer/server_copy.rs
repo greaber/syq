@@ -60,7 +60,7 @@ fn unchanged(source: &Object, old: &Object, a: &HeadObjectOutput, b: &HeadObject
 }
 
 fn copy_destination_key(job: &Download) -> String {
-    if job.key.ends_with('/') && job.size == 0 {
+    if client::is_directory_marker(&job.key, job.size) {
         format!("{}/", job.path)
     } else {
         job.path.clone()
@@ -132,7 +132,7 @@ impl Engine {
             .is_some_and(|e| e.region_mismatch())
         {
             error.context(format!("S3-to-S3 source bucket {:?} and destination bucket {:?} are configured with region {}; --s3-region applies to both endpoints: use the reported region if both buckets are there; buckets in different regions are not supported by this route",
-                self.options.source_bucket.as_deref().unwrap(), self.options.bucket,
+                self.options.route.source_bucket().unwrap(), self.options.bucket,
                 self.client.config().region().map_or("unknown", |region| region.as_ref())))
         } else {
             error
@@ -195,12 +195,11 @@ impl Engine {
             let engine = self.clone();
             async move {
                 engine.check_cancelled()?;
-                let mut kind = "file";
                 let result = engine
-                    .copy_object(&mut job, &mut kind)
+                    .copy_object(&mut job)
                     .await
                     .map_err(|error| engine.copy_error(error));
-                engine.settle(job.key.as_bytes(), &job.path, kind, &result, None);
+                engine.settle(job.key.as_bytes(), &job.path, job.kind, &result, None);
                 Ok(result.ok().flatten())
             }
         })
@@ -209,17 +208,9 @@ impl Engine {
         Ok(())
     }
 
-    async fn copy_object(
-        &self,
-        job: &mut Download,
-        kind: &mut &'static str,
-    ) -> Result<Option<u64>> {
-        let source_bucket = self.options.source_bucket.as_deref().unwrap();
+    async fn copy_object(&self, job: &mut Download) -> Result<Option<u64>> {
+        let source_bucket = self.options.route.source_bucket().unwrap();
         let key = copy_destination_key(job);
-        if job.path.is_empty() && job.key.ends_with('/') {
-            *kind = "dir";
-            return Ok(None);
-        }
         local::key_path(key.trim_end_matches('/').as_bytes())?;
         anyhow::ensure!(key.len() <= 1024, "S3 key exceeds 1024 bytes");
         let destination = async {
@@ -245,11 +236,7 @@ impl Engine {
             source.size == job.size,
             "S3 source size changed after planning"
         );
-        *kind = match source.kind() {
-            "dir" => "dir",
-            "symlink" => "symlink",
-            _ => "file",
-        };
+        job.kind = source.kind();
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {
@@ -314,7 +301,7 @@ impl Engine {
         copy_source: &str,
         new: bool,
     ) -> Result<()> {
-        let bucket = self.options.source_bucket.as_deref().unwrap();
+        let bucket = self.options.route.source_bucket().unwrap();
         let part_size = self.part_size(source.size);
         anyhow::ensure!(
             part_size <= 5 * 1024 * 1024 * 1024,
