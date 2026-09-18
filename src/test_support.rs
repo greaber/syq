@@ -59,3 +59,26 @@ pub(crate) fn filesystem_accepts_non_utf8_names() -> bool {
         Err(_) => false,
     }
 }
+
+/// The ordinary confined source registration: each path is its own root, no
+/// root symlink is followed, and only `independent_handoff_workers` varies.
+pub(crate) fn register_source_roots<P: AsRef<std::path::Path>>(
+    paths: &[P],
+    independent_handoff_workers: usize,
+) -> crate::proto::Request {
+    use std::os::unix::ffi::OsStrExt;
+    crate::proto::Request::RegisterSourceRoots {
+        base: crate::proto::SourceRootBase::default(),
+        selections: paths
+            .iter()
+            .map(|path| crate::proto::SourceRootSelection {
+                path: path.as_ref().as_os_str().as_bytes().to_vec(),
+                follow_root: false,
+            })
+            .collect(),
+        symlink_policy: crate::proto::OperatorSymlinkPolicy::Refuse,
+        allow_unconfined_paths: false,
+        shared_workers: 0,
+        independent_handoff_workers,
+    }
+}

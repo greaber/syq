@@ -3073,17 +3073,7 @@ fn source_workers_adopt_registered_descriptor_after_path_replacement() {
     let identity = fs::metadata(&selected).unwrap();
     let session = DescriptorSessionSlot::default();
     let mut control = FsOps::with_descriptor_session(session.clone());
-    let response = control.handle(&Request::RegisterSourceRoots {
-        base: SourceRootBase::default(),
-        selections: vec![SourceRootSelection {
-            path: selected.as_os_str().as_bytes().to_vec(),
-            follow_root: false,
-        }],
-        symlink_policy: OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
-        shared_workers: 0,
-        independent_handoff_workers: 0,
-    });
+    let response = control.handle(&crate::test_support::register_source_roots(&[&selected], 0));
     let Response::SourceRootsRegistered(roots) = response else {
         panic!("unexpected source registration response: {response:?}")
     };
@@ -3142,17 +3132,8 @@ fn destination_worker_claims_copy_sources_from_the_foreign_session() {
 
     let source_session = DescriptorSessionSlot::default();
     let mut source_control = FsOps::with_descriptor_session(source_session);
-    let response = source_control.handle(&Request::RegisterSourceRoots {
-        base: SourceRootBase::default(),
-        selections: vec![SourceRootSelection {
-            path: source.as_os_str().as_bytes().to_vec(),
-            follow_root: false,
-        }],
-        symlink_policy: OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
-        shared_workers: 0,
-        independent_handoff_workers: 1,
-    });
+    let response =
+        source_control.handle(&crate::test_support::register_source_roots(&[&source], 1));
     let Response::SourceRootsRegistered(roots) = response else {
         panic!("unexpected source registration response: {response:?}")
     };
@@ -3192,23 +3173,10 @@ fn source_initialization_rejects_mismatched_bad_and_excess_roots_atomically() {
     fs::create_dir(&second).unwrap();
     let session = DescriptorSessionSlot::default();
     let mut control = FsOps::with_descriptor_session(session.clone());
-    let response = control.handle(&Request::RegisterSourceRoots {
-        base: SourceRootBase::default(),
-        selections: vec![
-            SourceRootSelection {
-                path: first.as_os_str().as_bytes().to_vec(),
-                follow_root: false,
-            },
-            SourceRootSelection {
-                path: second.as_os_str().as_bytes().to_vec(),
-                follow_root: false,
-            },
-        ],
-        symlink_policy: OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
-        shared_workers: 0,
-        independent_handoff_workers: 0,
-    });
+    let response = control.handle(&crate::test_support::register_source_roots(
+        &[&first, &second],
+        0,
+    ));
     let Response::SourceRootsRegistered(roots) = response else {
         panic!("unexpected source registration response: {response:?}")
     };
@@ -3247,17 +3215,7 @@ fn source_initialization_rejects_missing_mistyped_and_cross_session_leaf_tickets
     fs::write(&first, b"first").unwrap();
     fs::write(&second, b"second").unwrap();
     let register = |control: &mut FsOps, path: &Path| {
-        let response = control.handle(&Request::RegisterSourceRoots {
-            base: SourceRootBase::default(),
-            selections: vec![SourceRootSelection {
-                path: path.as_os_str().as_bytes().to_vec(),
-                follow_root: false,
-            }],
-            symlink_policy: OperatorSymlinkPolicy::Refuse,
-            allow_unconfined_paths: false,
-            shared_workers: 0,
-            independent_handoff_workers: 0,
-        });
+        let response = control.handle(&crate::test_support::register_source_roots(&[&path], 0));
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
         };
@@ -3320,17 +3278,7 @@ fn independent_source_worker_keeps_exact_object_after_control_and_broker_close()
     fs::write(&selected, b"original").unwrap();
     let session = DescriptorSessionSlot::default();
     let mut control = FsOps::with_descriptor_session(session.clone());
-    let response = control.handle(&Request::RegisterSourceRoots {
-        base: SourceRootBase::default(),
-        selections: vec![SourceRootSelection {
-            path: selected.as_os_str().as_bytes().to_vec(),
-            follow_root: false,
-        }],
-        symlink_policy: OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
-        shared_workers: 0,
-        independent_handoff_workers: 1,
-    });
+    let response = control.handle(&crate::test_support::register_source_roots(&[&selected], 1));
     let Response::SourceRootsRegistered(roots) = response else {
         panic!("unexpected source registration response: {response:?}")
     };
@@ -3375,17 +3323,7 @@ fn repeated_source_registration_keeps_the_original_root_and_leaf_pin() {
     fs::write(&first, b"first").unwrap();
     fs::write(&second, b"second").unwrap();
     let mut control = FsOps::new();
-    let register = |path: &Path| Request::RegisterSourceRoots {
-        base: SourceRootBase::default(),
-        selections: vec![SourceRootSelection {
-            path: path.as_os_str().as_bytes().to_vec(),
-            follow_root: false,
-        }],
-        symlink_policy: OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
-        shared_workers: 0,
-        independent_handoff_workers: 0,
-    };
+    let register = |path: &Path| crate::test_support::register_source_roots(&[&path], 0);
     let response = control.handle(&register(&first));
     let Response::SourceRootsRegistered(roots) = response else {
         panic!("unexpected source registration response: {response:?}")
@@ -3428,17 +3366,7 @@ fn source_stat_enforces_exact_leaf_authority_and_ignores_parallel_path() {
     fs::write(temporary.path().join("sibling"), b"sibling").unwrap();
     let session = DescriptorSessionSlot::default();
     let mut control = FsOps::with_descriptor_session(session.clone());
-    let response = control.handle(&Request::RegisterSourceRoots {
-        base: SourceRootBase::default(),
-        selections: vec![SourceRootSelection {
-            path: selected.as_os_str().as_bytes().to_vec(),
-            follow_root: false,
-        }],
-        symlink_policy: OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
-        shared_workers: 0,
-        independent_handoff_workers: 0,
-    });
+    let response = control.handle(&crate::test_support::register_source_roots(&[&selected], 0));
     let Response::SourceRootsRegistered(roots) = response else {
         panic!("unexpected source registration response: {response:?}")
     };
@@ -3514,17 +3442,7 @@ fn source_scan_rejects_a_replaced_exact_symlink() {
     std::os::unix::fs::symlink("target-a", &selected).unwrap();
     let session = DescriptorSessionSlot::default();
     let mut control = FsOps::with_descriptor_session(session);
-    let response = control.handle(&Request::RegisterSourceRoots {
-        base: SourceRootBase::default(),
-        selections: vec![SourceRootSelection {
-            path: selected.as_os_str().as_bytes().to_vec(),
-            follow_root: false,
-        }],
-        symlink_policy: OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
-        shared_workers: 0,
-        independent_handoff_workers: 0,
-    });
+    let response = control.handle(&crate::test_support::register_source_roots(&[&selected], 0));
     let Response::SourceRootsRegistered(roots) = response else {
         panic!("unexpected source registration response: {response:?}")
     };
@@ -3569,17 +3487,7 @@ fn exact_symlink_scan_uses_the_descriptor_bound_raw_target_snapshot() {
     symlink(Path::new(&target), &selected).unwrap();
     let session = DescriptorSessionSlot::default();
     let mut control = FsOps::with_descriptor_session(session);
-    let response = control.handle(&Request::RegisterSourceRoots {
-        base: SourceRootBase::default(),
-        selections: vec![SourceRootSelection {
-            path: selected.as_os_str().as_bytes().to_vec(),
-            follow_root: false,
-        }],
-        symlink_policy: OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
-        shared_workers: 0,
-        independent_handoff_workers: 1,
-    });
+    let response = control.handle(&crate::test_support::register_source_roots(&[&selected], 1));
     let Response::SourceRootsRegistered(roots) = response else {
         panic!("unexpected source registration response: {response:?}")
     };
@@ -4166,17 +4074,7 @@ fn source_stat_does_not_follow_intermediate_symlinks() {
     std::os::unix::fs::symlink("../outside", selected.join("link")).unwrap();
     let session = DescriptorSessionSlot::default();
     let mut control = FsOps::with_descriptor_session(session.clone());
-    let response = control.handle(&Request::RegisterSourceRoots {
-        base: SourceRootBase::default(),
-        selections: vec![SourceRootSelection {
-            path: selected.as_os_str().as_bytes().to_vec(),
-            follow_root: false,
-        }],
-        symlink_policy: OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
-        shared_workers: 0,
-        independent_handoff_workers: 0,
-    });
+    let response = control.handle(&crate::test_support::register_source_roots(&[&selected], 0));
     let Response::SourceRootsRegistered(roots) = response else {
         panic!("unexpected source registration response: {response:?}")
     };
