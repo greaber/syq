@@ -907,6 +907,13 @@ EOF
     cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-tuning-check
 done
 
+printf 'case: restricted authorization accepts 128 workers\n'
+syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
+    --as /tmp/syq-real-ssh/workers-128 --coordinate-at src \
+    --performance-tuning workers=128 --no-progress
+ssh destination cat /tmp/syq-real-ssh/workers-128 > /tmp/syq-real-ssh-workers-check
+cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-workers-check
+
 printf 'case: adaptive worker ceilings through each remote coordinator\n'
 for transport in tcp ssh; do
     for coordinator in src dst local; do

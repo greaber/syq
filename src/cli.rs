@@ -3057,7 +3057,7 @@ mod tests {
     fn automatic_workers_still_respect_restricted_receiver_authority() {
         let mut args = native_engine_defaults();
         args.restricted_grant = Some("signed grant".into());
-        assert_eq!(args.automatic_worker_limit(), 64);
+        assert_eq!(args.automatic_worker_limit(), 128);
         args.resource_limits = Some(crate::advanced::ResourceLimits {
             workers: Some(3),
             ..Default::default()

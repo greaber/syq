@@ -72,7 +72,7 @@ const MAX_UNIX_TIMESTAMP: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
 pub(crate) const MAX_ENTRIES: u64 = 1_000_000_000_000;
 // Keep later accounting representable in both signed and unsigned counters.
 pub(crate) const MAX_COPY_BYTES: u64 = i64::MAX as u64;
-pub(crate) const MAX_CONNECTIONS: u16 = 64;
+pub(crate) const MAX_CONNECTIONS: u16 = 128;
 const MAX_FILTER_RULES: usize = 4096;
 const MAX_FILTER_RULE_BYTES: usize = 4096;
 const MAX_FILTER_ROOTS: usize = 1024;
@@ -2210,6 +2210,8 @@ mod tests {
         // the deterministic test key below. Do not regenerate on protocol edits.
         let encoded = include_bytes!("../tests/fixtures/restricted-grant-v0.4.1.bin");
         let decoded = SignedGrantEnvelope::decode(encoded).unwrap();
+        let GrantOperation::Copy(copy) = &decoded.grant.operation;
+        assert_eq!(copy.limits.max_connections, 8);
         assert_eq!(decoded.tcp_congestion, None);
         assert_eq!(decoded.encode().unwrap(), encoded);
         let private = PrivateKey::new(
@@ -2428,6 +2430,20 @@ mod tests {
             )
             .unwrap();
             assert_eq!(verified.into_parts().1.mapping, Some(mapping.clone()));
+        }
+    }
+
+    #[test]
+    fn signed_worker_allowances_round_trip_without_widening() {
+        let fixture = Fixture::ordinary();
+        for workers in [1, 8, 32, 64, 128] {
+            let mut grant = fixture_grant(1);
+            let GrantOperation::Copy(copy) = &mut grant.operation;
+            copy.limits.max_connections = workers;
+            let encoded = fixture.signed(grant);
+            let decoded = SignedGrantEnvelope::decode(&encoded).unwrap();
+            let GrantOperation::Copy(copy) = decoded.grant.operation;
+            assert_eq!(copy.limits.max_connections, workers);
         }
     }
 
