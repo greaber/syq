@@ -58,14 +58,15 @@ for workload sizes, warm-up time, and command-line options.
 <caption>Published example: Germany → US East Coast</caption>
 <thead><tr><th scope="col">Tool</th><th scope="col">Average speed</th></tr></thead>
 <tbody>
-<tr><th scope="row">syq</th><td>159.1 MB/s</td></tr>
-<tr><th scope="row">syq over SSH</th><td>87.2 MB/s</td></tr>
-<tr><th scope="row">rsync</th><td>18.0 MB/s</td></tr>
+<tr><th scope="row">syq</th><td>159.9 MB/s</td></tr>
+<tr><th scope="row">syq over SSH</th><td>88.3 MB/s</td></tr>
+<tr><th scope="row">rsync</th><td>18.3 MB/s</td></tr>
 </tbody>
 </table>
 <figcaption>One 1.07 GB file, held in memory at both ends; three runs per tool.
 From the separate <a href="https://greaber.github.io/syq-bench/all-results.html#public-wan-forward">syq-bench project</a>,
-which provides more extensive benchmarks. Your results will depend on your machines and connection.</figcaption>
+measured on September 13, 2026 (<a href="https://greaber.github.io/syq-bench/data/release-060-public-wan-forward.json">raw results</a>).
+Your results will depend on your machines and connection.</figcaption>
 </figure>
 
 ## Updates

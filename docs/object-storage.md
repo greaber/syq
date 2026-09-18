@@ -51,8 +51,8 @@ syq stream --from s3://backups data.gz --write-fd 3 3>data.gz
 ```
 
 The descriptor must be inherited by syq and open for the requested direction.
-No descriptor range is reserved; descriptor 2 is reserved for diagnostics.
-Dedicate the descriptor to this transfer while syq runs. Syq leaves its blocking
+Any descriptor except 2 (reserved for diagnostics) is accepted. Dedicate it to
+this transfer while syq runs. Syq leaves its blocking
 or nonblocking mode unchanged. Regular-file descriptors use their current offset and
 are not truncated, renamed, or given copied metadata. Progress and summaries
 are not written; stdout contains only payload when it is the selected output.
@@ -70,7 +70,7 @@ additional memory for HTTP/TLS. Slow producers or consumers apply backpressure.
 Override these settings with `--performance-tuning s3-part-size=SIZE`,
 `s3-max-concurrent-parts-per-object=N`, or `s3-retries=N`; other tuning keys
 are not accepted for streams. Increasing part size or concurrency increases
-memory use. These settings do not use the file-copy adaptive controller.
+memory use. Stream concurrency does not adjust automatically.
 
 An unknown-length upload can contain at most 10,000 parts. With the default
 16 MiB part size that is 156.25 GiB; choose a larger part size before starting a
@@ -138,17 +138,13 @@ The account needs object read/write and bucket listing permissions. Downloads
 and server-side copies pin the source version when the service supplies a
 version ID. On AWS, reading that version also requires `s3:GetObjectVersion`;
 reading its tags requires `s3:GetObjectVersionTagging`.
-Multipart
-recovery also needs permission to list uploaded parts and abort obsolete
-uploads. Server-side copies preserve tags. Multipart copies read source tags
-unless HEAD explicitly reports zero tags, so they can require tag-reading
-permission in addition to the permissions for a single-request copy. Missing
-tag counts are treated as unknown. If the service returns HTTP 501 (tag reads
-unsupported), syq warns once and continues without tags for unknown counts,
-remembering that response for the rest of the run. A positive tag count still
-causes a failure rather than dropping known tags. Permission errors remain fatal.
-Writing copied tags requires the corresponding destination permission. Syq does not change
-bucket policies or lifecycle rules.
+Multipart recovery also needs permission to list uploaded parts and abort
+obsolete uploads. Server-side copies preserve tags; multipart copies can need
+additional permissions to read source tags and write them at the destination.
+Permission errors fail the copy. If a service does not support reading tags
+(HTTP 501), syq warns and continues without them only when it cannot determine
+whether the source has tags; known tags are never silently dropped. Syq does
+not change bucket policies or lifecycle rules.
 
 ## Parallelism
 
@@ -234,15 +230,13 @@ accepts `s3_header=["x-amz-storage-class: STANDARD_IA"]`. Supported classes
 and defaults vary by provider. These headers apply when an object is copied;
 changing them alone does not force an unchanged object to be copied.
 
-Before copying, syq compares object type, size, user metadata and content headers.
-It skips objects when these match and a common provider-reported whole-object
-checksum matches; otherwise it uses matching ETags or syq file metadata when no
-comparable checksum is available. This needs no local ETag cache or body reads.
-Composite checksums are not compared because they depend on part boundaries.
-ETags can also change with multipart layout or encryption. Without a comparable
-whole-object checksum or syq metadata, these objects can be copied again on every
-run even when their contents have not changed. Tags, ACLs, storage class and encryption settings are not
-part of this quick check; tag-only changes do not trigger a copy.
+Syq skips existing objects when their type, size, user metadata and content
+headers match, along with a provider-reported whole-object checksum. Without
+comparable checksums, it uses matching ETags or syq file metadata. Multipart
+layout and encryption can change ETags, so objects without another basis for
+comparison may be copied again even when their contents have not changed.
+Tag-only changes do not trigger a copy; ACLs, storage class, and encryption
+settings are also excluded from this quick check.
 
 S3 permits a key and keys beneath its corresponding prefix to coexist. Server-side
 copies do not reject an existing destination solely for that reason.
@@ -250,9 +244,8 @@ copies do not reject an existing destination solely for that reason.
 By default, server-side copies use one copy request up to the 5 GiB limit.
 An explicit `s3-part-size` also sets the multipart threshold, capped at that
 limit. Larger objects use concurrent multipart server-side copying, with the shared
-request budget described above. Server-copy tuning uses the same rules for
-every provider. Unless you set `s3-max-concurrent-parts-per-object`, parts
-can use the shared request budget's full tuning range. Failed or cancelled
+request budget described above. Use `s3-max-concurrent-parts-per-object` to
+limit one object's share of that budget. Failed or cancelled
 multipart copies attempt to abort their unfinished upload; retries restart that object.
 If cleanup fails, syq reports the upload ID for manual cleanup. Already completed
 objects remain available.
