@@ -442,13 +442,13 @@ pub struct SourceLeafIdentity {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RegisteredSourceRoot {
     pub ticket: DescriptorTicket,
-    /// Present only for an exact non-directory selection. This typed ticket
-    /// names the original selected object, not its containing directory.
+    /// Pins an exact non-directory selection. FIFO sources on platforms
+    /// without an inert metadata descriptor omit this ticket; their parent
+    /// and expected identity still constrain the selection.
     pub leaf_ticket: Option<DescriptorTicket>,
     pub selection: RegisteredPath,
-    /// Present only for an exact leaf. Every worker acquires and retains its
-    /// own clone of `leaf_ticket` before acknowledging readiness, preventing
-    /// identity reuse even if the control connection exits first.
+    /// Present only for an exact leaf. Workers retain `leaf_ticket` when
+    /// available; an unpinned FIFO has identity checks but no inode-reuse guard.
     pub expected_leaf: Option<SourceLeafIdentity>,
     /// Permit this explicitly opted-in rsync session to use legacy unconfined
     /// source pathnames for `--insecure-links` compatibility.
@@ -464,7 +464,15 @@ impl RegisteredSourceRoot {
             bail!("source root ticket and registered path identify different roots");
         }
         let exact_leaf = !self.selection.relative.is_empty();
-        if exact_leaf != self.expected_leaf.is_some() || exact_leaf != self.leaf_ticket.is_some() {
+        if exact_leaf != self.expected_leaf.is_some() {
+            bail!("source root leaf selection and expected identity disagree");
+        }
+        let unpinned_fifo = self
+            .expected_leaf
+            .as_ref()
+            .is_some_and(|expected| expected.file_type == crate::sys::MODE_FIFO)
+            && self.leaf_ticket.is_none();
+        if exact_leaf != self.leaf_ticket.is_some() && !unpinned_fifo {
             bail!("source root leaf selection and expected identity disagree");
         }
         if exact_leaf && self.selection.relative.contains(&b'/') {

@@ -9,8 +9,8 @@ pub(crate) enum OperatorFinalComponent {
     Entry {
         follow_symlink: bool,
     },
-    /// A byte-stream source. On platforms without O_PATH, keep a FIFO's
-    /// parent and identity without opening a metadata handle that joins it.
+    /// A byte-stream source. Like other selections, FIFO classification does
+    /// not open a reader; the caller opens it when ready to consume bytes.
     StreamSource {
         follow_symlink: bool,
     },
@@ -32,8 +32,9 @@ pub(crate) struct OperatorSymlinkHop {
 
 /// An existing named entry selected relative to its retained parent. `object`
 /// pins a non-directory object where the platform can open it without
-/// following; a selected symlink may have only its parent, name, and observed
-/// identity. Directories are pinned separately by `PinnedDirectory`.
+/// following or connecting a FIFO. FIFOs outside Linux and some symlinks have
+/// only their parent, name, and observed identity. Directories are pinned
+/// separately by `PinnedDirectory`.
 pub(crate) struct PinnedLeaf {
     pub(super) parent: File,
     pub(super) name: CString,
@@ -77,6 +78,14 @@ impl PinnedLeaf {
                 "selected FIFO control input cannot be reopened through an exact descriptor on this platform; use --files-from - or --mapping -, or materialize ignore rules in a regular file"
             );
         }
+        // Reject an already-visible replacement before opening it: even a
+        // nonblocking open of a replacement FIFO would connect its producer.
+        // The descriptor check below still covers changes after this stat.
+        require_operator_identity(
+            self.metadata,
+            metadata_at(self.parent.as_raw_fd(), &self.name)?,
+            "operator file",
+        )?;
         // A pathname replacement must not make the candidate open block before
         // its identity is checked. The selected object is not a FIFO here, but
         // its replacement may be one. Restore ordinary blocking I/O only after
@@ -502,13 +511,11 @@ impl OperatorResolver {
                 return Err(io::Error::from_raw_os_error(libc::ENOTDIR).into());
             }
             // Only Linux O_PATH pins a FIFO without joining it as a reader.
-            // In particular, macOS O_EVTONLY can release a waiting producer
-            // and discard its bytes before the stream's actual open. Elsewhere
-            // retain the parent and observed identity; the input open checks it.
-            let object = if metadata.is_fifo()
-                && !cfg!(target_os = "linux")
-                && matches!(final_component, OperatorFinalComponent::StreamSource { .. })
-            {
+            // macOS O_EVTONLY can release a producer and discard its bytes even
+            // when the caller only inspects a name. Elsewhere retain the parent
+            // and observed identity. Callers recheck it but cannot prevent FIFO
+            // inode reuse.
+            let object = if metadata.is_fifo() && !cfg!(target_os = "linux") {
                 None
             } else {
                 let object = open_operator_metadata_at(current.directory.as_raw_fd(), &name)

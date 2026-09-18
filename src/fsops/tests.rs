@@ -4527,3 +4527,68 @@ fn process_umask_matches_file_creation() {
     let created = file.metadata().unwrap().mode() & 0o777;
     assert_eq!(created, 0o777 & !process_umask());
 }
+
+#[test]
+fn registered_fifo_keeps_identity_checks_without_connecting_a_writer() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let fifo = temporary.path().join("pipe");
+    let regular = temporary.path().join("file");
+    make_fifo(&fifo, 0o600);
+    fs::write(&regular, b"data").unwrap();
+    let session = DescriptorSessionSlot::default();
+    let mut control = FsOps::with_descriptor_session(session.clone());
+    let response = control.handle(&crate::test_support::register_source_roots(
+        &[&fifo, &regular],
+        0,
+    ));
+    let Response::SourceRootsRegistered(roots) = response else {
+        panic!("unexpected source registration response: {response:?}");
+    };
+    // Existing pinned records and the FIFO-only exception use the same wire
+    // representation; all peers must match build identities before decoding.
+    let encoded = postcard::to_stdvec(&roots).unwrap();
+    let roots: Vec<RegisteredSourceRoot> = postcard::from_bytes(&encoded).unwrap();
+    let mut worker = FsOps::with_descriptor_session(session.clone());
+    worker.initialize_sources(&roots).unwrap();
+    let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    let writer = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    let error = io::Error::last_os_error();
+    if writer >= 0 {
+        unsafe {
+            libc::close(writer);
+        }
+    }
+    assert_eq!(writer, -1, "source registration connected a FIFO reader");
+    assert_eq!(error.raw_os_error(), Some(libc::ENXIO));
+
+    // Only FIFOs may omit an exact-object ticket; regular files still need one.
+    let mut unpinned = roots[0].clone();
+    unpinned.leaf_ticket = None;
+    unpinned.validate().unwrap();
+    let mut unpinned_regular = roots[1].clone();
+    unpinned_regular.leaf_ticket = None;
+    assert!(unpinned_regular.validate().is_err());
+
+    fs::rename(&fifo, temporary.path().join("original")).unwrap();
+    make_fifo(&fifo, 0o600);
+    let mut fresh = FsOps::with_descriptor_session(session);
+    assert!(
+        fresh.initialize_sources(&[unpinned]).is_err(),
+        "worker accepted a replaced FIFO"
+    );
+    let response = worker.handle(&Request::StatMany {
+        paths: vec![b"ignored".to_vec()],
+        sources: Some(vec![roots[0].selection.clone()]),
+        follow: false,
+        guard: None,
+    });
+    assert!(
+        matches!(response, Response::EndpointError(_)),
+        "worker accepted a replaced FIFO: {response:?}"
+    );
+}

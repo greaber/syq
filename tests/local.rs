@@ -965,6 +965,9 @@ mod confinement;
 mod copy;
 #[path = "local/data_safety.rs"]
 mod data_safety;
+#[cfg(debug_assertions)]
+#[path = "local/fifo.rs"]
+mod fifo;
 #[path = "local/hashing.rs"]
 mod hashing;
 #[path = "local/local_copy_selection.rs"]

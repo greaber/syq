@@ -222,11 +222,12 @@ fn pin_selection(
             }
             let emitted_source = emitted_source(location, leaf.resolved_relative())?;
             let (parent, name, metadata, object) = leaf.into_parts();
-            let object = object
-                .context("this platform cannot retain the selected map source leaf safely")?;
+            if object.is_none() && !metadata.is_fifo() {
+                bail!("this platform cannot retain the selected map source leaf safely");
+            }
             let symlink_target = if metadata.is_symlink() {
                 Some(
-                    read_open_symlink(&object)?.context(
+                    read_open_symlink(object.as_ref().expect("symlink object was checked"))?.context(
                         "this platform cannot snapshot a selected map symlink through its pinned object (macOS 13 or newer is required on Darwin)",
                     )?,
                 )
@@ -242,7 +243,7 @@ fn pin_selection(
                     file_type: metadata.file_type(),
                     symlink_target,
                 }),
-                _leaf_object: Some(object),
+                _leaf_object: object,
                 emitted_source,
             })
         }

@@ -6,7 +6,8 @@
 //! parent directory remain pinned while an endpoint-local worker pool removes
 //! descendants relative to directory descriptors. Regardless of source following,
 //! a selected symlink and symlinks encountered below a selected directory are
-//! unlinked as entries; neither is followed.
+//! unlinked as entries; neither is followed. FIFOs on platforms without O_PATH
+//! retain only their parent and observed identity, avoiding a stream reader.
 
 use crate::proto::{
     Kind, NativeRemoveDisposition, NativeRemoveErrorClass, NativeRemoveFailure, NativeRemoveKind,
