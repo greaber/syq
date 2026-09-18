@@ -1379,20 +1379,9 @@ impl Planner<'_> {
                 dst_root,
             )?
         };
-        let mut ops: Vec<Op> = Vec::new();
-        let mut op_names: Vec<QueuedLeafOp> = Vec::new();
-        let mut meta_fixes: Vec<Op> = Vec::new();
+        let mut leaf_ops = LeafOps::default();
         for (p, dst_entry) in others.into_iter().zip(stats) {
-            let Planned {
-                src: src_path,
-                source,
-                dst: dst_path,
-                dst_rel,
-                rel,
-                e,
-                contested,
-            } = p;
-            let target_condition = self.exact_condition_for(&dst_path);
+            let target_condition = self.exact_condition_for(&p.dst);
             let target_condition_holds = match (target_condition, &dst_entry) {
                 (TargetCondition::Any, _) | (TargetCondition::Absent, None) => true,
                 (TargetCondition::Absent, Some(_)) => false,
@@ -1419,364 +1408,404 @@ impl Planner<'_> {
             if !target_condition_holds {
                 self.progress.error(&format!(
                     "syq: target {} changed after the placement precondition was checked",
-                    display(&dst_path)
+                    display(&p.dst)
                 ));
                 self.collision = true;
                 continue;
             }
-            if (opts.existing || opts.ignore_existing)
-                && self.under_missing_dir(&dst_path, dst_root)
-            {
+            if (opts.existing || opts.ignore_existing) && self.under_missing_dir(&p.dst, dst_root) {
                 // Below a directory we won't create: nothing to do, even if the
                 // destination has something reachable there through a symlink.
                 self.progress.files_excluded.fetch_add(1, Relaxed);
                 continue;
             }
-            match e.kind {
-                Kind::File => {
-                    if self.unusable_files.contains(&dst_path) {
-                        // register_namespace reported it; nothing can stage here.
-                        continue;
-                    }
-                    // Never copy a file onto itself (same path, hardlink, or a
-                    // symlinked alias) — with --inplace that would truncate the
-                    // source. Only possible when both ends are the same machine.
-                    // This is also what settles a contested claim: two sources
-                    // may map onto one destination file only if one of them
-                    // *is* that file (so nothing is actually written twice).
-                    let same_file = opts.same_host
-                        && dst_entry
-                            .as_ref()
-                            .is_some_and(|d| d.dev == e.dev && d.ino == e.ino);
-                    if same_file {
-                        if !opts.quiet {
-                            self.progress.eprintln(&format!(
-                                "skipping {rel}: source and destination are the same file"
-                            ));
-                        }
-                        self.progress.files_excluded.fetch_add(1, Relaxed);
-                        if !contested {
-                            // Nothing will be written here; let another source have it.
-                            self.dst_seen.insert(dst_path, Claim::Weak);
-                        }
-                        continue;
-                    }
-                    if contested {
-                        self.progress.error(&format!(
-                            "syq: {rel}: two sources map to the same destination {} — refusing to clobber it",
-                            display(&dst_path)
-                        ));
-                        self.collision = true;
-                        continue;
-                    }
-                    if opts.max_size.is_some_and(|m| e.size > m)
-                        || opts.min_size.is_some_and(|m| e.size < m)
-                        || self.skip_existing(&dst_entry)
-                    {
-                        self.progress.files_excluded.fetch_add(1, Relaxed);
-                        continue;
-                    }
-                    if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref())
-                    {
-                        continue;
-                    }
-                    let same = dst_entry
-                        .as_ref()
-                        .is_some_and(|d| opts.metadata_matches(&e, d));
-                    let dst_newer = opts.update
-                        && dst_entry.as_ref().is_some_and(|d| {
-                            d.kind == Kind::File
-                                && (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
-                        });
-                    if dst_newer {
-                        self.progress.files_excluded.fetch_add(1, Relaxed);
-                        continue;
-                    }
-                    if opts.verify_only {
-                        if dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File) {
-                            self.enqueue(
-                                (src_path.clone(), source.clone()),
-                                dst_path.clone(),
-                                rel.clone(),
-                                dst_rel.clone(),
-                                e.clone(),
-                                dst_entry.clone(),
-                            );
-                        } else {
-                            self.progress.error(&format!("MISSING {rel}"));
-                        }
-                    } else if same && !opts.checksum && opts.expected_for(&dst_rel).is_none() {
-                        // Content is up to date, but still reconcile metadata
-                        // (mode/owner/group) the way rsync does — a skipped file
-                        // shouldn't keep stale permissions.
-                        if let Some(d) = &dst_entry {
-                            let ff = opts.metadata_fix_flags(&e, d);
-                            if ff != 0 {
-                                self.progress.files_unchanged.fetch_add(1, Relaxed);
-                                self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
-                                if opts.dry_run {
-                                    self.dry_run_changes.metadata_files += 1;
-                                    self.emit_trace(
-                                        "transfer_file",
-                                        &dst_rel,
-                                        "file",
-                                        None,
-                                        "metadata_differs",
-                                    );
-                                    if opts.verbose > 0 {
-                                        self.progress.println(&format!(
-                                            "update metadata {} (requested file metadata differs)",
-                                            display(&dst_path)
-                                        ));
-                                    }
-                                    continue;
-                                }
-                                meta_fixes.push(Op::SetFileMetaIfSame {
-                                    path: dst_path.clone(),
-                                    condition: match target_condition {
-                                        TargetCondition::Any => target_identity(d),
-                                        condition => condition,
-                                    },
-                                    meta: e.meta(),
-                                    flags: ff,
-                                });
-                                continue;
-                            }
-                        }
-                        self.progress.files_unchanged.fetch_add(1, Relaxed);
-                        self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
-                    } else if opts.dry_run {
-                        self.progress.files_total.fetch_add(1, Relaxed);
-                        self.progress.bytes_total.fetch_add(e.size, Relaxed);
-                        self.progress.files_done.fetch_add(1, Relaxed);
-                        // Dry aggregates mean planned work, bytes included —
-                        // files_done already moves here, so bytes_done must
-                        // too or the terminal record contradicts its traces.
-                        self.progress.bytes_done.fetch_add(e.size, Relaxed);
-                        self.dry_run_changes.regular_files += 1;
-                        if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::File) {
-                            self.dry_run_changes.type_replacements += 1;
-                        }
-                        self.emit_trace(
-                            "transfer_file",
-                            &dst_rel,
-                            "file",
-                            Some(e.size),
-                            match &dst_entry {
-                                None => "destination_missing",
-                                Some(d) if d.kind != Kind::File => "type_differs",
-                                Some(_) => "content_differs",
-                            },
-                        );
-                        if opts.verbose > 0 {
-                            let shown = display(&dst_path);
-                            let action = match &dst_entry {
-                                None => format!("create file {shown} (destination missing)"),
-                                Some(d) if d.kind != Kind::File => format!(
-                                    "replace with file {shown} (destination is {})",
-                                    kind_label(d.kind)
-                                ),
-                                Some(d) if d.size != e.size => {
-                                    format!("update file {shown} (size differs)")
-                                }
-                                Some(_) if opts.checksum => {
-                                    format!("update file {shown} (content comparison requested)")
-                                }
-                                Some(d)
-                                    if opts.flags & flags::TIMES != 0
-                                        && (d.mtime, d.mtime_nsec) != (e.mtime, e.mtime_nsec) =>
-                                {
-                                    format!("update file {shown} (modification time differs)")
-                                }
-                                Some(_) => {
-                                    format!("update file {shown} (content quick check unavailable)")
-                                }
-                            };
-                            self.progress.println(&action);
-                        }
-                    } else {
-                        self.enqueue(
-                            (src_path, source),
-                            dst_path,
-                            rel,
-                            dst_rel.clone(),
-                            e.clone(),
-                            dst_entry,
-                        );
-                    }
-                }
-                Kind::Symlink => {
-                    if self.skip_existing(&dst_entry) {
-                        self.progress.files_excluded.fetch_add(1, Relaxed);
-                        continue;
-                    }
-                    if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref())
-                    {
-                        continue;
-                    }
-                    let target = e.link.clone().unwrap_or_default();
-                    let same = dst_entry.as_ref().is_some_and(|d| {
-                        d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..])
-                    });
-                    if opts.verify_only {
-                        if !same {
-                            self.progress.error(&format!("DIFFERS {rel} (symlink)"));
-                        }
-                        continue;
-                    }
-                    if same {
-                        continue;
-                    }
-                    if opts.dry_run {
-                        self.dry_run_changes.symlinks += 1;
-                        if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::Symlink) {
-                            self.dry_run_changes.type_replacements += 1;
-                        }
-                        self.emit_trace(
-                            "create_symlink",
-                            &dst_rel,
-                            "symlink",
-                            None,
-                            match &dst_entry {
-                                None => "destination_missing",
-                                Some(d) if d.kind != Kind::Symlink => "type_differs",
-                                Some(_) => "content_differs",
-                            },
-                        );
-                        if opts.verbose > 0 {
-                            let shown = display(&dst_path);
-                            let action = match &dst_entry {
-                                None => format!(
-                                    "create symlink {shown} -> {} (destination missing)",
-                                    display(&target)
-                                ),
-                                Some(d) if d.kind != Kind::Symlink => format!(
-                                    "replace with symlink {shown} -> {} (destination is {})",
-                                    display(&target),
-                                    kind_label(d.kind)
-                                ),
-                                Some(_) => format!(
-                                    "update symlink {shown} -> {} (target differs)",
-                                    display(&target)
-                                ),
-                            };
-                            self.progress.println(&action);
-                        }
-                        continue;
-                    }
-                    op_names.push(QueuedLeafOp {
-                        dst_rel: dst_rel.clone(),
-                        action: "create_symlink",
-                        kind: "symlink",
-                        name: format!("{rel} -> {}", display(&target)),
-                    });
-                    ops.push(Op::Symlink {
-                        path: dst_path.clone(),
-                        target,
-                        condition: self.exact_condition_for(&dst_path),
-                    });
-                    ops.push(Op::SetMeta {
-                        // Apply runs successful leaf creation/replacement
-                        // before metadata; a failed guarded replacement skips
-                        // this phase entirely.
-                        condition: TargetCondition::Any,
-                        path: dst_path,
-                        meta: e.meta(),
-                        flags: opts.flags & !flags::MODE,
-                    });
-                }
+            match p.e.kind {
+                Kind::File => self.plan_file(p, dst_entry, target_condition, &mut leaf_ops),
+                Kind::Symlink => self.plan_symlink(p, dst_entry, &mut leaf_ops),
                 Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
-                    if self.skip_existing(&dst_entry) {
-                        self.progress.files_excluded.fetch_add(1, Relaxed);
-                        continue;
-                    }
-                    if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref())
-                    {
-                        continue;
-                    }
-                    let same = dst_entry
-                        .as_ref()
-                        .is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
-                    if opts.verify_only {
-                        if !same {
-                            let what = if dst_entry.is_none() {
-                                "MISSING"
-                            } else {
-                                "DIFFERS"
-                            };
-                            self.progress.error(&format!("{what} {rel} (special file)"));
-                        }
-                        continue;
-                    }
-                    if same || opts.dry_run {
-                        if opts.dry_run && !same {
-                            self.dry_run_changes.specials += 1;
-                            if dst_entry.as_ref().is_some_and(|d| d.kind != e.kind) {
-                                self.dry_run_changes.type_replacements += 1;
-                            }
-                            self.emit_trace(
-                                "create_special",
-                                &dst_rel,
-                                "special",
-                                None,
-                                match &dst_entry {
-                                    None => "destination_missing",
-                                    Some(d) if d.kind != e.kind => "type_differs",
-                                    Some(_) => "content_differs",
-                                },
-                            );
-                            if opts.verbose > 0 {
-                                let shown = display(&dst_path);
-                                let action = match &dst_entry {
-                                    None => format!(
-                                        "create {} {shown} (destination missing)",
-                                        kind_label(e.kind)
-                                    ),
-                                    Some(d) if d.kind != e.kind => format!(
-                                        "replace with {} {shown} (destination is {})",
-                                        kind_label(e.kind),
-                                        kind_label(d.kind)
-                                    ),
-                                    Some(_) => format!(
-                                        "update {} {shown} (device identity differs)",
-                                        kind_label(e.kind)
-                                    ),
-                                };
-                                self.progress.println(&action);
-                            }
-                        }
-                        continue;
-                    }
-                    op_names.push(QueuedLeafOp {
-                        dst_rel: dst_rel.clone(),
-                        action: "create_special",
-                        kind: "special",
-                        name: rel,
-                    });
-                    ops.push(Op::Mknod {
-                        path: dst_path.clone(),
-                        mode: e.mode,
-                        rdev: e.rdev,
-                        condition: self.exact_condition_for(&dst_path),
-                    });
-                    let mut meta = e.meta();
-                    let mut flags = opts.flags;
-                    if flags & flags::MODE == 0 {
-                        meta.mode = e.mode & 0o777 & !opts.umask;
-                        flags |= flags::RECEIVER_MODE;
-                    }
-                    ops.push(Op::SetMeta {
-                        condition: TargetCondition::Any,
-                        path: dst_path,
-                        meta,
-                        flags,
-                    });
+                    self.plan_special(p, dst_entry, &mut leaf_ops)
                 }
                 Kind::Dir | Kind::Other => unreachable!("handled in the mapping loop"),
             }
         }
-        self.flush_meta_fixes(meta_fixes)?;
-        self.flush_leaf_ops(ops, &op_names)
+        self.flush_meta_fixes(leaf_ops.meta_fixes)?;
+        self.flush_leaf_ops(leaf_ops.ops, &leaf_ops.names)
+    }
+
+    /// Decide what a mapped regular file needs: a skip, a metadata fix, a
+    /// dry-run trace or a transfer.
+    fn plan_file(
+        &mut self,
+        leaf: Planned,
+        dst_entry: Option<Entry>,
+        target_condition: TargetCondition,
+        leaf_ops: &mut LeafOps,
+    ) {
+        let opts = self.opts;
+        let Planned {
+            src: src_path,
+            source,
+            dst: dst_path,
+            dst_rel,
+            rel,
+            e,
+            contested,
+        } = leaf;
+        if self.unusable_files.contains(&dst_path) {
+            // register_namespace reported it; nothing can stage here.
+            return;
+        }
+        // Never copy a file onto itself (same path, hardlink, or a
+        // symlinked alias) — with --inplace that would truncate the
+        // source. Only possible when both ends are the same machine.
+        // This is also what settles a contested claim: two sources
+        // may map onto one destination file only if one of them
+        // *is* that file (so nothing is actually written twice).
+        let same_file = opts.same_host
+            && dst_entry
+                .as_ref()
+                .is_some_and(|d| d.dev == e.dev && d.ino == e.ino);
+        if same_file {
+            if !opts.quiet {
+                self.progress.eprintln(&format!(
+                    "skipping {rel}: source and destination are the same file"
+                ));
+            }
+            self.progress.files_excluded.fetch_add(1, Relaxed);
+            if !contested {
+                // Nothing will be written here; let another source have it.
+                self.dst_seen.insert(dst_path, Claim::Weak);
+            }
+            return;
+        }
+        if contested {
+            self.progress.error(&format!(
+                "syq: {rel}: two sources map to the same destination {} — refusing to clobber it",
+                display(&dst_path)
+            ));
+            self.collision = true;
+            return;
+        }
+        if opts.max_size.is_some_and(|m| e.size > m)
+            || opts.min_size.is_some_and(|m| e.size < m)
+            || self.skip_existing(&dst_entry)
+        {
+            self.progress.files_excluded.fetch_add(1, Relaxed);
+            return;
+        }
+        if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref()) {
+            return;
+        }
+        let same = dst_entry
+            .as_ref()
+            .is_some_and(|d| opts.metadata_matches(&e, d));
+        let dst_newer = opts.update
+            && dst_entry.as_ref().is_some_and(|d| {
+                d.kind == Kind::File && (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
+            });
+        if dst_newer {
+            self.progress.files_excluded.fetch_add(1, Relaxed);
+            return;
+        }
+        if opts.verify_only {
+            if dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File) {
+                self.enqueue(
+                    (src_path.clone(), source.clone()),
+                    dst_path.clone(),
+                    rel.clone(),
+                    dst_rel.clone(),
+                    e.clone(),
+                    dst_entry.clone(),
+                );
+            } else {
+                self.progress.error(&format!("MISSING {rel}"));
+            }
+        } else if same && !opts.checksum && opts.expected_for(&dst_rel).is_none() {
+            // Content is up to date, but still reconcile metadata
+            // (mode/owner/group) the way rsync does — a skipped file
+            // shouldn't keep stale permissions.
+            if let Some(d) = &dst_entry {
+                let ff = opts.metadata_fix_flags(&e, d);
+                if ff != 0 {
+                    self.progress.files_unchanged.fetch_add(1, Relaxed);
+                    self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
+                    if opts.dry_run {
+                        self.dry_run_changes.metadata_files += 1;
+                        self.emit_trace(
+                            "transfer_file",
+                            &dst_rel,
+                            "file",
+                            None,
+                            "metadata_differs",
+                        );
+                        if opts.verbose > 0 {
+                            self.progress.println(&format!(
+                                "update metadata {} (requested file metadata differs)",
+                                display(&dst_path)
+                            ));
+                        }
+                        return;
+                    }
+                    leaf_ops.meta_fixes.push(Op::SetFileMetaIfSame {
+                        path: dst_path.clone(),
+                        condition: match target_condition {
+                            TargetCondition::Any => target_identity(d),
+                            condition => condition,
+                        },
+                        meta: e.meta(),
+                        flags: ff,
+                    });
+                    return;
+                }
+            }
+            self.progress.files_unchanged.fetch_add(1, Relaxed);
+            self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
+        } else if opts.dry_run {
+            self.progress.files_total.fetch_add(1, Relaxed);
+            self.progress.bytes_total.fetch_add(e.size, Relaxed);
+            self.progress.files_done.fetch_add(1, Relaxed);
+            // Dry aggregates mean planned work, bytes included —
+            // files_done already moves here, so bytes_done must
+            // too or the terminal record contradicts its traces.
+            self.progress.bytes_done.fetch_add(e.size, Relaxed);
+            self.dry_run_changes.regular_files += 1;
+            if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::File) {
+                self.dry_run_changes.type_replacements += 1;
+            }
+            self.emit_trace(
+                "transfer_file",
+                &dst_rel,
+                "file",
+                Some(e.size),
+                match &dst_entry {
+                    None => "destination_missing",
+                    Some(d) if d.kind != Kind::File => "type_differs",
+                    Some(_) => "content_differs",
+                },
+            );
+            if opts.verbose > 0 {
+                let shown = display(&dst_path);
+                let action = match &dst_entry {
+                    None => format!("create file {shown} (destination missing)"),
+                    Some(d) if d.kind != Kind::File => format!(
+                        "replace with file {shown} (destination is {})",
+                        kind_label(d.kind)
+                    ),
+                    Some(d) if d.size != e.size => {
+                        format!("update file {shown} (size differs)")
+                    }
+                    Some(_) if opts.checksum => {
+                        format!("update file {shown} (content comparison requested)")
+                    }
+                    Some(d)
+                        if opts.flags & flags::TIMES != 0
+                            && (d.mtime, d.mtime_nsec) != (e.mtime, e.mtime_nsec) =>
+                    {
+                        format!("update file {shown} (modification time differs)")
+                    }
+                    Some(_) => {
+                        format!("update file {shown} (content quick check unavailable)")
+                    }
+                };
+                self.progress.println(&action);
+            }
+        } else {
+            self.enqueue(
+                (src_path, source),
+                dst_path,
+                rel,
+                dst_rel.clone(),
+                e.clone(),
+                dst_entry,
+            );
+        }
+    }
+
+    /// Queue the creation or replacement of a mapped symlink unless the
+    /// destination already matches.
+    fn plan_symlink(&mut self, leaf: Planned, dst_entry: Option<Entry>, leaf_ops: &mut LeafOps) {
+        let opts = self.opts;
+        let Planned {
+            dst: dst_path,
+            dst_rel,
+            rel,
+            e,
+            ..
+        } = leaf;
+        if self.skip_existing(&dst_entry) {
+            self.progress.files_excluded.fetch_add(1, Relaxed);
+            return;
+        }
+        if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref()) {
+            return;
+        }
+        let target = e.link.clone().unwrap_or_default();
+        let same = dst_entry
+            .as_ref()
+            .is_some_and(|d| d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..]));
+        if opts.verify_only {
+            if !same {
+                self.progress.error(&format!("DIFFERS {rel} (symlink)"));
+            }
+            return;
+        }
+        if same {
+            return;
+        }
+        if opts.dry_run {
+            self.dry_run_changes.symlinks += 1;
+            if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::Symlink) {
+                self.dry_run_changes.type_replacements += 1;
+            }
+            self.emit_trace(
+                "create_symlink",
+                &dst_rel,
+                "symlink",
+                None,
+                match &dst_entry {
+                    None => "destination_missing",
+                    Some(d) if d.kind != Kind::Symlink => "type_differs",
+                    Some(_) => "content_differs",
+                },
+            );
+            if opts.verbose > 0 {
+                let shown = display(&dst_path);
+                let action = match &dst_entry {
+                    None => format!(
+                        "create symlink {shown} -> {} (destination missing)",
+                        display(&target)
+                    ),
+                    Some(d) if d.kind != Kind::Symlink => format!(
+                        "replace with symlink {shown} -> {} (destination is {})",
+                        display(&target),
+                        kind_label(d.kind)
+                    ),
+                    Some(_) => format!(
+                        "update symlink {shown} -> {} (target differs)",
+                        display(&target)
+                    ),
+                };
+                self.progress.println(&action);
+            }
+            return;
+        }
+        leaf_ops.names.push(QueuedLeafOp {
+            dst_rel: dst_rel.clone(),
+            action: "create_symlink",
+            kind: "symlink",
+            name: format!("{rel} -> {}", display(&target)),
+        });
+        leaf_ops.ops.push(Op::Symlink {
+            path: dst_path.clone(),
+            target,
+            condition: self.exact_condition_for(&dst_path),
+        });
+        leaf_ops.ops.push(Op::SetMeta {
+            // Apply runs successful leaf creation/replacement
+            // before metadata; a failed guarded replacement skips
+            // this phase entirely.
+            condition: TargetCondition::Any,
+            path: dst_path,
+            meta: e.meta(),
+            flags: opts.flags & !flags::MODE,
+        });
+    }
+
+    /// Queue the creation or replacement of a mapped special file unless the
+    /// destination already matches.
+    fn plan_special(&mut self, leaf: Planned, dst_entry: Option<Entry>, leaf_ops: &mut LeafOps) {
+        let opts = self.opts;
+        let Planned {
+            dst: dst_path,
+            dst_rel,
+            rel,
+            e,
+            ..
+        } = leaf;
+        if self.skip_existing(&dst_entry) {
+            self.progress.files_excluded.fetch_add(1, Relaxed);
+            return;
+        }
+        if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref()) {
+            return;
+        }
+        let same = dst_entry
+            .as_ref()
+            .is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
+        if opts.verify_only {
+            if !same {
+                let what = if dst_entry.is_none() {
+                    "MISSING"
+                } else {
+                    "DIFFERS"
+                };
+                self.progress.error(&format!("{what} {rel} (special file)"));
+            }
+            return;
+        }
+        if same || opts.dry_run {
+            if opts.dry_run && !same {
+                self.dry_run_changes.specials += 1;
+                if dst_entry.as_ref().is_some_and(|d| d.kind != e.kind) {
+                    self.dry_run_changes.type_replacements += 1;
+                }
+                self.emit_trace(
+                    "create_special",
+                    &dst_rel,
+                    "special",
+                    None,
+                    match &dst_entry {
+                        None => "destination_missing",
+                        Some(d) if d.kind != e.kind => "type_differs",
+                        Some(_) => "content_differs",
+                    },
+                );
+                if opts.verbose > 0 {
+                    let shown = display(&dst_path);
+                    let action = match &dst_entry {
+                        None => format!(
+                            "create {} {shown} (destination missing)",
+                            kind_label(e.kind)
+                        ),
+                        Some(d) if d.kind != e.kind => format!(
+                            "replace with {} {shown} (destination is {})",
+                            kind_label(e.kind),
+                            kind_label(d.kind)
+                        ),
+                        Some(_) => format!(
+                            "update {} {shown} (device identity differs)",
+                            kind_label(e.kind)
+                        ),
+                    };
+                    self.progress.println(&action);
+                }
+            }
+            return;
+        }
+        leaf_ops.names.push(QueuedLeafOp {
+            dst_rel: dst_rel.clone(),
+            action: "create_special",
+            kind: "special",
+            name: rel,
+        });
+        leaf_ops.ops.push(Op::Mknod {
+            path: dst_path.clone(),
+            mode: e.mode,
+            rdev: e.rdev,
+            condition: self.exact_condition_for(&dst_path),
+        });
+        let mut meta = e.meta();
+        let mut flags = opts.flags;
+        if flags & flags::MODE == 0 {
+            meta.mode = e.mode & 0o777 & !opts.umask;
+            flags |= flags::RECEIVER_MODE;
+        }
+        leaf_ops.ops.push(Op::SetMeta {
+            condition: TargetCondition::Any,
+            path: dst_path,
+            meta,
+            flags,
+        });
     }
 
     /// Decide from its stat what happens to each mapped directory, and keep
@@ -3179,6 +3208,16 @@ pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
         ctime_nsec: 0,
         link: None,
     }
+}
+
+/// Destination operations collected while classifying one batch of leaves.
+/// Each entry of `names` owns two consecutive entries of `ops`: the creation
+/// and then its metadata.
+#[derive(Default)]
+struct LeafOps {
+    ops: Vec<Op>,
+    names: Vec<QueuedLeafOp>,
+    meta_fixes: Vec<Op>,
 }
 
 /// A queued symlink/special creation: the display string for -v plus the
