@@ -1978,7 +1978,7 @@ impl RemoteSpec {
         let conn = RemoteConn::from_pooled(session, compress, self.label());
         match receive_hello(conn, false) {
             Ok(conn) => {
-                if crate::transfer::debug() {
+                if crate::output::debug() {
                     crate::output::diagnostic!(
                         "syq: {}: control connection from the session pool",
                         self.label()
@@ -1991,7 +1991,7 @@ impl RemoteSpec {
                 Some(conn)
             }
             Err(error) => {
-                if crate::transfer::debug() {
+                if crate::output::debug() {
                     crate::output::diagnostic!(
                         "syq: {}: pooled session unusable ({error:#}); connecting directly",
                         self.label()
@@ -2137,7 +2137,7 @@ impl RemoteSpec {
                         multiplexer.workers_rejected.store(true, Ordering::Relaxed);
                     }
                     first_worker = false;
-                    if crate::transfer::debug() {
+                    if crate::output::debug() {
                         crate::output::diagnostic!(
                             "syq: {}: multiplexed SSH worker rejected; using independent SSH connections",
                             self.label()
@@ -2157,7 +2157,7 @@ impl RemoteSpec {
                     } else {
                         None
                     };
-                    if crate::transfer::debug() {
+                    if crate::output::debug() {
                         crate::output::diagnostic!(
                             "syq: connect to {} failed (attempt {}): {e:#}{}",
                             self.label(),
@@ -2258,7 +2258,7 @@ impl RemoteSpec {
             {
                 require_constrained_openssh(&self.rsh[0], "on the coordinator host")?;
             }
-            let mut command = self.ssh_command(ssh_connection, crate::transfer::debug());
+            let mut command = self.ssh_command(ssh_connection, crate::output::debug());
             let remote_command = if self.restricted_grant.is_some() {
                 // This text is inspected by the forced receiver through
                 // SSH_ORIGINAL_COMMAND; sshd replaces the requested executable.
@@ -2500,7 +2500,7 @@ impl RemoteSpec {
         if addrs.is_empty() {
             bail!("no advertised data address is reachable");
         }
-        if crate::transfer::debug() {
+        if crate::output::debug() {
             crate::output::diagnostic!(
                 "syq: {}: data paths {:?} (advertised {:?})",
                 self.label(),
@@ -2590,9 +2590,7 @@ impl RemoteSpec {
                             )
                         })
                     }
-                    Err(e) => {
-                        last = anyhow!("{}: {e}", crate::transfer::data_address(addr, info.port))
-                    }
+                    Err(e) => last = anyhow!("{}: {e}", data_address(addr, info.port)),
                 }
             }
             let stream = match got {
@@ -2603,7 +2601,7 @@ impl RemoteSpec {
                 .peer_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_default();
-            if crate::transfer::debug() {
+            if crate::output::debug() {
                 crate::output::diagnostic!(
                     "syq: {}: data connection via tcp {addr_s}",
                     self.label()
@@ -2837,12 +2835,7 @@ fn hello(
     role: ConnectionRole,
 ) -> Result<RemoteConn> {
     let worker = !matches!(role, ConnectionRole::Control);
-    conn.send(hello_request(
-        compress,
-        crate::transfer::debug(),
-        token,
-        role,
-    ))?;
+    conn.send(hello_request(compress, crate::output::debug(), token, role))?;
     receive_hello(conn, worker)
 }
 
@@ -3597,7 +3590,7 @@ impl Endpoint {
                                 if !i.failed {
                                     i.failed = true;
                                     i.failure = Some(format!("{e:#}"));
-                                    if !spec.quiet || crate::transfer::debug() {
+                                    if !spec.quiet || crate::output::debug() {
                                         let congestion_note = tcp_congestion_fallback_note(
                                             info.congestion_control.as_deref(),
                                         );
@@ -3625,6 +3618,30 @@ impl Endpoint {
                 )?))
             }
         }
+    }
+}
+
+pub(crate) fn parse_ports(s: &str) -> Result<(u16, u16)> {
+    let (a, b) = s.split_once('-').unwrap_or((s, s));
+    let lo: u16 = a
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
+    let hi: u16 = b
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
+    if hi < lo {
+        bail!("bad port range {s:?}");
+    }
+    Ok((lo, hi))
+}
+
+pub(crate) fn data_address(address: &str, port: u16) -> String {
+    if address.contains(':') {
+        format!("[{address}]:{port}")
+    } else {
+        format!("{address}:{port}")
     }
 }
 

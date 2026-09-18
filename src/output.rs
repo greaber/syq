@@ -22,6 +22,11 @@ fn safe_message(args: Arguments<'_>) -> String {
     result
 }
 
+/// Whether `SYQ_DEBUG` asks for internal diagnostics on stderr.
+pub fn debug() -> bool {
+    std::env::var_os("SYQ_DEBUG").is_some()
+}
+
 /// One lock owns both the live row and writes that can disturb it. Diagnostic
 /// writers never take a Progress lock, so worker warnings cannot invert the
 /// ticker's lock order. Redirected stdout stays outside this lock.

@@ -16,11 +16,15 @@ use crate::rooted::{
     OperatorFinalComponent, OperatorResolver, OperatorSymlinkHop, PinnedLeaf as RootedPinnedLeaf,
     PinnedPath, RootMetadata,
 };
+use crate::sys::{
+    directory_names, open_at, retry_zero, stat_dev, stat_mode, MODE_DIRECTORY, MODE_REGULAR,
+    MODE_SYMLINK, MODE_TYPE_MASK,
+};
 use anyhow::{bail, Context, Result};
 use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -32,23 +36,6 @@ const EVENT_POLL: Duration = Duration::from_millis(100);
 const EVENT_FLUSH: Duration = Duration::from_millis(100);
 const ATTACHED_HEARTBEAT: Duration = Duration::from_secs(1);
 const RMDIR_RETRIES: usize = 3;
-
-#[cfg(target_os = "linux")]
-const MODE_TYPE_MASK: u32 = libc::S_IFMT;
-#[cfg(not(target_os = "linux"))]
-const MODE_TYPE_MASK: u32 = libc::S_IFMT as u32;
-#[cfg(target_os = "linux")]
-const MODE_DIRECTORY: u32 = libc::S_IFDIR;
-#[cfg(not(target_os = "linux"))]
-const MODE_DIRECTORY: u32 = libc::S_IFDIR as u32;
-#[cfg(target_os = "linux")]
-const MODE_SYMLINK: u32 = libc::S_IFLNK;
-#[cfg(not(target_os = "linux"))]
-const MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
-#[cfg(target_os = "linux")]
-const MODE_REGULAR: u32 = libc::S_IFREG;
-#[cfg(not(target_os = "linux"))]
-const MODE_REGULAR: u32 = libc::S_IFREG as u32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Identity {
@@ -1116,20 +1103,8 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
             | libc::O_NONBLOCK
             | libc::O_NOCTTY
             | libc::O_CLOEXEC,
+        0,
     )
-}
-
-fn open_at(parent: RawFd, name: &CString, flags: libc::c_int) -> io::Result<File> {
-    loop {
-        let descriptor = unsafe { libc::openat(parent, name.as_ptr(), flags) };
-        if descriptor >= 0 {
-            return Ok(unsafe { File::from_raw_fd(descriptor) });
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
 }
 
 fn metadata_at(parent: RawFd, component: &[u8]) -> io::Result<Identity> {
@@ -1168,26 +1143,6 @@ fn identity_from_stat(stat: &libc::stat) -> Identity {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn stat_dev(stat: &libc::stat) -> u64 {
-    stat.st_dev
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stat_dev(stat: &libc::stat) -> u64 {
-    stat.st_dev as u64
-}
-
-#[cfg(target_os = "linux")]
-fn stat_mode(stat: &libc::stat) -> u32 {
-    stat.st_mode
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stat_mode(stat: &libc::stat) -> u32 {
-    stat.st_mode as u32
-}
-
 fn require_same_identity(expected: Identity, actual: Identity, what: &str) -> Result<()> {
     if expected != actual {
         bail!(
@@ -1201,65 +1156,13 @@ fn require_same_identity(expected: Identity, actual: Identity, what: &str) -> Re
     Ok(())
 }
 
-struct DirectoryStream(*mut libc::DIR);
-
-impl Drop for DirectoryStream {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::closedir(self.0) };
-    }
-}
-
-fn open_directory_stream(directory: &File) -> Result<DirectoryStream> {
+fn read_directory(directory: &File) -> Result<Vec<Vec<u8>>> {
     // A duplicated directory descriptor shares its open-file-description
     // offset. Reopen `.` relative to the pinned descriptor so concurrent
     // scans and retries each have an independent offset.
     let reopened =
         open_directory_at(directory, b".").context("open independent removal directory stream")?;
-    let descriptor = reopened.into_raw_fd();
-    let stream = unsafe { libc::fdopendir(descriptor) };
-    if stream.is_null() {
-        let error = io::Error::last_os_error();
-        let _ = unsafe { libc::close(descriptor) };
-        return Err(error).context("open removal directory stream");
-    }
-    Ok(DirectoryStream(stream))
-}
-
-fn read_directory_stream(stream: &mut DirectoryStream) -> Result<Vec<Vec<u8>>> {
-    let mut names = Vec::new();
-    loop {
-        set_errno(0);
-        let entry = unsafe { libc::readdir(stream.0) };
-        if entry.is_null() {
-            let errno = get_errno();
-            if errno != 0 {
-                return Err(io::Error::from_raw_os_error(errno)).context("read removal directory");
-            }
-            break;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." {
-            names.push(name.to_vec());
-        }
-    }
-    Ok(names)
-}
-
-fn read_directory(directory: &File) -> Result<Vec<Vec<u8>>> {
-    let mut stream = open_directory_stream(directory)?;
-    read_directory_stream(&mut stream)
-}
-
-fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {
-    loop {
-        if operation() == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
+    directory_names(reopened).context("read removal directory")
 }
 
 fn is_directory_not_empty(error: &anyhow::Error) -> bool {
@@ -1269,34 +1172,6 @@ fn is_directory_not_empty(error: &anyhow::Error) -> bool {
             .and_then(io::Error::raw_os_error)
             .is_some_and(|errno| errno == libc::ENOTEMPTY || errno == libc::EEXIST)
     })
-}
-
-#[cfg(target_os = "linux")]
-fn set_errno(value: libc::c_int) {
-    unsafe { *libc::__errno_location() = value };
-}
-
-#[cfg(target_os = "linux")]
-fn get_errno() -> libc::c_int {
-    unsafe { *libc::__errno_location() }
-}
-
-#[cfg(target_os = "macos")]
-fn set_errno(value: libc::c_int) {
-    unsafe { *libc::__error() = value };
-}
-
-#[cfg(target_os = "macos")]
-fn get_errno() -> libc::c_int {
-    unsafe { *libc::__error() }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn set_errno(_value: libc::c_int) {}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn get_errno() -> libc::c_int {
-    0
 }
 
 #[cfg(test)]
@@ -1428,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn simultaneous_directory_streams_have_independent_offsets() {
+    fn repeated_directory_reads_have_independent_offsets() {
         let temp = crate::test_support::tempdir().unwrap();
         fs::write(temp.path().join("one"), b"1").unwrap();
         fs::write(temp.path().join("two"), b"2").unwrap();
@@ -1437,11 +1312,8 @@ mod tests {
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(temp.path())
             .unwrap();
-        let mut first = open_directory_stream(&directory).unwrap();
-        let mut second = open_directory_stream(&directory).unwrap();
-
-        let mut first_names = read_directory_stream(&mut first).unwrap();
-        let mut second_names = read_directory_stream(&mut second).unwrap();
+        let mut first_names = read_directory(&directory).unwrap();
+        let mut second_names = read_directory(&directory).unwrap();
         first_names.sort();
         second_names.sort();
 

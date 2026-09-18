@@ -40,6 +40,31 @@ impl CopyPolicy {
     }
 }
 
+/// The fresh-destination capacity rule, shared with the receiver's one-turn
+/// small copy so both refuse the same copies.
+#[derive(Clone, Copy)]
+pub(crate) struct FreshCapacityAssessment {
+    pub(crate) logical_bytes: u64,
+    pub(crate) objects: u64,
+    pub(crate) available_bytes: u64,
+    pub(crate) available_inodes: Option<u64>,
+}
+
+impl FreshCapacityAssessment {
+    pub(crate) fn byte_shortage(self) -> bool {
+        self.logical_bytes > self.available_bytes
+    }
+
+    pub(crate) fn inode_shortage(self) -> bool {
+        self.available_inodes
+            .is_some_and(|available| self.objects.saturating_add(64) > available)
+    }
+
+    pub(crate) fn sufficient(self) -> bool {
+        !self.byte_shortage() && !self.inode_shortage()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

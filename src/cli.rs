@@ -2197,7 +2197,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
             if target.is_empty() {
                 bail!("--as target may not be empty");
             }
-            crate::transfer::validate_manifest_path(&target, "--as")?;
+            crate::mapping::validate_manifest_path(&target, "--as")?;
             (Placement::As, Some(target))
         }
         None => {
@@ -2600,7 +2600,7 @@ fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> 
     args.no_bootstrap = remote.helper.no_bootstrap;
     args.tcp_plain = remote.tcp_plain;
     args.no_tcp = remote.no_tcp;
-    crate::transfer::parse_ports(&remote.tcp_ports)?;
+    crate::conn::parse_ports(&remote.tcp_ports)?;
     args.tcp_ports = remote.tcp_ports;
     args.tcp_congestion = remote.tcp_congestion;
     args.detach = remote.detach;

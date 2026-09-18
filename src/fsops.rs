@@ -10,6 +10,10 @@ use crate::rooted::{
     read_open_symlink, root_metadata_from_std, OperatorFinalComponent, OperatorResolver,
     PinnedPath, RelativePath, Root, RootIdentity, RootMetadata,
 };
+use crate::sys::{
+    absent_or_nondirectory, COMMON_NAME_MAX, MODE_BLOCK, MODE_CHAR, MODE_DIRECTORY, MODE_FIFO,
+    MODE_REGULAR, MODE_SOCKET, MODE_SYMLINK, NAME_MAX_CACHE_CAP,
+};
 use crate::write_gate::CachedFile;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -61,8 +65,6 @@ const SOURCE_SHARED_WORKER_FD_RESERVE: usize =
 /// A destination mutation names a path only relative to an authority: a
 /// registered destination root or a receiver's guard.
 const UNROOTED_MUTATION: &str = "destination mutation before a destination root was registered";
-const COMMON_NAME_MAX: usize = 255;
-const NAME_MAX_CACHE_CAP: usize = 1024;
 
 #[cfg(debug_assertions)]
 pub(crate) fn record_test_event(variable: &str, event: std::fmt::Arguments<'_>) -> io::Result<()> {
@@ -289,35 +291,6 @@ fn unsupported_copy_pairs() -> &'static Mutex<HashSet<(FileSystemKey, FileSystem
     PAIRS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-#[cfg(target_os = "linux")]
-const MODE_DIR: u32 = libc::S_IFDIR;
-#[cfg(not(target_os = "linux"))]
-const MODE_DIR: u32 = libc::S_IFDIR as u32;
-#[cfg(target_os = "linux")]
-const MODE_FILE: u32 = libc::S_IFREG;
-#[cfg(not(target_os = "linux"))]
-const MODE_FILE: u32 = libc::S_IFREG as u32;
-#[cfg(target_os = "linux")]
-const MODE_LINK: u32 = libc::S_IFLNK;
-#[cfg(not(target_os = "linux"))]
-const MODE_LINK: u32 = libc::S_IFLNK as u32;
-#[cfg(target_os = "linux")]
-const MODE_FIFO: u32 = libc::S_IFIFO;
-#[cfg(not(target_os = "linux"))]
-const MODE_FIFO: u32 = libc::S_IFIFO as u32;
-#[cfg(target_os = "linux")]
-const MODE_SOCKET: u32 = libc::S_IFSOCK;
-#[cfg(not(target_os = "linux"))]
-const MODE_SOCKET: u32 = libc::S_IFSOCK as u32;
-#[cfg(target_os = "linux")]
-const MODE_CHAR: u32 = libc::S_IFCHR;
-#[cfg(not(target_os = "linux"))]
-const MODE_CHAR: u32 = libc::S_IFCHR as u32;
-#[cfg(target_os = "linux")]
-const MODE_BLOCK: u32 = libc::S_IFBLK;
-#[cfg(not(target_os = "linux"))]
-const MODE_BLOCK: u32 = libc::S_IFBLK as u32;
-
 pub fn resolve(p: &[u8]) -> PathBuf {
     if p.is_empty() {
         return PathBuf::from(".");
@@ -528,15 +501,6 @@ impl OperatorDirectorySelection {
         }
         Ok(relation)
     }
-}
-
-fn absent_or_nondirectory(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .and_then(io::Error::raw_os_error)
-            .is_some_and(|errno| matches!(errno, libc::ENOENT | libc::ENOTDIR | libc::ELOOP))
-    })
 }
 
 /// Walk parents from an already-open destination directory. The source
@@ -1144,9 +1108,9 @@ pub(crate) fn rooted_entry(
     metadata: RootMetadata,
 ) -> Result<Entry> {
     let kind = match metadata.file_type() {
-        MODE_DIR => Kind::Dir,
-        MODE_FILE => Kind::File,
-        MODE_LINK => Kind::Symlink,
+        MODE_DIRECTORY => Kind::Dir,
+        MODE_REGULAR => Kind::File,
+        MODE_SYMLINK => Kind::Symlink,
         MODE_FIFO => Kind::Fifo,
         MODE_SOCKET => Kind::Socket,
         MODE_CHAR => Kind::CharDev,
@@ -1211,9 +1175,9 @@ pub(crate) fn rooted_entry_in_directory(
     metadata: RootMetadata,
 ) -> Result<Entry> {
     let kind = match metadata.file_type() {
-        MODE_DIR => Kind::Dir,
-        MODE_FILE => Kind::File,
-        MODE_LINK => Kind::Symlink,
+        MODE_DIRECTORY => Kind::Dir,
+        MODE_REGULAR => Kind::File,
+        MODE_SYMLINK => Kind::Symlink,
         MODE_FIFO => Kind::Fifo,
         MODE_SOCKET => Kind::Socket,
         MODE_CHAR => Kind::CharDev,
@@ -1888,7 +1852,7 @@ impl FsOps {
         let fresh = (exact && destinations[0].is_none())
             || info.as_ref().is_some_and(|info| info.empty == Some(true));
         if let Some(info) = info.filter(|_| fresh) {
-            let assessment = crate::transfer::FreshCapacityAssessment {
+            let assessment = crate::copy_policy::FreshCapacityAssessment {
                 logical_bytes: total,
                 objects: request.files.len() as u64,
                 available_bytes: info.available_bytes,

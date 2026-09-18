@@ -386,7 +386,7 @@ impl PreparedRange<'_> {
         };
         worker.begin(source, copied, self.range.end);
         self.active = true;
-        if std::env::var_os("SYQ_DEBUG").is_some() {
+        if crate::output::debug() {
             eprintln!(
                 "syq: source read-ahead started: {copied}..{}",
                 self.range.end

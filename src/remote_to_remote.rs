@@ -1120,7 +1120,7 @@ fn run_remote(
     if args.detach {
         drop(spec.connect_with(false, false)?);
     }
-    let dbg = if crate::transfer::debug() {
+    let dbg = if crate::output::debug() {
         "SYQ_DEBUG=1 "
     } else {
         ""
