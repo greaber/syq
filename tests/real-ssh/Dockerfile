@@ -59,6 +59,7 @@ COPY --from=builder /tmp/syq-other-build /usr/local/bin/syq-other-build
 COPY --chmod=0755 tests/real-ssh/ssh-wrapper.sh /usr/local/bin/ssh
 COPY --chmod=0755 tests/real-ssh/entrypoint.sh /usr/local/libexec/syq-real-ssh-entrypoint
 COPY --chmod=0755 tests/real-ssh/scenarios.sh /usr/local/libexec/syq-real-ssh-scenarios
+COPY tests/real-ssh/benchmark.sh /usr/local/libexec/syq-real-ssh-benchmark
 COPY --chmod=0755 scripts/try-benchmark.sh /usr/local/libexec/syq-try-benchmark
 COPY tests/real-ssh/sshd_config /etc/ssh/sshd_config
 

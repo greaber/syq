@@ -36,7 +36,9 @@ endpoint() {
 }
 
 runner() {
-    python3 /usr/local/libexec/syq-test-root-security.py
+    if [ "${SYQ_REAL_SSH_SUITE:-core}" = core ]; then
+        python3 /usr/local/libexec/syq-test-root-security.py
+    fi
     test -r /run/lab/id_ed25519
     install -d -m 0700 -o syq -g syq /home/syq/.ssh
     install -m 0600 -o syq -g syq /run/lab/id_ed25519 /home/syq/.ssh/id_ed25519

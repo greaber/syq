@@ -10,6 +10,7 @@
 !tests/real-ssh/
 !tests/real-ssh/entrypoint.sh
 !tests/real-ssh/scenarios.sh
+!tests/real-ssh/benchmark.sh
 !tests/real-ssh/ssh-wrapper.sh
 !tests/real-ssh/sshd_config
 
