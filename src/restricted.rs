@@ -4142,10 +4142,11 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
             "--max-size with deletion is not yet independently enforceable by the command-restricted receiver"
         );
     }
-    if args.connections_opt.is_some() && args.connections > crate::tune::MAX {
+    if args.connections_opt.is_some() && args.connections > usize::from(delegation::MAX_CONNECTIONS)
+    {
         bail!(
             "command-restricted transfers support at most {} connections",
-            crate::tune::MAX
+            usize::from(delegation::MAX_CONNECTIONS)
         );
     }
     crate::transfer::parse_ports(&args.tcp_ports)?;
@@ -4290,7 +4291,11 @@ fn grant_for(
                 max_connections: u16::try_from(if args.connections_opt.is_some() {
                     args.connections
                 } else {
-                    crate::tune::MAX
+                    args.resource_limits
+                        .as_ref()
+                        .and_then(|limits| limits.workers)
+                        .unwrap_or(usize::from(delegation::MAX_CONNECTIONS))
+                        .min(usize::from(delegation::MAX_CONNECTIONS))
                 })
                 .context("connection maximum exceeds grant representation")?,
                 max_deletions,
@@ -8986,6 +8991,69 @@ esac
         authority
             .record_scanned(&target, [b"entry-0".as_slice()])
             .unwrap();
+    }
+
+    #[test]
+    fn worker_authorizations_use_128_or_a_smaller_explicit_setting() {
+        let source = Location::parse("host-a:source").unwrap();
+        for (setting, expected) in [
+            (None, 128),
+            (Some("--resource-limits=workers=3"), 3),
+            (Some("--resource-limits=workers=1000"), 128),
+            (Some("--performance-tuning=workers=32"), 32),
+            (Some("--performance-tuning=workers=128"), 128),
+        ] {
+            let mut argv: Vec<_> = [
+                "cp", "--from", "host-a", "source", "--to", "host-b", "--as", "/backup",
+            ]
+            .map(std::ffi::OsString::from)
+            .into();
+            argv.extend(setting.map(std::ffi::OsString::from));
+            let args = Args::parse_args(&argv).unwrap();
+            validate_restricted_args(&args).unwrap();
+            let grant = grant_for(
+                &args,
+                std::slice::from_ref(&source),
+                EnrollmentId::random(),
+                "backup",
+                b"/backup",
+            )
+            .unwrap();
+            let GrantOperation::Copy(copy) = grant.operation;
+            assert_eq!(copy.limits.max_connections, expected);
+        }
+        let args = Args::parse_args(
+            &[
+                "cp",
+                "--from",
+                "host-a",
+                "source",
+                "--to",
+                "host-b",
+                "--as",
+                "/backup",
+                "--performance-tuning=workers=129",
+            ]
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        assert!(validate_restricted_args(&args).is_err());
+    }
+
+    #[test]
+    fn receiver_admission_keeps_each_authorizations_worker_allowance() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        for workers in [2, 32, 64, 128] {
+            let mut authority = test_authority(temporary.path(), DeletionPolicy::Forbid, 1024);
+            authority.copy.limits.max_connections = workers;
+            for _ in 0..workers {
+                authority.acquire_connection().unwrap();
+            }
+            assert!(authority.acquire_connection().is_err());
+            authority.release_connection();
+            authority.acquire_connection().unwrap();
+            assert!(authority.acquire_connection().is_err());
+        }
     }
 
     #[test]

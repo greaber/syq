@@ -642,7 +642,11 @@ fn constrain(
     request.copy.limits.max_total_bytes = request.copy.limits.max_total_bytes.min(max_bytes);
     request.copy.limits.max_file_bytes = request.copy.limits.max_file_bytes.min(max_bytes);
     request.copy.limits.max_entries = request.copy.limits.max_entries.min(max_entries);
-    request.copy.limits.max_connections = request.copy.limits.max_connections.min(32);
+    request.copy.limits.max_connections = request
+        .copy
+        .limits
+        .max_connections
+        .min(crate::delegation::MAX_CONNECTIONS);
     Ok(request)
 }
 
@@ -705,8 +709,13 @@ fn select_copy(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
     {
         bail!("named destinations own their connection; --syq-path, --rsh, --pscope, --detach, --peer-auth, and --tcp-plain cannot be combined with them");
     }
-    if args.connections_opt.is_some() && args.connections > 32 {
-        bail!("named destinations support at most 32 workers per transfer");
+    if args.connections_opt.is_some()
+        && args.connections > usize::from(crate::delegation::MAX_CONNECTIONS)
+    {
+        bail!(
+            "named destinations support at most {} workers per transfer",
+            crate::delegation::MAX_CONNECTIONS
+        );
     }
     Ok(Some(handoff::Selection::new(
         name,
@@ -1712,6 +1721,19 @@ mod tests {
             secret,
         )
     }
+    #[test]
+    fn named_destination_allows_128_workers_and_preserves_smaller_allowances() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let args = args(&temporary.path().join("source"), "output");
+        let (request, _) = request(&args);
+        for (requested, expected) in [(2, 2), (32, 32), (64, 64), (128, 128), (256, 128)] {
+            let mut request = request.clone();
+            request.copy.limits.max_connections = requested;
+            let constrained = constrain(request, temporary.path(), 1000, 1000, 0).unwrap();
+            assert_eq!(constrained.copy.limits.max_connections, expected);
+        }
+    }
+
     pub(super) fn broker(
         root: &Path,
         approval: Approval,

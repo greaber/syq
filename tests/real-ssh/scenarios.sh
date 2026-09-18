@@ -275,8 +275,8 @@ return_copy_pid=
 test ! -e "$receive_root/denied"
 if syq persist receive approve "$request_id"; then echo 'denied approval ID was reused' >&2; exit 1; fi
 
-printf 'case: approval allows only the pending copy once\n'
-timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as approved' &
+printf 'case: approval allows the pending 128-worker copy once\n'
+timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as approved --performance-tuning workers=128' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
@@ -927,6 +927,13 @@ EOF
     cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-tuning-check
 done
 
+printf 'case: restricted authorization accepts 128 workers\n'
+syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
+    --as /tmp/syq-real-ssh/workers-128 --coordinate-at src \
+    --performance-tuning workers=128 --no-progress
+ssh destination cat /tmp/syq-real-ssh/workers-128 > /tmp/syq-real-ssh-workers-check
+cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-workers-check
+
 printf 'case: adaptive worker ceilings through each remote coordinator\n'
 for transport in tcp ssh; do
     for coordinator in src dst local; do
@@ -1019,7 +1026,7 @@ for benchmark_mode in push pull; do
 import json, pathlib, sys
 cache = json.loads(pathlib.Path(sys.argv[1]).read_text())
 key = 'local>destination|ssh' if sys.argv[2] == 'push' else 'destination>local|ssh'
-assert 1 <= cache['paths'][key] <= 64, cache
+assert cache['paths'][key] >= 1, cache
 print('Verified a learned starting count for', key)
 PY
     rm -f "$benchmark_cache" "$benchmark_cache.lock"

@@ -1834,16 +1834,20 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         args.connections
     };
+    // Descriptor preflight is an estimate, not a reservation. For automatic
+    // copies check the source roots and control session, not every worker the
+    // tuner might someday try. Fixed counts retain their up-front estimate.
+    let budgeted_workers = if autotune { 0 } else { args.connections };
     let source_shared_workers = match &src_ep {
-        Endpoint::Local { .. } => maximum_workers,
-        Endpoint::Remote(_) if use_tcp => maximum_workers,
+        Endpoint::Local { .. } => budgeted_workers,
+        Endpoint::Remote(_) if use_tcp => budgeted_workers,
         Endpoint::Remote(_) => 0,
     };
     // Only workers that can attempt local offload need foreign source claims.
     // Actual local destinations live in a separate receiver process.
     let mut copy_local_claim_workers = if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy()
     {
-        maximum_workers
+        budgeted_workers
     } else {
         0
     };
@@ -1872,7 +1876,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let source_independent_handoff_workers = copy_local_claim_workers
         .checked_add(match &src_ep {
             Endpoint::Local { .. } => 0,
-            Endpoint::Remote(_) => maximum_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
+            Endpoint::Remote(_) => budgeted_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
         })
         .context("source worker count overflow")?;
     // Admission is complete before worker closures receive shared options.
@@ -11190,7 +11194,7 @@ mod tests {
         assert_eq!(initial_range_workers(1, [u64::MAX], 1), 1);
         assert_eq!(initial_range_workers(0, [u64::MAX], 1), 0);
         assert_eq!(initial_range_workers(8, [], 1), 1);
-        for id in 0..crate::tune::MAX {
+        for id in [0, 1, 2, 63, 64, 128, 1000] {
             assert_eq!(reuse_startup_ssh(id, true), id < 2);
             assert_eq!(reuse_startup_ssh(id, false), id == 0);
         }

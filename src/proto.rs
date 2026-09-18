@@ -672,11 +672,12 @@ pub enum Request {
         /// Explicit rsync compatibility opt-out. It permits legacy unconfined
         /// source discovery only for the session created by this registration.
         allow_unconfined_paths: bool,
-        /// Maximum source workers that can share the control helper process.
-        /// Zero still budgets the registry and control connection themselves.
+        /// Fixed source workers that can share the control helper process.
+        /// Automatic copies pass zero: estimate only the registry and control
+        /// session, not speculative future workers. This reserves no handles.
         shared_workers: usize,
-        /// Maximum concurrent independent-worker claims against the control
-        /// process's private descriptor broker.
+        /// Estimated concurrent independent-worker claims for a fixed worker
+        /// count; automatic copies pass zero.
         independent_handoff_workers: usize,
     },
     /// Create the missing suffix retained by CheckOperatorDirectory, then

@@ -633,18 +633,24 @@ fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
     ])
 }
 
-fn broker_connection_limit(connections_opt: Option<usize>, connections: usize) -> Result<usize> {
-    // A direct transfer keeps one destination control connection open beside
-    // its data workers. Automatic tuning may grow beyond the initial worker
-    // count, while an explicit -j is a fixed user-selected upper bound.
-    let data_connections = if connections_opt.is_some() {
-        connections
+// This bounds unauthenticated clients on the invoking machine independently of
+// data-worker tuning. SSH authentication channels need not stay open for the
+// lifetime of a data worker.
+const DEFAULT_BROKER_CONNECTIONS: usize = 129;
+
+fn broker_connection_limit(worker_limit: Option<usize>, restricted: bool) -> Result<usize> {
+    let worker_limit = if restricted {
+        let maximum = usize::from(crate::delegation::MAX_CONNECTIONS);
+        Some(worker_limit.unwrap_or(maximum).min(maximum))
     } else {
-        crate::tune::MAX
+        worker_limit
     };
-    data_connections
-        .checked_add(1)
-        .context("SSH connection count is too large for the constrained agent broker")
+    match worker_limit {
+        Some(workers) => workers
+            .checked_add(1)
+            .context("SSH connection count is too large for the constrained agent broker"),
+        None => Ok(DEFAULT_BROKER_CONNECTIONS),
+    }
 }
 
 fn automatic_enrollment_allowed(dry_run: bool, verify_only: bool) -> bool {
@@ -827,7 +833,14 @@ fn run_remote(
                 "prepare command-restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
             )?;
         let policy = crate::agent_broker::BrokerPolicy::new(coordinator_policy, peer_policy);
-        let limit = broker_connection_limit(args.connections_opt, args.connections)?;
+        let limit = broker_connection_limit(
+            args.connections_opt.or_else(|| {
+                args.resource_limits
+                    .as_ref()
+                    .and_then(|limits| limits.workers)
+            }),
+            prepared.is_some(),
+        )?;
         let broker = if let Some(prepared) = prepared {
             restricted_destination_path = Some(prepared.canonical_destination);
             restricted_grant = Some(prepared.grant);
@@ -1488,10 +1501,19 @@ mod tests {
     }
 
     #[test]
-    fn broker_capacity_covers_control_and_planned_workers() {
-        assert_eq!(broker_connection_limit(None, 8).unwrap(), 65);
-        assert_eq!(broker_connection_limit(Some(128), 128).unwrap(), 129);
-        assert!(broker_connection_limit(Some(usize::MAX), usize::MAX).is_err());
+    fn broker_capacity_is_bounded_independently_of_automatic_workers() {
+        for restricted in [false, true] {
+            assert_eq!(broker_connection_limit(None, restricted).unwrap(), 129);
+            assert_eq!(broker_connection_limit(Some(3), restricted).unwrap(), 4);
+            assert_eq!(broker_connection_limit(Some(128), restricted).unwrap(), 129);
+        }
+        assert_eq!(broker_connection_limit(Some(1000), false).unwrap(), 1001);
+        assert!(broker_connection_limit(Some(usize::MAX), false).is_err());
+        assert_eq!(broker_connection_limit(Some(1000), true).unwrap(), 129);
+        assert_eq!(
+            broker_connection_limit(Some(usize::MAX), true).unwrap(),
+            129
+        );
     }
 
     #[test]

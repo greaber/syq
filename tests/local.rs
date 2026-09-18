@@ -249,6 +249,100 @@ fn source_fd_budget_handles_ten_exact_sources_with_128_slots() {
 }
 
 #[test]
+fn automatic_worker_ceiling_does_not_reserve_hypothetical_descriptors() {
+    let t = Tmp::new();
+    write(
+        &t.path("source"),
+        b"a large ceiling does not open more files",
+    );
+    for (label, limit) in [("default", None), ("large-ceiling", Some("workers=65536"))] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args(["cp", "--no-progress", &t.s("source"), "--as", &t.s(label)]);
+        if let Some(limit) = limit {
+            command.args(["--resource-limits", limit]);
+        }
+        command.env("SYQ_TUNING_CACHE", "");
+        set_child_nofile_limit(&mut command, 512);
+        let output = command.run().unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path(label)), read(&t.path("source")));
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn automatic_workers_can_start_above_64_from_the_cache() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let data = prng(5 * 1024 * 1024 + 123, 806);
+    for file in ["one", "two"] {
+        write(&t.path(&format!("source/{file}")), &data);
+    }
+    for (label, limit, expected) in [("default", None, 80), ("capped", Some(72), 72)] {
+        write(
+            &t.path("tuning.json"),
+            br#"{"paths":{"local>host|tcp":80}}"#,
+        );
+        let events = t.path(&format!("events-{label}"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--srcs-in",
+            &t.s("source"),
+            "--to",
+            "host",
+            "--into",
+            &t.s(label),
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+            "--no-progress",
+            "-vv",
+            "--resource-limits",
+            "bandwidth=4M",
+        ]);
+        if let Some(limit) = limit {
+            command.args(["--resource-limits", &format!("workers={limit}")]);
+        }
+        let output = command
+            .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
+            .env("SYQ_TEST_WORKER_EVENTS", &events)
+            .env("SYQ_TEST_REQUIRE_TCP", "1")
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert!(
+            stderr_of(&output).contains(&format!(
+                "starting with {expected} connections remembered for this path"
+            )),
+            "{output:?}"
+        );
+        for file in ["one", "two"] {
+            assert_eq!(read(&t.path(&format!("{label}/{file}"))), data);
+        }
+        let observed = fs::read_to_string(&events).unwrap();
+        let ids: Vec<usize> = observed
+            .lines()
+            .filter(|line| line.starts_with("connected "))
+            .map(|line| line.split_whitespace().nth(1).unwrap().parse().unwrap())
+            .collect();
+        assert!(ids.iter().any(|&id| id >= 64), "{label}: {observed}");
+        if let Some(limit) = limit {
+            assert!(ids.iter().all(|&id| id < limit), "{label}: {observed}");
+        }
+    }
+}
+
+#[test]
 fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creation() {
     let t = Tmp::new();
     write(&t.path("source"), &vec![b'x'; 8 * 1024 * 1024]);
@@ -332,15 +426,6 @@ fn source_fd_preflight_accounts_for_independent_ssh_broker_claims() {
     let ssh = fake_ssh(&t);
     t.expose_remote_syq();
     write(&t.path("source"), &vec![b'x'; 8 * 1024 * 1024]);
-    let cache = t.path("tuning.json");
-    write(
-        &cache,
-        serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "fake>local|ssh": 64 }
-        }))
-        .unwrap()
-        .as_bytes(),
-    );
     let remote = format!("fake:{}", t.s("source"));
     let mut command = compat_command();
     command
@@ -349,6 +434,7 @@ fn source_fd_preflight_accounts_for_independent_ssh_broker_claims() {
         .args([
             "--syq-no-bootstrap",
             "--syq-no-tcp",
+            "--performance-tuning=workers=64",
             "--no-progress",
             &remote,
             &t.s("destination"),
@@ -357,7 +443,7 @@ fn source_fd_preflight_accounts_for_independent_ssh_broker_claims() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("SYQ_TUNING_CACHE", &cache);
+        .env("SYQ_TUNING_CACHE", "");
     unsafe {
         command.pre_exec(|| {
             let mut inherited = libc::rlimit {

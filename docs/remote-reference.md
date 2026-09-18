@@ -17,6 +17,11 @@ instead of relaxing host verification.
 Your local SSH configuration selects hostB's login, address, port, and trusted
 host keys. HostA's SSH configuration does not override those choices.
 
+The constrained authentication broker admits at most 129 simultaneous clients
+by default, independently of automatic copy-worker tuning. An explicit worker
+setting or ceiling adjusts that bound to the requested count plus one control
+connection. Command-restricted copies never exceed 129 broker clients.
+
 ## Enrollment
 
 Enrollment needs normal command authority on the destination during setup.
@@ -52,7 +57,10 @@ Default limits are 100 million entries and 8 TiB of file data. Override them
 for one transfer with `--receiver-max-entries N` and
 `--receiver-max-bytes SIZE`. Values can raise or lower the defaults within the
 allowed ranges. The transfer must start within 24 hours of authorization and
-finish within seven days of authorization.
+finish within seven days of authorization. New authorizations allow up to
+128 worker connections, including for named destinations; a smaller worker
+setting or resource limit lowers that allowance. Existing authorizations keep
+their original limits.
 
 | Option or combination | Restricted receiver |
 |---|---|
@@ -63,7 +71,7 @@ finish within seven days of authorization.
 | `--skip-newer` | Timestamp selection uses source-reported modification times |
 | `--min-size` | Unsupported |
 | `--max-size` with `--prune` | Unsupported |
-| Fixed `workers` above 64 | Unsupported |
+| Fixed `workers` above 128 | Unsupported |
 | `--inplace` with `--as-new` | Unsupported |
 | `--detach` | Unsupported; the local broker must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |
