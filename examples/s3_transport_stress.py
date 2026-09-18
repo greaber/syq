@@ -14,6 +14,7 @@ import ssl
 import subprocess
 import sys
 import time
+import threading
 import urllib.parse
 import urllib.request
 
@@ -21,6 +22,7 @@ ROOT = Path.cwd()
 assert subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip() == str(ROOT)
 PLAIN_HTTP = os.environ.get('SYQ_STRESS_HTTP') == '1'
 QUEUE_SWEEP = os.environ.get('SYQ_STRESS_QUEUES')
+MEMORY_TRACE = os.environ.get('SYQ_STRESS_MEMORY') == '1'
 QUEUES = [int(q) for q in QUEUE_SWEEP.split(',')] if QUEUE_SWEEP else []
 D = ROOT / ('target/transport-stress-http-v2' if PLAIN_HTTP else 'target/transport-stress-v2')
 if QUEUE_SWEEP:
@@ -87,6 +89,52 @@ def remove_container(cid):
     cleanup.append(cid)
     (D / 'cleanup.json').write_text(json.dumps(cleanup))
 
+class MemoryTrace:
+    def __init__(self, cid, tag):
+        self.samples = []
+        self.done = threading.Event()
+        self.path = D / (tag + '.memory.json')
+        for _ in range(100):
+            self.pid = int(command(['docker', 'inspect', '--format', '{{.State.Pid}}', cid]))
+            if self.pid:
+                break
+            time.sleep(.02)
+        assert self.pid, 'container did not start within bounded startup check'
+        group = Path(f'/proc/{self.pid}/cgroup').read_text().strip().split('::', 1)[1]
+        self.group = Path('/sys/fs/cgroup') / group.lstrip('/')
+        assert (self.group / 'memory.stat').is_file(), self.group
+        self.started = time.monotonic()
+        self.thread = threading.Thread(target=self.sample, daemon=True)
+        self.thread.start()
+
+    def sample(self):
+        while not self.done.is_set() and time.monotonic() - self.started < 600:
+            row = {'seconds': time.monotonic() - self.started}
+            try:
+                for name in ('memory.current', 'memory.peak'):
+                    row[name] = int((self.group / name).read_text())
+                for name in ('memory.stat', 'memory.events', 'cpu.stat'):
+                    row[name] = {k: int(v) for k, v in
+                                 (line.split() for line in (self.group / name).read_text().splitlines())}
+                wanted = {'VmRSS', 'VmHWM', 'RssAnon', 'RssFile', 'VmSize', 'Threads'}
+                row['process'] = {k: int(v.split()[0]) for k, v in
+                                  (line.split(':', 1) for line in Path(f'/proc/{self.pid}/status').read_text().splitlines())
+                                  if k in wanted}
+                self.samples.append(row)
+            except FileNotFoundError:
+                break
+            except PermissionError as error:
+                self.samples.append({'error': str(error)})
+                break
+            self.done.wait(.02)
+
+    def stop(self):
+        self.done.set()
+        self.thread.join(timeout=2)
+        assert not self.thread.is_alive(), 'memory sampler did not stop'
+        self.path.write_text(json.dumps(self.samples))
+        assert self.samples and not any('error' in r for r in self.samples), self.samples
+
 def run(case, mode, repeats, label):
     global active
     for row in results:
@@ -104,14 +152,25 @@ def run(case, mode, repeats, label):
             *(['--cpus', str(case['cpu_quota'])] if 'cpu_quota' in case else []),
             *(['--device-write-bps', case['write_bps']] if 'write_bps' in case else []),
             *(['-e', 'SYQ_SPIKE_QUEUE=' + mode.removeprefix('queue-')] if QUEUE_SWEEP else []),
-            IMAGE, '/bench/client', 'async' if QUEUE_SWEEP else mode, '/bench/' + case['fixture'] + '.json',
+            IMAGE, '/bench/client', 'async' if mode.startswith('queue-') else mode, '/bench/' + case['fixture'] + '.json',
             str(case['concurrency']), '/output', '/bench/cert/public.crt', 'auto', str(repeats)]
+    gate = STAGE / 'start-client'
+    if MEMORY_TRACE:
+        gate.unlink(missing_ok=True)
+        at = args.index(IMAGE) + 1
+        args[at:at] = ['/bin/sh', '-c',
+                      'for i in $(seq 1 200); do if [ -f /bench/start-client ]; then exec "$@"; fi; sleep .05; done; exit 124',
+                      'gate']
     active = command(args)
     process = subprocess.Popen(['docker', 'start', '-a', active], stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, start_new_session=True)
     deadline = time.monotonic() + 600
     started = time.monotonic()
+    monitor = None
     try:
+        if MEMORY_TRACE:
+            monitor = MemoryTrace(active, tag)
+            gate.touch()
         while True:
             try:
                 stdout, stderr = process.communicate(timeout=10)
@@ -120,6 +179,9 @@ def run(case, mode, repeats, label):
                 print(f'{tag}: running {time.monotonic() - started:.0f}s', flush=True)
                 if time.monotonic() > deadline:
                     raise TimeoutError(f'{tag}: 600s deadline exceeded')
+        if monitor:
+            monitor.stop()
+            monitor = None
         state = json.loads(command(['docker', 'inspect', '--format', '{{json .State}}', active]))
         (D / (tag + '.state.json')).write_text(json.dumps(state))
         (D / (tag + '.stderr')).write_text(stderr)
@@ -163,6 +225,8 @@ def run(case, mode, repeats, label):
         (D / 'results.json').write_text(json.dumps(results, indent=2))
         return row
     finally:
+        if monitor:
+            monitor.stop()
         if process.poll() is None:
             command(['docker', 'kill', active])
             os.killpg(process.pid, signal.SIGKILL)
@@ -248,9 +312,12 @@ try:
             rounds = int(os.environ.get('SYQ_STRESS_ROUNDS', 2))
             label = os.environ.get('SYQ_STRESS_LABEL', 'measured')
             minimum = float(os.environ.get('SYQ_STRESS_MIN_SECONDS', 30))
+            modes = [f'queue-{queue}' for queue in QUEUES]
+            if os.environ.get('SYQ_STRESS_SYNC') == '1':
+                modes.append('sync')
             for rep in range(rounds):
-                for queue in (QUEUES if rep == 0 else list(reversed(QUEUES))):
-                    row = run(case, f'queue-{queue}', repeats, f'{label}-{rep}')
+                for mode in (modes if rep % 2 == 0 else list(reversed(modes))):
+                    row = run(case, mode, repeats, f'{label}-{rep}')
                     assert row.get('status') == 'oom' or row['elapsed'] >= minimum, 'trial too short for selected phase'
             continue
         unit = fixtures[case['fixture']]['count'] * fixtures[case['fixture']]['size']
