@@ -65,9 +65,6 @@ fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     {
         bail!("return authorization owns its SSH connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp, --tcp-plain, --peer-auth, or --coordinate-at");
     }
-    if args.connections_opt.is_some() && args.connections > 32 {
-        bail!("return authorization supports at most 32 workers per copy");
-    }
     if args.owner || args.group || args.devices || args.inplace {
         bail!("return authorization does not accept ownership, special-file preservation, or --inplace");
     }
@@ -827,6 +824,20 @@ mod tests {
         ] {
             assert!(target_endpoint(target).is_err(), "{target}");
         }
+    }
+
+    #[test]
+    fn return_authorization_uses_the_restricted_worker_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut args = args(root.path(), "output");
+        for workers in [1, 32, 64, 128] {
+            args.connections_opt = Some(workers);
+            args.connections = workers;
+            assert_eq!(eligible_target(&args).unwrap(), "server");
+        }
+        args.connections_opt = Some(129);
+        args.connections = 129;
+        assert!(eligible_target(&args).is_err());
     }
 
     #[test]
