@@ -24,8 +24,8 @@ in flake.packages.${builtins.currentSystem}.release.overrideAttrs (old: {
     unset _PYTHON_HOST_PLATFORM
     export SOURCE_DATE_EPOCH=1789697110
     cd sdk/python
+    maturin sdist --out "$TMPDIR/dist"
     maturin build --release --strip --compatibility pypi --target aarch64-apple-darwin --offline --out "$TMPDIR/dist"
-    maturin sdist --manifest-path ../../Cargo.toml --out "$TMPDIR/dist"
     ${pkgs.python313}/bin/python ${root + /scripts/normalize-python-sdist.py} --epoch "$SOURCE_DATE_EPOCH" "$TMPDIR"/dist/*.tar.gz
     cd ../..
     runHook postBuild
