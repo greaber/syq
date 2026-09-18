@@ -207,7 +207,6 @@ impl Options {
             || tuning.batch_bytes.is_some()
             || tuning.split_min_size.is_some()
             || tuning.bw_pacing.is_some()
-            || tuning.job_storage.is_some()
         {
             bail!(
                 "filesystem performance tuning is not supported for S3 {operation}; use the s3-* keys"
