@@ -269,7 +269,18 @@ If your provider requires a custom header, ensure both clients send it: stock
 s5cmd has no arbitrary-header option. `--s5cmd-quiet` runs s5cmd without its
 per-object logging as a separate control.
 
-For documentation changes, run `python3 scripts/check-doc-links.py`.
+For documentation changes, run `python3 scripts/check-doc-links.py` and build the
+book with mdBook. Command-reference tables follow the executable's complete help:
+
+```sh
+cargo build --locked --bin syq
+python3 tests/cli_reference.py target/debug/syq
+python3 tests/cli_reference.py --check target/debug/syq
+```
+
+The update preserves prose outside the marked table blocks. Add a section for a
+new public command and update the advanced-control key references when needed.
+The `help` integration test checks the tables against the built executable.
 See the repository's `AGENTS.md` for the full contribution workflow.
 
 ## Machine-facing completion commands

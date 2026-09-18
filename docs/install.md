@@ -91,6 +91,9 @@ files.
 
 ## Shell completion
 
+See the [completion command reference](commands/completion.md) for every command
+and cache-management option.
+
 Add the line for your shell to its startup file:
 
 ```bash

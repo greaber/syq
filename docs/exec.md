@@ -1,5 +1,7 @@
 # Run commands on your receiving machine
 
+For every argument and option, see the [`exec` command reference](commands/exec.md).
+
 From a server shell, ask your Mac or Linux desktop to run a command:
 
 ```sh

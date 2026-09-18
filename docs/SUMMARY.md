@@ -23,9 +23,22 @@
 
 # Reference
 
+- [Command reference](commands/index.md)
+  - [cp](commands/cp.md)
+  - [rm](commands/rm.md)
+  - [clean-partials](commands/clean-partials.md)
+  - [map](commands/map.md)
+  - [stream](commands/stream.md)
+  - [exec](commands/exec.md)
+  - [rsync](commands/rsync.md)
+  - [persist](commands/persist.md)
+  - [receiver](commands/receiver.md)
+  - [completion](commands/completion.md)
+- [Performance tuning](tuning.md)
+- [Resource limits](resource-limits.md)
+- [Integrity checking](integrity-checking.md)
 - [Remote copy details](remote-reference.md)
 - [Persistence details](persistence-reference.md)
-- [Tuning options](tuning.md)
 - [Automation results](automation.md)
 - [Rsync compatibility](rsync-compat.md)
 

@@ -1,8 +1,9 @@
 # Performance tuning
 
-Syq adjusts performance automatically. Use these controls to investigate copies
-where the defaults perform poorly. They appear in `--help-all` and are
-experimental; their keys and bounds may change between releases.
+`--performance-tuning` overrides syq's automatic choices. This page lists every
+key, its default, and where it applies. Use these controls to investigate copies
+where the defaults perform poorly; the keys and bounds are experimental and may
+change between releases.
 
 `--performance-tuning workers=N` fixes the number of filesystem copy-worker
 slots instead of adjusting it automatically. Workers process files or ranges;
@@ -12,8 +13,86 @@ Idle slots do no work, and shortcuts can finish a copy using fewer workers.
 This is not a limit on total sockets, file descriptors, CPU or memory.
 
 Both `syq cp` and `syq rsync` use this spelling. Leave it unset for everyday
-copies. S3 uses separate [object, part and request controls](object-storage.md#parallelism).
-Use `--resource-limits bandwidth=RATE` to leave bandwidth for other work.
+copies. S3 uses the object, part, and request controls below. `syq rm` and
+`syq clean-partials` accept only `workers`, which controls filesystem removal;
+it does not change S3 deletion batches. `syq stream` accepts only the three
+[S3 stream controls](#s3-streams).
+
+Use [resource limits](resource-limits.md) to cap bandwidth and
+[integrity checking](integrity-checking.md) to choose content checks.
+
+## Transfer controls
+
+`syq cp` and `syq rsync` accept `--performance-tuning`. Supply
+comma-separated `KEY=VALUE` pairs:
+
+```sh
+syq cp large-file --to server --as /scratch/benchmark-copy \
+  --performance-tuning workers=1 -v \
+  --performance-tuning copy-path=ranges,request-size=1M,pipeline-depth=8
+```
+
+| Key | Default | Accepted values |
+|---|---|---|
+| `workers` | Automatic | 1 through 65536 filesystem worker slots; route-specific receiver limits also apply |
+| `comparison-block-size` | 4 MiB | 64 KiB through 64 MiB; filesystem copies only |
+| `request-size` | Hash block size (normally 4 MiB) for ordinary requests; at most 2 MiB for streaming | 512 bytes through 64 MiB |
+| `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
+| `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
+| `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
+| `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
+| `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
+| `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--resource-limits bandwidth=RATE` |
+
+Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
+keys, and out-of-range values fail the command. Overrides apply to the remote
+coordinator too and are not saved.
+
+## S3 copies
+
+These keys apply to `syq cp` with S3 endpoints. Filesystem worker and request
+controls above do not configure S3 concurrency. Start with the automatic defaults.
+
+| Key | Default | Accepted values / meaning |
+|---|---|---|
+| `s3-max-concurrent-requests` | Automatic | 1–65536 simultaneous data requests across objects; excludes metadata requests and idle sockets |
+| `s3-max-concurrent-objects` | Automatic | 1–65536 objects in progress, including preparation and finalization |
+| `s3-max-concurrent-parts-per-object` | Automatic | 1–1024 simultaneous parts or ranges per object |
+| `s3-part-size` | Automatic | 5 MiB–5 GiB per upload part or download range |
+| `s3-retries` | `10` | 0–100 retries for transient failures and throttling; 0 disables retries |
+
+The concurrency limits are nested. For example:
+
+```sh
+syq cp data --to s3://backups --into archive \
+  --performance-tuning s3-max-concurrent-objects=4,s3-max-concurrent-parts-per-object=8,s3-max-concurrent-requests=16
+```
+
+This allows four objects in progress and up to eight parts per object, with at
+most sixteen simultaneous data requests across them. It does not reserve eight
+slots per object. Small objects can use one request. Explicit maxima disable
+automatic adjustment of that setting; insufficient ready work can leave slots idle.
+
+Part size grows when needed to stay within 10,000 upload parts. For server-side
+copies, an explicit part size also selects the multipart threshold, capped at
+5 GiB. Without an explicit part limit, server-side copies can use the shared
+request budget's full tuning range.
+
+These settings do not cap total memory or sockets. Small uploads share a
+256 MiB payload-buffer budget, and an object maximum beyond available capacity
+is rejected. See [S3 parallelism](object-storage.md#parallelism) for resource costs.
+S3 tuning is not saved between runs.
+
+## S3 streams
+
+`syq stream` accepts only `s3-part-size`, `s3-max-concurrent-parts-per-object`,
+and `s3-retries`, with the same ranges as above. Defaults are 16 MiB parts,
+four parallel parts, and ten retries. Stream concurrency does not tune itself.
+Larger parts or more concurrency increase buffering.
+
+An upload is limited to 10,000 parts: 156.25 GiB at the default size. Choose a
+larger part size before a larger stream; provider object-size limits still apply.
+See [shell pipelines](object-storage.md#shell-pipelines) for failure and cleanup behavior.
 
 ## Remembered connection counts
 
@@ -35,31 +114,7 @@ scoring, but does not guarantee that tuning has settled.
 auto-tuning continues unless you also set `workers`. Use `-vv` to see
 when syq starts from a remembered count.
 
-## Transfer controls
-
-`syq cp` and `syq rsync` accept `--performance-tuning`. Supply
-comma-separated `KEY=VALUE` pairs:
-
-```sh
-syq cp large-file --to server --as /scratch/benchmark-copy \
-  --performance-tuning workers=1 -v \
-  --performance-tuning copy-path=ranges,request-size=1M,pipeline-depth=8
-```
-
-| Key | Default | Accepted values |
-|---|---|---|
-| `comparison-block-size` | 4 MiB | 64 KiB through 64 MiB; filesystem copies only |
-| `request-size` | Hash block size (normally 4 MiB) for ordinary requests; at most 2 MiB for streaming | 512 bytes through 64 MiB |
-| `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
-| `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
-| `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
-| `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
-| `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
-| `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--resource-limits bandwidth=RATE` |
-
-Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
-keys, and out-of-range values fail the command. Overrides apply to the remote
-coordinator too and are not saved.
+## Filesystem tuning examples
 
 Larger requests reduce overhead per byte; deeper pipelines allow more requests
 to await replies at once. Both can increase memory use. Neither changes the

@@ -24,6 +24,9 @@ rules can let syq skip entire object subtrees. Download exclusion totals count
 individual excluded files and count each ignored subtree once, without counting
 its descendants. Keys inside ignored subtrees are not validated.
 
+For complete option lists, see [`cp`](commands/cp.md), [`rm`](commands/rm.md),
+and [`stream`](commands/stream.md).
+
 ## Shell pipelines
 
 `syq stream` transfers one object's contents without creating a local temporary
@@ -153,41 +156,9 @@ large downloads into byte ranges. It chooses settings automatically and adjusts
 concurrency as the copy runs. Start with the defaults; short copies may finish
 before syq can measure a better setting. S3 tuning is not saved between runs.
 
-For deliberate overrides, use `--performance-tuning`. These settings choose
-parallelism rather than bounding the process's total resource use:
-
-| Key | Meaning |
-|---|---|
-| `s3-max-concurrent-requests=N` | Maximum simultaneous data requests across all objects; 1–65536 |
-| `s3-max-concurrent-objects=N` | Maximum objects in progress; 1–65536 |
-| `s3-max-concurrent-parts-per-object=N` | Maximum simultaneous parts or ranges for each object; 1–1024 |
-| `s3-part-size=SIZE` | Part/range size; 5M–5G |
-| `s3-retries=N` | Transient failure and throttling retry budget; 0–100, default 10 |
-
-These are nested concurrency limits, not counts of worker threads. An object
-stays in progress through preparation, hashing, data transfer and finalization.
-A large object's transfer can use several parts at once; a small object needs
-fewer parts. Every data request also needs a shared request slot.
-
-For example:
-
-```sh
---performance-tuning s3-max-concurrent-objects=4,s3-max-concurrent-parts-per-object=8,s3-max-concurrent-requests=16
-```
-
-This allows up to four objects in progress and up to eight parts per object,
-with at most sixteen simultaneous data requests across them. It does not reserve
-eight slots for every object. An object no larger than the part size uses one
-data request. Upload part size increases when necessary to stay within 10,000
-parts.
-
-An explicit maximum disables automatic adjustment of that setting; actual
-concurrency can be lower when there is insufficient ready work. The shared
-request limit covers uploads, range downloads, server-side copies and
-content-verification GETs.
-Metadata requests and idle SDK sockets are separate, so these settings do not
-cap total open sockets. The payload buffer budget still applies; an explicit
-object maximum beyond the available small-upload capacity is rejected.
+Use the [S3 performance-tuning reference](tuning.md#s3-copies) for the complete
+object, part, request, and retry controls. Explicit limits override automatic
+choices; they do not cap total process memory or open sockets.
 
 Small uploads share a 256 MiB payload-buffer budget. TLS and request bookkeeping
 use additional memory. Large objects stream through bounded buffers. Discovery

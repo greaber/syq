@@ -1,5 +1,7 @@
 # Remove files
 
+For every argument and option, see the [`rm` command reference](commands/rm.md).
+
 Remove a file or symlink:
 
 ```sh

@@ -1,5 +1,7 @@
 # Persistence details
 
+For every argument and option, see the [`persist` command reference](commands/persist.md).
+
 For everyday setup, start with [Send files home from a server](receive.md).
 
 ## Names and profiles
