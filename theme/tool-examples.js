@@ -19,34 +19,40 @@
     const task = chooser("Your task");
     groups.forEach((group) => tool.add(new Option(group.dataset.tool, group.dataset.tool)));
 
-    function showTask() {
-      const group = groups.find((item) => item.dataset.tool === tool.value);
-      group.querySelectorAll(".tool-example").forEach((example, index) => {
-        example.hidden = index !== task.selectedIndex;
+    const examples = groups.map((group) => ({
+      group,
+      tool: group.dataset.tool,
+      tasks: [...group.querySelectorAll(".tool-example")],
+    }));
+    const titles = new Set(examples.flatMap((item) => item.tasks.map((entry) => entry.dataset.title)));
+    titles.forEach((title) => task.add(new Option(title, title)));
+
+    function update() {
+      function available(name, title) {
+        return examples.some((item) => item.tool === name &&
+          item.tasks.some((entry) => entry.dataset.title === title));
+      }
+      for (const option of tool.options) {
+        option.disabled = !available(option.value, task.value);
+      }
+      for (const option of task.options) {
+        option.disabled = !available(tool.value, option.value);
+      }
+      examples.forEach((item) => {
+        item.group.hidden = item.tool !== tool.value;
+        item.group.open = true;
+        item.group.querySelector("summary").hidden = true;
+        item.tasks.forEach((entry) => {
+          entry.hidden = entry.dataset.title !== task.value;
+        });
       });
       widget.querySelector(".tool-examples-status").textContent =
         `${tool.value} and syq: ${task.value}.`;
     }
-    function showTool() {
-      const previous = task.value;
-      task.replaceChildren();
-      groups.forEach((group) => {
-        const selected = group.dataset.tool === tool.value;
-        group.hidden = !selected;
-        group.open = true;
-        group.querySelector("summary").hidden = true;
-        if (selected) {
-          group.querySelectorAll(".tool-example").forEach((example) => {
-            task.add(new Option(example.dataset.title, example.dataset.title));
-          });
-        }
-      });
-      if ([...task.options].some((option) => option.value === previous)) task.value = previous;
-      showTask();
-    }
-    tool.addEventListener("change", showTool);
-    task.addEventListener("change", showTask);
-    showTool();
+    tool.addEventListener("change", update);
+    task.addEventListener("change", update);
+    update();
     controls.hidden = false;
+    widget.querySelector(".tool-examples-hint").hidden = false;
   });
 })();

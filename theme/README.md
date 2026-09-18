@@ -77,7 +77,9 @@ The docs homepage preserves its copy-files-with-syq fragment for existing links.
 The homepage leads with fast, programmable file transfer and examples that
 separate file selection, endpoints, and placement. Its tool comparison widget
 uses curated examples in `docs/assets/tool-examples.html`; all examples remain
-readable without JavaScript. Native selectors provide keyboard navigation.
+readable without JavaScript. Native selectors provide keyboard navigation. Both keep their selected value;
+choices without a matching tool/task example are disabled. Keep at least one
+shared task across all tools so readers can switch between them.
 Shared landing-actions buttons offer installation, benchmarks, sending files
 home, server-to-server copies and programmable file placement. Quickstart
 examples follow under Try a copy.
