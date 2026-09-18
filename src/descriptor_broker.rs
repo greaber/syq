@@ -102,6 +102,7 @@ impl RegisteredRootRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn register(&self, directory: File) -> Result<RegisteredRootId> {
         Ok(self.register_many(vec![directory])?.remove(0))
     }
@@ -195,7 +196,7 @@ impl RegisteredRootRegistry {
         Ok(ids)
     }
 
-    /// Used by local workers and TCP workers hosted by the control process.
+    #[cfg(test)]
     pub(crate) fn acquire(&self, id: RegisteredRootId) -> Result<File> {
         self.acquire_optional(id, RegisteredDescriptorKind::Directory)?
             .with_context(|| format!("unknown descriptor session root {}", id.0))
@@ -319,10 +320,12 @@ impl DescriptorSession {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn registry(&self) -> RegisteredRootRegistry {
         self.registry.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn register(&self, directory: File) -> Result<RegisteredRootId> {
         self.registry.register(directory)
     }

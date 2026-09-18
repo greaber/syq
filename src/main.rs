@@ -10,7 +10,6 @@ mod completion_details;
 mod conn;
 mod copy_policy;
 mod delegation;
-#[allow(dead_code)]
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod descriptor_broker;
 mod descriptor_copy;
@@ -46,7 +45,6 @@ mod restricted;
 mod results;
 mod resume;
 mod rm;
-#[allow(dead_code)]
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod rooted;
 mod s3;

@@ -182,32 +182,6 @@ impl PinnedLeaf {
         clear_nonblocking(&file).context("normalize selected operator file flags")?;
         Ok(file)
     }
-
-    /// Open the selected identity for ordinary output, validating it before
-    /// truncation so a namespace replacement cannot redirect the write.
-    pub(crate) fn open_regular_write(self, truncate: bool) -> Result<File> {
-        self.open_regular(libc::O_WRONLY, truncate)
-    }
-
-    fn open_regular(self, access: libc::c_int, truncate: bool) -> Result<File> {
-        if !self.metadata.is_file() {
-            bail!("operator path does not select a regular file");
-        }
-        let file = open_at(
-            self.parent.as_raw_fd(),
-            &self.name,
-            access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
-            0,
-        )
-        .context("open selected operator file")?;
-        let actual = root_metadata_from_std(&file.metadata()?)?;
-        require_operator_identity(self.metadata, actual, "operator file")?;
-        clear_nonblocking(&file).context("normalize selected operator file flags")?;
-        if truncate {
-            file.set_len(0).context("truncate selected operator file")?;
-        }
-        Ok(file)
-    }
 }
 
 /// An existing selected directory. `entry` retains the parent/name used to
@@ -899,10 +873,6 @@ impl Root {
 
     pub(crate) fn identity(&self) -> RootIdentity {
         self.identity
-    }
-
-    pub(crate) fn as_raw_fd(&self) -> RawFd {
-        self.directory.as_raw_fd()
     }
 
     /// Open the root or a descendant directory without following any
@@ -1778,6 +1748,7 @@ impl Root {
     /// Rename one leaf to another. Both parents are resolved and retained
     /// beneath this root before the atomic rename. Existing destinations follow
     /// ordinary `rename(2)` replacement rules.
+    #[cfg(test)]
     pub(crate) fn rename(&self, source: &RelativePath, target: &RelativePath) -> Result<()> {
         let source_parent = self.resolve_parent(source)?;
         let target_parent = self.resolve_parent(target)?;
