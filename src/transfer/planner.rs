@@ -1405,58 +1405,7 @@ impl Planner<'_> {
                 planned.push((p, dst_rel, e, st));
             }
             if opts.dry_run {
-                let mut meta_flags = opts.flags;
-                if !opts.perms {
-                    meta_flags &= !flags::MODE;
-                }
-                for (p, _, e, destination) in &planned {
-                    match destination {
-                        None => {
-                            // The insert doubles as a dedupe: an explicit
-                            // directory entry that upgrades a synthesized
-                            // ancestor from an earlier chunk plans the same
-                            // path again, and a live run's stat would filter
-                            // it while a dry run has nothing to stat. The
-                            // trace itself is deferred (see
-                            // directory_creates).
-                            if self.dry_run_changes.directories.insert(p.clone()) {
-                                self.dry_run_changes
-                                    .directory_creates
-                                    .push((p.clone(), "destination_missing"));
-                                if opts.verbose > 0 {
-                                    self.progress.println(&format!(
-                                        "create directory {} (destination missing)",
-                                        display_directory(p)
-                                    ));
-                                }
-                            }
-                        }
-                        Some(d)
-                            if !opts.preserve_existing_directory_metadata
-                                && metadata_differs(e, d, meta_flags)
-                                && !self.implicit_dirs.contains(p) =>
-                        {
-                            self.dry_run_changes.metadata_directories.insert(p.clone());
-                            if let Some(dst_rel) = strip_dst_root(p, dst_root) {
-                                self.emit_trace_with_src(
-                                    "create_directory",
-                                    dst_rel,
-                                    "dir",
-                                    None,
-                                    "metadata_differs",
-                                    !self.implicit_dirs.contains(p),
-                                );
-                            }
-                            if opts.verbose > 0 {
-                                self.progress.println(&format!(
-                                    "update metadata {} (requested directory metadata differs)",
-                                    display_directory(p)
-                                ));
-                            }
-                        }
-                        Some(_) => {}
-                    }
-                }
+                self.trace_dry_run_dirs(&planned, dst_root);
             } else if !opts.verify_only {
                 // Create new dirs; also "create" existing ones we can't yet
                 // write into (0o700 not set) so apply() opens them up. The
@@ -2043,6 +1992,63 @@ impl Planner<'_> {
         }
         self.flush_meta_fixes(meta_fixes)?;
         self.flush_leaf_ops(ops, &op_names)
+    }
+
+    /// Record what a live run would do to this batch's directories.
+    fn trace_dry_run_dirs(&mut self, planned: &[PlannedDir], dst_root: &[u8]) {
+        let opts = self.opts;
+        let mut meta_flags = opts.flags;
+        if !opts.perms {
+            meta_flags &= !flags::MODE;
+        }
+        for (p, _, e, destination) in planned {
+            match destination {
+                None => {
+                    // The insert doubles as a dedupe: an explicit
+                    // directory entry that upgrades a synthesized
+                    // ancestor from an earlier chunk plans the same
+                    // path again, and a live run's stat would filter
+                    // it while a dry run has nothing to stat. The
+                    // trace itself is deferred (see
+                    // directory_creates).
+                    if self.dry_run_changes.directories.insert(p.clone()) {
+                        self.dry_run_changes
+                            .directory_creates
+                            .push((p.clone(), "destination_missing"));
+                        if opts.verbose > 0 {
+                            self.progress.println(&format!(
+                                "create directory {} (destination missing)",
+                                display_directory(p)
+                            ));
+                        }
+                    }
+                }
+                Some(d)
+                    if !opts.preserve_existing_directory_metadata
+                        && metadata_differs(e, d, meta_flags)
+                        && !self.implicit_dirs.contains(p) =>
+                {
+                    self.dry_run_changes.metadata_directories.insert(p.clone());
+                    if let Some(dst_rel) = strip_dst_root(p, dst_root) {
+                        self.emit_trace_with_src(
+                            "create_directory",
+                            dst_rel,
+                            "dir",
+                            None,
+                            "metadata_differs",
+                            !self.implicit_dirs.contains(p),
+                        );
+                    }
+                    if opts.verbose > 0 {
+                        self.progress.println(&format!(
+                            "update metadata {} (requested directory metadata differs)",
+                            display_directory(p)
+                        ));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
     }
 
     /// Queue the final metadata of this batch's directories, applied once
