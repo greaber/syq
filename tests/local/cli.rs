@@ -984,7 +984,7 @@ fn stream_placement_and_source_roots() {
                 .open(fifo)
                 .and_then(|mut file| file.write_all(b"fifo"))
         });
-        let output = cp(&["pipe", flag, "container"]);
+        let output = cp(&["--root", ".", "--src-non-dir", "pipe", flag, "container"]);
         // Release the owned writer even if a regression rejected the copy.
         let _rescue = OpenOptions::new()
             .read(true)
