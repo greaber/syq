@@ -23,6 +23,6 @@ for installation. The `syq` command is also available in the Python environment.
 Installing from a source distribution builds the executable and requires Rust
 and a C compiler. Its remote behavior follows the native source version bundled
 in that distribution: source builds upload themselves to compatible SSH hosts
-by default. See [source builds](development.md) for helper selection and symbols
+by default. See [source builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for helper selection and symbols
 when building from a checkout with those options. Older distributions retain
 their bundled native version's build options.

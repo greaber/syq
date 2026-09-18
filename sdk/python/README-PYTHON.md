@@ -80,7 +80,7 @@ result = syq.rm(src_dir="old-output", root="/srv/jobs")
 print(result.entries_removed, result.selectors_missing)
 ```
 
-Positional paths, `src`, and `srcs` refuse directories. Use `src_dir` to remove
+Positional paths and `src` refuse directories. Use `src_dir` to remove
 a tree, or `srcs_in` to recursively empty it while keeping its root.
 
 `root` confines removal to that directory. Add `on="server"` to remove files

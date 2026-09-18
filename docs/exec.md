@@ -1,5 +1,7 @@
 # Run commands on your receiving machine
 
+See [`syq exec`](commands/exec.md) for the option list.
+
 From a server shell, ask your Mac or Linux desktop to run a command:
 
 ```sh

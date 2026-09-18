@@ -5,25 +5,12 @@ syq cp project --into backup
 ```
 
 This copies `project` to `backup/project`. Existing files are updated when
-needed; unrelated files stay.
+needed; unrelated files stay. See [`syq cp`](commands/cp.md) for the option list.
 
-On macOS, eligible local files use filesystem cloning when both paths are on
-the same APFS volume. The copy initially shares disk blocks with the source;
-later changes to either file are independent. Reported bytes count the file's
-size, so the displayed rate can exceed the disk's physical throughput.
-Other filesystems and cross-volume copies use normal copying. Syq also uses
-normal copying when the open-file limit leaves no room for cloning.
-
-Syq groups small files into requests to reduce per-file overhead; larger files
-can use cloning. See [batch sizes](tuning.md#batch-size-and-splitting) for how
-tuning affects this choice.
-
-Cloning keeps the usual overwrite and metadata rules. Writing in place,
-comparing checksums, or setting a bandwidth limit uses normal copying. So does explicitly
-selecting [range transfers](tuning.md). Destination directories with
-inheritable access control entries, filesystem-compressed files, and files
-whose metadata cannot be safely removed also use normal copying. Cloned copies
-omit source extended attributes and file flags, just as normal copies do.
+Local copies use filesystem copy optimizations when available. On the same
+APFS volume, eligible files can share disk blocks while remaining independently
+writable. See [local copies and NFS](speed.md#local-copies-and-nfs) for what this
+means for storage use and reported speed.
 
 The final summary shows what was copied or skipped, how long it took, and any
 errors. Add `-v` to list copied paths. For connection and performance details,
@@ -36,11 +23,6 @@ time limits, and
 [restricted server-to-server copies](remote-reference.md#limits-and-unsupported-options)
 must finish before their signed authorization expires. SDK callers can also
 set their own deadlines.
-
-On Linux, syq asks the kernel to read ahead in source files when reads show
-storage activity or waits. This works for local and remote copies and uses a
-small, bounded number of helper threads. Local copies can also use faster
-filesystem copy operations when available.
 
 ## See where files go
 
@@ -114,10 +96,15 @@ The `@` is required: `--to laptop` selects an SSH destination, while
 `--to @laptop` requires that receiver to be connected and pass its identity check.
 See [Send files home from a server](receive.md) for setup and destination paths.
 
-For object storage, use `--to s3://BUCKET`, `--from s3://BUCKET`, or both to
-copy between buckets. Select keys with the same source and placement options. See
-[Copy to and from object storage](object-storage.md) for credentials, headers,
-metadata, and tuning.
+Use S3 buckets with the same selectors and placement options:
+
+```sh
+syq cp photos --to s3://backups --into laptop
+syq cp --from s3://backups laptop/photos --into restored
+syq cp --from s3://backups --srcs-in laptop --to s3://archive --into laptop
+```
+
+See [S3 options and behavior](object-storage.md) for credentials and filesystem differences.
 
 For two SSH endpoints, see [Copy between servers](remote-to-remote.md).
 
@@ -344,95 +331,33 @@ the destination.
 
 ## Check file contents
 
-Syq normally skips files whose size and modification time match. `syq cp`
-compares whole seconds exactly and ignores as many trailing fractional digits
-as are zero in the destination timestamp. For example, destination `.120000000`
-seconds matches source `.123456789`; a whole-second destination timestamp
-ignores the source fraction entirely. This accommodates destinations that
-truncate fractional seconds. Directory metadata previews use the same fractional
-precision rule. `syq rsync` compares whole seconds only when checking file contents.
-
-Syq preserves the source timestamp at the destination, so the machines' clocks
-do not need to agree. A timestamp difference outside that precision triggers
-checking even when the source is older, unless you request `--skip-newer`.
-
-Matching metadata is a shortcut, not proof that contents match. An edit can
-preserve both size and timestamp, and changes within the ignored fraction can
-be missed. `--hash` checks contents even when those two attributes match:
+Syq normally skips files whose size and modification time match. Matching
+metadata does not prove that contents match; use `--hash` to compare contents:
 
 ```sh
 syq cp --hash --srcs-in project --into backup
 ```
 
-This changes how syq decides what needs copying. For larger network
-copies, syq still compares blocks when size or modification time differs,
-even without `--hash`, so it can reuse unchanged data. Local and small copies
-may use faster paths instead.
+To require a known whole-file digest, use `--expected-hash ALGORITHM:HEX` with
+one named regular file. Syq checks the complete result, including reused bytes.
+A mismatch fails the file; with normal staging it does not replace the destination.
+Selection filters still exclude files from checking. For batch copies, use
+[expected digests in mappings](mappings.md#the-format).
 
-Advanced controls keep resource policy, performance choices and integrity
-checking separate:
-
-| Option | Purpose |
-|---|---|
-| `--resource-limits bandwidth=RATE` | Caps aggregate logical file-data throughput |
-| `--performance-tuning workers=N` | Fixes filesystem copy-worker slots instead of adjusting them automatically |
-| `--integrity-checking compare=HASH,transfer=HASH` | Chooses content comparison and extra payload checks independently |
-
-Each option accepts comma-separated `KEY=VALUE` pairs and can be repeated with
-different keys. Duplicate keys are errors. See [performance tuning](tuning.md)
-for the worker and S3 request controls. These tune parallelism; they do not
-bound total sockets, file descriptors, CPU or memory.
-
-Comparison defaults to `compare=size-mtime`. If those attributes are insufficient,
-use `compare=blake3`, also available as `--hash`. Other choices are `sha256`,
-`md5`, and `xxh3-128`. MD5 supports existing manifests; XXH3-128 is a fast
-noncryptographic checksum. Neither provides cryptographic collision resistance.
-`--hash` conflicts with a different explicit comparison choice.
-
-Extra payload checks default to `transfer=off`. Enable them with, for example,
-`--integrity-checking transfer=blake3`; the same four hash types are supported.
-The comparison and transfer hash types can differ. SSH and encrypted TCP retain
-their transport protection independently, and `--tcp-plain` does not enable
-payload checks automatically. Same-host copies keep their kernel-copy and
-whole-file shortcuts. Use `--expected-hash` to validate the complete local result.
-Content comparison, verification and recovery still hash data when needed.
-[S3 provider checksums](object-storage.md#metadata-and-integrity) also stay enabled.
-
-To require a particular whole-file digest, use `--expected-hash ALGORITHM:HEX`
-with one named regular file:
-
-```sh
-syq cp data.bin --as backup.bin --expected-hash md5:900150983cd24fb0d6963f7d28e17f72
-```
-
-This checks all resulting bytes, including reused data, before reporting success;
-a metadata match alone is insufficient. When size and modification time match,
-syq validates the existing destination and skips copying if its digest matches.
-Otherwise it copies and validates the result; a mismatch fails that file. With normal
-staging, validation happens before replacing the destination. With `--inplace`,
-the file has already been modified when validation finishes. Use
-[per-file mapping expectations](mappings.md#the-format) for a batch. Selection
-filters still exclude files, and excluded files are not digest-verified.
-The expected digest's algorithm can differ from either integrity-checking hash type. Dry runs
-preview changes without validating the expectation.
-
-For files being changed by another program, stop the writer or copy a snapshot.
-No copy makes the whole tree transactional or guarantees durability across
-power loss.
-
-To compare without writing, use `--verify-only`:
+To compare without copying:
 
 ```sh
 syq cp --verify-only --srcs-in project --into backup
 ```
 
-This compares file contents, symlink targets, and entry types without writing.
-Missing or different entries make the command fail. It does not compare metadata
-or look for extra destination files.
+Missing or different entries make the command fail. This compares contents,
+symlink targets, and entry types, without comparing metadata or looking for
+extra destination files.
 
-For two servers, add `--coordinate-at local` to compare through your machine
-using ordinary SSH access, with no restricted receiver enrollment. This also
-supports `--results`. See [remote verification](remote-reference.md#verification).
+The [Integrity checking reference](integrity-checking.md) covers timestamp
+precision, every comparison and payload-check algorithm, expected digests,
+and verification restrictions. For consistent source data, stop concurrent
+writers or copy a snapshot.
 
 ## In-place writes
 
@@ -518,11 +443,10 @@ in names and peer diagnostics. JSON status output keeps the original values.
 Syq reads no configuration file. Besides the usual system variables such as
 `HOME`, `TMPDIR`, and `SSH_AUTH_SOCK`, and the AWS credential, region, and
 endpoint variables described under
-[object storage](object-storage.md#credentials-and-providers), syq honors:
+[object storage](object-storage.md#s3-options), syq honors:
 
-- `SYQ_CP_OPTIONS`, `SYQ_RSYNC_OPTIONS`, `SYQ_RM_OPTIONS`, and
-  `SYQ_STREAM_OPTIONS` hold extra arguments for `syq cp`, `syq rsync`,
-  `syq rm`, and `syq stream`, respectively. Use them to adjust a
+- `SYQ_CP_OPTIONS`, `SYQ_RSYNC_OPTIONS`, and `SYQ_RM_OPTIONS` hold extra
+  arguments for `syq cp`, `syq rsync`, and `syq rm`, respectively. Use them to adjust a
   command inside a script or program that does not let you change its syq
   options. The value is split like a shell command line and inserted right
   after the command name, before the arguments the script supplies, so
@@ -577,7 +501,8 @@ Use `--min-size` and `--max-size` to select regular files by size.
 For parallelism and bandwidth controls, see [Speed](speed.md). For scripts,
 see [Automation results](automation.md).
 
-Use `--help` (or `-h`) for everyday options and `--help-all` for the full list,
-including tuning, scripting, and manual setup. `syq help COMMAND` shows the
+The [`cp` command reference](commands/cp.md) lists every option, including tuning,
+scripting, and manual setup. In a terminal, use `--help` (or `-h`) for everyday
+options and `--help-all` for the full list. `syq help COMMAND` shows the
 same help without running the command. In `syq rsync`, `-h` means
 human-readable sizes; use `--help` for help.
