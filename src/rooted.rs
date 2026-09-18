@@ -262,6 +262,7 @@ pub(crate) enum PinnedPath {
     Directory(PinnedDirectory),
     /// A readable object opened directly through a retained procfs magic-link
     /// parent. This is used only for final control-file inputs.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     OpenFile(File),
 }
 
