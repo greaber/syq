@@ -9,6 +9,7 @@ use crate::conn::{
     data_address, endpoint_error, ok, parse_ports, Conn, DataAddressSource, DataTransport,
     Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate, TcpPairStats,
 };
+use crate::copy_policy::FreshCapacityAssessment;
 #[cfg(test)]
 use crate::fsops::content_digest;
 use crate::fsops::{destination_fraction_matches, is_partial_name, is_recovery_name, join};
@@ -4341,31 +4342,6 @@ struct FreshCapacityPlan {
     logical_bytes: u64,
     objects: u64,
     overflowed: bool,
-}
-
-/// The fresh-destination capacity rule, shared with the receiver's one-turn
-/// small copy so both refuse the same copies.
-#[derive(Clone, Copy)]
-pub(crate) struct FreshCapacityAssessment {
-    pub(crate) logical_bytes: u64,
-    pub(crate) objects: u64,
-    pub(crate) available_bytes: u64,
-    pub(crate) available_inodes: Option<u64>,
-}
-
-impl FreshCapacityAssessment {
-    fn byte_shortage(self) -> bool {
-        self.logical_bytes > self.available_bytes
-    }
-
-    fn inode_shortage(self) -> bool {
-        self.available_inodes
-            .is_some_and(|available| self.objects.saturating_add(64) > available)
-    }
-
-    pub(crate) fn sufficient(self) -> bool {
-        !self.byte_shortage() && !self.inode_shortage()
-    }
 }
 
 fn fresh_capacity_error(capacity: FreshCapacityAssessment) -> anyhow::Error {

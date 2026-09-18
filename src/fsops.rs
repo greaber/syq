@@ -1852,7 +1852,7 @@ impl FsOps {
         let fresh = (exact && destinations[0].is_none())
             || info.as_ref().is_some_and(|info| info.empty == Some(true));
         if let Some(info) = info.filter(|_| fresh) {
-            let assessment = crate::transfer::FreshCapacityAssessment {
+            let assessment = crate::copy_policy::FreshCapacityAssessment {
                 logical_bytes: total,
                 objects: request.files.len() as u64,
                 available_bytes: info.available_bytes,
