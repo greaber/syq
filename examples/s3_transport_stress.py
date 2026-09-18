@@ -386,6 +386,8 @@ try:
         cases = [dict(case, chunk_bytes=int(value)) for case in cases
                  for value in os.environ['SYQ_STRESS_CHUNKS'].split(',')]
     for case in cases:
+        if os.environ.get('SYQ_STRESS_CPUS'):
+            case['cpus'] = os.environ['SYQ_STRESS_CPUS']
         if os.environ.get('SYQ_STRESS_MEMORY_LIMIT'):
             case['memory'] = os.environ['SYQ_STRESS_MEMORY_LIMIT']
         if HEAP_PROBE:
