@@ -1,0 +1,20 @@
+.docs-version {
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:8px 12px;
+  margin:20px 0 28px;
+  font:14px/1.5 var(--display, sans-serif);
+  color:var(--fg);
+}
+.docs-version select {
+  max-width:100%;
+  padding:6px 10px;
+  border:1px solid var(--table-border-color);
+  border-radius:4px;
+  font:inherit;
+  color:var(--fg);
+  background:var(--bg);
+}
+.docs-version select:focus-visible {outline:2px solid var(--links);outline-offset:3px}
+@media print {.docs-version select,.docs-version noscript {display:none}}

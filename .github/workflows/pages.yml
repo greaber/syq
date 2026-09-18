@@ -11,7 +11,14 @@ on:
       - 'theme/**'
       - 'book.toml'
       - 'scripts/check-doc-links.py'
+      - 'scripts/build-doc-site.py'
+      - 'scripts/test-doc-site.py'
       - '.github/workflows/pages.yml'
+  # GITHUB_TOKEN publication does not emit a usable release event. Refresh even
+  # if a later package/tap step failed: the GitHub release may already be public.
+  workflow_run:
+    workflows: [release]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -26,6 +33,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A completed release must not replace development docs with the tag tree.
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || 'master' }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Check documentation links
         run: python3 scripts/check-doc-links.py
       - name: Install mdBook
@@ -40,14 +52,20 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           tar -xzf mdbook.tar.gz -C "$HOME/.local/bin" mdbook
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Build the site
-        run: mdbook build
+      - name: Test version selection
+        run: python3 scripts/test-doc-site.py
+      - name: Build all documentation versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/build-doc-site.py
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: target/book
+          path: target/doc-site
 
   deploy:
+    # A manual task-branch run builds a review artifact without publishing it.
+    if: github.ref == 'refs/heads/master'
     needs: build
     runs-on: ubuntu-latest
     permissions:
