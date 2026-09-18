@@ -1,6 +1,7 @@
 """Sustained adversarial download comparison; owned containers and files only."""
 import concurrent.futures
 import datetime
+import errno
 import hashlib
 import hmac
 import importlib.util
@@ -124,10 +125,9 @@ class MemoryTrace:
                                   (line.split(':', 1) for line in Path(f'/proc/{self.pid}/status').read_text().splitlines())
                                   if k in wanted}
                 self.samples.append(row)
-            except FileNotFoundError:
-                break
-            except PermissionError as error:
-                self.samples.append({'error': str(error)})
+            except OSError as error:
+                if error.errno not in (errno.ENOENT, errno.ENODEV, errno.ESRCH):
+                    self.samples.append({'error': str(error)})
                 break
             self.done.wait(.02)
 
