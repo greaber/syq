@@ -4,11 +4,13 @@ Syq adjusts performance automatically. Use these controls to investigate copies
 where the defaults perform poorly. They appear in `--help-all` and are
 experimental; their keys and bounds may change between releases.
 
-On Linux, syq automatically keeps its shared metadata pool on sixteen physical
-cores within one NUMA node when that many cores are available in its CPU
-allocation. This also applies to single-socket hosts. Transfer workers keep
-access to the rest of the allocation. Placement requires no elevated privileges;
-when CPU topology or affinity is unavailable, Linux continues to place threads.
+On Linux, syq automatically groups shared metadata work on sixteen physical
+cores in one NUMA node when its CPU allocation allows it. This also applies to
+single-socket hosts. For bulk TCP data, threads use the network interface's
+NUMA node when its locality is available, returning to their broader CPU
+allocation for small-file batches. Placement respects existing CPU restrictions,
+requires no elevated privileges, and falls back to normal scheduling when
+topology or affinity is unavailable.
 
 `--performance-tuning workers=N` fixes the number of filesystem copy-worker
 slots instead of adjusting it automatically. Workers process files or ranges;

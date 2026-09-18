@@ -7779,6 +7779,12 @@ impl Worker {
     }
 
     fn run_inner(&mut self) -> Result<()> {
+        let mut placement = crate::placement::BulkPlacement::new(
+            [self.src.placement_address(), self.dst.placement_address()]
+                .into_iter()
+                .flatten()
+                .collect(),
+        );
         loop {
             if !self.gate.allowed(self.id) {
                 let _parked = self
@@ -7808,6 +7814,7 @@ impl Worker {
                 Item::File(idx) => {
                     let progress = self.progress.clone();
                     let _copying = progress.copying_interval();
+                    placement.set_bulk(false);
                     if self.fast_eligible(idx) {
                         let first_bytes = self.job(idx).entry.size;
                         let target = self
@@ -7844,7 +7851,7 @@ impl Worker {
                             }
                         }
                         for (position, &i) in slow.iter().enumerate() {
-                            if let Err(e) = self.handle_file(i) {
+                            if let Err(e) = self.handle_file(i, &mut placement) {
                                 if self.transport_dead() {
                                     for &pending in &slow[position + 1..] {
                                         self.sched.ranges_ready(pending, vec![]);
@@ -7858,7 +7865,7 @@ impl Worker {
                         let res = if self.opts.verify_only {
                             self.verify_file(idx)
                         } else {
-                            self.handle_file(idx)
+                            self.handle_file(idx, &mut placement)
                         };
                         if let Err(e) = res {
                             self.file_error(idx, e)?;
@@ -7866,6 +7873,7 @@ impl Worker {
                     }
                 }
                 Item::Range(h) => {
+                    placement.set_bulk(true);
                     let progress = self.progress.clone();
                     let _copying = progress.copying_interval();
                     let (idx, start) = {
@@ -8386,7 +8394,11 @@ impl Worker {
         self.sched.jobs.lock().unwrap().snapshot(idx)
     }
 
-    fn handle_file(&mut self, idx: usize) -> Result<()> {
+    fn handle_file(
+        &mut self,
+        idx: usize,
+        placement: &mut crate::placement::BulkPlacement,
+    ) -> Result<()> {
         let job = self.job(idx);
         let size = job.entry.size;
         let opts = self.opts.clone();
@@ -8556,6 +8568,9 @@ impl Worker {
         self.progress.bytes_total.fetch_sub(size - to_send, Relaxed);
         match self.sched.ranges_ready(idx, ranges) {
             Some(h) => {
+                // Comparison and receiver-side copies need no NIC placement.
+                // Enter it only after planning actual payload work.
+                placement.set_bulk(true);
                 let start = h.lock().unwrap().pos;
                 let mut credited = 0;
                 let res = self.transfer_range(&h, &mut credited);
