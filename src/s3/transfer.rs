@@ -68,6 +68,22 @@ struct Download {
     expected_digest: Option<Digest>,
     copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
 }
+impl Download {
+    fn known_kind(&self) -> &'static str {
+        if let Some((source, _)) = self.copy_source.as_deref() {
+            match source.kind() {
+                "dir" => "dir",
+                "symlink" => "symlink",
+                _ => "file",
+            }
+        } else if client::is_directory_marker(&self.key, self.size) {
+            "dir"
+        } else {
+            "file"
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
     schema: u32,
@@ -229,11 +245,7 @@ impl Engine {
                 let dirs = directories.clone();
                 async move {
                     engine.check_cancelled()?;
-                    let mut kind = if client::is_directory_marker(&job.key, job.size) {
-                        "dir"
-                    } else {
-                        "file"
-                    };
+                    let mut kind = job.known_kind();
                     let result = engine.download(&job, &dst, dirs, &mut kind).await;
                     engine.settle(
                         job.key.as_bytes(),

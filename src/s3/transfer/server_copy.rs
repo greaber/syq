@@ -195,11 +195,7 @@ impl Engine {
             let engine = self.clone();
             async move {
                 engine.check_cancelled()?;
-                let mut kind = if client::is_directory_marker(&job.key, job.size) {
-                    "dir"
-                } else {
-                    "file"
-                };
+                let mut kind = job.known_kind();
                 let result = engine
                     .copy_object(&mut job, &mut kind)
                     .await
@@ -323,20 +319,22 @@ impl Engine {
             part_size <= 5 * 1024 * 1024 * 1024,
             "object exceeds the S3 multipart size limit"
         );
-        self.check_cancelled()?;
-        let tagging = if metadata.tag_count() == Some(0) {
-            String::new()
+        let read_tags = if metadata.tag_count() == Some(0) {
+            false
         } else if self.copy_tagging_unsupported.load(Relaxed) {
             anyhow::ensure!(
                 metadata.tag_count().is_none_or(|count| count <= 0),
                 "source has tags but S3 GetObjectTagging is unsupported; refusing to drop known tags"
             );
-            String::new()
+            false
         } else {
+            true
+        };
+        let setup_slot = self.tuning.requests.acquire().await;
+        self.check_cancelled()?;
+        let tagging = if read_tags {
             // A missing count is unknown. Only explicit lack of tagging support
             // permits copying without tags; permission failures remain fatal.
-            let tag_slot = self.tuning.requests.acquire().await;
-            self.check_cancelled()?;
             let tags = self
                 .client
                 .get_object_tagging()
@@ -345,7 +343,6 @@ impl Engine {
                 .set_version_id(source.version.clone())
                 .send()
                 .await;
-            drop(tag_slot);
             let tags = match tags {
                 Ok(tags) => Some(tags),
                 Err(e)
@@ -379,9 +376,9 @@ impl Engine {
                 }
             }
             serializer.finish().replace('+', "%20")
+        } else {
+            String::new()
         };
-        let setup_slot = self.tuning.requests.acquire().await;
-        self.check_cancelled()?;
         let created = self
             .client
             .create_multipart_upload()
