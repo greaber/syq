@@ -13,7 +13,8 @@ see [diagnosing a slow copy](speed.md#diagnose-a-slow-copy).
 
 File transfers have no automatic duration or stall deadline. They can continue
 through slowdowns and pauses; cancel the command if you no longer want to wait.
-Connection setup and SSH dead-peer detection still have time limits, and
+Connection setup, SSH keepalives, and return-connection heartbeats still have
+time limits, and
 [restricted server-to-server copies](remote-reference.md#limits-and-unsupported-options)
 must finish before their signed authorization expires. SDK callers can also
 set their own deadlines.
