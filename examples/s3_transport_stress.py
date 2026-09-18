@@ -202,6 +202,9 @@ def run(case, mode, repeats, label):
                 break
             except subprocess.TimeoutExpired:
                 print(f'{tag}: running {time.monotonic() - started:.0f}s', flush=True)
+                if NETEM_MS:
+                    with (D / (tag + '.sender-tcp.txt')).open('a') as trace:
+                        trace.write(network_command(['ss', '-tin', 'state', 'established']) + '\n')
                 if time.monotonic() > deadline:
                     raise TimeoutError(f'{tag}: 600s deadline exceeded')
         if monitor:
