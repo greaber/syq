@@ -32,18 +32,15 @@ class ComparisonCoverage(unittest.TestCase):
         self.groups = parser.groups
 
     def test_every_combination_is_an_example_or_an_explicit_limitation(self):
-        shared = set(self.groups["syq"]["tasks"])
+        self.assertEqual(set(self.groups), {"rsync", "rclone", "s5cmd", "scp"})
         titles = set().union(*(set(group["tasks"]) for group in self.groups.values()))
         for tool, group in self.groups.items():
             with self.subTest(tool=tool):
                 tasks = set(group["tasks"])
                 self.assertEqual(len(tasks), len(group["tasks"]), "duplicate task")
-                if tool == "syq":
-                    continue
                 unsupported = group["unsupported"]
-                self.assertFalse(tasks & shared, "duplicate shared workflow")
-                self.assertFalse((tasks | shared) & unsupported.keys())
-                self.assertEqual(titles, tasks | shared | unsupported.keys())
+                self.assertFalse(tasks & unsupported.keys())
+                self.assertEqual(titles, tasks | unsupported.keys())
                 self.assertTrue(all(isinstance(reason, str) and reason.strip()
                                     for reason in unsupported.values()))
 
@@ -57,7 +54,8 @@ class ComparisonCoverage(unittest.TestCase):
         }
         for tool, tasks in expected.items():
             with self.subTest(tool=tool):
-                self.assertLessEqual(tasks | {"Choose destination names with a script"},
+                self.assertLessEqual(tasks | {"Choose destination names with a script", "Send files home without an SSH server",
+                                         "Copy between servers without agent forwarding"},
                                      set(self.groups[tool]["tasks"]))
 
 

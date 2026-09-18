@@ -17,8 +17,7 @@
     }
     const tool = chooser("Your tool");
     const task = chooser("Your task");
-    groups.filter((group) => group.dataset.tool !== "syq")
-      .forEach((group) => tool.add(new Option(group.dataset.tool, group.dataset.tool)));
+    groups.forEach((group) => tool.add(new Option(group.dataset.tool, group.dataset.tool)));
 
     const examples = groups.map((group) => ({
       group,
@@ -26,14 +25,8 @@
       unsupported: JSON.parse(group.dataset.unsupported || "{}"),
       tasks: [...group.querySelectorAll(".tool-example")],
     }));
-    for (const [label, syqOnly] of [["Compare familiar tasks", false], ["Workflow setup", true]]) {
-      const group = document.createElement("optgroup");
-      group.label = label;
-      const titles = new Set(examples.filter((item) => (item.tool === "syq") === syqOnly)
-        .flatMap((item) => item.tasks.map((entry) => entry.dataset.title)));
-      titles.forEach((title) => group.append(new Option(title, title)));
-      task.append(group);
-    }
+    const titles = new Set(examples.flatMap((item) => item.tasks.map((entry) => entry.dataset.title)));
+    titles.forEach((title) => task.add(new Option(title, title)));
 
     function update() {
       function reason(name, title) {
@@ -48,7 +41,7 @@
         option.title = reason(tool.value, option.value) || "";
       }
       examples.forEach((item) => {
-        item.group.hidden = (item.tool !== tool.value && item.tool !== "syq") ||
+        item.group.hidden = item.tool !== tool.value ||
           !item.tasks.some((entry) => entry.dataset.title === task.value);
         item.group.open = true;
         item.group.querySelector("summary").hidden = true;
@@ -56,10 +49,8 @@
           entry.hidden = entry.dataset.title !== task.value;
         });
       });
-      const syqOnly = examples.some((item) => item.tool === "syq" &&
-        item.tasks.some((entry) => entry.dataset.title === task.value));
       widget.querySelector(".tool-examples-status").textContent =
-        syqOnly ? `Workflow setup: ${task.value}.` : `${tool.value} and syq: ${task.value}.`;
+        `${tool.value} and syq: ${task.value}.`;
     }
     tool.addEventListener("change", update);
     task.addEventListener("change", update);

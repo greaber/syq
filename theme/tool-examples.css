@@ -42,5 +42,3 @@
 .content .tool-example-commands pre code { font-size: 15px; }
 .tool-examples-hint { font-size: .85em; }
 .tool-examples option:disabled { color: GrayText; }
-
-.tool-example-commands.tool-example-syq { grid-template-columns: 1fr; }

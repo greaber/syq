@@ -81,8 +81,8 @@ readable without JavaScript. Native selectors provide keyboard navigation. Both 
 choices explicitly listed in each tool’s `data-unsupported` attribute are
 disabled, with a reason. Missing examples are not evidence of incompatibility. Run
 `python3 scripts/test-tool-examples.py` to check coverage and known supported tasks. Keep at least one
-shared task across all tools so readers can switch between them. The “Workflow setup”
-group describes syq alongside alternatives that use different setup or routes.
+shared task across all tools so readers can switch between them. Every task compares the selected tool with syq, including alternatives that
+use different setup or data routes.
 Shared landing-actions buttons offer installation, benchmarks, sending files
 home, server-to-server copies and programmable file placement. Quickstart
 examples follow under Try a copy.
