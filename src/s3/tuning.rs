@@ -40,11 +40,14 @@ impl Tuning {
                             || host == "fly.storage.tigris.dev"
                             || host.ends_with(".tigris.dev")
                     }),
-            requests: Arc::new(Budget::new(
+            requests: Arc::new(Budget::with_ceiling(
                 args.tuning_options
                     .and_then(|t| t.s3_requests)
                     .unwrap_or(64),
                 args.tuning_options.and_then(|t| t.s3_requests).is_none(),
+                args.resource_limits
+                    .as_ref()
+                    .and_then(|limits| limits.s3_requests),
             )),
         }
     }
@@ -60,7 +63,9 @@ impl Tuning {
         (!self.tigris || !self.upload) && ns != u64::MAX && ns >= 50_000_000
     }
     pub fn configure(&self, tiny: bool, request_cap: usize, seed: usize) {
-        let request_cap = request_cap.max(self.fixed_requests.unwrap_or(1));
+        let request_cap = request_cap
+            .max(self.fixed_requests.unwrap_or(1))
+            .min(self.requests.ceiling.unwrap_or(usize::MAX));
         let mut s = self.requests.state.lock().unwrap();
         // Configuration separates completed planning from transfer admission.
         // Planning HEADs use permits but supply no transfer-throughput samples.
@@ -120,6 +125,7 @@ struct Window {
     settled: bool,
 }
 pub(super) struct Budget {
+    ceiling: Option<usize>,
     state: Mutex<Window>,
     changed: Notify,
     received: AtomicU64,
@@ -139,12 +145,18 @@ impl Permit {
     }
 }
 impl Budget {
+    #[cfg(test)]
     fn new(limit: usize, adaptive: bool) -> Self {
+        Self::with_ceiling(limit, adaptive, None)
+    }
+    fn with_ceiling(limit: usize, adaptive: bool, ceiling: Option<usize>) -> Self {
+        let limit = limit.min(ceiling.unwrap_or(usize::MAX));
         Self {
+            ceiling,
             state: Mutex::new(Window {
                 active: 0,
                 limit,
-                max: 256,
+                max: 256.min(ceiling.unwrap_or(usize::MAX)),
                 adaptive,
                 since: None,
                 bytes: 0,
@@ -223,6 +235,7 @@ impl Budget {
         Some(workers.min(s.limit))
     }
     pub fn finish_objects(&self, maximum: usize) {
+        let maximum = maximum.min(self.ceiling.unwrap_or(usize::MAX));
         let mut s = self.state.lock().unwrap();
         if s.adaptive {
             s.limit = maximum;
@@ -393,6 +406,40 @@ pub(super) fn small_object_capacity(largest: u64) -> anyhow::Result<usize> {
 mod tests {
     use super::*;
     use std::{future::Future, task::Context};
+
+    #[tokio::test]
+    async fn resource_request_ceiling_survives_configuration_and_object_handoff() {
+        let tuning = Tuning {
+            control_ns: Arc::new(AtomicU64::new(u64::MAX)),
+            fixed_requests: None,
+            tigris: false,
+            upload: false,
+            requests: Arc::new(Budget::with_ceiling(64, true, Some(3))),
+            reads: crate::s3::read_recovery::Recovery::default(),
+            upload_buffers: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        assert_eq!(tuning.request_limit(), 3);
+        for tiny in [false, true] {
+            tuning.observe_control(Duration::from_millis(100));
+            tuning.configure(tiny, 512, 64);
+            assert_eq!(tuning.request_limit(), 3);
+            assert_eq!(tuning.request_capacity(), 3);
+        }
+        let budget = &tuning.requests;
+        let a = budget.acquire().await;
+        let b = budget.acquire().await;
+        let c = budget.acquire().await;
+        let mut blocked = Box::pin(budget.acquire());
+        assert!(futures_util::poll!(&mut blocked).is_pending());
+        budget.finish_objects(512);
+        assert_eq!(tuning.request_limit(), 3);
+        assert!(futures_util::poll!(&mut blocked).is_pending());
+        drop(a);
+        let next = tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .unwrap();
+        drop((b, c, next));
+    }
 
     #[tokio::test]
     async fn planning_time_does_not_advance_the_first_request_window() {

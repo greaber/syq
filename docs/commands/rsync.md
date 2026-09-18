@@ -86,7 +86,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 
 | Argument / option | Meaning |
 |---|---|
-| `--resource-limits <KEY=VALUE,...>` | [Bandwidth limit](../resource-limits.md) |
+| `--resource-limits <KEY=VALUE,...>` | [Bandwidth and concurrency ceilings](../resource-limits.md) |
 
 ## Integrity checking
 

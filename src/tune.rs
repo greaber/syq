@@ -1021,7 +1021,11 @@ pub fn run(
 
         // Heal an unexpectedly missing active slot. At one active worker keep
         // exactly one ready spare so the important 1→2 probe is instantaneous.
-        let retain = if active == 1 { 2 } else { active };
+        let retain = if active == 1 {
+            2.min(policy.max)
+        } else {
+            active
+        };
         gate.set_retain(retain);
         // A pipelined whole-file batch is already owned and cannot be stolen.
         // Do not repeatedly reconnect slots that drained the queue while the

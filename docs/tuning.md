@@ -1,7 +1,8 @@
 # Performance tuning
 
-`--performance-tuning` overrides syq's automatic choices. Leave it unset for
-everyday copies. These experimental controls are available in `syq cp` and
+`--performance-tuning` overrides syq's automatic choices. To keep automatic
+choices within a ceiling, use [resource limits](resource-limits.md) instead.
+Leave performance tuning unset for everyday copies. These experimental controls are available in `syq cp` and
 `syq rsync`; `syq rm` and `syq clean-partials` accept only `workers` for filesystem
 removal.
 
@@ -52,8 +53,11 @@ syq cp data --to s3://backups --into archive \
 ```
 
 This allows four objects in progress and up to eight parts per object, with at
-most sixteen simultaneous data requests across them. An explicit maximum
-disables automatic adjustment of that setting.
+most sixteen simultaneous data requests across them. These performance-tuning
+values fix the available slots and disable automatic adjustment of each
+specified count; unused slots can remain idle. To let syq
+choose counts within these ceilings instead, pass the same keys through
+`--resource-limits`. A count cannot be specified in both groups.
 
 Part size grows when needed to stay within 10,000 upload parts. For server-side
 copies, an explicit part size also selects the multipart threshold, capped at
@@ -74,7 +78,8 @@ before syq learns a better count.
 
 The cache is `~/.cache/syq/tuning.json`; `XDG_CACHE_HOME` changes its parent.
 `SYQ_TUNING_CACHE` names another file, or disables the cache when empty.
-Supplying `--performance-tuning` or `--resource-limits` bypasses the cache.
+Supplying `--performance-tuning` or `--resource-limits workers=N` bypasses the
+cache. A bandwidth limit alone still uses it.
 Live tuning continues unless you fix `workers`. Use `-vv` to see the starting count.
 
 ## Filesystem tuning examples

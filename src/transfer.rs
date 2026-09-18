@@ -1645,7 +1645,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
         if args.connections_default {
-            args.connections = tune::START_SSH;
+            args.connections = tune::START_SSH.min(args.automatic_worker_limit());
         }
         if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Dst {
             return crate::remote_to_remote::coordinate_at_dst(
@@ -1704,7 +1704,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             tune::START_SSH
         } else {
             tune::start_local()
-        };
+        }
+        .min(args.automatic_worker_limit());
     }
     #[cfg(not(target_os = "linux"))]
     if let Some(algorithm) = &args.tcp_congestion {
@@ -1829,7 +1830,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
     };
     let maximum_workers = if autotune {
-        tune::MAX
+        args.automatic_worker_limit()
     } else {
         args.connections
     };
@@ -2113,7 +2114,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 spawn_worker.clone(),
             );
             let n0 = initial;
-            let policy = tune::Policy::new(n0, tune::MIN, tune::MAX);
+            let policy = tune::Policy::new(n0, tune::MIN, maximum_workers);
             *tuner.lock().unwrap() = Some(std::thread::spawn(move || {
                 tune::run(policy, gate, sched, progress, |id| spawn_worker(id))
             }));
@@ -2812,12 +2813,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .is_some_and(|info| !info.failed),
                 });
         if autotune && all_remote_endpoints_use_tcp && (src_ep.is_remote() || dst_ep.is_remote()) {
-            args.connections = tune::START_TCP;
+            args.connections = tune::START_TCP.min(args.automatic_worker_limit());
             gate.set_active(args.connections);
         }
-        let tuning_key = (autotune && args.tuning_options.is_none())
-            .then(|| tune::path_key(&src_ep, &dst_ep))
-            .flatten();
+        let tuning_key = (autotune
+            && args.tuning_options.is_none()
+            && args
+                .resource_limits
+                .as_ref()
+                .is_none_or(|limits| limits.workers.is_none()))
+        .then(|| tune::path_key(&src_ep, &dst_ep))
+        .flatten();
         let remembered_start = tuning_key.as_deref().and_then(tune::cached);
         if let Some(remembered) = remembered_start {
             args.connections = remembered;

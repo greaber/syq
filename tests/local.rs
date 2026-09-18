@@ -7624,6 +7624,77 @@ fn tuning_options_are_in_full_help_and_validate_before_copying() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let data = prng(9 * 1024 * 1024 + 123, 905);
+    write(&t.path("source"), &data);
+    // Old-format remembered counts must neither override the cap nor be replaced.
+    let cache = br#"{"paths":{"local>host|tcp":64,"local>host|ssh":64}}"#;
+    write(&t.path("tuning.json"), cache);
+    for route in ["local", "tcp", "ssh"] {
+        for limit in [1, 3] {
+            let label = format!("{route}-{limit}");
+            let events = t.path(&format!("events-{label}"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command.args([
+                "cp",
+                "--no-progress",
+                "--stats",
+                "-vv",
+                "--resource-limits",
+                &format!("workers={limit},bandwidth=16M"),
+            ]);
+            command.arg(t.s("source"));
+            if route != "local" {
+                command.args([
+                    "--to",
+                    "host",
+                    "--rsh",
+                    rsh.to_str().unwrap(),
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--tcp-ports",
+                    EPHEMERAL_TCP_PORTS,
+                ]);
+                if route == "ssh" {
+                    command.arg("--no-tcp");
+                } else {
+                    command.env("SYQ_TEST_REQUIRE_TCP", "1");
+                }
+            }
+            command
+                .args(["--as", &t.s(&label)])
+                .env("SYQ_TEST_WORKER_EVENTS", &events)
+                .env("SYQ_TEST_TUNE_SAMPLE_MS", "20")
+                .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+                .env("XDG_CONFIG_HOME", t.path("config"))
+                .env("XDG_CACHE_HOME", t.path("cache"));
+            let out = command.run().unwrap();
+            assert_output_ok(&out);
+            assert!(stderr_of(&out).contains("auto-tuned"), "{out:?}");
+            assert_eq!(read(&t.path(&label)), data);
+            let observed = fs::read_to_string(&events).unwrap();
+            let connected: Vec<_> = observed
+                .lines()
+                .filter(|line| line.starts_with("connected "))
+                .collect();
+            assert!(!connected.is_empty(), "{label}: {observed}");
+            for line in connected {
+                let id: usize = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+                assert!(id < limit, "{label}: {observed}");
+            }
+            assert_eq!(read(&t.path("tuning.json")), cache);
+        }
+    }
+}
+
 #[test]
 fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
     let t = Tmp::new();
@@ -14426,7 +14497,8 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "--inplace",
             "--prune",
             "--max-delete=1",
-            "--performance-tuning=workers=2",
+            "--resource-limits=workers=2",
+            "--performance-tuning=request-size=1M",
             "--into-existing",
             &t.s("dst"),
             "-q",
@@ -14458,7 +14530,8 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
         "--inplace",
         "--prune",
         "--max-delete=1",
-        "--performance-tuning=workers=2",
+        "--resource-limits=workers=2",
+        "--performance-tuning=request-size=1048576",
     ] {
         assert!(
             log.contains(option),

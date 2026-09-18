@@ -237,7 +237,7 @@ pub struct Args {
     pub performance_tuning: Vec<String>,
     #[arg(skip)]
     pub tuning_options: Option<crate::transfer_tuning::TransferTuning>,
-    /// Limit aggregate logical file-data bandwidth
+    /// Limit bandwidth and automatically chosen copy concurrency
     #[arg(
         long = "resource-limits",
         long_help = crate::advanced::RESOURCE_HELP,
@@ -664,6 +664,11 @@ impl Args {
             self.connections_opt = tuning.workers;
         }
         if let Some(limits) = &self.resource_limits {
+            limits.validate(
+                self.tuning_options.unwrap_or_default(),
+                self.s3.is_some(),
+                self.rm,
+            )?;
             if limits.bandwidth.is_some() && self.bwlimit.is_some() {
                 bail!("--bwlimit conflicts with --resource-limits bandwidth");
             }
@@ -691,6 +696,14 @@ impl Args {
         self.connections_default = self.connections_opt.is_none();
         self.connections = self.connections_opt.unwrap_or(8);
         Ok(())
+    }
+
+    pub fn automatic_worker_limit(&self) -> usize {
+        self.resource_limits
+            .as_ref()
+            .and_then(|limits| limits.workers)
+            .unwrap_or(crate::tune::MAX)
+            .min(crate::tune::MAX)
     }
 
     pub fn meta_flags(&self) -> u8 {
@@ -1057,7 +1070,7 @@ struct NativeCopyOperationalArgs {
     /// Disable transport compression
     #[arg(long)]
     no_compress: bool,
-    /// Limit aggregate logical file-data bandwidth
+    /// Limit bandwidth and automatically chosen copy concurrency
     #[arg(
         long = "resource-limits",
         long_help = crate::advanced::RESOURCE_HELP,
@@ -3016,6 +3029,61 @@ mod tests {
                 assert!(message.contains(reason), "{message}");
             }
         }
+    }
+
+    #[test]
+    fn resource_limits_keep_automatic_workers_and_reject_conflicts() {
+        let args = parse_native_copy(
+            &["source", "--as", "target", "--resource-limits=workers=3"].map(OsString::from),
+        )
+        .unwrap();
+        assert!(args.connections_default);
+        assert_eq!(args.automatic_worker_limit(), 3);
+        for extra in [
+            "--performance-tuning=workers=3",
+            "--resource-limits=workers=2",
+            "--resource-limits=s3-max-concurrent-objects=2",
+        ] {
+            assert!(parse_native_copy(
+                &[
+                    "source",
+                    "--as",
+                    "target",
+                    "--resource-limits=workers=3",
+                    extra
+                ]
+                .map(OsString::from)
+            )
+            .is_err());
+        }
+        for key in [
+            "s3-max-concurrent-requests",
+            "s3-max-concurrent-objects",
+            "s3-max-concurrent-parts-per-object",
+        ] {
+            let limit = format!("--resource-limits={key}=3");
+            let fixed = format!("--performance-tuning={key}=3");
+            let mut flags = vec!["source", "--to", "s3://bucket", "--as", "object", &limit];
+            assert!(
+                parse_native_copy(&flags.iter().map(OsString::from).collect::<Vec<_>>()).is_ok()
+            );
+            flags.push(&fixed);
+            assert!(
+                parse_native_copy(&flags.iter().map(OsString::from).collect::<Vec<_>>()).is_err()
+            );
+        }
+        assert!(parse_native_copy(
+            &[
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+                "--resource-limits=workers=3"
+            ]
+            .map(OsString::from)
+        )
+        .is_err());
     }
 
     #[test]

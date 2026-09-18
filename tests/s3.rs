@@ -1726,26 +1726,24 @@ fn s3_fast_queued_ranges_preserve_bytes_and_fail_without_publication() {
 #[test]
 fn s3_one_request_slot_supports_multipart_and_content_verification() {
     let server = Server::start("ok");
-    let temp = tempfile::tempdir().unwrap();
-    for extra in [None, Some("--verify-only")] {
-        let mut args = vec![
-            "--from",
-            "s3://bucket",
-            "data",
-            "--as",
-            "result",
-            "--performance-tuning=s3-max-concurrent-requests=1",
-        ];
-        if let Some(flag) = extra {
-            args.push(flag);
+    for control in [
+        "--performance-tuning=s3-max-concurrent-requests=1",
+        "--resource-limits=s3-max-concurrent-requests=1,s3-max-concurrent-objects=1",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        for extra in [None, Some("--verify-only")] {
+            let mut args = vec!["--from", "s3://bucket", "data", "--as", "result", control];
+            if let Some(flag) = extra {
+                args.push(flag);
+            }
+            let output = server.cp(temp.path(), &args);
+            assert!(output.status.success(), "{}", output_text(&output));
         }
-        let output = server.cp(temp.path(), &args);
-        assert!(output.status.success(), "{}", output_text(&output));
+        assert_eq!(
+            std::fs::metadata(temp.path().join("result")).unwrap().len(),
+            SIZE as u64
+        );
     }
-    assert_eq!(
-        std::fs::metadata(temp.path().join("result")).unwrap().len(),
-        SIZE as u64
-    );
 }
 
 #[test]

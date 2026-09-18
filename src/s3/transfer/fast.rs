@@ -29,6 +29,12 @@ impl Engine {
                 self.part_size(largest)
             };
         let fixed_workers = self.args.tuning_options.and_then(|t| t.s3_object_workers);
+        let object_limit = self
+            .args
+            .resource_limits
+            .as_ref()
+            .and_then(|limits| limits.s3_object_workers)
+            .unwrap_or(usize::MAX);
         let ramp_whole_objects = single_request && !tiny && fixed_workers.is_none();
         let small_upload = self.options.route == Route::Upload && largest <= 1024 * 1024;
         let capacity = if small_upload {
@@ -59,7 +65,8 @@ impl Engine {
             workers.min(capacity)
         } else {
             workers
-        };
+        }
+        .min(object_limit);
         // Object size and control latency do not establish available bandwidth.
         // Start whole-object batches conservatively and measure before growing;
         // preparation follows the same request budget.
@@ -97,7 +104,7 @@ impl Engine {
             } else {
                 256
             };
-            let maximum = capacity.min(count as usize);
+            let maximum = capacity.min(count as usize).min(object_limit);
             Some(maximum)
         } else {
             None
@@ -134,7 +141,7 @@ impl Engine {
         seed.max(size.div_ceil(10_000).next_multiple_of(1024 * 1024))
     }
     pub(super) fn part_workers(&self) -> usize {
-        if !self.options.automatic_concurrency {
+        let workers = if !self.options.automatic_concurrency {
             self.options.concurrency
         } else {
             match self.options.route {
@@ -145,7 +152,14 @@ impl Engine {
                 Route::Download if self.tuning.tigris() => 8,
                 Route::Upload | Route::Download => 64,
             }
-        }
+        };
+        workers.min(
+            self.args
+                .resource_limits
+                .as_ref()
+                .and_then(|limits| limits.s3_part_workers)
+                .unwrap_or(usize::MAX),
+        )
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn download_fast_range(
@@ -433,6 +447,42 @@ impl AsRef<[u8]> for UploadBuffer {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    #[test]
+    fn resource_ceilings_bound_initial_and_adaptive_s3_concurrency() {
+        for route in [
+            Route::Upload,
+            Route::Download,
+            Route::ServerCopy {
+                source_bucket: "source".into(),
+            },
+        ] {
+            for size in [1024, 8 << 20, 32u64 << 30] {
+                let mut engine = planning_engine(&["--resource-limits", "s3-max-concurrent-objects=3,s3-max-concurrent-requests=2,s3-max-concurrent-parts-per-object=1"]);
+                engine.options.route = route.clone();
+                engine.tuning.observe_control(Duration::from_millis(100));
+                let workers = engine
+                    .object_workers(std::iter::repeat_n(size, 1024))
+                    .unwrap();
+                assert!((1..=3).contains(&workers.initial));
+                assert!(workers.maximum.is_none_or(|n| n <= 3));
+                assert_eq!(engine.part_workers(), 1);
+                assert!(engine.tuning.request_limit() <= 2);
+                if let Some(maximum) = workers.maximum {
+                    engine.tuning.requests.finish_objects(maximum);
+                    assert!(engine.tuning.request_limit() <= 2);
+                }
+            }
+        }
+        let fixed = planning_engine(&["--performance-tuning", "s3-max-concurrent-objects=7,s3-max-concurrent-requests=6,s3-max-concurrent-parts-per-object=5"]);
+        let workers = fixed
+            .object_workers(std::iter::repeat_n(1024, 1024))
+            .unwrap();
+        assert_eq!(workers.initial, 7);
+        assert!(workers.maximum.is_none());
+        assert_eq!(fixed.tuning.request_limit(), 6);
+        assert_eq!(fixed.part_workers(), 5);
+    }
 
     #[test]
     fn server_copy_threshold_tracks_single_request_scheduling() {
