@@ -52,7 +52,7 @@ if HEAP_PROBE:
 subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
                 '-keyout', str(CERT / 'private.key'), '-out', str(CERT / 'public.crt'),
                 '-days', '1', '-subj', '/CN=localhost', '-addext', 'basicConstraints=critical,CA:FALSE',
-                '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost'],
+                '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost,DNS:s3-spike.test'],
                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 os.environ.update(AWS_ACCESS_KEY_ID='syq-test-user', AWS_SECRET_ACCESS_KEY='syq-test-password',
                   AWS_REGION='us-east-1', AWS_EC2_METADATA_DISABLED='true', SYQ_TEST_BUCKET='transport-stress')
@@ -83,13 +83,13 @@ def presign(key):
         'X-Amz-Date': stamp, 'X-Amz-Expires': '21600', 'X-Amz-SignedHeaders': 'host'
     }.items()), quote_via=urllib.parse.quote)
     canonical = '\n'.join(['GET', path, query,
-                           'host:' + urllib.parse.urlsplit(endpoint).netloc + '\n',
+                           'host:' + urllib.parse.urlsplit(download_endpoint).netloc + '\n',
                            'host', 'UNSIGNED-PAYLOAD'])
     signed = '\n'.join(['AWS4-HMAC-SHA256', stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
     secret = b'AWS4syq-test-password'
     for item in [day, 'us-east-1', 's3', 'aws4_request']:
         secret = hmac.new(secret, item.encode(), hashlib.sha256).digest()
-    return endpoint + path + '?' + query + '&X-Amz-Signature=' + hmac.new(secret, signed.encode(), hashlib.sha256).hexdigest()
+    return download_endpoint + path + '?' + query + '&X-Amz-Signature=' + hmac.new(secret, signed.encode(), hashlib.sha256).hexdigest()
 
 def remove_container(cid):
     command(['docker', 'rm', '-f', cid])
@@ -160,7 +160,9 @@ def run(case, mode, repeats, label):
     out = D / (tag + '-output')
     out.mkdir()
     memory = case.get('memory', '1g')
-    args = ['docker', 'create', '--network', 'host', '--cpuset-cpus', case['cpus'],
+    args = ['docker', 'create', '--network', 'host',
+            *(['--add-host', 's3-spike.test:' + server_ip] if NETEM_MS else []),
+            '--cpuset-cpus', case['cpus'],
             '--memory', memory, '--memory-swap', memory, '--pids-limit', '512',
             '-v', str(STAGE) + ':/bench:ro', '-v', str(out) + ':/output:rw',
             '-e', 'SYQ_SPIKE_READERS_PER_WRITER=' + str(case.get('readers', 1)),
@@ -270,6 +272,11 @@ try:
     port = command(['docker', 'inspect', '--format',
                     '{{(index (index .NetworkSettings.Ports "9000/tcp") 0).HostPort}}', server])
     endpoint = ('http' if PLAIN_HTTP else 'https') + '://127.0.0.1:' + port
+    server_ip = command(['docker', 'inspect', '--format',
+                         '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', server])
+    # Fixture setup may use the published port, but measured delayed TCP must
+    # bypass Docker's userland proxy, which would split it into two connections.
+    download_endpoint = ('http' if PLAIN_HTTP else 'https') + '://s3-spike.test:9000' if NETEM_MS else endpoint
     os.environ['AWS_ENDPOINT_URL_S3'] = endpoint
     deadline = time.monotonic() + 60
     while True:

@@ -2,6 +2,8 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <malloc.h>
+#include <netinet/tcp.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -14,21 +16,29 @@ static int (*real_connect)(int, const struct sockaddr *, socklen_t);
 static int receive_bytes;
 static _Atomic unsigned connections;
 static _Atomic int observed_receive_bytes;
+static _Atomic int last_socket = -1;
 
 static void *sample_heap(void *unused) {
     (void)unused;
     FILE *out = fopen("/output/.allocator.csv", "w");
     if (!out) _exit(110);
-    fprintf(out, "seconds,arena,uordblks,fordblks,hblkhd,connections,initial_rcvbuf\n");
+    fprintf(out, "seconds,arena,uordblks,fordblks,hblkhd,connections,initial_rcvbuf,rtt_us,current_rcvbuf\n");
     struct timespec start, now, interval = {.tv_nsec = 100000000};
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int i = 0; i < 6000; ++i) {
         struct mallinfo2 m = mallinfo2();
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed = now.tv_sec - start.tv_sec + (now.tv_nsec - start.tv_nsec) / 1e9;
-        fprintf(out, "%.6f,%zu,%zu,%zu,%zu,%u,%d\n", elapsed,
+        struct tcp_info info = {0};
+        socklen_t info_size = sizeof(info);
+        int fd = atomic_load(&last_socket), current_receive = 0;
+        socklen_t receive_size = sizeof(current_receive);
+        if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &info_size)) info.tcpi_rtt = 0;
+        if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &current_receive, &receive_size)) current_receive = 0;
+        fprintf(out, "%.6f,%zu,%zu,%zu,%zu,%u,%d,%u,%d\n", elapsed,
                 m.arena, m.uordblks, m.fordblks, m.hblkhd,
-                atomic_load(&connections), atomic_load(&observed_receive_bytes));
+                atomic_load(&connections), atomic_load(&observed_receive_bytes),
+                info.tcpi_rtt, current_receive);
         fflush(out);
         nanosleep(&interval, NULL);
     }
@@ -58,6 +68,7 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {
         if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual, &size)) _exit(114);
         atomic_store(&observed_receive_bytes, actual);
         atomic_fetch_add(&connections, 1);
+        atomic_store(&last_socket, fd);
     }
     return real_connect(fd, address, length);
 }
