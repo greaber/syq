@@ -103,11 +103,6 @@ def render(command, parsed, commands):
         if not command:
             out.append("| [`help`](#syq-help) | Show help for any command or nested command |")
         out.append("")
-    if command == ("cp",):
-        order = ["Sources and selection", "Destination placement", "Copy policy and filtering",
-                 "Integrity checking", "Performance tuning", "Resource limits", "SSH and transport",
-                 "Remote-to-remote transfers", "Progress and results", "Preview and output", "Help and version"]
-        groups = sorted(groups, key=lambda group: order.index(group[0]) if group[0] in order else len(order))
     for heading, rows in groups:
         if not rows:
             continue
@@ -117,6 +112,19 @@ def render(command, parsed, commands):
         if len(command) == 1 and children and heading == "Help and version":
             heading = "Help (also available on subcommands)"
         title = f"## {heading}" if len(command) == 1 and not children and not command[0].startswith("--") else f"**{heading}**"
+        if command == ("cp",):
+            # Preserve links to the previously published section headings.
+            aliases = {
+                "Sources and filtering": ["sources-and-selection"],
+                "Destination and mapping": ["destination-placement"],
+                "Updates and deletion": ["copy-policy-and-filtering"],
+                "Verification": ["integrity-checking"],
+                "Connections and remote execution": ["ssh-and-transport", "remote-to-remote-transfers"],
+                "Performance and resource limits": ["performance-tuning", "resource-limits"],
+                "Preview, progress, and results": ["progress-and-results", "preview-and-output"],
+            }
+            for old in aliases.get(heading, []):
+                out += [f'<a id="{old}"></a>', ""]
         out += [title, "", "| Argument / option | Meaning |", "|---|---|"]
         for signature, description in rows:
             body = prose(description)

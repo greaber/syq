@@ -281,7 +281,11 @@ fn everyday_copy_controls_stay_visible_but_performance_overrides_do_not() {
             assert!(!short.contains(option), "{command}: {short}");
             assert!(full.contains(option), "{command}: {full}");
         }
-        assert!(full.contains("Performance tuning"));
+        assert!(full.contains(if command == "cp" {
+            "Performance and resource limits"
+        } else {
+            "Performance tuning"
+        }));
         assert!(full.contains("Normal copies tune automatically"));
     }
     let short = help(&["cp", "--help"]);
