@@ -24,7 +24,9 @@ QUEUE_SWEEP = os.environ.get('SYQ_STRESS_QUEUES')
 QUEUES = [int(q) for q in QUEUE_SWEEP.split(',')] if QUEUE_SWEEP else []
 D = ROOT / ('target/transport-stress-http-v2' if PLAIN_HTTP else 'target/transport-stress-v2')
 if QUEUE_SWEEP:
-    D = ROOT / 'target/transport-queue-sweep-v1'
+    run_name = os.environ.get('SYQ_STRESS_RUN', 'transport-queue-sweep-v1')
+    assert Path(run_name).name == run_name
+    D = ROOT / 'target' / run_name
 D.mkdir(exist_ok=True)
 STAGE = D / 'stage'
 STAGE.mkdir(exist_ok=True)
@@ -98,6 +100,8 @@ def run(case, mode, repeats, label):
     args = ['docker', 'create', '--network', 'host', '--cpuset-cpus', case['cpus'],
             '--memory', memory, '--memory-swap', memory, '--pids-limit', '512',
             '-v', str(STAGE) + ':/bench:ro', '-v', str(out) + ':/output:rw',
+            *(['--cpus', str(case['cpu_quota'])] if 'cpu_quota' in case else []),
+            *(['--device-write-bps', case['write_bps']] if 'write_bps' in case else []),
             *(['-e', 'SYQ_SPIKE_QUEUE=' + mode.removeprefix('queue-')] if QUEUE_SWEEP else []),
             IMAGE, '/bench/client', 'async' if QUEUE_SWEEP else mode, '/bench/' + case['fixture'] + '.json',
             str(case['concurrency']), '/output', '/bench/cert/public.crt', 'auto', str(repeats)]
@@ -212,19 +216,32 @@ try:
     if QUEUE_SWEEP:
         cases.append({'name': 'writeback-roomy', 'fixture': 'large', 'cpus': '0-7',
                       'concurrency': 64, 'memory': '4g'})
+        cases.extend([
+            {'name': 'many-cores', 'fixture': 'large', 'cpus': '0-7,16-39',
+             'concurrency': 64, 'memory': '4g'},
+            {'name': 'cpu-quota', 'fixture': 'large', 'cpus': '0-7',
+             'concurrency': 64, 'memory': '4g', 'cpu_quota': 2},
+            {'name': 'disk-limited', 'fixture': 'large', 'cpus': '0-7',
+             'concurrency': 64, 'memory': '4g', 'write_bps': '/dev/md2:1gb'},
+        ])
         requested = os.environ.get('SYQ_STRESS_CASES', 'writeback-pressure').split(',')
-        cases = [case for case in cases if case['name'] in requested]
-        assert len(cases) == len(requested), requested
+        indexed = {case['name']: case for case in cases}
+        cases = [dict(indexed[name], protocol='http' if PLAIN_HTTP else 'https') for name in requested]
     for case in cases:
         if QUEUE_SWEEP:
             # Same sustained workloads as the previous experiment; never pilot-sized.
             repeats = {'writeback-pressure': 53, 'writeback-roomy': 64,
                        'single-stream': 32, 'two-core-fanout': 46,
-                       'small-file-fanout': 400}[case['name']]
-            for rep in range(2):
+                       'small-file-fanout': 400, 'many-cores': 64,
+                       'cpu-quota': 32, 'disk-limited': 64}[case['name']]
+            repeats = int(os.environ.get('SYQ_STRESS_REPEATS', repeats))
+            rounds = int(os.environ.get('SYQ_STRESS_ROUNDS', 2))
+            label = os.environ.get('SYQ_STRESS_LABEL', 'measured')
+            minimum = float(os.environ.get('SYQ_STRESS_MIN_SECONDS', 30))
+            for rep in range(rounds):
                 for queue in (QUEUES if rep == 0 else list(reversed(QUEUES))):
-                    row = run(case, f'queue-{queue}', repeats, f'measured-{rep}')
-                    assert row.get('status') == 'oom' or row['elapsed'] >= 30, 'measured trial too short'
+                    row = run(case, f'queue-{queue}', repeats, f'{label}-{rep}')
+                    assert row.get('status') == 'oom' or row['elapsed'] >= minimum, 'trial too short for selected phase'
             continue
         unit = fixtures[case['fixture']]['count'] * fixtures[case['fixture']]['size']
         pilot_bytes = 8 * 1024**3 if case['fixture'] == 'large' else 512 * 1024**2
