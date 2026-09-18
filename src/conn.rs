@@ -2590,9 +2590,7 @@ impl RemoteSpec {
                             )
                         })
                     }
-                    Err(e) => {
-                        last = anyhow!("{}: {e}", crate::transfer::data_address(addr, info.port))
-                    }
+                    Err(e) => last = anyhow!("{}: {e}", data_address(addr, info.port)),
                 }
             }
             let stream = match got {
@@ -3620,6 +3618,30 @@ impl Endpoint {
                 )?))
             }
         }
+    }
+}
+
+pub(crate) fn parse_ports(s: &str) -> Result<(u16, u16)> {
+    let (a, b) = s.split_once('-').unwrap_or((s, s));
+    let lo: u16 = a
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
+    let hi: u16 = b
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
+    if hi < lo {
+        bail!("bad port range {s:?}");
+    }
+    Ok((lo, hi))
+}
+
+pub(crate) fn data_address(address: &str, port: u16) -> String {
+    if address.contains(':') {
+        format!("[{address}]:{port}")
+    } else {
+        format!("{address}:{port}")
     }
 }
 

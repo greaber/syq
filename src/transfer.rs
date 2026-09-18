@@ -6,13 +6,12 @@ use crate::cli::{
     Location, Placement, SourceSelection,
 };
 use crate::conn::{
-    endpoint_error, ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec,
-    SshMultiplexer, TcpCandidate, TcpPairStats,
+    data_address, endpoint_error, ok, parse_ports, Conn, DataAddressSource, DataTransport,
+    Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate, TcpPairStats,
 };
 #[cfg(test)]
 use crate::fsops::content_digest;
 use crate::fsops::{destination_fraction_matches, is_partial_name, is_recovery_name, join};
-pub(crate) use crate::mapping::validate_manifest_path;
 use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
 use crate::output::debug;
 use crate::progress::{commas, human, Progress};
@@ -339,30 +338,6 @@ fn configure_hashing(connection: &mut dyn Conn, policy: crate::hashing::HashPoli
         "configure hashing",
     )?;
     Ok(())
-}
-
-pub(crate) fn parse_ports(s: &str) -> Result<(u16, u16)> {
-    let (a, b) = s.split_once('-').unwrap_or((s, s));
-    let lo: u16 = a
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
-    let hi: u16 = b
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("bad port range {s:?}"))?;
-    if hi < lo {
-        bail!("bad port range {s:?}");
-    }
-    Ok((lo, hi))
-}
-
-pub(crate) fn data_address(address: &str, port: u16) -> String {
-    if address.contains(':') {
-        format!("[{address}]:{port}")
-    } else {
-        format!("{address}:{port}")
-    }
 }
 
 fn link_speed(speed_mbps: u32) -> String {
