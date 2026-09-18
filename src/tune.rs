@@ -223,7 +223,10 @@ fn read_cache(path: &Path) -> TuningCache {
 }
 
 fn cached_at(path: &Path, key: &str) -> Option<usize> {
-    let _lock = lock_file(path, false).ok()?;
+    // The cache is replaced by rename, so a read without the lock still sees
+    // a complete file. Not being able to create the lock, as on a read-only
+    // home, must not hide a cache that is there.
+    let _lock = lock_file(path, false).ok();
     read_cache(path)
         .paths
         .get(key)
@@ -1400,6 +1403,25 @@ mod tests {
         assert_eq!(cached_at(&path, "a>b|tcp"), None);
         remember_at(&path, "a>b|tcp", 7).unwrap();
         assert_eq!(cached_at(&path, "a>b|tcp"), Some(7));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cache_is_read_when_its_lock_cannot_be_created() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores directory permissions
+        }
+        let dir = temporary_cache("readonly");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tuning.json");
+        remember_at(&path, "a>b|tcp", 9).unwrap();
+        std::fs::remove_file(path.with_extension("json.lock")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let cached = cached_at(&path, "a>b|tcp");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(cached, Some(9));
+        assert!(!path.with_extension("json.lock").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

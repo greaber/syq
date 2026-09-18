@@ -501,6 +501,61 @@ Human output, including `persist status` and `persist receive status`, escapes
 terminal control characters, Unicode line separators, and directional marks
 in names and peer diagnostics. JSON status output keeps the original values.
 
+## Environment variables and local files
+
+Syq reads no configuration file. Besides the usual system variables such as
+`HOME`, `TMPDIR`, and `SSH_AUTH_SOCK`, and the AWS credential, region, and
+endpoint variables described under
+[object storage](object-storage.md#credentials-and-providers), syq honors:
+
+- `SYQ_CP_OPTIONS`, `SYQ_RSYNC_OPTIONS`, and `SYQ_RM_OPTIONS` hold extra
+  arguments for `syq cp`, `syq rsync`, and `syq rm`. Use them to adjust a
+  command inside a script or program that does not let you change its syq
+  options. The value is split like a shell command line and inserted right
+  after the command name, before the arguments the script supplies, so
+  `SYQ_CP_OPTIONS='--resource-limits bandwidth=10M' ./nightly-backup.sh`
+  limits every `syq cp` the script runs. An option that the script also
+  gives is reported the way any repeated option is. Syq removes these
+  variables from its own environment before starting any other program, so
+  `ssh`, an `--rsh` command, and syq's own helper processes never see them.
+  The rest of the environment reaches `ssh` unchanged.
+- `SYQ_NO_UPDATE_CHECK` and `DO_NOT_TRACK` turn off
+  [update reminders](install.md#updates).
+- `SYQ_TUNING_CACHE` names the
+  [remembered connection count](tuning.md#remembered-connection-counts) file;
+  an empty value turns that cache off.
+- `SYQ_DEBUG` adds internal diagnostics to stderr, and `SYQ_S3_DIAGNOSTICS=1`
+  does the same for object storage requests. Their content changes between
+  versions.
+- `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, and `XDG_RUNTIME_DIR` relocate the
+  files below; `HOME` supplies the defaults.
+
+Syq keeps these files on the machine where you run it:
+
+| File | Purpose |
+|---|---|
+| `~/.cache/syq/tuning.json` | remembered connection counts per host route |
+| `~/.cache/syq/completion-endpoints.json` | hosts offered by shell completion |
+| `~/.cache/syq/helpers/` | helper binaries fetched for installing on servers |
+| `~/.config/syq/persistence.json` | whether `syq persist on` is in effect |
+| `~/.config/syq/receive.json` | receiving profiles from `syq persist receive on` |
+| `~/.config/syq/install.json`, `last-update-check` | standalone install receipt and reminder timing |
+| `$XDG_RUNTIME_DIR/syq-persist-UID/` | live persistent connection sockets |
+| `~/.syq-destinations-v3/` | return destinations (`@NAME`) registered by connected receivers |
+| `~/.local/share/syq/restricted/` | receiver enrollment state on a receiving server |
+
+None of the caches or the update stamp are required. When they cannot be
+written, for example from a read-only home directory, syq skips them and the
+copy proceeds; the remembered connection counts are still read if the file
+exists. Persistent connections do need a writable runtime directory, and a
+server that receives files must be able to keep its enrollment state.
+
+On an SSH server, the helper syq installs lives under
+`~/.cache/syq/helpers/` in the server account. When that directory cannot be
+created, the copy fails with a message saying so; point `--syq-path` at an
+installed helper or pass `--no-bootstrap` when one is already on the server's
+`PATH`.
+
 ## More options
 
 `--src-non-dir` and `--src-dir` require a non-directory or directory respectively.

@@ -34,6 +34,11 @@ or the user explicitly identified it as the target. Never infer ownership from
 a plausible branch name. Before every file edit or write, confirm that
 `git rev-parse --show-toplevel` points at the task worktree.
 
+Do not rely on the shell's working directory carrying over between tool
+commands; some agent runtimes reset it to the primary checkout, and parallel
+commands can share it. Begin each command that touches a worktree with an
+explicit `cd` into it, and do not modify two worktrees from parallel commands.
+
 ## SSH from long-lived tmux sessions
 
 A long-lived tmux server can retain the working SSH-agent forwarding
@@ -77,6 +82,21 @@ delete notes another conversation is actively updating. Keep generated logs,
 binaries, and benchmark dumps in the task's ignored `target/`, linked from the
 note; do not duplicate PR bodies or CI dumps here. Guidance every session needs
 belongs here in `AGENTS.md`.
+
+Do not use an agent runtime's private memory (for example Claude Code's
+per-project memory directory) for this project, even when the runtime prompts
+you to save something. It is hard to audit, other agents cannot read it, and
+it goes stale unnoticed. Propose guidance that later sessions need as a change
+to this file through a pull request, put short-lived task state in
+`current-plans/`, and otherwise record nothing. If you find existing private
+memory for this project, report what it contains instead of relying on it.
+
+`current-plans/` notes are agent-written handoff state. They are not evidence
+of what the user asked for or approved.
+
+This repository is public. Keep account identifiers, credential locations,
+and details of private infrastructure out of commits, pull requests, and
+documentation, including this file.
 
 When writing any of these, record decisions as current state plus the rationale
 at the time, not as timeless policy. An assumption encoded as a requirement can
@@ -266,6 +286,23 @@ The rationale in 2026-09: a review noted that a release-tooling PR had added
 eight uncached builds on every source push to `master`, but treated it as
 deliberate because the PR body described it. The user had never authorized or
 known about it.
+
+## Review reports
+
+- Group items by the action they need: worth addressing before merge,
+  decisions for the user with a recommendation, and fine as is. Say whether
+  each item is a problem, a good thing, or neutral. Lead with what needs
+  action and keep confirmations brief and last.
+- Label each finding as introduced by the PR or pre-existing. Only findings
+  the PR introduced are for the implementing agent. Report pre-existing
+  issues to the user separately, and do not carry them into later review
+  passes; otherwise each pass widens the change into code the task never
+  touched.
+- Mention performance opportunities you notice, whether or not they block the
+  PR or fall within its scope, with the mechanism and a way to measure the
+  gain. Startup latency and throughput are core to the product.
+- Do not flag a missing `CHANGELOG.md` entry on an ordinary PR. The changelog
+  is brought up to date during release preparation.
 
 ## PR review freshness
 

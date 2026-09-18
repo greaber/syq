@@ -214,7 +214,10 @@ in `$XDG_CACHE_HOME/syq/s3`, or `~/.cache/syq/s3`. Download partials live beside
 the destination. Syq checks their identity and rehashes saved ranges before
 reuse. Single-request downloads restart and discard their temporary file on
 failure or cancellation. Existing destination files remain visible until a
-replacement has passed the requested checks.
+replacement has passed the requested checks. Recovery handles interrupted
+processes and connections; it does not guarantee recovery after a machine crash.
+If a crash damages a recovery record, syq names the file in its error; remove
+it to restart that object.
 
 Incomplete multipart uploads remain at the provider for recovery. If you
 abandon one, abort it using your provider's tools; a bucket lifecycle rule can

@@ -160,10 +160,19 @@ impl HttpConnector for Connector {
                         .method(request.method())
                         .uri(request.uri());
                     *builder.headers_mut().expect("valid request") = request.headers().clone();
-                    let response = agent.run(
-                        builder
-                            .body(ureq::SendBody::from_owned_reader(source.take(file.length)))?,
-                    )?;
+                    let observed = request
+                        .extensions()
+                        .get::<super::diagnostics::UploadProgress>()
+                        .cloned();
+                    let body = if let Some(observed) = observed {
+                        ureq::SendBody::from_owned_reader(ObservedReader {
+                            reader: source.take(file.length),
+                            observed,
+                        })
+                    } else {
+                        ureq::SendBody::from_owned_reader(source.take(file.length))
+                    };
+                    let response = agent.run(builder.body(body)?)?;
                     file.source.check(&check)?;
                     let (parts, mut body) = response.into_parts();
                     let mut bytes = Vec::new();
@@ -223,4 +232,16 @@ impl http_body::Body for FileBodyMarker {
 }
 pub(super) fn body(length: u64) -> aws_sdk_s3::primitives::ByteStream {
     aws_sdk_s3::primitives::ByteStream::new(SdkBody::from_body_1_x(FileBodyMarker(length)))
+}
+
+struct ObservedReader<R> {
+    reader: R,
+    observed: super::diagnostics::UploadProgress,
+}
+impl<R: Read> Read for ObservedReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.reader.read(output)?;
+        self.observed.handed(n);
+        Ok(n)
+    }
 }
