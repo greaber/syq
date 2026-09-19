@@ -15,7 +15,7 @@ This page describes stream semantics. The
 [JSON Schema](https://github.com/greaber/syq/blob/master/schemas/automation.schema.json)
 lists precise field shapes;
 [example streams](https://github.com/greaber/syq/tree/master/tests/fixtures/automation)
-show complete runs. Mapping manifests are a [different format](mappings.md#the-format).
+show complete runs. For mapping manifests, see [Mapping format](commands/map.md#mapping-format).
 
 ## The channel
 
@@ -56,8 +56,9 @@ can leave it missing.
 
 - Check the terminal record and process exit code; a mismatch is a protocol
   error. Use terminal totals, not progress or a count of operation records.
-- Build [mapping retries](mappings.md#machine-readable-results) only after
-  terminal `success` or `partial`. Other statuses can leave entries unresolved.
+- Retry individual mapping entries only after terminal `success` or `partial`;
+  see [Retry failed mapping entries](#retry-failed-mapping-entries). Other
+  statuses can leave entries unresolved.
 - Ignore unknown record types and optional fields within a supported schema
   version.
 - Reject unknown `schema`, `schema_version`, terminal `status`, or path
@@ -414,6 +415,6 @@ succeed; fix the underlying error first. Unchanged and excluded files appear
 only in summary totals, not as individual results.
 
 For command-restricted copies between servers, `--results` contains verified
-[receiver receipts](remote-reference.md#signed-results). These describe
+receiver receipts; see [Signed results](remote-reference.md#signed-results). These describe
 destination changes rather than source entry failures; retry the original
 mapping instead of applying the `operation_result` filter above.

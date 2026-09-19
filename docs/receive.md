@@ -4,18 +4,8 @@ Inspect files on your server, then copy them to your laptop from the same shell.
 The laptop opens and maintains the connection. It needs no SSH server, public
 address, or incoming network port.
 
-With syq installed on both machines, connect from your laptop:
-
-```sh
-syq persist connect server
-```
-
-This keeps a connection open so the server can send files back to your laptop.
-Once the command finishes, you can close the terminal and continue working on
-the server. By default, your laptop is available under its short hostname, and
-received files go into your home directory.
-
-To give it the name `laptop` and choose a different starting directory:
+With syq installed on both machines, run these commands on your laptop to
+receive files as `@laptop` in `~/Downloads/server`:
 
 ```sh
 mkdir -p ~/Downloads/server
@@ -23,7 +13,8 @@ syq persist receive on --name laptop --cwd ~/Downloads/server
 syq persist connect server
 ```
 
-On the server, use the name from any shell, including an existing tmux session:
+Once `connect` finishes, you can close that terminal. On the server, use the
+name from any shell, including an existing tmux session:
 
 ```sh
 ls -lh results
@@ -31,37 +22,12 @@ syq cp results --to @laptop
 syq cp report.pdf --to @laptop --as reports/latest.pdf
 ```
 
-Each incoming copy waits for approval **on your laptop** before it can inspect
-or change destination entries. Review the destination and permissions, then
-choose **Allow once** or **Deny**. Use **Details** on macOS or
-`syq persist receive pending` in a local terminal to see the complete request.
-Approving a copy trusts the server to supply its contents.
-
-You can also [run commands on the receiving machine](exec.md), with separate
-local approval, to build a project there or open a copied artifact.
-
-## Multiple receiving profiles
-
-Give a project its own receiving name and directory:
-
-```sh
-syq persist receive on --name project --root ~/work/project
-syq persist connect server
-```
-
-Then run `syq cp results --to @project` on the server. The directory must already
-exist. Each name has its own settings and approval policy, so you can keep a
-project separate from your general `laptop` destination. See
-[Names and profiles](persistence-reference.md#names-and-profiles) when moving
-a name to another laptop.
-
-Use `syq persist receive status` to list profiles and
-`syq persist receive off --name project` to stop one. See
-[Names and profiles](persistence-reference.md#names-and-profiles) for more options.
-
 ## Approving copies
 
-Approve or deny from the desktop prompt, or from a terminal on your laptop:
+Each incoming copy waits for approval **on your laptop**. Review the destination
+and permissions, then choose **Allow once** or **Deny**. To see the complete
+request, use **Details** on macOS or `syq persist receive pending` in a local
+terminal. You can also approve or deny there:
 
 ```sh
 syq persist receive pending
@@ -69,22 +35,9 @@ syq persist receive approve REQUEST_ID
 syq persist receive deny REQUEST_ID
 ```
 
-Requests expire after five minutes. If a prompt is missing or dismissed, the
-request stays pending; it is never approved automatically. To use only terminal
-approval, run `syq persist receive on --notify off`.
-
-For unattended copies from trusted server accounts, explicitly enable automatic
-approval:
-
-```sh
-syq persist receive on --approve always
-syq persist receive on --approve ask   # require approval again
-```
-
-Automatic approval trusts all processes running as the connected server accounts,
-including for overwrites. Commands and copies to another server still require
-separate approval. See [Persistent connections](security.md#persistent-connections)
-for the trust boundary.
+Approving a copy trusts the server to supply its contents. Requests expire after
+five minutes. If a prompt is missing or dismissed, the request stays pending;
+it is never approved automatically. To use only terminal approval, run `syq persist receive on --name laptop --notify off`.
 
 ## Names and paths
 
@@ -110,11 +63,45 @@ take effect. Other profiles keep working.
 See [Directories](persistence-reference.md#directories) if a
 receiving location cannot be opened.
 
+## Multiple receiving profiles
+
+Give a project its own receiving name and directory:
+
+```sh
+syq persist receive on --name project --root ~/work/project
+syq persist connect server
+```
+
+Then run `syq cp results --to @project` on the server. The directory must already
+exist. Each name has its own settings and approval policy, so you can keep a
+project separate from your general `laptop` destination. See
+[Names and profiles](persistence-reference.md#names-and-profiles) when moving
+a name to another laptop.
+
+Use `syq persist receive status` to list profiles and
+`syq persist receive off --name project` to stop one. See
+[Names and profiles](persistence-reference.md#names-and-profiles) for more options.
+
+## Unattended copies
+
+For unattended copies from trusted server accounts, explicitly enable automatic
+approval:
+
+```sh
+syq persist receive on --name laptop --approve always
+syq persist receive on --name laptop --approve ask   # require approval again
+```
+
+Automatic approval trusts all processes running as the connected server accounts,
+including for overwrites. Commands and copies to another server still require
+separate approval. See [Persistent connections](security.md#persistent-connections)
+for the trust boundary.
+
 ## Copy permissions and limits
 
 By default, each copy is limited to 100 GiB and one million entries. Pruning
 requires a positive deletion limit on both machines. Change limits with
-`syq persist receive on --max-bytes SIZE --max-entries N --max-delete N`.
+`syq persist receive on --name laptop --max-bytes SIZE --max-entries N --max-delete N`.
 
 Most copy options work here; ownership and special-file preservation,
 `--inplace`, and `--min-size` are unsupported. See
@@ -135,5 +122,8 @@ An interrupted copy still needs to be rerun so it can resume. After rebooting
 your laptop, run `syq persist connect server` again.
 
 If a connection fails to start, `syq persist receive status` shows the error.
-The [Persistence details](persistence-reference.md) covers troubleshooting,
+[Persistence details](persistence-reference.md) covers troubleshooting,
 upgrading, and using connections in scripts.
+
+To run a build or open a copied report on your laptop, see
+[Run commands on your receiving machine](exec.md). Each command needs its own approval.

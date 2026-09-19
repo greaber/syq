@@ -82,7 +82,7 @@ When size and modification time match, syq validates the existing destination an
 Otherwise it copies and validates the result; a mismatch fails that file. With normal
 staging, validation happens before replacing the destination. With `--inplace`,
 the file has already been modified when validation finishes. For a batch, put a
-digest in each mapping entry; see [The format](mappings.md#the-format). Selection
+digest in each mapping entry; see [Mapping format](commands/map.md#mapping-format). Selection
 filters still apply.
 The expected digest's algorithm can differ from either integrity-checking hash type. Dry runs
 preview changes without validating the expectation.

@@ -1185,8 +1185,8 @@ fn jq(program: &str, args: &[&str], input: &[u8]) -> Output {
     child.wait_with_output().unwrap()
 }
 
-fn run_doc_pipeline(t: &Tmp, program: &str, jq_args: &[&str], src: &str, dst: &str) {
-    assert_documented("mappings.md", jq_args, program);
+fn run_doc_pipeline(t: &Tmp, page: &str, program: &str, jq_args: &[&str], src: &str, dst: &str) {
+    assert_documented(page, jq_args, program);
     let map_out = syq_map_in(&t.path(""), &["--srcs-in", src]);
     assert!(map_out.status.success());
     let jq_out = jq(program, jq_args, &map_out.stdout);
@@ -1212,7 +1212,7 @@ fn mappings_md_lowercase_example_works_verbatim() {
     let t = Tmp::new();
     write(&t.path("src/Berlin/IMG_1234.JPG"), b"img");
     write(&t.path("src/Notes.TXT"), b"hello");
-    run_doc_pipeline(&t, DOC_JQ_LOWERCASE, &["-c"], "src", "pub");
+    run_doc_pipeline(&t, "mappings.md", DOC_JQ_LOWERCASE, &["-c"], "src", "pub");
     assert_eq!(read(&t.path("pub/berlin/img_1234.jpg")), b"img");
     assert_eq!(read(&t.path("pub/notes.txt")), b"hello");
 }
@@ -1226,19 +1226,33 @@ fn mappings_md_date_partition_example_works_verbatim() {
     set_mtime(&t.path("photos/IMG_1234.JPG"), 1721900000); // 2024-07
     set_mtime(&t.path("photos/IMG_8812.JPG"), 1730500000); // 2024-11
     set_mtime(&t.path("photos/clip.mp4"), 1736000000); // 2025-01
-    run_doc_pipeline(&t, DOC_JQ_DATE_PARTITION, &["-c"], "photos", "archive");
+    run_doc_pipeline(
+        &t,
+        "mappings.md",
+        DOC_JQ_DATE_PARTITION,
+        &["-c"],
+        "photos",
+        "archive",
+    );
     assert_eq!(read(&t.path("archive/2024/07/IMG_1234.JPG")), b"july");
     assert_eq!(read(&t.path("archive/2024/11/IMG_8812.JPG")), b"november");
     assert_eq!(read(&t.path("archive/2025/01/clip.mp4")), b"january");
 }
 
 #[test]
-fn mappings_md_min_size_example_works_verbatim() {
+fn map_reference_md_min_size_example_works_verbatim() {
     let t = Tmp::new();
     write(&t.path("data/big.bin"), &vec![7u8; 1048576]);
     write(&t.path("data/small.txt"), b"tiny");
     write(&t.path("data/sub/also-small.txt"), b"tiny");
-    run_doc_pipeline(&t, DOC_JQ_MIN_SIZE, &["-c"], "data", "big");
+    run_doc_pipeline(
+        &t,
+        "commands/map.md",
+        DOC_JQ_MIN_SIZE,
+        &["-c"],
+        "data",
+        "big",
+    );
     assert_eq!(read(&t.path("big/big.bin")).len(), 1048576);
     assert!(!t.path("big/small.txt").exists());
     assert!(
@@ -1313,13 +1327,20 @@ fn automation_md_retry_gate_example_works_verbatim() {
 const DOC_JQ_DROP_SPECIALS: &str = r#"select(.kind != "special")"#;
 
 #[test]
-fn mappings_md_drop_specials_example_works_verbatim() {
+fn map_reference_md_drop_specials_example_works_verbatim() {
     let t = Tmp::new();
     write(&t.path("src/a.txt"), b"ok");
     let fifo = t.path("src/pipe");
     let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
-    run_doc_pipeline(&t, DOC_JQ_DROP_SPECIALS, &["-c"], "src", "dst");
+    run_doc_pipeline(
+        &t,
+        "commands/map.md",
+        DOC_JQ_DROP_SPECIALS,
+        &["-c"],
+        "src",
+        "dst",
+    );
     assert_eq!(read(&t.path("dst/a.txt")), b"ok");
     assert!(!t.path("dst/pipe").exists());
 }

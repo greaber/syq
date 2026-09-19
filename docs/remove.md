@@ -1,7 +1,5 @@
 # Remove files
 
-See [`syq rm`](commands/rm.md) for the option list.
-
 Remove a file or symlink:
 
 ```sh
@@ -21,9 +19,9 @@ Remove a directory's contents recursively, leaving the directory itself:
 syq rm --srcs-in cache
 ```
 
-Add `--dry-run -v` to either command to see what would be removed first.
-Missing paths succeed. Filesystem removal is permanent; completed deletions cannot be
-rolled back.
+Add `--dry-run -v` to preview what would be removed first.
+A missing path is not an error. Filesystem removal is permanent; completed
+deletions cannot be rolled back.
 
 ## On another machine
 
@@ -51,9 +49,8 @@ syq rm --root /srv --src-dir cache --src-dir old-output
 ```
 
 This removes `/srv/cache` and `/srv/old-output`, with selection confined to
-`/srv`. Use `--src-non-dir PATH` or `--src-dir DIR` when the path must be a
-non-directory or directory respectively. All selections are checked before
-deletion begins. Filters are not supported.
+`/srv`. Syq refuses paths or symlinks that lead outside that directory.
+See [Selection rules](commands/rm.md#selection-rules) for the supported selectors.
 
 ## Symlinks
 
@@ -76,3 +73,5 @@ must stay inside that root.
 If some entries cannot be removed, syq reports the errors and continues with
 independent entries. Completed deletions remain in effect. Use
 [automation results](automation.md) for per-path outcomes in scripts.
+
+See [`syq rm`](commands/rm.md) for all options.

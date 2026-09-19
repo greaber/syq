@@ -45,7 +45,9 @@ commands.
 
 If the command is killed by a signal, syq returns `128 + signal`. Setup and
 connection failures return nonzero; losing the exit status is an error.
-Changing receiving settings or losing the connection cancels the command.
-Syq also stops remaining children in its process group when the foreground
-program exits. Detached process sessions can survive this cleanup. Commands
-do not emit copy receipts or copy automation records.
+Interrupting the request, stopping or changing receiving, or losing the
+connection forcibly stops the command's process group. Cleanup handlers do not
+run. Remaining children in that group are also stopped when the foreground
+program exits. Detached processes and applications launched through macOS
+`open` can survive this cleanup. Commands do not emit copy receipts or copy
+automation records.

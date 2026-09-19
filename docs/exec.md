@@ -1,7 +1,5 @@
 # Run commands on your receiving machine
 
-See [`syq exec`](commands/exec.md) for the option list.
-
 From a server shell, ask your Mac or Linux desktop to run a command:
 
 ```sh
@@ -9,7 +7,7 @@ syq exec --on @laptop --cwd work/project -- cargo test
 syq exec --on @laptop --cwd work/project -- open report.html
 ```
 
-The second command uses macOS's `open` program to display an artifact. Replace
+The second command uses macOS's `open` program to open the report. Replace
 it with any program installed on your receiving machine.
 
 If you have already set up [receiving files](receive.md), you can request
@@ -69,25 +67,9 @@ values change. Stdin is closed and there is no interactive terminal.
 Stdout and stderr stream back to your terminal, and syq returns the command's
 exit code. A lost connection is an error; the command is not retried automatically.
 
-Interrupting the request or stopping receiving forcibly stops its process
-group. Cleanup handlers do not run. Detached processes and applications
-launched through macOS `open` can outlive the request. Completed changes to
-files are not rolled back.
+Interrupting the request or stopping receiving stops the command. Completed
+changes to files are not rolled back. See [Execution details](commands/exec.md#execution-details)
+for cancellation behavior and limits.
 
-From Python, use the SDK's raw command interface with the syq executable
-you use for receiving:
-
-```python
-import syq
-
-result = syq.run(
-    ["exec", "--on", "@laptop", "--cwd", "work/project", "--", "cargo", "test"],
-    executable="/path/to/syq",
-    timeout=600,
-)
-print(result.stdout.decode())
-```
-
-This captures output and raises on a nonzero exit. For live terminal output,
-run the CLI directly. See the [Execution details](commands/exec.md#execution-details)
-for execution limits and cancellation details.
+See [`syq exec`](commands/exec.md) for all options, or
+[Guide and examples](python-guide.md) for Python calls.

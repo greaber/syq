@@ -53,7 +53,16 @@ connections need a writable runtime directory. See [Enrollment](remote-reference
 for receiver state and [Names and profiles](persistence-reference.md#names-and-profiles)
 for backing up or replacing a receiving identity.
 
+## SSH helper installation
+
 SSH helpers are installed under `~/.cache/syq/helpers/` on the server too.
 If that directory cannot be created, select an installed helper with
 `--syq-path`, or use `--no-bootstrap` when a matching syq is on the server's
 `PATH`.
+
+When an official release installs a helper, it also tries to install the command
+at `~/.local/bin/syq`. Completion and background connections can trigger this
+step. Failure to install the command does not stop the copy. Reusing a cached
+helper does not repeat the command installation; use the standalone installer
+if the command is missing. Development builds and connections using
+`--syq-path` or `--no-bootstrap` do not install the command.

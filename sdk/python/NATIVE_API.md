@@ -161,11 +161,15 @@ is attempted. S3 can retry buffered multipart parts.
 | `StreamWriter` | `write(bytes)` writes the complete buffer and returns its length; `flush()` has no Python buffer to flush; `close()` ends payload input; `commit()` publishes and checks completion; `abort()` cancels |
 | `StreamReader` | `read(size=-1)`, `readinto(buffer)`; `close()` drains remaining bytes in bounded chunks and checks completion; `abort()` cancels |
 
+Streams use bounded transport buffers. `read()` without a size collects all
+remaining bytes in Python memory and checks completion before returning.
+
 ### Writer completion
 
 Use a `with` block. Successful writer exit sends a separate commit signal
 after closing the payload; EOF alone cannot publish a managed upload. An
 exception in the writer body before commit aborts without replacing the destination.
+Writers support `io.BufferedWriter` and `io.TextIOWrapper`.
 `close()` only ends payload input, so a buffered or text wrapper can close it
 while unwinding an exception without publishing partial data. Successful
 context exit commits even if a wrapper already closed the payload. Calling

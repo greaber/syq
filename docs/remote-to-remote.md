@@ -4,6 +4,8 @@ Copy directly between servers without putting private keys on either server
 or giving one server unrestricted access to your SSH agent. Your machine
 authorizes the copy and shows the results; the file data bypasses it.
 
+## Run the copy from your laptop
+
 ```sh
 # Copy the contents of hostA's big directory into hostB's big directory.
 syq cp --from hostA --srcs-in big --to hostB --into big
@@ -20,33 +22,7 @@ HostA gets permission for this transfer only. HostB checks that permission
 and reports what it changed. See [A compromised source server](security.md#a-compromised-source-server)
 for what this protects against.
 
-## Start a copy from the source server
-
-With a [return connection](receive.md) from your laptop, you can inspect files
-on hostA and send them to hostB from the same shell:
-
-```sh
-# Run on hostA, including in an existing tmux shell.
-syq cp results --to hostB --into /archive --auth-from @laptop
-```
-
-Your laptop asks for approval, then uses its SSH access to hostB to authorize
-this copy. Trust hostB's SSH host key on the laptop beforehand. Relative
-destination paths start in the hostB account's home directory; your laptop's
-receiving root does not contain this copy, but its transfer limits still apply.
-
-Files go directly from hostA to hostB over encrypted TCP. HostB needs a
-reachable data port; see [Make TCP reachable](server-tuning.md#make-tcp-reachable).
-This route cannot use SSH for file data. Keep the laptop connection and source
-command running until completion.
-
-Without `--auth-from`, syq tries an available receiving machine, then hostA's
-own SSH access if none is eligible. Once it requests approval, refusal or
-failure ends the attempt. Use `--auth-from ssh` to choose hostA's SSH access
-explicitly. See [authorization selection](remote-reference.md#authorization-selection)
-for supported options.
-
-## What you need
+### What you need
 
 - SSH access from your machine to both servers, with their host keys already
   trusted. Connect with ordinary SSH once if either server is new to you.
@@ -59,10 +35,9 @@ for supported options.
   SSH directly.
 - An existing parent directory for the destination.
 
-Keep your command running until the copy finishes. Use native `syq cp`;
-`syq rsync` does not accept two remote endpoints.
+Keep your laptop command running until the copy finishes.
 
-## First copy and access management
+### First copy and access management
 
 The first copy sets up a restricted receiver on hostB automatically. It adds
 a restricted key to `authorized_keys`; the private key stays on your machine.
@@ -90,9 +65,31 @@ for upgrades and sharing between installations.
 If your machine reaches hostB through hostA, add `--via hostA` to `enroll` or
 `revoke`.
 
+<a id="start-a-copy-from-the-source-server"></a>
+
+## Run the copy from a server
+
+With a [return connection](receive.md) from your laptop, you can inspect files
+on hostA and send them to hostB from the same shell:
+
+```sh
+# Run on hostA, including in an existing tmux shell.
+syq cp results --to hostB --into /archive --auth-from @laptop
+```
+
+Your laptop asks for approval, then uses its SSH access to hostB to authorize
+this copy. Trust hostB's SSH host key on the laptop beforehand. Relative
+destination paths start in the hostB account's home directory; your laptop's
+receiving root does not contain this copy, but its transfer limits still apply.
+
+Files go directly from hostA to hostB over encrypted TCP. HostB needs a
+reachable data port; see [Make TCP reachable](server-tuning.md#make-tcp-reachable).
+This route cannot use SSH for file data. Keep the laptop connection and source
+command running until completion.
+
 ## Mirror a directory
 
-Include a deletion limit when pruning:
+From your laptop, include a deletion limit when pruning:
 
 ```sh
 syq cp --prune --max-delete 100 --from hostA --srcs-in data --to hostB --into-existing /archive
@@ -104,8 +101,9 @@ planned, none are performed and the command exits 25. Preview first with
 
 ## Other routes and authentication
 
-Syq may switch between encrypted TCP and SSH on the selected route. It never
-silently relays file data through your machine when a direct connection fails.
+Copies started from your laptop can switch between encrypted TCP and SSH on
+the selected route. Syq never silently relays file data through your machine
+when a direct connection fails.
 If the servers cannot connect directly, explicitly relay through your machine:
 
 ```sh

@@ -12,18 +12,6 @@ Installs into `~/.local/bin` without `sudo`. Make sure that directory is on your
 `PATH`. To choose another directory, download the script and run
 `sh install.sh --bin-dir DIR`.
 
-## Automatic installation on SSH servers
-
-An official release installs its SSH helper as needed and also tries to make
-`syq` available at `~/.local/bin/syq` on the server. It leaves existing commands
-and shell startup files alone. Completion and background connections can also
-trigger installation.
-
-Use `syq --self-update` on the server to update that command. If it is missing,
-use the standalone installer above; reusing a cached helper does not reinstall
-it. Development builds and `--syq-path` / `--no-bootstrap` connections do not
-install the command.
-
 ## Homebrew
 
 ```sh
@@ -35,34 +23,21 @@ brew install greaber/tap/syq
 See [source builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for Cargo builds, custom compilation options,
 and choosing between your own executable and compatible official SSH helpers.
 
+## Automatic installation on SSH servers
+
+Syq installs its SSH helper on the server when needed. Official releases also
+try to make `syq` available at `~/.local/bin/syq` for commands you run there.
+Existing commands and shell startup files are left alone.
+
+Use `syq --self-update` on the server to update that command, or the standalone
+installer above if it is missing. See [SSH helper installation](environment.md#ssh-helper-installation)
+for custom helpers and installation exceptions.
+
 ## Try a benchmark
 
-Compare syq with rsync on your own machines, or with rsync and cp locally:
-
-```sh
-curl --proto '=https' --tlsv1.2 -fLsS https://raw.githubusercontent.com/greaber/syq/master/scripts/try-benchmark.sh | bash
-```
-
-Choose an SSH host to compare syq with rsync, or a local copy to include cp.
-The script creates test data, checks the copied contents, and cleans up afterward.
-If syq is missing, it offers to install it. See [quick comparison](speed.md#quick-comparison)
-for workload sizes, warm-up time, and command-line options.
-
-<figure class="benchmark-example">
-<table>
-<caption>Published example: Germany → US East Coast</caption>
-<thead><tr><th scope="col">Tool</th><th scope="col">Average speed</th></tr></thead>
-<tbody>
-<tr><th scope="row">syq</th><td>159.9 MB/s</td></tr>
-<tr><th scope="row">syq over SSH</th><td>88.3 MB/s</td></tr>
-<tr><th scope="row">rsync</th><td>18.3 MB/s</td></tr>
-</tbody>
-</table>
-<figcaption>One 1.07 GB file, held in memory at both ends; three runs per tool.
-From the separate <a href="https://greaber.github.io/syq-bench/all-results.html#public-wan-forward">syq-bench project</a>,
-measured on September 13, 2026 (<a href="https://greaber.github.io/syq-bench/data/release-060-public-wan-forward.json">raw results</a>).
-Your results will depend on your machines and connection.</figcaption>
-</figure>
+Compare syq with rsync on your own machines, or with rsync and cp locally.
+See [Quick comparison](speed.md#quick-comparison) for the script and how to
+read its results.
 
 ## Updates
 
@@ -73,6 +48,8 @@ Standalone and Homebrew installs may print an update reminder in a terminal,
 at most once a day after a successful command, naming the upgrade command for
 that install. Nothing updates automatically. Set `SYQ_NO_UPDATE_CHECK=1` or
 `DO_NOT_TRACK=1` to disable reminders.
+
+### Update-check data
 
 Downloads and the daily reminder check go through `dl.syq.christmas`, a host
 run by the maintainer that serves the GitHub release files from a cache. It
@@ -85,9 +62,6 @@ verified against the signed release manifest, so the host cannot substitute
 files.
 
 ## Shell completion
-
-See the [completion command reference](commands/completion.md) for every command
-and cache-management option.
 
 Add the line for your shell to its startup file:
 
@@ -105,6 +79,7 @@ syq completion fish | source
 Completion suggests options, hosts, and paths, with file details beside path
 matches. In Bash, press Tab again to list matches. Remote paths use your usual
 SSH login. Open a new shell after adding the setup line or upgrading syq.
+See [`syq completion`](commands/completion.md) for all options.
 
 ## Keep connections open
 

@@ -64,8 +64,8 @@ copies, an explicit part size also selects the multipart threshold, capped at
 5 GiB. Without an explicit part limit, server-side copies can use the shared
 request budget's full tuning range.
 
-See [S3 parallelism](object-storage.md#s3-options) for memory use and buffering
-limits. S3 tuning is not saved between runs.
+For S3 streams, see [Descriptor copies](object-storage.md#descriptor-copies)
+for buffering and upload-size limits. S3 tuning is not saved between runs.
 
 <a id="s3-streams"></a>
 
@@ -172,4 +172,4 @@ Use the same reporting options and fresh destinations for each run.
 Prefer `-v`; `--stats` can change which copy optimizations run.
 With overrides, `-v` reports effective settings and a final
 `syq: tuning observed:` diagnostic. Check elapsed time, exit status, and copied
-contents. See [Speed](speed.md#quick-comparison) for the benchmark script.
+contents. See [Quick comparison](speed.md#quick-comparison) for the benchmark script.

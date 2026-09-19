@@ -2,14 +2,14 @@
 
 Remove local files, remote filesystem entries, or S3 objects.
 See [Remove files](../remove.md) for selection rules and
-[S3 removal](../object-storage.md#versions-and-deletion) for versioned objects.
+[Versions and deletion](../object-storage.md#versions-and-deletion) for versioned objects.
 
 ```sh
 syq rm --src-dir old-output --dry-run -v
 ```
 
 For scripting, see [environment variables](../environment.md)
-and [removal results](../automation.md#removal-records).
+and [Removal records](../automation.md#removal-records).
 
 <!-- CLI: rm -->
 ```text
@@ -87,3 +87,11 @@ syq rm [OPTIONS] --srcs-in DIR
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
+
+## Selection rules
+
+Named paths, `--src`, and `--src-non-dir` require non-directories. Use
+`--src-dir` to require a directory and remove it recursively, or `--srcs-in`
+to remove its contents while keeping the directory. These directory selectors
+reject a final symlink even when following is enabled. All selections are
+checked before deletion begins. Filters are not supported.
