@@ -255,7 +255,7 @@ impl Worker {
     }
 
     pub(super) fn record_small_batch_reply(
-        sent: Vec<usize>,
+        sent: &[usize],
         response: Response,
         results: &mut [Option<Result<()>>],
     ) -> bool {
@@ -266,11 +266,11 @@ impl Worker {
         let applied = match applied {
             Ok(applied) => applied,
             Err(error) => {
-                Self::fail_small_batch(results, sent, &error);
+                Self::fail_small_batch(results, sent.iter().copied(), &error);
                 return false;
             }
         };
-        for (idx, error) in sent.into_iter().zip(applied) {
+        for (&idx, error) in sent.iter().zip(applied) {
             results[idx] =
                 Some(error.map_or(Ok(()), |error| Err(endpoint_error(error)).context("put")));
         }
@@ -280,10 +280,24 @@ impl Worker {
     pub(super) fn receive_small_batch(
         &mut self,
         sent: Vec<usize>,
+        jobs: &[WorkerJob],
         results: &mut [Option<Result<()>>],
     ) -> Result<bool> {
         let response = self.dst.recv()?;
-        Ok(Self::record_small_batch_reply(sent, response, results))
+        let valid = Self::record_small_batch_reply(&sent, response, results);
+        // Acknowledgments advance both byte and file activity for the tuner.
+        // Confirmed file completion still belongs to the final source check.
+        let (bytes, files) = sent
+            .iter()
+            .filter(|&&idx| matches!(results[idx], Some(Ok(()))))
+            .fold((0, 0), |(bytes, files), &idx| {
+                (bytes + jobs[idx].entry.size, files + 1)
+            });
+        if files > 0 {
+            self.progress.add_bytes(bytes);
+            self.progress.add_tuning_files(files);
+        }
+        Ok(valid)
     }
 
     pub(super) fn transfer_small_batches(
@@ -428,8 +442,11 @@ impl Worker {
                     writes.push_back(sent);
                 }
                 if writes.len() >= write_window
-                    && !self
-                        .receive_small_batch(writes.pop_front().expect("pending batch"), results)?
+                    && !self.receive_small_batch(
+                        writes.pop_front().expect("pending batch"),
+                        jobs,
+                        results,
+                    )?
                 {
                     break;
                 }
@@ -454,7 +471,7 @@ impl Worker {
                 // A receive error ends draining even if the connection cannot
                 // report a dead flag. Endpoint errors consume their reply and
                 // belong only to that group; keep later acknowledgments too.
-                self.receive_small_batch(sent, results)?;
+                self.receive_small_batch(sent, jobs, results)?;
             }
             Ok(())
         })();
@@ -491,13 +508,20 @@ impl Worker {
         let mut groups = Vec::new();
         let mut start = 0;
         let mut bytes = 0u64;
+        let mut path_bytes = 0usize;
         for (i, job) in jobs.iter().enumerate() {
-            if i > start && bytes.saturating_add(job.entry.size) > group_bytes {
+            let source_bytes = source_request_bytes(&job.src, Some(&job.source));
+            if i > start
+                && (bytes.saturating_add(job.entry.size) > group_bytes
+                    || path_bytes.saturating_add(source_bytes) > SOURCE_BATCH_PATH_BYTES)
+            {
                 groups.push(start..i);
                 start = i;
                 bytes = 0;
+                path_bytes = 0;
             }
             bytes += job.entry.size;
+            path_bytes = path_bytes.saturating_add(source_bytes);
         }
         if start < jobs.len() {
             groups.push(start..jobs.len());
@@ -522,12 +546,23 @@ impl Worker {
         batch.retain(|_| *keep.next().unwrap());
         let mut keep = owned.iter();
         jobs.retain(|_| *keep.next().unwrap());
-        result?;
         let results: Vec<_> = results
             .into_iter()
             .zip(owned)
             .filter_map(|(result, own)| own.then_some(result))
             .collect();
+        let (credited, credited_files) = jobs
+            .iter()
+            .zip(&results)
+            .filter(|(_, result)| matches!(result, Some(Ok(()))))
+            .fold((0, 0), |(bytes, files), (job, _)| {
+                (bytes + job.entry.size, files + 1)
+            });
+        if let Err(error) = result {
+            self.progress.bytes_done.fetch_sub(credited, Relaxed);
+            self.progress.undo_tuning_files(credited_files);
+            return Err(error);
+        }
         // Recheck only acknowledged successes. Later errors must not discard
         // them or make us inspect groups this worker never published.
         let successful = jobs
@@ -542,7 +577,14 @@ impl Worker {
         let now = if paths.is_empty() {
             Vec::new()
         } else {
-            stat_many_registered(&mut *self.src, paths, Some(registered), false)?
+            match stat_many_registered(&mut *self.src, paths, Some(registered), false) {
+                Ok(now) => now,
+                Err(error) => {
+                    self.progress.bytes_done.fetch_sub(credited, Relaxed);
+                    self.progress.undo_tuning_files(credited_files);
+                    return Err(error);
+                }
+            }
         };
         let mut now = now.into_iter();
         for ((idx, j), res) in batch.iter().zip(jobs.iter()).zip(results) {
@@ -576,6 +618,8 @@ impl Worker {
                 None => true,
             };
             if changed {
+                self.progress.bytes_done.fetch_sub(j.entry.size, Relaxed);
+                self.progress.undo_tuning_files(1);
                 if let (Some(e), true, true) = (
                     now,
                     j.attempt + 1 < MAX_ATTEMPTS,
@@ -614,8 +658,8 @@ impl Worker {
                 }
                 continue;
             }
-            self.progress.add_bytes(j.entry.size);
             j.done.store(j.entry.size, Relaxed);
+            // Already counted for tuning when the destination acknowledged it.
             self.progress.files_done.fetch_add(1, Relaxed);
             if let Some(results) = self.progress.results_writer() {
                 results.emit_operation(&crate::results::OperationRecord {
@@ -1741,7 +1785,7 @@ impl Worker {
             self.progress.files_total.fetch_sub(1, Relaxed);
             self.progress.files_unchanged.fetch_add(1, Relaxed);
         } else {
-            self.progress.files_done.fetch_add(1, Relaxed);
+            self.progress.add_files(1);
             if let Some(results) = self.progress.results_writer() {
                 results.emit_operation_expected(
                     &crate::results::OperationRecord {
@@ -1862,7 +1906,7 @@ impl Worker {
             self.opts.dry_run_metadata_files.fetch_add(1, Relaxed);
             (None, "metadata_differs")
         } else {
-            self.progress.files_done.fetch_add(1, Relaxed);
+            self.progress.add_files(1);
             self.progress.bytes_done.fetch_add(job.entry.size, Relaxed);
             (Some(job.entry.size), "content_differs")
         };
@@ -1901,7 +1945,7 @@ impl Worker {
             Ok(true) => {
                 self.progress.add_bytes(job.entry.size);
                 job.done.store(job.entry.size, Relaxed);
-                self.progress.files_done.fetch_add(1, Relaxed);
+                self.progress.add_files(1);
                 self.progress.files_unchanged.fetch_add(1, Relaxed);
                 self.progress
                     .bytes_unchanged
