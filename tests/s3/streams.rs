@@ -74,3 +74,8 @@ fn named_pipes_and_process_substitution_upload() {
 fn managed_streams_commit_only_after_producer_success() {
     scenario("managed-commit");
 }
+
+#[test]
+fn stream_previews_inspect_without_transferring_payload() {
+    scenario("preview-results");
+}

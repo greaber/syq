@@ -4,6 +4,7 @@ pub(crate) mod controls;
 pub(crate) mod fd;
 mod file;
 mod parallel;
+mod report;
 pub(crate) use controls::validate_controls;
 use controls::Controls;
 
@@ -71,6 +72,9 @@ pub(crate) struct StreamPlacement {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Operation {
     Open {
+        dry_run: bool,
+        only_new: bool,
+        only_existing: bool,
         path: Vec<u8>,
         write: bool,
         follow: bool,
@@ -85,8 +89,9 @@ pub(crate) enum Operation {
 pub(crate) use file::{resolve_source, FileWorker, Session};
 
 pub(crate) fn run(mut args: Args) -> Result<i32> {
+    let report = report::Report::start(&args)?;
     let plan = args.descriptor_copy.take().unwrap();
-    let controls = Arc::new(Controls::new(&args));
+    let controls = Arc::new(Controls::new(&args, report));
     if let Some(options) = args.s3.take() {
         let ticker = controls.progress.spawn_ticker();
         let result = crate::s3::stream::run(
@@ -102,7 +107,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
         if let Some(ticker) = ticker {
             let _ = ticker.join();
         }
-        controls.finish(result.is_ok());
+        controls.finish(result.as_ref().err());
         return result;
     }
     let ticker = controls.progress.spawn_ticker();
@@ -124,7 +129,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
     if let Some(ticker) = ticker {
         let _ = ticker.join();
     }
-    controls.finish(result.is_ok());
+    controls.finish(result.as_ref().err());
     // A caller-owned quiet pipe cannot be interrupted by changing its shared
     // flags. This CLI entry point exits after endpoint cleanup.
     runtime.shutdown_background();

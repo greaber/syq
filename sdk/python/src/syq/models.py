@@ -501,6 +501,7 @@ class CpResult(OperationSummary):
     deletions_completed: int | None
     deletions_blocked: int | None
     receipt: ReceiptSummary | None = None
+    bytes_total_known: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

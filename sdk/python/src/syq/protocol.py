@@ -852,6 +852,7 @@ class AutomationDecoder:
                     )
             result = CpResult(
                 **common,
+                bytes_total_known=_boolean(record, "bytes_total_known") if "bytes_total_known" in record else None,
                 status=status,
                 exit_code=exit_code,
                 dry_run=dry_run,

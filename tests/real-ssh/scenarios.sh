@@ -152,7 +152,8 @@ path = "/tmp/syq-real-ssh/stream 'with spaces'"
 import re
 for transport, extra in (("EncryptedTcp", []), ("Ssh", ["--no-tcp"])):
     parallel = [*controls, "--performance-tuning", "workers=2", "--resource-limits", "bandwidth=8M", *extra]
-    upload = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path, *parallel],
+    policy = '--only-new' if transport == 'EncryptedTcp' else '--only-existing'
+    upload = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path, policy, *parallel],
                             input=payload, capture_output=True, check=True, timeout=60)
     result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1', *parallel],
                             capture_output=True, check=True, timeout=60)
@@ -181,8 +182,28 @@ subprocess.run(['bash', '-c',
 result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'],
                         stdout=subprocess.PIPE, check=True, timeout=30)
 assert result.stdout == b'local producer'
+# A preview or skip must finish even with an open, quiet input pipe.
+import json, os, tempfile
+with tempfile.TemporaryDirectory(prefix='syq-stream-results-') as directory:
+    for index, options in enumerate((['--only-new', '--as', path],
+                                    ['--only-existing', '--as', '/tmp/syq-real-ssh/preview-missing/object'],
+                                    ['--dry-run', '--as', '/tmp/syq-real-ssh/preview-missing/object'])):
+        read_fd, write_fd = os.pipe()
+        try:
+            results_path = directory + '/result-' + str(index)
+            result = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination',
+                                     *options, '--results', results_path], stdin=read_fd,
+                                    capture_output=True, timeout=15)
+            assert result.returncode == 0, result.stderr
+            records = [json.loads(line) for line in open(results_path)]
+            assert records[-1]['type'] == 'result' and records[-1]['exit_code'] == 0
+            assert records[-1]['files_excluded'] == (index < 2)
+            assert not result.stdout
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+subprocess.run(['ssh', 'destination', 'test ! -e /tmp/syq-real-ssh/preview-missing'], check=True, timeout=15)
 # A producer exception closes the control pipe without authorizing publication.
-import os
 for commit in (b'', b'C'):
     read_fd, write_fd = os.pipe()
     os.write(write_fd, commit)

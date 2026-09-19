@@ -51,6 +51,7 @@ pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
 }
 
 pub(crate) struct Controls {
+    pub report: super::report::Report,
     pub settings: Settings,
     pub pipeline: usize,
     pub progress: Arc<Progress>,
@@ -60,7 +61,7 @@ pub(crate) struct Controls {
     quiet: bool,
 }
 impl Controls {
-    pub fn new(args: &Args) -> Self {
+    pub fn new(args: &Args, report: super::report::Report) -> Self {
         let tuning = args.tuning_options.unwrap_or_default();
         let limit = (args.bwlimit_bytes != 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(args.bwlimit_bytes));
@@ -77,6 +78,9 @@ impl Controls {
             args.progress_json && !args.quiet,
         );
         Arc::get_mut(&mut progress).unwrap().stream = true;
+        if let Some(writer) = report.writer() {
+            progress.set_results(writer.clone());
+        }
         progress.files_total.store(1, Relaxed);
         if args.verbose > 0 && !args.quiet {
             if let Some(options) = &args.s3 {
@@ -104,6 +108,7 @@ impl Controls {
             }
         }
         Self {
+            report,
             settings,
             pipeline: tuning.pipeline_depth(),
             progress,
@@ -141,14 +146,26 @@ impl Controls {
         }
         Ok(())
     }
-    pub fn finish(&self, success: bool) {
+    pub fn finish(&self, error: Option<&anyhow::Error>) {
+        let success = error.is_none();
         let bytes = self.progress.bytes_done.load(Relaxed);
-        if success {
+        if success && !self.report.dry_run && !self.report.skipped() {
             self.set_size(bytes);
             self.progress.files_done.store(1, Relaxed);
         }
+        if success && self.report.dry_run && !self.report.skipped() {
+            self.progress.files_done.store(1, Relaxed);
+            self.progress
+                .bytes_done
+                .store(self.progress.bytes_total.load(Relaxed), Relaxed);
+        }
+        if self.report.skipped() {
+            self.progress.files_excluded.store(1, Relaxed);
+        }
+        self.progress.errors.store(u64::from(!success), Relaxed);
         self.progress.finish(success);
-        if self.stats && !self.quiet {
+        self.report.finish(self, error);
+        if self.stats && !self.quiet && !self.report.dry_run && !self.report.skipped() {
             let seconds = self.progress.start.elapsed().as_secs_f64();
             crate::output::diagnostic!(
                 "stream {}: {} bytes in {:.3}s ({:.0} bytes/s)",

@@ -201,8 +201,20 @@ Filesystem streams use parallel data workers over SSH or encrypted TCP, with
 automatic worker tuning as in regular-file copies. `workers=N` fixes the worker
 count; `--no-tcp` keeps data on SSH. S3 transfers one object, with concurrent
 parts. Restart recovery, named receiving destinations, detached execution,
-directory selection, comparison policies, metadata preservation, dry runs,
-and result records are unsupported.
+directory selection, content comparison, and metadata preservation are unsupported.
+
+`--only-new` skips a destination that exists; `--only-existing` skips one that
+is missing. Existing directories, S3 key prefixes, and dangling symlinks also
+count as existing for `--only-new`. Skips succeed without reading input or
+opening a named FIFO. A shell producer can therefore receive SIGPIPE; in Python, check the writer's
+`skipped` property before producing bytes. An output FD already exists, so
+`--only-new --as-fd N` always skips after validating the source.
+
+Use `--dry-run` to check source and destination placement without reading input,
+opening a named pipe, or changing the destination. It cannot check a payload
+hash or predict the length of a pipe. `--results` and `--results-fd` report
+[stream outcomes](../automation.md#stream_result) separately from payload;
+results and payload/completion descriptors must differ.
 
 Other inherited descriptors work too, except 2, which is reserved for
 diagnostics. Dedicate each descriptor to the copy. Syq advances its offset,
