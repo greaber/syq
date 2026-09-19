@@ -5,77 +5,81 @@
 <section class="tool-example" data-title="Copy a file">
 <h3>Copy a file</h3>
 <div class="tool-example-commands">
-<div><p><strong>rsync</strong></p><pre><code>rsync -t report.csv server:/backup/</code></pre></div>
+<div><p><strong>rsync</strong> <small>3.2.3+</small></p><pre><code>rsync -t --mkpath --modify-window=-1 report.csv server:/backup/</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --into /backup</code></pre></div>
 </div>
 <p>Copies report.csv to /backup/report.csv on server.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p></details>
 </section>
 <section class="tool-example" data-title="Send a folder to a server">
 <h3>Send a folder to a server</h3>
 <div class="tool-example-commands">
-<div><p><strong>rsync</strong></p><pre><code>rsync -rt project server:/backup/</code></pre></div>
+<div><p><strong>rsync</strong> <small>3.2.3+</small></p><pre><code>rsync -rlt --mkpath --modify-window=-1 project server:/backup/</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project to /backup/project. Other entries in /backup stay.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>Rsync -rt skips symlinks; syq copies them as links.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p><p>Rsync can replace an empty destination directory with a source file. Syq refuses file/directory type conflicts, even for empty directories.</p></details>
 </section>
 <section class="tool-example" data-title="Copy the files inside a folder">
 <h3>Copy the files inside a folder</h3>
 <div class="tool-example-commands">
-<div><p><strong>rsync</strong></p><pre><code>rsync -rt project/ server:/backup/</code></pre></div>
+<div><p><strong>rsync</strong> <small>3.2.3+</small></p><pre><code>rsync -rlt --mkpath --modify-window=-1 project/ server:/backup/</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project/index.html to /backup/index.html. Destination-only files stay.</p>
 <p class="tool-example-note">In rsync, project/ copies the contents; project copies the folder. In syq, a trailing slash does not change placement: use --srcs-in for contents.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p><p>Rsync can replace an empty destination directory with a source file. Syq refuses file/directory type conflicts, even for empty directories.</p></details>
 </section>
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
 <div class="tool-example-commands">
-<div><p><strong>rsync</strong></p><pre><code>rsync -rt --delete project/ server:/backup/</code></pre></div>
+<div><p><strong>rsync</strong> <small>3.2.3+</small></p><pre><code>rsync -rlt --mkpath --modify-window=-1 --delete-after project/ server:/backup/</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --prune</code></pre></div>
 </div>
 <p>Updates /backup with the contents of project and removes destination entries absent from the source.</p>
 <p class="tool-example-note">Deletes destination-only files. Preview syq with --dry-run -v. <a href="reference.html#mirror-a-directory">Mirroring details</a>.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p><p>Rsync can replace an empty destination directory with a source file. Syq refuses file/directory type conflicts, even for empty directories.</p></details>
 </section>
 <section class="tool-example" data-title="Download a file from a server">
 <h3>Download a file from a server</h3>
 <div class="tool-example-commands">
-<div><p><strong>rsync</strong></p><pre><code>rsync -t server:/data/report.csv .</code></pre></div>
+<div><p><strong>rsync</strong> <small>3.2.3+</small></p><pre><code>rsync -t --mkpath --modify-window=-1 server:/data/report.csv .</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --from server /data/report.csv --into .</code></pre></div>
 </div>
 <p>Fetches report.csv into your current directory.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p></details>
 </section>
 <section class="tool-example" data-title="Preview a copy">
 <h3>Preview a copy</h3>
 <div class="tool-example-commands">
-<div><p><strong>rsync</strong></p><pre><code>rsync -rt --dry-run --itemize-changes project/ server:/backup/</code></pre></div>
+<div><p><strong>rsync</strong> <small>3.2.3+</small></p><pre><code>rsync -rlt --mkpath --modify-window=-1 --dry-run --itemize-changes project/ server:/backup/</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --dry-run -v</code></pre></div>
 </div>
 <p>Lists planned changes without copying file data.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>Syq may still install or cache its remote helper during setup.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p><p>Rsync can replace an empty destination directory with a source file. Syq refuses file/directory type conflicts, even for empty directories.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
 <div class="tool-example-commands">
-<div><p><strong>rsync</strong></p><pre><code>rsync -t report.csv server:/backup/latest.csv</code></pre></div>
+<div><p><strong>rsync</strong> <small>3.2.3+</small></p><pre><code>rsync -t --mkpath --modify-window=-1 report.csv server:/backup/latest.csv</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --as /backup/latest.csv</code></pre></div>
 </div>
 <p>Copies report.csv to /backup/latest.csv; the source stays.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>If latest.csv is a directory, rsync copies report.csv inside it. Syq --as requires the exact destination to be a file for this source and refuses that directory.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p><p>If a requested destination filename is already a directory, rsync copies inside it. Syq refuses to replace that directory with a file.</p></details>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
 <p>A script chooses beach.jpg for a.jpg and summit.jpg for b.jpg.</p>
 <div class="tool-example-commands">
-<div><p><strong>rsync</strong></p><pre><code>rsync -t photos/a.jpg server:/archive/beach.jpg
-rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
+<div><p><strong>rsync</strong> <small>3.2.3+</small></p><pre><code>rsync -t --mkpath --modify-window=-1 photos/a.jpg server:/archive/beach.jpg
+rsync -t --mkpath --modify-window=-1 photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
 {"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --to server --into /archive</code></pre></div>
 </div>
-<details class="tool-example-differences"><summary>Differences</summary><p>For rsync, /archive must already exist on server. Syq creates missing destination directories.</p></details>
 <p><a href="mappings.html">Generate a mapping with a script</a>.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p><p>If a requested destination filename is already a directory, rsync copies inside it. Syq refuses to replace that directory with a file.</p><p>These rsync commands run separately. Syq validates the complete mapping for duplicate destinations and file/ancestor conflicts before copying.</p></details>
 </section>
-<!-- References: https://download.samba.org/pub/rsync/rsync.1 --></details>
+<!-- --mkpath requires rsync 3.2.3 or later. Semantics checked with rsync 3.2.7. References: https://download.samba.org/pub/rsync/rsync.1 --></details>
 <details class="tool-examples-group" data-tool="rclone" data-unsupported="{&quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers without agent forwarding&quot;: &quot;Copies between distinct SFTP servers relay data through the rclone process on your laptop; the task requires a direct server-to-server data route.&quot;}" open><summary>rclone</summary>
 <section class="tool-example" data-title="Copy a file">
 <h3>Copy a file</h3>
@@ -85,41 +89,46 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 </div>
 <p>Uploads report.csv to reports/report.csv in bucket backups.</p>
 <p class="tool-example-note">Here s3 is an rclone S3 remote. Syq uses AWS credentials and its own endpoint settings. Existing objects can be replaced.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Rclone stores source modification times in S3 metadata named mtime; syq uses syq-mtime and syq-mtime-nsec. Each tool restores its own timestamp format; one tool’s upload does not give the other the same source-time information.</p></details>
 </section>
 <section class="tool-example" data-title="Copy the files inside a folder">
 <h3>Copy the files inside a folder</h3>
 <div class="tool-example-commands">
-<div><p><strong>rclone</strong></p><pre><code>rclone copy project backup</code></pre></div>
+<div><p><strong>rclone</strong></p><pre><code>rclone copy --links --create-empty-src-dirs project backup</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --into backup</code></pre></div>
 </div>
 <p>Copies project/index.html to backup/index.html. Destination-only files stay.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Without --metadata, rclone does not restore source Unix permission bits. Syq gives new files the source read/write/execute bits limited by the destination umask and keeps existing destination permissions. Rclone’s --metadata would additionally restore ownership and other metadata, so it does not match syq’s default either.</p></details>
 </section>
 <section class="tool-example" data-title="Upload a folder’s contents to S3">
 <h3>Upload a folder’s contents to S3</h3>
 <div class="tool-example-commands">
-<div><p><strong>rclone</strong></p><pre><code>rclone copy project s3:backups/project</code></pre></div>
+<div><p><strong>rclone</strong></p><pre><code>rclone copy --links --create-empty-src-dirs --s3-directory-markers project s3:backups/project</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to s3://backups --into project</code></pre></div>
 </div>
 <p>Uploads project/index.html to the key project/index.html in bucket backups.</p>
 <p class="tool-example-note">s3 is an rclone S3 remote. Syq uses AWS credentials and endpoint settings.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Rclone stores source modification times in S3 metadata named mtime; syq uses syq-mtime and syq-mtime-nsec. Each tool restores its own timestamp format; one tool’s upload does not give the other the same source-time information.</p><p>Rclone --links uploads a symlink as a text file with a .rclonelink suffix. Syq keeps the original name: as a real link on an SSH server, or an object marked as a symlink in S3.</p></details>
 </section>
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
 <div class="tool-example-commands">
-<div><p><strong>rclone</strong></p><pre><code>rclone sync project backup</code></pre></div>
+<div><p><strong>rclone</strong></p><pre><code>rclone sync --links --create-empty-src-dirs project backup</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --into backup --prune</code></pre></div>
 </div>
 <p>Updates backup with the contents of project and removes destination entries absent from the source.</p>
 <p class="tool-example-note">Deletes destination-only files. Preview syq with --dry-run -v.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Without --metadata, rclone does not restore source Unix permission bits. Syq gives new files the source read/write/execute bits limited by the destination umask and keeps existing destination permissions. Rclone’s --metadata would additionally restore ownership and other metadata, so it does not match syq’s default either.</p></details>
 </section>
 <section class="tool-example" data-title="Download a folder from S3">
 <h3>Download a folder from S3</h3>
 <div class="tool-example-commands">
-<div><p><strong>rclone</strong></p><pre><code>rclone copy s3:backups/reports reports</code></pre></div>
+<div><p><strong>rclone</strong></p><pre><code>rclone copy --links --create-empty-src-dirs s3:backups/reports reports</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --from s3://backups --srcs-in reports --into reports</code></pre></div>
 </div>
 <p>Downloads reports/january.csv from S3 to reports/january.csv locally, keeping subfolders.</p>
 <p class="tool-example-note">Here s3 is an rclone S3 remote. Relative paths are kept; unrelated local files stay.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Rclone stores source modification times in S3 metadata named mtime; syq uses syq-mtime and syq-mtime-nsec. Each tool restores its own timestamp format; one tool’s upload does not give the other the same source-time information.</p><p>Rclone --links restores its .rclonelink objects as local symlinks. Syq restores objects carrying syq’s symlink metadata. Neither decodes the other format.</p><p>Without --metadata, rclone does not restore source Unix permission bits. Syq gives new files the source read/write/execute bits limited by the destination umask and keeps existing destination permissions. Rclone’s --metadata would additionally restore ownership and other metadata, so it does not match syq’s default either.</p></details>
 </section>
 <section class="tool-example" data-title="Copy a file between S3 buckets">
 <h3>Copy a file between S3 buckets</h3>
@@ -129,14 +138,16 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 </div>
 <p>Copies report.csv from bucket backups to bucket archive.</p>
 <p class="tool-example-note">Here s3 is an rclone S3 remote. Both buckets must exist on the same S3 service for this syq example.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>Rclone’s default skip decision uses size and modification time, with a hash comparison when times differ. Syq checks object type, size and copyable metadata, then compares full-object checksums when available; otherwise, it accepts matching ETags or a source carrying syq metadata. These tests can make different decisions about whether to copy an existing object.</p></details>
 </section>
 <section class="tool-example" data-title="Preview a copy">
 <h3>Preview a copy</h3>
 <div class="tool-example-commands">
-<div><p><strong>rclone</strong></p><pre><code>rclone copy project backup --dry-run</code></pre></div>
+<div><p><strong>rclone</strong></p><pre><code>rclone copy --links --create-empty-src-dirs project backup --dry-run</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --into backup --dry-run -v</code></pre></div>
 </div>
 <p>Previews copying the contents of project into backup.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Without --metadata, rclone does not restore source Unix permission bits. Syq gives new files the source read/write/execute bits limited by the destination umask and keeps existing destination permissions. Rclone’s --metadata would additionally restore ownership and other metadata, so it does not match syq’s default either.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -145,6 +156,7 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --as latest.csv</code></pre></div>
 </div>
 <p>Copies report.csv to latest.csv in your current directory; the source stays.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Without --metadata, rclone does not restore source Unix permission bits. Syq gives new files the source read/write/execute bits limited by the destination umask and keeps existing destination permissions. Rclone’s --metadata would additionally restore ownership and other metadata, so it does not match syq’s default either.</p></details>
 </section>
 <section class="tool-example" data-title="Remove a file">
 <h3>Remove a file</h3>
@@ -158,11 +170,12 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <section class="tool-example" data-title="Send a folder to a server">
 <h3>Send a folder to a server</h3>
 <div class="tool-example-commands">
-<div><p><strong>rclone</strong></p><pre><code>rclone copy project server:/backup/project</code></pre></div>
+<div><p><strong>rclone</strong></p><pre><code>rclone copy --links --create-empty-src-dirs project server:/backup/project</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project to /backup/project on the server.</p>
 <p class="tool-example-note">Configure server as an <a href="https://rclone.org/sftp/">rclone SFTP remote</a>. Rclone’s destination includes project; syq’s --into keeps the source name.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Rclone --links uploads a symlink as a text file with a .rclonelink suffix. Syq keeps the original name: as a real link on an SSH server, or an object marked as a symlink in S3.</p><p>Without --metadata, rclone does not restore source Unix permission bits. Syq gives new files the source read/write/execute bits limited by the destination umask and keeps existing destination permissions. Rclone’s --metadata would additionally restore ownership and other metadata, so it does not match syq’s default either.</p></details>
 </section>
 <section class="tool-example" data-title="Download a file from a server">
 <h3>Download a file from a server</h3>
@@ -172,6 +185,7 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 </div>
 <p>Downloads report.csv into your current folder.</p>
 <p class="tool-example-note">Here server is an rclone SFTP remote.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Without --metadata, rclone does not restore source Unix permission bits. Syq gives new files the source read/write/execute bits limited by the destination umask and keeps existing destination permissions. Rclone’s --metadata would additionally restore ownership and other metadata, so it does not match syq’s default either.</p></details>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
@@ -183,8 +197,9 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 {"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div>
 </div>
 <p><a href="mappings.html">Generate a mapping with a script</a>.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Without --metadata, rclone does not restore source Unix permission bits. Syq gives new files the source read/write/execute bits limited by the destination umask and keeps existing destination permissions. Rclone’s --metadata would additionally restore ownership and other metadata, so it does not match syq’s default either.</p><p>These rclone commands run separately. Syq checks the complete mapping for duplicate destinations and file/ancestor conflicts before copying.</p></details>
 </section>
-<!-- References: https://rclone.org/commands/rclone_copy/ https://rclone.org/commands/rclone_sync/ https://rclone.org/commands/rclone_copyto/ https://rclone.org/commands/rclone_deletefile/ https://rclone.org/sftp/ https://rclone.org/docs/#name-transform --></details>
+<!-- Sources: rclone v1.73.0 backend/local/local.go, backend/sftp/sftp.go, fs/operations/operations.go. References: https://rclone.org/commands/rclone_copy/ https://rclone.org/commands/rclone_sync/ https://rclone.org/commands/rclone_copyto/ https://rclone.org/commands/rclone_deletefile/ https://rclone.org/sftp/ https://rclone.org/docs/#name-transform --></details>
 <details class="tool-examples-group" data-tool="s5cmd" data-unsupported="{&quot;Send a folder to a server&quot;: &quot;S5cmd has no SSH endpoint; use an SSH transfer tool.&quot;, &quot;Download a file from a server&quot;: &quot;S5cmd has no SSH endpoint; use an SSH transfer tool.&quot;, &quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers without agent forwarding&quot;: &quot;S5cmd has no SSH endpoint. S3 staging changes the required direct server-to-server data route.&quot;}" open><summary>s5cmd</summary>
 <section class="tool-example" data-title="Copy a file">
 <h3>Copy a file</h3>
@@ -193,6 +208,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to s3://backups --as reports/report.csv</code></pre></div>
 </div>
 <p>Uploads report.csv to the exact key reports/report.csv in bucket backups.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>S5cmd cp copies selected files again even when the destination already matches. Syq can skip unchanged entries. S5cmd’s size-only and source-newer conditions do not reproduce syq’s default comparison.</p><p>S5cmd uploads regular file contents without automatically recording source Unix permissions or modification times. Syq records those in its S3 metadata and restores modification times on download.</p></details>
 </section>
 <section class="tool-example" data-title="Download a folder from S3">
 <h3>Download a folder from S3</h3>
@@ -201,6 +217,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --from s3://backups --srcs-in reports --into reports</code></pre></div>
 </div>
 <p>Downloads reports/january.csv from S3 to reports/january.csv locally, keeping subfolders.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>S5cmd cp copies selected files again even when the destination already matches. Syq can skip unchanged entries. S5cmd’s size-only and source-newer conditions do not reproduce syq’s default comparison.</p><p>S5cmd downloads object bodies as regular files; it does not restore syq’s symlink or timestamp metadata. Syq recognizes that metadata and restores the original object type and modification time.</p></details>
 </section>
 <section class="tool-example" data-title="Copy a file between S3 buckets">
 <h3>Copy a file between S3 buckets</h3>
@@ -210,6 +227,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 </div>
 <p>Copies the key report.csv from bucket backups to bucket archive.</p>
 <p class="tool-example-note">Both buckets must exist. Credentials must allow reading the source and writing the destination. This example uses the same S3 service for both buckets.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>S5cmd cp copies selected files again even when the destination already matches. Syq can skip unchanged entries. S5cmd’s size-only and source-newer conditions do not reproduce syq’s default comparison.</p></details>
 </section>
 <section class="tool-example" data-title="Preview a copy">
 <h3>Preview a copy</h3>
@@ -218,6 +236,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to s3://backups --as report.csv --dry-run -v</code></pre></div>
 </div>
 <p>Previews uploading report.csv without writing the object.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>S5cmd cp copies selected files again even when the destination already matches. Syq can skip unchanged entries. S5cmd’s size-only and source-newer conditions do not reproduce syq’s default comparison.</p><p>S5cmd uploads regular file contents without automatically recording source Unix permissions or modification times. Syq records those in its S3 metadata and restores modification times on download.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -226,6 +245,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to s3://backups --as latest.csv</code></pre></div>
 </div>
 <p>Uploads report.csv as the key latest.csv; the local source stays.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>S5cmd cp copies selected files again even when the destination already matches. Syq can skip unchanged entries. S5cmd’s size-only and source-newer conditions do not reproduce syq’s default comparison.</p><p>S5cmd uploads regular file contents without automatically recording source Unix permissions or modification times. Syq records those in its S3 metadata and restores modification times on download.</p></details>
 </section>
 <section class="tool-example" data-title="Remove a file">
 <h3>Remove a file</h3>
@@ -244,6 +264,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 </div>
 <p>Uploads project/index.html to project/index.html in bucket backups.</p>
 <p class="tool-example-note">Both select the folder’s contents and preserve relative paths. Existing objects can be replaced; unrelated objects stay.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>S5cmd cp copies selected files again even when the destination already matches. Syq can skip unchanged entries. S5cmd’s size-only and source-newer conditions do not reproduce syq’s default comparison.</p><p>S5cmd uploads regular file contents without automatically recording source Unix permissions or modification times. Syq records those in its S3 metadata and restores modification times on download.</p><p>S5cmd follows source symlinks and omits empty directories. Its --no-follow-symlinks skips links rather than preserving them. Syq stores symlinks and empty directories for restoration by syq.</p></details>
 </section>
 <section class="tool-example" data-title="Copy the files inside a folder">
 <h3>Copy the files inside a folder</h3>
@@ -252,6 +273,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to s3://backups --into project</code></pre></div>
 </div>
 <p>Copies the files inside project to the project/ folder in S3.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>S5cmd cp copies selected files again even when the destination already matches. Syq can skip unchanged entries. S5cmd’s size-only and source-newer conditions do not reproduce syq’s default comparison.</p><p>S5cmd uploads regular file contents without automatically recording source Unix permissions or modification times. Syq records those in its S3 metadata and restores modification times on download.</p><p>S5cmd follows source symlinks and omits empty directories. Its --no-follow-symlinks skips links rather than preserving them. Syq stores symlinks and empty directories for restoration by syq.</p></details>
 </section>
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
@@ -261,6 +283,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 </div>
 <p>Updates the project/ folder in S3 and removes objects absent from the local project folder.</p>
 <p class="tool-example-note">Preview with s5cmd --dry-run sync --delete or add --dry-run -v to syq. Bucket versioning affects recovery.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>S5cmd sync copies when sizes differ or the source modification time is newer. Syq can also update a same-size destination whose modification time is newer than the source. For S3, s5cmd uses the object’s service timestamp; syq uses its stored source timestamp when present.</p><p>S5cmd runs its generated copy and removal commands concurrently. Syq waits for copying to finish and suppresses pruning after scan or copy errors.</p><p>S5cmd uploads regular file contents without automatically recording source Unix permissions or modification times. Syq records those in its S3 metadata and restores modification times on download.</p><p>S5cmd follows source symlinks and omits empty directories. Its --no-follow-symlinks skips links rather than preserving them. Syq stores symlinks and empty directories for restoration by syq.</p></details>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
@@ -272,65 +295,66 @@ cp photos/b.jpg s3://backups/archive/summit.jpg</code></pre><pre><code>s5cmd run
 {"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --to s3://backups --into archive</code></pre></div>
 </div>
 <p><a href="mappings.html">Generate a mapping with a script</a>.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>S5cmd cp copies selected files again even when the destination already matches. Syq can skip unchanged entries. S5cmd’s size-only and source-newer conditions do not reproduce syq’s default comparison.</p><p>S5cmd uploads regular file contents without automatically recording source Unix permissions or modification times. Syq records those in its S3 metadata and restores modification times on download.</p><p>S5cmd executes independent commands from copies.txt. Syq checks the entire mapping for duplicate destinations and file/ancestor conflicts before copying.</p></details>
 </section>
-<!-- References: https://github.com/peak/s5cmd#examples --></details>
+<!-- Sources: peak/s5cmd v2.3.0 command/cp.go, command/sync.go, command/sync_strategy.go, storage/fs.go; https://github.com/peak/s5cmd#examples --></details>
 <details class="tool-examples-group" data-tool="scp" data-unsupported="{&quot;Upload a folder’s contents to S3&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Download a folder from S3&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Copy a file between S3 buckets&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Match a folder, deleting extra files&quot;: &quot;Scp has no mirroring/deletion option.&quot;, &quot;Preview a copy&quot;: &quot;Scp has no dry-run option.&quot;, &quot;Remove a file&quot;: &quot;Scp has no file-removal command; use a filesystem or SSH removal tool.&quot;, &quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers without agent forwarding&quot;: &quot;Scp -3 relays through the laptop. Scp -R requires source-server access to the destination; the task allows only laptop logins.&quot;}" open><summary>scp</summary>
 <section class="tool-example" data-title="Copy a file">
 <h3>Copy a file</h3>
 <div class="tool-example-commands">
-<div><p><strong>scp</strong></p><pre><code>scp report.csv server:/backup/</code></pre></div>
+<div><p><strong>scp</strong></p><pre><code>scp -p report.csv server:/backup/</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --into /backup</code></pre></div>
 </div>
 <p>Copies report.csv to /backup/report.csv on server.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>For scp, /backup must exist. Syq creates it if needed and can skip unchanged files.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>Scp -p preserves source permission bits and access times as well as modification times. Syq preserves modification times, leaves existing destination permissions alone, and creates files with source read/write/execute bits limited by the destination umask; it does not preserve source access times.</p><p>Scp transfers each file again and writes directly to the destination. Syq can skip unchanged files and normally stages changed files before replacing them, keeping the old file available until replacement.</p><p>The scp destination directory must already exist for the placement shown. Syq creates missing destination directories.</p></details>
 </section>
 <section class="tool-example" data-title="Download a file from a server">
 <h3>Download a file from a server</h3>
 <div class="tool-example-commands">
-<div><p><strong>scp</strong></p><pre><code>scp server:/data/report.csv .</code></pre></div>
+<div><p><strong>scp</strong></p><pre><code>scp -p server:/data/report.csv .</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --from server /data/report.csv --into .</code></pre></div>
 </div>
 <p>Copies the server’s /data/report.csv to report.csv in your current directory.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>Scp copies the file again and needs -p to preserve modification times. Syq can skip an unchanged file and preserves modification times by default.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>Scp -p preserves source permission bits and access times as well as modification times. Syq preserves modification times, leaves existing destination permissions alone, and creates files with source read/write/execute bits limited by the destination umask; it does not preserve source access times.</p><p>Scp transfers each file again and writes directly to the destination. Syq can skip unchanged files and normally stages changed files before replacing them, keeping the old file available until replacement.</p></details>
 </section>
 <section class="tool-example" data-title="Send a folder to a server">
 <h3>Send a folder to a server</h3>
 <div class="tool-example-commands">
-<div><p><strong>scp</strong></p><pre><code>scp -r project server:/backup/</code></pre></div>
+<div><p><strong>scp</strong></p><pre><code>scp -pr project server:/backup/</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project to /backup/project; /backup must already exist for the scp command.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>Scp follows symlinks and copies their targets; syq copies the links themselves.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>Scp -p preserves source permission bits and access times as well as modification times. Syq preserves modification times, leaves existing destination permissions alone, and creates files with source read/write/execute bits limited by the destination umask; it does not preserve source access times.</p><p>Scp transfers each file again and writes directly to the destination. Syq can skip unchanged files and normally stages changed files before replacing them, keeping the old file available until replacement.</p><p>Scp follows symlinks inside the copied tree and copies their targets. Syq copies those links themselves.</p><p>The scp destination directory must already exist for the placement shown. Syq creates missing destination directories.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
 <div class="tool-example-commands">
-<div><p><strong>scp</strong></p><pre><code>scp report.csv server:/backup/latest.csv</code></pre></div>
+<div><p><strong>scp</strong></p><pre><code>scp -p report.csv server:/backup/latest.csv</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --as /backup/latest.csv</code></pre></div>
 </div>
 <p>Copies report.csv to /backup/latest.csv; the source stays.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>If latest.csv is a directory, scp copies report.csv inside it. Syq --as refuses that directory for this file source.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>Scp -p preserves source permission bits and access times as well as modification times. Syq preserves modification times, leaves existing destination permissions alone, and creates files with source read/write/execute bits limited by the destination umask; it does not preserve source access times.</p><p>Scp transfers each file again and writes directly to the destination. Syq can skip unchanged files and normally stages changed files before replacing them, keeping the old file available until replacement.</p><p>The scp destination directory must already exist for the placement shown. Syq creates missing destination directories.</p><p>If a requested destination filename is already a directory, scp copies inside it. Syq refuses to replace that directory with a file.</p></details>
 </section>
 <section class="tool-example" data-title="Copy the files inside a folder">
 <h3>Copy the files inside a folder</h3>
 <div class="tool-example-commands">
-<div><p><strong>scp</strong></p><pre><code>scp -r project/. server:/backup/</code></pre></div>
+<div><p><strong>scp</strong></p><pre><code>scp -pr project/. server:/backup/</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project’s contents, including hidden files and subfolders, into /backup.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>Scp follows symlinks; syq copies them as links. The scp destination /backup must already exist.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>Scp -p preserves source permission bits and access times as well as modification times. Syq preserves modification times, leaves existing destination permissions alone, and creates files with source read/write/execute bits limited by the destination umask; it does not preserve source access times.</p><p>Scp transfers each file again and writes directly to the destination. Syq can skip unchanged files and normally stages changed files before replacing them, keeping the old file available until replacement.</p><p>Scp follows symlinks inside the copied tree and copies their targets. Syq copies those links themselves.</p><p>The scp destination directory must already exist for the placement shown. Syq creates missing destination directories.</p></details>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
 <p>A script chooses beach.jpg for a.jpg and summit.jpg for b.jpg.</p>
 <div class="tool-example-commands">
-<div><p><strong>scp</strong></p><pre><code>scp photos/a.jpg server:/archive/beach.jpg
-scp photos/b.jpg server:/archive/summit.jpg</code></pre></div>
+<div><p><strong>scp</strong></p><pre><code>scp -p photos/a.jpg server:/archive/beach.jpg
+scp -p photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
 {"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --to server --into /archive</code></pre></div>
 </div>
-<details class="tool-example-differences"><summary>Differences</summary><p>For scp, /archive must already exist on server. Syq creates missing destination directories.</p></details>
 <p><a href="mappings.html">Generate a mapping with a script</a>.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>Scp -p preserves source permission bits and access times as well as modification times. Syq preserves modification times, leaves existing destination permissions alone, and creates files with source read/write/execute bits limited by the destination umask; it does not preserve source access times.</p><p>Scp transfers each file again and writes directly to the destination. Syq can skip unchanged files and normally stages changed files before replacing them, keeping the old file available until replacement.</p><p>The scp destination directory must already exist for the placement shown. Syq creates missing destination directories.</p><p>If a requested destination filename is already a directory, scp copies inside it. Syq refuses to replace that directory with a file.</p><p>These scp commands run separately. Syq checks the complete mapping for duplicate destinations and file/ancestor conflicts before copying.</p></details>
 </section>
 <!-- References: https://man.openbsd.org/scp --></details>
 <details class="tool-examples-group" data-tool="syq" data-unsupported="{}" open><summary>syq</summary>
@@ -366,7 +390,6 @@ scp photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <h3>Preview a copy</h3>
 <div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --dry-run -v</code></pre></div></div>
 <p>Lists planned changes without copying file data.</p>
-<p class="tool-example-note">Remote setup may still install or cache the helper.</p>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
