@@ -398,7 +398,7 @@ are numeric IDs. Times use Unix seconds plus optional nanoseconds. Supplying
 `mtime` without `mtime_nsec` uses zero nanoseconds. Omitted attributes follow
 normal copy behavior. Explicit attributes do not require `preserve`, except
 where a restricted receiver's signed grant needs the corresponding permission.
-The [mapping reference](mappings.md#the-format) describes backend behavior.
+The [mapping reference](https://greaber.github.io/syq/mappings.html#the-format) describes backend behavior.
 
 ### RelativePath and PathValue
 
@@ -592,6 +592,8 @@ Byte fields measure file content,
 `scanned` counts scanned entries, and `elapsed_ms` is milliseconds. Optional
 `activity` contains [diagnostic measurements](https://greaber.github.io/syq/automation.html#progress)
 when the producer collects them; otherwise it is `None`.
+Optional `rate_bytes_per_second` and `eta_ms` provide rate and remaining-time
+estimates; use final byte counts and elapsed time for completed-run measurements.
 
 `protocol.type = "progress"`. Fields in addition to the common envelope:
 
@@ -607,6 +609,8 @@ scanned: int
 scan_done: bool
 elapsed_ms: int
 activity: dict[str, Any] | None
+rate_bytes_per_second: int | None
+eta_ms: int | None
 ```
 
 ### TraceEvent
@@ -649,6 +653,7 @@ class_: ErrorClass | None
 os_kind: OsKind | None
 message: str | None
 expected_hash: Hash | None
+metadata: DestinationMetadata | None
 provenance: str | None
 scope: int | None
 code: ReceiptCode | None

@@ -313,6 +313,6 @@ Input pipes, sockets, and devices have no payload metadata, so they reject
 and the time of the write; existing files keep their permissions.
 Output pipes likewise cannot preserve times, permissions, or ownership. Parent
 directories are created as needed. The source `--cwd` / `--root` options
-apply, but `--root` cannot confine a descriptor that is already open. Symlink
-handling is unchanged; see [Symlinks](../reference.md#symlinks). Named remote
+apply to pathname sources. `--root` with `--src-fd` is rejected because it cannot
+confine a descriptor that is already open. Symlink handling is unchanged; see [Symlinks](../reference.md#symlinks). Named remote
 sources must be regular files.

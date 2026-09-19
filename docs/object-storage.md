@@ -55,8 +55,10 @@ are unsupported on this route.
 
 ## Descriptor copies
 
-With `--src-fd` or `--as-fd`, `cp` transfers one exact UTF-8 key's raw contents, without path normalization or
-prefix selection. Regular-file uploads store syq's file metadata. Output
+With `--src-fd` or `--as-fd`, `cp` transfers one exact UTF-8 key's raw contents
+instead of selecting a prefix tree. Keys are literal unless a download uses
+`--cwd` or `--root`; those options resolve the source relative to a prefix using
+the usual S3 path rules. Regular-file uploads store syq's file metadata. Output
 descriptors receive raw bytes; use `--preserve` to apply attributes to a regular
 output file. Pipes carry only bytes. No local temporary file is created. See
 [File descriptors](commands/cp.md#file-descriptors) for command examples.

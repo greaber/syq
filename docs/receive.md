@@ -12,6 +12,11 @@ Receiving lets you do three things from a connected server:
 All three use a [persistent connection](persistence.md) opened by your laptop.
 It needs no SSH server, public address, or incoming network port.
 
+<a id="ssh-setup"></a>
+<a id="persistence-in-scripts"></a>
+<a id="updating-receiving-connections"></a>
+<a id="background-connections"></a>
+
 ## Set up receiving
 
 <a id="ssh-setup"></a>

@@ -114,7 +114,9 @@ Do not combine it with `comparison-block-size`.
 
 ### Streaming and request windows
 
-Syq normally streams remote ranges above 16 MiB, with blocks of at most 2 MiB.
+Syq normally streams remote ranges larger than four ordinary requests
+(16 MiB with default settings), with stream blocks of at most 2 MiB. The
+threshold follows the effective request size, including bandwidth limits.
 `copy-path=streaming` forces streaming and disables whole-file and small-file
 shortcuts. `copy-path=auto-streaming` keeps those shortcuts and streams the
 remaining ranges.

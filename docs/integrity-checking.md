@@ -12,15 +12,20 @@ hash from a trusted source to check authenticity; see [Expected hashes](#expecte
 
 ## Comparison
 
-Syq normally skips files whose size and modification time match. `syq cp`
-compares whole seconds exactly and ignores as many trailing fractional digits
-as are zero in the destination timestamp. For example, destination `.120000000`
+Syq normally skips files whose size and modification time match. For filesystem
+copies, `syq cp` compares whole seconds exactly and ignores as many trailing
+fractional digits as are zero in the destination timestamp. For example, destination `.120000000`
 seconds matches source `.123456789`; a whole-second destination timestamp
 ignores the source fraction entirely. This accommodates destinations that
 truncate fractional seconds, but it also ignores coincidental trailing zeros;
 the rule uses the timestamp, not a measurement of filesystem precision.
 Directory metadata previews use the same fractional precision rule. `syq rsync`
 compares whole seconds only when checking file contents.
+
+Local/S3 copies compare timestamps exactly, including stored nanoseconds; they
+do not use the filesystem rule above. Uploads need syq metadata on the existing
+object for this shortcut. Downloads use the stored source timestamp, or S3's
+modification time in whole seconds when syq metadata is absent.
 
 A timestamp difference outside that precision triggers checking even when the
 source is older. Use `--hash` to check contents even when size and timestamp
