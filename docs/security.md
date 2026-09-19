@@ -219,13 +219,24 @@ would. See [Other authentication modes](remote-reference.md#other-authentication
 Suppose the grant permits hostA to copy into hostB's `/archive`. A compromised
 hostA can misuse the access that copy requires, but cannot grant itself more:
 
-| HostA can | HostA cannot |
-|---|---|
-| Supply false contents, names, sizes, or timestamps | Change the signed destination scope to write into `/etc` or an SSH configuration directory |
-| Overwrite files where the grant permits overwriting | Ignore a restriction to creating new files only |
-| Omit a source file and, if pruning is authorized, cause its destination copy to be deleted | Delete without permission or exceed the signed deletion limit |
-| Inspect destination entries for copy planning and consume the allowed space | Exceed the signed byte or entry limits |
-| Stop the transfer or withhold its receipt | Forge hostB's receipt, reuse the grant for another copy, or use the restricted key to run a shell |
+HostA can:
+
+- Supply false contents, names, sizes, or timestamps.
+- Overwrite files where the grant permits overwriting.
+- Omit a source file and, if pruning is authorized, cause its destination copy
+  to be deleted.
+- Inspect destination entries for copy planning and consume the allowed space.
+- Stop the transfer or withhold its receipt.
+
+HostA cannot:
+
+- Change the signed destination scope to write into `/etc` or an SSH
+  configuration directory.
+- Overwrite existing files when the grant permits only creating new ones,
+  or delete files without permission.
+- Exceed the signed byte, entry, or deletion limits.
+- Reuse the grant for another copy or use the restricted key to run a shell.
+- Forge hostB's receipt.
 
 The filesystem limitations above still apply, including effects through
 hard links. HostB's account and receiver remain trusted to
