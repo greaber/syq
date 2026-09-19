@@ -84,7 +84,7 @@ A colon in a native path is simply part of the path.
 Use `--to @NAME` to send local source files to a registered receiving machine.
 The `@` is required: `--to laptop` selects an SSH destination, while
 `--to @laptop` selects your connected receiving machine.
-See [Send files home from a server](receive.md) for setup and destination paths.
+See [Use your laptop from a server](receive.md) for setup and destination paths.
 
 Use S3 buckets with the same selectors and placement options:
 

@@ -289,7 +289,7 @@ syq enforces them on every filesystem operation. The server can supply false
 contents, inspect destination entries during planning, and use disk space
 within those limits. The default starting directory is your home, without
 containment; `syq persist receive on --root DIRECTORY` confines copies to that
-directory. See [Send files home from a server](receive.md) for setup and
+directory. See [Use your laptop from a server](receive.md) for setup and
 approval controls.
 
 A receiving name is tied to a public key; reconnecting requires proof of the

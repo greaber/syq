@@ -69,7 +69,7 @@ If your machine reaches hostB through hostA, add `--via hostA` to `enroll` or
 
 ## Run the copy from a server
 
-With a [return connection](receive.md) from your laptop, you can inspect files
+With a [receiving connection](receive.md#set-up-receiving) from your laptop, you can inspect files
 on hostA and send them to hostB from the same shell:
 
 ```sh

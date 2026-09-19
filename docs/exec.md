@@ -10,7 +10,7 @@ syq exec --on @laptop --cwd work/project -- open report.html
 The second command uses macOS's `open` program to open the report. Replace
 it with any program installed on your receiving machine.
 
-If you have already set up [receiving files](receive.md), you can request
+If you have already set up [receiving](receive.md#set-up-receiving), you can request
 commands through the same connection. Otherwise, run `syq persist connect server`
 on your desktop first. Your desktop needs no SSH server or incoming network
 port, and you can make requests from any shell on the server, including an
