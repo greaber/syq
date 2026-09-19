@@ -349,7 +349,7 @@ mod tests {
     use super::*;
     #[test]
     fn a_download_waiting_for_data_does_not_occupy_the_only_blocking_worker() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let idle_file = Arc::new(File::create(dir.path().join("idle")).unwrap());
         let active_path = dir.path().join("active");
         let active_file = Arc::new(File::create(&active_path).unwrap());
@@ -450,7 +450,7 @@ mod tests {
     #[tokio::test]
     async fn write_failure_crosses_completion_barrier() {
         for batched in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let path = dir.path().join("output");
             std::fs::write(&path, b"original").unwrap();
             let file = Arc::new(File::open(&path).unwrap());

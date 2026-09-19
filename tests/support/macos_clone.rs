@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 pub fn available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let source = std::fs::File::create(dir.path().join("source")).unwrap();
         source.set_len(4096).unwrap();
         let source = std::fs::File::open(dir.path().join("source")).unwrap();

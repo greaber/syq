@@ -187,7 +187,7 @@ async fn fragmented_downloads_release_receive_buffers_and_preserve_bytes() {
             chunks,
         },
     ));
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let path = dir.path().join("output");
     std::fs::write(&path, b"prefix!").unwrap();
     let size = 7 + expected.len() as u64;
@@ -297,7 +297,7 @@ pub(super) fn planning_engine(extra: &[&str]) -> Engine {
 #[test]
 fn completed_download_releases_blocking_capacity_for_secondary_hash() {
     for valid in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let destination = dir.path().join("destination");
         std::fs::write(&destination, b"original").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()

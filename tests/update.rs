@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "support/temp.rs"]
+mod test_support;
+
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 fn release_target() -> &'static str {
@@ -34,8 +37,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let parent = std::env::temp_dir();
-        let parent = fs::canonicalize(&parent).unwrap_or(parent);
+        let parent = test_support::temp_dir();
         let path = parent.join(format!("syq-update-test-{}-{sequence}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();

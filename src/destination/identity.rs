@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn key_is_stable_across_reloads_and_concurrent_creators() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let keys = std::thread::scope(|scope| {
             let tasks: Vec<_> = (0..8)
                 .map(|_| {
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn proof_works_across_builds_but_not_different_receivers() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let (_broker, receiver, mut registration, _) =
             super::super::tests::broker(dir.path(), super::super::Approval::Always);
         let owner = receiver.identity_key.public_key().to_openssh().unwrap();
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn private_key_and_ownership_reject_unsafe_or_unknown_state() {
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         load_key_from(dir.path()).unwrap();
         let path = dir.path().join("identity_ed25519");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn long_key_comment_does_not_poison_ownership() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let key = generate_key().unwrap();
         let challenge = random_token().unwrap();
         let mut proof = prove(&key, "laptop", &challenge, "secret").unwrap();
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn ownership_survives_disconnect_until_explicit_forget() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let first = generate_key().unwrap().public_key().to_openssh().unwrap();
         let second = generate_key().unwrap().public_key().to_openssh().unwrap();
         claim(dir.path(), "laptop", &first).unwrap();

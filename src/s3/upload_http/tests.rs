@@ -6,8 +6,8 @@ async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests
     for synchronous in [false, true] {
         for phase in ["upload", "response-headers", "response-body"] {
             let await_response = phase != "upload";
-            let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().canonicalize().unwrap().join("source");
+            let temp = crate::test_support::tempdir().unwrap();
+            let path = temp.path().join("source");
             let size = if await_response {
                 4096
             } else {

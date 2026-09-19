@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[test]
 fn selected_hash_is_independent_of_payload_integrity() {
     use crate::hashing::{HashAlgorithm, HashPolicy};
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let path = directory.path().join("source");
     fs::write(&path, b"file contents").unwrap();
     for algorithm in [
@@ -98,7 +98,7 @@ fn selected_hash_is_independent_of_payload_integrity() {
 #[test]
 fn payload_integrity_checks_are_explicit() {
     use crate::hashing::{HashAlgorithm, HashPolicy};
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let path = b"target";
     let copy_id = [3; 16];
     let mut operations = destination_ops(directory.path());
@@ -178,7 +178,7 @@ fn payload_integrity_checks_are_explicit() {
 #[test]
 fn expected_digest_failure_preserves_existing_destination() {
     use crate::hashing::{Digest, HashAlgorithm, HashPolicy};
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let target = directory.path().join("target");
     fs::write(&target, b"old").unwrap();
     let path = b"target";
@@ -1217,7 +1217,7 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
 
 #[test]
 fn put_small_stages_with_final_mode_and_truncates_reused_sidecar() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let mut rooted = FsOps::new();
     rooted
         .install_destination(File::open(dir.path()).unwrap(), b"logical")
@@ -1343,7 +1343,7 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
         );
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     // macOS temp paths can traverse /var, a symlink to /private/var.
     // Exercise staging failure with a path the refusal policy accepts.
     let canonical = dir.path().canonicalize().unwrap();
@@ -1591,7 +1591,7 @@ fn destination_observation_uses_the_adopted_root_not_its_old_name() {
 
 #[test]
 fn unmatched_basis_creates_private_empty_stage_without_copying_old_bytes() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let path = directory.path().join("basis");
     fs::write(&path, b"old contents").unwrap();
     let copy_id = [42; 16];

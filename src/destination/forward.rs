@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn ssh_destinations_expand_only_a_leading_home_tilde() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let home = fs::canonicalize(root.path()).unwrap();
         for path in [b"~/archive".as_slice(), b"~//archive", b"archive"] {
             assert_eq!(
@@ -828,7 +828,7 @@ mod tests {
 
     #[test]
     fn return_authorization_uses_the_restricted_worker_limit() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let mut args = args(root.path(), "output");
         for workers in [1, 32, 64, 128] {
             args.connections_opt = Some(workers);
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn forward_validation_precedes_approval_and_outbound_ssh() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
         let (valid, _) = request(&args(root.path(), "output"));
         for case in 0..5 {
@@ -872,7 +872,7 @@ mod tests {
     #[test]
     fn forward_always_requires_a_local_decision_and_revocation_cancels_it() {
         for revoke in [false, true] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::tempdir().unwrap();
             let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
             let (copy, _) = request(&args(root.path(), "output"));
             let task = std::thread::spawn(move || {
