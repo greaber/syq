@@ -7,6 +7,10 @@ syq map --srcs-in photos > photos.ndjson
 syq cp --mapping photos.ndjson -C photos --into archive
 ```
 
+Named selectors must be relative to the source base; use `-C DIR` or `--root DIR`
+to choose that base. `--srcs-in` must be the only selector when used. `--as`
+requires one named object and cannot combine with `--srcs-in`.
+
 See [Rename and reorganize during a copy](../mappings.md) for worked examples.
 
 <!-- CLI: map -->
