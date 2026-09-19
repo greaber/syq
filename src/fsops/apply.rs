@@ -488,7 +488,9 @@ pub(super) fn set_meta_rooted(
     let metadata = target.root.metadata(&target.relative)?;
     require_rooted_condition(metadata, condition, &target.label)?;
     let is_link = metadata.is_symlink();
-    let owner_differs = (flags & flags::OWNER != 0 && is_superuser() && metadata.uid != meta.uid)
+    let owner_differs = (flags & flags::OWNER != 0
+        && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
+        && metadata.uid != meta.uid)
         || (flags & flags::GROUP != 0 && metadata.gid != meta.gid);
     let mode_differs =
         flags & flags::MODE_MASK != 0 && !is_link && metadata.mode & 0o7777 != meta.mode & 0o7777;

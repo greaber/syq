@@ -497,10 +497,7 @@ impl Engine {
         object.kind() == source.kind()
             && object.size == size
             && object.metadata.as_ref().is_some_and(|m| {
-                m.mtime == source.meta.mtime
-                    && m.nsec == source.meta.mtime_nsec
-                    && (explicit.mtime.is_none()
-                        || (m.mtime, m.nsec) == (desired.mtime, desired.nsec))
+                (m.mtime, m.nsec) == (desired.mtime, desired.nsec)
                     && (!(self.args.perms || explicit.mode.is_some()) || m.mode == desired.mode)
                     && (!(self.args.owner || self.args.group || explicit.uid.is_some())
                         || m.uid == desired.uid)
@@ -551,7 +548,9 @@ impl Engine {
                 None
             }
         });
+        let can_compare_time = source.metadata.is_none_or(|m| m.mtime.is_none());
         if whole_algorithm.is_none()
+            && can_compare_time
             && existing
                 .as_ref()
                 .is_some_and(|o| self.upload_metadata_matches(&source, size, o))
@@ -724,8 +723,10 @@ impl Engine {
             self.upload_metadata_matches(&source, size, o)
                 && o.metadata.as_ref().is_some_and(|m| {
                     self.args.checksum
-                        || whole_digest.is_none()
-                        || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm)
+                        || (whole_digest.is_none() && can_compare_time)
+                        || (whole_digest.is_some()
+                            && m.hash == whole_digest
+                            && m.hash_algorithm == metadata.hash_algorithm)
                 })
         });
         let comparison_digest = if self.args.checksum || self.args.verify_only {
@@ -1654,7 +1655,7 @@ impl Engine {
                     unchanged = metadata.hash.as_ref() == Some(&hash);
                 }
             } else {
-                unchanged = (m.mtime, m.mtime_nsec) == source_time;
+                unchanged = explicit.mtime.is_none() && (m.mtime, m.mtime_nsec) == source_time;
             }
         }
         if self.args.verify_only {

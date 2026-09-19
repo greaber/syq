@@ -1507,7 +1507,7 @@ impl Planner<'_> {
         }
         let same = dst_entry
             .as_ref()
-            .is_some_and(|d| opts.metadata_matches(&e, d));
+            .is_some_and(|d| opts.metadata_matches(&dst_rel, &e, d));
         let dst_newer = opts.update
             && dst_entry.as_ref().is_some_and(|d| {
                 d.kind == Kind::File && (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
@@ -1644,8 +1644,12 @@ impl Planner<'_> {
             return;
         };
         let meta = self.opts.metadata_for(rel, source);
-        let flags = requested.flags();
-        if !metadata_differs(&meta, &destination.meta(), flags) {
+        let flags = requested.apply_flags();
+        // Explicit nanoseconds must be attempted even if preservation's quick
+        // comparison would tolerate truncation by the destination filesystem.
+        let time_differs = requested.mtime.is_some()
+            && (meta.mtime, meta.mtime_nsec) != (destination.mtime, destination.mtime_nsec);
+        if !time_differs && !metadata_differs(&meta, &destination.meta(), flags) {
             return;
         }
         if self.opts.dry_run {
@@ -2139,7 +2143,8 @@ impl Planner<'_> {
                 }
                 Some(d)
                     if !opts.preserve_existing_directory_metadata
-                        && metadata_differs(&meta, &d.meta(), meta_flags)
+                        && (metadata_differs(&meta, &d.meta(), meta_flags)
+                            || opts.metadata_fix_flags(dst_rel, e, d) != 0)
                         && !self.implicit_dirs.contains(p) =>
                 {
                     self.dry_run_changes.metadata_directories.insert(p.clone());

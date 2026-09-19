@@ -1785,7 +1785,11 @@ impl Worker {
         let Some(destination) = job.dst_entry.as_deref() else {
             return Ok(false);
         };
-        if self.opts.checksum || !self.opts.metadata_matches(&job.entry, destination) {
+        if self.opts.checksum
+            || !self
+                .opts
+                .metadata_matches(&job.rel_bytes, &job.entry, destination)
+        {
             return Ok(false);
         }
         match self.dst.call(Request::ValidateDigest {

@@ -1620,6 +1620,10 @@ fn native_mapping_destination_metadata_keeps_source_identity_and_repairs_attribu
     );
     // A fixed requested timestamp is not a reason to reuse stale contents.
     write(&t.path("src/small"), b"other");
+    File::open(t.path("src/small"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(946684800, 123456789))
+        .unwrap();
     assert_output_ok(&syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes())));
     assert_eq!(read(&t.path("dst/dir/small")), b"other");
     // Matching content still receives explicit permissions, including on reruns.
@@ -1676,5 +1680,80 @@ fn native_mapping_metadata_failures_keep_retry_intent_and_validate_before_writes
         );
         assert!(!out.status.success(), "{entry}");
         assert!(!t.path("dst/file").exists());
+    }
+}
+
+#[test]
+fn native_mapping_metadata_repairs_link_fraction() {
+    use std::os::unix::fs::symlink;
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"content");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    symlink("file", t.path("src/link")).unwrap();
+    symlink("file", t.path("dst/link")).unwrap();
+    set_mtime(&t.path("dst/link"), 123);
+    let mut entry: serde_json::Value =
+        serde_json::from_str(&entry_line("link", "link", Some("symlink"))).unwrap();
+    entry["metadata"] = serde_json::json!({"mtime":123,"mtime_nsec":456});
+    let args = [
+        "--mapping",
+        "-",
+        "-C",
+        "src",
+        "--into",
+        "dst",
+        "--no-progress",
+    ];
+    assert_output_ok(&syq_cp_in(
+        &t.path(""),
+        &args,
+        Some(entry.to_string().as_bytes()),
+    ));
+    let m = fs::symlink_metadata(t.path("dst/link")).unwrap();
+    assert_eq!((m.mtime(), m.mtime_nsec()), (123, 456));
+}
+
+#[test]
+fn native_mapping_metadata_rejects_unapplied_ownership() {
+    use std::os::unix::fs::symlink;
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"content");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    symlink("file", t.path("src/link")).unwrap();
+    symlink("file", t.path("dst/link")).unwrap();
+    let args = [
+        "--mapping",
+        "-",
+        "-C",
+        "src",
+        "--into",
+        "dst",
+        "--no-progress",
+    ];
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("ownership denial requires a non-root test process");
+        return;
+    }
+    // Test staged publication, unchanged file repair, and an existing symlink.
+    write(&t.path("dst/file"), b"content");
+    set_mtime(&t.path("src/file"), 100);
+    set_mtime(&t.path("dst/file"), 100);
+    for (src, dst, kind) in [
+        ("file", "new", "file"),
+        ("file", "file", "file"),
+        ("link", "link", "symlink"),
+    ] {
+        for field in ["uid", "gid"] {
+            let mut entry: serde_json::Value =
+                serde_json::from_str(&entry_line(src, dst, Some(kind))).unwrap();
+            entry["metadata"] = serde_json::json!({field: 4294967294u32});
+            let out = syq_cp_in(&t.path(""), &args, Some(entry.to_string().as_bytes()));
+            assert!(
+                !out.status.success(),
+                "unapplied {field} on {dst} reported success: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(read(&t.path("dst/file")), b"content");
+        }
     }
 }

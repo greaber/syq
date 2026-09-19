@@ -184,7 +184,11 @@ impl Opts {
     }
 
     fn flags_for(&self, path: &[u8]) -> u8 {
-        self.flags | self.mapping_metadata.get(path).map_or(0, |m| m.flags())
+        self.flags
+            | self
+                .mapping_metadata
+                .get(path)
+                .map_or(0, |m| m.apply_flags())
     }
 
     fn metadata_fix_flags(&self, path: &[u8], source: &Entry, destination: &Entry) -> u8 {
@@ -195,10 +199,10 @@ impl Opts {
             changes |= flags::MODE;
         }
         if flags & flags::OWNER != 0 && source.uid != destination.uid {
-            changes |= flags::OWNER;
+            changes |= flags::OWNER | (flags & flags::REQUIRE_OWNER);
         }
         if flags & flags::GROUP != 0 && source.gid != destination.gid {
-            changes |= flags::GROUP;
+            changes |= flags::GROUP | (flags & flags::REQUIRE_GROUP);
         }
         if self
             .mapping_metadata
@@ -211,8 +215,14 @@ impl Opts {
         changes
     }
 
-    fn metadata_matches(&self, source: &Entry, destination: &Entry) -> bool {
-        destination.kind == Kind::File
+    fn metadata_matches(&self, path: &[u8], source: &Entry, destination: &Entry) -> bool {
+        // An earlier copy may have assigned this destination timestamp. Even
+        // if the source now happens to match it, it is not content evidence.
+        !self
+            .mapping_metadata
+            .get(path)
+            .is_some_and(|m| m.mtime.is_some())
+            && destination.kind == Kind::File
             && destination.size == source.size
             && self.flags & flags::TIMES != 0
             && destination.mtime == source.mtime

@@ -336,6 +336,10 @@ pub mod flags {
     /// including any receiver-observed directory setgid inheritance.
     pub const RECEIVER_MODE: u8 = 16;
     pub const MODE_MASK: u8 = MODE | RECEIVER_MODE;
+    /// Explicit mapping ownership must succeed, unlike best-effort preservation.
+    /// These modifiers require the corresponding OWNER/GROUP flag and authority.
+    pub const REQUIRE_OWNER: u8 = 32;
+    pub const REQUIRE_GROUP: u8 = 64;
 }
 
 /// Best-effort kernel counters for one end of a TCP data socket. `None` means

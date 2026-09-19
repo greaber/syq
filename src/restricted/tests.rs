@@ -3304,6 +3304,34 @@ fn grant_distinguishes_receiver_modes_from_source_permission_preservation() {
 }
 
 #[test]
+fn explicit_ownership_flags_require_existing_grant_authority() {
+    use proto::flags;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    for (attribute, required) in [
+        (flags::OWNER, flags::REQUIRE_OWNER),
+        (flags::GROUP, flags::REQUIRE_GROUP),
+    ] {
+        assert!(authority.check_flags(required).is_err());
+        assert!(authority.check_flags(attribute | required).is_err());
+    }
+    authority.copy.options.preserve_owner = true;
+    authority
+        .check_flags(flags::OWNER | flags::REQUIRE_OWNER)
+        .unwrap();
+    assert!(authority
+        .check_flags(flags::GROUP | flags::REQUIRE_GROUP)
+        .is_err());
+    authority.copy.options.preserve_group = true;
+    authority
+        .check_flags(flags::GROUP | flags::REQUIRE_GROUP)
+        .unwrap();
+    assert!(authority.check_flags(flags::REQUIRE_GROUP).is_err());
+}
+
+#[test]
 fn receiver_managed_modes_preserve_existing_objects_and_mask_new_ones() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");

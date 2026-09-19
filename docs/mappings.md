@@ -103,13 +103,14 @@ Optional fields are `mode` (permission bits, 0–4095), numeric `uid` and `gid`,
 A supplied `mtime` defaults to zero fractional seconds. Omitted attributes
 follow normal copy behavior; the top-level `mtime` remains informational.
 
-Explicit attributes apply without `--preserve`. Filesystem ownership changes
-still require OS permission, and symlinks cannot have a requested `mode`.
+Explicit attributes apply without `--preserve`. Ownership requests fail if the
+filesystem refuses them; symlinks cannot have a requested `mode`.
 S3 uploads store the attributes in syq object metadata; downloads apply them
 to the filesystem. S3-to-S3 copies keep other object metadata and stay server-side.
 Restricted receivers also require matching `--preserve` permissions in the signed
 grant. Selection rules such as `--only-new` still take precedence. Supplied
-timestamps describe the destination, not evidence that source contents match it.
+timestamps disable the size/time shortcut for those entries. Use `--hash` to
+compare contents when repeating a copy with a fixed destination timestamp.
 Older binaries that do not support `metadata` reject the manifest.
 
 Each entry copies one object. **A directory entry is not recursive.**

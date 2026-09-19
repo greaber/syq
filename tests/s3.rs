@@ -186,6 +186,43 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault == "mapping-metadata-rerun" {
+        let data = vec![b'x'; 65536];
+        let fields = vec![
+            ("ETag".into(), "\"mapping-object\"".into()),
+            ("Content-Length".into(), data.len().to_string()),
+            ("x-amz-meta-syq-format".into(), "1".into()),
+            ("x-amz-meta-syq-kind".into(), "file".into()),
+            ("x-amz-meta-syq-mode".into(), "416".into()),
+            ("x-amz-meta-syq-uid".into(), "0".into()),
+            ("x-amz-meta-syq-gid".into(), "0".into()),
+            ("x-amz-meta-syq-mtime".into(), "123".into()),
+            ("x-amz-meta-syq-mtime-nsec".into(), "456".into()),
+        ];
+        match method {
+            "HEAD" if !gate.0.load(Ordering::Acquire) => reply(&mut socket, 404, &[], b"", true),
+            "HEAD" => reply(&mut socket, 200, &fields, b"", true),
+            "GET" => reply(&mut socket, 200, &fields, &data, false),
+            "PUT" => {
+                let length: usize = headers["content-length"].parse().unwrap();
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).unwrap();
+                assert_eq!(body, data);
+                assert_eq!(headers["x-amz-meta-syq-mtime"], "123");
+                assert_eq!(headers["x-amz-meta-syq-mtime-nsec"], "456");
+                gate.0.store(true, Ordering::Release);
+                reply(
+                    &mut socket,
+                    200,
+                    &[("ETag".into(), "\"mapping-object\"".into())],
+                    b"",
+                    false,
+                );
+            }
+            _ => panic!("unexpected mapping request {first}"),
+        }
+        return;
+    }
     if fault == "copy-root-marker" {
         let path = first.split_whitespace().nth(1).unwrap();
         match (method, path.split('?').next().unwrap()) {
@@ -4497,6 +4534,17 @@ fn s3_mapping_metadata_uses_existing_requests_for_upload_and_download() {
         let entry = serde_json::json!({"src":{"encoding":"utf-8","value":"file"},
             "dst":{"encoding":"utf-8","value":"file"}, "metadata":{"mode":0o640,"mtime":123,"mtime_nsec":456}});
         std::fs::write(temp.path().join("mapping"), entry.to_string()).unwrap();
+        if fault == "single-ok" {
+            // The destination time might have been explicitly assigned by an
+            // earlier mapping. Even a match to the source is not content proof.
+            std::fs::create_dir(temp.path().join("output")).unwrap();
+            let path = temp.path().join("output/file");
+            std::fs::write(&path, vec![b'y'; 65536]).unwrap();
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1700000000))
+                .unwrap();
+        }
         let endpoint = if fault == "upload-metadata" {
             "--to"
         } else {
@@ -4514,19 +4562,56 @@ fn s3_mapping_metadata_uses_existing_requests_for_upload_and_download() {
             ],
         );
         assert!(output.status.success(), "{fault}: {}", output_text(&output));
-        // Planning HEAD and one data request; overrides add no provider calls.
-        assert_eq!(server.requests.load(Ordering::Relaxed), 2, "{fault}");
+        // Upload: HEAD + PUT. Existing download: discovery HEAD + execution
+        // HEAD + GET, as for ordinary existing-file downloads.
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            if fault == "single-ok" { 3 } else { 2 },
+            "{fault}"
+        );
         if fault == "single-ok" {
             let meta = std::fs::metadata(temp.path().join("output/file")).unwrap();
             assert_eq!(
                 (meta.mode() & 0o7777, meta.mtime(), meta.mtime_nsec()),
                 (0o640, 123, 456)
             );
-            assert_eq!(
-                std::fs::read(temp.path().join("output/file")).unwrap(),
-                vec![b'x'; 65536]
+            assert!(
+                std::fs::read(temp.path().join("output/file")).unwrap() == vec![b'x'; 65536],
+                "download retained stale content"
             );
         }
+    }
+}
+
+#[test]
+fn s3_mapping_metadata_rejects_unapplied_ownership_on_download() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("ownership denial requires a non-root test process");
+        return;
+    }
+    let server = Server::start("single-ok");
+    let temp = tempfile::tempdir().unwrap();
+    for field in ["uid", "gid"] {
+        let entry = serde_json::json!({"src":{"encoding":"utf-8","value":"file"},
+            "dst":{"encoding":"utf-8","value":"file"}, "metadata":{field:4294967294u32}});
+        std::fs::write(temp.path().join("mapping"), entry.to_string()).unwrap();
+        let out = server.cp(
+            temp.path(),
+            &[
+                "--mapping",
+                "mapping",
+                "--from",
+                "s3://bucket",
+                "--into",
+                "output",
+            ],
+        );
+        assert!(
+            !out.status.success(),
+            "unapplied {field} reported success: {}",
+            output_text(&out)
+        );
+        assert!(!temp.path().join("output/file").exists());
     }
 }
 
@@ -4559,5 +4644,48 @@ fn server_copy_mapping_metadata_preserves_other_headers_without_reading_bodies()
             server.requests.load(Ordering::Relaxed),
             if fault.contains("multipart") { 7 } else { 3 }
         );
+    }
+}
+
+#[test]
+fn s3_mapping_metadata_hash_rerun_avoids_upload_despite_overridden_time() {
+    let server = Server::start("mapping-metadata-rerun");
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("file"), vec![b'x'; 65536]).unwrap();
+    let entry = serde_json::json!({"src":{"encoding":"utf-8","value":"file"},
+        "dst":{"encoding":"utf-8","value":"file"}, "metadata":{"mode":0o640,"mtime":123,"mtime_nsec":456}});
+    std::fs::write(temp.path().join("mapping"), entry.to_string()).unwrap();
+    for round in 0..3 {
+        let mut args = vec![
+            "--mapping",
+            "mapping",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "output",
+            "--results",
+            "results.jsonl",
+        ];
+        if round > 0 {
+            args.push("--hash");
+        }
+        let before = server.requests.load(Ordering::Relaxed);
+        let out = server.cp(temp.path(), &args);
+        assert!(out.status.success(), "{}", output_text(&out));
+        // First HEAD + PUT; reruns HEAD + checksum GET, with no re-upload.
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed) - before,
+            2,
+            "round {round}: {}",
+            output_text(&out)
+        );
+        let results = parsed_results(temp.path());
+        let summary = results.last().unwrap();
+        assert_eq!(
+            summary["bytes_transferred"],
+            if round == 0 { 65536 } else { 0 }
+        );
+        assert_eq!(summary["files_unchanged"], if round == 0 { 0 } else { 1 });
+        std::fs::remove_file(temp.path().join("results.jsonl")).unwrap();
     }
 }

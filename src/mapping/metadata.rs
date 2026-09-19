@@ -69,6 +69,21 @@ impl Metadata {
         selected
     }
 
+    /// Application flags also distinguish explicit ownership from preservation.
+    pub(crate) fn apply_flags(&self) -> u8 {
+        self.flags()
+            | if self.uid.is_some() {
+                flags::REQUIRE_OWNER
+            } else {
+                0
+            }
+            | if self.gid.is_some() {
+                flags::REQUIRE_GROUP
+            } else {
+                0
+            }
+    }
+
     pub(crate) fn apply(&self, meta: &mut Meta) {
         if let Some(mode) = self.mode {
             meta.mode = mode;

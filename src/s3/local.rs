@@ -561,6 +561,7 @@ pub(super) fn apply_file_metadata(
         },
         flags::MODE
             | flags::TIMES
+            | explicit.apply_flags()
             | if args.owner || explicit.uid.is_some() {
                 flags::OWNER
             } else {
