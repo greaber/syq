@@ -3829,6 +3829,7 @@ fn receiver_rejects_descriptor_copy_operations() {
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     for operation in [
         crate::descriptor_copy::Operation::Open {
+            entry: 1,
             dry_run: false,
             only_new: false,
             only_existing: false,
@@ -3841,12 +3842,16 @@ fn receiver_rejects_descriptor_copy_operations() {
             source_meta: None,
             settings: Default::default(),
         },
-        crate::descriptor_copy::Operation::Finish { size: 0 },
+        crate::descriptor_copy::Operation::Finish { entry: 1, size: 0 },
+        crate::descriptor_copy::Operation::Abort { entry: 1 },
     ] {
         let mut request = Request::DescriptorCopy(operation);
         assert!(authority.authorize(&mut request, true).is_err());
         assert!(!request.allowed_on_source_worker());
     }
+    let mut rebind = Request::BindStream(None);
+    assert!(authority.authorize(&mut rebind, true).is_err());
+    assert!(!rebind.allowed_on_source_worker());
 }
 
 #[test]

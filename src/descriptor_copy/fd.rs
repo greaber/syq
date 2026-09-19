@@ -1,5 +1,5 @@
-//! Inherited byte streams without changing shared file status flags. Blocking
-//! workers may outlive cancellation; the CLI exits after network cleanup.
+//! Caller-owned descriptors retain their shared file status flags. Exclusively
+//! owned payload ends use nonblocking I/O so a cancelled entry can retire them.
 use anyhow::{bail, Context, Result};
 use std::{
     fs::File,
@@ -74,15 +74,7 @@ impl Source {
                             && actual.ino() == expected.ino,
                         "source FIFO changed while opening"
                     );
-                    #[cfg(target_os = "linux")]
-                    enlarge_pipe(&file);
-                    Ok(Descriptor {
-                        file,
-                        metadata: None,
-                        original: -1,
-                        descriptor_flags: 0,
-                        cancelled,
-                    })
+                    Descriptor::owned(file, true, cancelled)
                 })
                 .await?
             }
@@ -90,14 +82,63 @@ impl Source {
     }
 }
 
+pub(crate) struct CancelOnDrop(pub Arc<AtomicBool>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Relaxed);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Retirement {
+    done: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+impl Retirement {
+    pub(crate) async fn wait(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.done.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
 pub(crate) struct Descriptor {
     file: File,
+    retired: Arc<Retirement>,
     metadata: Option<std::fs::Metadata>,
     original: i32,
     descriptor_flags: i32,
     cancelled: Arc<AtomicBool>,
 }
 impl Descriptor {
+    /// For a pipe/socket whose open-file description is exclusively owned by
+    /// syq (including SDK payload ends). Caller-owned FDs use `open` instead.
+    pub(crate) fn owned(file: File, upload: bool, cancelled: Arc<AtomicBool>) -> Result<Self> {
+        let mut result = Self::open(file.as_raw_fd(), upload, cancelled)?;
+        if result.metadata.is_none() {
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0
+                || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                    < 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("make owned stream cancellable");
+            }
+        }
+        // The original is now ours to close, not a caller descriptor whose
+        // close-on-exec flags must be restored when the duplicate is dropped.
+        result.original = -1;
+        Ok(result)
+    }
+    pub(crate) fn retirement(&self) -> Option<Arc<Retirement>> {
+        (self.original == -1).then(|| self.retired.clone())
+    }
     pub fn open(fd: i32, upload: bool, cancelled: Arc<AtomicBool>) -> Result<Self> {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
@@ -128,6 +169,7 @@ impl Descriptor {
         let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         let result = Self {
             file,
+            retired: Arc::default(),
             metadata: kind.is_file().then_some(metadata),
             original: fd,
             descriptor_flags,
@@ -177,8 +219,8 @@ impl Descriptor {
         }
         Ok(())
     }
-    // Only already-nonblocking descriptors need poll. Process exit ends a quiet
-    // wait, just as it ends a blocking read/write; no periodic wakeup is needed.
+    // Owned payload ends and already-nonblocking inherited FDs can retire
+    // without changing any caller's shared file status flags.
     fn wait(&self, events: i16) -> Result<()> {
         loop {
             if self.cancelled.load(Relaxed) {
@@ -189,7 +231,7 @@ impl Descriptor {
                 events,
                 revents: 0,
             };
-            let rc = unsafe { libc::poll(&mut poll, 1, -1) };
+            let rc = unsafe { libc::poll(&mut poll, 1, 100) };
             if rc > 0 {
                 return Ok(());
             }
@@ -298,6 +340,10 @@ impl Descriptor {
 }
 impl Drop for Descriptor {
     fn drop(&mut self) {
+        self.retired
+            .done
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.retired.changed.notify_waiters();
         unsafe {
             if self.original > 2 {
                 libc::fcntl(self.original, libc::F_SETFD, self.descriptor_flags);

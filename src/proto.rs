@@ -951,6 +951,9 @@ pub enum WireRequest<Data> {
         guard: Option<ContainerGuard>,
     },
     DescriptorCopy(crate::descriptor_copy::Operation),
+    /// Reuse a drained stream worker within its original endpoint session.
+    /// None releases its file before the control connection publishes it.
+    BindStream(Option<(DescriptorTicket, crate::descriptor_copy::Settings)>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

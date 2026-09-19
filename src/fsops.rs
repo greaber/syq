@@ -375,8 +375,9 @@ fn is_superuser() -> bool {
 }
 
 pub struct FsOps {
-    descriptor_copy: Option<crate::descriptor_copy::Session>,
+    descriptor_copy: crate::descriptor_copy::Session,
     stream_worker: Option<crate::descriptor_copy::FileWorker>,
+    stream_ticket: Option<crate::descriptor_broker::DescriptorTicket>,
     hash_policy: crate::hashing::HashPolicy,
     pub(crate) observations: Arc<crate::transfer_observations::Registry>,
     operation: Arc<crate::transfer_observations::Actor>,
@@ -552,8 +553,9 @@ impl FsOps {
         let observations = Arc::new(crate::transfer_observations::Registry::default());
         let operation = observations.actor("filesystem");
         FsOps {
-            descriptor_copy: None,
+            descriptor_copy: Default::default(),
             stream_worker: None,
+            stream_ticket: None,
             hash_policy: crate::hashing::HashPolicy {
                 algorithm: crate::hashing::HashAlgorithm::Blake3,
                 transfer_integrity: true,
@@ -1048,11 +1050,18 @@ impl FsOps {
         ticket: &crate::descriptor_broker::DescriptorTicket,
         settings: crate::descriptor_copy::Settings,
     ) -> Result<()> {
+        if let Some(original) = &self.stream_ticket {
+            anyhow::ensure!(
+                original.same_session(ticket),
+                "stream worker cannot change endpoint sessions"
+            );
+        }
         let write = ticket.stream_write()?;
         let file = self.descriptor_session.acquire(ticket)?;
         self.stream_worker = Some(crate::descriptor_copy::FileWorker::new(
             file, write, settings,
         )?);
+        self.stream_ticket = Some(ticket.clone());
         Ok(())
     }
 
@@ -1745,7 +1754,7 @@ impl FsOps {
             Ok(())
         };
         match req {
-            Request::DescriptorCopy(_) => {
+            Request::DescriptorCopy(_) | Request::BindStream(_) => {
                 bail!("descriptor copies require a separate unrestricted control session")
             }
             Request::Scan { root, guard, .. } => {

@@ -2571,7 +2571,7 @@ impl RestrictedAuthority {
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a command-restricted destination")
             }
-            Request::DescriptorCopy(_) => {
+            Request::DescriptorCopy(_) | Request::BindStream(_) => {
                 bail!("descriptor copies are not valid on a command-restricted receiver")
             }
             Request::Hello { .. } => bail!("unexpected second receiver handshake"),
