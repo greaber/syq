@@ -194,6 +194,14 @@ for mapping entries, kind and bytes where applicable, plus a `reason`:
 `destination_missing`, `type_differs`, `content_differs`, `metadata_differs`,
 or `destination_only`.
 
+For filesystem copies of regular files, `content_differs` means the sizes or
+compared hashes differ.
+A metadata quick check that decides to copy uses `metadata_differs`; it does not
+establish whether the contents differ. `transfer_file` traces with `bytes` plan
+content work; those without `bytes` plan only metadata changes. Use `--hash` for
+content comparisons. Inspection failures emit errors and a non-success terminal
+result; differences found by a dry run are planned changes, not errors.
+
 A trace cannot be matched by identity to a later live operation: the filesystem
 may change between runs.
 

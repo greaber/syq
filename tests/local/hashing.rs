@@ -867,3 +867,172 @@ pub(super) fn expected_mapping(
     write(&t.path(&path), entry.to_string().as_bytes());
     t.s(&path)
 }
+
+#[test]
+fn dry_run_hash_compares_contents_and_metadata_without_writing() {
+    for route in [
+        "local", "push-tcp", "push-ssh", "pull-tcp", "pull-ssh", "relay",
+    ] {
+        let t = Tmp::new();
+        for (name, source, destination) in [
+            ("same", b"same".as_slice(), Some(b"same".as_slice())),
+            ("corrupt", b"aaaa", Some(b"bbbb".as_slice())),
+            ("metadata", b"bytes", Some(b"bytes".as_slice())),
+            ("missing", b"new", None),
+            ("size", b"new", Some(b"old data".as_slice())),
+            ("ignored", b"x", Some(b"z".as_slice())),
+        ] {
+            write(&t.path(&format!("src/{name}")), source);
+            set_mtime(&t.path(&format!("src/{name}")), 1_700_000_000);
+            if let Some(bytes) = destination {
+                write(&t.path(&format!("dst/{name}")), bytes);
+                set_mtime(&t.path(&format!("dst/{name}")), 1_700_000_000);
+            }
+        }
+        fs::set_permissions(t.path("src/metadata"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(t.path("dst/metadata"), fs::Permissions::from_mode(0o600)).unwrap();
+        set_mtime(&t.path("dst/metadata"), 1_700_000_001);
+        let before = fs::metadata(t.path("dst/metadata")).unwrap();
+        let rsh = fake_rsh(&t);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--dry-run",
+            "--hash",
+            "--preserve=permissions",
+            "--ignore=ignored",
+            "--performance-tuning=workers=2",
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+        ]);
+        if route.ends_with("ssh") {
+            command.arg("--no-tcp");
+        }
+        if route.starts_with("pull") || route == "relay" {
+            command.args(["--from", "source"]);
+        }
+        command.args(["--srcs-in", &t.s("src")]);
+        if route.starts_with("push") || route == "relay" {
+            command.args(["--to", "destination"]);
+        }
+        if route == "relay" {
+            command.args(["--coordinate-at", "local"]);
+        }
+        command.args([
+            "--into",
+            &t.s("dst"),
+            "--results",
+            &t.s("result.ndjson"),
+            "-v",
+        ]);
+        let output = command.run().unwrap();
+        assert_output_ok(&output);
+        let text = fs::read_to_string(t.path("result.ndjson")).unwrap();
+        assert_automation_stream(&automation_validator(), &text, route);
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let summary = records.last().unwrap();
+        assert_eq!(summary["files_transferred"], 3, "{route}: {summary}");
+        assert_eq!(summary["bytes_transferred"], 10, "{route}: {summary}");
+        assert_eq!(summary["files_unchanged"], 2, "{route}: {summary}");
+        assert_eq!(summary["bytes_unchanged"], 9, "{route}: {summary}");
+        assert_eq!(
+            summary["files_excluded"], 0,
+            "ignore exclusions use paths_ignored"
+        );
+        assert!(!records.iter().any(|r| r["type"] == "operation_result"));
+        for (name, reason, bytes) in [
+            ("corrupt", "content_differs", Some(4)),
+            ("size", "content_differs", Some(3)),
+            ("missing", "destination_missing", Some(3)),
+            ("metadata", "metadata_differs", None),
+        ] {
+            let trace = records
+                .iter()
+                .find(|r| r["type"] == "trace" && r["dst"]["value"] == name)
+                .unwrap();
+            assert_eq!(trace["reason"], reason, "{route}: {trace}");
+            assert_eq!(trace.get("bytes").and_then(|b| b.as_u64()), bytes);
+        }
+        assert!(!records.iter().any(|r| r["type"] == "trace"
+            && ["same", "ignored"].contains(&r["dst"]["value"].as_str().unwrap_or(""))));
+        assert_eq!(read(&t.path("dst/corrupt")), b"bbbb");
+        assert_eq!(read(&t.path("dst/size")), b"old data");
+        assert_eq!(read(&t.path("dst/ignored")), b"z");
+        assert!(!t.path("dst/missing").exists());
+        let after = fs::metadata(t.path("dst/metadata")).unwrap();
+        assert_eq!(
+            (after.ino(), after.mode(), after.mtime(), after.mtime_nsec()),
+            (
+                before.ino(),
+                before.mode(),
+                before.mtime(),
+                before.mtime_nsec()
+            )
+        );
+        assert!(partial_files(&t.0).is_empty());
+    }
+}
+
+#[test]
+fn dry_run_hash_mapping_reports_source_names_and_timestamp_only_changes() {
+    let t = Tmp::new();
+    write(&t.path("src/input"), b"abc");
+    write(&t.path("output"), b"abc");
+    set_mtime(&t.path("src/input"), 1_700_000_000);
+    set_mtime(&t.path("output"), 1_700_000_001);
+    for hash in [false, true] {
+        let results = t.s(if hash { "hash.ndjson" } else { "quick.ndjson" });
+        let mapping = expected_mapping(&t, "input", "output", None);
+        let source = t.s("src");
+        let destination = t.s("");
+        let mut args = vec![
+            "cp",
+            "--dry-run",
+            "--mapping",
+            &mapping,
+            "-C",
+            &source,
+            "--into",
+            &destination,
+            "--results",
+            &results,
+        ];
+        if hash {
+            args.push("--integrity-checking=compare=md5");
+        }
+        let output = native_syq(&args);
+        assert_output_ok(&output);
+        let records: Vec<serde_json::Value> = fs::read_to_string(results)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let trace = records
+            .iter()
+            .find(|r| r["type"] == "trace" && r["kind"] == "file")
+            .unwrap();
+        assert_eq!(trace["src"]["value"], "input");
+        assert_eq!(trace["dst"]["value"], "output");
+        assert_eq!(trace["reason"], "metadata_differs");
+        assert_eq!(
+            trace.get("bytes").and_then(|b| b.as_u64()),
+            if hash { None } else { Some(3) }
+        );
+        assert_eq!(
+            records.last().unwrap()["files_transferred"],
+            u64::from(!hash)
+        );
+        assert_eq!(records.last().unwrap()["files_unchanged"], u64::from(hash));
+        assert_eq!(
+            fs::metadata(t.path("output")).unwrap().mtime(),
+            1_700_000_001
+        );
+    }
+}
