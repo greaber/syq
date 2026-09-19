@@ -256,14 +256,19 @@ consistency, and durability considerations are covered in
 
 ## Persistent connections
 
-A persistent SSH login stays available to processes running as your local user
-without another key touch or agent approval. Receiving is configured separately.
-When enabled, servers you have a persistent connection to can request copies
-to or commands on your machine.
-Receiving defaults to enabled, but `syq persist receive off` disables it while
-keeping SSH reuse. `syq persist off` closes both.
+A persistent SSH login lets processes running as your local user access the
+server without another key touch or agent approval. This access remains
+available even with receiving turned off. `syq persist off` closes the
+persistent connections, including receiving.
 
-When receiving is enabled, requests from a server are subject to local approval:
+## Receivers
+
+With receiving enabled, servers you have persistent connections to can request
+copies to or commands on your machine, or authorization for copies to another
+server. Receiving is configured separately and defaults to enabled. `syq persist receive off`
+disables these requests while keeping SSH reuse.
+
+Requests from a server are subject to local approval:
 
 | Request | Approval on your machine |
 |---|---|

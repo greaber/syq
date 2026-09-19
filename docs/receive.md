@@ -101,7 +101,7 @@ syq persist receive on --name laptop --approve ask   # require approval again
 
 Automatic approval trusts all processes running as the connected server accounts,
 including for overwrites. Commands and copies to another server still require
-separate approval. See [Persistent connections](security.md#persistent-connections)
+separate approval. See [Receivers](security.md#receivers)
 for the trust boundary.
 
 ## Copy permissions and limits
