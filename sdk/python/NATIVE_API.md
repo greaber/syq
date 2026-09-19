@@ -65,7 +65,7 @@ filesystem and remote checks happen in syq.
 
 ## cp
 
-`cp(*sources, **options)` → [CpResult](https://greaber.github.io/syq/python-reference.html#cpresult) copies files. Choose one placement option.
+`cp(*sources, **options)` → [CpResult](https://greaber.github.io/syq/python-reference.html#cpresult) copies files. Choose one placement option unless every destination is a callback.
 In addition to the shared arguments above, it accepts:
 
 | Options | Values / purpose |
@@ -74,6 +74,7 @@ In addition to the shared arguments above, it accepts:
 | `into`, `into_new`, `into_existing` | Destination directory paths |
 | `as_`, `as_new`, `as_existing` | Exact destination paths |
 | `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
+| `stream_concurrency` | Maximum callback entries active at once; default `4`, range `1..256`; transport worker and request limits are shared across entries |
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune`, `dry_run`, `hash` | Boolean: mirror, preview, or compare content |
 | `integrity_checking` | Comma-separated string, e.g. `"transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
@@ -323,6 +324,56 @@ starts no copy. Plain iterables and manifest paths have no source context; pass
 `cwd`, `root`, or `from_` explicitly as needed. See
 [mapping rules](https://greaber.github.io/syq/mappings.html).
 
+### Callback mappings
+
+`StreamSource(produce, *, size=None)` supplies bytes to one mapping entry.
+`StreamDestination(consume)` receives them. Pass either or both as the `src`
+and `dst` of a `MappingEntry`; callback entries require `kind=None` or `"file"`.
+These objects work with live `cp(mapping=...)` calls, not saved pathname manifests.
+
+The complete iterable is validated before any callback or destination change.
+Callbacks start lazily, with at most `stream_concurrency` entries active; one
+entry can have both a producer and consumer. Pathname entries run first with
+their usual comparison and recovery behavior, then callback entries share
+transfer sessions. A mixed mapping therefore has one endpoint setup per phase.
+A failed entry does not undo entries that already succeeded.
+
+Producers receive a writable binary file object. Returning normally authorizes
+publication; closing the object only ends the bytes. An exception, including
+one raised after a wrapper closes the writer, cancels unpublished work. Consumers
+receive a readable binary object. Reading through EOF checks transfer success;
+a normal early return drains and checks the rest. Consumer exceptions cancel
+remaining work. Write extracted files into a staging directory and publish it
+after `cp` succeeds. syq cannot undo a consumer's own side effects.
+
+`Client` runs callbacks on worker threads. `AsyncClient` accepts the same
+synchronous callbacks, or `async def` callbacks that await `read`, `write`, and
+`close`; async callbacks run on the caller's event loop. Cancellation releases
+blocked payload I/O. Application code that keeps computing without I/O must
+cooperate with cancellation. Do not retain the supplied file object after return.
+
+`StreamSource.size` promises the exact byte count; a mismatch fails before
+publication. `MappingEntry.size` remains informational. `expected_hash` checks
+the bytes during transfer on every backend; it adds no second download. Without
+an expectation or requested integrity check, no extra whole-stream hash is made.
+`metadata` sets attributes on named destinations without `preserve`. Source
+callbacks have no file metadata to preserve. S3 stores explicit attributes in
+syq's existing object metadata format; omitted attributes use new-file defaults.
+
+Skip policies and dry runs do not invoke excluded callbacks. Callbacks always
+transfer when selected; they have no saved content identity for comparison or
+restart recovery. They cannot use `hash`, content comparison, `inplace`, pruning,
+or source-tree ignore rules. Filter entries in your script. Named receiver
+grants authorize paths and do not accept callbacks. Callbacks run locally;
+mixed pathname transfers between SSH hosts require `coordinate_at="local"`.
+
+Callback runs emit `MappingStreamResult` events with the original zero-based
+entry index, `source` and `destination` (`PathValue`, or `None` for a callback),
+`disposition`, `dry_run`, optional `bytes`, and optional error `message`.
+After a completed run, use failed entry indices to construct an application
+retry. Callbacks are never replayed automatically. Their automation records use
+schema version 3; ordinary pathname and descriptor calls retain version 2.
+
 <a id="digest-and-hashalgorithm"></a>
 
 ### Hash and HashAlgorithm
@@ -350,8 +401,8 @@ of these to `cp(mapping=...)`; use `dataclasses.replace` to change an entry.
 
 | Attribute | Type | Meaning |
 |---|---|---|
-| `src` | `RelativePath` | Path relative to the copy's source base |
-| `dst` | `RelativePath` | Path relative to the destination container |
+| `src` | `RelativePath` or `StreamSource` | Path relative to the source base, or a producer callback |
+| `dst` | `RelativePath` or `StreamDestination` | Path relative to the destination container, or a consumer callback |
 | `kind` | `EntryKind` or `None` | Object kind, when known; default `None` |
 | `size` | `int` or `None` | Informational size in bytes; default `None` |
 | `mtime` | `int` or `None` | Informational modification time in Unix seconds; default `None` |

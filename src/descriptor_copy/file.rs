@@ -414,6 +414,11 @@ impl FileSession {
                             .file
                             .set_permissions(Permissions::from_mode(destination.mode))?;
                     }
+                    if let Some(attributes) = destination.metadata.overrides {
+                        let mut meta = super::metadata::from_file(&stream.file.metadata()?);
+                        attributes.apply(&mut meta);
+                        crate::fsops::set_meta_file(&stream.file, &meta, attributes.apply_flags())?;
+                    }
                     stream.file.sync_all()?;
                     destination.root.rename_regular_if_same(
                         &destination.temporary,

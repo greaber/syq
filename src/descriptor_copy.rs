@@ -1,12 +1,13 @@
 //! Raw byte copies through caller-owned descriptors. The named counterpart is
 //! one regular file or one exact S3 key; no file-tree or recovery state is made.
+pub(crate) mod check;
 pub(crate) mod controls;
 pub(crate) mod fd;
 mod file;
 pub(crate) mod metadata;
-mod parallel;
+pub(crate) mod parallel;
 pub(crate) mod report;
-mod session;
+pub(crate) mod session;
 pub(crate) use controls::validate_controls;
 use controls::Controls;
 

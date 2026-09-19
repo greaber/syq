@@ -195,7 +195,48 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
     get = base + ['--from', 's3://bucket', 'object']
     put = base + ['--to', 's3://bucket', '--as', 'object']
     try:
-        if CASE == 'preview-results':
+        if CASE == 'mapping-callbacks':
+            import syq
+            sdk = syq.Client(executable=SYQ, env=env, timeout=15)
+            options = dict(s3_endpoint=f'http://127.0.0.1:{server.server_port}', s3_region='us-east-1',
+                           performance_tuning='s3-part-size=5M,s3-max-concurrent-parts-per-object=2,s3-retries=0',
+                           resource_limits='s3-max-concurrent-requests=1')
+            def produce(out):
+                out.write(DATA)
+            for payload in (b'', b'bytes', DATA):
+                result = sdk.cp(mapping=[syq.MappingEntry(syq.StreamSource(lambda out: out.write(payload), size=len(payload)), 'object',
+                    metadata=syq.DestinationMetadata(mode=0o640, mtime=123, mtime_nsec=456))], to='s3://bucket', into='.', **options)
+                assert result.bytes_transferred == len(payload), result
+                assert STATE['published'] == payload
+                assert STATE['metadata']['x-amz-meta-syq-mode'] == str(0o640), STATE['metadata']
+            values = []
+            result = sdk.cp(mapping=[syq.MappingEntry('object', syq.StreamDestination(lambda inp: values.append(inp.read()))) for _ in range(4)],
+                            from_='s3://bucket', stream_concurrency=4, **options)
+            assert values == [DATA] * 4, [len(v) for v in values]
+            assert result.bytes_transferred == len(DATA) * 4
+            before = STATE['aborts']
+            result = sdk.cp(mapping=[syq.MappingEntry(syq.StreamSource(produce), 'object', expected_hash=syq.Hash('sha256', '0' * 64))],
+                            to='s3://bucket', into='.', check=False, **options)
+            assert result.exit_code == 23 and STATE['aborts'] == before + 1, result
+            assert STATE['published'] == DATA
+            def late_failure(out):
+                out.write(DATA)
+                raise ValueError('archive producer failed')
+            try:
+                sdk.cp(mapping=[syq.MappingEntry(syq.StreamSource(late_failure), 'object')], to='s3://bucket', into='.', **options)
+            except ValueError as error:
+                assert str(error) == 'archive producer failed'
+            else:
+                raise AssertionError('callback failure disappeared')
+            assert STATE['published'] == DATA
+            CASE = 'truncated'
+            values = []
+            result = sdk.cp(mapping=[syq.MappingEntry('object', syq.StreamDestination(lambda inp: values.append(inp.read())))],
+                            from_='s3://bucket', check=False, **options)
+            assert result.exit_code == 23 and values == [], result
+            CASE = 'mapping-callbacks'
+
+        elif CASE == 'preview-results':
             results = Path(temp) / 'download.json'
             response = run(get + ['--dry-run', '--results', str(results)], env=env)
             success(response)

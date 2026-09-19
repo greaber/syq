@@ -176,6 +176,28 @@ reader context to finish successfully before making those files available.
 See [Byte streams](https://greaber.github.io/syq/python-reference.html#byte-streams)
 for wrappers, explicit completion, and async behavior.
 
+For several generated files, put producers in a mapping. syq starts them as
+transfer capacity becomes available and reuses its connections:
+
+```python
+from functools import partial
+
+def pack(directory, output):
+    with tarfile.open(fileobj=output, mode="w|") as archive:
+        archive.add(directory, arcname=directory)
+
+syq.cp(mapping=[syq.MappingEntry(syq.StreamSource(partial(pack, name)), f"{name}.tar")
+                for name in ("images", "labels")],
+       to="s3://backups", into="dataset", stream_concurrency=2)
+```
+
+A `StreamDestination(consumer)` receives downloaded bytes in the same way.
+Archive formats belong to your callback. The
+[RSB example](https://github.com/greaber/syq/blob/master/examples/rsb-streams/rsb_streams.py)
+shows sharded tar uploads and restoration using an RSB-compatible Parquet index.
+See [Callback mappings](https://greaber.github.io/syq/python-reference.html#callback-mappings)
+for completion, retries, and async callbacks.
+
 ## Use asyncio
 
 Await operations on `AsyncClient`. Its arguments and results match `Client`:

@@ -67,6 +67,14 @@ pub enum CoordinateAt {
 pub struct Args {
     #[arg(skip)]
     pub(crate) descriptor_copy: Option<crate::descriptor_copy::Plan>,
+    #[arg(skip)]
+    pub(crate) stream_mapping_fd: Option<i32>,
+    #[arg(skip)]
+    pub(crate) stream_concurrency: usize,
+    #[arg(skip)]
+    pub(crate) stream_preserve_times: bool,
+    #[arg(skip)]
+    pub(crate) results_override: Option<std::sync::Arc<crate::results::ResultsWriter>>,
     /// Process-local S3 transfer settings; never serialized into helper requests.
     #[arg(skip)]
     pub(crate) s3: Option<crate::s3::Options>,
@@ -1263,6 +1271,11 @@ struct NativeCopyFields {
     /// -C and dst paths are relative to the --into container
     #[arg(long, value_name = "FILE")]
     mapping: Option<OsString>,
+    /// Private SDK callback control socket; callbacks are not saved mappings.
+    #[arg(long, hide = true, requires = "mapping", conflicts_with_all = ["src_fd", "as_fd"])]
+    stream_mapping_fd: Option<i32>,
+    #[arg(long, hide = true, requires = "stream_mapping_fd", value_parser = clap::value_parser!(u16).range(1..=256))]
+    stream_concurrency: Option<u16>,
     #[command(flatten)]
     results_output: NativeResultsArgs,
     #[command(flatten)]
@@ -2103,6 +2116,19 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.delete = prune;
     args.max_delete = max_delete;
     args.native_mapping = mapping.map(OsStringExt::into_vec);
+    args.stream_mapping_fd = copy.stream_mapping_fd;
+    args.stream_concurrency = usize::from(copy.stream_concurrency.unwrap_or(4));
+    args.stream_preserve_times = copy
+        .operational
+        .preserve
+        .iter()
+        .any(|p| matches!(p, NativePreserve::Times));
+    if let Some(fd) = args.stream_mapping_fd {
+        anyhow::ensure!(
+            fd > 2 && Some(fd) != results_fd,
+            "stream mapping control requires a distinct descriptor greater than 2"
+        );
+    }
     args.native_results = results.map(OsStringExt::into_vec);
     args.native_results_fd = results_fd;
     args.suppress_summary = copy.suppress_summary;

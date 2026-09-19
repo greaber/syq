@@ -34,6 +34,9 @@ pub const SCHEMA: &str = "syq.automation";
 pub const SCHEMA_VERSION: u64 = 2;
 
 pub struct ResultsWriter {
+    schema_version: u64,
+    parent: Option<Arc<ResultsWriter>>,
+    phase_result: Mutex<Option<serde_json::Value>>,
     mapping_metadata: std::sync::OnceLock<
         std::collections::HashMap<crate::proto::PathBytes, crate::mapping::Metadata>,
     >,
@@ -46,6 +49,12 @@ pub struct ResultsWriter {
     /// nothing may follow it, even from a straggling ticker render racing
     /// an error unwind. Sealing also makes a second terminal impossible.
     sealed: AtomicBool,
+}
+
+impl std::fmt::Debug for ResultsWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResultsWriter").finish_non_exhaustive()
+    }
 }
 
 /// One settled operation. `dst`/`src` are container/base-relative raw path
@@ -173,6 +182,9 @@ pub enum RunMode {
 /// native commands use this path so descriptor ownership, symlink policy,
 /// fresh-file semantics, and run identity cannot drift.
 pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
+    if let Some(writer) = &args.results_override {
+        return Ok(Some(writer.clone()));
+    }
     let requested = args.native_results.is_some() || args.native_results_fd.is_some();
     if !requested {
         return Ok(None);
@@ -221,7 +233,11 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
         })?;
         Box::new(file)
     };
-    let writer = Arc::new(ResultsWriter::new(out));
+    let mut writer = ResultsWriter::new(out);
+    if args.stream_mapping_fd.is_some() {
+        writer.schema_version = 3;
+    }
+    let writer = Arc::new(writer);
     let run_id = {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).context("generate run ID")?;
@@ -314,12 +330,25 @@ fn run_endpoints(args: &Args, include_destination: bool) -> Vec<EndpointRecord> 
 impl ResultsWriter {
     pub fn new(out: Box<dyn Write + Send>) -> Self {
         ResultsWriter {
+            schema_version: SCHEMA_VERSION,
+            parent: None,
+            phase_result: Mutex::new(None),
             mapping_metadata: Default::default(),
             out: Mutex::new(out),
             seq: AtomicU64::new(0),
             dead: AtomicBool::new(false),
             sealed: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn phase(parent: Arc<Self>) -> Arc<Self> {
+        let mut writer = Self::new(Box::new(std::io::sink()));
+        writer.schema_version = parent.schema_version;
+        writer.parent = Some(parent);
+        Arc::new(writer)
+    }
+    pub(crate) fn take_phase_result(&self) -> Option<serde_json::Value> {
+        self.phase_result.lock().unwrap().take()
     }
 
     pub fn emit_run(&self, run: &RunRecord) {
@@ -686,10 +715,18 @@ impl ResultsWriter {
         if seal {
             self.sealed.store(true, Relaxed);
         }
+        if let Some(parent) = &self.parent {
+            if seal {
+                *self.phase_result.lock().unwrap() = Some(record);
+            } else if record["type"] != "run" {
+                parent.emit_value(record);
+            }
+            return;
+        }
         let seq = self.seq.fetch_add(1, Relaxed);
         let object = record.as_object_mut().expect("record is an object");
         object.insert("schema".into(), SCHEMA.into());
-        object.insert("schema_version".into(), SCHEMA_VERSION.into());
+        object.insert("schema_version".into(), self.schema_version.into());
         object.insert("seq".into(), seq.into());
         // One buffer, one write: the record lands whole and immediately, so
         // a consumer tailing the file or reading a pipe sees events live.

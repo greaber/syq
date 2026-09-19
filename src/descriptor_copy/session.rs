@@ -48,7 +48,34 @@ impl Drop for LocalSession {
         self.0.close();
     }
 }
-pub(super) struct Session {
+pub(crate) struct Resources {
+    workers: Arc<Semaphore>,
+    pub budget: Arc<Semaphore>,
+    buffers: Mutex<VecDeque<Vec<u8>>>,
+    bandwidth: Option<Arc<crate::bwlimit::BandwidthLimit>>,
+}
+impl Resources {
+    pub fn new(args: &Args) -> Arc<Self> {
+        Arc::new(Self {
+            workers: Arc::new(Semaphore::new(
+                (if args.connections_default {
+                    args.automatic_worker_limit()
+                } else {
+                    args.connections
+                })
+                .min(Semaphore::MAX_PERMITS),
+            )),
+            budget: Arc::new(Semaphore::new(BUFFER_BYTES / GRANULE)),
+            buffers: Mutex::new(VecDeque::new()),
+            bandwidth: (args.bwlimit_bytes != 0)
+                .then(|| Arc::new(crate::bwlimit::BandwidthLimit::new(args.bwlimit_bytes))),
+        })
+    }
+    pub fn bandwidth(&self) -> Option<Arc<crate::bwlimit::BandwidthLimit>> {
+        self.bandwidth.clone()
+    }
+}
+pub(crate) struct Session {
     pub endpoint: Endpoint,
     pub args: Args,
     control: Mutex<Control>,
@@ -60,8 +87,7 @@ pub(super) struct Session {
     limit: usize,
     pub budget: Arc<Semaphore>,
     // Keep the previous FIFO reuse order as entries share the buffer cache.
-    buffers: Mutex<VecDeque<Vec<u8>>>,
-    bandwidth: Option<crate::bwlimit::BandwidthLimit>,
+    resources: Arc<Resources>,
     // Drop connections before closing the broker.
     _local: Option<LocalSession>,
     #[cfg(test)]
@@ -69,6 +95,13 @@ pub(super) struct Session {
 }
 impl Session {
     pub fn connect(args: &Args, location: &Location) -> Result<Arc<Self>> {
+        Self::connect_shared(args, location, Resources::new(args))
+    }
+    pub fn connect_shared(
+        args: &Args,
+        location: &Location,
+        resources: Arc<Resources>,
+    ) -> Result<Arc<Self>> {
         let local = location
             .host
             .is_none()
@@ -106,16 +139,14 @@ impl Session {
             } else {
                 args.connections
             },
-            budget: Arc::new(Semaphore::new(BUFFER_BYTES / GRANULE)),
-            buffers: Mutex::new(VecDeque::new()),
-            bandwidth: (args.bwlimit_bytes != 0)
-                .then(|| crate::bwlimit::BandwidthLimit::new(args.bwlimit_bytes)),
+            budget: resources.budget.clone(),
+            resources,
             _local: local,
             #[cfg(test)]
             connections_created: AtomicU64::new(0),
         }))
     }
-    pub fn entry(self: &Arc<Self>) -> Result<Entry> {
+    pub(super) fn entry(self: &Arc<Self>) -> Result<Entry> {
         let id = self
             .next_entry
             .fetch_update(Relaxed, Relaxed, |id| id.checked_add(1))
@@ -182,13 +213,27 @@ impl Session {
         *started = true;
         Ok(())
     }
-    pub fn worker(
+    pub(super) fn worker(
         self: &Arc<Self>,
         ticket: DescriptorTicket,
         settings: Settings,
         first: bool,
         cancelled: &AtomicBool,
+        runtime: &tokio::runtime::Handle,
     ) -> Result<Worker> {
+        // Queue once: newly admitted entries must not jump ahead of entries
+        // already waiting for the shared worker ceiling.
+        let permit = runtime.block_on(async {
+            let acquire = self.resources.workers.clone().acquire_owned();
+            tokio::pin!(acquire);
+            loop {
+                anyhow::ensure!(!cancelled.load(Relaxed), "stream cancelled");
+                tokio::select! {
+                    permit = &mut acquire => return Ok::<_, anyhow::Error>(permit?),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                }
+            }
+        })?;
         let mut connections = self.connections.lock().unwrap();
         while connections.leased >= self.limit {
             anyhow::ensure!(!cancelled.load(Relaxed), "stream cancelled");
@@ -206,6 +251,7 @@ impl Session {
             session: self.clone(),
             connection: None,
             reusable: false,
+            _permit: permit,
         };
         worker.connection = Some(if let Some(mut connection) = cached {
             // Release was sent after the previous entry's checked fence. Send
@@ -225,10 +271,15 @@ impl Session {
         Ok(worker)
     }
     pub fn buffer(&self) -> Vec<u8> {
-        self.buffers.lock().unwrap().pop_front().unwrap_or_default()
+        self.resources
+            .buffers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_default()
     }
     pub fn recycle(&self, mut buffer: Vec<u8>) {
-        let mut buffers = self.buffers.lock().unwrap();
+        let mut buffers = self.resources.buffers.lock().unwrap();
         let held = buffers.iter().map(Vec::capacity).sum::<usize>();
         if held.saturating_add(buffer.capacity()) <= BUFFER_BYTES {
             buffer.clear();
@@ -236,7 +287,7 @@ impl Session {
         }
     }
     pub fn pace(&self, bytes: u64) {
-        if let Some(limit) = &self.bandwidth {
+        if let Some(limit) = &self.resources.bandwidth {
             limit.wait_prepaid(bytes);
         }
     }
@@ -275,6 +326,7 @@ pub(super) struct Worker {
     session: Arc<Session>,
     connection: Option<Box<dyn Conn>>,
     reusable: bool,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 impl Worker {
     pub fn connection(&mut self) -> &mut dyn Conn {

@@ -56,6 +56,7 @@ async fn copy(
         output,
         commit,
         input_meta,
+        None,
     )
     .await
 }
@@ -208,6 +209,7 @@ async fn cancelling_quiet_owned_payload_retires_io_and_keeps_the_session_usable(
         None,
         None,
         None,
+        None,
     );
     let cancel = async {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -260,6 +262,7 @@ async fn cancelling_full_upload_queue_retires_input_and_releases_budget() {
         controls.clone(),
         cancelled.clone(),
         Some(descriptor),
+        None,
         None,
         None,
         None,

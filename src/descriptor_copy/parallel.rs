@@ -177,6 +177,7 @@ impl Workers {
             self.controls.settings,
             self.args.connections_default && id < 2,
             &self.cancelled,
+            &self.runtime,
         )?;
         self.gate.mark_ready(id);
         self.ready.notify_one();
@@ -257,7 +258,7 @@ impl Workers {
                         pending -= 1;
                     }
                 }
-                self.controls.progress.add_bytes(job.len as u64);
+                self.controls.add_bytes(job.len as u64);
             }
             Ok(())
         })();
@@ -424,21 +425,22 @@ pub(super) async fn run(
         tokio::task::spawn_blocking(move || Session::connect(&args, &location)).await??
     };
     execute(
-        session, plan, controls, cancelled, input, output, commit, input_meta,
+        session, plan, controls, cancelled, input, output, commit, input_meta, None,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute(
+pub(crate) async fn execute(
     session: Arc<Session>,
     plan: Plan,
     controls: Arc<Controls>,
     cancelled: Arc<AtomicBool>,
     mut input: Option<fd::Descriptor>,
-    output: Option<fd::Descriptor>,
-    commit: Option<fd::Descriptor>,
+    mut output: Option<fd::Descriptor>,
+    mut commit: Option<fd::Descriptor>,
     input_meta: Option<crate::proto::Meta>,
+    callback: Option<Arc<crate::stream_mapping::Payload>>,
 ) -> Result<()> {
     let _cancel = fd::CancelOnDrop(cancelled.clone());
     let args = &session.args;
@@ -452,6 +454,16 @@ async fn execute(
         return Ok(());
     };
     controls.report.ready();
+    if let Some(payload) = &callback {
+        let upload = plan.source.is_some();
+        let (descriptor, acknowledge) = payload.open(upload, cancelled.clone())?;
+        if upload {
+            input = Some(descriptor);
+        } else {
+            output = Some(descriptor);
+        }
+        commit = Some(acknowledge);
+    }
     if let Some(source @ fd::Source::Pipe { .. }) = plan.source.clone() {
         input = Some(source.open(cancelled.clone()).await?);
     }
@@ -532,6 +544,7 @@ async fn execute(
             let runtime = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || -> Result<u64> {
                 let mut off = 0u64;
+                let mut check = controls.expected.start();
                 loop {
                     // Reserve one request, not request-size times depth. Only
                     // bytes actually read become initialized buffer contents.
@@ -549,6 +562,7 @@ async fn execute(
                         break;
                     }
                     let len = data.len();
+                    check.add(&data)?;
                     jobs_tx
                         .blocking_send(Job {
                             off,
@@ -561,7 +575,7 @@ async fn execute(
                         .checked_add(len as u64)
                         .context("stream length overflow")?;
                 }
-                Ok(off)
+                check.finish()
             })
             .await??
         } else {
@@ -590,6 +604,7 @@ async fn execute(
             let writer = async {
                 let mut output = output.context("missing stream output")?;
                 let mut next = 0u64;
+                let mut check = controls.expected.start();
                 let mut ready = BTreeMap::new();
                 while next < size {
                     let job = results_rx
@@ -602,11 +617,13 @@ async fn execute(
                     );
                     ready.insert(job.off, job);
                     while let Some(job) = ready.remove(&next) {
+                        check.add(&job.data)?;
                         output = output.write_chunk(job.data.into()).await?;
-                        controls.progress.add_bytes(job.len as u64);
+                        controls.add_bytes(job.len as u64);
                         next += job.len as u64;
                     }
                 }
+                check.finish()?;
                 Ok::<_, anyhow::Error>(())
             };
             tokio::try_join!(feeder, writer)?;
@@ -641,12 +658,19 @@ async fn execute(
         };
         draining.store(true, Relaxed);
         while let Some(result) = tasks.join_next().await { result??; }
-        fd::await_commit(commit).await?;
+        let mut commit = commit;
+        if workers.upload {
+            fd::await_commit(commit.take()).await?;
+        }
         let mut finish = move || prepared.entry.finish(size);
         if session.endpoint.is_remote() {
             tokio::task::spawn_blocking(finish).await??;
         } else {
             finish()?;
+        }
+        if !workers.upload {
+            if let Some(payload) = &callback { payload.transferred(None)?; }
+            fd::await_commit(commit).await?;
         }
         if let Some(output) = metadata_output {
             controls.metadata.apply(&output, prepared.source_meta)?;
@@ -669,15 +693,19 @@ async fn execute(
     for retired in retirements {
         retired.wait().await;
     }
+    if let Some(payload) = callback {
+        payload.transferred(result.as_ref().err())?;
+    }
     result
 }
-async fn direct(
+pub(crate) async fn direct(
     mut input: fd::Descriptor,
     mut output: fd::Descriptor,
     commit: Option<fd::Descriptor>,
     controls: Arc<Controls>,
 ) -> Result<()> {
     let source_meta = input.metadata();
+    let mut check = controls.expected.start();
     loop {
         let (next, data) = input.read_available(controls.settings.request_size).await?;
         input = next;
@@ -686,9 +714,11 @@ async fn direct(
         }
         controls.pace(data.len() as u64).await;
         let len = data.len();
+        check.add(&data)?;
         output = output.write_chunk(data).await?;
-        controls.progress.add_bytes(len as u64);
+        controls.add_bytes(len as u64);
     }
+    check.finish()?;
     fd::await_commit(commit).await?;
     output.apply_metadata(controls.metadata, source_meta)
 }

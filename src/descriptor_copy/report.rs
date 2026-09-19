@@ -24,6 +24,7 @@ pub(crate) struct Report {
     writer: Option<Arc<ResultsWriter>>,
     source: Value,
     destination: Value,
+    entry: Option<u64>,
 }
 impl Report {
     pub fn start(args: &Args) -> Result<Self> {
@@ -66,6 +67,7 @@ impl Report {
             )?,
             source,
             destination,
+            entry: None,
         };
         // Without a skip policy, input can queue while the destination connects.
         // Decide this after CLI/environment parsing so the SDK need not duplicate it.
@@ -84,6 +86,29 @@ impl Report {
         }
         Ok(report)
     }
+    pub(crate) fn entry(
+        args: &Args,
+        id: u64,
+        writer: Option<Arc<ResultsWriter>>,
+        source: Value,
+        destination: Value,
+    ) -> Self {
+        Self {
+            dry_run: args.dry_run,
+            only_new: args.ignore_existing,
+            only_existing: args.existing,
+            skipped: AtomicBool::new(false),
+            ready_sent: AtomicBool::new(false),
+            quiet: args.quiet,
+            writer,
+            source,
+            destination,
+            entry: Some(id),
+        }
+    }
+    pub(crate) fn is_entry(&self) -> bool {
+        self.entry.is_some()
+    }
     pub fn skip(&self) {
         self.skipped.store(true, Relaxed);
     }
@@ -91,7 +116,7 @@ impl Report {
         self.skipped.load(Relaxed)
     }
     pub fn ready(&self) {
-        if self.ready_sent.swap(true, Relaxed) {
+        if self.ready_sent.swap(true, Relaxed) || self.entry.is_some() {
             return;
         }
         if let Some(writer) = &self.writer {
@@ -140,9 +165,18 @@ impl Report {
         } else if !self.dry_run || known {
             record["bytes"] = bytes.into();
         }
+        if let Some(id) = self.entry {
+            record["entry"] = id.into();
+            if let Some(error) = error {
+                record["message"] = format!("{error:#}").into();
+            }
+        }
         writer.emit_value(record);
         if let Some(error) = error {
             writer.emit_error_classified(&format!("{error:#}"), None, None);
+        }
+        if self.entry.is_some() {
+            return;
         }
         writer.emit_result_size_known(
             &results::ResultRecord {
@@ -170,6 +204,9 @@ impl Report {
 }
 
 fn describe(endpoint: &Value) -> String {
+    if endpoint["callback"] == true {
+        return format!("callback at mapping entry {}", endpoint["entry"]);
+    }
     if let Some(fd) = endpoint.get("fd") {
         return format!("descriptor {fd}");
     }

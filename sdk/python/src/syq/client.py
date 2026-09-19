@@ -41,6 +41,8 @@ from .models import (
     _mapping_json,
 )
 from .protocol import AutomationDecoder, parse_mapping_line
+from ._stream_endpoints import StreamSource, StreamDestination
+from ._callback_runtime import Callbacks
 
 
 Argument = str | bytes
@@ -328,6 +330,7 @@ class _LineProcess:
         cwd: PathArgument | None,
         env: Mapping[str, str] | None,
         timeout: float | None,
+        pass_fds: tuple[int, ...] = (),
     ) -> _LineProcess:
         read_fd, write_fd = _results_pipe()
         output = os.fdopen(read_fd, "rb", buffering=0)
@@ -340,7 +343,7 @@ class _LineProcess:
                     env=env,
                     timeout=timeout,
                     machine_output=output,
-                    pass_fds=(write_fd,),
+                    pass_fds=(write_fd, *pass_fds),
                 )
             except BaseException:
                 output.close()
@@ -628,6 +631,7 @@ def _copy_arguments(
     inplace: bool,
     max_delete: int | None,
     integrity_checking: str | None = None,
+    allow_missing_placement: bool = False,
 ) -> tuple[list[Argument], int, int]:
     argv: list[Argument] = [command]
     source_count = 0
@@ -674,7 +678,7 @@ def _copy_arguments(
     selected_placements = [
         (name, value) for name, value in placements if value is not None
     ]
-    if command != "map" and len(selected_placements) != 1:
+    if command != "map" and len(selected_placements) != 1 and not (allow_missing_placement and not selected_placements):
         raise SyqInvocationError(
             "exactly one of --into, --into-new, --into-existing, --as, "
             "--as-new, or --as-existing is required"
@@ -858,7 +862,7 @@ def _mapping_line(entry: MappingEntry, *, index: int) -> bytes:
         raise TypeError(f"mapping[{index}] must be a MappingEntry")
     return (
         json.dumps(
-            _mapping_json(entry),
+            _mapping_json(entry, stream_id=index),
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -868,10 +872,16 @@ def _mapping_line(entry: MappingEntry, *, index: int) -> bytes:
 
 def _write_mapping_manifest(
     manifest: BinaryIO, mapping: Iterable[MappingEntry]
-) -> None:
+) -> tuple[dict[int, MappingEntry], bool]:
+    callbacks = {}
+    named_destination = False
     for index, entry in enumerate(mapping):
         manifest.write(_mapping_line(entry, index=index))
+        named_destination |= not isinstance(entry.dst, StreamDestination)
+        if isinstance(entry.src, StreamSource) or isinstance(entry.dst, StreamDestination):
+            callbacks[index] = entry
     manifest.flush()
+    return callbacks, named_destination
 
 
 class MapStream(FileMapping):
@@ -1111,14 +1121,20 @@ class Client:
         results: BinaryIO | None,
         timeout: Timeout,
         check: bool,
+        callbacks: Callbacks | None = None,
     ) -> OperationSummary:
+        if callbacks is not None:
+            argv = [*argv, f"--stream-mapping-fd={callbacks.child.fileno()}", f"--stream-concurrency={callbacks.concurrency}"]
         command = (self._executable_value(), *argv)
         process = _LineProcess.start_results(
             command,
             cwd=self.process_cwd,
             env=self.env,
             timeout=resolve_timeout(timeout, self.timeout),
+            pass_fds=() if callbacks is None else (callbacks.child.fileno(),),
         )
+        if callbacks is not None:
+            callbacks.attach(process._process)
         writer = _ResultsFileWriter(results)
         decoder = AutomationDecoder(
             mode=mode,
@@ -1126,6 +1142,7 @@ class Client:
             mapping=mapping,
             dry_run=dry_run,
             selectors_total=selectors_total,
+            stream_entries=None if callbacks is None else set(callbacks.entries),
         )
         terminal_line: bytes | None = None
         try:
@@ -1141,15 +1158,22 @@ class Client:
                 if event is not None and on_event is not None:
                     on_event(event)
             returncode = process.finish()
+            if callbacks is not None:
+                callbacks.close(abort=False)
+                callbacks.raise_error()
             result = decoder.finish(returncode)
             assert terminal_line is not None
             writer.finish(terminal_line)
         except BaseException as error:
+            if callbacks is not None:
+                callbacks.close(abort=True)
             process.abort()
+            if callbacks is not None and callbacks._error is not None:
+                error = callbacks._error
             if isinstance(error, SyqProtocolError):
                 error.returncode = process.returncode
                 error.stderr = process.stderr
-            raise
+            raise error
         if check and result.status is not OperationStatus.SUCCESS:
             raise SyqOperationError(result, stderr=process.stderr)
         return result
@@ -1175,6 +1199,7 @@ class Client:
         as_new: PathArgument | None = None,
         as_existing: PathArgument | None = None,
         mapping: PathArgument | Iterable[MappingEntry] | None = None,
+        stream_concurrency: int = 4,
         results: BinaryIO | None = None,
         prune: bool = False,
         dry_run: bool = False,
@@ -1268,6 +1293,7 @@ class Client:
             preserve=preserve,
             inplace=inplace,
             max_delete=max_delete,
+            allow_missing_placement=mapping is not None and not isinstance(mapping, (str, bytes, os.PathLike)),
         )
         _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
         if auth_from is not None:
@@ -1325,22 +1351,32 @@ class Client:
         with tempfile.NamedTemporaryFile(
             mode="wb", prefix="syq-python-mapping-", suffix=".ndjson"
         ) as manifest:
-            _write_mapping_manifest(manifest, mapping)
+            entries, named_destination = _write_mapping_manifest(manifest, mapping)
+            if not any(value is not None for value in (into, into_new, into_existing)):
+                if named_destination or not entries:
+                    raise SyqInvocationError("pathname mapping destinations require --into, --into-new, or --into-existing")
+                argv.extend(["--into", "."])
+            callbacks = Callbacks(entries, stream_concurrency) if entries else None
             _insert_mapping_option(
                 argv, source_end, os.path.realpath(manifest.name)
             )
-            return self._typed(
-                argv,
-                mode="cp",
-                prune=False,
-                mapping=True,
-                dry_run=dry_run,
-                selectors_total=None,
-                on_event=on_event,
-                results=results,
-                timeout=timeout,
-                check=check,
-            )
+            try:
+                return self._typed(
+                    argv,
+                    mode="cp",
+                    prune=False,
+                    mapping=True,
+                    dry_run=dry_run,
+                    selectors_total=None,
+                    on_event=on_event,
+                    results=results,
+                    timeout=timeout,
+                    check=check,
+                    callbacks=callbacks,
+                )
+            finally:
+                if callbacks is not None:
+                    callbacks.close(abort=False)
 
     def rm(
         self,
