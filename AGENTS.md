@@ -432,6 +432,14 @@ Use dotenvx 2.21.0 for this inventory. Initialize it once with
 `scripts/init-release-secrets.sh`, and run the sync without `--execute` before
 every actual update. See `RELEASING.md` for provisioning, backup, and rotation.
 
+## Performance evidence
+
+Choose benchmark duration to suit the behavior being measured; there is no
+fixed minimum. Short tests can measure startup or small operations, but do not
+infer sustained performance from subsecond runs unless there is evidence that
+they reach a representative steady state quickly. Consider startup, autotuning
+and variability, and lengthen or repeat the test as needed to support the claim.
+
 ## Verification
 
 **Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
