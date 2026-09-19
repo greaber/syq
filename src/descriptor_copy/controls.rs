@@ -110,7 +110,9 @@ impl Controls {
             pipeline: tuning.pipeline_depth(),
             s3_requests: tuning
                 .s3_requests
-                .or_else(|| args.resource_limits.as_ref().and_then(|l| l.s3_requests)),
+                .into_iter()
+                .chain(args.resource_limits.as_ref().and_then(|l| l.s3_requests))
+                .min(),
             s3_objects: tuning.s3_object_workers.unwrap_or(32).min(
                 args.resource_limits
                     .as_ref()

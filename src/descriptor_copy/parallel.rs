@@ -663,6 +663,9 @@ async fn execute(
         // Preserve the first copy error; these joins only retire its workers.
         let _ = joined;
     }
+    // No worker can consume queued jobs now. Release the remaining receiver
+    // so a producer blocked in blocking_send wakes and drops its descriptor.
+    drop(workers);
     for retired in retirements {
         retired.wait().await;
     }

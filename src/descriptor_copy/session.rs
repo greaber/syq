@@ -7,6 +7,7 @@ use crate::{
     proto::{Request, Response},
 };
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     Arc, Condvar, Mutex,
@@ -58,7 +59,8 @@ pub(super) struct Session {
     data_started: Mutex<bool>,
     limit: usize,
     pub budget: Arc<Semaphore>,
-    buffers: Mutex<Vec<Vec<u8>>>,
+    // Keep the previous FIFO reuse order as entries share the buffer cache.
+    buffers: Mutex<VecDeque<Vec<u8>>>,
     bandwidth: Option<crate::bwlimit::BandwidthLimit>,
     // Drop connections before closing the broker.
     _local: Option<LocalSession>,
@@ -105,7 +107,7 @@ impl Session {
                 args.connections
             },
             budget: Arc::new(Semaphore::new(BUFFER_BYTES / GRANULE)),
-            buffers: Mutex::new(Vec::new()),
+            buffers: Mutex::new(VecDeque::new()),
             bandwidth: (args.bwlimit_bytes != 0)
                 .then(|| crate::bwlimit::BandwidthLimit::new(args.bwlimit_bytes)),
             _local: local,
@@ -223,14 +225,14 @@ impl Session {
         Ok(worker)
     }
     pub fn buffer(&self) -> Vec<u8> {
-        self.buffers.lock().unwrap().pop().unwrap_or_default()
+        self.buffers.lock().unwrap().pop_front().unwrap_or_default()
     }
     pub fn recycle(&self, mut buffer: Vec<u8>) {
         let mut buffers = self.buffers.lock().unwrap();
         let held = buffers.iter().map(Vec::capacity).sum::<usize>();
         if held.saturating_add(buffer.capacity()) <= BUFFER_BYTES {
             buffer.clear();
-            buffers.push(buffer);
+            buffers.push_back(buffer);
         }
     }
     pub fn pace(&self, bytes: u64) {

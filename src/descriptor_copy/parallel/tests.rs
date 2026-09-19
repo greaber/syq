@@ -227,3 +227,70 @@ async fn cancelling_quiet_owned_payload_retires_io_and_keeps_the_session_usable(
         .unwrap();
     assert_eq!(std::fs::read(&target).unwrap(), b"next");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_full_upload_queue_retires_input_and_releases_budget() {
+    use std::io::Seek;
+    let dir = crate::test_support::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::write(&target, b"old").unwrap();
+    let mut args = arguments(&target, true);
+    args.connections = 1;
+    // Let the producer fill the queue before the sole worker drains it.
+    args.bwlimit_bytes = 1024 * 1024;
+    let session = Session::connect(
+        &args,
+        args.descriptor_copy
+            .as_ref()
+            .unwrap()
+            .location
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    let controls = controls(&args);
+    let mut source = input(&vec![7; 2 * 1024 * 1024]);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let descriptor =
+        fd::Descriptor::owned(source.try_clone().unwrap(), true, cancelled.clone()).unwrap();
+    let retirement = descriptor.retirement().unwrap();
+    let transfer = execute(
+        session.clone(),
+        args.descriptor_copy.clone().unwrap(),
+        controls.clone(),
+        cancelled.clone(),
+        Some(descriptor),
+        None,
+        None,
+        None,
+    );
+    let cancel = async {
+        loop {
+            let read = source.stream_position().unwrap();
+            let written = controls.progress.bytes_done.load(Relaxed);
+            // One in flight, 64 queued, and one blocked in blocking_send.
+            if read.saturating_sub(written) >= 66 * controls.settings.request_size as u64 {
+                cancelled.store(true, Relaxed);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let (result, ()) = tokio::join!(transfer, cancel);
+        assert!(result.is_err());
+        retirement.wait().await;
+    })
+    .await
+    .expect("full-queue cancellation must retire its input");
+    assert_eq!(
+        session.budget.available_permits(),
+        super::super::BUFFER_BYTES / GRANULE
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    copy(session, &target, true, &input(b"next"), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"next");
+}

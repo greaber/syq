@@ -43,12 +43,10 @@ async fn serve(
         .map_or(0, |v| v.parse::<usize>().unwrap());
     let mut body = vec![0; length];
     socket.read_exact(&mut body).await.unwrap();
-    let data = matches!(method, "PUT" | "GET");
-    if data {
-        let count = active.fetch_add(1, Relaxed) + 1;
-        maximum.fetch_max(count, Relaxed);
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    // Metadata requests share the same ceiling as payload requests.
+    let count = active.fetch_add(1, Relaxed) + 1;
+    maximum.fetch_max(count, Relaxed);
+    tokio::time::sleep(Duration::from_millis(5)).await;
     let (status, body, extra) = {
         let mut store = store.lock().unwrap();
         let query: BTreeMap<_, _> = uri.query_pairs().collect();
@@ -85,9 +83,7 @@ async fn serve(
             other => panic!("unexpected {other} {uri}"),
         }
     };
-    if data {
-        active.fetch_sub(1, Relaxed);
-    }
+    active.fetch_sub(1, Relaxed);
     let length = if method == "HEAD" {
         String::new()
     } else {
@@ -208,7 +204,31 @@ async fn entries_share_s3_admission_and_failed_producer_does_not_cancel_client()
             )
             .build(),
     );
-    let mut options = arguments(true).s3.unwrap();
+    let mut args = Args::parse_args(
+        &[
+            "cp",
+            "--quiet",
+            "--src-fd",
+            "0",
+            "--to",
+            "s3://fixture",
+            "--as",
+            "object",
+            "--performance-tuning=s3-max-concurrent-requests=8",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    // The CLI rejects duplicate control keys today; exercise the shared
+    // executor when tuning and an enclosing session ceiling are both present.
+    args.resource_limits = Some(crate::advanced::ResourceLimits {
+        s3_requests: Some(1),
+        ..Default::default()
+    });
+    let controls = Controls::new(&args, Report::start(&args).unwrap());
+    let mut options = args.s3.unwrap();
     options.endpoint = Some(endpoint);
     options.part_size = 8; // The independent fixture accepts tiny multipart parts.
     options.concurrency = 2;
@@ -217,7 +237,7 @@ async fn entries_share_s3_admission_and_failed_producer_does_not_cancel_client()
         options,
         cancellation: Arc::default(),
         parts: Arc::new(tokio::sync::Semaphore::new(2)),
-        requests: tokio::sync::Semaphore::new(2),
+        requests: tokio::sync::Semaphore::new(controls.s3_requests.unwrap()),
         objects: tokio::sync::Semaphore::new(3),
         bandwidth: None,
     };
@@ -282,7 +302,7 @@ async fn entries_share_s3_admission_and_failed_producer_does_not_cancel_client()
     assert_eq!(state.objects["/fixture/last"], b"still usable");
     assert!(state.parts.is_empty());
     assert_eq!(state.aborted, 2);
-    assert!(maximum.load(Relaxed) <= 2);
+    assert_eq!(maximum.load(Relaxed), 1);
     assert_eq!(session.parts.available_permits(), 2);
     server.abort();
 }
