@@ -36,3 +36,16 @@ syq exec [OPTIONS] --on <@NAME> -- <PROGRAM>...
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
+
+## Execution details
+
+Requests allow up to 256 arguments (16 KiB total) and a 4096-byte working-directory
+path. Each server connection permits one pending approval and eight active
+commands.
+
+If the command is killed by a signal, syq returns `128 + signal`. Setup and
+connection failures return nonzero; losing the exit status is an error.
+Changing receiving settings or losing the connection cancels the command.
+Syq also stops remaining children in its process group when the foreground
+program exits. Detached process sessions can survive this cleanup. Commands
+do not emit copy receipts or copy automation records.

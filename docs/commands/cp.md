@@ -8,7 +8,7 @@ syq cp --srcs-in project --to server --into backup --dry-run -v
 ```
 
 Put source selectors and `--mapping` before `--to` or a placement option.
-For scripting, see [environment variables](../reference.md#environment-variables-and-local-files)
+For scripting, see [environment variables](../environment.md)
 and [results](../automation.md).
 
 <!-- CLI: cp -->
@@ -163,6 +163,70 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
+
+## Update policies
+
+`--only-new` can add children to an existing directory, but does not change
+that directory's permissions to make it writable. `--only-existing` skips
+missing destination subtrees. `--skip-newer` compares timestamps only for
+regular-file pairs; it does not prevent other entry-type replacements.
+
+`--only-new` cannot combine with `--only-existing` or `--skip-newer`.
+`--only-existing` conflicts with `--into-new` and `--as-new`, which require
+the destination to be absent.
+
+`--only-new` and `--skip-newer` cannot combine with `--inplace`: an interrupted
+write could leave a file that a retry skips. Restricted receivers also reject
+`--only-existing --inplace` and `--as-new --inplace`, because direct writes do
+not enforce those destination conditions. [Named receiving destinations](../persistence-reference.md#copy-limits)
+and S3 do not support `--inplace`.
+
+These policies do not disable requested pruning. Descriptor-specific
+restrictions are listed under [file descriptors](#file-descriptors).
+
+## Pruning
+
+`--prune` deletes only within the copied directories, after copying succeeds.
+Ignored and size-excluded paths, syq partial files, and recovery entries are
+kept. This also keeps their parent directories; extra hard links to copied
+files may be kept too. An interruption during deletion can leave some extras
+already removed.
+
+Keep the source outside the destination. Syq detects overlap locally and for
+remote paths using the same host name, user, and port. Different SSH aliases
+or shared storage can hide overlap from this check.
+
+## Filename and type conflicts
+
+If the source has both `Report.txt` and `report.txt`, a case-insensitive
+destination cannot store both. Syq does not check for that before copying,
+and one file can replace the other. The same problem applies to distinct
+Unicode spellings that the destination treats as one name. Rename the source
+entries or use a destination that can distinguish them. Unsupported names
+are reported as copy errors.
+
+Syq refuses replacements between directories and non-directories, including
+empty directories. Move or remove the conflicting destination before retrying.
+Other replacements can fail if the filesystem lacks the operation needed to
+replace an entry safely; the old entry is kept.
+
+## Capacity checks
+
+For missing or empty filesystem destinations, syq checks available bytes and
+capacity for new files when the filesystem reports them. A clear shortage
+fails before copying. Updates to populated destinations do not use this whole-copy
+estimate: existing data may be reused or replaced. Allocation errors still
+fail the affected copy.
+
+## Metadata details
+
+Source setuid, setgid, and sticky bits are not copied without
+`--preserve=permissions`. Ownership uses numeric IDs. On macOS, an existing
+destination directory must be readable before syq can temporarily repair
+missing write or search permission.
+
+Modification times are preserved for named file destinations. Output
+descriptors require explicit `--preserve=times`; see below.
 
 ## File descriptors
 

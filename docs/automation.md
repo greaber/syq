@@ -64,8 +64,10 @@ can leave it missing.
   `encoding` values.
 - Treat human `message` text as display only; parse structured fields.
 
-`--progress-json` is a separate progress display whose format may change.
-Use `--results` when you need a stable consumer contract.
+`--results` includes both progress samples and final outcomes; use it for new
+integrations, including live progress displays. `--progress-json` emits
+progress on stderr, where diagnostics can also appear. Its format may change,
+and it does not supply the results stream's completion contract.
 
 ## Record envelope
 
@@ -97,6 +99,10 @@ their existing representation.
 Copy runs also carry `prune` and `mapping`. Compare-only runs add optional
 `verify_only: true`; absence means false. Removal has one source endpoint
 regardless of selector count and omits those copy fields.
+
+For S3 downloads using `--only-new` or `--only-existing`, unchanged-file totals
+include skipped symlinks selected through a prefix, but exclude symlinks named
+directly or through a mapping.
 
 With `--verify-only`, differences and inspection failures produce `error`
 records and a nonzero terminal status. Matching regular files count as
@@ -375,3 +381,39 @@ Command approvals in `syq persist receive pending --json` use `kind: "command"`
 and include `argv`, `cwd`, and `permission`. Argument and directory strings in
 this summary are escaped for display. Use an up-to-date syq binary to inspect
 and approve commands; clients that only support copy requests omit them.
+
+## Retry failed mapping entries
+
+Add `--results r.ndjson` to record outcomes in a fresh file outside the copy
+trees.
+
+Failed mapping entries contain `src`, `dst`, and `kind`, so they can form a
+retry manifest. Preserve `expected_digest` too when present. First require a terminal `result` with `success` or `partial`:
+a missing terminal or an early stop means some entries may have no results.
+In those cases, rerun the original copy instead.
+
+```bash
+set -o pipefail
+syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
+jq -cs 'if (.[-1].type? // "") != "result"
+        then "incomplete results stream (no terminal record)" | halt_error
+        elif (.[-1].status != "success" and .[-1].status != "partial")
+        then "run stopped early (status \(.[-1].status)); rerun it instead of retrying" | halt_error
+        else .[] | select(.type == "operation_result"
+                          and .disposition == "failed"
+                          and .retryable != "no")
+             | {src, dst, kind}
+               + (if has("expected_digest") then {expected_digest} else {} end)
+        end' r.ndjson \
+  | syq cp --mapping - -C src --to nas --into /data
+```
+
+The filter skips non-retryable entries, including failed implicit parent
+creation without a source path. It does not guarantee that retrying will
+succeed; fix the underlying error first. Unchanged and excluded files appear
+only in summary totals, not as individual results.
+
+For command-restricted copies between servers, `--results` contains verified
+[receiver receipts](remote-reference.md#signed-results). These describe
+destination changes rather than source entry failures; retry the original
+mapping instead of applying the `operation_result` filter above.

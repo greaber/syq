@@ -51,9 +51,9 @@ syq persist connect server
 
 Then run `syq cp results --to @project` on the server. The directory must already
 exist. Each name has its own settings and approval policy, so you can keep a
-project separate from your general `laptop` destination. Names stay assigned to
-their receiving machine while it is offline; see [replacing a receiver](persistence-reference.md#names-and-profiles)
-when moving a name to another laptop.
+project separate from your general `laptop` destination. See
+[replacing a receiver](persistence-reference.md#names-and-profiles) when moving
+a name to another laptop.
 
 Use `syq persist receive status` to list profiles and
 `syq persist receive off --name project` to stop one. See
@@ -89,10 +89,8 @@ for the trust boundary.
 
 ## Names and paths
 
-Use `--to @laptop` to select a receiving machine. The command fails if that
-receiver is offline or fails its identity check. Without `@`, `--to laptop`
-always names an SSH destination, resolved through SSH configuration or DNS.
-Once a copy starts, it keeps the same destination even if the connection fails.
+Use `--to @laptop` for your connected receiving machine. Without `@`,
+`--to laptop` names an SSH destination instead.
 
 The directory you set with `--cwd` is where incoming copies start. You can
 choose a path relative to it with `--into` or `--as`, or use an absolute path
@@ -104,17 +102,14 @@ To contain copies within a directory instead:
 syq persist receive on --name laptop --root ~/Downloads/server
 ```
 
-With `--root`, all incoming copies must stay inside that directory. Absolute
-paths and `..` are rejected, and symlinks cannot lead outside it. A copy cannot
-replace the root itself with `--as .`. Switching back to `--cwd` removes this
-restriction.
+With `--root`, incoming paths must be relative and stay inside that directory,
+even when following symlinks. Switching back to `--cwd` allows copies elsewhere.
 
 Changing a profile's settings stops its active copies so the new settings can
 take effect. Other profiles keep working.
 
-Syq also protects its own receiving files, executable, and SSH authority files
-from incoming copies. See [directory requirements](persistence-reference.md#directories)
-if a receiving location cannot be opened.
+See [directory requirements](persistence-reference.md#directories) if a
+receiving location cannot be opened.
 
 ## Copy permissions and limits
 

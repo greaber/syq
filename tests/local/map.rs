@@ -1132,8 +1132,8 @@ fn native_mapping_and_map_respect_typed_selectors() {
 }
 
 // Each documented jq transform lives here as a constant. Tests assert the
-// constant appears in docs/mappings.md (whitespace-normalized, so formatting can
-// change but semantics cannot drift silently), then execute the real
+// constant appears in its documentation page (ignoring whitespace changes),
+// so semantics cannot drift silently. They then execute the real
 // pipeline with jq against a local tree. Endpoints are adapted from the
 // documented `--to nas --into /...` to local directories.
 const DOC_JQ_LOWERCASE: &str = ".dst.value |= ascii_downcase";
@@ -1157,13 +1157,18 @@ const DOC_JQ_RETRY_GATE: &str = r#"if (.[-1].type? // "") != "result"
 /// Assert the doc contains the complete invocation — flags included — that
 /// the test executes, so an undocumented flag can never make a broken
 /// example pass.
-fn assert_documented(flags: &[&str], program: &str) {
-    let doc = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/mappings.md")).unwrap();
+fn assert_documented(page: &str, flags: &[&str], program: &str) {
+    let doc = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join(page),
+    )
+    .unwrap();
     let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let invocation = format!("jq {} '{program}'", flags.join(" "));
     assert!(
         squash(&doc).contains(&squash(&invocation)),
-        "docs/mappings.md no longer contains this documented jq invocation; update the doc and this test together:\n{invocation}"
+        "docs/{page} no longer contains this documented jq invocation; update the doc and this test together:\n{invocation}"
     );
 }
 
@@ -1181,7 +1186,7 @@ fn jq(program: &str, args: &[&str], input: &[u8]) -> Output {
 }
 
 fn run_doc_pipeline(t: &Tmp, program: &str, jq_args: &[&str], src: &str, dst: &str) {
-    assert_documented(jq_args, program);
+    assert_documented("mappings.md", jq_args, program);
     let map_out = syq_map_in(&t.path(""), &["--srcs-in", src]);
     assert!(map_out.status.success());
     let jq_out = jq(program, jq_args, &map_out.stdout);
@@ -1244,7 +1249,7 @@ fn mappings_md_min_size_example_works_verbatim() {
 }
 
 #[test]
-fn mappings_md_retry_gate_example_works_verbatim() {
+fn automation_md_retry_gate_example_works_verbatim() {
     let t = Tmp::new();
     write(&t.path("src/ok.txt"), b"ok");
     let expected = serde_json::json!({
@@ -1272,7 +1277,7 @@ fn mappings_md_retry_gate_example_works_verbatim() {
     );
     assert_eq!(cp.status.code(), Some(23));
     let results = read(&t.path("r1.ndjson"));
-    assert_documented(&["-cs"], DOC_JQ_RETRY_GATE);
+    assert_documented("automation.md", &["-cs"], DOC_JQ_RETRY_GATE);
     // Complete partial stream: the gate passes and emits the retry entry.
     let out = jq(DOC_JQ_RETRY_GATE, &["-cs"], &results);
     assert!(out.status.success());

@@ -87,18 +87,13 @@ Paths use `encoding: "utf-8"`, or `"base64"` with standard base64 of raw
 filename bytes. Absolute or empty paths, and any `.` or `..` component, are
 refused. Unknown fields are refused too.
 
-`expected_digest` requires a regular file. Algorithms are `blake3`, `sha256`,
-`md5`, and `xxh3-128`; the hex value contains 64 digits for BLAKE3 or SHA-256,
-and 32 for MD5 or XXH3-128. It checks the complete resulting file, including
-reused bytes, and a mismatch fails the entry. See [content checks](reference.md#check-file-contents)
-for staging, in-place writes, and selection filters. Older binaries that do not
-support this field reject the manifest.
+`expected_digest` checks a regular file's complete contents, including reused
+bytes. A mismatch fails the entry. See [expected digests](integrity-checking.md#expected-digests)
+for algorithms and behavior with in-place writes.
 
 Each entry copies one object. **A directory entry is not recursive.**
 `syq map` emits its descendants as separate entries. A missing source or
-wrong `kind` fails that entry while independent entries continue. A kind
-mismatch is a non-retryable conflict; a missing source is an I/O failure
-whose retryability is unknown.
+wrong `kind` fails that entry while independent entries continue.
 
 Any program can generate this format:
 
@@ -116,12 +111,10 @@ the destination container:
 syq cp --from hostA -C /data --mapping pairs.ndjson --to hostB --into /archive
 ```
 
-`--mapping -` reads the manifest from stdin. File contents follow the selected
-copy route. The restricted receiver permits writes only at the listed
-destinations and creates missing parent directories as needed. New parents use
-permissions limited by the receiver's umask; existing parents keep theirs.
-If a file or symlink blocks a parent directory, move or remove it before
-retrying. The affected entries fail while unrelated mappings continue.
+`--mapping -` reads the manifest from stdin. File contents travel directly
+between the servers. The receiver allows writes at the listed destinations
+and creates missing parent directories. If a file or symlink blocks a parent
+directory, move or remove it before retrying.
 
 Mapped destinations and their parent directories count against the receiver's
 entry limit. Each manifest line can be up to 1 MiB, and each destination path
@@ -142,62 +135,26 @@ Copy options and filters belong to the later `cp` command or your transform.
 
 ## Semantics and limits
 
-- `--mapping` replaces `cp` source selectors. Use `--into`, `--into-new`, or
-  `--into-existing` for the destination. It cannot combine with `--as` or
-  `--prune` or `--detach`. Both endpoints may be remote.
-- A contents selection emits paths relative to the selected directory. Use
-  that same directory as the consuming copy's `-C` base. Named `map`
-  selectors must be relative and resolve inside their base; a contents
-  selector may point outside it. `--root` confines either kind of selection.
-- Follow options apply to command-line paths, never to manifest entries.
-  A manifest entry that would traverse a symlink fails. Named `map`
-  selectors followed with `--follow-src` emit the referent path relative to
-  their base and refuse referents outside it.
-- Named manifest paths follow the normal control-path rules: only `--follow`
-  permits link traversal in that path. Use `--mapping -` for portable stream
-  input; named FIFOs need Linux with procfs.
-- The whole manifest is read and validated before copying. Malformed input,
-  duplicate destinations (including identical duplicate lines), and declared
-  file/ancestor conflicts refuse the run. The destination container may
-  already have been created. Memory grows with manifest size.
-- Conflicts found only when inspecting actual source or destination objects
-  fail individual entries. A missing destination parent is created implicitly.
-- Normal native preservation applies. `kind: "special"` checks the type but
-  does not enable special-file copying: use `--preserve=specials` or those
-  entries are visibly excluded.
+Use `--mapping` in place of source selectors, with an `--into` placement.
+It cannot combine with `--as`, `--prune`, or `--detach`.
+
+Use the same source base for `map` and `cp`. A `--srcs-in photos` mapping uses
+paths relative to `photos`, so pass `-C photos` when copying it. `--root`
+confines source selection. Follow options apply to supplied paths, never to
+links traversed by a manifest entry.
+
+Syq reads and validates the whole manifest before copying. Malformed input,
+duplicate destination names, and declared file/ancestor conflicts refuse the
+run; memory use grows with manifest size. The destination container may already
+have been created. Conflicts discovered while copying fail the affected entries.
+
+`kind: "special"` checks the source type; add `--preserve=specials` to copy
+those entries. Use `--mapping -` for a pipeline; a named FIFO manifest requires
+Linux with procfs.
 
 ## Machine-readable results
 
 Add `--results r.ndjson` to record outcomes in a fresh file outside the copy
-trees. See [Automation results](automation.md) for the stream contract.
-
-Failed mapping entries contain `src`, `dst`, and `kind`, so they can form a
-retry manifest. Preserve `expected_digest` too when present. First require a terminal `result` with `success` or `partial`:
-a missing terminal or an early stop means some entries may have no results.
-In those cases, rerun the original copy instead.
-
-```bash
-set -o pipefail
-syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
-jq -cs 'if (.[-1].type? // "") != "result"
-        then "incomplete results stream (no terminal record)" | halt_error
-        elif (.[-1].status != "success" and .[-1].status != "partial")
-        then "run stopped early (status \(.[-1].status)); rerun it instead of retrying" | halt_error
-        else .[] | select(.type == "operation_result"
-                          and .disposition == "failed"
-                          and .retryable != "no")
-             | {src, dst, kind}
-               + (if has("expected_digest") then {expected_digest} else {} end)
-        end' r.ndjson \
-  | syq cp --mapping - -C src --to nas --into /data
-```
-
-The filter skips non-retryable entries, including failed implicit parent
-creation without a source path. It does not guarantee that retrying will
-succeed; fix the underlying error first. Unchanged and excluded files appear
-only in summary totals, not as individual results.
-
-For command-restricted copies between servers, `--results` contains verified
-[receiver receipts](remote-reference.md#signed-results). These describe
-destination changes rather than source entry failures; retry the original
-mapping instead of applying the `operation_result` filter above.
+trees. After fixing a failure, rerun the original mapping to finish the copy.
+For scripts that select only failed entries to retry, see
+[retrying mapping entries](automation.md#retry-failed-mapping-entries).

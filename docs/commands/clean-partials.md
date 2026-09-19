@@ -8,8 +8,21 @@ syq clean-partials --dry-run -v backup
 syq clean-partials backup
 ```
 
-See [interrupted-copy recovery](../reference.md#resume-an-interrupted-copy) for
-which files this removes. Results use the [`rm` record format](../automation.md#removal-records).
+Add `--on server` to clean a remote tree. Results use the
+[`rm` record format](../automation.md#removal-records).
+
+## Which files are removed
+
+`clean-partials` removes regular files named `.FILENAME.syq-tmp.RANDOM`, with
+16 random characters at the end. The filename portion may be shortened or
+omitted. It does not follow symlinks or remove old partial-name formats.
+A regular file deliberately named like a partial is also selected, so preview
+before deleting.
+
+Interrupted replacements and macOS clones can leave `.syq-swap-...` entries
+containing displaced originals or temporary clone data. Neither this command
+nor pruning removes them. Stop copies using the destination, inspect these
+entries, and recover anything you need before removing them manually.
 
 <!-- CLI: clean-partials -->
 ```text

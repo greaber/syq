@@ -8,7 +8,7 @@ See [Remove files](../remove.md) for selection rules and
 syq rm --src-dir old-output --dry-run -v
 ```
 
-For scripting, see [environment variables](../reference.md#environment-variables-and-local-files)
+For scripting, see [environment variables](../environment.md)
 and [removal results](../automation.md#removal-records).
 
 <!-- CLI: rm -->

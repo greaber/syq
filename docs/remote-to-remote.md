@@ -22,52 +22,29 @@ for what this protects against.
 
 ## Start a copy from the source server
 
-If your laptop has a [return connection](receive.md) to the source server,
-you can inspect files in any server shell and send them to another SSH host:
+With a [return connection](receive.md) from your laptop, you can inspect files
+on hostA and send them to hostB from the same shell:
 
 ```sh
 # Run on hostA, including in an existing tmux shell.
-ls -lh results
-syq cp results --to hostB --into /archive
+syq cp results --to hostB --into /archive --auth-from @laptop
 ```
 
-Syq uses the first available receiving machine in alphabetical name order.
-If none is available, or the requested options are unsupported on this route,
-it uses hostA's SSH access. `--to @laptop` instead sends the files to the
-receiving machine itself.
+Your laptop asks for approval, then uses its SSH access to hostB to authorize
+this copy. Trust hostB's SSH host key on the laptop beforehand. Relative
+destination paths start in the hostB account's home directory; your laptop's
+receiving root does not contain this copy, but its transfer limits still apply.
 
-Use `--auth-from @laptop` to choose your laptop explicitly, or `--auth-from ssh`
-to use hostA's SSH access. The default is `--auth-from auto`. `--via @NAME` is
-an alias for choosing a receiving machine. See
-[authorization selection](remote-reference.md#authorization-selection) for
-name rules and route restrictions.
+Files go directly from hostA to hostB over encrypted TCP. HostB needs a
+[reachable data port](server-tuning.md#make-tcp-reachable); this route cannot
+use SSH for file data. Keep the laptop connection and source command running
+until completion.
 
-The selected laptop asks for approval before contacting hostB. Approve with the desktop
-prompt or `syq persist receive pending` and `syq persist receive approve REQUEST_ID` on the laptop.
-These requests require a decision even when `persist receive on --approve always` permits
-automatic copies onto the laptop itself. Once an approval request is sent,
-a refusal, interrupted connection, setup failure, or copy failure ends that
-attempt; syq does not try another authorizer or SSH. `--auth-from @NAME` and
-`--via @NAME` fail if that receiving machine is unavailable.
-
-The laptop uses its own SSH configuration, credentials, and trusted host keys
-to connect to hostB and install the matching syq helper. Connect to hostB with
-ordinary SSH from the laptop first if its host key is not yet trusted. The
-source server receives no SSH credentials or agent access. The control stream
-passes through the laptop; file data goes directly from hostA to hostB over
-encrypted TCP. HostB must expose a [reachable data port](server-tuning.md#make-tcp-reachable)
-to hostA. Failure to reach it fails the copy without switching to SSH data.
-
-The prompt shows the requested SSH endpoint and destination path. Relative
-paths start in that account's home directory on hostB. Your laptop's receiving
-root does not contain this copy, but its byte, entry, and deletion limits still
-apply.
-
-Keep the source command and your laptop's connection alive until completion.
-Stopping receiving or losing that connection cancels the copy. Retry with a
-new approval to resume it. Supported copy options match
-[return copies](receive.md#copy-permissions-and-limits), with additional
-[route restrictions](remote-reference.md#authorization-selection).
+Without `--auth-from`, syq tries an available receiving machine, then hostA's
+own SSH access if none is eligible. Once it requests approval, refusal or
+failure ends the attempt. Use `--auth-from ssh` to choose hostA's SSH access
+explicitly. See [authorization selection](remote-reference.md#authorization-selection)
+for supported options.
 
 ## What you need
 
@@ -104,15 +81,10 @@ syq receiver list
 syq receiver revoke ID
 ```
 
-Use the ID from `list`. Revocation stops active copies for that enrollment,
-blocks new ones, and removes its setup from both machines. Other enrollments
-keep working. Completed writes remain; interrupted copies can leave partial
-files. Enroll again before retrying those copies.
-
-If revocation reports that receivers have not stopped, the enrollment stays
-revoked. Retry `receiver revoke` to finish cleanup. See
-[enrollment details](remote-reference.md#enrollment) for upgrades and sharing
-between installations.
+Use the ID from `list`. Revocation stops active copies for that enrollment
+and removes its access; completed writes remain. If cleanup fails, retry
+`receiver revoke`. See [enrollment details](remote-reference.md#enrollment)
+for upgrades and sharing between installations.
 
 If your machine reaches hostB through hostA, add `--via hostA` to `enroll` or
 `revoke`.

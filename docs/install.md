@@ -14,20 +14,15 @@ Installs into `~/.local/bin` without `sudo`. Make sure that directory is on your
 
 ## Automatic installation on SSH servers
 
-When an official syq release installs its helper on an SSH server, it also
-tries to install the same version at `~/.local/bin/syq` for use on that server.
-Existing files and symlinks there are left alone; shell startup files are
-never edited. Syq reports installation or failure unless `--quiet` is set.
-Shell completion and background connections can also trigger installation,
-without printing a notice. Failure to install this command does not stop the
-transfer.
+An official release installs its SSH helper as needed and also tries to make
+`syq` available at `~/.local/bin/syq` on the server. It leaves existing commands
+and shell startup files alone. Completion and background connections can also
+trigger installation.
 
-Use `syq --self-update` on the server to update this command. To reinstall a
-removed command, run the standalone installer above on the server.
-
-Reusing a cached helper does not repeat this installation step. Development
-builds and connections using `--syq-path` or `--no-bootstrap` do not install
-the command.
+Use `syq --self-update` on the server to update that command. If it is missing,
+use the standalone installer above; reusing a cached helper does not reinstall
+it. Development builds and `--syq-path` / `--no-bootstrap` connections do not
+install the command.
 
 ## Homebrew
 

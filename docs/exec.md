@@ -9,9 +9,8 @@ syq exec --on @laptop --cwd work/project -- cargo test
 syq exec --on @laptop --cwd work/project -- open report.html
 ```
 
-The second command uses macOS's `open` program to display an artifact. Any
-program installed on the receiving machine can be requested, including a
-native application or a version of syq you have just built there.
+The second command uses macOS's `open` program to display an artifact. Replace
+it with any program installed on your receiving machine.
 
 If you have already set up [receiving files](receive.md), you can request
 commands through the same connection. Otherwise, run `syq persist connect server`
@@ -35,12 +34,9 @@ syq persist receive approve REQUEST_ID
 syq persist receive deny REQUEST_ID
 ```
 
-Command requests are available whenever receiving is enabled. Every command
-requires its own decision, even with `syq persist receive on --approve always` for copies.
-Approving a copy does not approve commands. A missing or dismissed desktop
-prompt never grants permission; use the local terminal commands. Pending
-requests expire after five minutes and are cancelled when the requester
-disconnects or receiving restarts or stops.
+Every command requires approval, even if copies are approved automatically.
+If the desktop prompt is missing, use the terminal commands above. Requests
+expire after five minutes.
 
 An approved command runs with your local user's permissions, including access
 to files and credentials. **The receiving `--root` and copy limits do not
@@ -68,31 +64,18 @@ The command inherits the receiving service's local environment, including
 Restart receiving from a terminal in the desired desktop session when those
 values change. Stdin is closed and there is no interactive terminal.
 
-A request supports at most 256 arguments, including the program, with at most
-16 KiB of argument bytes and a working-directory path of at most 4096 bytes.
-Each server connection permits one pending approval and eight active commands.
-Active commands do not prevent a new approval or an ordinary copy.
-
 ## Output, completion and cancellation
 
-Stdout and stderr stream back separately without text conversion. Syq returns
-the command's exit code; when the command is killed by a signal it reports the
-signal and returns `128 + signal`. A setup error or connection failure is a
-nonzero result. A connection that closes before delivering the exit status is
-an error even if some output arrived successfully.
+Stdout and stderr stream back to your terminal, and syq returns the command's
+exit code. A lost connection is an error; the command is not retried automatically.
 
-Interrupting the request, losing the connection, changing receiving settings,
-or stopping receiving cancels execution. Syq forcibly stops the command's
-process group, including remaining children when the foreground program exits;
-cleanup handlers do not run. Detached processes and applications launched
-through macOS `open` can outlive the request. Syq does not manage detached jobs.
+Interrupting the request or stopping receiving forcibly stops its process
+group. Cleanup handlers do not run. Detached processes and applications
+launched through macOS `open` can outlive the request. Completed changes to
+files are not rolled back.
 
-A command may already have changed files when interrupted. It is never retried
-automatically after a lost connection. Inspect the outcome before requesting
-it again. Commands do not produce copy receipts or copy automation records.
-
-Python callers can use the SDK's existing raw process interface with their
-chosen executable:
+From Python, use the SDK's raw command interface with the syq executable
+you use for receiving:
 
 ```python
 import syq
@@ -105,7 +88,6 @@ result = syq.run(
 print(result.stdout.decode())
 ```
 
-The raw SDK call captures byte output and raises on a nonzero exit by default.
-The async client's `run` method accepts the same command arguments. For live
-terminal output, invoke the CLI directly or use a subprocess with inherited
-stdout and stderr.
+This captures output and raises on a nonzero exit. For live terminal output,
+run the CLI directly. See the [command reference](commands/exec.md#execution-details)
+for execution limits and cancellation details.
