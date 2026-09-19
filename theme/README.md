@@ -84,9 +84,11 @@ disabled, with a reason. Missing examples are not evidence of incompatibility. R
 shared task across all tools so readers can switch between them. Comparisons keep the task’s starting point, endpoints, and data route fixed.
 The syq selection makes all tasks discoverable. Workarounds that change those
 constraints are described separately and do not enable a comparison.
-Shared landing-actions buttons offer installation, benchmarks, sending files
-home, server-to-server copies and programmable file placement. Quickstart
-examples follow under Try a copy.
+The landing-actions buttons offer installation and benchmarks. Quickstart
+examples follow under Try a copy, with task links below the comparison widget.
+Familiar commands appear first; Differences disclosures explain closer-match
+commands and remaining behavioral differences. Code wrapping is scoped to code
+elements so clipboard confirmations stay on one line.
 
 head.hbs adds Open Graph and Twitter card metadata so shared documentation
 links render a titled card rather than a bare URL. Title varies per page;
