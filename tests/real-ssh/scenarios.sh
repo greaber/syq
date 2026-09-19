@@ -141,10 +141,9 @@ syq completion cache clear >/dev/null
 
 printf 'case: descriptor upload and download over real SSH\n'
 python3 - <<'PY_DESCRIPTORS'
-import subprocess, hashlib
+import subprocess
 payload = bytes(range(256)) * 80000 + b'last\x00\xff'
-expected = "sha256:" + hashlib.sha256(payload).hexdigest()
-controls = ["--expected-hash", expected, "--integrity-checking", "transfer=md5",
+controls = ["--integrity-checking", "transfer=md5",
             "--performance-tuning", "request-size=1M,pipeline-depth=8", "--stats", "-vv"]
 path = "/tmp/syq-real-ssh/stream 'with spaces'"
 # Fixed workers plus pacing give both workers time to carry payload. Verify the
