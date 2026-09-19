@@ -59,7 +59,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                    'Last-Modified': 'Sun, 13 Sep 2020 12:26:40 GMT'}
         if CASE == 'file-metadata':
             headers.update(STATE.get('metadata', {}))
-        self.reply(200, headers=headers, length=len(DATA))
+        self.reply(200, headers=headers, length=len(STATE.get('published', DATA)) if CASE == 'file-metadata' else len(DATA))
 
     def do_GET(self):
         STATE['requests'] += 1
@@ -90,6 +90,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.rfile.read(int(self.headers.get('Content-Length', '0')))
 
     def do_PUT(self):
+        STATE['writes'] = STATE.get('writes', 0) + 1
         data = self.body()
         # Validate the checksum independently of syq's code.
         assert self.headers['x-amz-checksum-sha256'] == base64.b64encode(hashlib.sha256(data).digest()).decode()
@@ -116,6 +117,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply(200, headers={'ETag': '"part"', 'x-amz-checksum-sha256': self.headers['x-amz-checksum-sha256']})
 
     def do_POST(self):
+        STATE['writes'] = STATE.get('writes', 0) + 1
         body = self.body()
         if 'uploadId=' in self.path:
             STATE['published'] = b''.join(STATE['parts'][n] for n in sorted(STATE['parts']))
@@ -248,6 +250,44 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                           'x-amz-meta-syq-mtime': '1600000000',
                           'x-amz-meta-syq-mtime-nsec': '123456789'}
                 assert STATE['metadata'] == stored, STATE['metadata']
+            # Matching uploads inspect one HEAD without reading input or
+            # publishing again. A nonzero source offset compares remaining bytes.
+            results = Path(temp) / 'comparison.json'
+            source.write_bytes(b'prefix' + DATA)
+            os.utime(source, ns=(stamp, stamp))
+            for extra in ([], ['--dry-run']):
+                results.unlink(missing_ok=True)
+                before, writes = STATE['requests'], STATE['writes']
+                with source.open('rb') as stream:
+                    stream.seek(6)
+                    response = run(put + extra + ['--results', str(results)], stdin=stream, env=env)
+                    success(response)
+                    assert stream.tell() == 6
+                assert STATE['requests'] == before + 1 and STATE['writes'] == writes
+                records = [json.loads(line) for line in results.read_text().splitlines()]
+                assert not any(r['type'] == 'stream_ready' for r in records)
+                assert records[-1]['files_unchanged'] == 1
+                assert records[-1]['bytes_unchanged'] == len(DATA)
+                assert records[-1]['files_transferred'] == records[-1]['files_excluded'] == 0
+                assert records[-1]['bytes_transferred'] == 0
+            source.write_bytes(DATA)
+            os.utime(source, ns=(stamp, stamp))
+            # Unrequested mode differences do not force a write. Requested
+            # differences, subsecond timestamps, and expected hashes do.
+            STATE['metadata']['x-amz-meta-syq-mode'] = str(0o600)
+            with source.open('rb') as stream:
+                success(run(put, stdin=stream, env=env))
+                assert stream.tell() == 0
+            for extra in (['--preserve=permissions'], [],
+                          ['--expected-hash', 'sha256:' + hashlib.sha256(DATA).hexdigest()]):
+                if not extra:
+                    STATE['metadata']['x-amz-meta-syq-mtime-nsec'] = '123456788'
+                writes = STATE['writes']
+                with source.open('rb') as stream:
+                    success(run(put + extra, stdin=stream, env=env))
+                    assert stream.tell() == len(DATA)
+                assert STATE['writes'] > writes
+                assert STATE['metadata'] == stored
             output_path = Path(temp) / 'output'
             with output_path.open('w+b') as output:
                 for preserve in ([], ['--preserve=permissions,ownership'], ['--preserve=times']):
@@ -293,7 +333,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                     response = run(put + options, stdin=stream, env=env)
                 success(response)
                 assert STATE['published'] == b'prefix can coexist'
-                assert STATE['requests'] - requests == int(bool(options))
+                assert STATE['requests'] - requests == 1
                 assert STATE.get('lists', 0) == lists
             # An explicit placement condition still checks the prefix and
             # fails without consuming the source.
@@ -302,7 +342,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 failure(response)
                 assert b'existence condition failed' in response.stderr
                 assert stream.tell() == 0
-            STATE.update(missing_object=False, prefix_exists=False)
+            STATE.update(missing_object=False, prefix_exists=False, published=DATA)
             # Plain output ignores metadata, including unfamiliar formats,
             # whether stdout is a pipe or an already-open regular file.
             for metadata in ({}, {'x-amz-meta-syq-format': 'unknown'}):

@@ -227,6 +227,12 @@ diagnostics. Dedicate each descriptor to the copy. Syq advances its offset,
 respects append mode, and leaves its blocking mode alone;
 it does not truncate it. A literal `-` is a filename.
 
+A regular-file input descriptor uses the ordinary size/time check for a named
+destination. When they match, input stays unread and the copy counts as unchanged.
+The size is the number of bytes remaining after the descriptor's current offset.
+An expected hash requires reading and checking the payload instead. Pipes and
+output descriptors do not use this check.
+
 When a regular file is copied to a named destination, syq preserves its
 modification time. New named files use the source permissions limited by the
 destination umask; existing files keep their permissions. S3 uploads store file

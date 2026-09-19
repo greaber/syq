@@ -1236,6 +1236,160 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
 }
 
 #[test]
+fn stream_file_comparison_leaves_matching_input_unread() {
+    use std::io::{Seek, SeekFrom};
+    let t = Tmp::new();
+    write(&t.path("source"), b"prefixpayload");
+    fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o751)).unwrap();
+    let time = std::time::UNIX_EPOCH + std::time::Duration::new(1_600_000_000, 123_456_789);
+    let input = File::open(t.path("source")).unwrap();
+    input.set_modified(time).unwrap();
+    let rsh = fake_rsh(&t);
+    for remote in [false, true] {
+        write(&t.path("target"), b"payload");
+        fs::set_permissions(t.path("target"), fs::Permissions::from_mode(0o600)).unwrap();
+        File::open(t.path("target"))
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        let original = fs::metadata(t.path("target")).unwrap();
+        let cp = |placement: &str, extra: &[&str]| {
+            if t.path("results.json").exists() {
+                fs::remove_file(t.path("results.json")).unwrap();
+            }
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command
+                .current_dir(&t.0)
+                .env("HOME", &t.0)
+                .env("FAKE_REMOTE_HOME", &t.0)
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .args(["cp", "--rsh"])
+                .arg(&rsh)
+                .args(["--syq-path", env!("CARGO_BIN_EXE_syq"), "--src-fd", "0"]);
+            if remote {
+                command.args(["--to", "fixture"]);
+            }
+            command
+                .args([placement, "target", "--results", "results.json"])
+                .args(extra)
+                .stdin(input.try_clone().unwrap())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .start()
+                .unwrap()
+                .wait_with_output()
+                .unwrap()
+        };
+        let records = || {
+            read(&t.path("results.json"))
+                .split(|b| *b == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for extra in [
+            vec![],
+            vec!["--dry-run"],
+            vec!["--only-existing"],
+            vec!["--integrity-checking", "transfer=blake3"],
+        ] {
+            input.try_clone().unwrap().seek(SeekFrom::Start(6)).unwrap();
+            let output = cp("--as", &extra);
+            assert_output_ok(&output);
+            assert!(stderr_of(&output).contains("Unchanged"));
+            assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 6);
+            let after = fs::metadata(t.path("target")).unwrap();
+            assert_eq!(
+                (after.ino(), after.ctime(), after.ctime_nsec()),
+                (original.ino(), original.ctime(), original.ctime_nsec())
+            );
+            let values = records();
+            assert!(!values.iter().any(|v| v["type"] == "stream_ready"));
+            let stream = values
+                .iter()
+                .find(|v| v["type"] == "stream_result")
+                .unwrap();
+            assert_eq!(stream["bytes"], 0);
+            assert_eq!(
+                stream["disposition"],
+                if extra.contains(&"--dry-run") {
+                    "planned"
+                } else {
+                    "succeeded"
+                }
+            );
+            let result = values.last().unwrap();
+            assert_eq!(result["files_unchanged"], 1);
+            assert_eq!(result["bytes_unchanged"], 7);
+            assert_eq!(result["files_transferred"], 0);
+            assert_eq!(result["bytes_transferred"], 0);
+            assert_eq!(result["files_excluded"], 0);
+        }
+        // Matching content can still need metadata repair. Preserve its inode,
+        // and do not apply that repair in a preview.
+        for preview in [true, false] {
+            let mut extra = vec!["--preserve=permissions,ownership"];
+            if preview {
+                extra.push("--dry-run");
+            }
+            let output = cp("--as", &extra);
+            assert_output_ok(&output);
+            let after = fs::metadata(t.path("target")).unwrap();
+            assert_eq!(after.ino(), original.ino());
+            assert_eq!(after.mode() & 0o7777, if preview { 0o600 } else { 0o751 });
+            assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 6);
+            assert_eq!(records().last().unwrap()["files_unchanged"], 1);
+        }
+        // Match the destination timestamp's decimal precision, as normal cp does.
+        File::open(t.path("target"))
+            .unwrap()
+            .set_modified(time - std::time::Duration::from_nanos(9))
+            .unwrap();
+        assert_output_ok(&cp("--as", &[]));
+        assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 6);
+        assert_eq!(
+            fs::metadata(t.path("target")).unwrap().ino(),
+            original.ino()
+        );
+        // Exclusion and placement take precedence over content comparison.
+        assert_output_ok(&cp("--as", &["--max-size", "1"]));
+        assert_eq!(records().last().unwrap()["files_excluded"], 1);
+        assert_eq!(records().last().unwrap()["files_unchanged"], 0);
+        let output = cp("--as-new", &[]);
+        assert!(!output.status.success());
+        assert_eq!(records().last().unwrap()["files_unchanged"], 0);
+        assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 6);
+        // An expected digest must read and validate the payload even on a match.
+        let wrong = format!("sha256:{}", "00".repeat(32));
+        let output = cp("--as", &["--expected-hash", &wrong]);
+        assert!(!output.status.success());
+        assert_eq!(records().last().unwrap()["files_unchanged"], 0);
+        assert_eq!(read(&t.path("target")), b"payload");
+        assert_eq!(
+            fs::metadata(t.path("target")).unwrap().ino(),
+            original.ino()
+        );
+        // A changed size or timestamp transfers the remaining bytes normally.
+        for bytes in [b"old".as_slice(), b"1234567".as_slice()] {
+            write(&t.path("target"), bytes);
+            File::open(t.path("target"))
+                .unwrap()
+                .set_modified(if bytes.len() == 7 {
+                    time - std::time::Duration::from_secs(1)
+                } else {
+                    time
+                })
+                .unwrap();
+            input.try_clone().unwrap().seek(SeekFrom::Start(6)).unwrap();
+            assert_output_ok(&cp("--as", &[]));
+            assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 13);
+            assert_eq!(read(&t.path("target")), b"payload");
+            assert_eq!(records().last().unwrap()["files_transferred"], 1);
+        }
+    }
+}
+
+#[test]
 fn stream_file_metadata_and_newer_selection() {
     use std::io::{Seek, SeekFrom};
     let t = Tmp::new();

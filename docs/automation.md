@@ -224,11 +224,12 @@ is non-retryable. Do not construct a retry source from its destination name.
 
 ### `stream_ready`
 
-A producer may start supplying payload. Uploads without a skip policy emit this
+A producer may start supplying payload. Pipe uploads without a skip policy emit this
 before destination setup finishes, allowing several writers to connect concurrently.
-With `--only-new`, `--only-existing`, `--skip-newer`, size filters, or metadata
-preservation requested, source selection and destination checks come first.
-Skipped copies and dry runs finish without this record. Setup, transfer, or
+Regular-file inputs wait for size/time comparison. With `--only-new`,
+`--only-existing`, `--skip-newer`, size filters, or metadata preservation requested,
+source selection and destination checks also come first. Unchanged and skipped
+copies and dry runs finish without this record. Setup, transfer, or
 publication can still fail; require the terminal result for completion.
 
 ### `stream_result`
@@ -245,7 +246,10 @@ preview. `bytes` counts transferred bytes, including partial work on failure,
 or planned bytes in a dry run. It is absent for a preview of unknown-length
 input. A failed upload may have transferred bytes without publishing them.
 Skipped copies consume no payload, report zero bytes, and count as one excluded
-file. The normal terminal `result` still establishes completion. Its optional
+file. Unchanged regular-file uploads report `succeeded` (`planned` for a dry run)
+with zero transferred bytes; the terminal totals count them in `files_unchanged`
+and `bytes_unchanged`, rather than excluded files. The normal terminal `result`
+still establishes completion. Its optional
 `bytes_total_known` field is false when the source length is unknown; preview
 byte totals then count only known bytes, rather than asserting an empty input.
 

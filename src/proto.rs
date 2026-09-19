@@ -1176,9 +1176,10 @@ pub enum Response {
         metadata: Option<Meta>,
         ticket: DescriptorTicket,
     },
-    /// Dry-run inspection: a named source length, or unknown upload length.
+    /// Inspection or unchanged content: source length when known.
     DescriptorInspected {
         skipped: bool,
+        unchanged: bool,
         size: Option<u64>,
         metadata: Option<Meta>,
     },

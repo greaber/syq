@@ -1,5 +1,32 @@
 use super::*;
 
+/// Reuse ordinary file metadata repair with the resolver's pinned parent and
+/// observed identity; never follow a replacement symlink during repair.
+pub(crate) fn repair_selected_file_meta(
+    leaf: crate::rooted::PinnedLeaf,
+    meta: Meta,
+    flags: u8,
+) -> Result<()> {
+    let (parent, name, observed, _pin) = leaf.into_parts();
+    let operation = Op::SetFileMetaIfSame {
+        path: name.to_bytes().to_vec(),
+        condition: TargetCondition::MatchesFingerprint {
+            dev: observed.dev,
+            ino: observed.ino,
+            ctime: observed.ctime,
+            ctime_nsec: observed.ctime_nsec,
+        },
+        meta,
+        flags,
+    };
+    apply_one(
+        &operation,
+        None,
+        Some(Arc::new(Root::from_directory(parent)?)),
+        None,
+    )
+}
+
 pub(super) fn op_path(op: &Op) -> &[u8] {
     match op {
         Op::Mkdir { path, .. }

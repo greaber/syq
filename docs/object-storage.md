@@ -29,7 +29,9 @@ See [S3 tuning](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 
 With [`--src-fd` or `--as-fd`](commands/cp.md#file-descriptors), `cp`
 transfers one exact UTF-8 key's raw contents, without path normalization or
-prefix selection. Regular-file uploads store syq's file metadata. Output
+prefix selection. Regular-file uploads store syq's file metadata and use HEAD
+to skip objects whose size and stored source timestamp match. Different requested
+permissions or ownership require an upload. Output
 descriptors receive raw bytes; use `--preserve` to apply attributes to a regular
 output file. Pipes carry only bytes. No local temporary file is created.
 

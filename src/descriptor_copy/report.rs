@@ -19,6 +19,8 @@ pub(crate) struct Report {
     pub only_new: bool,
     pub only_existing: bool,
     skipped: AtomicBool,
+    unchanged: AtomicBool,
+    early_ready: bool,
     ready_sent: AtomicBool,
     quiet: bool,
     writer: Option<Arc<ResultsWriter>>,
@@ -55,6 +57,18 @@ impl Report {
             only_new: args.ignore_existing,
             only_existing: args.existing,
             skipped: AtomicBool::new(false),
+            unchanged: AtomicBool::new(false),
+            early_ready: plan.source.is_some()
+                && !args.dry_run
+                && !args.ignore_existing
+                && !args.existing
+                && !plan.size_filter.active()
+                && !args.update
+                && !args.times
+                && !args.perms
+                && !args.owner
+                && !args.group
+                && !args.devices,
             ready_sent: AtomicBool::new(false),
             quiet: args.quiet,
             writer: results::start(
@@ -67,23 +81,20 @@ impl Report {
             source,
             destination,
         };
-        // Without a skip policy, input can queue while the destination connects.
-        // Decide this after CLI/environment parsing so the SDK need not duplicate it.
-        if plan.source.is_some()
-            && !report.dry_run
-            && !report.only_new
-            && !report.only_existing
-            && !plan.size_filter.active()
-            && !args.update
-            && !args.times
-            && !args.perms
-            && !args.owner
-            && !args.group
-            && !args.devices
-        {
-            report.ready();
-        }
         Ok(report)
+    }
+    /// Pipe writers can queue input while the destination connects. Regular
+    /// files wait for comparison so an unchanged copy never announces readiness.
+    pub fn ready_while_connecting(&self, regular: bool) {
+        if self.early_ready && !regular {
+            self.ready();
+        }
+    }
+    pub fn mark_unchanged(&self) {
+        self.unchanged.store(true, Relaxed);
+    }
+    pub fn unchanged(&self) -> bool {
+        self.unchanged.load(Relaxed)
     }
     pub fn skip(&self) {
         self.skipped.store(true, Relaxed);
@@ -112,13 +123,21 @@ impl Report {
             progress.bytes_done.load(Relaxed)
         };
         let skipped = self.skipped() && success;
+        let unchanged = self.unchanged() && success;
+        let bytes = if unchanged { 0 } else { bytes };
+        if unchanged && !self.quiet {
+            crate::output::diagnostic!(
+                "Unchanged stream destination {}",
+                describe(&self.destination)
+            );
+        }
         if skipped && !self.quiet {
             crate::output::diagnostic!(
                 "Skipped stream destination {}",
                 describe(&self.destination)
             );
         }
-        if self.dry_run && success && !skipped && !self.quiet {
+        if self.dry_run && success && !skipped && !unchanged && !self.quiet {
             crate::output::diagnostic!(
                 "Would copy stream {} to {}{}",
                 describe(&self.source),
@@ -150,15 +169,15 @@ impl Report {
                 status: if success { "success" } else { "failed" },
                 exit_code: if success { 0 } else { 1 },
                 dry_run: self.dry_run,
-                files_transferred: u64::from(success && !skipped),
-                files_unchanged: 0,
+                files_transferred: u64::from(success && !skipped && !unchanged),
+                files_unchanged: u64::from(unchanged),
                 files_excluded: u64::from(skipped),
                 directories_created: 0,
                 symlinks_created: 0,
                 specials_created: 0,
                 errors: u64::from(!success),
                 bytes_transferred: if skipped { 0 } else { bytes },
-                bytes_unchanged: 0,
+                bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
                 copying_elapsed_ms: None,
                 elapsed_ms: progress.start.elapsed().as_millis() as u64,
                 deletions_planned: None,

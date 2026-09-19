@@ -85,6 +85,7 @@ pub(crate) enum Operation {
         settings: Settings,
         metadata: metadata::Policy,
         source_meta: Option<crate::proto::Meta>,
+        compare_size: Option<u64>,
     },
     Finish {
         size: u64,

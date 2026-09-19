@@ -203,6 +203,24 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-results-') as directory:
             os.close(read_fd)
             os.close(write_fd)
 subprocess.run(['ssh', 'destination', 'test ! -e /tmp/syq-real-ssh/preview-missing'], check=True, timeout=15)
+# Reusing a regular-file input leaves its offset untouched when the remote
+# destination already has the same size and modification time.
+with tempfile.TemporaryDirectory(prefix='syq-stream-comparison-') as directory:
+    source = directory + '/source'
+    with open(source, 'wb') as f:
+        f.write(b'prefix' + payload)
+    with open(source, 'rb', buffering=0) as f:
+        for index in range(2):
+            f.seek(6)
+            results = directory + '/result-' + str(index)
+            result = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination',
+                                     '--as', path + '-comparison', '--results', results], stdin=f,
+                                    capture_output=True, timeout=60)
+            assert result.returncode == 0, result.stderr
+            records = [json.loads(line) for line in open(results)]
+            assert records[-1]['files_unchanged'] == index, records
+            assert records[-1]['bytes_transferred'] == (0 if index else len(payload)), records
+            assert f.tell() == (6 if index else 6 + len(payload))
 # A producer exception closes the control pipe without authorizing publication.
 for commit in (b'', b'C'):
     read_fd, write_fd = os.pipe()

@@ -263,6 +263,7 @@ impl Session {
                 settings,
                 metadata,
                 source_meta,
+                compare_size,
             } => {
                 anyhow::ensure!(slot.is_none(), "descriptor stream already open");
                 anyhow::ensure!(
@@ -286,6 +287,7 @@ impl Session {
                 if *write && ((*only_new && exists) || (*only_existing && !exists)) {
                     return Ok(Response::DescriptorInspected {
                         skipped: true,
+                        unchanged: false,
                         size: None,
                         metadata: None,
                     });
@@ -320,9 +322,38 @@ impl Session {
                 } else {
                     *only_new
                 };
+                if !skipped && *write {
+                    if let (Some(length), Some(source), Some(destination)) =
+                        (compare_size, source_meta, file_meta)
+                    {
+                        let matches = matches!(&selected, PinnedPath::Leaf(leaf)
+                            if leaf.metadata().is_file() && leaf.metadata().len == *length)
+                            && source.mtime == destination.mtime
+                            && crate::fsops::destination_fraction_matches(
+                                source.mtime_nsec,
+                                destination.mtime_nsec,
+                            );
+                        if matches {
+                            let flags = metadata.repair_flags(*source, destination);
+                            if !dry_run && flags != 0 {
+                                let PinnedPath::Leaf(leaf) = selected else {
+                                    unreachable!()
+                                };
+                                crate::fsops::repair_selected_file_meta(leaf, *source, flags)?;
+                            }
+                            return Ok(Response::DescriptorInspected {
+                                skipped: false,
+                                unchanged: true,
+                                size: Some(*length),
+                                metadata: None,
+                            });
+                        }
+                    }
+                }
                 if *dry_run || skipped {
                     return Ok(Response::DescriptorInspected {
                         skipped,
+                        unchanged: false,
                         size,
                         metadata: (!*write).then_some(file_meta).flatten(),
                     });
@@ -478,6 +509,7 @@ mod tests {
             placement: StreamPlacement::default(),
             metadata: Default::default(),
             source_meta: None,
+            compare_size: None,
             settings: Settings {
                 verify: true,
                 ..Settings::default()
@@ -565,6 +597,7 @@ mod tests {
                 settings: Settings::default(),
                 metadata: Default::default(),
                 source_meta: None,
+                compare_size: None,
             },
             &descriptors,
         )

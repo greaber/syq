@@ -37,12 +37,12 @@ pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
             )
         };
         if !supported {
-            bail!("performance control {key:?} is not supported with this descriptor copy: streams transfer one object without file comparison or small-file batching; S3 uses its part controls");
+            bail!("performance control {key:?} is not supported with this descriptor copy: streams transfer one object without block reuse or small-file batching; S3 uses its part controls");
         }
     }
     if let Some(checks) = args.integrity_checking {
         if checks.compare.is_some() {
-            bail!("descriptor copies always transfer the selected bytes; content comparison is not supported");
+            bail!("descriptor copies support size/time checks for regular-file uploads, but content comparison is not supported");
         }
         if s3 && checks.transfer.flatten().is_some() {
             bail!("extra S3 stream verification is not supported: raw objects have no syq digest metadata; use --expected-hash with a known digest (provider checksums remain enabled)");
@@ -70,6 +70,7 @@ pub(crate) struct Controls {
     pub progress: Arc<Progress>,
     limit: Option<crate::bwlimit::BandwidthLimit>,
     expected: Option<Digest>,
+    quick_check: bool,
     stats: bool,
     quiet: bool,
 }
@@ -129,6 +130,8 @@ impl Controls {
             progress,
             limit,
             expected: args.expected_digest.clone(),
+            quick_check: args.expected_digest.is_none()
+                && (args.s3.is_none() || !args.transfer_integrity),
             stats: args.stats,
             quiet: args.quiet,
         }
@@ -151,6 +154,11 @@ impl Controls {
             self.report.skip();
         }
         Ok(skipped)
+    }
+    /// Only regular-file inputs supply a length. Explicit content checks take
+    /// precedence over the size/time shortcut, as in pathname copies.
+    pub fn comparison_size(&self, size: Option<u64>) -> Option<u64> {
+        size.filter(|_| self.quick_check && !self.report.skipped())
     }
     pub fn set_size(&self, size: u64) {
         self.progress.bytes_total.store(size, Relaxed);
@@ -183,11 +191,18 @@ impl Controls {
     pub fn finish(&self, error: Option<&anyhow::Error>) {
         let success = error.is_none();
         let bytes = self.progress.bytes_done.load(Relaxed);
-        if success && !self.report.dry_run && !self.report.skipped() {
+        let unchanged = self.report.unchanged();
+        if success && unchanged {
+            self.progress.files_unchanged.store(1, Relaxed);
+            self.progress
+                .bytes_unchanged
+                .store(self.progress.bytes_total.load(Relaxed), Relaxed);
+        }
+        if success && !self.report.dry_run && !self.report.skipped() && !unchanged {
             self.set_size(bytes);
             self.progress.files_done.store(1, Relaxed);
         }
-        if success && self.report.dry_run && !self.report.skipped() {
+        if success && self.report.dry_run && !self.report.skipped() && !unchanged {
             self.progress.files_done.store(1, Relaxed);
             self.progress
                 .bytes_done
@@ -199,7 +214,8 @@ impl Controls {
         self.progress.errors.store(u64::from(!success), Relaxed);
         self.progress.finish(success);
         self.report.finish(self, error);
-        if self.stats && !self.quiet && !self.report.dry_run && !self.report.skipped() {
+        if self.stats && !self.quiet && !self.report.dry_run && !self.report.skipped() && !unchanged
+        {
             let seconds = self.progress.start.elapsed().as_secs_f64();
             crate::output::diagnostic!(
                 "stream {}: {} bytes in {:.3}s ({:.0} bytes/s)",

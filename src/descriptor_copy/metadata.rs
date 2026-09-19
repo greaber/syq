@@ -45,6 +45,21 @@ impl Policy {
                 .zip(destination)
                 .is_some_and(|(src, dst)| (dst.mtime, dst.mtime_nsec) > (src.mtime, src.mtime_nsec))
     }
+    /// Size/time matches can still need requested permission or ownership fixes.
+    /// Leave the matching timestamp at the destination's existing precision.
+    pub fn repair_flags(self, source: Meta, destination: Meta) -> u8 {
+        let mut flags = 0;
+        if source.mode != destination.mode {
+            flags |= flags::MODE;
+        }
+        if source.uid != destination.uid {
+            flags |= flags::OWNER;
+        }
+        if source.gid != destination.gid {
+            flags |= flags::GROUP;
+        }
+        flags & self.preserve
+    }
     pub fn apply(self, file: &File, source: Option<Meta>) -> Result<()> {
         if let Some(meta) = source {
             crate::fsops::set_meta_file(file, &meta, self.preserve)?;

@@ -25,6 +25,7 @@ struct Plan<'a> {
     placement: crate::descriptor_copy::StreamPlacement,
     target: String,
     source_meta: Option<crate::proto::Meta>,
+    compare_size: Option<u64>,
 }
 pub(crate) fn run(
     options: Options,
@@ -50,6 +51,7 @@ pub(crate) fn run(
         placement,
         target,
         source_meta: None,
+        compare_size: None,
     };
     let cancelled = Arc::new(AtomicBool::new(false));
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -71,7 +73,10 @@ pub(crate) fn run(
         if plan.options.route == crate::s3::Route::Upload {
             plan.source_meta = descriptor.as_ref().and_then(Descriptor::metadata);
             controls.metadata.source(plan.source_meta)?;
-            controls.skip_size(descriptor.as_ref().map(Descriptor::remaining_len).transpose()?.flatten())?;
+            let size = descriptor.as_ref().map(Descriptor::remaining_len).transpose()?.flatten();
+            controls.skip_size(size)?;
+            plan.compare_size = controls.comparison_size(size);
+            controls.report.ready_while_connecting(plan.source_meta.is_some());
         }
         if plan.options.route == crate::s3::Route::Download {
             controls.metadata.output(descriptor.as_ref().and_then(Descriptor::metadata).is_some())?;
@@ -86,7 +91,7 @@ pub(crate) fn run(
             let operation = async {
                 if plan.options.route == crate::s3::Route::Upload {
                     check_placement(&client, &plan).await?;
-                    if controls.report.skipped() { return Ok(()); }
+                    if controls.report.skipped() || controls.report.unchanged() { return Ok(()); }
                     if controls.report.dry_run { return Ok(()); }
                 }
                 if plan.options.route == crate::s3::Route::Upload { controls.report.ready(); }
@@ -143,7 +148,7 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
     let report = &plan.controls.report;
     let policy = report.only_new || report.only_existing;
     let inspect_placement = existence != Existence::Any || policy;
-    if !inspect_placement && !plan.controls.metadata.skip_newer {
+    if !inspect_placement && !plan.controls.metadata.skip_newer && plan.compare_size.is_none() {
         return Ok(());
     }
     // Match ordinary S3 cp: a new target must have neither an exact object
@@ -162,6 +167,7 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
     } else {
         client::head_output(client, &plan.options.bucket, target, None).await?
     };
+    let mut object_head = None;
     if inspect_placement {
         let exact = exact_head.is_some();
         let prefix = if target.is_empty() {
@@ -178,9 +184,10 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
         }
         if policy {
             let final_present = if container {
-                super::client::head_output(client, &plan.options.bucket, &plan.key, None)
-                    .await?
-                    .is_some()
+                object_head =
+                    super::client::head_output(client, &plan.options.bucket, &plan.key, None)
+                        .await?;
+                object_head.is_some()
                     || super::client::prefix_exists(
                         client,
                         &plan.options.bucket,
@@ -199,19 +206,43 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
             bail!("S3 destination is a prefix, not an object");
         }
     }
-    if plan.controls.metadata.skip_newer {
-        let head = if container {
+    if plan.controls.metadata.skip_newer || plan.compare_size.is_some() {
+        let head = if container && !policy {
             client::head_output(client, &plan.options.bucket, &plan.key, None).await?
+        } else if container {
+            object_head
         } else {
             exact_head
         };
-        // Match pathname S3 copies, which compare whole seconds.
+        // --skip-newer compares whole seconds, as in pathname S3 copies.
         if let Some(head) = head {
             let stored = client::Metadata::decode(head.metadata())?;
-            let mtime =
-                stored.map_or_else(|| head.last_modified().map_or(0, |t| t.secs()), |m| m.mtime);
-            if mtime > plan.source_meta.context("missing source timestamp")?.mtime {
+            let source = plan.source_meta.context("missing source timestamp")?;
+            let mtime = stored
+                .as_ref()
+                .map_or_else(|| head.last_modified().map_or(0, |t| t.secs()), |m| m.mtime);
+            if plan.controls.metadata.skip_newer && mtime > source.mtime {
                 report.skip();
+                return Ok(());
+            }
+            // Match pathname uploads: stored source timestamps must match
+            // exactly. Different requested attributes need an object upload.
+            if let (Some(size), Some(stored)) = (plan.compare_size, stored) {
+                let destination = crate::proto::Meta {
+                    mode: stored.mode,
+                    uid: stored.uid,
+                    gid: stored.gid,
+                    mtime: stored.mtime,
+                    mtime_nsec: stored.nsec,
+                };
+                if stored.kind == client::ObjectKind::File
+                    && head.content_length().and_then(|n| u64::try_from(n).ok()) == Some(size)
+                    && (source.mtime, source.mtime_nsec)
+                        == (destination.mtime, destination.mtime_nsec)
+                    && plan.controls.metadata.repair_flags(source, destination) == 0
+                {
+                    report.mark_unchanged();
+                }
             }
         }
     }

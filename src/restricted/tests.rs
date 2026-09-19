@@ -3811,6 +3811,7 @@ fn receiver_rejects_descriptor_copy_operations() {
             placement: Default::default(),
             metadata: Default::default(),
             source_meta: None,
+            compare_size: None,
             settings: Default::default(),
         },
         crate::descriptor_copy::Operation::Finish { size: 0 },

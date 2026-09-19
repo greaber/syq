@@ -49,6 +49,7 @@ fn prepare(
     plan: &Plan,
     controls: &Controls,
     input_meta: Option<crate::proto::Meta>,
+    compare_size: Option<u64>,
 ) -> Result<Option<Prepared>> {
     let location = plan.location.as_ref().unwrap();
     let local_session = location
@@ -81,6 +82,7 @@ fn prepare(
             settings: controls.settings,
             metadata: controls.metadata,
             source_meta: input_meta,
+            compare_size,
         }))?,
         "open stream",
     )? {
@@ -92,9 +94,16 @@ fn prepare(
         Response::DescriptorInspected {
             size,
             skipped,
+            unchanged,
             metadata,
         } => {
-            anyhow::ensure!(inspect_only || skipped, "stream was not opened");
+            anyhow::ensure!(
+                inspect_only || skipped || unchanged,
+                "stream was not opened"
+            );
+            if unchanged {
+                controls.report.mark_unchanged();
+            }
             if plan.source.is_none() {
                 controls.skip_size(size)?;
                 controls.metadata.source(metadata)?;
@@ -391,15 +400,15 @@ pub(super) async fn run(
     if let Some(output) = &output {
         controls.metadata.output(output.metadata().is_some())?;
     }
+    let input_size = input
+        .as_ref()
+        .map(fd::Descriptor::remaining_len)
+        .transpose()?
+        .flatten();
     if plan.source.is_some() {
         controls.metadata.source(input_meta)?;
-        controls.skip_size(
-            input
-                .as_ref()
-                .map(fd::Descriptor::remaining_len)
-                .transpose()?
-                .flatten(),
-        )?;
+        controls.skip_size(input_size)?;
+        controls.report.ready_while_connecting(input_meta.is_some());
     }
     if plan.location.is_none() {
         if args.ignore_existing || controls.report.skipped() {
@@ -426,14 +435,15 @@ pub(super) async fn run(
         )
         .await;
     }
+    let compare_size = controls.comparison_size(input_size);
     let prepared = if plan.location.as_ref().unwrap().host.is_none() {
         // Keep local staging owned by this future from the instant it exists.
         // A detached blocking task could create it just as cancellation drops
         // the receiver, then lose its cleanup when the CLI exits.
-        prepare(&args, &plan, &controls, input_meta)?
+        prepare(&args, &plan, &controls, input_meta, compare_size)?
     } else {
         let (a, p, c) = (args.clone(), plan.clone(), controls.clone());
-        tokio::task::spawn_blocking(move || prepare(&a, &p, &c, input_meta)).await??
+        tokio::task::spawn_blocking(move || prepare(&a, &p, &c, input_meta, compare_size)).await??
     };
     let Some(prepared) = prepared else {
         return Ok(());
