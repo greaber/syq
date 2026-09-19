@@ -1038,15 +1038,13 @@ pub fn run(
         };
         last = now;
         last_rate = Some(rate);
-        if !gate.ready_through(active) {
-            observation.reset(outstanding);
+        let ready = gate.ready_through(active);
+        let work_available = enough_work(&sched, active, last_rate, tail_sample);
+        if !ready {
             activity_start = gate.activity_counts(active);
-            continue;
         }
-        if !enough_work(&sched, active, last_rate, tail_sample) {
-            observation.reset(outstanding);
-            continue;
-        }
+        // Missing readiness or a short tail prevents a score, but must not
+        // bypass the inconclusive-probe deadline below.
         let activity = gate.activity_counts(active);
         let contributing = activity
             .iter()
@@ -1064,7 +1062,7 @@ pub fn run(
             rate,
             seconds,
             outstanding,
-            contributing == active,
+            ready && work_available && contributing == active,
             threshold,
         );
         if crate::output::debug() {
