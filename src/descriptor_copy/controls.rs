@@ -191,7 +191,7 @@ impl Controls {
                 .bytes_done
                 .store(self.progress.bytes_total.load(Relaxed), Relaxed);
         }
-        if self.report.skipped() {
+        if success && self.report.skipped() {
             self.progress.files_excluded.store(1, Relaxed);
         }
         self.progress.errors.store(u64::from(!success), Relaxed);

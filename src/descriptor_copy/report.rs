@@ -105,7 +105,7 @@ impl Report {
         } else {
             progress.bytes_done.load(Relaxed)
         };
-        let skipped = self.skipped();
+        let skipped = self.skipped() && success;
         if skipped && !self.quiet {
             crate::output::diagnostic!(
                 "Skipped stream destination {}",

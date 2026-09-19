@@ -242,9 +242,14 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 assert stream.tell() == 7 and STATE['requests'] == before
                 conditional = list(put)
                 conditional[conditional.index('--as')] = '--as-new'
-                response = run(conditional + ['--max-size', '4'], stdin=stream, env=env)
+                results = Path(temp) / 'placement-failed.json'
+                response = run(conditional + ['--max-size', '4', '--results', str(results)], stdin=stream, env=env)
                 failure(response)
                 assert b'destination existence condition failed' in response.stderr
+                assert b'Skipped' not in response.stderr
+                records = [json.loads(line) for line in results.read_text().splitlines()]
+                assert records[-1]['status'] == 'failed' and records[-1]['errors'] == 1
+                assert records[-1]['files_excluded'] == 0
                 assert stream.tell() == 7
                 response = run(put + ['--min-size', '5', '--max-size', '5'], stdin=stream, env=env)
                 success(response)

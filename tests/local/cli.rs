@@ -1373,9 +1373,24 @@ fn stream_previews_and_results_do_not_consume_payload() {
         assert!(!values.iter().any(|r| r["type"] == "stream_ready"));
     }
     // Placement requirements still apply even when the source is excluded.
-    let output = cp(&["--src-fd", "0", "--as-new", "payload", "--max-size", "4"]);
-    assert!(!output.status.success());
-    assert!(stderr_of(&output).contains("destination existence condition failed"));
+    for (index, destination) in [vec![], vec!["--to", "fixture"]].into_iter().enumerate() {
+        let file = format!("size-placement-failed-{index}.json");
+        let mut args = vec!["--src-fd", "0"];
+        args.extend(destination);
+        args.extend(["--as-new", "payload", "--max-size", "4", "--results", &file]);
+        let output = cp(&args);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stderr_of(&output).contains("destination existence condition failed"));
+        assert!(!stderr_of(&output).contains("Skipped"));
+        let values = records(&file);
+        let terminal = values.last().unwrap();
+        assert_eq!(terminal["status"], "failed");
+        assert_eq!(terminal["errors"], 1);
+        assert_eq!(terminal["files_excluded"], 0);
+        assert!(values
+            .iter()
+            .any(|r| r["type"] == "stream_result" && r["disposition"] == "failed"));
+    }
     // No writer: opening this FIFO would hang. Reject unknown length before
     // opening it, including for a preview and a destination descriptor.
     for args in [
