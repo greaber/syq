@@ -84,18 +84,5 @@ See [`syq completion`](commands/completion.md) for all options.
 
 ## Keep connections open
 
-Keep an SSH connection ready for repeated copies:
-
-```sh
-syq persist connect server
-```
-
-This enables persistence and connects without copying files. Receiving is
-enabled by default: it supports [file copies to your machine, commands on it,
-and authorizing copies between servers](receive.md). See that
-guide for local approval controls. Connections stay open until you close them
-with `syq persist off`.
-Use `syq persist status` to see them.
-
-See [background connections](receive.md#background-connections) for reconnecting,
-turning receiving off, and using persistence in scripts.
+Use [persistence](persistence.md) to reuse SSH connections across syq commands
+and make your laptop available to connected servers.

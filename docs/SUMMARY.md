@@ -7,9 +7,9 @@
 - [Install and setup](install.md)
 - [Copy files](reference.md)
 - [Remove files](remove.md)
-- [Use your laptop from a server](receive.md)
-- [Run commands on your receiving machine](exec.md)
 - [Copy between servers](remote-to-remote.md)
+- [Keep connections open](persistence.md)
+- [Use your laptop from a server](receive.md)
 - [Rename and reorganize](mappings.md)
 # Performance
 

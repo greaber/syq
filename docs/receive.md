@@ -9,27 +9,48 @@ Receiving lets you do three things from a connected server:
 - [Authorize copies between servers](#authorize-copies-between-servers)
   using your laptop's SSH credentials.
 
-All three use the same receiving connection. Your laptop opens and maintains
-it; it needs no SSH server, public address, or incoming network port.
+All three use a [persistent connection](persistence.md) opened by your laptop.
+It needs no SSH server, public address, or incoming network port.
 
 ## Set up receiving
 
-With syq installed on both machines, run these commands on your laptop:
+Receiving starts automatically when syq opens a persistent SSH connection,
+unless you have turned receiving off. To enable persistence and connect to a
+server now, run this on your laptop with syq installed on both machines:
+
+```sh
+syq persist connect server
+```
+
+This opens the connection and waits until receiving is ready. An ordinary
+`ssh server` session does not enable receiving. If you already have a persistent
+connection to this server, you do not need to connect again. For example, after
+`syq persist on`, a syq copy or remote path completion can open that connection.
+If you previously turned receiving off, run `syq persist receive on` first.
+
+By default, your receiving name is your laptop's short hostname, and downloads
+and commands start in your home directory. `connect` prints the receiving name.
+The examples below use `@laptop`; replace it with your own name.
+
+Once `connect` finishes, you can close that terminal and make requests from any
+shell on the server, including an existing tmux session.
+
+### Optional name and directory
+
+To create a receiving profile named `laptop` with a different starting
+directory, run these commands on your laptop:
 
 ```sh
 mkdir -p ~/Downloads/server
 syq persist receive on --name laptop --cwd ~/Downloads/server
-syq persist connect server
 ```
 
-The name `@laptop` identifies your laptop for all three uses. `--cwd` sets the
-starting directory for downloads and commands. Once `connect` finishes, you
-can close that terminal and make requests from any shell on the server,
-including an existing tmux session.
+Here, `receive on` configures the profile; it is not required to use the default
+settings. `--cwd` sets the starting directory for downloads and commands.
 
 ## Copy files to your laptop
 
-On the server, send files to the directory you chose during setup:
+On the server, send files to your receiving directory:
 
 ```sh
 syq cp results --to @laptop
@@ -119,26 +140,44 @@ From the server, request a command in a project directory on your laptop:
 
 ```sh
 syq exec --on @laptop --cwd /path/to/project -- make
+syq exec --on @laptop --cwd /path/to/project -- open report.html
 ```
 
+The second command uses macOS's `open` program to display a report. Replace
+it with any program installed on your laptop.
+
 Every command requires approval on your laptop and runs with your local user's
-permissions. The download root does not restrict commands. Output streams back
-to the server terminal. See [Run commands on your receiving machine](exec.md)
-for arguments, working directories, and cancellation.
+permissions, including access to files and credentials. **The download root
+and copy limits do not restrict commands.** Build tools and scripts can execute
+code from their input files, so consider those files when approving a command.
+
+Output streams back to the server terminal, and syq returns the command's exit
+code. Interrupting the request or stopping receiving stops the command;
+completed changes are not rolled back. See [`syq exec`](commands/exec.md)
+for arguments, working directories, and cancellation details.
 
 ## Authorize copies between servers
 
-From the server, use your laptop's SSH access to authorize a copy to another
-server:
+Use your laptop's SSH access to [copy directly between servers](remote-to-remote.md),
+while running the command in your source server's shell:
 
 ```sh
+# Run on hostA, including in an existing tmux shell.
 syq cp results --to hostB --into /archive --auth-from @laptop
 ```
 
-Your laptop asks for approval for each copy, then authorizes it without giving
-the source server your private SSH keys. File data travels directly between the servers.
-See [Run the copy from a server](remote-to-remote.md#run-the-copy-from-a-server)
-for SSH setup and connectivity requirements.
+Your laptop asks for approval for each copy, then uses its SSH access to hostB
+to authorize it without giving the source server your private SSH keys.
+Trust hostB's SSH host key on the laptop beforehand. Relative destination paths
+start in the hostB account's home directory; your laptop's receiving root does
+not contain this copy, but its transfer limits still apply.
+
+Files go directly from hostA to hostB over encrypted TCP. HostB needs a
+reachable data port; see [Make TCP reachable](server-tuning.md#make-tcp-reachable).
+This route cannot use SSH for file data. Keep the laptop connection and source
+command running until completion. See
+[Authorization selection](remote-reference.md#authorization-selection) for
+automatic selection, other authorizers, and supported options.
 
 ## Multiple receiving profiles
 
@@ -165,14 +204,6 @@ Use `syq persist receive status` to list profiles and
 
 ## Background connections
 
-You can inspect your connections with `syq persist status`. To stop receiving
-while keeping SSH connections open for your own copies, run
-`syq persist receive off`. Use `syq persist off` to close both directions.
-
-After a network interruption or laptop sleep, syq reconnects automatically.
-An interrupted copy still needs to be rerun so it can resume. After rebooting
-your laptop, run `syq persist connect server` again.
-
-If a connection fails to start, `syq persist receive status` shows the error.
-[Persistence details](persistence-reference.md) covers troubleshooting,
-upgrading, and using connections in scripts.
+See [Keep connections open](persistence.md) for connection status, reconnecting,
+and turning persistence or receiving off. [Persistence details](persistence-reference.md)
+covers troubleshooting, upgrades, and scripts.

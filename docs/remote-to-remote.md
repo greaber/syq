@@ -69,23 +69,10 @@ If your machine reaches hostB through hostA, add `--via hostA` to `enroll` or
 
 ## Run the copy from a server
 
-With a [receiving connection](receive.md#set-up-receiving) from your laptop, you can inspect files
-on hostA and send them to hostB from the same shell:
-
-```sh
-# Run on hostA, including in an existing tmux shell.
-syq cp results --to hostB --into /archive --auth-from @laptop
-```
-
-Your laptop asks for approval, then uses its SSH access to hostB to authorize
-this copy. Trust hostB's SSH host key on the laptop beforehand. Relative
-destination paths start in the hostB account's home directory; your laptop's
-receiving root does not contain this copy, but its transfer limits still apply.
-
-Files go directly from hostA to hostB over encrypted TCP. HostB needs a
-reachable data port; see [Make TCP reachable](server-tuning.md#make-tcp-reachable).
-This route cannot use SSH for file data. Keep the laptop connection and source
-command running until completion.
+You can also start a copy in the source server's shell and use your laptop's
+SSH credentials to authorize it. This uses a receiving connection from your
+laptop; see [Authorize copies between servers](receive.md#authorize-copies-between-servers)
+for setup, approval, and connectivity requirements.
 
 ## Mirror a directory
 
