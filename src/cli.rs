@@ -295,10 +295,6 @@ pub struct Args {
     pub transfer_integrity: bool,
     #[arg(skip)]
     pub transfer_hash_type: Option<crate::hashing::HashAlgorithm>,
-    // Per-copy hashing state used by the shared transfer machinery. Public
-    // expectations belong to individual mapping entries.
-    #[arg(skip)]
-    pub expected_hash: Option<crate::hashing::Digest>,
     /// Syq extension: only compare source and destination contents; transfer nothing
     #[arg(long = "syq-verify-only")]
     pub verify_only: bool,
@@ -1928,7 +1924,6 @@ fn parse_descriptor_copy(
     // preserve source timestamps separately when publishing the file.
     args.times = false;
     args.descriptor_copy = Some(crate::descriptor_copy::Plan {
-        size_filter: crate::descriptor_copy::controls::SizeFilter::default(),
         source,
         as_fd,
         commit_fd: copy.stream_commit_fd,
@@ -2161,10 +2156,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
             bail!("--preserve=specials is not supported for S3 copies");
         }
         if options.route.is_server_copy()
-            && (args.checksum
-                || args.verify_only
-                || args.expected_hash.is_some()
-                || args.transfer_integrity)
+            && (args.checksum || args.verify_only || args.transfer_integrity)
         {
             bail!("S3-to-S3 copies stay server-side; content hash and verification options require reading object contents and are not supported");
         }

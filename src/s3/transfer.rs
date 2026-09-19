@@ -172,11 +172,6 @@ impl Engine {
             let (plan, prune) =
                 tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
             super::diagnostics::elapsed(scanning, "source_plan", plan.len() as u64);
-            if self.args.expected_hash.is_some()
-                && (plan.len() != 1 || plan[0].kind() != ObjectKind::File)
-            {
-                bail!("an expected digest requires exactly one regular file");
-            }
             self.check_upload_placement(plan.first().map(|s| s.kind() != ObjectKind::Dir))
                 .await?;
             self.discover_destination(plan.iter().map(|s| s.key.as_str()).collect())
@@ -198,11 +193,7 @@ impl Engine {
                     let label = source.label.clone();
                     let kind = source.kind();
                     engine.check_cancelled()?;
-                    let expected = source
-                        .expected_hash
-                        .as_ref()
-                        .or(engine.args.expected_hash.as_ref())
-                        .cloned();
+                    let expected = source.expected_hash.as_ref().cloned();
                     let result = engine.upload(source).await;
                     engine.settle(&label, &key, kind, &result, expected.as_ref());
                     Ok(result.ok().flatten())
@@ -214,9 +205,6 @@ impl Engine {
             let destination = Arc::new(Destination::open(&self.args)?);
             let (plan, prune) = self.download_plan(&destination.prefix).await?;
             let workers = self.object_workers(plan.iter().map(|s| s.size))?;
-            if self.args.expected_hash.is_some() && plan.len() != 1 {
-                bail!("an expected digest requires exactly one regular file");
-            }
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress
                 .bytes_total
@@ -237,9 +225,7 @@ impl Engine {
                         &job.path,
                         job.kind,
                         &result,
-                        job.expected_hash
-                            .as_ref()
-                            .or(engine.args.expected_hash.as_ref()),
+                        job.expected_hash.as_ref(),
                     );
                     Ok(result.ok().flatten())
                 }
@@ -496,11 +482,7 @@ impl Engine {
     }
 
     async fn upload(self: &Arc<Self>, source: Source) -> Result<Option<u64>> {
-        let expected_hash = source
-            .expected_hash
-            .as_ref()
-            .or(self.args.expected_hash.as_ref())
-            .filter(|_| !self.args.dry_run);
+        let expected_hash = source.expected_hash.as_ref().filter(|_| !self.args.dry_run);
         let existing = if self
             .upload_keys
             .get()
@@ -700,7 +682,7 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected.value))
             {
-                bail!("source does not match expected digest");
+                bail!("source does not match expected hash");
             }
         }
         let mut metadata = source.metadata(whole_digest.clone());
@@ -1314,7 +1296,7 @@ impl Engine {
                     bail!("S3 source type does not match mapping");
                 }
                 if expected_hash.is_some() && object.kind() != ObjectKind::File {
-                    bail!("an expected digest requires a regular file");
+                    bail!("an expected hash requires a regular file");
                 }
                 let kind = object.kind();
                 let directory = client::is_directory_marker(&object.key, object.size);
@@ -1454,10 +1436,7 @@ impl Engine {
         directories: DirectoryMetadata,
     ) -> Result<Option<u64>> {
         let part_size = self.part_size(job.size);
-        let expected_hash = job
-            .expected_hash
-            .as_ref()
-            .or(self.args.expected_hash.as_ref());
+        let expected_hash = job.expected_hash.as_ref();
         let requires_regular_file = expected_hash.is_some();
         let expected_hash = expected_hash.filter(|_| !self.args.dry_run);
         let root = &destination.root;
@@ -1536,7 +1515,7 @@ impl Engine {
             }
         }
         if requires_regular_file && object.kind() != ObjectKind::File {
-            bail!("an expected digest requires a regular file");
+            bail!("an expected hash requires a regular file");
         }
         if object.kind() == ObjectKind::Dir {
             if self.args.verify_only {
@@ -1853,11 +1832,11 @@ impl Engine {
     ) -> Result<()> {
         if let Some(expected) = expected {
             if object.kind() != ObjectKind::File {
-                bail!("an expected digest requires a regular file");
+                bail!("an expected hash requires a regular file");
             }
             let actual = self.remote_hash_as(object, expected.algorithm).await?;
             if actual != expected.value {
-                bail!("remote object does not match expected digest");
+                bail!("remote object does not match expected hash");
             }
         }
         Ok(())

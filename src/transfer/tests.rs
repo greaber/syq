@@ -207,7 +207,6 @@ fn pipeline_worker(
     let opts = Arc::new(Opts {
         local_copy_fd_budget: true,
         hash_policy: Default::default(),
-        expected_hash: None,
         mapping_expected_hashes: Default::default(),
         block: 512,
         tuning: crate::transfer_tuning::TransferTuning {

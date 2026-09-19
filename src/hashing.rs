@@ -145,7 +145,7 @@ impl CopyHashing {
                 transfer_integrity: args.transfer_integrity,
                 transfer_hash_type: args.transfer_hash_type,
             },
-            expected_hash: args.expected_hash.clone(),
+            expected_hash: None,
         }
     }
 }

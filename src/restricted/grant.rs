@@ -166,7 +166,7 @@ pub(super) fn grant_for(
         DestinationPlacement::ExactPath | DestinationPlacement::DirectoryContents => {
             vec![MutationScope {
                 path: destination_bytes.clone(),
-                descendants: args.recursive && args.expected_hash.is_none(),
+                descendants: args.recursive,
             }]
         }
         DestinationPlacement::DirectoryAsChild => {
@@ -181,7 +181,7 @@ pub(super) fn grant_for(
                 }
                 scopes.push(MutationScope {
                     path: crate::fsops::join(&destination_bytes, &basename),
-                    descendants: args.recursive && args.expected_hash.is_none(),
+                    descendants: args.recursive,
                 });
             }
             scopes

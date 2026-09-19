@@ -123,7 +123,6 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
 
 pub struct Opts {
     pub hash_policy: crate::hashing::HashPolicy,
-    pub expected_hash: Option<crate::hashing::Digest>,
     pub mapping_expected_hashes: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
@@ -198,9 +197,7 @@ impl Opts {
     }
 
     fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
-        self.mapping_expected_hashes
-            .get(path)
-            .or(self.expected_hash.as_ref())
+        self.mapping_expected_hashes.get(path)
     }
     fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
         crate::copy_policy::CopyPolicy {
@@ -449,7 +446,6 @@ fn small_copy_eligible(
         && !args.delete
         && !args.update
         && !args.checksum
-        && args.expected_hash.is_none()
         && !args.ignore_existing
         && !args.existing
         && !args.stats
@@ -1367,7 +1363,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             transfer_integrity: args.transfer_integrity,
             transfer_hash_type: args.transfer_hash_type,
         },
-        expected_hash: args.expected_hash.clone(),
         mapping_expected_hashes: mapping_entries
             .as_ref()
             .map(|(entries, _)| {
@@ -1776,17 +1771,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         source_shared_workers,
         source_independent_handoff_workers,
     )?;
-    if args.expected_hash.is_some() {
-        let entry = stat_one_registered(
-            &mut *src_ctl,
-            &srcs[0].path,
-            &registered_sources[0].selection,
-            false,
-        )?;
-        if !entry.is_some_and(|entry| entry.kind == Kind::File) {
-            bail!("an expected hash requires one regular source file");
-        }
-    }
     source_roots
         .set(registered_sources)
         .expect("source roots set once");

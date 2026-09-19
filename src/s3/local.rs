@@ -294,7 +294,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
             }
         }
         if source.expected_hash.is_some() && source.kind() != ObjectKind::File {
-            bail!("an expected digest requires a regular file");
+            bail!("an expected hash requires a regular file");
         }
         if args.delete
             && source.kind() == ObjectKind::Dir
