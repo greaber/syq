@@ -313,6 +313,32 @@ mod tests {
             self.reads.fetch_add(1, Relaxed);
             anyhow::bail!("unresponsive helper")
         }
+        fn scan(
+            &mut self,
+            _: &[u8],
+            _: Option<&crate::proto::RegisteredPath>,
+            _: bool,
+            _: &[String],
+            _: bool,
+            _: &mut dyn FnMut(Vec<crate::proto::Entry>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<crate::proto::PathBytes>) -> Result<()>,
+            _: &mut dyn FnMut(String),
+        ) -> Result<()> {
+            unreachable!("stream control does not scan")
+        }
+        fn native_remove(
+            &mut self,
+            _: Option<&[u8]>,
+            _: Option<&[u8]>,
+            _: &[crate::proto::NativeRemoveSelection],
+            _: bool,
+            _: bool,
+            _: usize,
+            _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<crate::proto::NativeRemoveOutcome>) -> Result<()>,
+        ) -> Result<()> {
+            unreachable!("stream control does not remove paths")
+        }
     }
     #[test]
     fn abandoned_entry_does_not_wait_for_a_control_reply() {
