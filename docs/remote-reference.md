@@ -101,6 +101,10 @@ right contents. See the [threat model](security.md#a-compromised-source-server).
 | `--peer-auth full-agent` | Ordinary, unrestricted agent forwarding |
 | `--rsh COMMAND` | Whatever your supplied SSH command permits |
 
+The authentication broker allows 129 simultaneous clients by default. An
+explicit worker count or ceiling changes this to that count plus one control
+connection; restricted copies remain capped at 129 clients.
+
 To make hostB pull from hostA using credentials already on hostB:
 
 ```sh
