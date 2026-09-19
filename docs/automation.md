@@ -105,10 +105,8 @@ directly or through a mapping.
 ### `progress`
 
 Sampled telemetry, approximately once per second, for displays rather than
-accounting. It includes bytes, files, exclusions, scan state, and elapsed time.
-`rate_bytes_per_second` estimates recent throughput; `eta_ms` estimates remaining
-time when scanning is complete and throughput is positive. Older producers
-may omit both fields.
+accounting. It includes bytes, files, exclusions, scan state, elapsed time, and
+optional `rate_bytes_per_second` and `eta_ms` estimates.
 Removal has zero byte and unchanged/excluded counts; its file counts reflect
 outcomes received so far. The terminal record owns final totals.
 
