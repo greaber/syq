@@ -127,7 +127,8 @@ class StreamTests(unittest.TestCase):
             self.assertEqual(out.result.bytes_transferred, 0)
         self.assertEqual(target.read_bytes(), b"old")
         self.assertFalse((self.root / "missing").exists())
-        with self.client.open_writer(as_=target, only_existing=True) as out:
+        with self.assertWarnsRegex(FutureWarning, "only_existing.*unsupported"), \
+                self.client.open_writer(as_=target, only_existing=True) as out:
             self.assertFalse(out.skipped)
             out.write(b"new")
         with self.client.open_writer(as_=self.root / "new", only_new=True) as out:

@@ -17,7 +17,7 @@ BLOCK = re.compile(r"<!-- CLI: (.*?) -->\n(.*?)<!-- /CLI -->", re.S)
 GROUP_LINKS = {
     "--performance-tuning": "[Workers, request sizes, and copy methods](../tuning.md)",
     "--resource-limits": "[Bandwidth and concurrency ceilings](../resource-limits.md)",
-    "--integrity-checking": "[Comparison and transfer checksums](../integrity-checking.md)",
+    "--integrity-checking": "[Payload checks](../integrity-checking.md)",
 }
 
 # Preserve published cp fragments when help groups are reorganized.

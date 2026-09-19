@@ -63,7 +63,6 @@ their original limits.
 | `--tcp-congestion` | The receiver enforces the algorithm authorized for TCP |
 | `--tcp-plain` | Unsupported; data connections must be encrypted |
 | `--mapping` | Listed destinations and necessary parent creation are authorized |
-| `--skip-newer` | Timestamp selection uses source-reported modification times |
 | Fixed `workers` above 128 | Unsupported |
 | `--inplace` with `--as-new` | Unsupported |
 | `--detach` | Unsupported; the local broker must remain attached |

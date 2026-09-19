@@ -91,7 +91,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 
 | Argument / option | Meaning |
 |---|---|
-| `--integrity-checking <KEY=VALUE,...>` | [Comparison and transfer checksums](../integrity-checking.md) |
+| `--integrity-checking <KEY=VALUE,...>` | [Payload checks](../integrity-checking.md) |
 
 ## Progress and results
 

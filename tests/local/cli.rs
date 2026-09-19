@@ -1603,3 +1603,45 @@ fn removed_verify_only_options_are_rejected_without_changes() {
     }
     assert_eq!(read(&t.path("destination")), b"keep");
 }
+
+#[test]
+fn unsupported_copy_controls_warn_without_changing_behavior() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    set_mtime(&t.path("source"), 1_600_000_000);
+    for (option, copied, unsupported) in [
+        ("--only-existing", true, true),
+        ("--skip-newer", false, true),
+        ("--integrity-checking=compare=md5", true, true),
+        ("--integrity-checking=compare=size-mtime", true, true),
+        ("--hash", true, false),
+        ("--only-new", false, false),
+        ("--integrity-checking=transfer=sha256", true, false),
+    ] {
+        write(&t.path("destination"), b"old");
+        set_mtime(&t.path("destination"), 1_700_000_000);
+        let output = native_syq(&[
+            "cp",
+            "-q",
+            option,
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+        ]);
+        assert_output_ok(&output);
+        assert_eq!(
+            stderr_of(&output).contains("unsupported and may be removed without notice"),
+            unsupported,
+            "{option}: {output:?}"
+        );
+        assert_eq!(
+            read(&t.path("destination")),
+            if copied { b"source" as &[u8] } else { b"old" }
+        );
+    }
+    for option in ["--existing", "--update"] {
+        let output = native_syq(&["rsync", "-q", option, &t.s("source"), &t.s("destination")]);
+        assert_output_ok(&output);
+        assert!(!stderr_of(&output).contains("unsupported"), "{output:?}");
+    }
+}

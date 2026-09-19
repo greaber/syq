@@ -144,21 +144,12 @@ when copying between filesystems with different naming rules.
 
 ## Choose which existing files to update
 
-By default, syq adds missing files and updates files that differ. To change
-which files it copies:
-
-| Option | Behavior |
-|---|---|
-| `--only-new` | Add missing entries and leave existing ones alone |
-| `--only-existing` | Update existing entries without adding new ones |
-| `--skip-newer` | Leave regular files alone when their destination timestamp is newer |
+By default, syq adds missing files and updates files that differ. Use
+`--only-new` to add missing entries and leave existing ones alone.
 
 ```sh
 # Import new files without replacing existing files.
 syq cp --only-new --srcs-in incoming --into archive
-
-# Refresh only files already in the destination.
-syq cp --only-existing --srcs-in project --into deployed
 ```
 
 See [Update policies](commands/cp.md#update-policies) for supported combinations.

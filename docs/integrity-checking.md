@@ -1,19 +1,10 @@
 # Integrity checking
 
-`--integrity-checking` controls how `syq cp` and `syq rsync` compare contents
-and check transferred data:
+`--integrity-checking` controls extra payload checks:
 
 | Key | Default | Accepted values |
 |---|---|---|
-| `compare` | `size-mtime` | `size-mtime`, `blake3`, `sha256`, `md5`, `xxh3-128` |
 | `transfer` | `off` | `off`, `blake3`, `sha256`, `md5`, `xxh3-128` |
-
-Supply comma-separated `KEY=VALUE` pairs, or repeat the option with different
-keys. Comparison and transfer algorithms may differ:
-
-```sh
-syq cp data --into backup --integrity-checking compare=blake3,transfer=sha256
-```
 
 BLAKE3 and SHA-256 are cryptographic hashes. MD5 supports existing manifests;
 XXH3-128 is a noncryptographic checksum. Use BLAKE3 or SHA-256 with an expected
@@ -32,16 +23,15 @@ Directory metadata previews use the same fractional precision rule. `syq rsync`
 compares whole seconds only when checking file contents.
 
 A timestamp difference outside that precision triggers checking even when the
-source is older, unless you request `--skip-newer`. Use `--hash` to check contents
-even when size and timestamp match:
+source is older. Use `--hash` to check contents even when size and timestamp
+match:
 
 ```sh
 syq cp --hash --srcs-in project --into backup
 ```
 
-`--hash` is shorthand for `compare=blake3`. It conflicts with a different
-explicit comparison choice. In rsync syntax, use `-c` or `--checksum` for the
-same BLAKE3 comparison.
+`--hash` uses BLAKE3. In rsync syntax, use `-c` or `--checksum` for the same
+comparison.
 
 ## Payload checks
 

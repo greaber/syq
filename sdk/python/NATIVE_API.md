@@ -76,8 +76,8 @@ In addition to the shared arguments above, it accepts:
 | `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune`, `dry_run`, `hash` | Boolean: mirror, preview, or compare content |
-| `integrity_checking` | Comma-separated string, e.g. `"compare=blake3,transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
-| `only_new`, `only_existing`, `skip_newer` | Boolean: copy missing entries, copy existing entries, or skip newer destination files |
+| `integrity_checking` | Comma-separated string, e.g. `"transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
+| `only_new` | Boolean: copy missing entries without replacing existing ones |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
 | `preserve` | Preservation string or iterable: `times`, `permissions`, `ownership`, `specials` |
@@ -138,7 +138,7 @@ endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
 `syq_path`, `pscope`, `no_bootstrap`, `no_compress`, `no_tcp`, `tcp_plain`,
 `tcp_ports`, `tcp_congestion`, `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
 `performance_tuning`, `resource_limits`, `integrity_checking`, `only_new`,
-`only_existing`, `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
+`dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
 and `timeout` with the same meanings as `cp`.
 See the CLI stream reference for the applicable tuning and integrity controls.
 The client supplies the executable, process working directory, environment,
@@ -182,7 +182,7 @@ need their own final publication step after all object transfers succeed.
 
 Writers normally return while destination setup continues, so opening several
 writers lets their connections start concurrently. Setup errors can surface at
-`write()` or `commit()`. With `only_new=True`, `only_existing=True`, or `dry_run=True`,
+`write()` or `commit()`. With `only_new=True` or `dry_run=True`,
 opening waits for the destination decision (also for options inherited from the
 environment). Check `output.skipped` before producing data:
 
@@ -341,9 +341,7 @@ client.cp(
 The expectation covers the complete resulting file, including reused bytes.
 A mismatch fails the file rather than reporting a successful copy. Files excluded
 by selection rules are not hash-verified. `hash=True` still controls whether
-existing contents are compared instead of trusting size and modification time;
-`integrity_checking="compare=HASH"` selects and enables content comparison;
-`hash=True` is a shorthand for `compare=blake3`.
+existing contents are compared instead of trusting size and modification time.
 Dry runs preview changes without validating the expectation. An expected
 whole-file hash is independent of the algorithm used for block comparison or
 transport checks. MD5 and XXH3-128 are useful for compatibility

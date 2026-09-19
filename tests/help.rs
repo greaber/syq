@@ -399,3 +399,34 @@ fn command_reference_matches_public_help() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn unsupported_native_controls_are_hidden_from_help_and_completion() {
+    for flag in ["--help", "--help-all"] {
+        let text = help(&["cp", flag]);
+        for hidden in ["--only-existing", "--skip-newer", "compare="] {
+            assert!(!text.contains(hidden), "{hidden}: {text}");
+        }
+        assert!(text.contains("--only-new"));
+    }
+    let rsync = help(&["rsync", "--help-all"]);
+    assert!(rsync.contains("--existing"));
+    assert!(rsync.contains("--update"));
+    for shell in ["bash", "zsh", "fish"] {
+        let output = run(&[
+            "completion",
+            "__complete",
+            shell,
+            "2",
+            "--",
+            "syq",
+            "cp",
+            "--",
+        ]);
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("--only-new"), "{shell}: {text}");
+        assert!(!text.contains("--only-existing"), "{shell}: {text}");
+        assert!(!text.contains("--skip-newer"), "{shell}: {text}");
+    }
+}

@@ -20,7 +20,7 @@ Argument = str | bytes
 
 def arguments(*, executable: str, writing: bool, path: PathArgument | None,
               endpoint: str | None, options: Mapping[str, object]) -> list[Argument]:
-    from .client import _append_path_option, _argument, _text_arg
+    from .client import _append_path_option, _argument, _text_arg, _warn_unsupported_copy_options
     argv: list[Argument] = [executable, "cp"]
     if writing:
         argv += ["--src-fd", "0"]
@@ -65,6 +65,8 @@ def arguments(*, executable: str, writing: bool, path: PathArgument | None,
             argv.append(option)
         else:
             _append_path_option(argv, option, _argument(value, label=name))
+    _warn_unsupported_copy_options(only_existing=options.get("only_existing"),
+                                   integrity_checking=options.get("integrity_checking"))
     return argv
 
 
