@@ -2,10 +2,10 @@
 
 As of 2026-09-05, docs and benchmarks share Open Sans headings and prose,
 a Manrope syq wordmark, IBM Plex Mono commands and numbers, and white/dark
-palettes. The syq wordmark stays blue on both sites. Benchmarks use orange
-for active navigation indicators, primary buttons, and their favicon.
-Shared text and interaction colors remain blue, as do measured syq results.
-The favicons use the Manrope “s”, blue for docs and orange for benchmarks.
+palettes. The syq wordmark and measured syq results stay blue on both sites.
+Benchmarks use a golden-orange background tint and favicon, with neutral
+text and controls. Docs retain their blue interaction colors.
+The favicons use the Manrope “s”, blue for docs and golden orange for benchmarks.
 Main text is 20px. The same top navigation links both sites, while
 the docs retain mdBook's compact sidebar and benchmarks keep their own layout.
 
