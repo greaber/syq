@@ -488,13 +488,20 @@ impl Worker {
         let mut groups = Vec::new();
         let mut start = 0;
         let mut bytes = 0u64;
+        let mut path_bytes = 0usize;
         for (i, job) in jobs.iter().enumerate() {
-            if i > start && bytes.saturating_add(job.entry.size) > group_bytes {
+            let source_bytes = source_request_bytes(&job.src, Some(&job.source));
+            if i > start
+                && (bytes.saturating_add(job.entry.size) > group_bytes
+                    || path_bytes.saturating_add(source_bytes) > SOURCE_BATCH_PATH_BYTES)
+            {
                 groups.push(start..i);
                 start = i;
                 bytes = 0;
+                path_bytes = 0;
             }
             bytes += job.entry.size;
+            path_bytes = path_bytes.saturating_add(source_bytes);
         }
         if start < jobs.len() {
             groups.push(start..jobs.len());

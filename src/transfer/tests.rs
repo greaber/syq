@@ -1735,3 +1735,146 @@ fn tcp_stats_distinguish_unavailable_fields_from_zero() {
     assert!(output.contains("receive unavailable, send-buffer unavailable"));
     assert!(output.contains("tcp ECN CE deliveries: unavailable"));
 }
+
+#[test]
+fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
+    struct CheckedConn {
+        entries: Arc<std::collections::HashMap<PathBytes, Entry>>,
+        requests: Arc<Mutex<Vec<Request>>>,
+        replies: std::collections::VecDeque<Response>,
+    }
+    impl Conn for CheckedConn {
+        fn supports_request_pipelining(&self) -> bool {
+            true
+        }
+        fn send(&mut self, request: Request) -> Result<()> {
+            let mut wire = Vec::new();
+            FrameWriter::new(&mut wire, false).write_msg(&request)?;
+            let reply = match &request {
+                Request::ReadSmallBatch(reads) => Response::SmallBlocks(
+                    reads
+                        .iter()
+                        .map(|read| {
+                            let data = vec![7; read.len as usize];
+                            Ok(SmallBlock {
+                                hash: content_digest(&data),
+                                data,
+                            })
+                        })
+                        .collect(),
+                ),
+                Request::PutSmallBatch(puts) => Response::Applied(vec![None; puts.len()]),
+                Request::StatMany { paths, .. } => Response::Stats(
+                    paths
+                        .iter()
+                        .map(|path| self.entries.get(path).cloned())
+                        .collect(),
+                ),
+                other => panic!("unexpected request {other:?}"),
+            };
+            self.requests.lock().unwrap().push(request);
+            self.replies.push_back(reply);
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Response> {
+            self.replies
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("missing reply"))
+        }
+        fn scan(
+            &mut self,
+            _: &[u8],
+            _: Option<&RegisteredPath>,
+            _: bool,
+            _: &[String],
+            _: bool,
+            _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+            _: &mut dyn FnMut(String),
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn native_remove(
+            &mut self,
+            _: Option<&[u8]>,
+            _: Option<&[u8]>,
+            _: &[NativeRemoveSelection],
+            _: bool,
+            _: bool,
+            _: usize,
+            _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+    }
+    let prefix = format!("{}/", "a".repeat(250)).repeat(12);
+    let jobs: Vec<_> = (0..2048)
+        .map(|i| pipeline_job(format!("{prefix}{i:04}").as_bytes(), 1))
+        .collect();
+    // All names fit normal component/path limits, but a single request with
+    // both spellings exceeds the metadata frame boundary.
+    let oversized = Request::StatMany {
+        paths: jobs.iter().map(|job| job.src.clone()).collect(),
+        sources: Some(jobs.iter().map(|job| job.source.clone()).collect()),
+        follow: false,
+        guard: None,
+    };
+    assert!(FrameWriter::new(Vec::new(), false)
+        .write_msg(&oversized)
+        .is_err());
+    let entries = Arc::new(
+        jobs.iter()
+            .map(|job| (job.src.clone(), job.entry.clone()))
+            .collect(),
+    );
+    let sched = Arc::new(Sched::new(512, 8192));
+    for job in &jobs {
+        sched.push_file(job.clone());
+    }
+    sched.scan_done();
+    assert!(matches!(sched.next(), Item::File(0)));
+    assert_eq!(sched.begin_fast_batch(1, jobs.len()), jobs.len());
+    let mut batch = vec![0];
+    batch.extend(sched.take_small(1, jobs.len() - 1, u64::MAX));
+    sched.mark_fast(batch.len() - 1);
+    let source_requests = Arc::new(Mutex::new(Vec::new()));
+    let destination_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut worker = pipeline_worker(
+        &sched,
+        &Arc::new(Mutex::new(PipelineState::default())),
+        &Arc::new(Mutex::new(PipelineState::default())),
+        false,
+    );
+    worker.src = Box::new(CheckedConn {
+        entries: Arc::clone(&entries),
+        requests: source_requests.clone(),
+        replies: Default::default(),
+    });
+    worker.dst = Box::new(CheckedConn {
+        entries,
+        requests: destination_requests,
+        replies: Default::default(),
+    });
+    worker.fast_batch(&mut batch).unwrap();
+    sched.complete_fast_batch(batch.len());
+    assert!(sched.finished());
+    assert_eq!(worker.progress.files_done.load(Relaxed), jobs.len() as u64);
+    assert_eq!(worker.progress.errors.load(Relaxed), 0);
+    assert!(jobs.iter().all(|job| job.done.load(Relaxed) == 1));
+    let requests = source_requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .filter(|request| matches!(request, Request::ReadSmallBatch(_)))
+            .count()
+            > 1
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| matches!(request, Request::StatMany { .. }))
+            .count()
+            > 1
+    );
+}

@@ -48,6 +48,16 @@ const FAST_BATCH_FILES: usize = 2048;
 // Keep the startup worker budget independent of the larger batch ceiling.
 // Larger batches must not leave small trees with fewer transfer workers.
 const STARTUP_BATCH_FILES: usize = 128;
+// Source requests carry both display paths and registered references. Leave
+// room for framing within the metadata protocol's 8 MiB limit, even when a
+// large batch contains long paths rather than substantial file data.
+const SOURCE_BATCH_PATH_BYTES: usize = 4 << 20;
+
+fn source_request_bytes(path: &[u8], source: Option<&RegisteredPath>) -> usize {
+    path.len()
+        .saturating_add(source.map_or(0, |source| source.relative().len()))
+        .saturating_add(64)
+}
 const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
 
 // Bound a window of small-file groups independently of the logical batch.
@@ -3278,8 +3288,8 @@ fn validate_range_reply(expected_off: u64, expected_len: u64, off: u64, len: usi
 
 fn stat_many_registered(
     conn: &mut dyn Conn,
-    paths: Vec<PathBytes>,
-    sources: Option<Vec<RegisteredPath>>,
+    mut paths: Vec<PathBytes>,
+    mut sources: Option<Vec<RegisteredPath>>,
     follow: bool,
 ) -> Result<Vec<Option<Entry>>> {
     if paths.is_empty() {
@@ -3289,6 +3299,25 @@ fn stat_many_registered(
         if sources.len() != paths.len() {
             bail!("source stat capability count does not match path count");
         }
+    }
+    let path_bytes = paths.iter().enumerate().fold(0usize, |bytes, (i, path)| {
+        bytes.saturating_add(source_request_bytes(
+            path,
+            sources.as_ref().map(|sources| &sources[i]),
+        ))
+    });
+    if paths.len() > 1 && path_bytes > SOURCE_BATCH_PATH_BYTES {
+        let middle = paths.len() / 2;
+        let tail_paths = paths.split_off(middle);
+        let tail_sources = sources.as_mut().map(|sources| sources.split_off(middle));
+        let mut entries = stat_many_registered(conn, paths, sources, follow)?;
+        entries.extend(stat_many_registered(
+            conn,
+            tail_paths,
+            tail_sources,
+            follow,
+        )?);
+        return Ok(entries);
     }
     match ok(
         conn.call(Request::StatMany {
