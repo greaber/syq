@@ -111,6 +111,19 @@ def run(args, *, ok=True, env=None, capture=False):
     return completed
 
 
+def assert_comparison(path, *, changed, unchanged):
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    terminal = records[-1]
+    assert terminal['type'] == 'result' and terminal['status'] == 'success', records
+    assert terminal['dry_run'] and terminal['errors'] == 0, terminal
+    assert terminal['files_transferred'] == changed, terminal
+    assert terminal['files_unchanged'] == unchanged, terminal
+    assert terminal['symlinks_created'] == terminal['specials_created'] == 0, terminal
+    changes = [r for r in records if r['type'] == 'trace' and r['action'] == 'transfer_file' and 'bytes' in r]
+    assert len(changes) == changed, records
+    return changes
+
+
 def interrupted(args, threshold=5*1024*1024):
     command=[SYQ,'cp','--no-progress','--progress-json','--performance-tuning=s3-part-size=5M,s3-max-concurrent-parts-per-object=1,s3-retries=1','--resource-limits=bandwidth=1MiB']
     for name,value in HEADERS.items(): command+=['--s3-header',name+': '+value]
@@ -176,7 +189,8 @@ def check():
                 assert actual.read_bytes() == path.read_bytes(), path.name
                 assert actual.stat().st_mode & 0o7777 == path.stat().st_mode & 0o7777
                 assert actual.stat().st_mtime_ns == path.stat().st_mtime_ns
-        run(['--from', remote, placement + '/source', '--into', dst, '--dry-run','--hash'])
+        run(['--from', remote, placement + '/source', '--into', dst, '--dry-run', '--hash', '--results', root / 'matching.ndjson'])
+        assert_comparison(root / 'matching.ndjson', changed=0, unchanged=4)
         owned = root / 'owned'
         owned.mkdir()
         run(['--from', remote, placement + '/source', '--as', owned, '--preserve=ownership'])
@@ -193,7 +207,10 @@ def check():
         assert (restored / 'script').read_bytes() == b'local edits'
         run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--only-new'])
         assert (restored / 'script').read_bytes() == b'local edits'
-        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--dry-run','--hash'])
+        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--dry-run', '--hash', '--results', root / 'different.ndjson'])
+        changes = assert_comparison(root / 'different.ndjson', changed=1, unchanged=0)
+        assert changes[0]['dst']['value'] == 'script', changes
+        assert (restored / 'script').read_bytes() == b'local edits'
         run(['--from', remote, placement + '/source/script', '--as-new', restored / 'script'], ok=False)
         run(['--from', remote, placement + '/source/script', '--as', root / 'absent', '--only-existing'])
         assert not (root / 'absent').exists()

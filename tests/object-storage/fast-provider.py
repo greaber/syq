@@ -35,7 +35,20 @@ with tempfile.TemporaryDirectory(prefix='syq-fast-check-') as tmp:
         assert {p.name:p.stat().st_ino for p in target.iterdir()}==before
         assert not list((cache/'syq'/'s3').glob('*.json'))
         assert not list(target.glob('.syq-s3-*'))
-        # Verification independently checks objects written without digests.
-        subprocess.run([binary,'cp','--no-progress','--dry-run','--hash','--from','s3://'+c.BUCKET,'--srcs-in',c.PREFIX,'--into',str(target)],env=env,check=True,timeout=180)
+        # Compare objects without stored hashes, including same-size corruption.
+        comparison = ('--dry-run', '--hash', '--from', 's3://'+c.BUCKET,
+                      '--srcs-in', c.PREFIX, '--into', target)
+        run(*comparison, '--results', root/'matching.ndjson')
+        c.assert_comparison(root/'matching.ndjson', changed=0, unchanged=len(expected))
+        corrupted = target/'65536'
+        before = corrupted.stat()
+        bad = bytearray(corrupted.read_bytes()); bad[0] ^= 1
+        corrupted.write_bytes(bad)
+        os.utime(corrupted, ns=(before.st_atime_ns, before.st_mtime_ns))
+        (target/'1').unlink()
+        run(*comparison, '--results', root/'different.ndjson')
+        changes = c.assert_comparison(root/'different.ndjson', changed=2, unchanged=len(expected)-2)
+        assert {r['dst']['value'] for r in changes} == {'65536', '1'}, changes
+        assert corrupted.read_bytes() == bad and not (target/'1').exists()
         print('Automatic sizes, direct-I/O tail, quick check, metadata, and content verification passed',flush=True)
     finally:c.clean()

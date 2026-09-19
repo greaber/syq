@@ -1734,10 +1734,19 @@ fn s3_one_request_slot_supports_multipart_and_content_verification() {
         for extra in [false, true] {
             let mut args = vec!["--from", "s3://bucket", "data", "--as", "result", control];
             if extra {
-                args.extend(["--dry-run", "--hash"]);
+                args.extend(["--dry-run", "--hash", "--results", "results.jsonl"]);
             }
             let output = server.cp(temp.path(), &args);
             assert!(output.status.success(), "{}", output_text(&output));
+            if extra {
+                let records = parsed_results(temp.path());
+                let terminal = records.last().unwrap();
+                assert_eq!(terminal["status"], "success");
+                assert_eq!(terminal["files_transferred"], 0);
+                assert_eq!(terminal["files_unchanged"], 1);
+                assert_eq!(terminal["bytes_unchanged"], SIZE);
+                assert!(!records.iter().any(|r| r["type"] == "trace"), "{records:?}");
+            }
         }
         assert_eq!(
             std::fs::metadata(temp.path().join("result")).unwrap().len(),

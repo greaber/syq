@@ -234,6 +234,8 @@ print("case: previews and protected paths remain restricted", flush=True)
 copy("/tmp/syq-real-ssh/forward/preview", extra=("--dry-run",))
 remote("test ! -e /tmp/syq-real-ssh/forward/preview")
 copy("/tmp/syq-real-ssh/forward/approved", extra=("--dry-run", "--hash",))
+source_hash = run("ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
+assert remote("sha256sum /tmp/syq-real-ssh/forward/approved").split()[0] == source_hash
 remote("printf '%s\\n' '# protected syq test fixture' > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys")
 authorized = remote("sha256sum ~/.ssh/authorized_keys")
 copy(".ssh/authorized_keys", success=False)

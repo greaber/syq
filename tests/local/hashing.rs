@@ -378,28 +378,41 @@ fn hash_policy_xxh3_compares_repairs_and_previews() {
         "--integrity-checking=transfer=blake3",
     ]);
     assert_eq!(read(&t.path("destination")), contents);
-    run_native_ok(&[
-        "cp",
-        "--dry-run",
-        "--src",
-        &t.s("src/source"),
-        "--as",
-        &t.s("destination"),
-        "--integrity-checking",
-        "compare=xxh3-128",
-    ]);
+    let preview = |name: &str, changed: bool| {
+        let output = native_syq(&[
+            "cp",
+            "--dry-run",
+            "--src",
+            &t.s("src/source"),
+            "--as",
+            &t.s("destination"),
+            "--integrity-checking",
+            "compare=xxh3-128",
+            "--results",
+            &t.s(name),
+        ]);
+        assert_output_ok(&output);
+        let records: Vec<serde_json::Value> = fs::read_to_string(t.path(name))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["type"], "result");
+        assert_eq!(terminal["status"], "success");
+        assert_eq!(terminal["files_transferred"], u64::from(changed));
+        assert_eq!(terminal["files_unchanged"], u64::from(!changed));
+        let traces: Vec<_> = records.iter().filter(|r| r["type"] == "trace").collect();
+        assert_eq!(traces.len(), usize::from(changed), "{records:?}");
+        if changed {
+            assert_eq!(traces[0]["dst"]["value"], "");
+            assert_eq!(traces[0]["reason"], "content_differs");
+            assert_eq!(traces[0]["bytes"], contents.len());
+        }
+    };
+    preview("matching.ndjson", false);
     write(&t.path("destination"), &bad);
-    let output = native_syq(&[
-        "cp",
-        "--dry-run",
-        "--src",
-        &t.s("src/source"),
-        "--as",
-        &t.s("destination"),
-        "--integrity-checking",
-        "compare=xxh3-128",
-    ]);
-    assert_output_ok(&output);
+    preview("different.ndjson", true);
     assert_eq!(read(&t.path("destination")), bad, "preview must not repair");
 }
 
