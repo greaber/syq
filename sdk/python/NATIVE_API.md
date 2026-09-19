@@ -139,9 +139,14 @@ source basename, so they require an exact destination path.
 returns a `StreamReader`. `cwd` resolves relative sources; `root` also confines
 them. Choose at most one, as with `cp`. These bases belong to the source
 endpoint, independently of the client's local `process_cwd`. Both accept `rsh`, `syq_path`, `pscope`,
-`no_bootstrap`, `no_compress`, `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
-`performance_tuning`, and `timeout` with the same meanings as `cp`.
-Only the stream-supported S3 part controls apply to `performance_tuning`.
+`no_bootstrap`, `no_compress`, `no_tcp`, `tcp_plain`, `tcp_ports`, `tcp_congestion`,
+`s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
+`performance_tuning`, `resource_limits`, `integrity_checking`, `expected_digest`,
+`stats`, `verbose`, `quiet`, `progress`, `no_progress`, `progress_json`, and
+`timeout` with the same meanings as `cp`. Pass a `syq.Digest` as `expected_digest`
+to check the bytes during transfer. A mismatch prevents a writer from publishing;
+a reader may already have returned bytes when it reports the failure.
+See the CLI stream reference for the applicable tuning and integrity controls.
 The client supplies the executable, process working directory, environment,
 and default timeout. Stream calls always check transfer failures.
 
@@ -185,7 +190,10 @@ can block, so use explicit contexts for timely cleanup.
 raises `subprocess.TimeoutExpired` unless the transfer has completed successfully;
 transfer failures raise `SyqProcessError`,
 whose result contains the exit status and the last 8 KiB of diagnostics, without
-capturing payload bytes.
+capturing payload bytes. The stream's `stderr` property exposes those same
+last 8 KiB as bytes, including on success. For example, request `stats=True`
+and read `output.stderr.decode()` after the writer context exits. This is a
+bounded diagnostic tail, not a complete progress-event history.
 
 Async streams use `async with` directly and await I/O and explicit closure:
 

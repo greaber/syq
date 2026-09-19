@@ -61,10 +61,16 @@ Server-side S3 copies preserve stored digests without reading or verifying
 object bodies. They do not support content-hash comparison, extra transfer
 hashing, expected digests, or `--verify-only`.
 
+Descriptor copies use the same optional payload checks as regular-file
+copies: `transfer=ALGORITHM` enables them and selects the hash. Raw S3 streams keep
+provider checksums but do not store syq digest metadata, so they cannot use
+that metadata for extra verification. Use a known expected hash instead.
+Neither backend rereads the object after transfer by default.
+
 ## Expected digests
 
 To require a particular whole-file digest, use `--expected-hash ALGORITHM:HEX`
-with one named regular file:
+with one named regular file or a descriptor stream:
 
 ```sh
 syq cp data.bin --as backup.bin --expected-hash md5:900150983cd24fb0d6963f7d28e17f72
@@ -79,6 +85,11 @@ the file has already been modified when validation finishes. Use
 filters still apply.
 The expected digest's algorithm can differ from either integrity-checking hash type. Dry runs
 preview changes without validating the expectation.
+
+For descriptor input, syq checks the digest as bytes arrive and refuses to
+publish a named destination if it differs. For descriptor output, bytes have
+already reached the consumer when a mismatch is reported. Always check the
+exit status; syq cannot retract those bytes. No second pass is needed.
 
 The algorithms are `blake3`, `sha256`, `md5`, and `xxh3-128`. Supply 64 hex
 digits for BLAKE3 or SHA-256, and 32 for MD5 or XXH3-128. In `syq rsync`, use

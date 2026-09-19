@@ -37,6 +37,12 @@ pub trait Conn: Send {
         Ok(())
     }
     fn send(&mut self, req: Request) -> Result<()>;
+    /// Send with the usual reply contract, optionally returning an owned
+    /// WriteRange buffer for the producer to reuse after serialization.
+    fn send_recycling(&mut self, req: Request) -> Result<Option<Vec<u8>>> {
+        self.send(req)?;
+        Ok(None)
+    }
     fn recv(&mut self) -> Result<Response>;
     /// Wait before the reply starts, excluding its remaining payload transfer
     /// when the connection can observe arrival separately from decoding.
@@ -670,13 +676,20 @@ impl Conn for RemoteConn {
     }
 
     fn send(&mut self, req: Request) -> Result<()> {
+        self.send_recycling(req).map(|_| ())
+    }
+    fn send_recycling(&mut self, req: Request) -> Result<Option<Vec<u8>>> {
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(true));
         anyhow::ensure!(
             self.write_stream.is_none()
                 || matches!(req, Request::WriteRange { .. } | Request::WriteStreamFence),
             "only writes and their fence are valid during streaming writes"
         );
-        self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))
+        self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))?;
+        Ok(match req {
+            Request::WriteRange { data, .. } => Some(data),
+            _ => None,
+        })
     }
     fn recv(&mut self) -> Result<Response> {
         self.receive_response().map(ReceivedResponse::into_inner)
@@ -2191,6 +2204,20 @@ impl Endpoint {
         self.connect_with_role(compress, ConnectionRole::Control, false)
     }
 
+    pub(crate) fn connect_stream(
+        &self,
+        compress: bool,
+        ticket: crate::descriptor_broker::DescriptorTicket,
+        settings: crate::descriptor_copy::Settings,
+        first_worker: bool,
+    ) -> Result<Box<dyn Conn>> {
+        self.connect_with_role(
+            compress,
+            ConnectionRole::StreamWorker { ticket, settings },
+            first_worker,
+        )
+    }
+
     pub(crate) fn connect_with_sources(
         &self,
         compress: bool,
@@ -2242,6 +2269,9 @@ impl Endpoint {
                                 "initialize local source worker: {error:#}"
                             ))
                         })?
+                    }
+                    ConnectionRole::StreamWorker { ticket, settings } => {
+                        conn.ops.initialize_stream(&ticket, settings)?
                     }
                     ConnectionRole::Control => {}
                 }

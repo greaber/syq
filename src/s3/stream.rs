@@ -18,7 +18,8 @@ use std::{
     time::Duration,
 };
 
-struct Plan {
+struct Plan<'a> {
+    controls: &'a crate::descriptor_copy::controls::Controls,
     options: Options,
     key: String,
     placement: crate::descriptor_copy::StreamPlacement,
@@ -31,6 +32,7 @@ pub(crate) fn run(
     as_fd: Option<i32>,
     commit_fd: Option<i32>,
     placement: crate::descriptor_copy::StreamPlacement,
+    controls: &crate::descriptor_copy::controls::Controls,
 ) -> Result<i32> {
     let target = key.clone();
     let key = match &placement.name {
@@ -41,6 +43,7 @@ pub(crate) fn run(
         None => key,
     };
     let mut plan = Plan {
+        controls,
         options,
         key,
         placement,
@@ -121,7 +124,7 @@ pub(crate) fn source_key(path: &[u8], base: Option<&[u8]>) -> Result<String> {
     }
 }
 
-async fn check_placement(client: &Client, plan: &Plan) -> Result<()> {
+async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
     use crate::cli::Existence;
     let existence = plan.placement.existence;
     if existence == Existence::Any {
@@ -164,16 +167,24 @@ fn digest(algorithm: Algorithm, data: &[u8]) -> String {
 
 async fn upload(
     client: &Client,
-    plan: &Plan,
+    plan: &Plan<'_>,
     input: Descriptor,
     upload_id: &mut Option<String>,
     commit: Option<Descriptor>,
 ) -> Result<()> {
+    let controls = plan.controls;
     let options = &plan.options;
+    let mut expected_hash = controls.expected_hasher();
     let size = usize::try_from(options.part_size)?;
     let algorithm = Algorithm::for_endpoint(options.endpoint.as_deref());
     let (mut input, first) = input.read_chunk(size).await?;
     if first.len() < size {
+        if let Some(hash) = &mut expected_hash {
+            hash.update(&first);
+        }
+        controls.verify(expected_hash)?;
+        let length = first.len() as u64;
+        controls.pace(length).await;
         crate::descriptor_copy::fd::await_commit(commit).await?;
         let hash = digest(algorithm, &first);
         client
@@ -190,6 +201,7 @@ async fn upload(
             .await
             .map_err(|e| e.into_service_error())
             .context("upload object")?;
+        controls.progress.add_bytes(length);
         return Ok(());
     }
     let created = client
@@ -219,6 +231,9 @@ async fn upload(
             bail!("stream exceeds 10,000 multipart parts; rerun with a larger --performance-tuning s3-part-size=SIZE");
         }
         let last = data.len() < size;
+        if let Some(hash) = &mut expected_hash {
+            hash.update(&data);
+        }
         pending.push(upload_part(client, plan, &id, number, data, algorithm));
         number += 1;
         if pending.len() >= options.concurrency {
@@ -245,6 +260,7 @@ async fn upload(
     while let Some(part) = pending.try_next().await? {
         completed.push(part);
     }
+    controls.verify(expected_hash)?;
     completed.sort_by_key(|p| p.part_number());
     crate::descriptor_copy::fd::await_commit(commit).await?;
     client
@@ -272,12 +288,15 @@ async fn upload(
 
 async fn upload_part(
     client: &Client,
-    plan: &Plan,
+    plan: &Plan<'_>,
     id: &str,
     number: i32,
     data: Bytes,
     algorithm: Algorithm,
 ) -> Result<CompletedPart> {
+    let controls = plan.controls;
+    let length = data.len() as u64;
+    controls.pace(length).await;
     let hash = digest(algorithm, &data);
     let output = client
         .upload_part()
@@ -292,6 +311,7 @@ async fn upload_part(
         .await
         .map_err(|e| e.into_service_error())
         .context("upload stream part")?;
+    controls.progress.add_bytes(length);
     Ok(CompletedPart::builder()
         .part_number(number)
         .e_tag(output.e_tag().context("S3 part omitted ETag")?)
@@ -299,7 +319,8 @@ async fn upload_part(
         .build())
 }
 
-async fn download(client: &Client, plan: &Plan, mut output: Descriptor) -> Result<()> {
+async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> Result<()> {
+    let controls = plan.controls;
     // Read raw objects, including objects carrying another tool's metadata.
     let head = client
         .head_object()
@@ -313,6 +334,8 @@ async fn download(client: &Client, plan: &Plan, mut output: Descriptor) -> Resul
         head.content_length()
             .context("S3 HEAD omitted Content-Length")?,
     )?;
+    controls.set_size(size);
+    let mut expected_hash = controls.expected_hasher();
     let etag = head.e_tag().context("S3 HEAD omitted ETag")?;
     let version = head.version_id();
     let part_size = plan.options.part_size;
@@ -330,20 +353,26 @@ async fn download(client: &Client, plan: &Plan, mut output: Descriptor) -> Resul
         })
         .buffered(plan.options.concurrency);
     while let Some(bytes) = parts.try_next().await? {
+        if let Some(hash) = &mut expected_hash {
+            hash.update(&bytes);
+        }
+        let length = bytes.len() as u64;
         output = output.write_chunk(bytes).await?;
+        controls.progress.add_bytes(length);
     }
-    Ok(())
+    controls.verify(expected_hash)
 }
 
 async fn read_part(
     client: &Client,
-    plan: &Plan,
+    plan: &Plan<'_>,
     etag: &str,
     version: Option<&str>,
     size: u64,
     offset: u64,
     length: u64,
 ) -> Result<Bytes> {
+    plan.controls.pace(length).await;
     let range = format!("bytes={offset}-{}", offset + length - 1);
     let expected = format!("bytes {offset}-{}/{size}", offset + length - 1);
     for attempt in 0..=plan.options.retries {

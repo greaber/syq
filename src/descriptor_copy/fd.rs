@@ -3,13 +3,25 @@
 use anyhow::{bail, Context, Result};
 use std::{
     fs::File,
-    io::{Read, Write},
+    io::Write,
     os::fd::{AsRawFd, FromRawFd},
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
         Arc,
     },
 };
+
+// A small kernel pipe forces frequent producer/consumer wakeups and tiny
+// network requests even when both ends are fast. This bounded, best-effort
+// hint changes capacity only, never shared file status flags. Keep a larger
+// caller-selected capacity and keep copying if the per-user quota refuses it.
+#[cfg(target_os = "linux")]
+fn enlarge_pipe(file: &File) {
+    let size = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPIPE_SZ) };
+    if size > 0 && size < 1 << 20 {
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETPIPE_SZ, 1 << 20) };
+    }
+}
 
 /// A caller-owned descriptor, or an explicitly selected local FIFO.
 #[derive(Clone, Debug)]
@@ -62,6 +74,8 @@ impl Source {
                             && actual.ino() == expected.ino,
                         "source FIFO changed while opening"
                     );
+                    #[cfg(target_os = "linux")]
+                    enlarge_pipe(&file);
                     Ok(Descriptor {
                         file,
                         original: -1,
@@ -104,6 +118,10 @@ impl Descriptor {
         let kind = metadata.file_type();
         if !(kind.is_file() || kind.is_fifo() || kind.is_socket() || kind.is_char_device()) {
             bail!("descriptor {fd} must refer to a file, pipe, socket, or character device");
+        }
+        #[cfg(target_os = "linux")]
+        if kind.is_fifo() {
+            enlarge_pipe(&file);
         }
         let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         let result = Self {
@@ -159,46 +177,71 @@ impl Descriptor {
     }
     async fn read(mut self, size: usize, fill: bool) -> Result<(Self, bytes::Bytes)> {
         tokio::task::spawn_blocking(move || {
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(size)
-                .context("allocate stream part")?;
-            bytes.resize(size, 0);
-            let mut used = 0;
-            while used < size {
-                self.check_cancelled()?;
-                if used > 0 && !fill {
-                    let mut poll = libc::pollfd {
-                        fd: self.file.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let ready = unsafe { libc::poll(&mut poll, 1, 0) };
-                    if ready == 0 {
-                        break;
-                    }
-                    if ready < 0 {
-                        let error = std::io::Error::last_os_error();
-                        if error.kind() == std::io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        return Err(error.into());
-                    }
-                }
-                match self.file.read(&mut bytes[used..]) {
-                    Ok(0) => break,
-                    Ok(n) => used += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        self.wait(libc::POLLIN)?;
-                    }
-                    Err(e) => return Err(e).context("read input stream"),
-                }
-            }
-            bytes.truncate(used);
-            Ok((self, bytes::Bytes::from(bytes)))
+            let data = self.read_bytes(size, fill)?;
+            Ok((self, bytes::Bytes::from(data)))
         })
         .await?
+    }
+    pub(crate) fn read_bytes(&mut self, size: usize, fill: bool) -> Result<Vec<u8>> {
+        self.read_reusing(size, fill, Vec::new())
+    }
+    pub(crate) fn read_reusing(
+        &mut self,
+        size: usize,
+        fill: bool,
+        mut bytes: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        bytes.clear();
+        bytes
+            .try_reserve_exact(size)
+            .context("allocate stream part")?;
+        while bytes.len() < size {
+            self.check_cancelled()?;
+            if !bytes.is_empty() && !fill {
+                let mut poll = libc::pollfd {
+                    fd: self.file.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+                if ready == 0 {
+                    break;
+                }
+                if ready < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            }
+            let used = bytes.len();
+            // read initializes exactly the returned number of bytes in spare
+            // capacity. Unread capacity is never exposed, hashed or sent.
+            let n = unsafe {
+                libc::read(
+                    self.file.as_raw_fd(),
+                    bytes.as_mut_ptr().add(used).cast(),
+                    size - used,
+                )
+            };
+            if n == 0 {
+                break;
+            }
+            if n > 0 {
+                unsafe {
+                    bytes.set_len(used + n as usize);
+                }
+            } else {
+                let e = std::io::Error::last_os_error();
+                match e.kind() {
+                    std::io::ErrorKind::Interrupted => continue,
+                    std::io::ErrorKind::WouldBlock => self.wait(libc::POLLIN)?,
+                    _ => return Err(e).context("read input stream"),
+                }
+            }
+        }
+        Ok(bytes)
     }
     pub async fn write_chunk(mut self, bytes: bytes::Bytes) -> Result<Self> {
         tokio::task::spawn_blocking(move || {
@@ -246,6 +289,7 @@ pub(crate) async fn await_commit(control: Option<Descriptor>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::os::unix::net::UnixStream;
     #[test]
     fn stream_descriptor_preserves_flags_and_reads_blocking_or_nonblocking_input() {

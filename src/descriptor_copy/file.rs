@@ -1,5 +1,5 @@
 //! One pinned regular file per connection, with private staging for writes.
-use super::{Operation, StreamPlacement, CHUNK};
+use super::{Operation, Settings, StreamPlacement};
 use crate::{
     proto::{OperatorSymlinkPolicy, Response},
     rooted::{OperatorFinalComponent, OperatorResolver, PinnedPath, RelativePath, Root},
@@ -7,19 +7,15 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use std::{
     fs::{File, Metadata, Permissions},
-    io::{Read, Write},
     os::unix::{
         ffi::OsStrExt,
-        fs::{MetadataExt, PermissionsExt},
+        fs::{FileExt, MetadataExt, PermissionsExt},
     },
 };
 
 pub(crate) struct Session {
     file: File,
     original: Metadata,
-    remaining: u64,
-    offset: u64,
-    hash: blake3::Hasher,
     destination: Option<Destination>,
 }
 struct Destination {
@@ -143,7 +139,12 @@ impl Session {
         follow: bool,
         root: Option<&[u8]>,
         placement: &StreamPlacement,
+        settings: Settings,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            (512..=64 << 20).contains(&settings.request_size),
+            "invalid stream request size"
+        );
         let selected = if write {
             anyhow::ensure!(
                 root.is_none(),
@@ -228,11 +229,8 @@ impl Session {
         };
         let original = file.metadata()?;
         Ok(Self {
-            remaining: original.len(),
             original,
             file,
-            offset: 0,
-            hash: blake3::Hasher::new(),
             destination,
         })
     }
@@ -248,73 +246,33 @@ impl Session {
         );
         Ok(())
     }
-    pub(crate) fn handle(slot: &mut Option<Self>, operation: &Operation) -> Result<Response> {
-        let result = Self::handle_inner(slot, operation);
-        if result.is_err() {
-            slot.take();
-        }
-        result
-    }
-    fn handle_inner(slot: &mut Option<Self>, operation: &Operation) -> Result<Response> {
-        if let Operation::Open {
-            path,
-            write,
-            follow,
-            root,
-            placement,
-        } = operation
-        {
-            anyhow::ensure!(slot.is_none(), "descriptor stream already open");
-            *slot = Some(Self::open(
+    pub(crate) fn handle(
+        slot: &mut Option<Self>,
+        operation: &Operation,
+        descriptors: &crate::descriptor_broker::DescriptorSessionSlot,
+    ) -> Result<Response> {
+        let result = (|| match operation {
+            Operation::Open {
                 path,
-                *write,
-                *follow,
-                root.as_deref(),
+                write,
+                follow,
+                root,
                 placement,
-            )?);
-            return Ok(Response::Ok);
-        }
-        let stream = slot.as_mut().context("no descriptor stream is open")?;
-        match operation {
-            Operation::Read => {
-                anyhow::ensure!(stream.destination.is_none(), "stream is not readable");
-                let mut data = vec![0; stream.remaining.min(CHUNK as u64) as usize];
-                stream
-                    .file
-                    .read_exact(&mut data)
-                    .context("read complete source stream block")?;
-                stream.unchanged()?;
-                let off = stream.offset;
-                stream.offset += data.len() as u64;
-                stream.remaining -= data.len() as u64;
-                stream.hash.update(&data);
-                Ok(Response::Block {
-                    off,
-                    hash: *blake3::hash(&data).as_bytes(),
-                    data,
-                })
+                settings,
+            } => {
+                anyhow::ensure!(slot.is_none(), "descriptor stream already open");
+                let stream =
+                    Self::open(path, *write, *follow, root.as_deref(), placement, *settings)?;
+                let size = (!*write).then_some(stream.original.len());
+                let ticket = descriptors.register_stream(stream.file.try_clone()?, *write)?;
+                *slot = Some(stream);
+                Ok(Response::DescriptorOpened { size, ticket })
             }
-            Operation::Write { off, hash, data } => {
-                anyhow::ensure!(stream.destination.is_some(), "stream is not writable");
+            Operation::Finish { size } => {
+                let stream = slot.as_ref().context("no descriptor stream is open")?;
                 anyhow::ensure!(
-                    *off == stream.offset
-                        && !data.is_empty()
-                        && data.len() <= CHUNK
-                        && *hash == *blake3::hash(data).as_bytes(),
-                    "invalid stream write block"
-                );
-                stream.file.write_all(data)?;
-                stream.hash.update(data);
-                stream.offset = stream
-                    .offset
-                    .checked_add(data.len() as u64)
-                    .context("stream length overflow")?;
-                Ok(Response::Ok)
-            }
-            Operation::Finish { size, hash } => {
-                anyhow::ensure!(
-                    *size == stream.offset && *hash == *stream.hash.finalize().as_bytes(),
-                    "stream completion length or digest mismatch"
+                    stream.file.metadata()?.len() == *size,
+                    "stream completion length mismatch"
                 );
                 if let Some(destination) = &stream.destination {
                     stream
@@ -327,13 +285,82 @@ impl Session {
                         (stream.original.dev(), stream.original.ino()),
                     )?;
                 } else {
-                    anyhow::ensure!(stream.remaining == 0, "source stream is incomplete");
                     stream.unchanged()?;
                 }
                 slot.take();
                 Ok(Response::Ok)
             }
-            Operation::Open { .. } => unreachable!(),
+        })();
+        if result.is_err() {
+            slot.take();
+        }
+        result
+    }
+}
+
+/// Uses the ordinary range frames and direct payload encoding, confined to
+/// the already-open file. No worker can choose a different pathname or publish.
+pub(crate) struct FileWorker {
+    file: File,
+    write: bool,
+    settings: Settings,
+}
+impl FileWorker {
+    pub(crate) fn new(file: File, write: bool, settings: Settings) -> Result<Self> {
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "stream worker needs a regular file"
+        );
+        anyhow::ensure!(
+            (512..=64 << 20).contains(&settings.request_size),
+            "invalid stream request size"
+        );
+        Ok(Self {
+            file,
+            write,
+            settings,
+        })
+    }
+    pub(crate) fn handle(&self, request: &crate::proto::Request) -> Result<Response> {
+        use crate::proto::Request;
+        match request {
+            Request::ReadRange {
+                path,
+                source: None,
+                off,
+                len,
+                ..
+            } if !self.write && path.is_empty() && *len as usize <= self.settings.request_size => {
+                let mut data = vec![0; *len as usize];
+                self.file
+                    .read_exact_at(&mut data, *off)
+                    .context("read complete stream range")?;
+                Ok(Response::Block {
+                    off: *off,
+                    hash: self.settings.hash(&data),
+                    data,
+                })
+            }
+            Request::WriteRange {
+                path,
+                off,
+                data,
+                hash,
+                ..
+            } if self.write
+                && path.is_empty()
+                && !data.is_empty()
+                && data.len() <= self.settings.request_size =>
+            {
+                anyhow::ensure!(
+                    self.settings.matches(data, *hash),
+                    "stream range digest mismatch"
+                );
+                self.file.write_all_at(data, *off)?;
+                Ok(Response::Ok)
+            }
+            Request::Shutdown => Ok(Response::Ok),
+            _ => bail!("request is not valid for this stream file capability"),
         }
     }
 }
@@ -341,81 +368,129 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{descriptor_broker::DescriptorSessionSlot, proto::Request};
 
     #[test]
-    fn failed_or_abandoned_streams_do_not_publish() {
+    fn parallel_workers_are_confined_and_publication_waits_for_finish() {
         let temporary = crate::test_support::tempdir().unwrap();
         let target = temporary.path().join("target");
         std::fs::write(&target, b"old").unwrap();
-        for corrupt_block in [false, true] {
-            let mut slot = None;
-            Session::handle(
-                &mut slot,
-                &Operation::Open {
-                    path: target.as_os_str().as_bytes().to_vec(),
-                    write: true,
-                    follow: false,
-                    root: None,
-                    placement: StreamPlacement::default(),
-                },
-            )
-            .unwrap();
-            let hash = if corrupt_block {
-                [0; 32]
-            } else {
-                *blake3::hash(b"new").as_bytes()
-            };
-            let result = Session::handle(
-                &mut slot,
-                &Operation::Write {
-                    off: 0,
-                    hash,
-                    data: b"new".to_vec(),
-                },
-            );
-            assert_eq!(result.is_err(), corrupt_block);
-            if !corrupt_block {
-                assert!(Session::handle(&mut slot, &Operation::Finish { size: 4, hash }).is_err());
-            }
-            assert!(slot.is_none());
-            assert_eq!(std::fs::read(&target).unwrap(), b"old");
-            assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
-        }
+        let descriptors = DescriptorSessionSlot::default();
         let mut slot = None;
-        Session::handle(
-            &mut slot,
-            &Operation::Open {
-                path: target.as_os_str().as_bytes().to_vec(),
-                write: true,
-                follow: false,
-                root: None,
-                placement: StreamPlacement::default(),
+        let open = Operation::Open {
+            path: target.as_os_str().as_bytes().to_vec(),
+            write: true,
+            follow: false,
+            root: None,
+            placement: StreamPlacement::default(),
+            settings: Settings {
+                verify: true,
+                ..Settings::default()
+            },
+        };
+        let Response::DescriptorOpened { ticket, .. } =
+            Session::handle(&mut slot, &open, &descriptors).unwrap()
+        else {
+            panic!()
+        };
+        let first = FileWorker::new(
+            descriptors.acquire(&ticket).unwrap(),
+            ticket.stream_write().unwrap(),
+            Settings {
+                verify: true,
+                ..Settings::default()
             },
         )
         .unwrap();
+        let second = FileWorker::new(
+            descriptors.acquire(&ticket).unwrap(),
+            true,
+            Settings {
+                verify: true,
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+        let write = |off, data: &[u8]| Request::WriteRange {
+            path: Vec::new(),
+            inplace: true,
+            copy_id: [0; 16],
+            attempt: 0,
+            off,
+            hash: Settings::default().algorithm.hash(data),
+            data: data.to_vec(),
+            guard: None,
+        };
+        second.handle(&write(3, b"two")).unwrap();
+        first.handle(&write(0, b"one")).unwrap();
+        let mut wrong_path = write(0, b"bad");
+        if let Request::WriteRange { path, .. } = &mut wrong_path {
+            *path = b"another-file".to_vec();
+        }
+        assert!(first.handle(&wrong_path).is_err());
+        let mut corrupt = write(0, b"bad");
+        if let Request::WriteRange { hash, .. } = &mut corrupt {
+            *hash = [0; 32];
+        }
+        assert!(first.handle(&corrupt).is_err());
+        assert!(first
+            .handle(&Request::DescriptorCopy(Operation::Finish { size: 6 }))
+            .is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        Session::handle(&mut slot, &Operation::Finish { size: 6 }, &descriptors).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"onetwo");
+        assert!(slot.is_none());
+        // Bad lengths and abandoned sessions preserve the already-published file.
+        Session::handle(&mut slot, &open, &descriptors).unwrap();
+        assert!(Session::handle(&mut slot, &Operation::Finish { size: 1 }, &descriptors).is_err());
+        Session::handle(&mut slot, &open, &descriptors).unwrap();
         drop(slot);
         assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&target).unwrap(), b"onetwo");
     }
 
     #[test]
-    fn truncated_source_stream_is_an_error() {
+    fn source_ticket_cannot_write_and_changed_source_fails_finish() {
         let temporary = crate::test_support::tempdir().unwrap();
-        let source = temporary.path().join("source");
-        std::fs::write(&source, b"original").unwrap();
+        let target = temporary.path().join("source");
+        std::fs::write(&target, b"old").unwrap();
+        let descriptors = DescriptorSessionSlot::default();
         let mut slot = None;
-        Session::handle(
+        let Response::DescriptorOpened { size, ticket } = Session::handle(
             &mut slot,
             &Operation::Open {
-                path: source.as_os_str().as_bytes().to_vec(),
+                path: target.as_os_str().as_bytes().to_vec(),
                 write: false,
                 follow: false,
                 root: None,
                 placement: StreamPlacement::default(),
+                settings: Settings::default(),
             },
+            &descriptors,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(size, Some(3));
+        let worker = FileWorker::new(
+            descriptors.acquire(&ticket).unwrap(),
+            ticket.stream_write().unwrap(),
+            Settings::default(),
         )
         .unwrap();
-        std::fs::write(&source, b"short").unwrap();
-        assert!(Session::handle(&mut slot, &Operation::Read).is_err());
-        assert!(slot.is_none());
+        assert!(worker
+            .handle(&Request::WriteRange {
+                path: Vec::new(),
+                inplace: true,
+                copy_id: [0; 16],
+                attempt: 0,
+                off: 0,
+                hash: [0; 32],
+                data: b"bad".to_vec(),
+                guard: None
+            })
+            .is_err());
+        std::fs::write(target, b"changed").unwrap();
+        assert!(Session::handle(&mut slot, &Operation::Finish { size: 3 }, &descriptors).is_err());
     }
 }

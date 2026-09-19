@@ -435,6 +435,21 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 }
             }
         }
+        ConnectionRole::StreamWorker { ticket, settings } => {
+            let initialized = if authority.is_some() {
+                Err(anyhow::anyhow!(
+                    "restricted receivers do not accept stream file capabilities"
+                ))
+            } else {
+                ops.initialize_stream(ticket, *settings)
+            };
+            if let Err(error) = initialized {
+                w.write_msg(&Response::Err(format!(
+                    "initialize stream worker: {error:#}"
+                )))?;
+                return Err(error);
+            }
+        }
         ConnectionRole::Control
         | ConnectionRole::DestinationWorker {
             destination: None, ..

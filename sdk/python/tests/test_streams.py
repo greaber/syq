@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from array import array
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,39 @@ class StreamTests(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if not k.startswith('SYQ_')}
         self.env['HOME'] = str(self.root)
         self.client = syq.Client(executable=SYQ, env=self.env, timeout=10)
+
+    def test_stream_controls_and_diagnostics(self):
+        payload = b"checksummed stream" * 5000
+        expected = syq.Digest("sha256", hashlib.sha256(payload).hexdigest())
+        target = self.root / "checked"
+        with self.client.open_writer(as_=target, expected_digest=expected,
+                integrity_checking="transfer=sha256", stats=True,
+                resource_limits="bandwidth=1M", performance_tuning="request-size=8K") as out:
+            out.write(payload)
+        self.assertIn(b"stream complete", out.stderr)
+        with self.client.open_reader(target, expected_digest=expected, progress_json=True) as source:
+            self.assertEqual(source.read(), payload)
+        self.assertEqual(json.loads(source.stderr.splitlines()[-1])["files_done"], 1)
+        wrong = syq.Digest("sha256", "0" * 64)
+        with self.assertRaises(syq.SyqProcessError):
+            with self.client.open_writer(as_=target, expected_digest=wrong) as out:
+                out.write(b"incorrect")
+        self.assertEqual(target.read_bytes(), payload)
+        with self.assertRaises(syq.SyqProcessError):
+            with self.client.open_reader(target, expected_digest=wrong) as source:
+                source.read()
+
+        async def asynchronous():
+            client = syq.AsyncClient(executable=SYQ, env=self.env, timeout=10)
+            async with client.open_writer(as_=target, expected_digest=expected,
+                    stats=True, resource_limits="workers=1") as out:
+                await out.write(payload)
+            self.assertIn(b"stream complete", out.stderr)
+            async with client.open_reader(target, expected_digest=expected,
+                    integrity_checking="transfer=md5", progress_json=True) as source:
+                self.assertEqual(await source.read(), payload)
+            self.assertEqual(json.loads(source.stderr.splitlines()[-1])["files_done"], 1)
+        asyncio.run(asynchronous())
 
     def test_writer_placement_and_reader_source_bases(self):
         rsh = self.root / "rsh"
@@ -125,7 +159,7 @@ class StreamTests(unittest.TestCase):
         rsh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$1"\n')
         rsh.chmod(0o700)
         target = self.root / 'remote file'
-        options = dict(rsh=str(rsh), syq_path=str(SYQ))
+        options = dict(rsh=str(rsh), syq_path=str(SYQ), no_tcp=True)
         with self.client.open_writer(to='fixture', as_=target, **options) as output:
             output.write(b'remote bytes')
         with self.client.open_reader(target, from_='fixture', **options) as input:

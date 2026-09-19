@@ -16,6 +16,7 @@ pub(super) enum LocalConnectionRole {
     Control,
     SourceWorker,
     DestinationWorker,
+    StreamWorker,
 }
 
 impl From<&ConnectionRole> for LocalConnectionRole {
@@ -24,6 +25,7 @@ impl From<&ConnectionRole> for LocalConnectionRole {
             ConnectionRole::Control => Self::Control,
             ConnectionRole::SourceWorker { .. } => Self::SourceWorker,
             ConnectionRole::DestinationWorker { .. } => Self::DestinationWorker,
+            ConnectionRole::StreamWorker { .. } => Self::StreamWorker,
         }
     }
 }
@@ -71,7 +73,10 @@ impl Conn for LocalConn {
         Ok(())
     }
 
-    fn send(&mut self, mut req: Request) -> Result<()> {
+    fn send(&mut self, req: Request) -> Result<()> {
+        self.send_recycling(req).map(|_| ())
+    }
+    fn send_recycling(&mut self, mut req: Request) -> Result<Option<Vec<u8>>> {
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(true));
         anyhow::ensure!(
             self.write_stream.is_none() || matches!(req, Request::WriteRange { .. }),
@@ -107,13 +112,13 @@ impl Conn for LocalConn {
             self.pending.push_back(Response::Err(
                 "request is allowed only on the control connection".into(),
             ));
-            return Ok(());
+            return Ok(None);
         }
         if self.role == LocalConnectionRole::SourceWorker && !req.allowed_on_source_worker() {
             self.pending.push_back(Response::Err(
                 "request is not valid on a source worker".into(),
             ));
-            return Ok(());
+            return Ok(None);
         }
         match req {
             Request::ReadStream(stream) => {
@@ -130,17 +135,17 @@ impl Conn for LocalConn {
                     self.read_stream = Some(stream);
                     self.pending.push_back(Response::Ok);
                 }
-                return Ok(());
+                return Ok(None);
             }
             Request::ShrinkReadStream { end } => {
                 if self.read_stream.is_none() {
                     self.pending
                         .push_back(Response::Err("no read stream is active".into()));
-                    return Ok(());
+                    return Ok(None);
                 }
                 crate::streaming::shrink_limit(&mut self.read_stream_limit, end)?;
                 self.ops.shrink_source_range(end);
-                return Ok(());
+                return Ok(None);
             }
             Request::StopReadStream => {
                 self.ops.end_source_range();
@@ -150,17 +155,20 @@ impl Conn for LocalConn {
                 } else if !self.read_stream_done_sent {
                     self.pending.push_back(Response::ReadStreamDone);
                 }
-                return Ok(());
+                return Ok(None);
             }
             _ => {}
         }
         let resp = self.ops.handle_in_place(&mut req);
         if let Some(state) = &mut self.write_stream {
             state.record(resp);
-            return Ok(());
+        } else {
+            self.pending.push_back(resp);
         }
-        self.pending.push_back(resp);
-        Ok(())
+        Ok(match req {
+            Request::WriteRange { data, .. } => Some(data),
+            _ => None,
+        })
     }
     fn recv(&mut self) -> Result<Response> {
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));

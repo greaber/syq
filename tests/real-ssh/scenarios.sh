@@ -141,12 +141,27 @@ syq completion cache clear >/dev/null
 
 printf 'case: descriptor upload and download over real SSH\n'
 python3 - <<'PY_DESCRIPTORS'
-import subprocess
+import subprocess, hashlib
 payload = bytes(range(256)) * 80000 + b'last\x00\xff'
+expected = "sha256:" + hashlib.sha256(payload).hexdigest()
+controls = ["--expected-hash", expected, "--integrity-checking", "transfer=md5",
+            "--performance-tuning", "request-size=1M,pipeline-depth=8", "--stats", "-vv"]
 path = "/tmp/syq-real-ssh/stream 'with spaces'"
-subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path], input=payload, check=True, timeout=60)
-result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'], stdout=subprocess.PIPE, check=True, timeout=60)
-assert result.stdout == payload
+# Fixed workers plus pacing give both workers time to carry payload. Verify the
+# actual per-worker byte counters, not just that two connections were opened.
+import re
+for transport, extra in (("EncryptedTcp", []), ("Ssh", ["--no-tcp"])):
+    parallel = [*controls, "--performance-tuning", "workers=2", "--resource-limits", "bandwidth=8M", *extra]
+    upload = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path, *parallel],
+                            input=payload, capture_output=True, check=True, timeout=60)
+    result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1', *parallel],
+                            capture_output=True, check=True, timeout=60)
+    assert result.stdout == payload
+    for response, action in ((upload, "sent"), (result, "read")):
+        assert response.stderr.count(("ready (" + transport + ")").encode()) == 2, response.stderr
+        counts = re.findall(rb"stream worker (\d+): " + action.encode() + rb" (\d+) bytes", response.stderr)
+        assert len(counts) == 2 and all(int(n) > 0 for _, n in counts), response.stderr
+        assert sum(int(n) for _, n in counts) == len(payload), response.stderr
 result = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as-new', path],
                         input=b'no', capture_output=True, timeout=30)
 assert result.returncode != 0, result.stderr

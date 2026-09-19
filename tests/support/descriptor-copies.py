@@ -33,12 +33,12 @@ def fail(args, **kwargs):
     return result
 
 
-def wait_for(predicate, description):
+def wait_for(predicate, description, interval=.05):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         if predicate():
             return
-        time.sleep(.05)
+        time.sleep(interval)
     raise AssertionError('timed out: ' + description)
 
 
@@ -109,14 +109,15 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                     child = subprocess.Popen(command, pass_fds=(a.fileno(),), stdout=subprocess.PIPE,
                                              stderr=subprocess.PIPE, env=ENV, start_new_session=True)
                     CHILDREN.append(child)
-                    wait_for(lambda: list(target.parent.glob('.syq-stream-*')), 'staging file')
+                    wait_for(lambda: list(target.parent.glob('.syq-stream-*')), 'staging file', interval=.0001)
                     assert target.read_bytes() == DATA
                     child.send_signal(signal.SIGTERM)
                     _, error = child.communicate(timeout=10)
                     assert child.returncode != 0, error
                     assert fcntl.fcntl(a, fcntl.F_GETFL) == before
                     assert target.read_bytes() == DATA
-                    wait_for(lambda: not list(target.parent.glob('.syq-stream-*')), 'staging cleanup')
+                    wait_for(lambda: not list(target.parent.glob('.syq-stream-*')),
+                             f'staging cleanup (remote={ssh}, nonblocking={nonblocking})')
             # Broken consumers fail. Remote path sources remain regular files.
             child = subprocess.Popen([SYQ, 'cp', *options, *source, str(target), '--as-fd', '1'],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV, start_new_session=True)
@@ -192,8 +193,8 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
         # Reject unsupported settings before opening input or mutating output.
         inherited_target = root / 'inherited-options'
         inherited_target.write_bytes(b'old')
-        for options, diagnostic in (('--stats', b'--stats'),
-                                    ('--performance-tuning workers=1', b'workers')):
+        for options, diagnostic in (('--dry-run', b'--dry-run'),
+                                    ('--performance-tuning batch-files=1', b'batch-files')):
             result = subprocess.run(
                 [SYQ, 'cp', '--src-fd', '0', '--as', str(inherited_target)],
                 input=b'new', stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -230,7 +231,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
         created = root / 'umask-output'
         run(['--src-fd', '0', '--as', str(created)], input=b'new', umask=0o027)
         assert created.stat().st_mode & 0o777 == 0o640
-        for option in ('--prune', '--dry-run', '--hash', '--verify-only', '--stats', '--detach'):
+        for option in ('--prune', '--dry-run', '--hash', '--verify-only', '--detach'):
             result = fail(['--src-fd', '0', '--as', str(root / 'forbidden'), option], input=b'')
             assert not (root / 'forbidden').exists(), option
         for args in (['--src-fd', '0'], ['--as-fd', '1'], ['--src-fd', '2', '--as', 'bad'],

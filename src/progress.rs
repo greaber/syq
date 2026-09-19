@@ -13,6 +13,8 @@ pub struct Progress {
     pub width: Option<usize>,
     /// Removal mode: header counts entries instead of bytes.
     pub rm: bool,
+    /// A byte stream whose length is unknown until EOF.
+    pub stream: bool,
     pub bytes_total: AtomicU64,
     pub bytes_done: AtomicU64,
     /// Monotonic high-water mark of logical completion. Recovery may roll
@@ -112,6 +114,7 @@ impl Progress {
             json,
             width,
             rm: false,
+            stream: false,
             bytes_total: AtomicU64::new(0),
             bytes_done: AtomicU64::new(0),
             tuning_high_water: AtomicU64::new(0),
@@ -295,10 +298,11 @@ impl Progress {
                 });
             }
         }
-        if self.json && status.is_none() {
+        if self.json && (status.is_none() || self.stream) {
             let now = Instant::now();
-            if t.last_json
-                .is_none_or(|l| now - l >= Duration::from_secs(1))
+            if (self.stream && status.is_some())
+                || t.last_json
+                    .is_none_or(|l| now - l >= Duration::from_secs(1))
             {
                 t.last_json = Some(now);
                 crate::output::emit_json_stderr(format_args!(
@@ -319,6 +323,8 @@ impl Progress {
         let elapsed = now - self.start;
         let state = if let Some(status) = status {
             status.to_string()
+        } else if !scan_done && self.stream {
+            format!("{}/s", human(rate as u64))
         } else if !scan_done {
             format!("scanning {}", commas(self.scanned.load(Relaxed)))
         } else if self.errors.load(Relaxed) > 0 {
@@ -339,7 +345,15 @@ impl Progress {
                 format!("{}/{} entries", commas(fdone), commas(ftotal)),
             )
         } else {
-            (done, total, format!("{}/{}", human(done), human(total)))
+            (
+                done,
+                total,
+                if self.stream && !scan_done {
+                    human(done)
+                } else {
+                    format!("{}/{}", human(done), human(total))
+                },
+            )
         };
         let mut details = vec![state, format!("elapsed {}", hms(elapsed.as_secs_f64()))];
         if status.is_none() && age < Duration::from_secs(5) && !self.rm {

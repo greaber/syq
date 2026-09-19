@@ -50,7 +50,8 @@ impl RegisteredRootId {
 }
 
 struct RegisteredRoot {
-    directory: File,
+    descriptor: File,
+    kind: RegisteredDescriptorKind,
     source_leaf: Option<File>,
 }
 
@@ -58,6 +59,8 @@ struct RegisteredRoot {
 enum RegisteredDescriptorKind {
     Directory,
     SourceLeaf,
+    StreamRead,
+    StreamWrite,
 }
 
 impl RegisteredDescriptorKind {
@@ -65,6 +68,8 @@ impl RegisteredDescriptorKind {
         match self {
             Self::Directory => 0,
             Self::SourceLeaf => 1,
+            Self::StreamRead => 2,
+            Self::StreamWrite => 3,
         }
     }
 
@@ -72,6 +77,8 @@ impl RegisteredDescriptorKind {
         match byte {
             0 => Some(Self::Directory),
             1 => Some(Self::SourceLeaf),
+            2 => Some(Self::StreamRead),
+            3 => Some(Self::StreamWrite),
             _ => None,
         }
     }
@@ -123,7 +130,8 @@ impl RegisteredRootRegistry {
             directories
                 .into_iter()
                 .map(|directory| RegisteredRoot {
-                    directory,
+                    descriptor: directory,
+                    kind: RegisteredDescriptorKind::Directory,
                     source_leaf: None,
                 })
                 .collect(),
@@ -154,7 +162,8 @@ impl RegisteredRootRegistry {
             handles
                 .into_iter()
                 .map(|(directory, source_leaf)| RegisteredRoot {
-                    directory,
+                    descriptor: directory,
+                    kind: RegisteredDescriptorKind::Directory,
                     source_leaf,
                 })
                 .collect(),
@@ -213,8 +222,9 @@ impl RegisteredRootRegistry {
             .roots
             .get(&id)
             .and_then(|root| match kind {
-                RegisteredDescriptorKind::Directory => Some(&root.directory),
+                kind if kind == root.kind => Some(&root.descriptor),
                 RegisteredDescriptorKind::SourceLeaf => root.source_leaf.as_ref(),
+                _ => None,
             })
             .map(File::try_clone)
             .transpose()
@@ -228,8 +238,9 @@ impl RegisteredRootRegistry {
             .roots
             .get(&id)
             .is_some_and(|root| match kind {
-                RegisteredDescriptorKind::Directory => true,
+                kind if kind == root.kind => true,
                 RegisteredDescriptorKind::SourceLeaf => root.source_leaf.is_some(),
+                _ => false,
             })
     }
 }
@@ -278,6 +289,14 @@ impl DescriptorTicket {
         self.kind == RegisteredDescriptorKind::SourceLeaf
     }
 
+    pub(crate) fn stream_write(&self) -> Result<bool> {
+        match self.kind {
+            RegisteredDescriptorKind::StreamRead => Ok(false),
+            RegisteredDescriptorKind::StreamWrite => Ok(true),
+            _ => bail!("stream worker requires an exact stream file ticket"),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn broker_path(&self) -> PathBuf {
         self.socket_path()
@@ -294,25 +313,32 @@ pub(crate) struct DescriptorSession {
 
 impl DescriptorSession {
     pub(crate) fn start(max_roots: usize, max_connections: usize) -> Result<Self> {
+        Self::start_inner(max_roots, max_connections, false)
+    }
+
+    fn start_inner(max_roots: usize, max_connections: usize, managed: bool) -> Result<Self> {
         let registry = RegisteredRootRegistry::new(max_roots)?;
         let secret: [u8; SECRET_LEN] = crate::tcp_records::random_bytes(SECRET_LEN)
             .try_into()
             .map_err(|_| anyhow!("generated descriptor broker secret has the wrong length"))?;
         let server_registry = registry.clone();
         let server_secret = secret;
-        let broker = PrivateBroker::start(
-            PrivateBrokerConfig {
-                directory_prefix: "syq-fd-",
-                socket_name: "broker.sock",
-                listener_thread: "syq-fd-listener",
-                client_thread: "syq-fd-client",
-                max_connections,
-                io_timeout: BROKER_IO_TIMEOUT,
-            },
-            move |mut stream, _connections| {
-                let _ = serve_acquire(&mut stream, &server_registry, &server_secret);
-            },
-        )?;
+        let config = PrivateBrokerConfig {
+            directory_prefix: "syq-fd-",
+            socket_name: "broker.sock",
+            listener_thread: "syq-fd-listener",
+            client_thread: "syq-fd-client",
+            max_connections,
+            io_timeout: BROKER_IO_TIMEOUT,
+        };
+        let handler = move |mut stream: TrackedStream, _connections| {
+            let _ = serve_acquire(&mut stream, &server_registry, &server_secret);
+        };
+        let broker = if managed {
+            PrivateBroker::start_managed(config, handler)?
+        } else {
+            PrivateBroker::start(config, handler)?
+        };
         Ok(Self {
             broker,
             registry,
@@ -390,6 +416,57 @@ impl Default for DescriptorSessionSlot {
 }
 
 impl DescriptorSessionSlot {
+    /// The caller handles signals and must close this session before exit.
+    pub(crate) fn managed() -> Result<Self> {
+        Ok(Self {
+            session: Arc::new(Mutex::new(Some(DescriptorSession::start_inner(
+                DEFAULT_MAX_ROOTS,
+                DEFAULT_MAX_CONNECTIONS,
+                true,
+            )?))),
+            ..Self::default()
+        })
+    }
+
+    /// Stream tickets carry only one already-open regular file, never a path
+    /// or directory authority. The kind fixes the worker's read/write direction.
+    pub(crate) fn register_stream(&self, file: File, write: bool) -> Result<DescriptorTicket> {
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "stream capability requires a regular file"
+        );
+        anyhow::ensure!(
+            !self.closed.load(Ordering::Acquire),
+            "descriptor session is closed"
+        );
+        let mut session = self.session.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(
+            !self.closed.load(Ordering::Acquire),
+            "descriptor session is closed"
+        );
+        if session.is_none() {
+            *session = Some(DescriptorSession::start(
+                self.max_roots,
+                self.max_connections,
+            )?);
+        }
+        let session = session.as_ref().unwrap();
+        let kind = if write {
+            RegisteredDescriptorKind::StreamWrite
+        } else {
+            RegisteredDescriptorKind::StreamRead
+        };
+        let id = session
+            .registry
+            .register_entries(vec![RegisteredRoot {
+                descriptor: file,
+                kind,
+                source_leaf: None,
+            }])?
+            .remove(0);
+        session.ticket_for(id, kind)
+    }
+
     pub(crate) fn register(&self, directory: File) -> Result<DescriptorTicket> {
         Ok(self.register_many(vec![directory])?.remove(0))
     }
@@ -896,6 +973,47 @@ mod tests {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         bytes
+    }
+
+    #[test]
+    fn stream_tickets_preserve_direction_across_the_broker() {
+        use std::fs;
+        use std::os::unix::fs::FileExt;
+        let temporary = crate::test_support::tempdir().unwrap();
+        let path = temporary.path().join("file");
+        fs::write(&path, b"old").unwrap();
+        let session = DescriptorSessionSlot::default();
+        let ticket = session
+            .register_stream(
+                fs::OpenOptions::new().write(true).open(&path).unwrap(),
+                true,
+            )
+            .unwrap();
+        assert!(ticket.stream_write().unwrap());
+        acquire_descriptor(&ticket)
+            .unwrap()
+            .write_all_at(b"new", 0)
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        for kind in [
+            RegisteredDescriptorKind::Directory,
+            RegisteredDescriptorKind::SourceLeaf,
+            RegisteredDescriptorKind::StreamRead,
+        ] {
+            let mut wrong = ticket.clone();
+            wrong.kind = kind;
+            assert!(acquire_descriptor(&wrong).is_err());
+        }
+        let read = session
+            .register_stream(File::open(&path).unwrap(), false)
+            .unwrap();
+        assert!(!read.stream_write().unwrap());
+        assert!(acquire_descriptor(&read)
+            .unwrap()
+            .write_all_at(b"bad", 0)
+            .is_err());
+        session.close();
+        assert!(acquire_descriptor(&ticket).is_err());
     }
 
     fn ticket_from_environment() -> DescriptorTicket {
