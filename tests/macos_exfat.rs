@@ -1,6 +1,9 @@
 //! Copy to a real macOS exFAT volume, including its native capacity counters.
 #![cfg(target_os = "macos")]
 
+#[path = "support/temp.rs"]
+mod test_support;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -16,7 +19,7 @@ struct ExfatImage {
 
 impl ExfatImage {
     fn new() -> Self {
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = crate::test_support::tempdir().unwrap();
         let root = scratch.path().canonicalize().unwrap();
         let image = root.join("exfat.dmg");
         let mount = root.join("mount");
@@ -76,7 +79,7 @@ fn assert_success(output: &Output) {
 #[test]
 fn fresh_exfat_destinations_have_unknown_inode_capacity() {
     let volume = ExfatImage::new();
-    let source_dir = tempfile::tempdir().unwrap();
+    let source_dir = crate::test_support::tempdir().unwrap();
     let source = source_dir.path().canonicalize().unwrap().join("source");
     fs::write(&source, b"payload").unwrap();
     let copy = |destination: &str, placement: &str, extra: &[&str]| {

@@ -1,5 +1,8 @@
 //! Integration tests: local -> local copies through the built binary.
 
+#[path = "support/temp.rs"]
+mod test_support;
+
 use base64::Engine as _;
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -45,13 +48,7 @@ static COUNTER: AtomicUsize = AtomicUsize::new(0);
 // The isolated real-SSH Compose suite still exercises the production default.
 const EPHEMERAL_TCP_PORTS: &str = "0-0";
 
-/// The process temporary directory with symlinks resolved. macOS places
-/// `TMPDIR` under `/var`, a symlink to `/private/var`, and native operator
-/// paths refuse symlink components by default.
-fn temp_dir() -> PathBuf {
-    let path = std::env::temp_dir();
-    fs::canonicalize(&path).unwrap_or(path)
-}
+use test_support::temp_dir;
 
 /// Whether the temporary filesystem accepts file names that are not valid
 /// UTF-8. APFS on macOS rejects them with `EILSEQ`, so tests about raw byte
@@ -311,7 +308,7 @@ fn interrupted_partial(args: &[&str], dir: &Path) -> PathBuf {
 
 #[cfg(debug_assertions)]
 fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> PathBuf {
-    let barrier = tempfile::tempdir().unwrap();
+    let barrier = crate::test_support::tempdir().unwrap();
     let ready = barrier.path().join("ready");
     let continuation = barrier.path().join("continue");
     let mut command = compat_command();

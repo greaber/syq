@@ -1,5 +1,8 @@
 //! Output failures must not replace filesystem outcomes or freeze telemetry.
 
+#[path = "support/temp.rs"]
+mod test_support;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
@@ -31,7 +34,7 @@ fn terminal(path: &std::path::Path) -> serde_json::Value {
 #[test]
 fn closed_human_streams_preserve_copy_and_removal_results() {
     for broken_stderr in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         fs::write(root.join("src"), b"output failure must not lose this").unwrap();
         for (mode, args, result) in [
@@ -89,7 +92,7 @@ fn closed_human_streams_preserve_copy_and_removal_results() {
 
 #[test]
 fn closed_stderr_preserves_failure_exit_status() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let output = command(directory.path())
         .args([
             "cp",
@@ -114,7 +117,7 @@ fn closed_stderr_preserves_failure_exit_status() {
 
 #[test]
 fn full_stdout_keeps_results_progress_running() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     fs::write(root.join("src"), b"data").unwrap();
     let (mut reader, mut writer) = UnixStream::pair().unwrap();
@@ -189,7 +192,7 @@ fn full_stdout_keeps_results_progress_running() {
 
 #[test]
 fn broken_stdout_warning_does_not_append_to_live_progress() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let data = vec![42; 2 * 1024 * 1024];
     fs::write(root.join("src"), &data).unwrap();
@@ -232,7 +235,7 @@ fn broken_stdout_warning_does_not_append_to_live_progress() {
 #[cfg(debug_assertions)]
 #[test]
 fn fatal_deferred_metadata_error_leaves_final_incomplete_counts() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     fs::create_dir(root.join("src")).unwrap();
     fs::create_dir(root.join("dst")).unwrap();

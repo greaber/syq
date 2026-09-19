@@ -1,4 +1,7 @@
 //! Failures at the local build handoff must precede approval and SSH fallback.
+#[path = "support/temp.rs"]
+mod test_support;
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -10,7 +13,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir(temp.path().join(".syq-destinations-v3")).unwrap();
         fs::set_permissions(
             temp.path().join(".syq-destinations-v3"),

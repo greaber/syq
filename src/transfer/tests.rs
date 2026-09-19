@@ -333,7 +333,7 @@ fn prune_index_timing() {
 #[test]
 #[ignore = "manual simulated-latency timing; run with --ignored --nocapture"]
 fn prune_pipeline_timing() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let candidate = crate::fsops::lstat_entry(b"extra".to_vec(), directory.path()).unwrap();
     let seen = (0..4096)
         .map(|i| (format!("dst/file-{i}").into_bytes(), Claim::Leaf))
@@ -366,7 +366,7 @@ fn prune_pipeline_timing() {
 
 #[test]
 fn prune_walk_drops_synced_entries_and_skips_empty_candidate_lookups() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let file = directory.path().join("file");
     std::fs::write(&file, b"contents").unwrap();
     let template = crate::fsops::lstat_entry(Vec::new(), &file).unwrap();
@@ -390,7 +390,7 @@ fn prune_walk_drops_synced_entries_and_skips_empty_candidate_lookups() {
 
 #[test]
 fn prune_walk_keeps_shields_recovery_and_nested_scopes() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let mut entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
     let seen = [(b"dst/blocked".to_vec(), Claim::Weak)]
         .into_iter()
@@ -416,7 +416,7 @@ fn prune_walk_keeps_shields_recovery_and_nested_scopes() {
 
 #[test]
 fn prune_alias_lookups_are_bounded_and_keep_only_candidate_identities() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let file = directory.path().join("file");
     std::fs::write(&file, b"contents").unwrap();
     let mut candidate = crate::fsops::lstat_entry(b"stored-name".to_vec(), &file).unwrap();
@@ -1304,7 +1304,7 @@ impl Conn for SetupConn {
 #[test]
 fn existing_destination_setup_pipelines_and_drains_failures() {
     for fail_at in [None, Some(0), Some(1), Some(2)] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::tempdir().unwrap();
         let path = directory.path().as_os_str().as_bytes();
         let entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
         let mut conn = SetupConn {
@@ -1344,7 +1344,7 @@ fn existing_destination_setup_pipelines_and_drains_failures() {
 
 #[test]
 fn existing_destination_setup_rejects_replaced_inode_without_writes() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let destination = directory.path().join("destination");
     std::fs::create_dir(&destination).unwrap();
     let entry = crate::fsops::lstat_entry(Vec::new(), &destination).unwrap();
@@ -1384,7 +1384,7 @@ fn existing_destination_setup_replays_on_v032_receiver() {
     // This probe deliberately speaks the released client's identity. Real
     // clients retain exact build pinning; it is not a mixed-build bypass.
     let binary = std::env::var_os("SYQ_V032_BINARY").expect("SYQ_V032_BINARY");
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let path = directory.path().as_os_str().as_bytes();
     let entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
     let mut conn = SetupConn {

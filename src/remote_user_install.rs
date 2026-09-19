@@ -176,7 +176,7 @@ mod tests {
             assert_eq!(fs::read(&installed).unwrap(), fs::read(&original).unwrap());
             return;
         }
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_support::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(TEST_ARGS)
             .env(CHILD_HOME, home.path())
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn concurrent_publication_preserves_the_winning_copy() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_support::tempdir().unwrap();
         let bin = prepare_bin(home.path()).unwrap();
         let destination = bin.join("syq");
         let sources = [home.path().join("first"), home.path().join("second")];
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn installs_independent_copy_preserves_it_and_reinstalls_after_removal() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let source = root.path().join("helper");
         let home = root.path().join("home with spaces");
         fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn preserves_dangling_destination_symlinks() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let bin = root.path().join(".local/bin");
         fs::create_dir_all(&bin).unwrap();
         symlink("missing", bin.join("syq")).unwrap();
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn refuses_other_writable_install_directories_without_changing_permissions() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let bin = root.path().join(".local/bin");
         fs::create_dir_all(&bin).unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o777)).unwrap();
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn accepts_group_writable_and_setgid_layouts_without_chmod() {
         for mode in [0o775, 0o2775] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::tempdir().unwrap();
             let home = root.path().join("home");
             let local = home.join(".local");
             let bin = local.join("bin");
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn lookup_errors_are_reported_and_do_not_create_a_command() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let local = root.path().join(".local");
         symlink(".local", &local).unwrap();
         let error = install_from(&root.path().join("helper"), root.path()).unwrap_err();
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn copy_failure_cleans_up_staging() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let bin = prepare_bin(root.path()).unwrap();
         let error =
             copy_and_publish(&root.path().join("missing"), &bin, &bin.join("syq")).unwrap_err();
