@@ -1152,6 +1152,7 @@ const DOC_JQ_RETRY_GATE: &str = r#"if (.[-1].type? // "") != "result"
                           and .retryable != "no")
              | {src, dst, kind}
                + (if has("expected_digest") then {expected_digest} else {} end)
+               + (if has("metadata") then {metadata} else {} end)
         end"#;
 
 /// Assert the doc contains the complete invocation — flags included — that
@@ -1254,6 +1255,7 @@ fn mappings_md_retry_gate_example_works_verbatim() {
     let mut missing: serde_json::Value =
         serde_json::from_str(&entry_line("gone.txt", "g.txt", None)).unwrap();
     missing["expected_digest"] = expected.clone();
+    missing["metadata"] = serde_json::json!({"mode": 0o640, "mtime": 123});
     let manifest = format!("{missing}\n{}", entry_line("ok.txt", "ok.txt", None));
     let cp = syq_cp_in(
         &t.path(""),
@@ -1279,6 +1281,7 @@ fn mappings_md_retry_gate_example_works_verbatim() {
     let retry: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one retry entry");
     assert_eq!(retry["dst"]["value"], "g.txt");
     assert_eq!(retry["expected_digest"], expected);
+    assert_eq!(retry["metadata"], missing["metadata"]);
     // The emitted entry executes as a mapping after the source appears.
     write(&t.path("src/gone.txt"), b"late");
     let cp = syq_cp_in(
@@ -1288,6 +1291,8 @@ fn mappings_md_retry_gate_example_works_verbatim() {
     );
     assert!(cp.status.success());
     assert_eq!(read(&t.path("dst/g.txt")), b"late");
+    let meta = fs::metadata(t.path("dst/g.txt")).unwrap();
+    assert_eq!((meta.mode() & 0o7777, meta.mtime()), (0o640, 123));
     // Truncated stream: refused.
     let truncated: Vec<u8> = results
         .split(|&b| b == b'\n')
