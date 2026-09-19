@@ -64,8 +64,6 @@ their original limits.
 | `--tcp-plain` | Unsupported; data connections must be encrypted |
 | `--mapping` | Listed destinations and necessary parent creation are authorized |
 | `--skip-newer` | Timestamp selection uses source-reported modification times |
-| `--min-size` | Unsupported |
-| `--max-size` with `--prune` | Unsupported |
 | Fixed `workers` above 128 | Unsupported |
 | `--inplace` with `--as-new` | Unsupported |
 | `--detach` | Unsupported; the local broker must remain attached |
@@ -85,7 +83,7 @@ results. Use `-v` for totals or `--results FILE` for
 than as live per-file progress. For `--dry-run --results`, use
 `--coordinate-at local` to get the preview stream.
 
-`--receiver-receipt digests` adds BLAKE3 hashes of affected regular files.
+`--receiver-receipt hashes` adds BLAKE3 hashes of affected regular files.
 Receipts allow up to four million records and 512 MiB of plaintext. Reaching
 a cap stops further changes and reports an incomplete outcome.
 
@@ -134,7 +132,7 @@ for each reply. Offline or unsupported connections are skipped. With none
 available, or with unsupported options, it uses the source machine's SSH access.
 Once approval is requested, refusal or failure ends the attempt.
 
-`--auth-from @NAME` and its alias `--via @NAME` require that receiving machine
+`--auth-from @NAME` requires that receiving machine
 to authorize the copy. `--auth-from ssh` uses the source machine's SSH access.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
@@ -165,7 +163,7 @@ produce `--results`; a receiver receipt cannot attest to the source's comparison
 Verification never installs an enrollment.
 
 `--verify-only` cannot combine with `--dry-run`, `--prune`, `--inplace`, or
-overwrite policies. Filters and size limits select the entries to compare;
+overwrite policies. Filters select the entries to compare;
 special files require `--preserve=specials`. Metadata is not compared, but device
 identity is. A requested results file may still be written, and remote setup may
 still cache the helper or [install syq](install.md#automatic-installation-on-ssh-servers).

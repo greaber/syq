@@ -71,7 +71,9 @@ pub(crate) fn run(
         if plan.options.route == crate::s3::Route::Upload {
             plan.source_meta = descriptor.as_ref().and_then(Descriptor::metadata);
             controls.metadata.source(plan.source_meta)?;
-            controls.skip_size(descriptor.as_ref().map(Descriptor::remaining_len).transpose()?.flatten())?;
+            if let Some(size) = descriptor.as_ref().map(Descriptor::remaining_len).transpose()?.flatten() {
+                controls.set_size(size);
+            }
         }
         if plan.options.route == crate::s3::Route::Download {
             controls.metadata.output(descriptor.as_ref().and_then(Descriptor::metadata).is_some())?;
@@ -246,15 +248,11 @@ async fn upload(
         }
         .encode()
     });
-    let mut expected_hash = controls.expected_hasher();
+
     let size = usize::try_from(options.part_size)?;
     let algorithm = Algorithm::for_endpoint(options.endpoint.as_deref());
     let (mut input, first) = input.read_chunk(size).await?;
     if first.len() < size {
-        if let Some(hash) = &mut expected_hash {
-            hash.update(&first);
-        }
-        controls.verify(expected_hash)?;
         let length = first.len() as u64;
         controls.pace(length).await;
         crate::descriptor_copy::fd::await_commit(commit).await?;
@@ -307,9 +305,6 @@ async fn upload(
             bail!("stream exceeds 10,000 multipart parts; rerun with a larger --performance-tuning s3-part-size=SIZE");
         }
         let last = data.len() < size;
-        if let Some(hash) = &mut expected_hash {
-            hash.update(&data);
-        }
         pending.push(upload_part(client, plan, &id, number, data, algorithm));
         number += 1;
         if pending.len() >= options.concurrency {
@@ -336,7 +331,6 @@ async fn upload(
     while let Some(part) = pending.try_next().await? {
         completed.push(part);
     }
-    controls.verify(expected_hash)?;
     completed.sort_by_key(|p| p.part_number());
     crate::descriptor_copy::fd::await_commit(commit).await?;
     client
@@ -412,9 +406,7 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
         head.content_length()
             .context("S3 HEAD omitted Content-Length")?,
     )?;
-    if controls.skip_size(Some(size))? {
-        return Ok(());
-    }
+    controls.set_size(size);
     if controls.report.only_new {
         controls.report.skip();
         return Ok(());
@@ -448,7 +440,6 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
         return Ok(());
     }
     controls.report.ready();
-    let mut expected_hash = controls.expected_hasher();
     let etag = head.e_tag().context("S3 HEAD omitted ETag")?;
     let version = head.version_id();
     let part_size = plan.options.part_size;
@@ -466,14 +457,10 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
         })
         .buffered(plan.options.concurrency);
     while let Some(bytes) = parts.try_next().await? {
-        if let Some(hash) = &mut expected_hash {
-            hash.update(&bytes);
-        }
         let length = bytes.len() as u64;
         output = output.write_chunk(bytes).await?;
         controls.progress.add_bytes(length);
     }
-    controls.verify(expected_hash)?;
     output.apply_metadata(controls.metadata, source_meta)
 }
 

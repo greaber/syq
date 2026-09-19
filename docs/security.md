@@ -250,7 +250,7 @@ provided by hostA.
 <a id="consistency-and-durability"></a>
 
 For checking contents against a trusted hash, see
-[Expected digests](integrity-checking.md#expected-digests). General corruption,
+[Expected hashes](integrity-checking.md#expected-hashes). General corruption,
 consistency, and durability considerations are covered in
 [Integrity checking](integrity-checking.md).
 

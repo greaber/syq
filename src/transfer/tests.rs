@@ -207,8 +207,7 @@ fn pipeline_worker(
     let opts = Arc::new(Opts {
         local_copy_fd_budget: true,
         hash_policy: Default::default(),
-        expected_digest: None,
-        mapping_expected_digests: Default::default(),
+        mapping_expected_hashes: Default::default(),
         block: 512,
         tuning: crate::transfer_tuning::TransferTuning {
             copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
@@ -230,6 +229,7 @@ fn pipeline_worker(
         dst_remote: true,
         restricted_receiver: false,
         dry_run: false,
+        dry_run_metadata_files: AtomicU64::new(0),
         quiet: true,
         verbose: 0,
         umask: 0,
@@ -1755,4 +1755,46 @@ fn tcp_stats_distinguish_unavailable_fields_from_zero() {
     assert!(output.contains("current average 1.00 ms, minimum unavailable"));
     assert!(output.contains("receive unavailable, send-buffer unavailable"));
     assert!(output.contains("tcp ECN CE deliveries: unavailable"));
+}
+
+#[test]
+fn dry_run_hash_errors_drain_both_endpoints_without_writes() {
+    for source_fails in [false, true] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        let mut job = pipeline_job(b"file", 3);
+        job.dst_entry = Some(job.entry.clone());
+        sched.push_file(job);
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        let source = Arc::new(Mutex::new(PipelineState::default()));
+        let destination = Arc::new(Mutex::new(PipelineState::default()));
+        for (state, fails) in [(&source, source_fails), (&destination, !source_fails)] {
+            state.lock().unwrap().replies.push_back(if fails {
+                Response::Err("injected read error".into())
+            } else {
+                Response::FileHash {
+                    size: 3,
+                    hash: [1; 32],
+                }
+            });
+        }
+        let mut worker = pipeline_worker(&sched, &source, &destination, false);
+        Arc::get_mut(&mut worker.opts).unwrap().dry_run = true;
+        worker.progress.files_total.store(1, Relaxed);
+        worker.progress.bytes_total.store(3, Relaxed);
+        let error = worker.preview_file(0).unwrap_err();
+        worker.file_error(0, error).unwrap();
+        assert_eq!(worker.progress.errors.load(Relaxed), 1);
+        assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+        assert!(sched.finished());
+        for state in [&source, &destination] {
+            let state = state.lock().unwrap();
+            assert_eq!(state.received, 1);
+            assert!(state.replies.is_empty());
+            assert!(matches!(
+                state.requests.as_slice(),
+                [Request::FileHash { .. }]
+            ));
+        }
+    }
 }

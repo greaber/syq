@@ -59,14 +59,14 @@ sources; other programs can generate it too.
 | `dst` | Required path relative to the destination container (`--into`) |
 | `kind` | Optional `file`, `dir`, `symlink`, or `special` precondition |
 | `size`, `mtime` | Optional information for transforms; ignored during execution |
-| `expected_digest` | Optional whole-file expectation: `{"algorithm":"md5","value":"900150983cd24fb0d6963f7d28e17f72"}` |
+| `expected_hash` | Optional whole-file expectation: `{"algorithm":"md5","value":"900150983cd24fb0d6963f7d28e17f72"}` |
 
 Paths use `encoding: "utf-8"`, or `"base64"` with standard base64 of raw
 filename bytes. Absolute or empty paths, and any `.` or `..` component, are
 refused. Unknown fields are refused too.
 
-`expected_digest` checks a regular file's complete contents, including reused
-bytes. A mismatch fails the entry. See [expected digests](../integrity-checking.md#expected-digests)
+`expected_hash` checks a regular file's complete contents, including reused
+bytes. A mismatch fails the entry. See [expected hashes](../integrity-checking.md#expected-hashes)
 for algorithms and behavior with in-place writes.
 
 Each entry copies one object. **A directory entry is not recursive.**

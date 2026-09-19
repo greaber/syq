@@ -93,7 +93,6 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | Argument / option | Meaning |
 |---|---|
 | `--integrity-checking <KEY=VALUE,...>` | [Comparison and transfer checksums](../integrity-checking.md) |
-| `--syq-expected-hash <ALGORITHM:HEX>` | Require one regular file to match ALGORITHM:HEX |
 
 ## Progress and results
 

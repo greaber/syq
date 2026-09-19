@@ -49,7 +49,6 @@ impl Settings {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
-    pub size_filter: controls::SizeFilter,
     pub source: Option<fd::Source>,
     pub as_fd: Option<i32>,
     pub commit_fd: Option<i32>,
@@ -95,7 +94,7 @@ pub(crate) use file::{resolve_source, FileWorker, Session};
 pub(crate) fn run(mut args: Args) -> Result<i32> {
     let report = report::Report::start(&args)?;
     let plan = args.descriptor_copy.take().unwrap();
-    let controls = Arc::new(Controls::new(&args, report, plan.size_filter));
+    let controls = Arc::new(Controls::new(&args, report));
     if let Some(options) = args.s3.take() {
         let ticker = controls.progress.spawn_ticker();
         let result = crate::s3::stream::run(

@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 pub const SCHEMA: &str = "syq.automation";
-pub const SCHEMA_VERSION: u64 = 1;
+pub const SCHEMA_VERSION: u64 = 2;
 
 pub struct ResultsWriter {
     out: Mutex<Box<dyn Write + Send>>,
@@ -536,7 +536,7 @@ impl ResultsWriter {
         });
         let object = record.as_object_mut().expect("record is an object");
         if let Some(expected) = expected {
-            object.insert("expected_digest".into(), serde_json::json!(expected));
+            object.insert("expected_hash".into(), serde_json::json!(expected));
         }
         if let Some(src) = op.src {
             object.insert("src".into(), tagged(src));

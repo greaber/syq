@@ -167,7 +167,9 @@ impl Worker {
                             }
                         }
                     } else {
-                        let res = if self.opts.verify_only {
+                        let res = if self.opts.dry_run {
+                            self.preview_file(idx)
+                        } else if self.opts.verify_only {
                             self.verify_file(idx)
                         } else {
                             self.handle_file(idx)
@@ -233,6 +235,7 @@ impl Worker {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
         !self.opts.verify_only
+            && !self.opts.dry_run
             && self.opts.expected_for(&j.rel_bytes).is_none()
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
@@ -671,7 +674,7 @@ impl Worker {
     ) {
         // Verification reports differences and inspection failures as errors,
         // never as a transfer operation that could be mistaken for a write.
-        if self.opts.verify_only {
+        if self.opts.verify_only || self.opts.dry_run {
             return;
         }
         if let Some(results) = self.progress.results_writer() {
@@ -827,7 +830,7 @@ impl Worker {
                     meta.mode = self.create_mode(&job);
                     ok(
                         self.dst.call(Request::FinishBasis {
-                            expected_digest: self.opts.expected_for(&job.rel_bytes).cloned(),
+                            expected_hash: self.opts.expected_for(&job.rel_bytes).cloned(),
                             path: job.dst.clone(),
                             copy_id: self.copy_id(),
                             meta,
@@ -1603,7 +1606,7 @@ impl Worker {
         let flags = publication_metadata_flags(self.opts.flags);
         let finalized = ok(
             self.dst.call(Request::Finalize {
-                expected_digest: self.opts.expected_for(&job.rel_bytes).cloned(),
+                expected_hash: self.opts.expected_for(&job.rel_bytes).cloned(),
                 path: job.dst.clone(),
                 inplace: job.inplace,
                 copy_id: self.copy_id(),
@@ -1658,10 +1661,11 @@ impl Worker {
             source: None,
             guard: None,
         })?;
+        // Drain both replies even when one endpoint reports a per-file error.
         let source = self.src.recv();
         let destination = self.dst.recv();
-        let source = ok(source?, "hash source after finalize")?;
-        let destination = ok(destination?, "hash destination after finalize")?;
+        let source = ok(source?, "hash source")?;
+        let destination = ok(destination?, "hash destination")?;
         match (source, destination) {
             (
                 Response::FileHash {
@@ -1828,34 +1832,69 @@ impl Worker {
         Ok(())
     }
 
+    pub(super) fn preview_file(&mut self, idx: usize) -> Result<()> {
+        let job = self.job(idx);
+        let result = self.contents_match(&job);
+        self.sched.ranges_ready(idx, vec![]);
+        let matched = match result {
+            Ok(matched) => matched,
+            Err(error) => {
+                if self.transport_dead() {
+                    self.sched.requeue(idx);
+                }
+                return Err(error);
+            }
+        };
+        let (bytes, reason) = if matched {
+            self.progress.files_total.fetch_sub(1, Relaxed);
+            self.progress.bytes_total.fetch_sub(job.entry.size, Relaxed);
+            self.progress.files_unchanged.fetch_add(1, Relaxed);
+            self.progress
+                .bytes_unchanged
+                .fetch_add(job.entry.size, Relaxed);
+            let destination = job
+                .dst_entry
+                .as_ref()
+                .expect("preview comparison has a destination");
+            if self.opts.metadata_fix_flags(&job.entry, destination) == 0 {
+                return Ok(());
+            }
+            self.opts.dry_run_metadata_files.fetch_add(1, Relaxed);
+            (None, "metadata_differs")
+        } else {
+            self.progress.files_done.fetch_add(1, Relaxed);
+            self.progress.bytes_done.fetch_add(job.entry.size, Relaxed);
+            (Some(job.entry.size), "content_differs")
+        };
+        if let Some(results) = self.progress.results_writer() {
+            results.emit_trace(&crate::results::TraceRecord {
+                action: "transfer_file",
+                dst: &job.rel_bytes,
+                src: job.src_rel.as_deref(),
+                kind: "file",
+                bytes,
+                reason,
+            });
+        }
+        if self.opts.verbose > 0 {
+            self.progress.println(&if matched {
+                format!(
+                    "update metadata {} (requested file metadata differs)",
+                    display(&job.dst)
+                )
+            } else {
+                format!("update file {} (contents differ)", display(&job.dst))
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn verify_file(&mut self, idx: usize) -> Result<()> {
         let job = self.job(idx);
 
         let r = (|| -> Result<bool> {
             self.validate_expected_destination(&job)?;
-            self.src.send(Request::FileHash {
-                path: job.src.clone(),
-                source: self.source_reference(&job),
-                guard: None,
-            })?;
-            self.dst.send(Request::FileHash {
-                path: job.dst.clone(),
-                source: None,
-                guard: None,
-            })?;
-            // Keep both reusable connections aligned even if one endpoint
-            // reports an ordinary per-file error.
-            let source_response = self.src.recv();
-            let destination_response = self.dst.recv();
-            let a = ok(source_response?, "hash source")?;
-            let b = ok(destination_response?, "hash destination")?;
-            match (a, b) {
-                (
-                    Response::FileHash { size: s1, hash: h1 },
-                    Response::FileHash { size: s2, hash: h2 },
-                ) => Ok(s1 == s2 && h1 == h2),
-                (a, b) => bail!("unexpected responses {a:?} {b:?}"),
-            }
+            self.contents_match(&job)
         })();
         self.sched.ranges_ready(idx, vec![]);
         match r {

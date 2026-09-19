@@ -96,7 +96,9 @@ fn prepare(
         } => {
             anyhow::ensure!(inspect_only || skipped, "stream was not opened");
             if plan.source.is_none() {
-                controls.skip_size(size)?;
+                if let Some(size) = size {
+                    controls.set_size(size);
+                }
                 controls.metadata.source(metadata)?;
             }
             if skipped {
@@ -112,8 +114,8 @@ fn prepare(
     );
     if plan.source.is_none() {
         controls.metadata.source(source_meta)?;
-        if controls.skip_size(size)? {
-            return Ok(None);
+        if let Some(size) = size {
+            controls.set_size(size);
         }
     }
     if let Endpoint::Remote(spec) = &endpoint {
@@ -393,13 +395,14 @@ pub(super) async fn run(
     }
     if plan.source.is_some() {
         controls.metadata.source(input_meta)?;
-        controls.skip_size(
-            input
-                .as_ref()
-                .map(fd::Descriptor::remaining_len)
-                .transpose()?
-                .flatten(),
-        )?;
+        if let Some(size) = input
+            .as_ref()
+            .map(fd::Descriptor::remaining_len)
+            .transpose()?
+            .flatten()
+        {
+            controls.set_size(size);
+        }
     }
     if plan.location.is_none() {
         if args.ignore_existing || controls.report.skipped() {
@@ -507,7 +510,6 @@ pub(super) async fn run(
             let runtime = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || -> Result<u64> {
                 let mut off = 0u64;
-                let mut expected = controls.expected_hasher();
                 loop {
                     // Reserve one request, not request-size times depth. Only
                     // bytes actually read become initialized buffer contents.
@@ -520,9 +522,6 @@ pub(super) async fn run(
                     )?;
                     if data.is_empty() {
                         break;
-                    }
-                    if let Some(hash) = &mut expected {
-                        hash.update(&data);
                     }
                     let len = data.len();
                     jobs_tx
@@ -537,7 +536,6 @@ pub(super) async fn run(
                         .checked_add(len as u64)
                         .context("stream length overflow")?;
                 }
-                controls.verify(expected)?;
                 Ok(off)
             })
             .await??
@@ -568,7 +566,6 @@ pub(super) async fn run(
                 let mut output = output.context("missing stream output")?;
                 let mut next = 0u64;
                 let mut ready = BTreeMap::new();
-                let mut expected = controls.expected_hasher();
                 while next < size {
                     let job = results_rx
                         .recv()
@@ -580,15 +577,11 @@ pub(super) async fn run(
                     );
                     ready.insert(job.off, job);
                     while let Some(job) = ready.remove(&next) {
-                        if let Some(hash) = &mut expected {
-                            hash.update(&job.data);
-                        }
                         output = output.write_chunk(job.data.into()).await?;
                         controls.progress.add_bytes(job.len as u64);
                         next += job.len as u64;
                     }
                 }
-                controls.verify(expected)?;
                 Ok::<_, anyhow::Error>(())
             };
             tokio::try_join!(feeder, writer)?;
@@ -654,22 +647,17 @@ async fn direct(
     controls: Arc<Controls>,
 ) -> Result<()> {
     let source_meta = input.metadata();
-    let mut hash = controls.expected_hasher();
     loop {
         let (next, data) = input.read_available(controls.settings.request_size).await?;
         input = next;
         if data.is_empty() {
             break;
         }
-        if let Some(hash) = &mut hash {
-            hash.update(&data);
-        }
         controls.pace(data.len() as u64).await;
         let len = data.len();
         output = output.write_chunk(data).await?;
         controls.progress.add_bytes(len as u64);
     }
-    controls.verify(hash)?;
     fd::await_commit(commit).await?;
     output.apply_metadata(controls.metadata, source_meta)
 }

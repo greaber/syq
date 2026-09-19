@@ -123,8 +123,7 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
 
 pub struct Opts {
     pub hash_policy: crate::hashing::HashPolicy,
-    pub expected_digest: Option<crate::hashing::Digest>,
-    pub mapping_expected_digests: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
+    pub mapping_expected_hashes: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
@@ -146,6 +145,7 @@ pub struct Opts {
     pub dst_remote: bool,
     pub restricted_receiver: bool,
     pub dry_run: bool,
+    dry_run_metadata_files: AtomicU64,
     pub quiet: bool,
     pub verbose: u8,
     pub umask: u32,
@@ -176,6 +176,13 @@ pub struct Opts {
 impl Opts {
     fn metadata_fix_flags(&self, source: &Entry, destination: &Entry) -> u8 {
         let mut changes = 0;
+        if self.flags & flags::TIMES != 0
+            && (source.mtime != destination.mtime
+                || (self.precise_mtime
+                    && !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)))
+        {
+            changes |= flags::TIMES;
+        }
         if self.flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777 {
             changes |= flags::MODE;
         }
@@ -198,9 +205,7 @@ impl Opts {
     }
 
     fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
-        self.mapping_expected_digests
-            .get(path)
-            .or(self.expected_digest.as_ref())
+        self.mapping_expected_hashes.get(path)
     }
     fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
         crate::copy_policy::CopyPolicy {
@@ -449,7 +454,6 @@ fn small_copy_eligible(
         && !args.delete
         && !args.update
         && !args.checksum
-        && args.expected_digest.is_none()
         && !args.ignore_existing
         && !args.existing
         && !args.stats
@@ -1367,15 +1371,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             transfer_integrity: args.transfer_integrity,
             transfer_hash_type: args.transfer_hash_type,
         },
-        expected_digest: args.expected_digest.clone(),
-        mapping_expected_digests: mapping_entries
+        mapping_expected_hashes: mapping_entries
             .as_ref()
             .map(|(entries, _)| {
                 entries
                     .iter()
                     .filter_map(|(_, entry)| {
                         entry
-                            .expected_digest
+                            .expected_hash
                             .clone()
                             .map(|digest| (entry.dst.clone(), digest))
                     })
@@ -1402,6 +1405,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_remote: dst_ep.is_remote(),
         restricted_receiver: args.restricted_grant.is_some(),
         dry_run: args.dry_run,
+        dry_run_metadata_files: AtomicU64::new(0),
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
         umask: crate::fsops::process_umask(),
@@ -1776,17 +1780,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         source_shared_workers,
         source_independent_handoff_workers,
     )?;
-    if args.expected_digest.is_some() {
-        let entry = stat_one_registered(
-            &mut *src_ctl,
-            &srcs[0].path,
-            &registered_sources[0].selection,
-            false,
-        )?;
-        if !entry.is_some_and(|entry| entry.kind == Kind::File) {
-            bail!("--expected-hash requires one regular source file");
-        }
-    }
     source_roots
         .set(registered_sources)
         .expect("source roots set once");
@@ -2788,7 +2781,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         sched.abort();
     } else {
         let has_file_work = !sched.jobs.lock().unwrap().is_empty();
-        if !opts.dry_run && has_file_work {
+        if has_file_work {
             if use_operator_anchor && destination_anchor.get().is_none() {
                 progress.error("syq: destination root is missing and cannot be anchored");
                 sched.abort();
@@ -2797,6 +2790,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let jobs = sched.jobs.lock().unwrap();
                     (
                         !opts.verify_only
+                            && !opts.dry_run
                             && !opts.tuning.force_ranges()
                             && bwlimit.is_none()
                             && jobs.iter().enumerate().all(|(idx, job)| {
@@ -2983,6 +2977,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     let max_delete_hit = st.max_delete_hit;
     let mut dry_run_changes = std::mem::take(&mut st.dry_run_changes);
+    if opts.dry_run {
+        dry_run_changes.regular_files = progress.files_done.load(Relaxed);
+        dry_run_changes.metadata_files += opts.dry_run_metadata_files.load(Relaxed);
+    }
     // The destination container is created outside per-entry accounting in
     // live runs; drop it here so the terminal record and the human dry-run
     // summary count the same set (spec: summary renders from the record).

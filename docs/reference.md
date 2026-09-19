@@ -165,7 +165,8 @@ See [Update policies](commands/cp.md#update-policies) for supported combinations
 
 ## Preview changes
 
-Add `--dry-run -v` to list planned changes without copying or deleting files:
+Add `--dry-run -v` to list planned changes without copying or deleting files.
+Include `--hash` to compare file contents during the preview:
 
 ```sh
 syq cp --dry-run -v --srcs-in project --into backup
@@ -185,7 +186,7 @@ syq cp --prune --max-delete 100 --srcs-in build --into-existing deploy
 This makes the contents of `deploy` match `build`: it copies changes, then
 removes extras. Preview with `--dry-run -v` first. If more than 100 removals
 are planned, syq refuses all deletions. Scan or copy errors also prevent deletion.
-Ignored paths and files excluded by size limits are kept.
+Ignored paths are kept.
 
 Placement determines where pruning happens. Compare:
 

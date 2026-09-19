@@ -37,8 +37,6 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--srcs <PATH>...` | Select several named source objects |
 | `--ignore <PATTERN>` | Skip paths matching a gitignore-style pattern (repeatable) |
 | `--ignore-from <FILE>` | Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order) |
-| `--max-size <SIZE>` | Skip regular source files larger than SIZE; --prune protects their destination paths |
-| `--min-size <SIZE>` | Skip regular source files smaller than SIZE; --prune protects their destination paths |
 | `[PATH]...` | Named source objects (shorthand for --src) |
 
 <a id="destination-placement"></a>
@@ -67,7 +65,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--only-existing` | Update only entries already present; create no missing entries or directories |
 | `--skip-newer` | Skip regular files newer at the destination; non-directory type replacements still occur |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
-| `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored and size-excluded source paths remain protected |
+| `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
 | `--max-delete <N>` | With --prune, refuse all removals if more than N are planned |
 
 ## Metadata and symlinks
@@ -86,7 +84,6 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--hash` | Hash existing source and destination files instead of trusting size and modification time |
-| `--expected-hash <ALGORITHM:HEX>` | Require one regular file to match ALGORITHM:HEX |
 | `--verify-only` | Compare selected contents without writing; fail on differences or inspection errors |
 | `--integrity-checking <KEY=VALUE,...>` | [Comparison and transfer checksums](../integrity-checking.md) |
 
@@ -101,9 +98,8 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--no-compress` | Disable transport compression |
 | `--receiver-max-entries <N>` | Command-restricted receiver ceiling: refuse to touch more than N destination entries |
 | `--receiver-max-bytes <SIZE>` | Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total |
-| `--receiver-receipt <DETAIL>` | Command-restricted receiver receipt detail: final sizes (default) or also final BLAKE3 file digests<br><br>Possible values:<br>- sizes: Final type and size of every path the transfer could have changed<br>- digests: Sizes plus a closure-time BLAKE3 digest of every regular file |
+| `--receiver-receipt <DETAIL>` | Command-restricted receiver receipt detail: final sizes (default) or also final BLAKE3 file hashes<br><br>Possible values:<br>- sizes: Final type and size of every path the transfer could have changed<br>- hashes: Sizes plus a closure-time BLAKE3 hash of every regular file |
 | `--auth-from <auto\|ssh\|@NAME>` | Authorize with a live receiving machine, or use SSH from this machine (default: auto) |
-| `--via <@NAME>` | Alias for --auth-from @NAME |
 | `--coordinate-at <COORDINATE_AT>` | Choose the endpoint that runs the coordinator<br><br>Possible values:<br>- auto: Run locally unless both endpoints are remote, then run at the source<br>- src: Run the coordinator at the source endpoint<br>- dst: Run the coordinator at the destination endpoint<br>- local: Keep the coordinator on the invoking machine and relay the data there<br><br>[default: auto] |
 | `--rsh <COMMAND>` | Remote shell command (default: ssh); the command owns SSH and agent policy when set |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
@@ -191,7 +187,7 @@ restrictions are listed under [file descriptors](#file-descriptors).
 ## Pruning
 
 `--prune` deletes only within the copied directories, after copying succeeds.
-Ignored and size-excluded paths, syq partial files, and recovery entries are
+Ignored paths, syq partial files, and recovery entries are
 kept. This also keeps their parent directories; extra hard links to copied
 files may be kept too. An interruption during deletion can leave some extras
 already removed.
@@ -278,17 +274,9 @@ destination.
 
 Progress, `--stats`, and `-v` go to stderr, leaving stdout for payload.
 Statistics report bytes, elapsed time, and average rate; pipe lengths are
-unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput
-or a known hash to check bytes during transfer without a second read; see
-[Expected digests](../integrity-checking.md#expected-digests).
+unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput.
 
-### Selection and previews
-
-`--min-size` and `--max-size` can select a named file or S3 object before reading
-its contents. With a regular-file `--src-fd`, they use the bytes remaining from
-the current offset. A size-filtered skip succeeds and leaves input unread.
-These options require a known length, so pipes, sockets, and devices are rejected
-before reading; syq does not buffer a stream to discover its size.
+<a id="selection-and-previews"></a>
 
 `--only-new` skips a destination that exists; `--only-existing` skips one that
 is missing. Existing directories, S3 key prefixes, and dangling symlinks also
