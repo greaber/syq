@@ -51,7 +51,16 @@ fn configure_at(mut command: Command, path: &str) -> Command {
                     "syq persist connect" => arg.get_id() == "timeout",
                     "syq persist receive on" => matches!(
                         arg.get_id().as_str(),
-                        "approval" | "notifications" | "name" | "cwd" | "root"
+                        "auto_approve_root"
+                            | "no_auto_approve_root"
+                            | "servers"
+                            | "all_servers"
+                            | "notifications"
+                            | "name"
+                            | "cwd"
+                            | "auto_cwd"
+                            | "root"
+                            | "no_root"
                     ),
                     "syq persist receive off" | "syq persist receive status" => {
                         arg.get_id() == "name"

@@ -840,11 +840,7 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
         });
         let control = scope.join(&key);
         let ssh_live = socket_is_live(&control);
-        let receiving = if receiving_enabled == Some(false) {
-            None
-        } else {
-            crate::receive_service::connection_status(&control)
-        };
+        let receiving = crate::receive_service::connection_status(&control);
         let state = match &receiving {
             _ if receiving_error.is_some() => "failed",
             Some(receiving) if receiving_enabled == Some(true) => {
