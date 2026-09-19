@@ -196,7 +196,8 @@ impl Controls {
             self.progress.files_unchanged.store(1, Relaxed);
             self.progress
                 .bytes_unchanged
-                .store(self.progress.bytes_total.load(Relaxed), Relaxed);
+                .store(self.progress.bytes_total.swap(0, Relaxed), Relaxed);
+            self.progress.files_total.store(0, Relaxed);
         }
         if success && !self.report.dry_run && !self.report.skipped() && !unchanged {
             self.set_size(bytes);

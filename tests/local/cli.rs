@@ -1324,6 +1324,10 @@ fn stream_file_comparison_leaves_matching_input_unread() {
             assert_eq!(result["files_transferred"], 0);
             assert_eq!(result["bytes_transferred"], 0);
             assert_eq!(result["files_excluded"], 0);
+            let progress = values.iter().rfind(|v| v["type"] == "progress").unwrap();
+            assert_eq!(progress["bytes_total"], 0);
+            assert_eq!(progress["files_total"], 0);
+            assert_eq!(progress["bytes_unchanged"], 7);
         }
         // Matching content can still need metadata repair. Preserve its inode,
         // and do not apply that repair in a preview.
