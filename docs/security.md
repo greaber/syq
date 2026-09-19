@@ -1,59 +1,51 @@
 # Security
 
-Syq is designed for copies where the tool has more authority than some of the
-files or machines involved: a backup account reading another user's tree,
-root copying an upload, or two servers whose copy your laptop authorizes.
+Syq often acts with more authority than the files or machines involved in a
+copy. A backup account may read another user's directory, or your laptop may
+authorize a copy between two servers. The protections below limit how those
+files and servers can use that authority.
 
 Report vulnerabilities through
 [SECURITY.md](https://github.com/greaber/syq/blob/master/SECURITY.md).
 
 ## Filesystem safety
 
-These protections limit where a copy or removal can act when someone else
-can change the files or paths it uses.
-
 ### Filesystem attacks
 
-Assume an attacker can change files and directory entries inside a selected
-tree, or in a parent directory they can write. They may act before the copy
-starts or while it is running. They do not control the account running syq.
+Suppose a backup account is copying an upload directory that another user can
+change. That user could replace a subdirectory with a symlink to private files
+elsewhere. A copy program that follows the link would read those files using
+the backup account's permissions. At a destination, the same trick could
+redirect writes or deletions into an unrelated directory.
 
-The attacks we aim to stop include:
+Checking a path before starting is not enough: someone who can write its parent
+directory may replace it while the copy is running. Syq therefore keeps
+directories open and accesses their entries through those open handles.
+Renaming an opened directory does not change which directory the handle refers
+to, and replacing its old name with a symlink does not redirect subsequent
+operations through that handle.
 
-- **Redirecting a read or write with a symlink.** A directory might be
-  replaced with a link to a private source or unrelated destination.
-- **Escaping through a supplied filename.** A peer might send an absolute
-  path or `..` components to reach outside the selected tree.
-- **Turning a deletion into a walk of another directory.** An entry might
-  change type after syq has decided what to remove.
+Syq also checks the names and operations within those directories:
 
-Native syq refuses symlink traversal unless you explicitly request it. It
-keeps selected directories open and works through those handles, so later
-renames cannot redirect the copy to another tree. Names received from the
-other endpoint are validated; deletion does not follow replacement links or
-recurse into unexpected directories.
+- Names received from a peer must stay within the selected tree; absolute
+  paths and escaping `..` components are rejected.
+- Native syq follows symlinks only when you explicitly ask it to. Copying a
+  symlink as a link does not grant access to its target.
+- Deletion does not follow a replacement symlink or descend into an unexpected
+  directory. If an entry changes just before removal, a single replacement
+  entry can still be removed.
 
-These protections bound where the operation can go. They do not prevent an
-authorized writer from changing the contents of that tree. In a removal race,
-a single replacement entry can still be unlinked.
-
-On macOS, selecting a FIFO keeps its parent directory open and checks the
-FIFO's identity without opening a stream reader. This avoids disturbing a
-producer during mapping, removal previews, or FIFO-node copies. Deleting a
-FIFO and creating another with the same inode number can defeat that identity
-check. A concurrent replacement of a regular file with a FIFO between its
-last check and open can also briefly connect a producer before syq rejects it.
-
-Human copy listings escape control characters in filenames. Diagnostics also
-escape terminal control sequences from peers; NDJSON keeps its JSON encoding.
+These protections assume the attacker controls files or directory entries,
+not the account running syq. They do not stop someone with write access from
+changing the contents of the selected tree.
 
 ### Relationship to rsync 3.5.0
 
-Syq's path protection is inspired by
+Syq uses the same basic approach as
 [rsync 3.5.0's security design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md#symlink-race-safe-path-resolution):
-keep directories open, work relative to them, and distrust peer-supplied paths.
-
-The default for paths you type is simpler in native syq:
+keep directories open and resolve later operations relative to them. One
+policy differs: whether to follow symlinks in paths you supply on the command
+line.
 
 | | Follow a symlink in a supplied path? |
 |---|---|
@@ -61,209 +53,208 @@ The default for paths you type is simpler in native syq:
 | Native syq | Only with an explicit follow option |
 
 Rsync's [ownership policy](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md#symlink-defense-for-operator-supplied-paths)
-preserves familiar symlinked directory setups. Our concern is that link
-ownership alone does not prove who placed it there: rename permissions come
-from its parent directories, subject to restrictions such as the sticky bit.
-A relative link moved to another directory can point somewhere different
-without changing its owner. See the [rename rules](https://man7.org/linux/man-pages/man2/rename.2.html).
+allows familiar symlinked directory setups. Syq requires an explicit choice
+because ownership does not always establish where a link came from. Someone
+with permission to rename entries in the parent directories may move a link
+they do not own. A relative link can then point somewhere different while
+keeping its original owner. The [rename rules](https://man7.org/linux/man-pages/man2/rename.2.html)
+include restrictions such as the sticky bit.
 
-Native syq avoids that implicit trust decision. This is a stricter default
-for this case, not a claim that syq is more secure overall. `syq rsync`
-keeps the ownership-based policy for compatibility. Its local-only
-`--insecure-links` option permits foreign-owned symlinks in typed local source,
-destination, and control paths. After opening a source root, scans and content
-reads still use its directory handles and refuse descendant symlink traversal.
+This is a stricter default for that case, not a claim of greater security
+overall. `syq rsync` keeps rsync's ownership policy for compatibility. Its
+local-only `--insecure-links` option also allows foreign-owned symlinks in
+supplied local paths; it does not enable symlink traversal inside an opened
+source tree.
 
 <a id="limits-to-keep-in-mind"></a>
+<a id="privileged-copies-and-hard-links"></a>
 
-### Privileged copies and hard links
+### Limits of path protection
 
-Do not copy as root into a directory writable by untrusted users. Syq writes
-private partial files. When reusing bytes from another partial, it only reads
-regular files owned by its effective user. It checks those bytes against source
-hashes and leaves the other partial unchanged. This does not make a shared writable directory trusted.
+A hard link is another name for the same file. If a destination file also has
+a hard link outside the destination directory, changing its contents in place
+or changing its metadata affects both names. Directory handles and symlink
+checks cannot prevent this.
 
-In-place writes and metadata changes through a destination hard link affect
-every name for that file, including names outside the permitted destination.
-Leave `--preserve=ownership` and `--preserve=permissions` off when copying from
-an untrusted source.
+Do not copy as root into a directory writable by untrusted users. Leave
+`--preserve=ownership` and `--preserve=permissions` off when copying from an
+untrusted source. These options let source metadata determine who owns copied
+files and who may access or execute them.
+
+Temporary files need protection too. Syq writes private partial files. It
+reuses data only from regular partial files owned by its effective user,
+checks the reused bytes against source hashes, and leaves the old partial
+unchanged. Those checks do not make a shared writable directory trusted.
+
+On macOS, a named pipe (FIFO) has an additional limitation. Syq checks its
+identity without opening a reader, but deleting and recreating it with the
+same inode number can make the replacement indistinguishable. Replacing a
+regular file with a FIFO just before it is opened can also briefly connect
+a waiting producer before syq detects and rejects the change.
 
 <a id="code-and-transport-integrity"></a>
+<a id="encryption-and-authentication"></a>
+<a id="tcp-data-connections"></a>
+<a id="malformed-or-stalled-peers"></a>
 
 ## Network security
 
-### Encryption and authentication
+Remote copies encrypt and authenticate file data, whether it travels through
+SSH or syq's direct TCP connections.
 
-File data is encrypted and authenticated by default. `--tcp-plain` sends
-file contents, protocol messages, and the worker authentication token in
-plaintext. An observer can steal the token and connect as a worker while the
-transfer is active; a network attacker can also alter traffic. Use it only on
-a network you trust.
-
-<a id="tcp-data-connections"></a>
-
-### Malformed or stalled peers
-
-TCP workers authenticate using credentials delivered through the control
-connection. The initial handshake has a ten-second deadline, but there is no
-general copy I/O timeout: a stalled peer can leave a copy waiting until you
-cancel it.
-
-Syq bounds incoming messages, decompression, and decoded collections to limit
-memory use from malformed peers. These are not a total process memory cap;
-memory also grows with connection count and request size. Invalid replies
-fail the connection visibly. Ordinary copies can fall back to SSH if TCP setup
-fails, keeping the same endpoints.
-
-Syq's process protocol has not been fuzzed as extensively as rsync's.
+`--tcp-plain` disables this protection for TCP: someone on the network can
+read or alter the traffic, including its authentication token. Use it only
+on a network you trust.
 
 ## Downloaded executables
 
-Code downloaded for remote operations and explicit self-updates is verified
-against a signed release manifest before use. This checks the downloaded
-executable; it cannot protect a machine whose trusted account or programs
-have already been compromised.
+Official releases provide executables for each supported operating system and
+CPU architecture. They are published as GitHub release assets and served
+through `dl.syq.christmas`. An installed syq downloads them for explicit
+self-updates and, when needed, to install a matching helper on an SSH server.
+Remote helpers use the same release as the client, even when the server needs
+a different platform's executable.
 
-## File contents
+A signed release manifest identifies the release and lists the size and
+SHA-256 hash of each archive and executable. The installed client carries the
+release public key. It verifies the manifest's Ed25519 signature with that key,
+then checks downloaded files against the signed sizes and hashes before using
+them. The verification key comes from the installed executable, not from the
+server supplying the download.
 
-### Expected contents and corruption checks
+This also applies when the SSH server downloads its own helper: your client
+verifies the manifest and checks the reported archive hash before authorizing
+installation. If that download cannot be verified, syq discards it and uploads
+a locally verified helper over SSH instead. A download host cannot substitute
+arbitrary executable code without a valid release signature. This relies on
+the release signing key, your installed client, and the SSH account remaining
+trusted.
 
-Optional `--integrity-checking transfer=blake3` checks detect accidental data
-corruption. They do not authenticate plaintext traffic: an attacker can replace
-both data and checksums.
-
-An expected whole-file digest supplied through a trusted channel checks the
-resulting file against that expectation. Use BLAKE3 or SHA-256 when resistance
-to malicious content substitution matters. See
-[Expected digests](integrity-checking.md#expected-digests) for how to supply one.
-
-### Consistency and durability
-
-Copies are not snapshots or transactions. Stop concurrent writers or use
-snapshots for consistent data. `--inplace` exposes incomplete updates.
-Syq does not `fsync` transfer data, so completion is not a power-loss durability
-guarantee.
+The first installation establishes that trust. The standalone installer checks
+the archive against a size and SHA-256 hash embedded in the script, but it does
+not independently verify the release signature. You trust the script obtained
+over HTTPS. Homebrew installations instead start with trust in Homebrew and the
+tap. When using your own source build, you trust that build; by default syq
+uploads the running executable as its remote helper. See [Install](install.md)
+for the installation methods.
 
 ## Copies between servers
 
-Direct copies between two SSH servers do not require persistent connections.
+Suppose your laptop can log into hostA and hostB, and you want hostA to send
+files directly to hostB. Giving hostA a private key or unrestricted access to
+your SSH agent would let a compromised hostA do more than the intended copy.
+Syq's default direct-copy mode lets your laptop authorize the transfer while
+limiting the access hostA receives.
 
 ### Destination permissions
 
-By default, the source gets permission for one transfer, not your SSH agent
-or a reusable destination credential. The restricted receiver independently
-enforces the allowed destination paths, write and deletion permissions, and
-limits. The source cannot enlarge or replay that permission. SSH and encrypted
-TCP workers share the same live receiver and copy limits. Falling back to SSH
-keeps file data on the source-to-destination route; relaying through your
-machine requires explicit `--coordinate-at local`.
+The protection has several parts:
 
-The destination machine, receiver, and account remain trusted. See
-[Other routes and authentication](remote-to-remote.md#other-routes-and-authentication)
-for alternatives: broker-only authentication permits the destination account's
-full authority during the session; full agent forwarding exposes your agent
-as `ssh -A` would.
+1. **Set up a restricted entry point on hostB.** Your laptop uses its normal
+   SSH access to install a receiver and a dedicated public key. That key's
+   `authorized_keys` entry permits only the receiver command, with SSH
+   forwarding disabled. The private key stays on your laptop. Later copies
+   reuse this setup.
+2. **Authenticate hostA's connection without handing it the key.** A small
+   signing service on your laptop answers hostA's SSH authentication requests.
+   Before signing, it checks OpenSSH's cryptographic proof of which server
+   the connection reaches, along with the requested login account. HostA
+   cannot use it to authenticate
+   to a different host or account, sign arbitrary messages, or access your
+   other agent keys.
+3. **Authorize the particular copy separately.** Your laptop signs a grant
+   stating the permitted destination paths, write and deletion permissions,
+   limits, and expiry. HostB's receiver verifies the signature, records that
+   the grant has been used, and enforces it throughout the transfer. HostA
+   cannot broaden the grant or redeem it again for a later copy.
+4. **Check the outcome with hostB.** The receiver signs a receipt of its
+   changes. Your laptop verifies it using hostB's receipt key, saved during
+   setup. HostA can relay the receipt, but cannot forge it.
+
+File data travels directly from hostA to hostB, over encrypted TCP or SSH.
+Your laptop provides authorization and verifies the result without carrying
+the file data. See [Copy between servers](remote-to-remote.md) for setup and
+revoking access.
+
+Alternative authentication modes grant more authority. `--peer-auth broker`
+limits authentication to the chosen host and user but allows that account's
+full authority. `--peer-auth full-agent` exposes your SSH agent as `ssh -A`
+would. See [Other authentication modes](remote-reference.md#other-authentication-modes).
 
 ### A compromised source server
 
-Syq checks peer-supplied paths and data ranges before using them. These checks
-reject malformed replies; they cannot establish that a source's file listing
-or contents are truthful. Selection based on source facts, such as `--skip-newer`
-timestamp comparisons, relies on the source's reports.
+These protections limit what hostA can do to hostB. They do not make hostA's
+files or claims trustworthy. It can omit files, supply invented contents or
+metadata, or stop the copy. Policies such as `--skip-newer` depend on the
+source's reported timestamps. The destination machine, receiver, and account
+remain trusted to enforce the grant and report their work accurately.
 
-The receiver signs what it did, and your machine verifies the receipt. A
-source cannot forge a clean account of destination changes. It can still omit
-files, invent content or metadata, or stop. A receipt does not prove the
-source supplied everything you intended.
+A verified receipt tells you what the receiver did; it does not prove that the
+source supplied every file you intended or the right contents.
+
+<a id="file-contents"></a>
+<a id="expected-contents-and-corruption-checks"></a>
+<a id="consistency-and-durability"></a>
+
+For checking contents against a trusted hash, see
+[Expected digests](integrity-checking.md#expected-digests). General corruption,
+consistency, and durability considerations are covered in
+[Integrity checking](integrity-checking.md).
 
 ## Persistent connections
 
-Persistence keeps SSH logins open for reuse. It also enables receiving by
-default, so a connected server can request copies to your machine, ask it to
-authorize a copy to another server, or request a command on your machine.
-These requests have their own approval rules, separate from the SSH login. See
-[Send files home from a server](receive.md) for setup.
-
-An open SSH login can be reused by other processes running as your local user
-without another key touch or agent approval. Persistence keeps that access
-available until the connection closes. `syq persist off` ends it; use
-`syq persist receive off` to stop incoming requests while keeping SSH reuse.
-
-[Isolated script scopes](persistence-reference.md#isolated-script-scopes) reuse
-SSH logins without enabling receiving. Stop background services when upgrading;
-replacing a binary does not change services already running it.
+A persistent SSH login stays available to processes running as your local user
+without another key touch or agent approval. `syq persist off` closes that
+access. Persistence also enables requests from connected servers to your
+machine; those requests have the separate protections below.
 
 ### Named receiving destinations
 
-A named destination such as `@laptop` lets a connected server request copies
-to that machine. By default, each request requires approval there through a
-desktop prompt or `persist receive approve`. Paths and limits are validated
-before prompting; the restricted filesystem executor checks every operation
-after approval. The server receives no SSH agent.
-[Commands](exec.md) need separate approval.
+A compromised connected server can request copies to your machine. By default,
+each request needs local approval for its destination, overwrite policy, and
+limits. Syq then enforces those restrictions on every filesystem operation.
+Approval permits that copy; it does not establish who typed the command on the
+server or whether its files are trustworthy. Within the approved scope, the
+server can inspect destination entries during planning and consume disk space.
 
-Receiving names stay assigned to a persistent receiver public key. Reconnecting
-requires proof of the corresponding private key; knowing the public key does
-not let another receiver claim the name. This prevents accidental reassignment
-and impersonation through registration, but the server account controls the
-assignment files and can replace them. It is not a security boundary against
-someone who controls that account. The receiver private key stays on the
-receiving machine and does not grant SSH login access.
+The default receiving directory is your home, but it is not a containment
+boundary. Use `syq persist receive on --root DIRECTORY` to contain copies.
+`--approve always` removes the per-copy decision and trusts connected server
+accounts for repeated copies. `syq persist receive off` disables receiving
+while leaving SSH reuse available. See [Send files home from a server](receive.md)
+for setup and approval controls.
 
-Approval permits that pending copy's destination, overwrite policy, and limits.
-It does not authenticate what you typed on a remote server or attest to source
-contents. The receiving user and desktop session remain trusted. Request IDs
-are local, expire after five minutes, and cannot be reused. Disconnecting or
-stopping receiving cancels pending decisions. Desktop failure never approves a
-copy. `syq persist receive on --approve always` explicitly removes the per-copy decision
-and trusts connected server accounts for repeated copies.
-
-The default starting directory is your home directory, with no containment.
-`syq persist receive on --root DIRECTORY` contains copies; `syq persist receive off` disables receiving
-while keeping ordinary persistence. A compromised connected server account can
-request more copies and invent their content. Once approved, it can inspect
-destination entries during copy planning and consume disk space within the
-approved limits. The laptop's receiving account is trusted.
-
-Receiver destinations require `@name` and fail if that receiver is offline.
-Bare names always identify SSH destinations, resolved through SSH configuration
-or DNS. A copy never switches routes after selecting its destination.
+A receiving name is tied to a public key, and reconnecting requires proof of
+the matching private key. Another client cannot claim the name just by knowing
+it. The server account controls the stored name assignments, however, so this
+does not protect against that account replacing them. The receiver's private
+key stays on the receiving machine and grants no SSH login access.
 
 ### Authorizing copies to another server
 
-A connected server can request a copy to another SSH host using a live receiving
-machine's SSH access. Eligible copies discover that machine automatically;
-`--auth-from @name` chooses it explicitly. This always needs a local decision,
-even if automatic receiving is enabled. Refusing the request ends the attempt;
-syq does not try another authorization source.
+A server can also ask your receiving machine to authorize a copy to another
+SSH destination. That always requires a local decision, even with automatic
+copy approval enabled. Refusal ends the attempt.
 
-Approval authorizes a connection using the receiving machine's SSH access and
-installation of a matching helper. The destination helper enforces one copy's
-paths, permissions and limits. The server gets a restricted control stream
-and encrypted TCP worker access for that copy; it gets no SSH agent, private
-key, or command-running interface. Host trust and SSH configuration are those
-of the approving machine. The destination account remains trusted, including
-its interpretation of relative paths. A compromised source can substitute
-content within the approved scope, just as when copying to your machine.
+Approval uses the receiving machine's SSH configuration and host trust to
+connect and install a matching helper. The source gets access only to the
+approved copy, enforced by the destination helper. It receives no private key,
+SSH agent, or command-running interface. As with a direct copy authorized from
+your laptop, you still trust the destination account and cannot trust a
+compromised source's contents.
 
 ### Approved commands on receiving machines
 
-[`syq exec`](exec.md) uses an existing return connection and always asks for a
-local decision before starting a program. Command approval is separate from
-copy approval, including when copies are automatically approved. The prompt
-shows the server account, argument list and working directory. A server
-account can request commands from any of its processes; syq cannot establish
-what a person typed in a remote shell.
+A compromised server can request commands through [`syq exec`](exec.md), but
+every command needs separate local approval, even when copies are approved
+automatically. The prompt shows the requesting server account, arguments, and
+working directory. It cannot prove that a particular person requested them.
 
-Approving execution grants the command your local user's authority. Copy root
-confinement, file protection and transfer limits do not restrict that program.
-Scripts and build files can change what it does. Commands receive the local
-service environment and closed stdin. They do not expose a general SSH agent
-forwarding interface, but an approved program can access credentials available
-to the local user.
+Approval lets the program run with your local user's full authority, including
+access to that user's credentials. Copy roots and transfer limits do not
+constrain it. In particular, approving a build or script also trusts the code
+it will run.
 
-Disconnecting cancels the foreground process group; commands are never
-replayed automatically. Completed effects cannot be rolled back, and programs
-that create separate process sessions can outlive cancellation. See the
-[Execution details](commands/exec.md#execution-details) for execution
-and interruption behavior.
+Disconnecting cancels the foreground process group, but cannot undo completed
+effects; programs that start separate process sessions can survive cancellation.
+Commands are not replayed automatically. See [Execution details](commands/exec.md#execution-details).

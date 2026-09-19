@@ -17,7 +17,7 @@ syq cp data --into backup --integrity-checking compare=blake3,transfer=sha256
 
 BLAKE3 and SHA-256 are cryptographic hashes. MD5 supports existing manifests;
 XXH3-128 is a noncryptographic checksum. Use BLAKE3 or SHA-256 with an expected
-digest from a trusted source to check authenticity; see [Expected contents and corruption checks](security.md#expected-contents-and-corruption-checks).
+digest from a trusted source to check authenticity; see [Expected digests](#expected-digests).
 
 ## Comparison
 
@@ -50,7 +50,8 @@ Extra payload checks default to `transfer=off`. Enable them with, for example,
 
 SSH and encrypted TCP retain their transport authentication independently.
 `--tcp-plain` does not enable payload checks automatically, and checksums do
-not authenticate plaintext traffic.
+not authenticate plaintext traffic: an attacker can replace both the data and
+its checksum.
 
 For a complete check of a local copy, use a known hash; see [Expected digests](#expected-digests).
 
@@ -124,4 +125,14 @@ an overwrite policy. Filters and size limits still select what is compared;
 special files require `--preserve=specials`. In rsync syntax, use
 `--syq-verify-only`.
 
-For files being changed by another program, stop the writer or copy a snapshot.
+## Consistency and durability
+
+A copy reads files over time. If another program changes them while syq is
+reading, the result may combine data from different moments. Syq does not
+create a snapshot; use a filesystem snapshot or stop the writer when you need
+a consistent view. `--inplace` also lets destination readers see partial
+updates, including after an interrupted copy.
+
+Successful completion does not guarantee that the copy will survive an
+immediate power loss. Normal file copies do not force transferred data onto
+durable storage with `fsync`.

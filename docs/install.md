@@ -57,9 +57,10 @@ records each request's time, syq version, platform, the connection's IP
 address, and the country, region, and city derived from that address, so the
 project can see how many installs exist and which versions are in use.
 Nothing identifies an install, and the check sends nothing else.
-Non-interactive use never makes the reminder check. Every download is
-verified against the signed release manifest, so the host cannot substitute
-files.
+Non-interactive use never makes the reminder check. An installed official syq
+verifies self-updates and helper downloads against a signed release manifest.
+See [Downloaded executables](security.md#downloaded-executables) for how that
+verification works and how trust is established during the first installation.
 
 ## Shell completion
 

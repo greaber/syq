@@ -90,7 +90,7 @@ Receipts allow up to four million records and 512 MiB of plaintext. Reaching
 a cap stops further changes and reports an incomplete outcome.
 
 A receipt does not prove that the source supplied every intended file or the
-right contents. See the [threat model](security.md#a-compromised-source-server).
+right contents. See [A compromised source server](security.md#a-compromised-source-server).
 
 ## Other authentication modes
 
