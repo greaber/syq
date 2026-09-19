@@ -7,6 +7,9 @@
 //! an LZ4 block prefixed by its decoded u32 little-endian size. Each direction
 //! selects compression independently; readers accept all three representations.
 
+mod payload;
+pub use payload::Payload;
+
 use crate::descriptor_broker::{DescriptorTicket, RegisteredRootId};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -600,8 +603,16 @@ pub struct Preparation {
     pub has_candidates: bool,
 }
 
+pub type Request = WireRequest<Payload>;
+
+// The writer and borrowed receiver view share one enum and field order.
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum Request {
+#[serde(bound(
+    serialize = "Data: serde_bytes::Serialize",
+    deserialize = "Data: serde_bytes::Deserialize<'de>"
+))]
+pub enum WireRequest<Data> {
     Hello {
         identity: String,
         compress: bool,
@@ -844,7 +855,7 @@ pub enum Request {
         off: u64,
         hash: ContentDigest,
         #[serde(with = "serde_bytes")]
-        data: Vec<u8>,
+        data: Data,
         guard: Option<ContainerGuard>,
     },
     Finalize {
@@ -1271,6 +1282,15 @@ pub struct DirectoryAnchor {
 
 /// Rough serialized size, so big blocks are encoded without reallocation.
 pub trait SizeHint {
+    /// Take ownership of a frame so payload messages can keep its storage.
+    /// Other messages continue to deserialize their fields into owned values.
+    fn decode_frame(payload: Vec<u8>) -> io::Result<crate::wire_budget::Budgeted<Self>>
+    where
+        Self: Sized + for<'de> Deserialize<'de>,
+    {
+        crate::wire_budget::decode(&payload)
+    }
+
     fn size_hint(&self) -> usize;
     fn frame_limit(&self) -> usize;
     /// Two passes are cheap for a block's byte slice, but substantially more
@@ -1284,6 +1304,10 @@ pub trait SizeHint {
 }
 
 impl SizeHint for Request {
+    fn decode_frame(payload: Vec<u8>) -> io::Result<crate::wire_budget::Budgeted<Self>> {
+        payload::decode_request(payload)
+    }
+
     fn direct_payload(&self) -> bool {
         matches!(self, Request::WriteRange { .. })
     }
@@ -1768,8 +1792,9 @@ impl<R: Read> FrameReader<R> {
         } else {
             body
         };
-        let decoded = crate::wire_budget::decode::<T>(&payload)?;
-        if payload.len() >= decoded.value.frame_limit() {
+        let payload_len = payload.len();
+        let decoded = T::decode_frame(payload)?;
+        if payload_len >= decoded.value.frame_limit() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "incoming message exceeds its size limit",

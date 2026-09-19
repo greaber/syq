@@ -114,7 +114,7 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
                 attempt: 0,
                 off: 0,
                 hash: fsops::content_digest(b"data"),
-                data: b"data".to_vec(),
+                data: b"data".to_vec().into(),
                 guard: None,
             })
             .unwrap();
