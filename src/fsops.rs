@@ -1170,11 +1170,12 @@ impl FsOps {
                 }
                 PinnedPath::Leaf(leaf) => {
                     let (parent, name, metadata, object) = leaf.into_parts();
-                    let object = object
-                        .context("this platform cannot retain the selected source leaf safely")?;
+                    if object.is_none() && !metadata.is_fifo() {
+                        bail!("this platform cannot retain the selected source leaf safely");
+                    }
                     let symlink_target = if metadata.is_symlink() {
                         Some(
-                            read_open_symlink(&object)?
+                            read_open_symlink(object.as_ref().expect("symlink object was checked"))?
                                 .context("this platform cannot snapshot a selected source symlink through its pinned object (macOS 13 or newer is required on Darwin)")?,
                         )
                     } else {
@@ -1189,7 +1190,7 @@ impl FsOps {
                             file_type: metadata.file_type(),
                             symlink_target,
                         }),
-                        Some(object),
+                        object,
                     ));
                 }
                 PinnedPath::Missing(_) => {
@@ -1312,6 +1313,7 @@ impl FsOps {
                 }
             };
             let directory = acquire(&source.ticket)?;
+            let root = Arc::new(Root::from_directory(directory)?);
             let leaf_object = match (&source.leaf_ticket, &source.expected_leaf) {
                 (Some(ticket), Some(expected)) => {
                     let object = acquire(ticket)?;
@@ -1340,13 +1342,21 @@ impl FsOps {
                     }
                     Some(object)
                 }
+                (None, Some(expected)) if expected.file_type == crate::sys::MODE_FIFO => {
+                    // Platforms without an inert FIFO descriptor retain its
+                    // parent and observed identity, never a stream reader.
+                    let metadata =
+                        root.metadata(&RelativePath::new(source.selection.relative())?)?;
+                    require_source_leaf_identity(expected, metadata)?;
+                    None
+                }
                 (None, None) => None,
                 _ => bail!("source root leaf selection and object ticket disagree"),
             };
             roots.insert(
                 id,
                 SourceRootHandle {
-                    root: Arc::new(Root::from_directory(directory)?),
+                    root,
                     _leaf_object: leaf_object.map(Arc::new),
                     selection: source.selection.relative().to_vec(),
                     expected_leaf: source.expected_leaf.clone(),
