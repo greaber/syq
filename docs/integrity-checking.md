@@ -17,7 +17,7 @@ syq cp data --into backup --integrity-checking compare=blake3,transfer=sha256
 
 BLAKE3 and SHA-256 are cryptographic hashes. MD5 supports existing manifests;
 XXH3-128 is a noncryptographic checksum. Use BLAKE3 or SHA-256 with an expected
-digest from a trusted source to check authenticity; see [code and transport integrity](security.md#code-and-transport-integrity).
+digest from a trusted source to check authenticity; see [Expected contents and corruption checks](security.md#expected-contents-and-corruption-checks).
 
 ## Comparison
 

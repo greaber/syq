@@ -7,7 +7,12 @@ root copying an upload, or two servers whose copy your laptop authorizes.
 Report vulnerabilities through
 [SECURITY.md](https://github.com/greaber/syq/blob/master/SECURITY.md).
 
-## Filesystem attacks
+## Filesystem safety
+
+These protections limit where a copy or removal can act when someone else
+can change the files or paths it uses.
+
+### Filesystem attacks
 
 Assume an attacker can change files and directory entries inside a selected
 tree, or in a parent directory they can write. They may act before the copy
@@ -69,24 +74,35 @@ keeps the ownership-based policy for compatibility. Its local-only
 destination, and control paths. After opening a source root, scans and content
 reads still use its directory handles and refuse descendant symlink traversal.
 
-## Code and transport integrity
+<a id="limits-to-keep-in-mind"></a>
+
+### Privileged copies and hard links
+
+Do not copy as root into a directory writable by untrusted users. Syq writes
+private partial files. When reusing bytes from another partial, it only reads
+regular files owned by its effective user. It checks those bytes against source
+hashes and leaves the other partial unchanged. This does not make a shared writable directory trusted.
+
+In-place writes and metadata changes through a destination hard link affect
+every name for that file, including names outside the permitted destination.
+Leave `--preserve=ownership` and `--preserve=permissions` off when copying from
+an untrusted source.
+
+<a id="code-and-transport-integrity"></a>
+
+## Network security
+
+### Encryption and authentication
 
 File data is encrypted and authenticated by default. `--tcp-plain` sends
 file contents, protocol messages, and the worker authentication token in
 plaintext. An observer can steal the token and connect as a worker while the
 transfer is active; a network attacker can also alter traffic. Use it only on
-a network you trust. Downloaded code for remote operations and explicit
-self-updates is verified against a signed release manifest before use.
-That verification cannot protect a machine whose trusted account or programs
-have already been compromised.
+a network you trust.
 
-Optional `--integrity-checking transfer=blake3` checks detect accidental data corruption; they
-do not authenticate plaintext traffic because an attacker can replace both
-data and checksums. An expected whole-file digest supplied through a trusted
-channel checks the resulting file against that expectation. Use BLAKE3 or
-SHA-256 when resistance to malicious content substitution matters.
+<a id="tcp-data-connections"></a>
 
-### TCP data connections
+### Malformed or stalled peers
 
 TCP workers authenticate using credentials delivered through the control
 connection. The initial handshake has a ten-second deadline, but there is no
@@ -99,52 +115,66 @@ memory also grows with connection count and request size. Invalid replies
 fail the connection visibly. Ordinary copies can fall back to SSH if TCP setup
 fails, keeping the same endpoints.
 
-## Limits to keep in mind
+Syq's process protocol has not been fuzzed as extensively as rsync's.
 
-- **Privileged copies need trusted destination directories.** Do not copy as root into a
-  directory writable by untrusted users. Syq writes private partial files.
-  When reusing bytes from another partial, it only reads regular files owned
-  by its effective user. It checks those bytes against source hashes and leaves
-  the other partial unchanged. This does not make a shared writable directory trusted.
-- **Hard links share contents and metadata.** In-place writes and metadata
-  changes through a destination hard link affect every name for that file,
-  including names outside the permitted destination.
-- **Copies are not snapshots or transactions.** Stop concurrent writers or
-  use snapshots for consistent data. `--inplace` exposes incomplete updates.
-  Syq does not `fsync` transfer data, so completion is not a power-loss
-  durability guarantee.
-- **Preserving authority is a choice.** Leave `--preserve=ownership` and
-  `--preserve=permissions` off when copying from an untrusted source.
-- **Protocol assurance is still developing.** Syq's process protocol has
-  not been fuzzed as extensively as rsync's.
+## Downloaded executables
 
-## A compromised source server
+Code downloaded for remote operations and explicit self-updates is verified
+against a signed release manifest before use. This checks the downloaded
+executable; it cannot protect a machine whose trusted account or programs
+have already been compromised.
+
+## File contents
+
+### Expected contents and corruption checks
+
+Optional `--integrity-checking transfer=blake3` checks detect accidental data
+corruption. They do not authenticate plaintext traffic: an attacker can replace
+both data and checksums.
+
+An expected whole-file digest supplied through a trusted channel checks the
+resulting file against that expectation. Use BLAKE3 or SHA-256 when resistance
+to malicious content substitution matters. See
+[Expected digests](integrity-checking.md#expected-digests) for how to supply one.
+
+### Consistency and durability
+
+Copies are not snapshots or transactions. Stop concurrent writers or use
+snapshots for consistent data. `--inplace` exposes incomplete updates.
+Syq does not `fsync` transfer data, so completion is not a power-loss durability
+guarantee.
+
+## Copies between servers
+
+Direct copies between two SSH servers do not require persistent connections.
+
+### Destination permissions
+
+By default, the source gets permission for one transfer, not your SSH agent
+or a reusable destination credential. The restricted receiver independently
+enforces the allowed destination paths, write and deletion permissions, and
+limits. The source cannot enlarge or replay that permission. SSH and encrypted
+TCP workers share the same live receiver and copy limits. Falling back to SSH
+keeps file data on the source-to-destination route; relaying through your
+machine requires explicit `--coordinate-at local`.
+
+The destination machine, receiver, and account remain trusted. See
+[Other routes and authentication](remote-to-remote.md#other-routes-and-authentication)
+for alternatives: broker-only authentication permits the destination account's
+full authority during the session; full agent forwarding exposes your agent
+as `ssh -A` would.
+
+### A compromised source server
 
 Syq checks peer-supplied paths and data ranges before using them. These checks
 reject malformed replies; they cannot establish that a source's file listing
-or contents are truthful.
-
-Direct copies between two SSH servers do not require persistent connections.
-By default, the source gets permission for one transfer, not your SSH agent
-or a reusable destination credential. The restricted receiver independently
-enforces the allowed destination paths,
-write and deletion permissions, and limits. Selection based on source facts,
-such as `--skip-newer` timestamp comparisons, relies on the source's reports.
-The source cannot enlarge or replay that permission. SSH and encrypted TCP
-workers share the same live receiver and copy limits. Falling back to SSH
-keeps file data on the source-to-destination route; relaying through your
-machine requires explicit `--coordinate-at local`.
+or contents are truthful. Selection based on source facts, such as `--skip-newer`
+timestamp comparisons, relies on the source's reports.
 
 The receiver signs what it did, and your machine verifies the receipt. A
 source cannot forge a clean account of destination changes. It can still omit
 files, invent content or metadata, or stop. A receipt does not prove the
 source supplied everything you intended.
-
-The destination machine, receiver, and account remain trusted. Other
-[authentication choices](remote-to-remote.md#other-routes-and-authentication)
-have different boundaries: broker-only authentication permits that destination
-account's full authority during the session; full agent forwarding exposes
-your agent as `ssh -A` would.
 
 ## Persistent connections
 
