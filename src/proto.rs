@@ -8,7 +8,7 @@
 //! selects compression independently; readers accept all three representations.
 
 mod payload;
-pub use payload::Payload;
+pub use payload::{FrameBuffer, Payload};
 
 use crate::descriptor_broker::{DescriptorTicket, RegisteredRootId};
 use anyhow::{bail, Result};
@@ -1284,11 +1284,15 @@ pub struct DirectoryAnchor {
 pub trait SizeHint {
     /// Take ownership of a frame so payload messages can keep its storage.
     /// Other messages continue to deserialize their fields into owned values.
-    fn decode_frame(payload: Vec<u8>) -> io::Result<crate::wire_budget::Budgeted<Self>>
+    fn decode_frame(payload: FrameBuffer) -> io::Result<crate::wire_budget::Budgeted<Self>>
     where
         Self: Sized + for<'de> Deserialize<'de>,
     {
         crate::wire_budget::decode(&payload)
+    }
+
+    fn recycle_frames() -> bool {
+        false
     }
 
     fn size_hint(&self) -> usize;
@@ -1304,7 +1308,11 @@ pub trait SizeHint {
 }
 
 impl SizeHint for Request {
-    fn decode_frame(payload: Vec<u8>) -> io::Result<crate::wire_budget::Budgeted<Self>> {
+    fn recycle_frames() -> bool {
+        true
+    }
+
+    fn decode_frame(payload: FrameBuffer) -> io::Result<crate::wire_budget::Budgeted<Self>> {
         payload::decode_request(payload)
     }
 
@@ -1627,6 +1635,7 @@ impl<W: Write> FrameWriter<W> {
 }
 
 pub struct FrameReader<R: Read> {
+    pool: payload::FramePool,
     r: BufReader<R>,
     preamble_read: bool,
     limit: usize,
@@ -1635,6 +1644,7 @@ pub struct FrameReader<R: Read> {
 impl<R: Read> FrameReader<R> {
     pub fn new(r: R) -> Self {
         FrameReader {
+            pool: payload::FramePool::default(),
             r: BufReader::with_capacity(16 << 10, r),
             preamble_read: false,
             limit: MAX_FRAME,
@@ -1743,6 +1753,16 @@ impl<R: Read> FrameReader<R> {
     fn read_frame<T: for<'de> Deserialize<'de> + SizeHint>(
         &mut self,
     ) -> io::Result<crate::wire_budget::Budgeted<T>> {
+        let result = self.read_frame_inner();
+        if result.is_err() {
+            self.pool.clear();
+        }
+        result
+    }
+
+    fn read_frame_inner<T: for<'de> Deserialize<'de> + SizeHint>(
+        &mut self,
+    ) -> io::Result<crate::wire_budget::Budgeted<T>> {
         let mut hdr = [0u8; 4];
         self.r.read_exact(&mut hdr)?;
         let len = u32::from_le_bytes(hdr) as usize;
@@ -1762,7 +1782,9 @@ impl<R: Read> FrameReader<R> {
         }
         // Encoded bytes and decompression are bounded by this reader's frame
         // limit. Their queue count is bounded by the connection's read-ahead.
-        let mut body = vec![0u8; len - 1];
+        let mut body = self
+            .pool
+            .buffer(len - 1, flag[0] == 0 && T::recycle_frames());
         self.r.read_exact(&mut body)?;
         let payload = if flag[0] == crate::compression::ZSTD {
             // Bound zstd's advertised window as well as its output. Level-1
@@ -1786,9 +1808,9 @@ impl<R: Read> FrameReader<R> {
                 output.try_reserve_exact(n).map_err(io::Error::other)?;
                 output.extend_from_slice(&chunk[..n]);
             }
-            output
+            output.into()
         } else if flag[0] == crate::compression::LZ4 {
-            crate::compression::decode_lz4(&body, self.limit)?
+            crate::compression::decode_lz4(&body, self.limit)?.into()
         } else {
             body
         };
