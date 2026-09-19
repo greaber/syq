@@ -800,8 +800,10 @@ impl Gate {
 
     pub fn set_retain(&self, n: usize) {
         let _g = self.slots.lock().unwrap();
-        self.retain.store(n.max(self.active()), Relaxed);
-        self.cv.notify_all();
+        let retain = n.max(self.active());
+        if self.retain.swap(retain, Relaxed) != retain {
+            self.cv.notify_all();
+        }
     }
 
     /// Claim absent slots through `n` for connection setup.
@@ -1072,7 +1074,16 @@ pub fn run(
             if warming {
                 policy.refresh_warming_baseline(estimate.rate);
                 baseline_variation = estimate.variation;
-                observation.reset(outstanding);
+                // The active count has not changed. Keep accumulating its
+                // baseline until activation instead of replacing good evidence
+                // with an unrelated, noisier two-second slice of the handshake.
+                if crate::output::debug() {
+                    crate::output::diagnostic!(
+                        "syq: tune baseline: {active} workers {:.3}MB/s margin={:.3}MB/s over {:.3}s while warming {}",
+                        estimate.rate / 1e6, estimate.variation / 1e6,
+                        estimate.seconds, policy.n
+                    );
+                }
             } else if !matches!(policy.state, State::Hold) || decided_at.elapsed() >= hold_interval
             {
                 policy.observe(estimate.rate);
