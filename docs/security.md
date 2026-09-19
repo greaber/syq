@@ -269,7 +269,7 @@ local approval:
 |---|---|
 | Send files to your machine | Required by default; `--approve always` explicitly allows unattended copies |
 | Use your SSH access for a copy to another server | Always required |
-| Run a command on your machine | Always required, even with `--approve always` |
+| Run a command on your machine | Always required |
 
 The prompt identifies the server account and requested operation. It cannot
 prove who typed the command there. Approving a copy does not approve a later
