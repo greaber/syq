@@ -54,7 +54,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if CASE == 'preview-results' and self.path.endswith('/missing'):
             self.reply(404)
             return
-        self.reply(200, headers={'ETag': '"original"', 'x-amz-version-id': 'v1'}, length=len(DATA))
+        headers = {'ETag': '"original"', 'x-amz-version-id': 'v1',
+                   'Last-Modified': 'Sun, 13 Sep 2020 12:26:40 GMT'}
+        if CASE == 'file-metadata':
+            headers.update(STATE.get('metadata', {}))
+        self.reply(200, headers=headers, length=len(DATA))
 
     def do_GET(self):
         STATE['requests'] += 1
@@ -105,6 +109,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             STATE['published'] = data
             STATE['completed'] = True
+            STATE['metadata'] = {k.lower(): v for k, v in self.headers.items() if k.lower().startswith('x-amz-meta-')}
         self.reply(200, headers={'ETag': '"part"', 'x-amz-checksum-sha256': self.headers['x-amz-checksum-sha256']})
 
     def do_POST(self):
@@ -114,6 +119,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             STATE['completed'] = True
             self.reply(200, b'<CompleteMultipartUploadResult><ETag>"done"</ETag></CompleteMultipartUploadResult>')
         else:
+            STATE['metadata'] = {k.lower(): v for k, v in self.headers.items() if k.lower().startswith('x-amz-meta-')}
             self.reply(200, b'<InitiateMultipartUploadResult><UploadId>owned</UploadId></InitiateMultipartUploadResult>')
 
     def do_DELETE(self):
@@ -219,6 +225,72 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                            input=b'created', env=env)
             success(response)
             assert STATE['published'] == b'created'
+
+        elif CASE == 'file-metadata':
+            source = Path(temp) / 'source'
+            stamp = 1_600_000_000_123_456_789
+            for payload in (b'short', DATA):
+                source.write_bytes(payload)
+                source.chmod(0o751)
+                os.utime(source, ns=(stamp, stamp))
+                with source.open('rb') as stream:
+                    response = run(put, stdin=stream, env=env)
+                success(response)
+                assert STATE['published'] == payload
+                # Existing version-1 format; no digest or new metadata fields.
+                stored = {'x-amz-meta-syq-format': '1', 'x-amz-meta-syq-kind': 'file',
+                          'x-amz-meta-syq-mode': str(0o751),
+                          'x-amz-meta-syq-uid': str(os.geteuid()),
+                          'x-amz-meta-syq-gid': str(os.getegid()),
+                          'x-amz-meta-syq-mtime': '1600000000',
+                          'x-amz-meta-syq-mtime-nsec': '123456789'}
+                assert STATE['metadata'] == stored, STATE['metadata']
+            output_path = Path(temp) / 'output'
+            with output_path.open('w+b') as output:
+                for preserve in ([], ['--preserve=permissions,ownership']):
+                    output.seek(0)
+                    os.fchmod(output.fileno(), 0o600)
+                    response = run(get + ['--as-fd', str(output.fileno()), *preserve],
+                                   pass_fds=(output.fileno(),), env=env)
+                    success(response)
+                    assert output_path.read_bytes() == DATA
+                    meta = os.fstat(output.fileno())
+                    assert meta.st_mtime_ns == stamp, meta.st_mtime_ns
+                    assert meta.st_mode & 0o7777 == (0o751 if preserve else 0o600)
+                output.seek(0)
+                os.utime(output.fileno(), ns=(stamp, stamp + 2_000_000_000))
+                before = dict(STATE['gets'])
+                response = run(get + ['--as-fd', str(output.fileno()), '--skip-newer'],
+                               pass_fds=(output.fileno(),), env=env)
+                success(response)
+                assert b'Skipped' in response.stderr
+                assert output.tell() == 0 and STATE['gets'] == before
+            STATE['metadata']['x-amz-meta-syq-mtime'] = '1600000002'
+            for preview in ([], ['--dry-run']):
+                with source.open('rb') as stream:
+                    response = run(put + ['--skip-newer', *preview], stdin=stream, env=env)
+                    success(response)
+                    assert b'Skipped' in response.stderr and stream.tell() == 0
+            # Ordinary raw objects use Last-Modified. Pipe consumers continue
+            # reading raw bytes even if an object's syq metadata is unfamiliar.
+            for metadata in ({}, {'x-amz-meta-syq-format': 'unknown'}):
+                STATE['metadata'] = metadata
+                response = run(get, env=env)
+                success(response)
+                assert response.stdout == DATA
+            STATE['metadata'] = {}
+            with output_path.open('w+b') as output:
+                response = run(get + ['--as-fd', str(output.fileno())],
+                               pass_fds=(output.fileno(),), env=env)
+                success(response)
+                assert os.fstat(output.fileno()).st_mtime_ns == 1_600_000_000_000_000_000
+            fifo = Path(temp) / 'pipe'
+            os.mkfifo(fifo)
+            before = STATE['requests']
+            response = run(base + ['--src', str(fifo), '--to', 's3://bucket', '--as', 'object', '--skip-newer'], env=env)
+            failure(response)
+            assert b'regular-file source timestamp' in response.stderr
+            assert STATE['requests'] == before
 
         elif CASE == 'size-filters':
             for flag, size in [('--max-size', len(DATA) - 1), ('--min-size', len(DATA) + 1)]:

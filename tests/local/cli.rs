@@ -1223,6 +1223,159 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
 }
 
 #[test]
+fn stream_file_metadata_and_newer_selection() {
+    use std::io::{Seek, SeekFrom};
+    let t = Tmp::new();
+    write(&t.path("source"), b"xpayload");
+    fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o751)).unwrap();
+    let source_time = std::time::UNIX_EPOCH + std::time::Duration::new(1_600_000_000, 123_456_789);
+    File::open(t.path("source"))
+        .unwrap()
+        .set_modified(source_time)
+        .unwrap();
+    let source_meta = fs::metadata(t.path("source")).unwrap();
+    let input = File::open(t.path("source")).unwrap();
+    let rsh = fake_rsh(&t);
+    let cp = |args: &[&str], output: Option<&File>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .current_dir(&t.0)
+            .env("HOME", &t.0)
+            .env("FAKE_REMOTE_HOME", &t.0)
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args([
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--performance-tuning",
+                "workers=1",
+            ])
+            .args(args)
+            .stdin(input.try_clone().unwrap())
+            .stdout(output.map_or_else(Stdio::piped, |file| file.try_clone().unwrap().into()));
+        unsafe {
+            command.pre_exec(|| {
+                libc::umask(0o027);
+                Ok(())
+            });
+        }
+        command
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap()
+            .wait_with_output()
+            .unwrap()
+    };
+    let check = |path: &str, mode| {
+        let meta = fs::metadata(t.path(path)).unwrap();
+        assert_eq!(meta.mode() & 0o7777, mode, "{path}");
+        assert_eq!(
+            (meta.mtime(), meta.mtime_nsec()),
+            (source_meta.mtime(), source_meta.mtime_nsec()),
+            "{path}"
+        );
+        assert_eq!(
+            (meta.uid(), meta.gid()),
+            (source_meta.uid(), source_meta.gid())
+        );
+    };
+    for remote in [false, true] {
+        let endpoint = if remote {
+            vec!["--to", "fixture"]
+        } else {
+            vec![]
+        };
+        let target = if remote { "remote" } else { "local" };
+        for (preserve, exists, mode) in [
+            (false, false, 0o750),
+            (false, true, 0o624),
+            (true, true, 0o751),
+        ] {
+            input.try_clone().unwrap().seek(SeekFrom::Start(1)).unwrap();
+            if exists {
+                write(&t.path(target), b"old");
+                fs::set_permissions(t.path(target), fs::Permissions::from_mode(0o624)).unwrap();
+            }
+            let mut args = vec!["--src-fd", "0"];
+            args.extend(&endpoint);
+            args.extend(["--as", target]);
+            if preserve {
+                args.push("--preserve=permissions,ownership");
+            }
+            let result = cp(&args, None);
+            assert!(result.status.success(), "{}", stderr_of(&result));
+            assert_eq!(read(&t.path(target)), b"payload");
+            check(target, mode);
+        }
+        // One nanosecond newer suffices. A skipped source FD stays unread.
+        File::open(t.path(target))
+            .unwrap()
+            .set_modified(source_time + std::time::Duration::from_nanos(1))
+            .unwrap();
+        input.try_clone().unwrap().rewind().unwrap();
+        for preview in [false, true] {
+            let mut args = vec!["--src-fd", "0"];
+            args.extend(&endpoint);
+            args.extend(["--as", target, "--skip-newer"]);
+            if preview {
+                args.push("--dry-run");
+            }
+            let result = cp(&args, None);
+            assert!(result.status.success(), "{}", stderr_of(&result));
+            assert!(stderr_of(&result).contains("Skipped"));
+            assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 0);
+            assert_eq!(read(&t.path(target)), b"payload");
+        }
+    }
+    // Output descriptors keep their mode unless requested, keep surrounding
+    // bytes, and acquire the source timestamp only when the copy succeeds.
+    for source in [
+        vec!["--src-fd", "0"],
+        vec!["source"],
+        vec!["--from", "fixture", "source"],
+    ] {
+        write(&t.path("output"), b"__old-tail-keep");
+        fs::set_permissions(t.path("output"), fs::Permissions::from_mode(0o600)).unwrap();
+        let mut output = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(t.path("output"))
+            .unwrap();
+        output.seek(SeekFrom::Start(2)).unwrap();
+        input.try_clone().unwrap().rewind().unwrap();
+        let mut args = source;
+        args.extend(["--as-fd", "1"]);
+        let result = cp(&args, Some(&output));
+        assert!(result.status.success(), "{}", stderr_of(&result));
+        assert_eq!(read(&t.path("output")), b"__xpayload-keep");
+        check("output", 0o600);
+        output.rewind().unwrap();
+        input.try_clone().unwrap().rewind().unwrap();
+        args.push("--preserve=permissions,ownership");
+        let result = cp(&args, Some(&output));
+        assert!(result.status.success(), "{}", stderr_of(&result));
+        check("output", 0o751);
+        output
+            .set_modified(source_time + std::time::Duration::from_secs(1))
+            .unwrap();
+        input.try_clone().unwrap().rewind().unwrap();
+        output.rewind().unwrap();
+        args.push("--skip-newer");
+        let result = cp(&args, Some(&output));
+        assert!(result.status.success(), "{}", stderr_of(&result));
+        assert!(stderr_of(&result).contains("Skipped"));
+        assert_eq!(output.stream_position().unwrap(), 0);
+        assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 0);
+    }
+    input.try_clone().unwrap().rewind().unwrap();
+    let result = cp(&["source", "--as-fd", "1", "--preserve=permissions"], None);
+    assert!(!result.status.success());
+    assert!(stderr_of(&result).contains("requires a regular-file destination"));
+    assert!(result.stdout.is_empty());
+}
+
+#[test]
 fn stream_previews_and_results_do_not_consume_payload() {
     use std::io::Seek;
     let t = Tmp::new();
@@ -1401,6 +1554,20 @@ fn stream_previews_and_results_do_not_consume_payload() {
         assert!(!output.status.success());
         assert!(
             stderr_of(&output).contains("require a known source length"),
+            "{}",
+            stderr_of(&output)
+        );
+        assert!(!t.path("missing").exists());
+    }
+    for flag in [
+        "--skip-newer",
+        "--preserve=permissions",
+        "--preserve=ownership",
+    ] {
+        let output = cp(&["pipe", "--as", "missing/metadata", flag]);
+        assert!(!output.status.success());
+        assert!(
+            stderr_of(&output).contains("regular-file source"),
             "{}",
             stderr_of(&output)
         );

@@ -33,6 +33,7 @@ struct Prepared {
     control: Box<dyn Conn>,
     ticket: DescriptorTicket,
     size: Option<u64>,
+    source_meta: Option<crate::proto::Meta>,
     workers: usize,
     worker_limit: usize,
     _local_session: Option<LocalSession>,
@@ -43,7 +44,13 @@ impl Drop for LocalSession {
         self.0.close();
     }
 }
-fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Option<Prepared>> {
+fn prepare(
+    args: &Args,
+    plan: &Plan,
+    controls: &Controls,
+    input_meta: Option<crate::proto::Meta>,
+    output_meta: Option<crate::proto::Meta>,
+) -> Result<Option<Prepared>> {
     let location = plan.location.as_ref().unwrap();
     let local_session = location
         .host
@@ -62,7 +69,7 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Option<Prepa
     // Excluded uploads still check explicit placement conditions, but must not
     // create a container or a staged destination. Reuse the inspection path.
     let inspect_only = args.dry_run || controls.report.skipped();
-    let (size, ticket) = match conn::ok(
+    let (size, ticket, source_meta) = match conn::ok(
         control.call(Request::DescriptorCopy(Operation::Open {
             dry_run: inspect_only,
             only_new: args.ignore_existing,
@@ -73,14 +80,28 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Option<Prepa
             root: plan.root.clone(),
             placement: plan.placement.clone(),
             settings: controls.settings,
+            metadata: controls.metadata,
+            source_meta: input_meta,
         }))?,
         "open stream",
     )? {
-        Response::DescriptorOpened { size, ticket } => (size, ticket),
-        Response::DescriptorInspected { size, skipped } => {
+        Response::DescriptorOpened {
+            size,
+            ticket,
+            metadata,
+        } => (size, ticket, metadata),
+        Response::DescriptorInspected {
+            size,
+            skipped,
+            metadata,
+        } => {
             anyhow::ensure!(inspect_only || skipped, "stream was not opened");
             if plan.source.is_none() {
                 controls.skip_size(size)?;
+                controls.metadata.source(metadata)?;
+                if controls.metadata.newer(metadata, output_meta) {
+                    controls.report.skip();
+                }
             }
             if skipped {
                 controls.report.skip();
@@ -93,8 +114,12 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Option<Prepa
         plan.source.is_some() || size.is_some(),
         "stream source did not report its length"
     );
-    if plan.source.is_none() && controls.skip_size(size)? {
-        return Ok(None);
+    if plan.source.is_none() {
+        controls.metadata.source(source_meta)?;
+        if controls.skip_size(size)? || controls.metadata.newer(source_meta, output_meta) {
+            controls.report.skip();
+            return Ok(None);
+        }
     }
     if let Endpoint::Remote(spec) = &endpoint {
         if !args.no_tcp {
@@ -164,6 +189,7 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Option<Prepa
         control,
         ticket,
         size,
+        source_meta,
         workers,
         worker_limit,
         _local_session: local_session,
@@ -366,7 +392,13 @@ pub(super) async fn run(
         .as_fd
         .map(|fd| fd::Descriptor::open(fd, false, cancelled.clone()))
         .transpose()?;
+    let input_meta = input.as_ref().and_then(fd::Descriptor::metadata);
+    let output_meta = output.as_ref().and_then(fd::Descriptor::metadata);
+    if let Some(output) = &output {
+        controls.metadata.output(output.metadata().is_some())?;
+    }
     if plan.source.is_some() {
+        controls.metadata.source(input_meta)?;
         controls.skip_size(
             input
                 .as_ref()
@@ -376,7 +408,10 @@ pub(super) async fn run(
         )?;
     }
     if plan.location.is_none() {
-        if args.ignore_existing || controls.report.skipped() {
+        if args.ignore_existing
+            || controls.report.skipped()
+            || controls.metadata.newer(input_meta, output_meta)
+        {
             controls.report.skip();
             return Ok(());
         }
@@ -404,10 +439,10 @@ pub(super) async fn run(
         // Keep local staging owned by this future from the instant it exists.
         // A detached blocking task could create it just as cancellation drops
         // the receiver, then lose its cleanup when the CLI exits.
-        prepare(&args, &plan, &controls)?
+        prepare(&args, &plan, &controls, input_meta, output_meta)?
     } else {
         let (a, p, c) = (args.clone(), plan.clone(), controls.clone());
-        tokio::task::spawn_blocking(move || prepare(&a, &p, &c)).await??
+        tokio::task::spawn_blocking(move || prepare(&a, &p, &c, input_meta, output_meta)).await??
     };
     let Some(prepared) = prepared else {
         return Ok(());
@@ -416,6 +451,11 @@ pub(super) async fn run(
     if let Some(source @ fd::Source::Pipe { .. }) = plan.source.clone() {
         input = Some(source.open(cancelled.clone()).await?);
     }
+    let metadata_output = output
+        .as_ref()
+        .map(fd::Descriptor::metadata_file)
+        .transpose()?
+        .flatten();
     let budget = Arc::new(Semaphore::new(BUFFER_BYTES / GRANULE));
     let (jobs_tx, jobs_rx) = mpsc::channel(64);
     let (results_tx, mut results_rx) = mpsc::channel(64);
@@ -603,6 +643,9 @@ pub(super) async fn run(
             // As with opening, local publication and cleanup stay owned here.
             finish()?;
         }
+        if let Some(output) = metadata_output {
+            controls.metadata.apply(&output, prepared.source_meta)?;
+        }
         Ok(())
     }.await;
     draining.store(true, Relaxed);
@@ -618,6 +661,7 @@ async fn direct(
     commit: Option<fd::Descriptor>,
     controls: Arc<Controls>,
 ) -> Result<()> {
+    let source_meta = input.metadata();
     let mut hash = controls.expected_hasher();
     loop {
         let (next, data) = input.read_available(controls.settings.request_size).await?;
@@ -634,5 +678,6 @@ async fn direct(
         controls.progress.add_bytes(len as u64);
     }
     controls.verify(hash)?;
-    fd::await_commit(commit).await
+    fd::await_commit(commit).await?;
+    output.apply_metadata(controls.metadata, source_meta)
 }

@@ -207,7 +207,7 @@ Filesystem streams use parallel data workers over SSH or encrypted TCP, with
 automatic worker tuning as in regular-file copies. `workers=N` fixes the worker
 count; `--no-tcp` keeps data on SSH. S3 transfers one object, with concurrent
 parts. Restart recovery, named receiving destinations, detached execution,
-directory selection, content comparison, and metadata preservation are unsupported.
+directory selection, and content comparison are unsupported.
 
 `--only-new` skips a destination that exists; `--only-existing` skips one that
 is missing. Existing directories, S3 key prefixes, and dangling symlinks also
@@ -224,12 +224,22 @@ results and payload/completion descriptors must differ.
 
 Other inherited descriptors work too, except 2, which is reserved for
 diagnostics. Dedicate each descriptor to the copy. Syq advances its offset,
-respects append mode, and leaves its blocking mode and metadata alone;
+respects append mode, and leaves its blocking mode alone;
 it does not truncate it. A literal `-` is a filename.
 
-Streams carry no source metadata. Existing files keep their permissions;
-new files use `0666` limited by the destination umask. Ownership follows file
-creation rules and timestamps reflect the write. Parent directories are
-created as needed. The usual [symlink rules](../reference.md#symlinks) and
+When the source is a regular file, syq preserves its modification time and
+accepts `--preserve=permissions,ownership`, just as for pathname copies. This
+also applies to regular-file output descriptors: even a partial write changes
+the whole file's timestamp. Existing files keep their permissions unless
+requested; new named files use the source permissions limited by the destination
+umask. S3 stores file attributes in its usual object metadata; an object without
+those attributes uses S3's modification time.
+
+`--skip-newer` leaves input unread when the destination file is newer. Output
+pipes have no timestamp to compare. Input pipes, sockets, and devices have no
+payload metadata, so they reject `--skip-newer` and `--preserve`. Their new
+named destinations use `0666` limited by the umask and the time of the write;
+existing files keep their permissions. Output pipes likewise cannot preserve
+permissions or ownership. Parent directories are created as needed. The usual [symlink rules](../reference.md#symlinks) and
 source `--cwd` / `--root` options apply, but `--root` cannot confine a descriptor
 that is already open. Named remote sources must be regular files.

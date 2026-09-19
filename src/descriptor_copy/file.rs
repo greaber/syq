@@ -23,6 +23,8 @@ struct Destination {
     target: RelativePath,
     temporary: RelativePath,
     mode: u32,
+    source_meta: Option<crate::proto::Meta>,
+    metadata: super::metadata::Policy,
 }
 impl Drop for Destination {
     fn drop(&mut self) {
@@ -137,7 +139,14 @@ fn resolve_destination(
 }
 
 impl Session {
-    fn open(selected: PinnedPath, write: bool) -> Result<Self> {
+    fn open(
+        selected: PinnedPath,
+        write: bool,
+        metadata: super::metadata::Policy,
+        source_meta: Option<crate::proto::Meta>,
+    ) -> Result<Self> {
+        let new_mode =
+            source_meta.map_or(0o666, |m| m.mode & 0o777) & !crate::fsops::process_umask();
         let (file, destination) = if write {
             let (root, target, mode) = match selected {
                 PinnedPath::Leaf(leaf) => {
@@ -151,7 +160,7 @@ impl Session {
                         if meta.is_file() {
                             meta.mode & 0o777
                         } else {
-                            0o666 & !crate::fsops::process_umask()
+                            new_mode
                         },
                     )
                 }
@@ -161,7 +170,7 @@ impl Session {
                     (
                         Root::from_directory(parent)?,
                         RelativePath::new(&path)?,
-                        0o666 & !crate::fsops::process_umask(),
+                        new_mode,
                     )
                 }
                 _ => bail!("stream destination must be a regular file or an absent path"),
@@ -199,7 +208,13 @@ impl Session {
                     root,
                     target,
                     temporary,
-                    mode,
+                    mode: if metadata.preserve & crate::proto::flags::MODE != 0 {
+                        source_meta.context("missing source permissions")?.mode
+                    } else {
+                        mode
+                    },
+                    source_meta,
+                    metadata,
                 }),
             )
         } else {
@@ -246,13 +261,18 @@ impl Session {
                 root,
                 placement,
                 settings,
+                metadata,
+                source_meta,
             } => {
                 anyhow::ensure!(slot.is_none(), "descriptor stream already open");
                 anyhow::ensure!(
                     (512..=64 << 20).contains(&settings.request_size),
                     "invalid stream request size"
                 );
-                let check_only = *dry_run || *only_new || *only_existing;
+                if *write {
+                    metadata.source(*source_meta)?;
+                }
+                let check_only = *dry_run || *only_new || *only_existing || metadata.skip_newer;
                 let mut selected = if *write {
                     anyhow::ensure!(
                         root.is_none(),
@@ -267,6 +287,7 @@ impl Session {
                     return Ok(Response::DescriptorInspected {
                         skipped: true,
                         size: None,
+                        metadata: None,
                     });
                 }
                 let size = match &selected {
@@ -281,10 +302,29 @@ impl Session {
                         if *write { " or an absent path" } else { "" }
                     ),
                 };
-                if *dry_run || (!*write && *only_new) {
+                let file_meta = match &selected {
+                    PinnedPath::Leaf(leaf) if leaf.metadata().is_file() => {
+                        let m = leaf.metadata();
+                        Some(crate::proto::Meta {
+                            mode: m.mode & 0o7777,
+                            uid: m.uid,
+                            gid: m.gid,
+                            mtime: m.mtime,
+                            mtime_nsec: m.mtime_nsec,
+                        })
+                    }
+                    _ => None,
+                };
+                let skipped = if *write {
+                    metadata.newer(*source_meta, file_meta)
+                } else {
+                    *only_new
+                };
+                if *dry_run || skipped {
                     return Ok(Response::DescriptorInspected {
-                        skipped: !*write && *only_new,
+                        skipped,
                         size,
+                        metadata: (!*write).then_some(file_meta).flatten(),
                     });
                 }
                 // A policy check must not create directories for a skipped copy.
@@ -296,11 +336,16 @@ impl Session {
                 {
                     selected = resolve_destination(path, *follow, placement, true)?;
                 }
-                let stream = Self::open(selected, *write)?;
+                let stream = Self::open(selected, *write, *metadata, *source_meta)?;
                 let size = (!*write).then_some(stream.original.len());
                 let ticket = descriptors.register_stream(stream.file.try_clone()?, *write)?;
+                let metadata = (!*write).then(|| super::metadata::from_file(&stream.original));
                 *slot = Some(stream);
-                Ok(Response::DescriptorOpened { size, ticket })
+                Ok(Response::DescriptorOpened {
+                    size,
+                    ticket,
+                    metadata,
+                })
             }
             Operation::Finish { size } => {
                 let stream = slot.as_ref().context("no descriptor stream is open")?;
@@ -309,9 +354,20 @@ impl Session {
                     "stream completion length mismatch"
                 );
                 if let Some(destination) = &stream.destination {
-                    stream
-                        .file
-                        .set_permissions(Permissions::from_mode(destination.mode))?;
+                    if let Some(mut meta) = destination.source_meta {
+                        meta.mode = destination.mode;
+                        crate::fsops::set_meta_file(
+                            &stream.file,
+                            &meta,
+                            crate::proto::flags::MODE
+                                | crate::proto::flags::TIMES
+                                | destination.metadata.preserve,
+                        )?;
+                    } else {
+                        stream
+                            .file
+                            .set_permissions(Permissions::from_mode(destination.mode))?;
+                    }
                     stream.file.sync_all()?;
                     destination.root.rename_regular_if_same(
                         &destination.temporary,
@@ -420,6 +476,8 @@ mod tests {
             follow: false,
             root: None,
             placement: StreamPlacement::default(),
+            metadata: Default::default(),
+            source_meta: None,
             settings: Settings {
                 verify: true,
                 ..Settings::default()
@@ -493,7 +551,7 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
         let descriptors = DescriptorSessionSlot::default();
         let mut slot = None;
-        let Response::DescriptorOpened { size, ticket } = Session::handle(
+        let Response::DescriptorOpened { size, ticket, .. } = Session::handle(
             &mut slot,
             &Operation::Open {
                 dry_run: false,
@@ -505,6 +563,8 @@ mod tests {
                 root: None,
                 placement: StreamPlacement::default(),
                 settings: Settings::default(),
+                metadata: Default::default(),
+                source_meta: None,
             },
             &descriptors,
         )
