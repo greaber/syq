@@ -172,13 +172,20 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn cipher_matches_previous_backend_at_record_boundaries() {
-        use aes_gcm::aead::{Aead, KeyInit};
-        use aes_gcm::Aes256Gcm;
+    fn cipher_preserves_legacy_bytes_at_record_boundaries() {
+        use sha2::{Digest, Sha256};
 
+        // SHA-256 of the concatenated ciphertexts and tags for these 81 cases,
+        // captured with the previous aes-gcm 0.11.1 backend, independently of
+        // Cipher. Keep this fixed so both wire bytes and nonce order are tested.
+        let expected = [
+            0xde, 0x91, 0xeb, 0xa8, 0xa5, 0x26, 0xae, 0x3d, 0xd2, 0x73, 0x9b, 0x53, 0xb8, 0x1a,
+            0x46, 0x56, 0xd9, 0x86, 0x68, 0x9f, 0xd8, 0x17, 0xb0, 0x90, 0x52, 0x8a, 0xaf, 0xd0,
+            0xa0, 0xc2, 0xff, 0x3f,
+        ];
         let key = [7; KEY_LEN];
-        let previous = Aes256Gcm::new_from_slice(&key).unwrap();
-        for direction in [0, 1] {
+        let mut digest = Sha256::new();
+        for direction in [0, 1, 2] {
             for id in [0, 0x123456, CONNECTION_ID_MAX] {
                 let mut sender = Cipher::new(&key, id, direction);
                 let mut receiver = Cipher::new(&key, id, direction);
@@ -187,23 +194,13 @@ mod tests {
                     .enumerate()
                 {
                     let plain: Vec<u8> = (0..len).map(|i| (i * 31 + counter) as u8).collect();
-                    let mut nonce = [0; 12];
-                    nonce[0] = direction;
-                    nonce[1..4].copy_from_slice(&id.to_be_bytes()[1..]);
-                    nonce[4..].copy_from_slice(&(counter as u64).to_be_bytes());
-                    let expected = previous.encrypt((&nonce).into(), plain.as_slice()).unwrap();
                     let encoded = sender.seal(&plain);
-                    assert_eq!(encoded, expected);
-                    assert_eq!(receiver.open(&expected).unwrap(), plain);
-                    assert_eq!(
-                        previous
-                            .decrypt((&nonce).into(), encoded.as_slice())
-                            .unwrap(),
-                        plain
-                    );
+                    digest.update(&encoded);
+                    assert_eq!(receiver.open(&encoded).unwrap(), plain);
                 }
             }
         }
+        assert_eq!(digest.finalize().as_slice(), expected);
     }
 
     #[test]
