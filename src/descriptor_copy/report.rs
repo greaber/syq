@@ -75,6 +75,7 @@ impl Report {
             && !report.only_existing
             && !plan.size_filter.active()
             && !args.update
+            && !args.times
             && !args.perms
             && !args.owner
             && !args.group

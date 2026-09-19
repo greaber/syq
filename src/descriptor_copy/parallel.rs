@@ -453,6 +453,7 @@ pub(super) async fn run(
     }
     let metadata_output = output
         .as_ref()
+        .filter(|_| controls.metadata.preserve != 0)
         .map(fd::Descriptor::metadata_file)
         .transpose()?
         .flatten();

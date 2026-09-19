@@ -71,7 +71,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow` | Follow symlinks in all directly supplied filesystem paths |
 | `--follow-src` | Follow symlinks in directly supplied source paths |
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
-| `--preserve <FEATURE>` | Preserve permissions or ownership, or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files |
+| `--preserve <FEATURE>` | Preserve times, permissions or ownership, or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- times: Preserve modification times (already the default for named destinations)<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files |
 
 ## Verification
 
@@ -227,20 +227,25 @@ diagnostics. Dedicate each descriptor to the copy. Syq advances its offset,
 respects append mode, and leaves its blocking mode alone;
 it does not truncate it. A literal `-` is a filename.
 
-When the source is a regular file, syq preserves its modification time and
-accepts `--preserve=permissions,ownership`, just as for pathname copies. This
-also applies to regular-file output descriptors: even a partial write changes
-the whole file's timestamp. Existing files keep their permissions unless
-requested; new named files use the source permissions limited by the destination
-umask. S3 stores file attributes in its usual object metadata; an object without
-those attributes uses S3's modification time.
+When a regular file is copied to a named destination, syq preserves its
+modification time. New named files use the source permissions limited by the
+destination umask; existing files keep their permissions. S3 uploads store file
+attributes in object metadata.
+
+Output descriptors use the timestamps from normal writes, including when
+appending to an existing file. Add `--preserve=times` to copy the source
+modification time instead; this changes the whole destination file's timestamp
+even for a partial write. `--preserve=permissions,ownership` copies those
+attributes without changing timestamps. S3 downloads interpret object metadata
+when attributes are requested; time preservation uses S3's modification time if
+no syq attributes are stored.
 
 `--skip-newer` leaves input unread when the destination file is newer. Output
 pipes have no timestamp to compare. Input pipes, sockets, and devices have no
 payload metadata, so they reject `--skip-newer` and `--preserve`. Their new
 named destinations use `0666` limited by the umask and the time of the write;
 existing files keep their permissions. Output pipes likewise cannot preserve
-permissions or ownership. Parent directories are created as needed. The usual
+times, permissions, or ownership. Parent directories are created as needed. The usual
 [symlink rules](../reference.md#symlinks) and source `--cwd` / `--root` options
 apply, but `--root` cannot confine a descriptor that is already open. Named remote
 sources must be regular files.

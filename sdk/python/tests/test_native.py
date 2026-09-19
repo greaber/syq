@@ -294,7 +294,7 @@ class NativeClientTests(unittest.TestCase):
             pscope="-scope",
             ignore=["*.tmp", "cache/"],
             ignore_from="ignore.txt",
-            preserve=["permissions", "ownership"],
+            preserve=["times", "permissions", "ownership"],
             inplace=True,
             max_size="2G",
             min_size=3,
@@ -324,7 +324,7 @@ class NativeClientTests(unittest.TestCase):
             "--hash", "--no-compress", "--resource-limits", "--performance-tuning",
             "--receiver-max-entries", "--receiver-max-bytes",
             "--receiver-receipt", "--ignore", "--ignore-from",
-            "--preserve",
+            "--preserve", "times", "permissions", "ownership",
             "--inplace", "--max-size", "--min-size",
         ):
             self.assertIn(expected, argv)

@@ -399,8 +399,11 @@ syq cp --preserve=permissions,ownership project --into backup
 ```
 
 `permissions` preserves modes; `ownership` requests numeric owner and group;
-`specials` enables device, FIFO, and socket nodes. Ownership needs suitable
-permissions on the destination. Hard links, ACLs, and xattrs are not preserved.
+`specials` enables device, FIFO, and socket nodes. `times` requests source
+modification times, which are already preserved for named destinations but are
+opt-in for [output descriptors](commands/cp.md#file-descriptors). Setting ownership
+or explicit timestamps needs suitable permissions on the destination. Hard links,
+ACLs, and xattrs are not preserved.
 
 ## Symlinks
 

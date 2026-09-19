@@ -250,16 +250,21 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 assert STATE['metadata'] == stored, STATE['metadata']
             output_path = Path(temp) / 'output'
             with output_path.open('w+b') as output:
-                for preserve in ([], ['--preserve=permissions,ownership']):
+                for preserve in ([], ['--preserve=permissions,ownership'], ['--preserve=times']):
                     output.seek(0)
                     os.fchmod(output.fileno(), 0o600)
+                    os.utime(output.fileno(), ns=(stamp, stamp))
                     response = run(get + ['--as-fd', str(output.fileno()), *preserve],
                                    pass_fds=(output.fileno(),), env=env)
                     success(response)
                     assert output_path.read_bytes() == DATA
                     meta = os.fstat(output.fileno())
-                    assert meta.st_mtime_ns == stamp, meta.st_mtime_ns
-                    assert meta.st_mode & 0o7777 == (0o751 if preserve else 0o600)
+                    if preserve == ['--preserve=times']:
+                        assert meta.st_mtime_ns == stamp, meta.st_mtime_ns
+                    else:
+                        assert meta.st_mtime_ns > stamp, meta.st_mtime_ns
+                    expected_mode = 0o751 if preserve == ['--preserve=permissions,ownership'] else 0o600
+                    assert meta.st_mode & 0o7777 == expected_mode
                 output.seek(0)
                 os.utime(output.fileno(), ns=(stamp, stamp + 2_000_000_000))
                 before = dict(STATE['gets'])
@@ -295,16 +300,30 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 assert b'existence condition failed' in response.stderr
                 assert stream.tell() == 0
             STATE.update(missing_object=False, prefix_exists=False)
-            # Ordinary raw objects use Last-Modified. Pipe consumers continue
-            # reading raw bytes even if an object's syq metadata is unfamiliar.
+            # Plain output ignores metadata, including unfamiliar formats,
+            # whether stdout is a pipe or an already-open regular file.
             for metadata in ({}, {'x-amz-meta-syq-format': 'unknown'}):
                 STATE['metadata'] = metadata
                 response = run(get, env=env)
                 success(response)
                 assert response.stdout == DATA
+                with output_path.open('w+b') as output:
+                    response = run(get + ['--as-fd', str(output.fileno())],
+                                   pass_fds=(output.fileno(),), env=env)
+                    success(response)
+                    assert output_path.read_bytes() == DATA
+                    assert os.fstat(output.fileno()).st_mtime_ns > stamp
+            with output_path.open('w+b') as output:
+                before = dict(STATE['gets'])
+                response = run(get + ['--as-fd', str(output.fileno()), '--preserve=times'],
+                               pass_fds=(output.fileno(),), env=env)
+                failure(response)
+                assert not output_path.read_bytes() and STATE['gets'] == before
+            # Explicit time preservation falls back to Last-Modified for objects
+            # without syq attributes.
             STATE['metadata'] = {}
             with output_path.open('w+b') as output:
-                response = run(get + ['--as-fd', str(output.fileno())],
+                response = run(get + ['--as-fd', str(output.fileno()), '--preserve=times'],
                                pass_fds=(output.fileno(),), env=env)
                 success(response)
                 assert os.fstat(output.fileno()).st_mtime_ns == 1_600_000_000_000_000_000

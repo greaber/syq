@@ -419,9 +419,11 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
         controls.report.skip();
         return Ok(());
     }
-    // Pipes receive only bytes. Do not interpret another tool's attributes
-    // unless the destination is a file that can carry them.
-    let source_meta = if let Some(destination) = output.metadata() {
+    // Raw output needs no object attributes, even when the FD is a file.
+    let source_meta = if let Some(destination) = output
+        .metadata()
+        .filter(|_| controls.metadata.preserve != 0 || controls.metadata.skip_newer)
+    {
         let stored = client::Metadata::decode(head.metadata())?;
         let meta = stored
             .filter(|m| m.kind == client::ObjectKind::File)

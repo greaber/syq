@@ -1328,8 +1328,8 @@ fn stream_file_metadata_and_newer_selection() {
             assert_eq!(read(&t.path(target)), b"payload");
         }
     }
-    // Output descriptors keep their mode unless requested, keep surrounding
-    // bytes, and acquire the source timestamp only when the copy succeeds.
+    // Output descriptors keep surrounding bytes and only acquire requested
+    // metadata. Permissions/ownership alone must not change the write timestamp.
     for source in [
         vec!["--src-fd", "0"],
         vec!["source"],
@@ -1349,10 +1349,21 @@ fn stream_file_metadata_and_newer_selection() {
         let result = cp(&args, Some(&output));
         assert!(result.status.success(), "{}", stderr_of(&result));
         assert_eq!(read(&t.path("output")), b"__xpayload-keep");
-        check("output", 0o600);
+        let meta = output.metadata().unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o600);
+        assert!(meta.modified().unwrap() > source_time);
+        output.set_modified(source_time).unwrap();
         output.rewind().unwrap();
         input.try_clone().unwrap().rewind().unwrap();
         args.push("--preserve=permissions,ownership");
+        let result = cp(&args, Some(&output));
+        assert!(result.status.success(), "{}", stderr_of(&result));
+        let meta = output.metadata().unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o751);
+        assert!(meta.modified().unwrap() > source_time);
+        output.rewind().unwrap();
+        input.try_clone().unwrap().rewind().unwrap();
+        args.push("--preserve=times");
         let result = cp(&args, Some(&output));
         assert!(result.status.success(), "{}", stderr_of(&result));
         check("output", 0o751);
@@ -1368,8 +1379,33 @@ fn stream_file_metadata_and_newer_selection() {
         assert_eq!(output.stream_position().unwrap(), 0);
         assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 0);
     }
+    // Appending is also a normal write unless times are explicitly requested.
+    let output = OpenOptions::new()
+        .append(true)
+        .open(t.path("output"))
+        .unwrap();
+    for preserve_times in [false, true] {
+        output.set_modified(source_time).unwrap();
+        let before = read(&t.path("output"));
+        let mut args = vec!["source", "--as-fd", "1"];
+        if preserve_times {
+            args.push("--preserve=times");
+        }
+        let result = cp(&args, Some(&output));
+        assert!(result.status.success(), "{}", stderr_of(&result));
+        assert_eq!(
+            read(&t.path("output")),
+            [before.as_slice(), b"xpayload"].concat()
+        );
+        let time = output.metadata().unwrap().modified().unwrap();
+        if preserve_times {
+            assert_eq!(time, source_time);
+        } else {
+            assert!(time > source_time);
+        }
+    }
     input.try_clone().unwrap().rewind().unwrap();
-    let result = cp(&["source", "--as-fd", "1", "--preserve=permissions"], None);
+    let result = cp(&["source", "--as-fd", "1", "--preserve=times"], None);
     assert!(!result.status.success());
     assert!(stderr_of(&result).contains("requires a regular-file destination"));
     assert!(result.stdout.is_empty());
@@ -1561,6 +1597,7 @@ fn stream_previews_and_results_do_not_consume_payload() {
     }
     for flag in [
         "--skip-newer",
+        "--preserve=times",
         "--preserve=permissions",
         "--preserve=ownership",
     ] {

@@ -21,7 +21,8 @@ impl Policy {
         Self {
             preserve: if args.perms { flags::MODE } else { 0 }
                 | if args.owner { flags::OWNER } else { 0 }
-                | if args.group { flags::GROUP } else { 0 },
+                | if args.group { flags::GROUP } else { 0 }
+                | if args.times { flags::TIMES } else { 0 },
             skip_newer: args.update,
             specials: args.devices,
         }
@@ -46,7 +47,7 @@ impl Policy {
     }
     pub fn apply(self, file: &File, source: Option<Meta>) -> Result<()> {
         if let Some(meta) = source {
-            crate::fsops::set_meta_file(file, &meta, self.preserve | flags::TIMES)?;
+            crate::fsops::set_meta_file(file, &meta, self.preserve)?;
         }
         Ok(())
     }
