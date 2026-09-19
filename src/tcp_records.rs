@@ -46,17 +46,26 @@ impl Cipher {
             .expect("encrypt");
     }
     pub fn open_in_place(&mut self, buffer: &mut Vec<u8>) -> io::Result<()> {
-        let nonce = Nonce::assume_unique_for_key(self.nonce());
-        match self.aead.open_in_place(nonce, Aad::empty(), buffer) {
-            Ok(plain) => {
-                let len = plain.len();
+        match self.open_buffer(buffer) {
+            Ok(len) => {
                 buffer.truncate(len);
                 Ok(())
             }
-            Err(_) => {
-                // The crypto implementation may modify the buffer on failure.
-                // Only authenticated plaintext may remain readable.
+            Err(error) => {
                 buffer.clear();
+                Err(error)
+            }
+        }
+    }
+
+    fn open_buffer(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let nonce = Nonce::assume_unique_for_key(self.nonce());
+        match self.aead.open_in_place(nonce, Aad::empty(), buffer) {
+            Ok(plain) => Ok(plain.len()),
+            Err(_) => {
+                // The backend may modify the buffer before reporting failure.
+                // Never leave unverified plaintext in a caller-owned buffer.
+                buffer.fill(0);
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "authentication failed (wrong key or corrupted data)",
@@ -147,7 +156,7 @@ impl<R: Read> RecordReader<R> {
             pos: 0,
         }
     }
-    fn fill(&mut self) -> io::Result<()> {
+    fn read_length(&mut self) -> io::Result<usize> {
         let mut hdr = [0u8; 4];
         self.inner.read_exact(&mut hdr)?;
         let len = u32::from_le_bytes(hdr) as usize;
@@ -157,6 +166,10 @@ impl<R: Read> RecordReader<R> {
                 format!("bad record length {len}"),
             ));
         }
+        Ok(len)
+    }
+
+    fn fill(&mut self, len: usize) -> io::Result<()> {
         self.buf.resize(len, 0);
         // Hide the buffer until both reading and authentication succeed, even
         // if a caller attempts another read after a partial or invalid record.
@@ -172,8 +185,37 @@ impl<R: Read> RecordReader<R> {
 
 impl<R: Read> Read for RecordReader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
         if self.pos >= self.buf.len() {
-            self.fill()?;
+            let len = self.read_length()?;
+            if out.len() >= len {
+                // Read and authenticate directly in the caller's initialized
+                // storage. Keep one body read, including the tag, and restore
+                // the destination tail occupied by that tag before returning.
+                let mut tail = [0; 16];
+                let tag_len = if self.cipher.is_some() {
+                    AES_256_GCM.tag_len().min(len)
+                } else {
+                    0
+                };
+                let end = len - tag_len;
+                tail[..tag_len].copy_from_slice(&out[end..len]);
+                let result = self.inner.read_exact(&mut out[..len]).and_then(|()| {
+                    if let Some(cipher) = &mut self.cipher {
+                        cipher.open_buffer(&mut out[..len])
+                    } else {
+                        Ok(len)
+                    }
+                });
+                if result.is_err() {
+                    out[..len].fill(0);
+                }
+                out[end..len].copy_from_slice(&tail[..tag_len]);
+                return result;
+            }
+            self.fill(len)?;
         }
         let n = out.len().min(self.buf.len() - self.pos);
         out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
@@ -391,6 +433,105 @@ mod tests {
         let error = receiver.open_in_place(&mut ciphertext).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(ciphertext.is_empty());
+    }
+
+    #[test]
+    fn full_records_read_directly_without_allocating_or_touching_the_tail() {
+        for encrypted in [false, true] {
+            let cipher = || encrypted.then(|| Cipher::new(&[7; KEY_LEN], 42, 1));
+            let mut encoded = Vec::new();
+            {
+                let mut writer = RecordWriter::new(&mut encoded, cipher());
+                writer.write_all(&vec![0x5a; RECORD_MAX]).unwrap();
+                writer.write_all(b"next").unwrap();
+                writer.flush().unwrap();
+            }
+            let mut reader = RecordReader::new(Cursor::new(encoded), cipher());
+            let mut out = vec![0xa5; RECORD_MAX + 64];
+            assert_eq!(reader.read(&mut out).unwrap(), RECORD_MAX);
+            assert_eq!(&out[..RECORD_MAX], vec![0x5a; RECORD_MAX]);
+            assert!(out[RECORD_MAX..].iter().all(|&b| b == 0xa5));
+            assert_eq!(reader.buf.capacity(), 0);
+            assert_eq!(reader.read(&mut out).unwrap(), 4);
+            assert_eq!(&out[..4], b"next");
+            assert_eq!(reader.buf.capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn direct_read_failures_erase_unverified_bytes_and_cannot_replay_them() {
+        let cipher = || Cipher::new(&[7; KEY_LEN], 42, 1);
+        let mut encoded = Vec::new();
+        {
+            let mut writer = RecordWriter::new(&mut encoded, Some(cipher()));
+            writer.write_all(&vec![0x5a; RECORD_MAX]).unwrap();
+            writer.flush().unwrap();
+        }
+        for truncate in [false, true] {
+            let mut wire = encoded.clone();
+            if truncate {
+                wire.truncate(wire.len() - 32);
+            } else {
+                *wire.last_mut().unwrap() ^= 1;
+            }
+            let mut reader = RecordReader::new(Cursor::new(wire), Some(cipher()));
+            let mut out = vec![0xa5; RECORD_MAX + 64];
+            let error = reader.read(&mut out).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if truncate {
+                    io::ErrorKind::UnexpectedEof
+                } else {
+                    io::ErrorKind::InvalidData
+                }
+            );
+            assert!(out[..RECORD_MAX].iter().all(|&b| b == 0));
+            assert!(out[RECORD_MAX..].iter().all(|&b| b == 0xa5));
+            out.fill(0xa5);
+            assert_eq!(
+                reader.read(&mut out).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+            assert!(out.iter().all(|&b| b == 0xa5));
+        }
+    }
+
+    #[test]
+    fn direct_and_buffered_reads_mix_over_short_interrupted_transport_reads() {
+        struct ShortRead<R> {
+            inner: R,
+            interrupted: bool,
+        }
+        impl<R: Read> Read for ShortRead<R> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.interrupted = !self.interrupted;
+                if self.interrupted {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let len = output.len().min(997);
+                self.inner.read(&mut output[..len])
+            }
+        }
+        for encrypted in [false, true] {
+            let cipher = || encrypted.then(|| Cipher::new(&[7; KEY_LEN], 42, 1));
+            let expected: Vec<_> = (0..3 * RECORD_MAX + 17).map(|i| (i % 251) as u8).collect();
+            let mut wire = Vec::new();
+            let mut writer = RecordWriter::new(&mut wire, cipher());
+            writer.write_all(&expected).unwrap();
+            writer.flush().unwrap();
+            let mut reader = RecordReader::new(
+                ShortRead {
+                    inner: wire.as_slice(),
+                    interrupted: false,
+                },
+                cipher(),
+            );
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+            let mut actual = vec![0; expected.len()];
+            reader.read_exact(&mut actual[..17]).unwrap();
+            reader.read_exact(&mut actual[17..]).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     struct ShortWriter {
