@@ -226,7 +226,8 @@ is non-retryable. Do not construct a retry source from its destination name.
 
 A producer may start supplying payload. Uploads without a skip policy emit this
 before destination setup finishes, allowing several writers to connect concurrently.
-With `--only-new` or `--only-existing`, the destination decision comes first.
+With `--only-new`, `--only-existing`, or size filters, source selection and
+destination checks come first.
 Skipped copies and dry runs finish without this record. Setup, transfer, or
 publication can still fail; require the terminal result for completion.
 

@@ -195,6 +195,12 @@ unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput
 or an [expected hash](../integrity-checking.md#expected-digests) to check bytes
 during transfer without a second read.
 
+`--min-size` and `--max-size` can select a named file or S3 object before reading
+its contents. With a regular-file `--src-fd`, they use the bytes remaining from
+the current offset. A size-filtered skip succeeds and leaves input unread.
+These options require a known length, so pipes, sockets, and devices are rejected
+before reading; syq does not buffer a stream to discover its size.
+
 Native streams accept `request-size`, `pipeline-depth`, and `bw-pacing` tuning.
 S3 uses its [multipart controls](../object-storage.md#descriptor-copies).
 Filesystem streams use parallel data workers over SSH or encrypted TCP, with

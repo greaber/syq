@@ -138,7 +138,9 @@ source basename, so they require an exact destination path.
 `client.open_reader(src, *, from_=None, cwd=None, root=None, follow_src=False, ...)`
 returns a `StreamReader`. `cwd` resolves relative sources; `root` also confines
 them. Choose at most one, as with `cp`. These bases belong to the source
-endpoint, independently of the client's local `process_cwd`. Both accept `rsh`, `syq_path`, `pscope`,
+endpoint, independently of the client's local `process_cwd`. Readers also accept
+`min_size` and `max_size` (size strings as in `cp`); excluded files or objects
+return no payload and set `skipped` at completion. Both accept `rsh`, `syq_path`, `pscope`,
 `no_bootstrap`, `no_compress`, `no_tcp`, `tcp_plain`, `tcp_ports`, `tcp_congestion`,
 `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
 `performance_tuning`, `resource_limits`, `integrity_checking`, `expected_digest`,

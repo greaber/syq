@@ -1329,6 +1329,83 @@ fn stream_previews_and_results_do_not_consume_payload() {
             .iter()
             .any(|r| r["type"] == "stream_result" && r["disposition"] == "skipped"));
     }
+    // File descriptors and named local/SSH reads have a known length. Size
+    // exclusion must leave the source offset and destination untouched.
+    for (index, args) in [
+        vec!["--src-fd", "0", "--as", "missing/small", "--max-size", "4"],
+        vec!["--src-fd", "0", "--as-fd", "1", "--min-size", "6"],
+        vec![
+            "--src-fd",
+            "0",
+            "--to",
+            "fixture",
+            "--as",
+            "payload",
+            "--min-size",
+            "6",
+        ],
+        vec!["payload", "--as-fd", "1", "--min-size", "6", "--dry-run"],
+        vec![
+            "--from",
+            "fixture",
+            "payload",
+            "--as-fd",
+            "1",
+            "--max-size",
+            "4",
+        ],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = format!("size-skip-{index}.json");
+        let mut args = args;
+        args.extend(["--results", &file]);
+        let output = cp(&args);
+        assert!(output.status.success(), "{args:?}: {}", stderr_of(&output));
+        assert!(output.stdout.is_empty());
+        assert!(!t.path("missing").exists());
+        assert_eq!(read(&t.path("payload")), b"bytes");
+        let values = records(&file);
+        assert_eq!(values.last().unwrap()["files_excluded"], 1);
+        assert_eq!(values.last().unwrap()["bytes_transferred"], 0);
+        assert_eq!(values.last().unwrap()["bytes_total_known"], true);
+        assert!(!values.iter().any(|r| r["type"] == "stream_ready"));
+    }
+    // Placement requirements still apply even when the source is excluded.
+    for (index, destination) in [vec![], vec!["--to", "fixture"]].into_iter().enumerate() {
+        let file = format!("size-placement-failed-{index}.json");
+        let mut args = vec!["--src-fd", "0"];
+        args.extend(destination);
+        args.extend(["--as-new", "payload", "--max-size", "4", "--results", &file]);
+        let output = cp(&args);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stderr_of(&output).contains("destination existence condition failed"));
+        assert!(!stderr_of(&output).contains("Skipped"));
+        let values = records(&file);
+        let terminal = values.last().unwrap();
+        assert_eq!(terminal["status"], "failed");
+        assert_eq!(terminal["errors"], 1);
+        assert_eq!(terminal["files_excluded"], 0);
+        assert!(values
+            .iter()
+            .any(|r| r["type"] == "stream_result" && r["disposition"] == "failed"));
+    }
+    // No writer: opening this FIFO would hang. Reject unknown length before
+    // opening it, including for a preview and a destination descriptor.
+    for args in [
+        vec!["pipe", "--as", "missing/pipe", "--min-size", "1"],
+        vec!["pipe", "--as-fd", "1", "--max-size", "1K", "--dry-run"],
+    ] {
+        let output = cp(&args);
+        assert!(!output.status.success());
+        assert!(
+            stderr_of(&output).contains("require a known source length"),
+            "{}",
+            stderr_of(&output)
+        );
+        assert!(!t.path("missing").exists());
+    }
     assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 0);
     let failed = cp(&[
         "pipe",
@@ -1341,7 +1418,17 @@ fn stream_previews_and_results_do_not_consume_payload() {
     assert!(!failed.status.success());
     assert_eq!(records("failed.json").last().unwrap()["errors"], 1);
     assert_eq!(read(&t.path("payload")), b"bytes");
-    let download = cp(&["payload", "--as-fd", "1", "--results", "download.json"]);
+    let download = cp(&[
+        "payload",
+        "--as-fd",
+        "1",
+        "--min-size",
+        "5",
+        "--max-size",
+        "5",
+        "--results",
+        "download.json",
+    ]);
     assert!(download.status.success(), "{}", stderr_of(&download));
     assert_eq!(download.stdout, b"bytes");
     let downloaded = records("download.json");
@@ -1352,6 +1439,27 @@ fn stream_previews_and_results_do_not_consume_payload() {
     assert_eq!(stream["destination"]["fd"], 1);
     assert_eq!(stream["bytes"], 5);
     assert_eq!(downloaded.last().unwrap()["bytes_total_known"], true);
+    // Only remaining bytes count when a regular-file descriptor is advanced.
+    input
+        .try_clone()
+        .unwrap()
+        .seek(std::io::SeekFrom::Start(2))
+        .unwrap();
+    let uploaded = cp(&[
+        "--src-fd",
+        "0",
+        "--to",
+        "fixture",
+        "--as",
+        "suffix",
+        "--min-size",
+        "3",
+        "--max-size",
+        "3",
+    ]);
+    assert!(uploaded.status.success(), "{}", stderr_of(&uploaded));
+    assert_eq!(read(&t.path("suffix")), b"tes");
+    assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 5);
     for args in [
         vec!["--src-fd", "3", "--as", "out", "--results-fd", "3"],
         vec!["/dev/fd/3", "--as", "out", "--results-fd", "3"],

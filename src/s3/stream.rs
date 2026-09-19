@@ -67,9 +67,7 @@ pub(crate) fn run(
             None => Some(Descriptor::open(as_fd.unwrap(), false, cancelled.clone())?),
         };
         if plan.options.route == crate::s3::Route::Upload {
-            if let Some(descriptor) = &descriptor {
-                if let Some(size) = descriptor.remaining_len()? { controls.set_size(size); }
-            }
+            controls.skip_size(descriptor.as_ref().map(Descriptor::remaining_len).transpose()?.flatten())?;
         }
         let cancellation = Arc::new(super::upload_http::Cancellation::default());
         let (client, _) = tokio::select! {
@@ -367,7 +365,9 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
         head.content_length()
             .context("S3 HEAD omitted Content-Length")?,
     )?;
-    controls.set_size(size);
+    if controls.skip_size(Some(size))? {
+        return Ok(());
+    }
     if controls.report.only_new {
         controls.report.skip();
         return Ok(());
