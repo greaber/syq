@@ -1,5 +1,8 @@
 //! Mapping manifest parsing shared by the planner and restricted authorizer.
 
+mod metadata;
+pub(crate) use metadata::Metadata;
+
 use crate::completion_details::display_bytes as display;
 use crate::proto::{Kind, PathBytes};
 use anyhow::{bail, Context, Result};
@@ -11,6 +14,7 @@ pub(crate) struct ManifestEntry {
     pub dst: PathBytes,
     pub kind: Option<DeclaredKind>,
     pub expected_digest: Option<crate::hashing::Digest>,
+    pub metadata: Option<Metadata>,
 }
 
 /// The manifest's `kind` field: disambiguation of the request, not a
@@ -71,6 +75,8 @@ pub(crate) fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
         #[serde(default)]
         expected_digest: Option<crate::hashing::Digest>,
         #[serde(default)]
+        metadata: Option<Metadata>,
+        #[serde(default)]
         #[allow(dead_code)]
         size: Option<u64>,
         #[serde(default)]
@@ -99,6 +105,12 @@ pub(crate) fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
         Some("special") => Some(DeclaredKind::Special),
         Some(other) => bail!("unknown kind {other:?}"),
     };
+    if let Some(metadata) = &entry.metadata {
+        metadata.validate()?;
+        if matches!(kind, Some(DeclaredKind::Symlink)) {
+            metadata.validate_kind(Kind::Symlink)?;
+        }
+    }
     if let Some(digest) = &entry.expected_digest {
         digest.validate()?;
         if kind.is_some_and(|kind| !matches!(kind, DeclaredKind::File)) {
@@ -110,6 +122,7 @@ pub(crate) fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
         dst,
         kind,
         expected_digest: entry.expected_digest,
+        metadata: entry.metadata,
     })
 }
 

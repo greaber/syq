@@ -22,6 +22,7 @@ pub(super) struct Source {
     pub meta: RootMetadata,
     pub key: String,
     pub label: Vec<u8>,
+    pub metadata: Option<crate::mapping::Metadata>,
     pub expected_digest: Option<crate::hashing::Digest>,
     // Keep a selected leaf alive so an unlink cannot recycle its inode.
     _pin: Option<Arc<File>>,
@@ -70,7 +71,7 @@ impl Source {
         Ok(())
     }
     pub fn metadata(&self, hash: Option<String>) -> Metadata {
-        Metadata {
+        let mut metadata = Metadata {
             kind: self.kind(),
             mode: self.meta.mode & 0o7777,
             uid: self.meta.uid,
@@ -79,7 +80,11 @@ impl Source {
             nsec: self.meta.mtime_nsec,
             hash,
             hash_algorithm: crate::hashing::HashAlgorithm::Blake3,
+        };
+        if let Some(attributes) = self.metadata {
+            metadata.override_with(&attributes);
         }
+        metadata
     }
     pub fn bytes(&self) -> Result<Vec<u8>> {
         if self.kind() == ObjectKind::Dir {
@@ -201,6 +206,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                 SourceSelection::Named,
                 entry.kind,
                 entry.expected_digest,
+                entry.metadata,
             ));
         }
     } else {
@@ -222,12 +228,13 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                 location.selection,
                 None,
                 None,
+                None,
             ));
         }
     }
     let mut out = Vec::new();
     let mut claims = BTreeMap::new();
-    for (path, destination, selection, declared_kind, expected_digest) in selectors {
+    for (path, destination, selection, declared_kind, expected_digest, metadata) in selectors {
         let resolved = crate::fsops::resolve(&path);
         let pinned = if resolved.is_absolute() {
             if args.native_source_root.is_some() {
@@ -263,6 +270,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                     key: destination,
                     label: path,
                     expected_digest,
+                    metadata,
                     _pin: None,
                 }
             }
@@ -275,6 +283,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                     key: destination,
                     label: path,
                     expected_digest,
+                    metadata,
                     _pin: pin.map(Arc::new),
                 }
             }
@@ -292,6 +301,13 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
             if kind.label().parse::<ObjectKind>()? != source.kind() {
                 bail!("source type does not match mapping");
             }
+        }
+        if let Some(metadata) = metadata {
+            metadata.validate_kind(match source.kind() {
+                ObjectKind::File => crate::proto::Kind::File,
+                ObjectKind::Dir => crate::proto::Kind::Dir,
+                ObjectKind::Symlink => crate::proto::Kind::Symlink,
+            })?;
         }
         if source.expected_digest.is_some() && source.kind() != ObjectKind::File {
             bail!("an expected digest requires a regular file");
@@ -472,6 +488,7 @@ pub(super) fn apply_metadata(
     metadata: &Metadata,
     args: &Args,
     existing_mode: Option<u32>,
+    explicit: crate::mapping::Metadata,
 ) -> Result<()> {
     if metadata.kind == super::client::ObjectKind::File {
         return apply_file_metadata(
@@ -479,13 +496,14 @@ pub(super) fn apply_metadata(
             metadata,
             args,
             existing_mode,
+            explicit,
         );
     }
-    if args.owner || args.group {
+    if args.owner || args.group || explicit.uid.is_some() || explicit.gid.is_some() {
         root.chown(
             path,
-            args.owner.then_some(metadata.uid),
-            args.group.then_some(metadata.gid),
+            (args.owner || explicit.uid.is_some()).then_some(metadata.uid),
+            (args.group || explicit.gid.is_some()).then_some(metadata.gid),
         )?;
     }
     if metadata.kind != super::client::ObjectKind::Symlink {
@@ -494,7 +512,7 @@ pub(super) fn apply_metadata(
         } else {
             root.open_regular_read(path)?
         };
-        let mode = if args.perms {
+        let mode = if args.perms || explicit.mode.is_some() {
             metadata.mode
         } else {
             existing_mode.unwrap_or(metadata.mode & 0o777 & !crate::fsops::process_umask())
@@ -524,9 +542,10 @@ pub(super) fn apply_file_metadata(
     metadata: &Metadata,
     args: &Args,
     existing_mode: Option<u32>,
+    explicit: crate::mapping::Metadata,
 ) -> Result<()> {
     use crate::proto::{flags, Meta};
-    let mode = if args.perms {
+    let mode = if args.perms || explicit.mode.is_some() {
         metadata.mode
     } else {
         existing_mode.unwrap_or(metadata.mode & 0o777 & !crate::fsops::process_umask())
@@ -542,7 +561,15 @@ pub(super) fn apply_file_metadata(
         },
         flags::MODE
             | flags::TIMES
-            | if args.owner { flags::OWNER } else { 0 }
-            | if args.group { flags::GROUP } else { 0 },
+            | if args.owner || explicit.uid.is_some() {
+                flags::OWNER
+            } else {
+                0
+            }
+            | if args.group || explicit.gid.is_some() {
+                flags::GROUP
+            } else {
+                0
+            },
     )
 }

@@ -208,6 +208,7 @@ fn pipeline_worker(
         local_copy_fd_budget: true,
         hash_policy: Default::default(),
         expected_digest: None,
+        mapping_metadata: Default::default(),
         mapping_expected_digests: Default::default(),
         block: 512,
         tuning: crate::transfer_tuning::TransferTuning {

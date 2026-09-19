@@ -235,6 +235,37 @@ class Digest:
         object.__setattr__(self, "value", self.value.lower())
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DestinationMetadata:
+    """Attributes to set on a mapped destination; omitted fields follow cp defaults."""
+
+    mode: int | None = None
+    uid: int | None = None
+    gid: int | None = None
+    mtime: int | None = None
+    mtime_nsec: int | None = None
+
+    def __post_init__(self) -> None:
+        for name, low, high in (
+            ("mode", 0, 0o7777), ("uid", 0, 2**32 - 2), ("gid", 0, 2**32 - 2),
+            ("mtime", -(2**63), 2**63 - 1), ("mtime_nsec", 0, 999_999_999),
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"metadata.{name} must be an integer or None")
+            if not low <= value <= high:
+                raise ValueError(f"metadata.{name} must be in {low}..{high}")
+        if self.mtime_nsec is not None and self.mtime is None:
+            raise ValueError("metadata.mtime_nsec requires metadata.mtime")
+
+
+def _metadata_json(metadata: DestinationMetadata) -> dict[str, int]:
+    return {name: value for name in ("mode", "uid", "gid", "mtime", "mtime_nsec")
+            if (value := getattr(metadata, name)) is not None}
+
+
 @dataclass(frozen=True, slots=True)
 class MappingEntry:
     src: RelativePath
@@ -243,6 +274,7 @@ class MappingEntry:
     size: int | None = None
     mtime: int | None = None
     expected_digest: Digest | None = None
+    metadata: DestinationMetadata | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.src, RelativePath):
@@ -262,6 +294,11 @@ class MappingEntry:
                 raise TypeError("expected_digest must be a Digest or None")
             if self.kind not in {None, EntryKind.FILE}:
                 raise ValueError("expected_digest requires a regular file")
+        if self.metadata is not None:
+            if not isinstance(self.metadata, DestinationMetadata):
+                raise TypeError("metadata must be DestinationMetadata or None")
+            if self.kind is EntryKind.SYMLINK and self.metadata.mode is not None:
+                raise ValueError("metadata.mode cannot be applied to a symlink")
         if self.size is not None and self.size < 0:
             raise ValueError("size must not be negative")
 
@@ -361,6 +398,7 @@ class OperationResult:
     scope: int | None = None
     code: ReceiptCode | None = None
     expected_digest: Digest | None = None
+    metadata: DestinationMetadata | None = None
 
     @property
     def is_retryable(self) -> bool:
@@ -378,6 +416,7 @@ class OperationResult:
                 RelativePath(self.dst.raw),
                 self.kind,
                 expected_digest=self.expected_digest,
+                metadata=self.metadata,
             )
         except ValueError:
             return None
@@ -564,4 +603,6 @@ def _mapping_json(entry: MappingEntry) -> dict[str, Any]:
             "algorithm": entry.expected_digest.algorithm.value,
             "value": entry.expected_digest.value,
         }
+    if entry.metadata is not None:
+        record["metadata"] = _metadata_json(entry.metadata)
     return record

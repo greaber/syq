@@ -206,7 +206,7 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
             &object,
             &root,
             &path,
-            (&metadata, None),
+            (&metadata, None, Default::default()),
             None,
             Some(initial),
             None,

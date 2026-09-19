@@ -81,6 +81,7 @@ A manifest contains one JSON object per line (NDJSON):
 | `dst` | Required path relative to the destination container (`--into`) |
 | `kind` | Optional `file`, `dir`, `symlink`, or `special` precondition |
 | `size`, `mtime` | Optional information for transforms; ignored during execution |
+| `metadata` | Optional destination attributes; see below |
 | `expected_digest` | Optional whole-file expectation: `{"algorithm":"md5","value":"900150983cd24fb0d6963f7d28e17f72"}` |
 
 Paths use `encoding: "utf-8"`, or `"base64"` with standard base64 of raw
@@ -93,6 +94,23 @@ and 32 for MD5 or XXH3-128. It checks the complete resulting file, including
 reused bytes, and a mismatch fails the entry. See [content checks](reference.md#check-file-contents)
 for staging, in-place writes, and selection filters. Older binaries that do not
 support this field reject the manifest.
+
+To set destination attributes without changing the source, add a `metadata`
+object, for example `"metadata": {"mode": 416, "mtime": 1700000000}`. This sets
+permissions to `0640` and the modification time to the given Unix second.
+Optional fields are `mode` (permission bits, 0–4095), numeric `uid` and `gid`,
+`mtime` (Unix seconds), and `mtime_nsec` (0–999999999, requires `mtime`).
+A supplied `mtime` defaults to zero fractional seconds. Omitted attributes
+follow normal copy behavior; the top-level `mtime` remains informational.
+
+Explicit attributes apply without `--preserve`. Filesystem ownership changes
+still require OS permission, and symlinks cannot have a requested `mode`.
+S3 uploads store the attributes in syq object metadata; downloads apply them
+to the filesystem. S3-to-S3 copies keep other object metadata and stay server-side.
+Restricted receivers also require matching `--preserve` permissions in the signed
+grant. Selection rules such as `--only-new` still take precedence. Supplied
+timestamps describe the destination, not evidence that source contents match it.
+Older binaries that do not support `metadata` reject the manifest.
 
 Each entry copies one object. **A directory entry is not recursive.**
 `syq map` emits its descendants as separate entries. A missing source or
@@ -172,7 +190,7 @@ Add `--results r.ndjson` to record outcomes in a fresh file outside the copy
 trees. See [Automation results](automation.md) for the stream contract.
 
 Failed mapping entries contain `src`, `dst`, and `kind`, so they can form a
-retry manifest. Preserve `expected_digest` too when present. First require a terminal `result` with `success` or `partial`:
+retry manifest. Preserve `expected_digest` and `metadata` too when present. First require a terminal `result` with `success` or `partial`:
 a missing terminal or an early stop means some entries may have no results.
 In those cases, rerun the original copy instead.
 
@@ -188,6 +206,7 @@ jq -cs 'if (.[-1].type? // "") != "result"
                           and .retryable != "no")
              | {src, dst, kind}
                + (if has("expected_digest") then {expected_digest} else {} end)
+               + (if has("metadata") then {metadata} else {} end)
         end' r.ndjson \
   | syq cp --mapping - -C src --to nas --into /data
 ```

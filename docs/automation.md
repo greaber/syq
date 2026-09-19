@@ -210,6 +210,7 @@ An outcome for a completed copy change or a failed mapping entry.
 | `disposition` | `succeeded`, `failed`, `blocked`; attested streams also use `incomplete` and `observed` |
 | `bytes`, `attempts` | Optional transfer information |
 | `expected_digest` | Expected whole-file digest, when supplied: an object with `algorithm` and hexadecimal `value`; preserve it in retry mappings |
+| `metadata` | Explicit destination attributes from the mapping, when supplied; preserve them in retry mappings |
 | `retryable` | On failures: `yes`, `no`, or `unknown` |
 | `class`, `os_kind`, `message` | Error details where available |
 | `provenance`, `scope`, `code` | Attested origin, signed destination-scope index, and receiver outcome code |

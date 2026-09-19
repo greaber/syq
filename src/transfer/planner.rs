@@ -848,6 +848,15 @@ impl Planner<'_> {
                         continue;
                     }
                 }
+                if let Some(metadata) = &m.metadata {
+                    if let Err(error) = metadata.validate_kind(e.kind) {
+                        let message = format!("--mapping line {line_number}: {error}");
+                        self.progress
+                            .error_classified(&message, Some("conflict"), None);
+                        self.emit_mapping_entry_failed(&m, "no", "conflict", None, &message);
+                        continue;
+                    }
+                }
                 // Destination ancestors: consistent with what earlier entries
                 // established, with missing ones synthesized parent-first.
                 let mut conflict = false;
@@ -1525,7 +1534,7 @@ impl Planner<'_> {
             // (mode/owner/group) the way rsync does — a skipped file
             // shouldn't keep stale permissions.
             if let Some(d) = &dst_entry {
-                let ff = opts.metadata_fix_flags(&e, d);
+                let ff = opts.metadata_fix_flags(&dst_rel, &e, d);
                 if ff != 0 {
                     self.progress.files_unchanged.fetch_add(1, Relaxed);
                     self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
@@ -1552,7 +1561,7 @@ impl Planner<'_> {
                             TargetCondition::Any => target_identity(d),
                             condition => condition,
                         },
-                        meta: e.meta(),
+                        meta: opts.metadata_for(&dst_rel, &e),
                         flags: ff,
                     });
                     return;
@@ -1621,6 +1630,51 @@ impl Planner<'_> {
         }
     }
 
+    /// An existing link or special entry needs no content copy, but an explicit
+    /// metadata request still applies. Ordinary preservation behavior is unchanged.
+    fn plan_explicit_leaf_metadata(
+        &mut self,
+        path: &PathBytes,
+        rel: &[u8],
+        source: &Entry,
+        destination: &Entry,
+        ops: &mut LeafOps,
+    ) {
+        let Some(requested) = self.opts.mapping_metadata.get(rel) else {
+            return;
+        };
+        let meta = self.opts.metadata_for(rel, source);
+        let flags = requested.flags();
+        if !metadata_differs(&meta, &destination.meta(), flags) {
+            return;
+        }
+        if self.opts.dry_run {
+            self.dry_run_changes.metadata_files += 1;
+            self.emit_trace(
+                if source.kind == Kind::Symlink {
+                    "create_symlink"
+                } else {
+                    "create_special"
+                },
+                rel,
+                if source.kind == Kind::Symlink {
+                    "symlink"
+                } else {
+                    "special"
+                },
+                None,
+                "metadata_differs",
+            );
+        } else {
+            ops.meta_fixes.push(Op::SetMeta {
+                path: path.clone(),
+                meta,
+                flags,
+                condition: target_identity(destination),
+            });
+        }
+    }
+
     /// Queue the creation or replacement of a mapped symlink unless the
     /// destination already matches.
     fn plan_symlink(&mut self, leaf: Planned, dst_entry: Option<Entry>, leaf_ops: &mut LeafOps) {
@@ -1650,6 +1704,13 @@ impl Planner<'_> {
             return;
         }
         if same {
+            self.plan_explicit_leaf_metadata(
+                &dst_path,
+                &dst_rel,
+                &e,
+                dst_entry.as_ref().unwrap(),
+                leaf_ops,
+            );
             return;
         }
         if opts.dry_run {
@@ -1706,8 +1767,8 @@ impl Planner<'_> {
             // this phase entirely.
             condition: TargetCondition::Any,
             path: dst_path,
-            meta: e.meta(),
-            flags: opts.flags & !flags::MODE,
+            meta: opts.metadata_for(&dst_rel, &e),
+            flags: opts.flags_for(&dst_rel) & !flags::MODE,
         });
     }
 
@@ -1743,42 +1804,50 @@ impl Planner<'_> {
             }
             return;
         }
-        if same || opts.dry_run {
-            if opts.dry_run && !same {
-                self.dry_run_changes.specials += 1;
-                if dst_entry.as_ref().is_some_and(|d| d.kind != e.kind) {
-                    self.dry_run_changes.type_replacements += 1;
-                }
-                self.emit_trace(
-                    "create_special",
-                    &dst_rel,
-                    "special",
-                    None,
-                    match &dst_entry {
-                        None => "destination_missing",
-                        Some(d) if d.kind != e.kind => "type_differs",
-                        Some(_) => "content_differs",
-                    },
-                );
-                if opts.verbose > 0 {
-                    let shown = display(&dst_path);
-                    let action = match &dst_entry {
-                        None => format!(
-                            "create {} {shown} (destination missing)",
-                            kind_label(e.kind)
-                        ),
-                        Some(d) if d.kind != e.kind => format!(
-                            "replace with {} {shown} (destination is {})",
-                            kind_label(e.kind),
-                            kind_label(d.kind)
-                        ),
-                        Some(_) => format!(
-                            "update {} {shown} (device identity differs)",
-                            kind_label(e.kind)
-                        ),
-                    };
-                    self.progress.println(&action);
-                }
+        if same {
+            self.plan_explicit_leaf_metadata(
+                &dst_path,
+                &dst_rel,
+                &e,
+                dst_entry.as_ref().unwrap(),
+                leaf_ops,
+            );
+            return;
+        }
+        if opts.dry_run {
+            self.dry_run_changes.specials += 1;
+            if dst_entry.as_ref().is_some_and(|d| d.kind != e.kind) {
+                self.dry_run_changes.type_replacements += 1;
+            }
+            self.emit_trace(
+                "create_special",
+                &dst_rel,
+                "special",
+                None,
+                match &dst_entry {
+                    None => "destination_missing",
+                    Some(d) if d.kind != e.kind => "type_differs",
+                    Some(_) => "content_differs",
+                },
+            );
+            if opts.verbose > 0 {
+                let shown = display(&dst_path);
+                let action = match &dst_entry {
+                    None => format!(
+                        "create {} {shown} (destination missing)",
+                        kind_label(e.kind)
+                    ),
+                    Some(d) if d.kind != e.kind => format!(
+                        "replace with {} {shown} (destination is {})",
+                        kind_label(e.kind),
+                        kind_label(d.kind)
+                    ),
+                    Some(_) => format!(
+                        "update {} {shown} (device identity differs)",
+                        kind_label(e.kind)
+                    ),
+                };
+                self.progress.println(&action);
             }
             return;
         }
@@ -1794,8 +1863,8 @@ impl Planner<'_> {
             rdev: e.rdev,
             condition: self.exact_condition_for(&dst_path),
         });
-        let mut meta = e.meta();
-        let mut flags = opts.flags;
+        let mut meta = opts.metadata_for(&dst_rel, &e);
+        let mut flags = opts.flags_for(&dst_rel);
         if flags & flags::MODE == 0 {
             meta.mode = e.mode & 0o777 & !opts.umask;
             flags |= flags::RECEIVER_MODE;
@@ -2044,11 +2113,9 @@ impl Planner<'_> {
     /// Record what a live run would do to this batch's directories.
     fn trace_dry_run_dirs(&mut self, planned: &[PlannedDir], dst_root: &[u8]) {
         let opts = self.opts;
-        let mut meta_flags = opts.flags;
-        if !opts.perms {
-            meta_flags &= !flags::MODE;
-        }
-        for (p, _, e, destination) in planned {
+        for (p, dst_rel, e, destination) in planned {
+            let meta_flags = opts.flags_for(dst_rel);
+            let meta = opts.metadata_for(dst_rel, e);
             match destination {
                 None => {
                     // The insert doubles as a dedupe: an explicit
@@ -2072,7 +2139,7 @@ impl Planner<'_> {
                 }
                 Some(d)
                     if !opts.preserve_existing_directory_metadata
-                        && metadata_differs(e, d, meta_flags)
+                        && metadata_differs(&meta, &d.meta(), meta_flags)
                         && !self.implicit_dirs.contains(p) =>
                 {
                     self.dry_run_changes.metadata_directories.insert(p.clone());
@@ -2106,11 +2173,7 @@ impl Planner<'_> {
         reopened_dirs: &std::collections::HashSet<PathBytes>,
     ) {
         let opts = self.opts;
-        let mut flags = opts.flags;
-        if !opts.perms {
-            flags &= !flags::MODE;
-        }
-        for (p, _, e, s) in planned {
+        for (p, dst_rel, e, s) in planned {
             // New implicit parents already have their final modes.
             // Restore only those temporarily reopened for writing.
             if self.implicit_dirs.contains(p) {
@@ -2134,8 +2197,8 @@ impl Planner<'_> {
                 continue;
             }
             let depth = p.iter().filter(|&&c| c == b'/').count();
-            let mut meta = e.meta();
-            let mut flags = flags;
+            let mut meta = opts.metadata_for(dst_rel, e);
+            let mut flags = opts.flags_for(dst_rel);
             // Without -p, existing directories retain their mode and
             // new directories receive the source mode through the
             // receiving side's umask. Only a signed receiver needs to
@@ -2495,6 +2558,7 @@ impl Planner<'_> {
             self.emit_mapping_entry_failed(
                 &ManifestEntry {
                     expected_digest: self.opts.expected_for(dst_rel).cloned(),
+                    metadata: self.opts.mapping_metadata.get(dst_rel).copied(),
                     src: self
                         .mapping_source_rel(dst_rel)
                         .expect("mapping parent failure"),

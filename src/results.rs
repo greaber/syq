@@ -34,6 +34,9 @@ pub const SCHEMA: &str = "syq.automation";
 pub const SCHEMA_VERSION: u64 = 1;
 
 pub struct ResultsWriter {
+    mapping_metadata: std::sync::OnceLock<
+        std::collections::HashMap<crate::proto::PathBytes, crate::mapping::Metadata>,
+    >,
     out: Mutex<Box<dyn Write + Send>>,
     seq: AtomicU64,
     /// A record failed to write: reported once on stderr, then nothing
@@ -311,6 +314,7 @@ fn run_endpoints(args: &Args, include_destination: bool) -> Vec<EndpointRecord> 
 impl ResultsWriter {
     pub fn new(out: Box<dyn Write + Send>) -> Self {
         ResultsWriter {
+            mapping_metadata: Default::default(),
             out: Mutex::new(out),
             seq: AtomicU64::new(0),
             dead: AtomicBool::new(false),
@@ -518,6 +522,17 @@ impl ResultsWriter {
         }
     }
 
+    pub(crate) fn mapping_metadata(
+        &self,
+        entries: impl IntoIterator<Item = (crate::proto::PathBytes, crate::mapping::Metadata)>,
+    ) {
+        // One mapping plan per invocation, installed before starting its jobs.
+        let entries: std::collections::HashMap<_, _> = entries.into_iter().collect();
+        if !entries.is_empty() {
+            assert!(self.mapping_metadata.set(entries).is_ok());
+        }
+    }
+
     pub fn emit_operation(&self, op: &OperationRecord) {
         self.emit_operation_expected(op, None);
     }
@@ -538,6 +553,14 @@ impl ResultsWriter {
         if let Some(expected) = expected {
             object.insert("expected_digest".into(), serde_json::json!(expected));
         }
+        if let Some(metadata) = self
+            .mapping_metadata
+            .get()
+            .and_then(|entries| entries.get(op.dst))
+        {
+            object.insert("metadata".into(), serde_json::json!(metadata));
+        }
+
         if let Some(src) = op.src {
             object.insert("src".into(), tagged(src));
         }

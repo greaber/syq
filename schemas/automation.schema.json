@@ -498,6 +498,9 @@
         },
         "expected_digest": {
           "$ref": "#/$defs/expectedDigest"
+        },
+        "metadata": {
+          "$ref": "#/$defs/destinationMetadata"
         }
       },
       "required": [
@@ -2009,6 +2012,42 @@
         "type": {
           "const": "stream_ready"
         }
+      },
+      "additionalProperties": false
+    },
+    "destinationMetadata": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4095
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967294
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967294
+        },
+        "mtime": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        },
+        "mtime_nsec": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 999999999
+        }
+      },
+      "dependentRequired": {
+        "mtime_nsec": [
+          "mtime"
+        ]
       },
       "additionalProperties": false
     }

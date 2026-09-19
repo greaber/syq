@@ -232,6 +232,34 @@ impl Engine {
         };
         let (source, existing) = tokio::try_join!(source, destination)?;
         let (source, source_head) = source.context("S3 copy source disappeared")?;
+        let mut desired_head = source_head.clone();
+        let explicit = job.metadata.unwrap_or_default();
+        explicit.validate_kind(match source.kind() {
+            ObjectKind::File => crate::proto::Kind::File,
+            ObjectKind::Dir => crate::proto::Kind::Dir,
+            ObjectKind::Symlink => crate::proto::Kind::Symlink,
+        })?;
+        if explicit.flags() != 0 {
+            let mut metadata = source.metadata.clone().unwrap_or(Metadata {
+                kind: source.kind(),
+                mode: if source.kind() == ObjectKind::Dir {
+                    0o777
+                } else {
+                    0o666
+                },
+                uid: unsafe { libc::geteuid() },
+                gid: unsafe { libc::getegid() },
+                mtime: source.mtime,
+                nsec: 0,
+                hash: None,
+                hash_algorithm: HashAlgorithm::Blake3,
+            });
+            metadata.override_with(&explicit);
+            desired_head
+                .metadata
+                .get_or_insert_with(Default::default)
+                .extend(metadata.encode());
+        }
         anyhow::ensure!(
             source.size == job.size,
             "S3 source size changed after planning"
@@ -248,7 +276,18 @@ impl Engine {
             if self.args.update && old_time > source_time {
                 return Ok(None);
             }
-            if unchanged(&source, old, &source_head, old_head) {
+            let same = if explicit.flags() == 0 {
+                unchanged(&source, old, &source_head, old_head)
+            } else {
+                // Supplied timestamps cannot establish content identity. Reuse
+                // provider identity/checksums already returned by these HEADs.
+                source.kind() == old.kind()
+                    && source.size == old.size
+                    && same_metadata(&desired_head, old_head)
+                    && full_checksum_match(&source_head, old_head)
+                        .unwrap_or(source.etag == old.etag)
+            };
+            if same {
                 self.progress
                     .bytes_unchanged
                     .fetch_add(source.size, Relaxed);
@@ -268,7 +307,8 @@ impl Engine {
         // multipart copying with small disposable fixtures.
         if source.size <= self.copy_request_limit(source.size) {
             let _slot = self.tuning.requests.acquire().await;
-            self.client
+            let request = self
+                .client
                 .copy_object()
                 .bucket(&self.options.bucket)
                 .key(&key)
@@ -279,7 +319,32 @@ impl Engine {
                 )
                 .metadata_directive(MetadataDirective::Copy)
                 .tagging_directive(TaggingDirective::Copy)
-                .set_if_none_match(must_be_new.then(|| "*".to_owned()))
+                .set_if_none_match(must_be_new.then(|| "*".to_owned()));
+            let request = if explicit.flags() != 0 {
+                request
+                    .metadata_directive(MetadataDirective::Replace)
+                    .set_metadata(desired_head.metadata().cloned())
+                    .set_content_type(desired_head.content_type().map(str::to_owned))
+                    .set_content_encoding(desired_head.content_encoding().map(str::to_owned))
+                    .set_content_language(desired_head.content_language().map(str::to_owned))
+                    .set_content_disposition(desired_head.content_disposition().map(str::to_owned))
+                    .set_cache_control(desired_head.cache_control().map(str::to_owned))
+            } else {
+                request
+            };
+            let expires = desired_head.expires_string().map(str::to_owned);
+            request
+                .customize()
+                .map_request(move |mut request| {
+                    if explicit.flags() != 0 {
+                        if let Some(expires) = &expires {
+                            request
+                                .headers_mut()
+                                .try_insert("expires", expires.clone())?;
+                        }
+                    }
+                    Ok::<_, aws_smithy_runtime_api::http::HttpError>(request)
+                })
                 .send()
                 .await
                 .map_err(|e| e.into_service_error())
@@ -287,7 +352,7 @@ impl Engine {
             self.tuning.requests.completed(source.size);
             self.progress.add_bytes(source.size);
         } else {
-            self.multipart_copy(&source, source_head, &key, &copy_source, must_be_new)
+            self.multipart_copy(&source, desired_head, &key, &copy_source, must_be_new)
                 .await?;
         }
         Ok(Some(source.size))

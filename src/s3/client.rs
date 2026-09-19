@@ -375,6 +375,22 @@ fn is_blake3(algorithm: &crate::hashing::HashAlgorithm) -> bool {
     *algorithm == crate::hashing::HashAlgorithm::Blake3
 }
 impl Metadata {
+    pub(super) fn override_with(&mut self, metadata: &crate::mapping::Metadata) {
+        let mut meta = crate::proto::Meta {
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            mtime: self.mtime,
+            mtime_nsec: self.nsec,
+        };
+        metadata.apply(&mut meta);
+        self.mode = meta.mode;
+        self.uid = meta.uid;
+        self.gid = meta.gid;
+        self.mtime = meta.mtime;
+        self.nsec = meta.mtime_nsec;
+    }
+
     pub fn encode(&self) -> HashMap<String, String> {
         let mut values = HashMap::from([
             (
