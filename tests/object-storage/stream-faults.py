@@ -51,7 +51,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         STATE['requests'] += 1
-        if CASE == 'preview-results' and self.path.endswith('/missing'):
+        if ((CASE == 'preview-results' and self.path.endswith('/missing'))
+                or (CASE == 'file-metadata' and STATE.get('missing_object'))):
             self.reply(404)
             return
         headers = {'ETag': '"original"', 'x-amz-version-id': 'v1',
@@ -62,8 +63,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         STATE['requests'] += 1
-        if CASE == 'preview-results' and 'list-type=2' in self.path:
-            self.reply(200, b'<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>')
+        if CASE in ('preview-results', 'file-metadata') and 'list-type=2' in self.path:
+            STATE['lists'] = STATE.get('lists', 0) + 1
+            child = b'<Contents><Key>object/child</Key><Size>1</Size></Contents>' if STATE.get('prefix_exists') else b''
+            self.reply(200, b'<ListBucketResult><IsTruncated>false</IsTruncated>' + child + b'</ListBucketResult>')
             return
         assert self.headers['If-Match'] == '"original"'
         assert urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)['versionId'] == ['v1']
@@ -271,6 +274,27 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                     response = run(put + ['--skip-newer', *preview], stdin=stream, env=env)
                     success(response)
                     assert b'Skipped' in response.stderr and stream.tell() == 0
+            # Timestamp selection concerns the exact object. A sibling prefix
+            # must neither add a LIST nor prevent creation of that object.
+            source.write_bytes(b'prefix can coexist')
+            STATE.update(missing_object=True, prefix_exists=True)
+            for options in ([], ['--skip-newer']):
+                requests = STATE['requests']
+                lists = STATE.get('lists', 0)
+                with source.open('rb') as stream:
+                    response = run(put + options, stdin=stream, env=env)
+                success(response)
+                assert STATE['published'] == b'prefix can coexist'
+                assert STATE['requests'] - requests == int(bool(options))
+                assert STATE.get('lists', 0) == lists
+            # An explicit placement condition still checks the prefix and
+            # fails without consuming the source.
+            with source.open('rb') as stream:
+                response = run(base + ['--to', 's3://bucket', '--as-new', 'object', '--skip-newer'], stdin=stream, env=env)
+                failure(response)
+                assert b'existence condition failed' in response.stderr
+                assert stream.tell() == 0
+            STATE.update(missing_object=False, prefix_exists=False)
             # Ordinary raw objects use Last-Modified. Pipe consumers continue
             # reading raw bytes even if an object's syq metadata is unfamiliar.
             for metadata in ({}, {'x-amz-meta-syq-format': 'unknown'}):

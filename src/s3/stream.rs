@@ -142,55 +142,62 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
     let existence = plan.placement.existence;
     let report = &plan.controls.report;
     let policy = report.only_new || report.only_existing;
-    if existence == Existence::Any && !policy && !plan.controls.metadata.skip_newer {
+    let inspect_placement = existence != Existence::Any || policy;
+    if !inspect_placement && !plan.controls.metadata.skip_newer {
         return Ok(());
     }
     // Match ordinary S3 cp: a new target must have neither an exact object
     // nor descendants; an existing container needs at least one prefixed key.
     // Existence checks do not need to decode object metadata.
-    let container = plan.placement.name.is_some();
+    // Timestamp selection alone needs only the exact destination's HEAD.
+    // An S3 key and a prefix with the same spelling can coexist.
+    let container = inspect_placement && plan.placement.name.is_some();
     let target = if container {
         plan.target.trim_end_matches('/')
     } else {
-        &plan.target
+        &plan.key
     };
     let exact_head = if target.is_empty() {
         None
     } else {
         client::head_output(client, &plan.options.bucket, target, None).await?
     };
-    let exact = exact_head.is_some();
-    let prefix = if target.is_empty() {
-        String::new()
-    } else {
-        format!("{target}/")
-    };
-    let present = (!(existence == Existence::Existing && container) && exact)
-        || super::client::prefix_exists(client, &plan.options.bucket, &prefix).await?;
-    if (existence == Existence::New && present) || (existence == Existence::Existing && !present) {
-        bail!("S3 destination existence condition failed");
-    }
-    if policy {
-        let final_present = if container {
-            super::client::head_output(client, &plan.options.bucket, &plan.key, None)
-                .await?
-                .is_some()
-                || super::client::prefix_exists(
-                    client,
-                    &plan.options.bucket,
-                    &format!("{}/", plan.key.trim_end_matches('/')),
-                )
-                .await?
+    if inspect_placement {
+        let exact = exact_head.is_some();
+        let prefix = if target.is_empty() {
+            String::new()
         } else {
-            present
+            format!("{target}/")
         };
-        if (report.only_new && final_present) || (report.only_existing && !final_present) {
-            report.skip();
-            return Ok(());
+        let present = (!(existence == Existence::Existing && container) && exact)
+            || super::client::prefix_exists(client, &plan.options.bucket, &prefix).await?;
+        if (existence == Existence::New && present)
+            || (existence == Existence::Existing && !present)
+        {
+            bail!("S3 destination existence condition failed");
         }
-    }
-    if !container && present && !exact {
-        bail!("S3 destination is a prefix, not an object");
+        if policy {
+            let final_present = if container {
+                super::client::head_output(client, &plan.options.bucket, &plan.key, None)
+                    .await?
+                    .is_some()
+                    || super::client::prefix_exists(
+                        client,
+                        &plan.options.bucket,
+                        &format!("{}/", plan.key.trim_end_matches('/')),
+                    )
+                    .await?
+            } else {
+                present
+            };
+            if (report.only_new && final_present) || (report.only_existing && !final_present) {
+                report.skip();
+                return Ok(());
+            }
+        }
+        if !container && present && !exact {
+            bail!("S3 destination is a prefix, not an object");
+        }
     }
     if plan.controls.metadata.skip_newer {
         let head = if container {

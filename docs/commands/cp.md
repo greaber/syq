@@ -240,6 +240,7 @@ pipes have no timestamp to compare. Input pipes, sockets, and devices have no
 payload metadata, so they reject `--skip-newer` and `--preserve`. Their new
 named destinations use `0666` limited by the umask and the time of the write;
 existing files keep their permissions. Output pipes likewise cannot preserve
-permissions or ownership. Parent directories are created as needed. The usual [symlink rules](../reference.md#symlinks) and
-source `--cwd` / `--root` options apply, but `--root` cannot confine a descriptor
-that is already open. Named remote sources must be regular files.
+permissions or ownership. Parent directories are created as needed. The usual
+[symlink rules](../reference.md#symlinks) and source `--cwd` / `--root` options
+apply, but `--root` cannot confine a descriptor that is already open. Named remote
+sources must be regular files.
