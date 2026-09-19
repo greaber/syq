@@ -49,16 +49,7 @@ unless you request `--prune`.
 
 {{#include assets/tool-examples.html}}
 
-## Put syq in your workflow
-
-Scripts can [choose files and destination names](mappings.md), preview a copy
-with `--dry-run`, and read structured results.
-The [Python SDK](python.md) provides copy and removal calls with typed results.
-
-Working in a server shell? [Send files to your laptop](receive.md) or
-[run a command there](exec.md), with approval on your laptop. It needs no SSH
-server or incoming network port. You can also [copy directly between servers](remote-to-remote.md)
-without forwarding your SSH agent.
+<a id="put-syq-in-your-workflow"></a>
 
 ## Common tasks
 

@@ -30,8 +30,8 @@
 .tool-examples select:focus-visible { outline: 2px solid var(--links); outline-offset: 2px; }
 .tool-examples summary { cursor: pointer; font-weight: 600; padding: .6em 0; }
 .tool-example-commands > div { min-width: 0; }
-.tool-example-commands pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-.tool-example-commands code { white-space: inherit; }
+.tool-example pre > code { white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-example .tooltiptext { white-space: nowrap; overflow-wrap: normal; width: max-content; }
 .tool-example-note { padding-left: .8em; border-left: 3px solid var(--table-border-color); }
 .tool-examples-status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 @media (max-width: 600px) {
@@ -44,7 +44,7 @@
 .content .tool-example-commands pre { margin: .4em 0; padding: 1em; }
 .tool-example-note { font-size: .9em; }
 
-.content .tool-example-commands pre code { font-size: 15px; }
+.content .tool-example pre code { font-size: 15px; }
 .tool-examples option:disabled { color: GrayText; }
 
 .tool-example-commands.tool-example-single { grid-template-columns: 1fr; }
