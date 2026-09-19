@@ -423,28 +423,6 @@ refused; even with `--follow-src`, symlinks cannot lead outside the root.
 Unlike `-C`, this is a boundary, not just a starting directory. It does not
 constrain the destination.
 
-## Shell pipelines and file descriptors
-
-You can compress data while sending it, without first saving the compressed
-file on your machine:
-
-```sh
-gzip -c data | syq cp --src-fd 0 --to server --as data.gz
-```
-
-Here `--src-fd 0` reads from stdin, and `--as data.gz` names the file to create
-on the server. To feed a downloaded file into another program, use `--as-fd 1`
-to write to stdout:
-
-```sh
-syq cp --from server data.gz --as-fd 1 | gzip -dc > data
-```
-
-Both examples also work with local files or S3 objects. A pipeline can leave
-incomplete output if one of its commands fails, so check the whole pipeline's
-status before using the result. See [file descriptors](commands/cp.md#file-descriptors)
-for process substitution, named pipes, and failure handling.
-
 ## Output and diagnostics
 
 The final summary shows what was copied or skipped, how long it took, and any
@@ -472,18 +450,25 @@ set their own deadlines.
 
 ## Shell pipelines and file descriptors
 
-Use `--src-fd 0` for stdin or `--as-fd 1` for stdout. The file can be
-local, on an SSH host, or in S3:
+You can compress data while sending it, without first saving the compressed
+file on your machine:
 
 ```sh
 gzip -c data | syq cp --src-fd 0 --to server --as data.gz
-syq cp --from s3://backups data.gz --as-fd 1 | gzip -dc > data
 ```
 
-These copies transfer raw bytes without source metadata or restart recovery.
-EOF ends input even if the producer failed; output can be partial after a
-failure. See [file descriptors](commands/cp.md#file-descriptors) for the full
-contract and restrictions.
+Here `--src-fd 0` reads from stdin, and `--as data.gz` names the file to create
+on the server. To feed a downloaded file into another program, use `--as-fd 1`
+to write to stdout:
+
+```sh
+syq cp --from server data.gz --as-fd 1 | gzip -dc > data
+```
+
+Both examples also work with local files or S3 objects. A pipeline can leave
+incomplete output if one of its commands fails, so check the whole pipeline's
+status before using the result. See [file descriptors](commands/cp.md#file-descriptors)
+for process substitution, named pipes, and failure handling.
 
 ## Environment variables and local files
 

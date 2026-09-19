@@ -26,6 +26,7 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project/index.html to /backup/index.html. Destination-only files stay.</p>
+<p class="tool-example-note">In rsync, project/ copies the contents; project copies the folder. In syq, a trailing slash does not change placement: use --srcs-in for contents.</p>
 </section>
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
