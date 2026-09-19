@@ -1564,13 +1564,13 @@ fn ssh_startup_workers_are_bounded_by_files_and_splittable_ranges() {
 }
 
 #[test]
-fn initial_fast_workers_respect_file_and_byte_batch_limits() {
+fn initial_fast_workers_preserve_startup_file_and_byte_budgets() {
     assert_eq!(
         initial_fast_workers(
             32,
             100,
             100 * (4 << 20),
-            FAST_BATCH_FILES,
+            STARTUP_BATCH_FILES,
             crate::transfer_tuning::DEFAULT_BATCH_BYTES
         ),
         25
@@ -1580,7 +1580,7 @@ fn initial_fast_workers_respect_file_and_byte_batch_limits() {
             8,
             100,
             100 * (4 << 20),
-            FAST_BATCH_FILES,
+            STARTUP_BATCH_FILES,
             crate::transfer_tuning::DEFAULT_BATCH_BYTES
         ),
         8
@@ -1590,7 +1590,7 @@ fn initial_fast_workers_respect_file_and_byte_batch_limits() {
             32,
             300,
             300,
-            FAST_BATCH_FILES,
+            STARTUP_BATCH_FILES,
             crate::transfer_tuning::DEFAULT_BATCH_BYTES
         ),
         3
