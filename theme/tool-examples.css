@@ -62,3 +62,7 @@
   transform: translateY(-75%) rotate(45deg);
   pointer-events: none;
 }
+
+.tool-example-differences { font-size: .85em; }
+.tool-example-differences > summary { font-weight: normal; padding: .3em 0; }
+.tool-example-differences > p { margin: .4em 0; }

@@ -9,7 +9,7 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --into /backup</code></pre></div>
 </div>
 <p>Copies report.csv to /backup/report.csv on server.</p>
-<p class="tool-example-note">The rsync destination /backup must already be a directory. Syq creates the container if needed. Metadata and comparison rules differ.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>Rsync uses the destination’s trailing slash to treat /backup as a directory. Syq uses --into, which creates the directory if needed.</p></details>
 </section>
 <section class="tool-example" data-title="Send a folder to a server">
 <h3>Send a folder to a server</h3>
@@ -18,7 +18,7 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project to /backup/project. Other entries in /backup stay.</p>
-<p class="tool-example-note">For rsync, /backup must exist. Rsync -rt skips symlinks; syq copies them as links.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>Rsync -rt skips symlinks; syq copies them as links.</p></details>
 </section>
 <section class="tool-example" data-title="Copy the files inside a folder">
 <h3>Copy the files inside a folder</h3>
@@ -27,7 +27,7 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project/index.html to /backup/index.html. Destination-only files stay.</p>
-<p class="tool-example-note">Rsync uses the trailing slash to select contents. Syq uses --srcs-in; trailing slashes do not change its native placement rules.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>Rsync uses the trailing slash to select contents. Syq uses --srcs-in; trailing slashes do not change its native placement rules.</p></details>
 </section>
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
@@ -45,7 +45,6 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp --from server /data/report.csv --into .</code></pre></div>
 </div>
 <p>Fetches report.csv into your current directory.</p>
-<p class="tool-example-note">The host goes in --from; the source path is a separate argument. Syq keeps modification times by default.</p>
 </section>
 <section class="tool-example" data-title="Preview a copy">
 <h3>Preview a copy</h3>
@@ -54,7 +53,7 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --dry-run -v</code></pre></div>
 </div>
 <p>Lists planned changes without copying file data.</p>
-<p class="tool-example-note">Syq may still install or cache its remote helper during setup. Remove --dry-run to perform the copy.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>Syq may still install or cache its remote helper during setup. Remove --dry-run to perform the copy.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -63,7 +62,7 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --as /backup/latest.csv</code></pre></div>
 </div>
 <p>Copies report.csv to /backup/latest.csv; the source stays.</p>
-<p class="tool-example-note">For the rsync command, /backup must exist and latest.csv must not be a directory. Syq makes the exact destination explicit with --as.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>If latest.csv is a directory, rsync copies report.csv inside it. Syq --as requires the exact destination to be a file for this source and refuses that directory.</p></details>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
@@ -74,7 +73,7 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
 {"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --to server --into /archive</code></pre></div>
 </div>
-<p class="tool-example-note">For rsync, /archive must already exist on server.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>For rsync, /archive must already exist on server.</p></details>
 <p><a href="mappings.html">Generate a mapping with a script</a>.</p>
 </section>
 <!-- References: https://download.samba.org/pub/rsync/rsync.1 --></details>
@@ -95,7 +94,7 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --into backup</code></pre></div>
 </div>
 <p>Copies project/index.html to backup/index.html. Destination-only files stay.</p>
-<p class="tool-example-note">Rclone copies directory contents. Syq expresses that with --srcs-in. Empty-directory, symlink, metadata, and file-comparison behavior differ.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>Rclone copies directory contents. Syq expresses that with --srcs-in.</p></details>
 </section>
 <section class="tool-example" data-title="Upload a folder’s contents to S3">
 <h3>Upload a folder’s contents to S3</h3>
@@ -113,7 +112,7 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --into backup --prune</code></pre></div>
 </div>
 <p>Updates backup with the contents of project and removes destination entries absent from the source.</p>
-<p class="tool-example-note">Deletes destination-only files. Preview syq with --dry-run -v. Comparison and metadata rules differ.</p>
+<p class="tool-example-note">Deletes destination-only files. Preview syq with --dry-run -v.</p>
 </section>
 <section class="tool-example" data-title="Download a folder from S3">
 <h3>Download a folder from S3</h3>
@@ -140,7 +139,6 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --into backup --dry-run -v</code></pre></div>
 </div>
 <p>Previews copying the contents of project into backup.</p>
-<p class="tool-example-note">Syq lists planned paths with -v. Remove --dry-run to apply changes; the filesystem is checked again at that time.</p>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -149,7 +147,6 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --as latest.csv</code></pre></div>
 </div>
 <p>Copies report.csv to latest.csv in your current directory; the source stays.</p>
-<p class="tool-example-note">The destination is a file, not a directory. Use --as-new in syq if it must not already exist.</p>
 </section>
 <section class="tool-example" data-title="Remove a file">
 <h3>Remove a file</h3>
@@ -176,7 +173,7 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --from server /data/report.csv --into .</code></pre></div>
 </div>
 <p>Downloads report.csv into your current folder.</p>
-<p class="tool-example-note">Here server is an rclone SFTP remote. Both commands can fetch the file; their metadata and comparison rules differ.</p>
+<p class="tool-example-note">Here server is an rclone SFTP remote.</p>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
@@ -187,7 +184,6 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
 {"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div>
 </div>
-<p class="tool-example-note">Rclone also supports name transforms.</p>
 <p><a href="mappings.html">Generate a mapping with a script</a>.</p>
 </section>
 <!-- References: https://rclone.org/commands/rclone_copy/ https://rclone.org/commands/rclone_sync/ https://rclone.org/commands/rclone_copyto/ https://rclone.org/commands/rclone_deletefile/ https://rclone.org/sftp/ https://rclone.org/docs/#name-transform --></details>
@@ -199,7 +195,6 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to s3://backups --as reports/report.csv</code></pre></div>
 </div>
 <p>Uploads report.csv to the exact key reports/report.csv in bucket backups.</p>
-<p class="tool-example-note">Syq separates the bucket (--to) from the key (--as). Existing objects can be replaced. Metadata and unchanged-file detection differ between tools.</p>
 </section>
 <section class="tool-example" data-title="Download a folder from S3">
 <h3>Download a folder from S3</h3>
@@ -208,7 +203,6 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --from s3://backups --srcs-in reports --into reports</code></pre></div>
 </div>
 <p>Downloads reports/january.csv from S3 to reports/january.csv locally, keeping subfolders.</p>
-<p class="tool-example-note">The s5cmd wildcard is quoted so your shell does not expand it. Syq uses --srcs-in to select everything inside reports/. Other local files stay.</p>
 </section>
 <section class="tool-example" data-title="Copy a file between S3 buckets">
 <h3>Copy a file between S3 buckets</h3>
@@ -226,7 +220,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to s3://backups --as report.csv --dry-run -v</code></pre></div>
 </div>
 <p>Previews uploading report.csv without writing the object.</p>
-<p class="tool-example-note">The global --dry-run flag goes before cp in s5cmd. Syq accepts it after cp and uses -v to list planned paths.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>The global --dry-run flag goes before cp in s5cmd. Syq accepts it after cp and uses -v to list planned paths.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -235,7 +229,6 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to s3://backups --as latest.csv</code></pre></div>
 </div>
 <p>Uploads report.csv as the key latest.csv; the local source stays.</p>
-<p class="tool-example-note">Use --as to specify the exact key. Existing objects can be replaced.</p>
 </section>
 <section class="tool-example" data-title="Remove a file">
 <h3>Remove a file</h3>
@@ -262,7 +255,6 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to s3://backups --into project</code></pre></div>
 </div>
 <p>Copies the files inside project to the project/ folder in S3.</p>
-<p class="tool-example-note">This example uses S3 as the destination; s5cmd does not provide an SSH endpoint. Use --srcs-in in syq to select the folder’s contents.</p>
 </section>
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
@@ -271,7 +263,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to s3://backups --into project --prune</code></pre></div>
 </div>
 <p>Updates the project/ folder in S3 and removes objects absent from the local project folder.</p>
-<p class="tool-example-note">Both tools support mirroring. Comparison rules differ. Preview with s5cmd --dry-run sync --delete or add --dry-run -v to syq. Bucket versioning affects recovery.</p>
+<p class="tool-example-note">Preview with s5cmd --dry-run sync --delete or add --dry-run -v to syq. Bucket versioning affects recovery.</p>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
@@ -293,7 +285,7 @@ cp photos/b.jpg s3://backups/archive/summit.jpg</code></pre><pre><code>s5cmd run
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --into /backup</code></pre></div>
 </div>
 <p>Copies report.csv to /backup/report.csv on server.</p>
-<p class="tool-example-note">For scp, /backup must exist. Syq creates it if needed and can skip unchanged files.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>For scp, /backup must exist. Syq creates it if needed and can skip unchanged files.</p></details>
 </section>
 <section class="tool-example" data-title="Download a file from a server">
 <h3>Download a file from a server</h3>
@@ -302,7 +294,7 @@ cp photos/b.jpg s3://backups/archive/summit.jpg</code></pre><pre><code>s5cmd run
 <div><p><strong>syq</strong></p><pre><code>syq cp --from server /data/report.csv --into .</code></pre></div>
 </div>
 <p>Copies the server’s /data/report.csv to report.csv in your current directory.</p>
-<p class="tool-example-note">Syq separates the SSH host from the path with --from. It can skip an unchanged file and keeps modification times by default.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>Scp copies the file again and needs -p to preserve modification times. Syq can skip an unchanged file and preserves modification times by default.</p></details>
 </section>
 <section class="tool-example" data-title="Send a folder to a server">
 <h3>Send a folder to a server</h3>
@@ -311,7 +303,7 @@ cp photos/b.jpg s3://backups/archive/summit.jpg</code></pre><pre><code>s5cmd run
 <div><p><strong>syq</strong></p><pre><code>syq cp project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project to /backup/project; /backup must already exist for the scp command.</p>
-<p class="tool-example-note">Syq copies folders without -r. Scp follows symlinks; syq normally copies links as links.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>Syq copies folders without -r. Scp follows symlinks; syq normally copies links as links.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -320,7 +312,7 @@ cp photos/b.jpg s3://backups/archive/summit.jpg</code></pre><pre><code>s5cmd run
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --as /backup/latest.csv</code></pre></div>
 </div>
 <p>Copies report.csv to /backup/latest.csv; the source stays.</p>
-<p class="tool-example-note">For scp, /backup must exist and latest.csv must not be a directory. Syq makes the destination name explicit with --as.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>If latest.csv is a directory, scp copies report.csv inside it. Syq --as refuses that directory for this file source.</p></details>
 </section>
 <section class="tool-example" data-title="Copy the files inside a folder">
 <h3>Copy the files inside a folder</h3>
@@ -329,7 +321,7 @@ cp photos/b.jpg s3://backups/archive/summit.jpg</code></pre><pre><code>s5cmd run
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project’s contents, including hidden files and subfolders, into /backup.</p>
-<p class="tool-example-note">The scp destination /backup must already exist. Scp follows symlinks; syq normally copies links as links. This example assumes regular files and directories.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>Scp follows symlinks; syq copies them as links. The scp destination /backup must already exist.</p></details>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
@@ -340,7 +332,7 @@ scp photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
 {"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --to server --into /archive</code></pre></div>
 </div>
-<p class="tool-example-note">For scp, /archive must already exist on server.</p>
+<details class="tool-example-differences"><summary>Differences</summary><p>For scp, /archive must already exist on server.</p></details>
 <p><a href="mappings.html">Generate a mapping with a script</a>.</p>
 </section>
 <!-- References: https://man.openbsd.org/scp --></details>
@@ -355,7 +347,6 @@ scp photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <h3>Send a folder to a server</h3>
 <div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp project --to server --into /backup</code></pre></div></div>
 <p>Copies project to /backup/project. Other entries in /backup stay.</p>
-<p class="tool-example-note">--into keeps the source folder name inside the destination.</p>
 </section>
 <section class="tool-example" data-title="Copy the files inside a folder">
 <h3>Copy the files inside a folder</h3>
@@ -384,7 +375,6 @@ scp photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <h3>Rename a file while copying</h3>
 <div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --as /backup/latest.csv</code></pre></div></div>
 <p>Copies report.csv to /backup/latest.csv; the source stays.</p>
-<p class="tool-example-note">--as chooses the exact destination name.</p>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
@@ -406,7 +396,6 @@ scp photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <h3>Download a folder from S3</h3>
 <div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp --from s3://backups --srcs-in reports --into reports</code></pre></div></div>
 <p>Downloads reports/january.csv from S3 to reports/january.csv locally, keeping subfolders.</p>
-<p class="tool-example-note">Select all keys under reports/ with --srcs-in. Other local files stay.</p>
 </section>
 <section class="tool-example" data-title="Copy a file between S3 buckets">
 <h3>Copy a file between S3 buckets</h3>
