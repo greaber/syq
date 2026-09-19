@@ -62,6 +62,8 @@ struct PipelineState {
     requests: Vec<Request>,
     replies: std::collections::VecDeque<Response>,
     received: usize,
+    progress: Option<Arc<Progress>>,
+    progress_at_receive: Vec<(u64, u64)>,
     sent_at_receive: Vec<usize>,
     peer: Option<Arc<Mutex<PipelineState>>>,
     peer_sent_at_receive: Vec<usize>,
@@ -124,6 +126,13 @@ impl Conn for PipelineConn {
         let mut state = self.0.lock().unwrap();
         anyhow::ensure!(!state.dead, "injected dead connection");
         state.received += 1;
+        if let Some(progress) = &state.progress {
+            let snapshot = (
+                progress.bytes_done.load(Relaxed),
+                progress.files_done.load(Relaxed),
+            );
+            state.progress_at_receive.push(snapshot);
+        }
         if let Some(sched) = state.steal_on_receive.take() {
             let Item::File(idx) = sched.next() else {
                 panic!("expected unread file group")
@@ -706,6 +715,115 @@ fn whole_file_groups_overlap_and_drain_both_endpoint_windows() {
 }
 
 #[test]
+fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
+    for failure in [
+        "none",
+        "destination-drop",
+        "stat-drop",
+        "changed",
+        "changed-retry",
+    ] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        let jobs: Vec<_> = (0..6)
+            .map(|i| {
+                let mut job = pipeline_job(format!("file{i}").as_bytes(), 1 << 20);
+                if failure == "changed" {
+                    job.attempt = MAX_ATTEMPTS - 1;
+                }
+                job
+            })
+            .collect();
+        for job in &jobs {
+            sched.push_file(job.clone());
+        }
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        assert_eq!(sched.begin_fast_batch(1, 6), 6);
+        let mut batch = vec![0];
+        batch.extend(sched.take_small(1 << 20, 5, u64::MAX));
+        sched.mark_fast(5);
+        let src = Arc::new(Mutex::new(PipelineState {
+            fail_receive: (failure == "stat-drop").then_some(7),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            fail_receive: (failure == "destination-drop").then_some(6),
+            ..Default::default()
+        }));
+        for _ in 0..6 {
+            let data = vec![0; 1 << 20];
+            src.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
+                    hash: content_digest(&data),
+                    data,
+                })]));
+            dst.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::Applied(vec![None]));
+        }
+        let mut entries: Vec<_> = batch
+            .iter()
+            .map(|&idx| Some(jobs[idx].entry.clone()))
+            .collect();
+        if failure.starts_with("changed") {
+            entries[0].as_mut().unwrap().mtime += 1;
+        }
+        src.lock()
+            .unwrap()
+            .replies
+            .push_back(Response::Stats(entries));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        // Other workers' progress must survive rollback of this batch.
+        worker.progress.add_bytes(123);
+        worker.progress.files_done.store(7, Relaxed);
+        src.lock().unwrap().progress = Some(worker.progress.clone());
+        dst.lock().unwrap().progress = Some(worker.progress.clone());
+        let result = worker.fast_batch(&mut batch);
+        let dropped = failure.ends_with("drop");
+        assert_eq!(result.is_err(), dropped, "{failure}: {result:?}");
+        let expected_files = if dropped {
+            0
+        } else if failure.starts_with("changed") {
+            5
+        } else {
+            6
+        };
+        assert_eq!(
+            worker.progress.bytes_done.load(Relaxed),
+            123 + (expected_files << 20),
+            "{failure}"
+        );
+        assert_eq!(
+            worker.progress.files_done.load(Relaxed),
+            7 + expected_files,
+            "{failure}"
+        );
+        let snapshots = &dst.lock().unwrap().progress_at_receive;
+        for (i, &(bytes, files)) in snapshots.iter().enumerate() {
+            assert_eq!(bytes, 123 + ((i as u64) << 20), "{failure}: ack {i}");
+            assert_eq!(files, 7, "no file completes before the source recheck");
+        }
+        if !dropped {
+            assert_eq!(
+                src.lock().unwrap().progress_at_receive.last(),
+                Some(&(123 + (6 << 20), 7))
+            );
+        }
+        assert_eq!(
+            jobs[0].done.load(Relaxed),
+            if expected_files == 6 { 1 << 20 } else { 0 }
+        );
+        assert_eq!(sched.is_failed(0), failure == "changed");
+        if failure == "changed-retry" {
+            assert_eq!(sched.jobs.lock().unwrap()[0].attempt, 1);
+        }
+    }
+}
+
+#[test]
 fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
     let sched = Arc::new(Sched::new(512, 8192));
     let jobs: Vec<_> = (0..8)
@@ -758,6 +876,7 @@ fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
     worker.fast_batch(&mut batch).unwrap();
     assert_eq!(batch, original);
     assert_eq!(worker.progress.files_done.load(Relaxed), 4);
+    assert_eq!(worker.progress.bytes_done.load(Relaxed), 4 << 20);
     assert_eq!(worker.progress.errors.load(Relaxed), 1);
     for &idx in &original[..4] {
         assert_eq!(jobs[idx].done.load(Relaxed), 1 << 20);
@@ -852,6 +971,10 @@ fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
         assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
         assert_eq!(src.lock().unwrap().stolen_file, Some(stolen));
         assert_eq!(batch, owned);
+        assert_eq!(
+            worker.progress.bytes_done.load(Relaxed),
+            if failure == "none" { 2 << 20 } else { 0 }
+        );
         assert_eq!(
             worker.progress.files_done.load(Relaxed),
             if failure == "none" { 8 } else { 0 }
