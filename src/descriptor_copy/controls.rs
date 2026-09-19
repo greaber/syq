@@ -63,6 +63,7 @@ pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
 
 pub(crate) struct Controls {
     pub report: super::report::Report,
+    pub metadata: super::metadata::Policy,
     pub settings: Settings,
     size_filter: SizeFilter,
     pub pipeline: usize,
@@ -121,6 +122,7 @@ impl Controls {
         }
         Self {
             report,
+            metadata: super::metadata::Policy::new(args),
             size_filter,
             settings,
             pipeline: tuning.pipeline_depth(),

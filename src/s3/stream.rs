@@ -1,5 +1,5 @@
-//! One raw S3 object and one inherited local byte stream. No filesystem
-//! metadata, helper protocol, or persistent upload identity is synthesized.
+//! One raw S3 object and one inherited local byte stream. Regular-file
+//! descriptors use the same object metadata as pathname copies.
 use super::{checksum::Algorithm, client, Options};
 use crate::descriptor_copy::fd::{Descriptor, Source};
 use anyhow::{bail, Context, Result};
@@ -24,6 +24,7 @@ struct Plan<'a> {
     key: String,
     placement: crate::descriptor_copy::StreamPlacement,
     target: String,
+    source_meta: Option<crate::proto::Meta>,
 }
 pub(crate) fn run(
     options: Options,
@@ -48,6 +49,7 @@ pub(crate) fn run(
         key,
         placement,
         target,
+        source_meta: None,
     };
     let cancelled = Arc::new(AtomicBool::new(false));
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -67,7 +69,12 @@ pub(crate) fn run(
             None => Some(Descriptor::open(as_fd.unwrap(), false, cancelled.clone())?),
         };
         if plan.options.route == crate::s3::Route::Upload {
+            plan.source_meta = descriptor.as_ref().and_then(Descriptor::metadata);
+            controls.metadata.source(plan.source_meta)?;
             controls.skip_size(descriptor.as_ref().map(Descriptor::remaining_len).transpose()?.flatten())?;
+        }
+        if plan.options.route == crate::s3::Route::Download {
+            controls.metadata.output(descriptor.as_ref().and_then(Descriptor::metadata).is_some())?;
         }
         let cancellation = Arc::new(super::upload_http::Cancellation::default());
         let (client, _) = tokio::select! {
@@ -135,53 +142,78 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
     let existence = plan.placement.existence;
     let report = &plan.controls.report;
     let policy = report.only_new || report.only_existing;
-    if existence == Existence::Any && !policy {
+    let inspect_placement = existence != Existence::Any || policy;
+    if !inspect_placement && !plan.controls.metadata.skip_newer {
         return Ok(());
     }
     // Match ordinary S3 cp: a new target must have neither an exact object
     // nor descendants; an existing container needs at least one prefixed key.
-    // Inspect raw metadata only, since stream inputs need no syq encoding.
-    let container = plan.placement.name.is_some();
+    // Existence checks do not need to decode object metadata.
+    // Timestamp selection alone needs only the exact destination's HEAD.
+    // An S3 key and a prefix with the same spelling can coexist.
+    let container = inspect_placement && plan.placement.name.is_some();
     let target = if container {
         plan.target.trim_end_matches('/')
     } else {
-        &plan.target
+        &plan.key
     };
-    let exact = !target.is_empty()
-        && super::client::head_output(client, &plan.options.bucket, target, None)
-            .await?
-            .is_some();
-    let prefix = if target.is_empty() {
-        String::new()
+    let exact_head = if target.is_empty() {
+        None
     } else {
-        format!("{target}/")
+        client::head_output(client, &plan.options.bucket, target, None).await?
     };
-    let present = (!(existence == Existence::Existing && container) && exact)
-        || super::client::prefix_exists(client, &plan.options.bucket, &prefix).await?;
-    if (existence == Existence::New && present) || (existence == Existence::Existing && !present) {
-        bail!("S3 destination existence condition failed");
-    }
-    if policy {
-        let final_present = if container {
-            super::client::head_output(client, &plan.options.bucket, &plan.key, None)
-                .await?
-                .is_some()
-                || super::client::prefix_exists(
-                    client,
-                    &plan.options.bucket,
-                    &format!("{}/", plan.key.trim_end_matches('/')),
-                )
-                .await?
+    if inspect_placement {
+        let exact = exact_head.is_some();
+        let prefix = if target.is_empty() {
+            String::new()
         } else {
-            present
+            format!("{target}/")
         };
-        if (report.only_new && final_present) || (report.only_existing && !final_present) {
-            report.skip();
-            return Ok(());
+        let present = (!(existence == Existence::Existing && container) && exact)
+            || super::client::prefix_exists(client, &plan.options.bucket, &prefix).await?;
+        if (existence == Existence::New && present)
+            || (existence == Existence::Existing && !present)
+        {
+            bail!("S3 destination existence condition failed");
+        }
+        if policy {
+            let final_present = if container {
+                super::client::head_output(client, &plan.options.bucket, &plan.key, None)
+                    .await?
+                    .is_some()
+                    || super::client::prefix_exists(
+                        client,
+                        &plan.options.bucket,
+                        &format!("{}/", plan.key.trim_end_matches('/')),
+                    )
+                    .await?
+            } else {
+                present
+            };
+            if (report.only_new && final_present) || (report.only_existing && !final_present) {
+                report.skip();
+                return Ok(());
+            }
+        }
+        if !container && present && !exact {
+            bail!("S3 destination is a prefix, not an object");
         }
     }
-    if !container && present && !exact {
-        bail!("S3 destination is a prefix, not an object");
+    if plan.controls.metadata.skip_newer {
+        let head = if container {
+            client::head_output(client, &plan.options.bucket, &plan.key, None).await?
+        } else {
+            exact_head
+        };
+        // Match pathname S3 copies, which compare whole seconds.
+        if let Some(head) = head {
+            let stored = client::Metadata::decode(head.metadata())?;
+            let mtime =
+                stored.map_or_else(|| head.last_modified().map_or(0, |t| t.secs()), |m| m.mtime);
+            if mtime > plan.source_meta.context("missing source timestamp")?.mtime {
+                report.skip();
+            }
+        }
     }
     Ok(())
 }
@@ -201,6 +233,19 @@ async fn upload(
 ) -> Result<()> {
     let controls = plan.controls;
     let options = &plan.options;
+    let metadata = plan.source_meta.map(|m| {
+        client::Metadata {
+            kind: client::ObjectKind::File,
+            mode: m.mode,
+            uid: m.uid,
+            gid: m.gid,
+            mtime: m.mtime,
+            nsec: m.mtime_nsec,
+            hash: None,
+            hash_algorithm: Default::default(),
+        }
+        .encode()
+    });
     let mut expected_hash = controls.expected_hasher();
     let size = usize::try_from(options.part_size)?;
     let algorithm = Algorithm::for_endpoint(options.endpoint.as_deref());
@@ -216,6 +261,7 @@ async fn upload(
         let hash = digest(algorithm, &first);
         client
             .put_object()
+            .set_metadata(metadata)
             .bucket(&options.bucket)
             .key(&plan.key)
             .set_checksum_sha256(algorithm.is_sha256().then_some(hash.clone()))
@@ -235,6 +281,7 @@ async fn upload(
     }
     let created = client
         .create_multipart_upload()
+        .set_metadata(metadata)
         .bucket(&options.bucket)
         .key(&plan.key)
         .set_checksum_algorithm(
@@ -372,6 +419,31 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
         controls.report.skip();
         return Ok(());
     }
+    // Raw output needs no object attributes, even when the FD is a file.
+    let source_meta = if controls.metadata.preserve != 0 {
+        let stored = client::Metadata::decode(head.metadata())?;
+        let meta = stored
+            .filter(|m| m.kind == client::ObjectKind::File)
+            .map_or_else(
+                || crate::proto::Meta {
+                    mode: 0o666,
+                    uid: unsafe { libc::geteuid() },
+                    gid: unsafe { libc::getegid() },
+                    mtime: head.last_modified().map_or(0, |t| t.secs()),
+                    mtime_nsec: 0,
+                },
+                |m| crate::proto::Meta {
+                    mode: m.mode,
+                    uid: m.uid,
+                    gid: m.gid,
+                    mtime: m.mtime,
+                    mtime_nsec: m.nsec,
+                },
+            );
+        Some(meta)
+    } else {
+        None
+    };
     if controls.report.dry_run {
         return Ok(());
     }
@@ -401,7 +473,8 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
         output = output.write_chunk(bytes).await?;
         controls.progress.add_bytes(length);
     }
-    controls.verify(expected_hash)
+    controls.verify(expected_hash)?;
+    output.apply_metadata(controls.metadata, source_meta)
 }
 
 async fn read_part(

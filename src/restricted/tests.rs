@@ -3809,6 +3809,8 @@ fn receiver_rejects_descriptor_copy_operations() {
             follow: false,
             root: None,
             placement: Default::default(),
+            metadata: Default::default(),
+            source_meta: None,
             settings: Default::default(),
         },
         crate::descriptor_copy::Operation::Finish { size: 0 },

@@ -169,6 +169,8 @@ placement path, rather than every copied entry.
 regular-file pairs; replacements between non-directory entry types still
 occur, but replacing a directory with a non-directory or the reverse is
 refused. Combine it with `--only-existing` to avoid creating missing entries too.
+It cannot combine with `--as-fd`; use a named destination so syq can check its
+timestamp before opening it.
 
 `--only-new` cannot combine with either policy. Neither `--only-new` nor
 `--skip-newer` can combine with `--inplace`: an interrupted write could leave
@@ -386,8 +388,11 @@ syq cp --preserve=permissions,ownership project --into backup
 ```
 
 `permissions` preserves modes; `ownership` requests numeric owner and group;
-`specials` enables device, FIFO, and socket nodes. Ownership needs suitable
-permissions on the destination. Hard links, ACLs, and xattrs are not preserved.
+`specials` enables device, FIFO, and socket nodes. `times` requests source
+modification times, which are already preserved for named destinations but are
+opt-in for [output descriptors](commands/cp.md#file-descriptors). Setting ownership
+or explicit timestamps needs suitable permissions on the destination. Hard links,
+ACLs, and xattrs are not preserved.
 
 ## Symlinks
 

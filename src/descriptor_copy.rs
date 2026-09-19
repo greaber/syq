@@ -3,6 +3,7 @@
 pub(crate) mod controls;
 pub(crate) mod fd;
 mod file;
+pub(crate) mod metadata;
 mod parallel;
 mod report;
 pub(crate) use controls::validate_controls;
@@ -82,6 +83,8 @@ pub(crate) enum Operation {
         root: Option<Vec<u8>>,
         placement: StreamPlacement,
         settings: Settings,
+        metadata: metadata::Policy,
+        source_meta: Option<crate::proto::Meta>,
     },
     Finish {
         size: u64,

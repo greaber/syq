@@ -81,7 +81,7 @@ In addition to the shared arguments above, it accepts:
 | `only_new`, `only_existing`, `skip_newer` | Boolean: copy missing entries, copy existing entries, or skip newer destination files |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
-| `preserve` | Preservation string or iterable of strings |
+| `preserve` | Preservation string or iterable: `times`, `permissions`, `ownership`, `specials` |
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
 | `min_size`, `max_size` | Native size strings or integer bytes |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` |

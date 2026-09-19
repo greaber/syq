@@ -1174,12 +1174,14 @@ pub enum Response {
     /// A pinned stream source length, or None for a destination.
     DescriptorOpened {
         size: Option<u64>,
+        metadata: Option<Meta>,
         ticket: DescriptorTicket,
     },
     /// Dry-run inspection: a named source length, or unknown upload length.
     DescriptorInspected {
         skipped: bool,
         size: Option<u64>,
+        metadata: Option<Meta>,
     },
 }
 
