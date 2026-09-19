@@ -171,13 +171,13 @@ struct Workers {
     runtime: tokio::runtime::Handle,
 }
 impl Workers {
-    fn run(&self, id: usize) -> Result<()> {
+    fn run(&self, id: usize, permit: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
         let mut worker = self.session.worker(
             self.ticket.clone(),
             self.controls.settings,
             self.args.connections_default && id < 2,
             &self.cancelled,
-            &self.runtime,
+            permit,
         )?;
         self.gate.mark_ready(id);
         self.ready.notify_one();
@@ -501,30 +501,40 @@ pub(crate) async fn execute(
         runtime: tokio::runtime::Handle::current(),
     };
     let mut tasks = tokio::task::JoinSet::new();
-    let spawn = |tasks: &mut tokio::task::JoinSet<Result<()>>, id| -> Result<()> {
+    let spawn = |tasks: &mut tokio::task::JoinSet<Result<()>>, id| {
         let worker = workers.clone();
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        // Workers must not exhaust Tokio's blocking pool: the pipe reader and
-        // ordered writer also need that pool to make forward progress.
-        let thread = std::thread::Builder::new()
-            .name(format!("stream-{id}"))
-            .spawn(move || {
-                let result = worker.run(id);
-                worker.gate.mark_absent(id);
-                let _ = result_tx.send(result);
-            })
-            .context("start stream data worker")?;
         tasks.spawn(async move {
-            let result = result_rx.await;
-            thread
-                .join()
-                .map_err(|_| anyhow::anyhow!("stream worker panicked"))?;
-            result.context("stream worker stopped")?
+            let result = async {
+                let Some(permit) = worker
+                    .session
+                    .worker_permit(&worker.cancelled, &worker.draining)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                let running = worker.clone();
+                // Reserve shared capacity before creating a thread. Workers
+                // cannot use Tokio's blocking pool: payload I/O needs it too.
+                let thread = std::thread::Builder::new()
+                    .name(format!("stream-{id}"))
+                    .spawn(move || {
+                        let _ = result_tx.send(running.run(id, permit));
+                    })
+                    .context("start stream data worker")?;
+                let result = result_rx.await;
+                thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("stream worker panicked"))?;
+                result.context("stream worker stopped")?
+            }
+            .await;
+            worker.gate.mark_absent(id);
+            result
         });
-        Ok(())
     };
     for id in gate.begin_warming(prepared.workers) {
-        spawn(&mut tasks, id)?;
+        spawn(&mut tasks, id);
     }
     let mut policy = tune::Policy::new(prepared.workers, 1, prepared.worker_limit);
     let mut sampler = tune::Sampler::default();
@@ -650,7 +660,7 @@ pub(crate) async fn execute(
                         let target = policy.observe(score);
                         if target != gate.active() {
                             if target < gate.active() { gate.set_active(target); gate.set_retain(target.max(2)); policy.activated(); }
-                            for id in gate.begin_warming(target) { spawn(&mut tasks, id)?; }
+                            for id in gate.begin_warming(target) { spawn(&mut tasks, id); }
                             sampler.reset();
                         }
                     }

@@ -213,27 +213,38 @@ impl Session {
         *started = true;
         Ok(())
     }
+    pub(super) async fn worker_permit(
+        &self,
+        cancelled: &AtomicBool,
+        draining: &AtomicBool,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        // Queue once, before creating an OS thread. Entries waiting for shared
+        // capacity must neither consume threads nor jump ahead of one another.
+        let acquire = self.resources.workers.clone().acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            anyhow::ensure!(!cancelled.load(Relaxed), "stream cancelled");
+            if draining.load(Relaxed) {
+                return Ok(None);
+            }
+            tokio::select! {
+                permit = &mut acquire => {
+                    let permit = permit?;
+                    anyhow::ensure!(!cancelled.load(Relaxed), "stream cancelled");
+                    return Ok((!draining.load(Relaxed)).then_some(permit));
+                },
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
+    }
     pub(super) fn worker(
         self: &Arc<Self>,
         ticket: DescriptorTicket,
         settings: Settings,
         first: bool,
         cancelled: &AtomicBool,
-        runtime: &tokio::runtime::Handle,
+        permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Worker> {
-        // Queue once: newly admitted entries must not jump ahead of entries
-        // already waiting for the shared worker ceiling.
-        let permit = runtime.block_on(async {
-            let acquire = self.resources.workers.clone().acquire_owned();
-            tokio::pin!(acquire);
-            loop {
-                anyhow::ensure!(!cancelled.load(Relaxed), "stream cancelled");
-                tokio::select! {
-                    permit = &mut acquire => return Ok::<_, anyhow::Error>(permit?),
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
-                }
-            }
-        })?;
         let mut connections = self.connections.lock().unwrap();
         while connections.leased >= self.limit {
             anyhow::ensure!(!cancelled.load(Relaxed), "stream cancelled");

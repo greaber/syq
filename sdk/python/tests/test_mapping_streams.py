@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import sys
 import unittest
 
 import syq
@@ -151,6 +152,55 @@ class MappingStreamCopies(unittest.TestCase):
             source.close()
         result = self.client.cp(mapping=[syq.MappingEntry("source", syq.StreamDestination(prefix))], cwd=self.root)
         self.assertEqual(result.bytes_transferred, 1024 * 1024)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "counts native threads through /proc")
+    def test_shared_worker_limit_bounds_native_threads(self):
+        import threading
+        import time
+        from functools import partial
+        from pathlib import Path
+        from unittest.mock import patch
+        from syq._callback_runtime import Callbacks
+
+        barrier = threading.Barrier(16)
+        release = threading.Event()
+        process_ids = []
+        attach = Callbacks.attach
+        def attached(callbacks, process):
+            process_ids.append(process.pid)
+            attach(callbacks, process)
+        def produce(index, output):
+            barrier.wait(timeout=5)
+            if index == 0:
+                try:
+                    # Keep all entries open long enough for workers waiting on
+                    # the shared ceiling to appear if they own native threads.
+                    deadline = time.monotonic() + 0.15
+                    peak = 0
+                    while time.monotonic() < deadline:
+                        names = []
+                        for task in Path(f"/proc/{process_ids[0]}/task").iterdir():
+                            try:
+                                names.append((task / "comm").read_text().strip())
+                            except (FileNotFoundError, ProcessLookupError):
+                                pass
+                        active = sum(name.startswith("stream-") for name in names)
+                        peak = max(peak, active)
+                        self.assertLessEqual(active, 16, "waiting entries created extra worker threads")
+                        time.sleep(0.005)
+                    self.assertGreater(peak, 0)
+                finally:
+                    release.set()
+            else:
+                self.assertTrue(release.wait(timeout=5))
+            output.write(bytes([index]) * 65536)
+        entries = [syq.MappingEntry(syq.StreamSource(partial(produce, i)), str(i)) for i in range(16)]
+        with patch.object(Callbacks, "attach", attached):
+            result = self.client.cp(mapping=entries, into=self.root, stream_concurrency=16,
+                                    performance_tuning="workers=16")
+        self.assertEqual(result.files_transferred, 16)
+        for i in range(16):
+            self.assertEqual((self.root / str(i)).read_bytes(), bytes([i]) * 65536)
 
     def test_concurrency_is_bounded_and_cancelled_full_producer_does_not_hang(self):
         import threading

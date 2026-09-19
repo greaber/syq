@@ -121,7 +121,10 @@ def main():
             for options, sending in [(upload, True), (download, False)]:
                 diagnostic = run(directory, sending, options, payloads)
                 expected = b'EncryptedTcp' if name == 'tcp' else b'Ssh'
-                assert diagnostic.count(b'ready (' + expected + b')') == 2 * len(payloads), diagnostic
+                # A short entry can finish before its second worker gets shared
+                # capacity. It must not open a connection merely to retire it.
+                ready = diagnostic.count(b'ready (' + expected + b')')
+                assert len(payloads) <= ready <= 2 * len(payloads), diagnostic
                 if name == 'tcp':
                     assert diagnostic.count(b'data connection via tcp ') == 2, diagnostic
             run(directory, True, upload + ['--only-new'], payloads, skipped=True)
