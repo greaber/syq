@@ -1199,7 +1199,7 @@ impl Engine {
             }
         }
         if self.options.route.is_server_copy() && selectors.iter().any(|s| s.4.is_some()) {
-            bail!("S3-to-S3 copies stay server-side; mapping expected digests require reading object contents and are not supported");
+            bail!("S3-to-S3 copies stay server-side; mapping expected hashes require reading object contents and are not supported");
         }
         let matcher = crate::scan::build_ignore(&self.args.ignore_lines)?;
         let min = self

@@ -45,7 +45,7 @@ pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
             bail!("descriptor copies always transfer the selected bytes; content comparison is not supported");
         }
         if s3 && checks.transfer.flatten().is_some() {
-            bail!("extra S3 stream verification is not supported: raw objects have no syq digest metadata; use --expected-hash with a known digest (provider checksums remain enabled)");
+            bail!("extra S3 stream verification is not supported: raw objects have no syq hash metadata (provider checksums remain enabled)");
         }
     }
     if let Some(options) = &mut args.s3 {

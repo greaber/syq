@@ -1784,7 +1784,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             false,
         )?;
         if !entry.is_some_and(|entry| entry.kind == Kind::File) {
-            bail!("--expected-hash requires one regular source file");
+            bail!("an expected hash requires one regular source file");
         }
     }
     source_roots
