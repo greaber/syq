@@ -14,22 +14,43 @@ It needs no SSH server, public address, or incoming network port.
 
 ## Set up receiving
 
-With syq installed on both machines, run these commands on your laptop:
+Receiving starts automatically when syq opens a persistent SSH connection,
+unless you have turned receiving off. To enable persistence and connect to a
+server now, run this on your laptop with syq installed on both machines:
+
+```sh
+syq persist connect server
+```
+
+This opens the connection and waits until receiving is ready. An ordinary
+`ssh server` session does not enable receiving. If you already have a persistent
+connection to this server, you do not need to connect again. For example, after
+`syq persist on`, a syq copy or remote path completion can open that connection.
+If you previously turned receiving off, run `syq persist receive on` first.
+
+By default, your receiving name is your laptop's short hostname, and downloads
+and commands start in your home directory. `connect` prints the receiving name.
+The examples below use `@laptop`; replace it with your own name.
+
+Once `connect` finishes, you can close that terminal and make requests from any
+shell on the server, including an existing tmux session.
+
+### Optional name and directory
+
+To create a receiving profile named `laptop` with a different starting
+directory, run these commands on your laptop:
 
 ```sh
 mkdir -p ~/Downloads/server
 syq persist receive on --name laptop --cwd ~/Downloads/server
-syq persist connect server
 ```
 
-The name `@laptop` identifies your laptop for all three uses. `--cwd` sets the
-starting directory for downloads and commands. Once `connect` finishes, you
-can close that terminal and make requests from any shell on the server,
-including an existing tmux session.
+Here, `receive on` configures the profile; it is not required to use the default
+settings. `--cwd` sets the starting directory for downloads and commands.
 
 ## Copy files to your laptop
 
-On the server, send files to the directory you chose during setup:
+On the server, send files to your receiving directory:
 
 ```sh
 syq cp results --to @laptop

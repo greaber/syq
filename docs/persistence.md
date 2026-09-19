@@ -1,7 +1,8 @@
 # Keep connections open
 
 Persistence keeps SSH connections ready for repeated copies and other syq
-commands. Enable it and connect to a server without copying files:
+commands. It is off by default. Enable it and connect to a server without
+copying files:
 
 ```sh
 syq persist connect server
@@ -13,8 +14,9 @@ opened by later syq commands instead, run `syq persist on`.
 Persistence also speeds up [remote path completion](install.md#shell-completion):
 completion reuses the open connection, avoiding a new SSH login for each lookup.
 
-Receiving is enabled by default. It lets connected servers request file copies
-to your machine, commands on it, and authorization for copies between servers,
+Receiving starts automatically with persistent connections unless you have
+turned it off. It lets connected servers request file copies to your machine,
+commands on it, and authorization for copies between servers,
 with approval on your machine. See [Use your laptop from a server](receive.md)
 for setup and approval controls.
 
