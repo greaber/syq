@@ -4424,5 +4424,5 @@ fn expected_mapping(root: &Path, source: &str, destination: &str, expected: &str
     });
     let path = root.join("expected.mapping");
     std::fs::write(&path, record.to_string()).unwrap();
-    path.to_str().unwrap().to_owned()
+    path.canonicalize().unwrap().to_str().unwrap().to_owned()
 }
