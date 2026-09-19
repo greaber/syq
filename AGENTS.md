@@ -434,37 +434,11 @@ every actual update. See `RELEASING.md` for provisioning, backup, and rotation.
 
 ## Performance evidence
 
-Match the benchmark to the claim: startup latency, total time for a small copy,
-and sustained transfer throughput are different measurements. Short tests are
-useful for real short operations and controlled microbenchmarks, but a few
-subsecond or one-to-two-second copies are preliminary evidence for a throughput
-change, not sufficient validation of a new performance default.
-
-- For sustained-throughput comparisons, pilot the workload and enlarge it so
-  the faster variant normally spends at least 30 seconds doing transfer work;
-  aim for 30–60 seconds per measured copy. This is a working target to expose
-  startup, autotuning and system-state effects, not a statistical guarantee.
-  Setup, verification, cleanup and sleeps do not count toward it. Preserve the
-  relevant file-size and directory distribution, and report changes in working
-  set or cache behavior. Repeatedly launching a short copy measures repeated
-  startup; it does not substitute for one sustained transfer.
-- Choose the run count and order before comparing results. Normally use at
-  least five independent baseline/candidate pairs with balanced or randomized
-  order. Keep all observations and report absolute times, variation and paired
-  differences, not just a percentage between medians. If the result remains
-  noisy, report it as inconclusive and plan further measurements; do not stop
-  collecting when the numbers become favorable. Longer duration alone does
-  not remove bias or replace repetition.
-- Record exact builds, workload, cache/warmup policy, concurrency and relevant
-  host load. Keep competing measurements off the hosts. Measure unprofiled
-  elapsed time separately from profiles; collect enough samples for the code
-  being attributed and report sampling limitations. Aggregate CPU seconds
-  across many cores are not elapsed measurement duration. CPU and syscall
-  reductions support a mechanism but do not establish a throughput gain.
-- Keep representative small-copy/startup tests too, using enough independent
-  repetitions to establish their variability. When a resource constraint
-  prevents a sustained test, state that limitation and keep the throughput
-  conclusion provisional. Verify copied content outside the timed interval.
+Choose benchmark duration to suit the behavior being measured; there is no
+fixed minimum. Short tests can measure startup or small operations, but do not
+infer sustained performance from subsecond runs unless there is evidence that
+they reach a representative steady state quickly. Consider startup, autotuning
+and variability, and lengthen or repeat the test as needed to support the claim.
 
 ## Verification
 
