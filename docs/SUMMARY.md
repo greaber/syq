@@ -11,6 +11,7 @@
 - [Keep connections open](persistence.md)
 - [Use your laptop from a server](receive.md)
 - [Rename and reorganize](mappings.md)
+- [Use rsync-style commands](rsync.md)
 # Performance
 
 - [Speed](speed.md)
