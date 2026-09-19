@@ -20,6 +20,21 @@ Prebuilt wheels include the matching syq executable. Installation needs no Rust
 compiler, and SDK calls need no executable download or writable home directory
 for installation. The `syq` command is also available in the Python environment.
 
+## Try a copy
+
+```python
+import syq
+
+result = syq.cp("data", into="backup")
+print(result.files_transferred, result.bytes_transferred)
+```
+
+This copies `data` to `backup/data`. Add `to="server"` to use an SSH destination,
+or `dry_run=True` to preview the changes. See the [guide and examples](python-guide.md)
+for filtering, mappings, removal, and error handling.
+
+## Building from source
+
 Installing from a source distribution builds the executable and requires Rust
 and a C compiler. Its remote behavior follows the native source version bundled
 in that distribution: source builds upload themselves to compatible SSH hosts

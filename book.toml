@@ -15,8 +15,8 @@ git-repository-url = "https://github.com/greaber/syq"
 edit-url-template = "https://github.com/greaber/syq/edit/master/{path}"
 
 # Shared branding and mdBook layout, plus the interactive copy examples.
-additional-css = ["theme/copy-demo.css", "theme/brand.css", "theme/docs.css", "theme/sidebar.css", "theme/controls.css"]
-additional-js = ["theme/docs.js", "theme/copy-demo.js", "theme/sidebar.js", "theme/controls.js"]
+additional-css = ["theme/copy-demo.css", "theme/tool-examples.css", "theme/brand.css", "theme/docs.css", "theme/sidebar.css", "theme/controls.css"]
+additional-js = ["theme/docs.js", "theme/copy-demo.js", "theme/tool-examples.js", "theme/sidebar.js", "theme/controls.js"]
 
 [output.html.redirect]
 "sdk-compatibility.html" = "python-reference.html#compatibility"

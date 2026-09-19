@@ -7,22 +7,9 @@ syq cp project --into backup
 This copies `project` to `backup/project`. Existing files are updated when
 needed; unrelated files stay. See [`syq cp`](commands/cp.md) for the option list.
 
-Local copies use filesystem copy optimizations when available. On the same
-APFS volume, eligible files can share disk blocks while remaining independently
-writable. See [local copies and NFS](speed.md#local-copies-and-nfs) for what this
-means for storage use and reported speed.
-
-The final summary shows what was copied or skipped, how long it took, and any
-errors. Add `-v` to list copied paths. For connection and performance details,
-see [diagnosing a slow copy](speed.md#diagnose-a-slow-copy).
-
-File transfers have no fixed duration or stall deadline. They can continue
-through slowdowns and pauses; cancel the command if you no longer want to wait.
-Connection setup, SSH keepalives, and return-connection heartbeats still have
-time limits, and
-[restricted server-to-server copies](remote-reference.md#limits-and-unsupported-options)
-must finish before their signed authorization expires. SDK callers can also
-set their own deadlines.
+Choose the files, then choose their destination. `--from` and `--to` select
+machines or buckets; omit them for local paths. Placement options decide
+whether to keep the source name or give it a new one.
 
 ## See where files go
 
@@ -437,6 +424,31 @@ refused; even with `--follow-src`, symlinks cannot lead outside the root.
 Unlike `-C`, this is a boundary, not just a starting directory. It does not
 constrain the destination.
 
+## Output and diagnostics
+
+The final summary shows what was copied or skipped, how long it took, and any
+errors. Add `-v` to list copied paths. For connection and performance details,
+see [diagnosing a slow copy](speed.md#diagnose-a-slow-copy).
+
+Human output, including `persist status` and `persist receive status`, escapes
+terminal control characters, Unicode line separators, and directional marks
+in names and peer diagnostics. JSON status output keeps the original values.
+
+## Performance and time limits
+
+Local copies use filesystem copy optimizations when available. On the same
+APFS volume, eligible files can share disk blocks while remaining independently
+writable. See [local copies and NFS](speed.md#local-copies-and-nfs) for what this
+means for storage use and reported speed.
+
+File transfers have no fixed duration or stall deadline. They can continue
+through slowdowns and pauses; cancel the command if you no longer want to wait.
+Connection setup, SSH keepalives, and return-connection heartbeats still have
+time limits, and
+[restricted server-to-server copies](remote-reference.md#limits-and-unsupported-options)
+must finish before their signed authorization expires. SDK callers can also
+set their own deadlines.
+
 ## Shell pipelines and file descriptors
 
 You can compress data while sending it, without first saving the compressed
@@ -458,12 +470,6 @@ Both examples also work with local files or S3 objects. A pipeline can leave
 incomplete output if one of its commands fails, so check the whole pipeline's
 status before using the result. See [file descriptors](commands/cp.md#file-descriptors)
 for process substitution, named pipes, and failure handling.
-
-## Output and diagnostics
-
-Human output, including `persist status` and `persist receive status`, escapes
-terminal control characters, Unicode line separators, and directional marks
-in names and peer diagnostics. JSON status output keeps the original values.
 
 ## Environment variables and local files
 

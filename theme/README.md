@@ -74,11 +74,22 @@ blue Manrope wordmark above an Open Sans title. This adds character to the
 homepages while retaining the compact navigation and normal article headings.
 The docs homepage preserves its copy-files-with-syq fragment for existing links.
 
-The homepage leads with fast, programmable file transfer and a short
-description of copying, reorganizing, removing, resuming and automation.
-Shared landing-actions buttons offer installation, benchmarks, sending files
-home, server-to-server copies and programmable file placement. Quickstart
-examples follow under Try a copy.
+The homepage leads with fast, programmable file transfer and examples that
+separate file selection, endpoints, and placement. Its tool comparison widget
+uses curated examples in `docs/assets/tool-examples.html`; all examples remain
+readable without JavaScript. Native selectors provide keyboard navigation. Both keep their selected value;
+choices explicitly listed in each tool’s `data-unsupported` attribute are
+disabled without hover tooltips. The attributes record the reasons; missing
+examples are not evidence of incompatibility. Run
+`python3 scripts/test-tool-examples.py` to check coverage and known supported tasks. Keep at least one
+shared task across all tools so readers can switch between them. Comparisons keep the task’s starting point, endpoints, and data route fixed.
+The syq selection makes all tasks discoverable. Workarounds that change those
+constraints are described separately and do not enable a comparison.
+The landing-actions buttons offer installation and benchmarks. Quickstart
+examples follow under Try a copy, with task links below the comparison widget.
+Familiar commands appear first; Differences disclosures explain closer-match
+commands and remaining behavioral differences. Code wrapping is scoped to code
+elements so clipboard confirmations stay on one line.
 
 head.hbs adds Open Graph and Twitter card metadata so shared documentation
 links render a titled card rather than a bare URL. Title varies per page;
