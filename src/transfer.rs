@@ -145,6 +145,7 @@ pub struct Opts {
     pub dst_remote: bool,
     pub restricted_receiver: bool,
     pub dry_run: bool,
+    dry_run_metadata_files: AtomicU64,
     pub quiet: bool,
     pub verbose: u8,
     pub umask: u32,
@@ -175,6 +176,13 @@ pub struct Opts {
 impl Opts {
     fn metadata_fix_flags(&self, source: &Entry, destination: &Entry) -> u8 {
         let mut changes = 0;
+        if self.flags & flags::TIMES != 0
+            && (source.mtime != destination.mtime
+                || (self.precise_mtime
+                    && !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)))
+        {
+            changes |= flags::TIMES;
+        }
         if self.flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777 {
             changes |= flags::MODE;
         }
@@ -1397,6 +1405,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_remote: dst_ep.is_remote(),
         restricted_receiver: args.restricted_grant.is_some(),
         dry_run: args.dry_run,
+        dry_run_metadata_files: AtomicU64::new(0),
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
         umask: crate::fsops::process_umask(),
@@ -2772,7 +2781,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         sched.abort();
     } else {
         let has_file_work = !sched.jobs.lock().unwrap().is_empty();
-        if !opts.dry_run && has_file_work {
+        if has_file_work {
             if use_operator_anchor && destination_anchor.get().is_none() {
                 progress.error("syq: destination root is missing and cannot be anchored");
                 sched.abort();
@@ -2781,6 +2790,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let jobs = sched.jobs.lock().unwrap();
                     (
                         !opts.verify_only
+                            && !opts.dry_run
                             && !opts.tuning.force_ranges()
                             && bwlimit.is_none()
                             && jobs.iter().enumerate().all(|(idx, job)| {
@@ -2967,6 +2977,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     let max_delete_hit = st.max_delete_hit;
     let mut dry_run_changes = std::mem::take(&mut st.dry_run_changes);
+    if opts.dry_run {
+        dry_run_changes.regular_files = progress.files_done.load(Relaxed);
+        dry_run_changes.metadata_files += opts.dry_run_metadata_files.load(Relaxed);
+    }
     // The destination container is created outside per-entry accounting in
     // live runs; drop it here so the terminal record and the human dry-run
     // summary count the same set (spec: summary renders from the record).

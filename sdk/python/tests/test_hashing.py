@@ -171,3 +171,30 @@ class CandidateHashingTests(unittest.TestCase):
                       and event.disposition is syq.Disposition.FAILED]
             self.assertTrue(failed)
             self.assertEqual(failed[0].retry_entry().expected_hash, expected)
+
+    def test_dry_run_hash_reports_changes_without_verification_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "source").write_bytes(b"abc")
+            (root / "destination").write_bytes(b"abc")
+            source = (root / "source").stat()
+            os.utime(root / "destination", ns=(source.st_atime_ns, source.st_mtime_ns))
+            client = syq.Client(executable=os.environ["SYQ_CANDIDATE_EXECUTABLE"], process_cwd=root)
+            events = []
+            result = client.cp("source", as_="destination", dry_run=True, hash=True,
+                               on_event=events.append)
+            self.assertEqual(result.files_unchanged, 1)
+            self.assertEqual(result.files_transferred, 0)
+            self.assertFalse(any(isinstance(event, syq.TraceEvent) for event in events))
+            (root / "destination").write_bytes(b"bad")
+            os.utime(root / "destination", ns=(source.st_atime_ns, source.st_mtime_ns))
+            events.clear()
+            result = client.cp("source", as_="destination", dry_run=True, hash=True,
+                               on_event=events.append)
+            self.assertIs(result.status, syq.OperationStatus.SUCCESS)
+            self.assertEqual(result.files_transferred, 1)
+            self.assertEqual(result.errors, 0)
+            trace = next(event for event in events if isinstance(event, syq.TraceEvent))
+            self.assertIs(trace.reason, syq.TraceReason.CONTENT_DIFFERS)
+            self.assertEqual(trace.bytes, 3)
+            self.assertEqual((root / "destination").read_bytes(), b"bad")

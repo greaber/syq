@@ -48,6 +48,18 @@ def hashing(root, source, temporary):
         run(command + ["--results", results], data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "sha256", "value": sha256}))
         summary = json.loads(Path(results).read_text().splitlines()[-1])
         assert summary["files_unchanged"] == 1 and summary["bytes_transferred"] == 0, summary
+        # Hash previews read both endpoints, retain mapping identities, and do not publish.
+        preview = str(Path(temporary) / ("hash-preview-" + name + ".ndjson"))
+        run(command + ["--dry-run", "--results", preview], data=manifest([(local.name, "hash-" + name, "file")]))
+        summary = json.loads(Path(preview).read_text().splitlines()[-1])
+        assert summary["files_unchanged"] == 1 and summary["files_transferred"] == 0, summary
+        ssh("destination", f"from pathlib import Path; import os; p=Path({destination!r}); m=p.stat(); p.write_bytes(b'x'*{len(payload)}); os.utime(p, ns=(m.st_atime_ns,m.st_mtime_ns))")
+        preview = str(Path(temporary) / ("hash-preview-changed-" + name + ".ndjson"))
+        run(command + ["--dry-run", "--results", preview], data=manifest([(local.name, "hash-" + name, "file")]))
+        records = [json.loads(line) for line in Path(preview).read_text().splitlines()]
+        assert records[-1]["files_transferred"] == 1 and records[-1]["status"] == "success", records
+        assert any(r["type"] == "trace" and r["reason"] == "content_differs" and r["src"]["value"] == local.name for r in records), records
+        ssh("destination", f"from pathlib import Path; assert Path({destination!r}).read_bytes()==b'x'*{len(payload)}")
         # compare=xxh3-128 checks the existing file with the selected algorithm.
         run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "md5", "value": md5}))
         run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "md5", "value": wrong_md5}), expected=23)

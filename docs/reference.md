@@ -194,7 +194,7 @@ These options do not disable `--prune`; requested pruning still removes extras.
 ## Preview changes
 
 `--dry-run` shows planned changes without carrying out the copy or deletions.
-Add `-v` to list the changes by path:
+Add `--hash` to compare contents and `-v` to list planned changes by path:
 
 ```sh
 syq cp --dry-run -v --srcs-in project --into backup
