@@ -1799,6 +1799,21 @@ impl<R: Read> FrameReader<R> {
             let mut decoder = zstd::stream::read::Decoder::new(&body[..])?;
             decoder.window_log_max(23)?;
             let mut output = Vec::new();
+            // Bulk encoders include the decoded length. Reserve it once for
+            // ordinary frames instead of growing at every streaming read.
+            // This is only a hint: unknown sizes and concatenated frames still
+            // use the streaming decoder and its actual-output bound below.
+            if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(&body) {
+                if size >= self.limit as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decompressed frame exceeds limit",
+                    ));
+                }
+                output
+                    .try_reserve_exact(size.min(8 << 20) as usize)
+                    .map_err(io::Error::other)?;
+            }
             let mut chunk = [0u8; 16 << 10];
             loop {
                 let n = decoder.read(&mut chunk)?;

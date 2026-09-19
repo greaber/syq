@@ -764,3 +764,39 @@ fn released_v060_zstd_frame_remains_decodable() {
         );
     }
 }
+
+#[test]
+fn zstd_known_unknown_and_concatenated_sizes_preserve_decoding_and_limits() {
+    let message = block_message(vec![b'z'; 128 << 10]);
+    let payload = postcard::to_stdvec(&message).unwrap();
+    let known = zstd::bulk::compress(&payload, 1).unwrap();
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    encoder.write_all(&payload).unwrap();
+    let unknown = encoder.finish().unwrap();
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&unknown).unwrap(),
+        None
+    );
+    let middle = payload.len() / 2;
+    let mut concatenated = zstd::bulk::compress(&payload[..middle], 1).unwrap();
+    concatenated.extend(zstd::bulk::compress(&payload[middle..], 1).unwrap());
+    for compressed in [known, unknown, concatenated] {
+        let bytes = raw_frame(&compressed, crate::compression::ZSTD);
+        let decoded: Response = FrameReader::new(bytes.as_slice()).read_msg().unwrap();
+        assert_eq!(postcard::to_stdvec(&decoded).unwrap(), payload);
+        let mut reader = FrameReader::new(bytes.as_slice());
+        reader.set_limit(payload.len());
+        assert!(reader
+            .read_msg::<Response>()
+            .unwrap_err()
+            .to_string()
+            .contains("decompressed frame exceeds limit"));
+        let bytes = raw_frame(
+            &compressed[..compressed.len() - 1],
+            crate::compression::ZSTD,
+        );
+        assert!(FrameReader::new(bytes.as_slice())
+            .read_msg::<Response>()
+            .is_err());
+    }
+}
