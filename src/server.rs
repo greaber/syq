@@ -623,6 +623,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         ops.end_source_range();
                     }
                     w.write_msg(&response)?;
+                    if let Response::Block { data, .. } = response {
+                        ops.recycle_read_buffer(data);
+                    }
                 }
                 ops.end_source_range();
                 if !done_sent {
@@ -879,6 +882,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     return Ok(());
                 }
                 w.write_msg(&resp)?;
+                if let Response::Block { data, .. } = resp {
+                    ops.recycle_read_buffer(data);
+                }
             }
         }
     }

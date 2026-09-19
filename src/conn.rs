@@ -43,6 +43,9 @@ pub trait Conn: Send {
         self.send(req)?;
         Ok(None)
     }
+    /// Return a consumed block to a local source. Remote helpers recycle their
+    /// own read buffers after serialization; decoded remote blocks are dropped.
+    fn recycle_read_buffer(&mut self, _data: Vec<u8>) {}
     fn recv(&mut self) -> Result<Response>;
     /// Wait before the reply starts, excluding its remaining payload transfer
     /// when the connection can observe arrival separately from decoding.

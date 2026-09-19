@@ -63,6 +63,8 @@ pub(crate) fn destination_fraction_matches(source: u32, destination: u32) -> boo
 
 pub const PARTIAL_MARKER: &str = ".syq-tmp.";
 const FD_CACHE_MAX: usize = 16;
+const MIN_REUSABLE_READ: usize = 64 << 10;
+const MAX_REUSABLE_READ: usize = 8 << 20;
 const PARTIAL_DIRECTORY_CACHE_MAX: usize = 64;
 const PARTIAL_CANDIDATES_MAX: usize = 256;
 const SOURCE_FD_RESERVE: usize = 32;
@@ -375,6 +377,8 @@ fn is_superuser() -> bool {
 }
 
 pub struct FsOps {
+    // Only completed responses return storage; outstanding blocks own theirs.
+    read_buffer: Vec<u8>,
     descriptor_copy: crate::descriptor_copy::Session,
     stream_worker: Option<crate::descriptor_copy::FileWorker>,
     stream_ticket: Option<crate::descriptor_broker::DescriptorTicket>,
@@ -553,6 +557,7 @@ impl FsOps {
         let observations = Arc::new(crate::transfer_observations::Registry::default());
         let operation = observations.actor("filesystem");
         FsOps {
+            read_buffer: Vec::new(),
             descriptor_copy: Default::default(),
             stream_worker: None,
             stream_ticket: None,

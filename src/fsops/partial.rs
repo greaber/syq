@@ -1313,6 +1313,17 @@ impl FsOps {
         self.read_ahead.end_stream();
     }
 
+    /// Accept storage only after its response has been consumed or serialized.
+    /// Retain one ordinary buffer; exceptional sizes must not set idle memory.
+    pub(crate) fn recycle_read_buffer(&mut self, data: Vec<u8>) {
+        if self.read_buffer.is_empty()
+            && (MIN_REUSABLE_READ..=MAX_REUSABLE_READ).contains(&data.len())
+            && data.capacity() <= MAX_REUSABLE_READ
+        {
+            self.read_buffer = data;
+        }
+    }
+
     pub fn read_range(
         &mut self,
         path: &[u8],
@@ -1332,6 +1343,12 @@ impl FsOps {
         if u64::from(len) > MAX_READ_BYTES {
             bail!("read length {len} exceeds the {MAX_READ_BYTES}-byte protocol limit");
         }
+        let mut data = if (MIN_REUSABLE_READ..=MAX_REUSABLE_READ).contains(&(len as usize)) {
+            std::mem::take(&mut self.read_buffer)
+        } else {
+            self.read_buffer = Vec::new();
+            Vec::new()
+        };
         #[cfg(target_os = "linux")]
         let mut preparation = std::mem::take(&mut self.read_ahead);
         let result = (|| {
@@ -1347,7 +1364,9 @@ impl FsOps {
                 // explicit rsync --insecure-links compatibility path.
                 self.cached(&p, attempt)?.file()
             };
-            let mut data = vec![0u8; len as usize];
+            // Every visible byte is replaced by read_exact_at before publishing
+            // the response. Reused initialized bytes need no zeroing first.
+            data.resize(len as usize, 0);
             #[cfg(target_os = "linux")]
             let read = preparation.read_exact_at(f, &mut data, off);
             #[cfg(not(target_os = "linux"))]

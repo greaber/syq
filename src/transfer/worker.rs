@@ -1406,7 +1406,7 @@ impl Worker {
                 };
                 validate_range_reply(expected_off, expected_len, off, data.len())?;
                 let n = data.len() as u64;
-                self.dst.send(Request::WriteRange {
+                let recycled = self.dst.send_recycling(Request::WriteRange {
                     path: job.dst.clone(),
                     inplace: job.inplace,
                     copy_id: self.copy_id(),
@@ -1416,6 +1416,9 @@ impl Worker {
                     data: data.into(),
                     guard: job.container_guard.clone(),
                 })?;
+                if let Some(buffer) = recycled {
+                    self.src.recycle_read_buffer(buffer);
+                }
                 pending_writes.push_back((slot, n));
                 if pending_writes.len() >= write_window {
                     let (slot, n) = pending_writes.pop_front().expect("pending write");
@@ -1569,7 +1572,7 @@ impl Worker {
                     break;
                 }
                 self.limit(claimed);
-                self.dst.send(Request::WriteRange {
+                let recycled = self.dst.send_recycling(Request::WriteRange {
                     path: job.dst.clone(),
                     inplace: job.inplace,
                     copy_id: self.copy_id(),
@@ -1579,6 +1582,9 @@ impl Worker {
                     data: data.into(),
                     guard: job.container_guard.clone(),
                 })?;
+                if let Some(buffer) = recycled {
+                    self.src.recycle_read_buffer(buffer);
+                }
                 sent += 1;
                 self.benchmark.streamed_blocks += 1;
                 self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(claimed);

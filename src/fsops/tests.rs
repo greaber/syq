@@ -4612,3 +4612,110 @@ fn registered_fifo_keeps_identity_checks_without_connecting_a_writer() {
         "worker accepted a replaced FIFO: {response:?}"
     );
 }
+
+#[test]
+fn source_read_reuse_preserves_outstanding_responses_and_exact_lengths() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let path = directory.path().join("source");
+    let block = 256 << 10;
+    let contents: Vec<u8> = (0..3).flat_map(|i| vec![17 * (i + 1); block]).collect();
+    fs::write(&path, &contents).unwrap();
+    let mut ops = FsOps::new();
+    let read = |ops: &mut FsOps, off: usize, len: usize| {
+        let Response::Block {
+            off: actual,
+            hash,
+            data,
+        } = ops
+            .read_range(path.as_os_str().as_bytes(), None, 0, off as u64, len as u32)
+            .unwrap()
+        else {
+            panic!("expected source block");
+        };
+        assert_eq!(actual, off as u64);
+        assert_eq!(data, contents[off..off + len]);
+        assert_eq!(hash, ops.hash_policy.payload_algorithm().hash(&data));
+        data
+    };
+    let first = read(&mut ops, 0, block);
+    let second = read(&mut ops, block, block);
+    assert_ne!(first.as_ptr(), second.as_ptr());
+    let reusable = first.as_ptr();
+    ops.recycle_read_buffer(first);
+    let third = read(&mut ops, 2 * block, block);
+    assert_eq!(third.as_ptr(), reusable);
+    assert_eq!(second, contents[block..2 * block]);
+    // Only a completed response is offered back. A second completed response
+    // does not grow the cache, and a shorter read exposes no stale tail.
+    ops.recycle_read_buffer(third);
+    ops.recycle_read_buffer(second);
+    let short = read(&mut ops, 0, block / 2);
+    assert_eq!(short.as_ptr(), reusable);
+    ops.recycle_read_buffer(short);
+    let grown = read(&mut ops, block, block);
+    assert_eq!(grown.as_ptr(), reusable);
+}
+
+#[test]
+fn source_read_reuse_keeps_errors_visible_and_does_not_publish_stale_data() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let path = directory.path().join("source");
+    let block = 128 << 10;
+    let contents = vec![0x5a; block];
+    fs::write(&path, &contents).unwrap();
+    let mut ops = FsOps::new();
+    let Response::Block { data, .. } = ops
+        .read_range(path.as_os_str().as_bytes(), None, 0, 0, block as u32)
+        .unwrap()
+    else {
+        panic!("expected source block");
+    };
+    ops.recycle_read_buffer(data);
+    // The first half can be read, but the requested block extends past EOF.
+    assert!(ops
+        .read_range(
+            path.as_os_str().as_bytes(),
+            None,
+            0,
+            (block / 2) as u64,
+            block as u32
+        )
+        .is_err());
+    let Response::Block { data, .. } = ops
+        .read_range(path.as_os_str().as_bytes(), None, 0, 0, block as u32)
+        .unwrap()
+    else {
+        panic!("expected source block after failed read");
+    };
+    assert_eq!(data, contents);
+}
+
+#[test]
+fn source_read_reuse_releases_storage_for_small_and_oversized_reads() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let path = directory.path().join("source");
+    fs::write(&path, vec![0x42; MAX_REUSABLE_READ + 1]).unwrap();
+    let mut ops = FsOps::new();
+    for len in [1 << 20, 4096, MAX_REUSABLE_READ + 1] {
+        let Response::Block { data, .. } = ops
+            .read_range(path.as_os_str().as_bytes(), None, 0, 0, len as u32)
+            .unwrap()
+        else {
+            panic!("expected source block");
+        };
+        assert_eq!(data.len(), len);
+        if len == 4096 {
+            assert_eq!(
+                data.capacity(),
+                len,
+                "small read must not own the old bulk buffer"
+            );
+        }
+        ops.recycle_read_buffer(data);
+        if len == 1 << 20 {
+            assert_eq!(ops.read_buffer.len(), len);
+        } else {
+            assert_eq!(ops.read_buffer.capacity(), 0);
+        }
+    }
+}
