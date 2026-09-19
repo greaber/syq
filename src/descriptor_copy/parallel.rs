@@ -59,9 +59,12 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Option<Prepa
         crate::transfer::endpoint(location, args)?
     };
     let mut control = endpoint.connect_control(args.compress)?;
+    // Excluded uploads still check explicit placement conditions, but must not
+    // create a container or a staged destination. Reuse the inspection path.
+    let inspect_only = args.dry_run || controls.report.skipped();
     let (size, ticket) = match conn::ok(
         control.call(Request::DescriptorCopy(Operation::Open {
-            dry_run: args.dry_run,
+            dry_run: inspect_only,
             only_new: args.ignore_existing,
             only_existing: args.existing,
             path: plan.location.as_ref().unwrap().path.clone(),
@@ -75,9 +78,9 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Option<Prepa
     )? {
         Response::DescriptorOpened { size, ticket } => (size, ticket),
         Response::DescriptorInspected { size, skipped } => {
-            anyhow::ensure!(args.dry_run || skipped, "stream was not opened");
-            if let Some(size) = size {
-                controls.set_size(size);
+            anyhow::ensure!(inspect_only || skipped, "stream was not opened");
+            if plan.source.is_none() {
+                controls.skip_size(size)?;
             }
             if skipped {
                 controls.report.skip();
@@ -90,8 +93,8 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Option<Prepa
         plan.source.is_some() || size.is_some(),
         "stream source did not report its length"
     );
-    if let Some(size) = size {
-        controls.set_size(size);
+    if plan.source.is_none() && controls.skip_size(size)? {
+        return Ok(None);
     }
     if let Endpoint::Remote(spec) = &endpoint {
         if !args.no_tcp {
@@ -363,13 +366,17 @@ pub(super) async fn run(
         .as_fd
         .map(|fd| fd::Descriptor::open(fd, false, cancelled.clone()))
         .transpose()?;
-    if let Some(input) = &input {
-        if let Some(size) = input.remaining_len()? {
-            controls.set_size(size);
-        }
+    if plan.source.is_some() {
+        controls.skip_size(
+            input
+                .as_ref()
+                .map(fd::Descriptor::remaining_len)
+                .transpose()?
+                .flatten(),
+        )?;
     }
     if plan.location.is_none() {
-        if args.ignore_existing {
+        if args.ignore_existing || controls.report.skipped() {
             controls.report.skip();
             return Ok(());
         }

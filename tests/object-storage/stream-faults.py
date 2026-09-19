@@ -220,6 +220,41 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
             success(response)
             assert STATE['published'] == b'created'
 
+        elif CASE == 'size-filters':
+            for flag, size in [('--max-size', len(DATA) - 1), ('--min-size', len(DATA) + 1)]:
+                results = Path(temp) / (flag + '.json')
+                response = run(get + [flag, str(size), '--results', str(results)], env=env)
+                success(response)
+                assert not response.stdout and not STATE['gets']
+                records = [json.loads(line) for line in results.read_text().splitlines()]
+                assert records[-1]['files_excluded'] == 1
+                assert records[-1]['bytes_transferred'] == 0
+            response = run(get + ['--min-size', str(len(DATA)), '--max-size', str(len(DATA))], env=env)
+            success(response)
+            assert response.stdout == DATA
+            source = Path(temp) / 'source'
+            source.write_bytes(b'prefix-bytes')
+            with source.open('rb') as stream:
+                stream.seek(7)
+                before = STATE['requests']
+                response = run(put + ['--max-size', '4'], stdin=stream, env=env)
+                success(response)
+                assert stream.tell() == 7 and STATE['requests'] == before
+                conditional = list(put)
+                conditional[conditional.index('--as')] = '--as-new'
+                response = run(conditional + ['--max-size', '4'], stdin=stream, env=env)
+                failure(response)
+                assert b'destination existence condition failed' in response.stderr
+                assert stream.tell() == 7
+                response = run(put + ['--min-size', '5', '--max-size', '5'], stdin=stream, env=env)
+                success(response)
+                assert STATE['published'] == b'bytes' and stream.tell() == 12
+            before = STATE['requests']
+            response = run(put + ['--max-size', '1K'], input=b'unread', env=env)
+            failure(response)
+            assert b'require a known source length' in response.stderr
+            assert STATE['requests'] == before
+
         elif CASE in ('download', 'retry', 'bad-range', 'truncated'):
             STATE['bad'] = 'etag'
             result = run(get, env=env)

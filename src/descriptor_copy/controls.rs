@@ -11,6 +11,17 @@ use std::{
     time::Instant,
 };
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SizeFilter {
+    pub min: Option<u64>,
+    pub max: Option<u64>,
+}
+impl SizeFilter {
+    pub fn active(self) -> bool {
+        self.min.is_some() || self.max.is_some()
+    }
+}
+
 pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
     let tuning = args.tuning_options.unwrap_or_default();
     tuning.validate(args.bwlimit_bytes)?;
@@ -53,6 +64,7 @@ pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
 pub(crate) struct Controls {
     pub report: super::report::Report,
     pub settings: Settings,
+    size_filter: SizeFilter,
     pub pipeline: usize,
     pub progress: Arc<Progress>,
     limit: Option<crate::bwlimit::BandwidthLimit>,
@@ -61,7 +73,7 @@ pub(crate) struct Controls {
     quiet: bool,
 }
 impl Controls {
-    pub fn new(args: &Args, report: super::report::Report) -> Self {
+    pub fn new(args: &Args, report: super::report::Report, size_filter: SizeFilter) -> Self {
         let tuning = args.tuning_options.unwrap_or_default();
         let limit = (args.bwlimit_bytes != 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(args.bwlimit_bytes));
@@ -109,6 +121,7 @@ impl Controls {
         }
         Self {
             report,
+            size_filter,
             settings,
             pipeline: tuning.pipeline_depth(),
             progress,
@@ -117,6 +130,25 @@ impl Controls {
             stats: args.stats,
             quiet: args.quiet,
         }
+    }
+    /// Select before reading payload or setting up data workers. Unknown length
+    /// is not zero: deciding a pipe's final size would require consuming it.
+    pub fn skip_size(&self, size: Option<u64>) -> Result<bool> {
+        if let Some(size) = size {
+            self.set_size(size);
+        }
+        if !self.size_filter.active() {
+            return Ok(false);
+        }
+        let size = size.ok_or_else(|| anyhow::anyhow!(
+            "--min-size and --max-size require a known source length; pipes, sockets, and devices cannot be size-filtered without consuming input"
+        ))?;
+        let skipped = self.size_filter.min.is_some_and(|min| size < min)
+            || self.size_filter.max.is_some_and(|max| size > max);
+        if skipped {
+            self.report.skip();
+        }
+        Ok(skipped)
     }
     pub fn set_size(&self, size: u64) {
         self.progress.bytes_total.store(size, Relaxed);

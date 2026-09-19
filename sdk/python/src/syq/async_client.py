@@ -617,6 +617,8 @@ class AsyncClient:
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
         expected_digest: Digest | None = None,
+        min_size: str | None = None,
+        max_size: str | None = None,
         only_new: bool = False,
         only_existing: bool = False,
         dry_run: bool = False,
@@ -634,7 +636,7 @@ class AsyncClient:
         async def start():
             argv = arguments(
                 executable=await self._executable_value(), writing=False, path=src, endpoint=from_,
-                options=dict(only_new=only_new, only_existing=only_existing, dry_run=dry_run, cwd=cwd, root=root,
+                options=dict(min_size=min_size, max_size=max_size, only_new=only_new, only_existing=only_existing, dry_run=dry_run, cwd=cwd, root=root,
                              rsh=rsh, syq_path=syq_path, pscope=pscope,
                              no_bootstrap=no_bootstrap, no_compress=no_compress,
                              no_tcp=no_tcp, tcp_plain=tcp_plain,

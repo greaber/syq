@@ -69,7 +69,12 @@ impl Report {
         };
         // Without a skip policy, input can queue while the destination connects.
         // Decide this after CLI/environment parsing so the SDK need not duplicate it.
-        if plan.source.is_some() && !report.dry_run && !report.only_new && !report.only_existing {
+        if plan.source.is_some()
+            && !report.dry_run
+            && !report.only_new
+            && !report.only_existing
+            && !plan.size_filter.active()
+        {
             report.ready();
         }
         Ok(report)

@@ -73,6 +73,39 @@ class StreamTests(unittest.TestCase):
             self.assertEqual(json.loads(source.stderr.splitlines()[-1])["files_done"], 1)
         asyncio.run(asynchronous())
 
+    def test_reader_size_filters(self):
+        target = self.root / "sized"
+        target.write_bytes(b"bytes")
+        for options in ({"max_size": "4"}, {"min_size": "6", "dry_run": True}):
+            with self.client.open_reader(target, **options) as source:
+                self.assertEqual(source.read(), b"")
+            self.assertTrue(source.skipped)
+            self.assertEqual(source.result.files_excluded, 1)
+            self.assertEqual(source.result.bytes_transferred, 0)
+        with self.client.open_reader(target, min_size="5", max_size="5") as source:
+            self.assertEqual(source.read(), b"bytes")
+        self.assertFalse(source.skipped)
+        inherited = syq.Client(executable=SYQ, env={**self.env, "SYQ_CP_OPTIONS": "--max-size 4"})
+        with inherited.open_reader(target) as source:
+            self.assertEqual(source.read(), b"")
+        self.assertTrue(source.skipped)
+        # Writers produce through a pipe: an inherited size filter must fail
+        # at open, before the caller starts generating bytes.
+        with self.assertRaises(syq.SyqProcessError) as error:
+            inherited.open_writer(as_=target)
+        self.assertIn(b"require a known source length", error.exception.result.stderr)
+        self.assertEqual(target.read_bytes(), b"bytes")
+
+        async def asynchronous():
+            client = syq.AsyncClient(executable=SYQ, env=self.env, timeout=10)
+            async with client.open_reader(target, max_size="4") as source:
+                self.assertEqual(await source.read(), b"")
+            self.assertTrue(source.skipped)
+            self.assertEqual(source.result.files_excluded, 1)
+            async with client.open_reader(target, min_size="5", max_size="5") as source:
+                self.assertEqual(await source.read(), b"bytes")
+        asyncio.run(asynchronous())
+
     def test_stream_results_and_previews(self):
         target = self.root / "result-object"
         with self.client.open_writer(as_=target, dry_run=True) as out:
