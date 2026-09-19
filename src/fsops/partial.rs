@@ -1364,14 +1364,19 @@ impl FsOps {
                 // explicit rsync --insecure-links compatibility path.
                 self.cached(&p, attempt)?.file()
             };
-            // Every visible byte is replaced by read_exact_at before publishing
-            // the response. Reused initialized bytes need no zeroing first.
-            // Growing a reused allocation must not double the capacity kept
-            // by each worker when block sizes change.
-            if data.capacity() < len as usize {
-                data.reserve_exact(len as usize - data.len());
+            if data.is_empty() {
+                // Preserve the allocator's zeroed-allocation path for first,
+                // small and oversized reads that have no reusable storage.
+                data = vec![0u8; len as usize];
+            } else {
+                // Every visible byte is replaced by read_exact_at before
+                // publishing. Reused initialized bytes need no zeroing first.
+                // Avoid doubling each worker's capacity when block sizes grow.
+                if data.capacity() < len as usize {
+                    data.reserve_exact(len as usize - data.len());
+                }
+                data.resize(len as usize, 0);
             }
-            data.resize(len as usize, 0);
             #[cfg(target_os = "linux")]
             let read = preparation.read_exact_at(f, &mut data, off);
             #[cfg(not(target_os = "linux"))]
