@@ -349,6 +349,61 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn learned_conservative_limit_does_not_change_a_successful_partial_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = rooted(dir.path());
+    let target = ops
+        .rooted_destination_target("x".repeat(120).as_bytes(), None)
+        .unwrap()
+        .unwrap();
+    target
+        .root
+        .test_name_limit
+        .store(143, std::sync::atomic::Ordering::Relaxed);
+    let (before, _, ()) = with_rooted_partial(&target, &[9; 16], |_, _| Ok(())).unwrap();
+    // Another, longer filename failed and populated the shared parent limit.
+    assert_eq!(
+        target
+            .root
+            .rejected_partial_name_max(&target.relative)
+            .unwrap(),
+        143
+    );
+    let (after, _, ()) = with_rooted_partial(&target, &[9; 16], |_, _| Ok(())).unwrap();
+    assert_eq!(before, after);
+    assert!(after.to_path_buf().as_os_str().len() > 143);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_partials_keep_the_authoritys_exact_name_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = Arc::new(Root::open(dir.path()).unwrap());
+    root.test_name_limit
+        .store(143, std::sync::atomic::Ordering::Relaxed);
+    let target = GuardedTarget {
+        root: root.clone(),
+        relative: RelativePath::new("x".repeat(120).as_bytes()).unwrap(),
+        label: PathBuf::from(format!("logical/{}", "x".repeat(120))),
+    }
+    .as_rooted();
+    // Accept any candidate, as a filesystem may accept names longer than its
+    // conservative pathconf limit. The quota checker still derives this exact
+    // pre-change spelling, so a successful optimistic open would be wrong.
+    let (relative, _, ()) = with_rooted_partial(&target, &[9; 16], |_, _| Ok(())).unwrap();
+    assert_eq!(
+        relative.to_path_buf(),
+        PathBuf::from(format!(".{}.syq-tmp.z6xlpz5jq2rgx7pp", "x".repeat(117)))
+    );
+    assert_eq!(
+        root.test_name_queries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn optimistic_partial_does_not_retry_unrelated_or_unchanged_names() {
     let dir = tempfile::tempdir().unwrap();
     let ops = rooted(dir.path());

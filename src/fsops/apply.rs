@@ -30,6 +30,7 @@ pub(super) fn apply_one(
             relative,
             label,
             create_missing_parents: true,
+            query_partial_name_limit: false,
         })
     } else {
         None
@@ -81,6 +82,9 @@ pub(super) struct RootedTarget {
     pub(super) relative: RelativePath,
     pub(super) label: PathBuf,
     pub(super) create_missing_parents: bool,
+    // Signed receivers independently derive the partial name for quota checks.
+    // Keep their exact limit selection in sync with that authority.
+    pub(super) query_partial_name_limit: bool,
 }
 
 // One filename-limit observation for adjacent siblings in a read-only batch
@@ -114,6 +118,14 @@ impl PartialNameLimits {
 }
 
 impl RootedTarget {
+    pub(super) fn partial_name_max(&self) -> Result<usize> {
+        if self.query_partial_name_limit {
+            self.root.name_max_for_parent(&self.relative)
+        } else {
+            self.root.partial_name_max(&self.relative)
+        }
+    }
+
     pub(super) fn location(&self) -> FileLocation {
         FileLocation::Rooted {
             root: self.root.identity(),
@@ -129,6 +141,7 @@ impl GuardedTarget {
             relative: self.relative.clone(),
             label: self.label.clone(),
             create_missing_parents: false,
+            query_partial_name_limit: true,
         }
     }
 }
@@ -137,8 +150,15 @@ pub(super) fn rooted_partial_target(
     target: &RootedTarget,
     copy_id: &CopyId,
 ) -> Result<(RelativePath, PathBuf)> {
+    rooted_partial_target_with_limit(target, copy_id, target.partial_name_max()?)
+}
+
+fn rooted_partial_target_with_limit(
+    target: &RootedTarget,
+    copy_id: &CopyId,
+    component_limit: usize,
+) -> Result<(RelativePath, PathBuf)> {
     let relative_path = target.relative.to_path_buf();
-    let component_limit = target.root.partial_name_max(&target.relative)?;
     // Derive the visible component from the logical command-line spelling so
     // PartialPaths and every state-machine request keep one stable sidecar
     // name, including the PATH_MAX compact form. Only the resulting component
@@ -171,10 +191,11 @@ pub(super) fn with_rooted_partial<T>(
             let too_long = error
                 .downcast_ref::<io::Error>()
                 .is_some_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG));
-            if !too_long || !target.root.learn_partial_name_max(&target.relative)? {
+            if !too_long || target.query_partial_name_limit {
                 return Err(error);
             }
-            let (short, label) = rooted_partial_target(target, copy_id)?;
+            let limit = target.root.rejected_partial_name_max(&target.relative)?;
+            let (short, label) = rooted_partial_target_with_limit(target, copy_id, limit)?;
             if short == relative {
                 return Err(error);
             }

@@ -673,6 +673,7 @@ impl FsOps {
                 relative: destination_relative,
                 label: destination_label,
                 create_missing_parents: false,
+                query_partial_name_limit: false,
             },
         ))
     }

@@ -1710,6 +1710,7 @@ impl FsOps {
             // requests must not silently expand either a registered root or a
             // signed receiver's mutation authority.
             create_missing_parents: false,
+            query_partial_name_limit: false,
         }))
     }
 
@@ -2272,9 +2273,8 @@ impl FsOps {
                 let parent = relative
                     .parent()
                     .context("operation requires a descendant path")?;
-                let limit = limits.get_or_query(&target.root, parent, || {
-                    target.root.partial_name_max(&target.relative)
-                })?;
+                let limit =
+                    limits.get_or_query(&target.root, parent, || target.partial_name_max())?;
                 partial_path_with_name_max(&target.label, copy_id, limit)?
             } else {
                 self.partial_path(&resolve(path), copy_id)?

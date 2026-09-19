@@ -2421,6 +2421,7 @@ fn rooted_mkdir_race_accepts_only_an_existing_real_directory() {
         relative: RelativePath::new(path).unwrap(),
         label: PathBuf::from(OsStr::from_bytes(path)),
         create_missing_parents: true,
+        query_partial_name_limit: false,
     };
 
     assert!(create_rooted_directory_or_existing(&target(b"winner"), 0o755).is_ok());

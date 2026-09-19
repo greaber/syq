@@ -738,34 +738,38 @@ impl Root {
         directory_names(readable).context("read confined directory")
     }
 
-    /// Start with the common Linux limit. Only a rejected partial name creates
-    /// this cache; ordinary copies do not resolve, stat, or hash the parent here.
+    /// Start with the common Linux limit, independent of previous failures.
+    /// Some filesystems report a conservative limit but accept longer names;
+    /// learning a limit must not change a name that already opened successfully.
     pub(crate) fn partial_name_max(&self, path: &RelativePath) -> Result<usize> {
-        let (parents, _) = path.leaf()?;
+        path.leaf()?;
         #[cfg(target_os = "linux")]
         {
-            Ok(self
-                .partial_name_limits
-                .get()
-                .and_then(|limits| limits.lock().unwrap().get(parents).copied())
-                .unwrap_or(COMMON_NAME_MAX))
+            Ok(COMMON_NAME_MAX)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = parents;
             self.name_max_for_parent(path)
         }
     }
 
-    /// Learn a smaller limit after ENAMETOOLONG. The cache belongs to this
-    /// retained root, so separate mount views cannot share an observation.
-    pub(crate) fn learn_partial_name_max(&self, path: &RelativePath) -> Result<bool> {
-        let actual = self.name_max_for_parent(path)?;
-        if actual >= COMMON_NAME_MAX {
-            return Ok(false);
-        }
+    /// Query or reuse the smaller limit only after ENAMETOOLONG. The cache
+    /// belongs to this retained root, so separate mount views cannot share it.
+    pub(crate) fn rejected_partial_name_max(&self, path: &RelativePath) -> Result<usize> {
         #[cfg(target_os = "linux")]
         {
+            let (parents, _) = path.leaf()?;
+            if let Some(limit) = self
+                .partial_name_limits
+                .get()
+                .and_then(|limits| limits.lock().unwrap().get(parents).copied())
+            {
+                return Ok(limit);
+            }
+        }
+        let actual = self.name_max_for_parent(path)?;
+        #[cfg(target_os = "linux")]
+        if actual < COMMON_NAME_MAX {
             let (parents, _) = path.leaf()?;
             let mut limits = self
                 .partial_name_limits
@@ -777,7 +781,7 @@ impl Root {
             }
             limits.insert(parents.to_vec(), actual);
         }
-        Ok(true)
+        Ok(actual)
     }
 
     #[cfg(all(test, target_os = "linux"))]
