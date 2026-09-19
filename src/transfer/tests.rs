@@ -1545,27 +1545,6 @@ fn dry_run_location_labels_include_explicit_ssh_port() {
 }
 
 #[test]
-fn fast_batch_ceiling_grows_on_high_rtt_tcp_or_remote_ssh() {
-    assert_eq!(fast_batch_file_limit(None, None, false), FAST_BATCH_FILES);
-    assert_eq!(
-        fast_batch_file_limit(Some(99_999), None, false),
-        FAST_BATCH_FILES
-    );
-    assert_eq!(
-        fast_batch_file_limit(None, Some(HIGH_RTT_US), false),
-        HIGH_RTT_FAST_BATCH_FILES
-    );
-    assert_eq!(
-        fast_batch_file_limit(Some(262_000), Some(1_000), false),
-        HIGH_RTT_FAST_BATCH_FILES
-    );
-    assert_eq!(
-        fast_batch_file_limit(None, None, true),
-        HIGH_RTT_FAST_BATCH_FILES
-    );
-}
-
-#[test]
 fn ssh_startup_workers_are_bounded_by_files_and_splittable_ranges() {
     const MIB: u64 = 1 << 20;
     for (bytes, expected) in [(0, 1), (32, 1), (63, 1), (64, 2), (128, 4), (512, 8)] {
