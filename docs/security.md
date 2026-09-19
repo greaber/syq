@@ -272,15 +272,16 @@ Requests from a server are subject to local approval:
 
 | Request | Approval on your machine |
 |---|---|
-| Send files to your machine | Required outside an explicitly configured `--auto-approve-root` |
+| Send files to your machine | Required by default; `--auto-approve-root` permits unattended downloads confined to that directory |
 | Use your SSH access for a copy to another server | Always required |
 | Run a command on your machine | Always required |
 
 The prompt identifies the server account and requested operation. It cannot
 prove who typed the command there. Approving a copy does not approve a later
-command. A profile's optional `--server` list limits which locally selected
-SSH connections may use it. Within each allowed server account, all processes
-share this authority.
+command. By default, every connected server can use every enabled profile.
+A profile's optional `--server` list limits which locally selected SSH
+connections may use it. Within each allowed server account, all processes
+share this authority; choosing a different profile name does not isolate them.
 
 <a id="named-receiving-destinations"></a>
 

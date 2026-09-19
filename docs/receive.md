@@ -20,8 +20,9 @@ It needs no SSH server, public address, or incoming network port.
 <a id="background-connections"></a>
 
 Receiving starts automatically when syq opens a persistent SSH connection,
-unless you have turned receiving off. To enable persistence and connect to a
-server now, run this on your laptop with syq installed on both machines:
+unless you have turned it off or restricted its profiles to other servers.
+To enable persistence and connect to a server now, run this on your laptop
+with syq installed on both machines:
 
 ```sh
 syq persist connect server
@@ -84,10 +85,9 @@ it is never approved automatically. To use only terminal approval, run `syq pers
 Use `--to @laptop` for your connected receiving machine. Without `@`,
 `--to laptop` names an SSH destination instead.
 
-The starting directory is your explicit `--cwd`, otherwise `--root`, otherwise
-`--auto-approve-root`, otherwise your home directory. You can
-choose a path relative to it with `--into` or `--as`, or use an absolute path
-to copy elsewhere. Without either option, files go into the starting directory.
+Without `--into` or `--as`, files go into the profile's starting directory,
+shown by `syq persist receive status`. Use either option to choose a path
+relative to that directory, or an absolute path to copy elsewhere.
 
 To contain copies within a directory instead:
 
@@ -97,18 +97,13 @@ syq persist receive on --name laptop --root ~/Downloads/server
 
 With `--root`, incoming paths must be relative and stay inside that directory,
 even when following symlinks. Use `--no-root` to remove this restriction;
-changing `--cwd` does not remove it. An explicit cwd must be inside the hard root.
+changing `--cwd` does not remove it. Unless you set `--cwd`, the starting
+directory follows the hard root, then the automatic approval root, then your
+home directory. See [Directories](persistence-reference.md#directories) for
+changing or resetting these settings.
 
-`--cwd` pins the starting directory. Use `--auto-cwd` to return to automatic
-selection; changes to either root then update the starting directory according
-to the order above. `receive status` shows the effective directory and how it
-was selected.
-
-Changing a profile's settings stops its active copies so the new settings can
-take effect. Other profiles keep working.
-
-See [Directories](persistence-reference.md#directories) if a
-receiving location cannot be opened.
+Changing a profile's settings stops its active copies, commands, and pending
+requests. Other profiles keep working.
 
 <a id="unattended-copies"></a>
 
@@ -123,8 +118,8 @@ syq persist receive on --name laptop --auto-approve-root ~/Downloads/server
 Downloads confined to that directory need no approval; downloads elsewhere ask.
 `--root`, if configured, remains a hard boundary even with approval.
 Automatic approval trusts all processes running as the connected server accounts,
-including for overwrites inside that directory. Limit a profile to particular
-connections with `--server` (see below).
+including for overwrites inside that directory. You can
+[limit a profile to particular servers](#different-settings-for-different-servers).
 
 Commands on your laptop and authorization for copies between servers still
 require approval every time. See [Receivers](security.md#receivers) for the
@@ -202,13 +197,12 @@ syq persist connect server
 
 Then run `syq cp results --to @project` on the server. The directory must already
 exist. Each name has its own settings and approval policy, so you can keep a
-project separate from your general `laptop` destination. See
-[Names and profiles](persistence-reference.md#names-and-profiles) when moving
-a name to another laptop.
+project separate from your general `laptop` destination.
 
 Use `syq persist receive status` to list profiles and
 `syq persist receive off --name project` to stop one. See
-[Names and profiles](persistence-reference.md#names-and-profiles) for more options.
+[Names and profiles](persistence-reference.md#names-and-profiles) for more options
+and for moving a name to another laptop.
 
 ### Different settings for different servers
 
@@ -216,6 +210,7 @@ By default, each enabled profile is available through every connected server.
 To give a particular server its own inbox:
 
 ```sh
+mkdir -p ~/Downloads/work
 syq persist receive on --name work-inbox --server work \
   --auto-approve-root ~/Downloads/work
 syq persist connect work
@@ -223,7 +218,7 @@ syq persist connect work
 
 On `work`, download with `syq cp results --to @work-inbox`. Other connections
 cannot use that profile. Your general profile can still ask for approval on
-every download. Repeat `--server` to allow several connections; a new list
-replaces the previous list. `--all-servers` removes the restriction. See the
+every download. Repeat `--server` to allow several connections, or use
+`--all-servers` to remove the restriction. See the
 [profile reference](persistence-reference.md#names-and-profiles) for how SSH
 destination names match.

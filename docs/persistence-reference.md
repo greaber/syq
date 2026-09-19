@@ -17,7 +17,8 @@ syq persist connect server
 
 Both names work from the same server account: `syq cp results --to @project`
 and `syq cp report.pdf --to @laptop`. Each profile has its own directory, copy
-root, limits, automatic approval root, and background connection to each allowed server.
+root, limits, automatic approval root, and background connection to each
+allowed server.
 New profiles start with the usual defaults, including asking for approval; they
 do not inherit another profile's trust or confinement settings. Up to 32 profiles
 can be saved.
@@ -32,11 +33,12 @@ The server cannot select its own identity for this check. Changing your local
 SSH configuration can change which account an allowed alias reaches.
 
 Repeat `--server` to supply several destinations. Each supplied list replaces
-the saved list; `--all-servers` clears it. Withdrawing a connection stops that
-profile's active operations and pending requests there. Profiles with other
-names keep working. `receive wait HOST` waits only for profiles allowed on HOST.
+the saved list; `--all-servers` clears the restriction. Changes apply to existing
+persistent connections too. `receive wait HOST` waits only for profiles allowed
+on HOST.
 
-`receive on --name NAME` creates a profile or updates that name's settings.
+`receive on --name NAME` creates a profile or updates that name's settings;
+omitted options keep their saved values.
 Without `--name`, `receive on` updates the first saved profile, shown first by
 `receive status`. The initial hostname profile becomes a saved profile when
 persistence first connects; adding a new name then keeps that original profile.
@@ -95,14 +97,13 @@ effective cwd and whether it is explicit.
 The hard root prohibits downloads outside it, even with approval. The automatic
 approval root skips the prompt only for downloads confined inside it; other
 downloads ask. Symlinks cannot grant automatic writes outside that root.
-Replacing the automatic root itself with `--as .` requires approval, and is
+Replacing the automatic root directory itself requires approval, and is
 prohibited when it is also the hard root. These roots do not restrict approved
 commands or the destinations of approved copies to other servers.
 
-Invalid settings leave the
-saved configuration unchanged. If a saved directory disappears, you can still
-inspect, disable, or reconfigure the profile. Filenames inside it may use normal
-Unix filename bytes.
+Invalid settings leave the saved configuration unchanged. If a saved directory
+disappears, you can still inspect, disable, or reconfigure the profile.
+Filenames inside it may use normal Unix filename bytes.
 
 ## Copy limits
 
@@ -195,8 +196,7 @@ Saved names, directories, and limits carry over. Existing working directories
 remain explicitly selected. Settings using the former `--approve always` now
 require approval; choose `--auto-approve-root` explicitly to enable unattended
 downloads. Older binaries reject the updated preferences; use the newer binary
-to manage receiving. Stop old background services before upgrading so they
-cannot continue using their previous policy.
+to manage receiving.
 
 Connections created before persistent receiver identities remain discoverable.
 Their names become assigned when an updated receiving machine reconnects.

@@ -369,9 +369,9 @@ without starting connections. Endpoint states are `starting`, `connecting`,
 SSH is connected and the receiving state and errors.
 
 With receiving enabled for an endpoint, `ready` means its allowed receiving
-profiles are online; SSH can
-reconnect on its next use. If receiving preferences cannot be read, SSH entries
-are still listed, `receiving_error` explains the failure, and each entry's
+profiles are online; SSH can reconnect on its next use. If receiving preferences
+cannot be read, SSH entries are still listed, `receiving_error` explains the
+failure, and each entry's
 `receiving_enabled` is `null`.
 
 `persist receive status --json` reports each profile's `cwd`, `cwd_explicit`,
