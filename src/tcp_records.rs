@@ -93,10 +93,21 @@ impl<W: Write> RecordWriter<W> {
         if let Some(cipher) = &mut self.cipher {
             cipher.seal_in_place(&mut self.buf);
         }
-        let result = self
-            .inner
-            .write_all(&(self.buf.len() as u32).to_le_bytes())
-            .and_then(|()| self.inner.write_all(&self.buf));
+        // Keep the header and body in one socket write without copying them.
+        let header = (self.buf.len() as u32).to_le_bytes();
+        let mut slices = [io::IoSlice::new(&header), io::IoSlice::new(&self.buf)];
+        let mut remaining = &mut slices[..];
+        let result = (|| {
+            while !remaining.is_empty() {
+                match self.inner.write_vectored(remaining) {
+                    Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                    Ok(n) => io::IoSlice::advance_slices(&mut remaining, n),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })();
         // A failed record write is fatal to this stream. Retain the allocation,
         // but never treat a failed record's ciphertext as fresh plaintext.
         self.buf.clear();
@@ -180,7 +191,7 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, IoSlice};
 
     #[test]
     fn cipher_preserves_legacy_bytes_at_record_boundaries() {
@@ -380,5 +391,111 @@ mod tests {
         let error = receiver.open_in_place(&mut ciphertext).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(ciphertext.is_empty());
+    }
+
+    struct ShortWriter {
+        data: Vec<u8>,
+        max: usize,
+        interrupted: bool,
+        zero: bool,
+    }
+    impl Write for ShortWriter {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            let n = b.len().min(self.max);
+            self.data.extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+        fn write_vectored(&mut self, b: &[IoSlice<'_>]) -> io::Result<usize> {
+            if self.interrupted {
+                self.interrupted = false;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if self.zero {
+                return Ok(0);
+            }
+            let mut room = self.max;
+            for s in b {
+                let n = room.min(s.len());
+                self.data.extend_from_slice(&s[..n]);
+                room -= n;
+                if room == 0 {
+                    break;
+                }
+            }
+            Ok(self.max - room)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn records_handle_partial_vectored_writes_and_interrupts() {
+        for encrypted in [false, true] {
+            let bytes: Vec<u8> = (0..262177).map(|i| (i % 251) as u8).collect();
+            let mut expected = vec![];
+            let mut cipher = encrypted.then(|| Cipher::new(&[7; 32], 42, 1));
+            for chunk in bytes.chunks(RECORD_MAX) {
+                let mut body = chunk.to_vec();
+                if let Some(cipher) = &mut cipher {
+                    cipher.seal_in_place(&mut body);
+                }
+                expected.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                expected.extend_from_slice(&body);
+            }
+            for max in [1, 3, 4, 5, 127, 262144, usize::MAX] {
+                let mut sink = ShortWriter {
+                    data: vec![],
+                    max,
+                    interrupted: true,
+                    zero: false,
+                };
+                {
+                    let mut w = RecordWriter::new(
+                        &mut sink,
+                        if encrypted {
+                            Some(Cipher::new(&[7; 32], 42, 1))
+                        } else {
+                            None
+                        },
+                    );
+                    w.write_all(&bytes).unwrap();
+                    w.flush().unwrap();
+                }
+                assert_eq!(sink.data, expected, "max={max} encrypted={encrypted}");
+            }
+        }
+    }
+    #[test]
+    fn records_reject_zero_length_writes() {
+        let mut sink = ShortWriter {
+            data: vec![],
+            max: 4,
+            interrupted: false,
+            zero: true,
+        };
+        let mut w = RecordWriter::new(&mut sink, None);
+        w.write_all(b"hello").unwrap();
+        assert_eq!(w.flush().unwrap_err().kind(), io::ErrorKind::WriteZero);
+    }
+    struct ScalarWriter(Vec<u8>);
+    impl Write for ScalarWriter {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            let n = b.len().min(3);
+            self.0.extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn records_support_scalar_writers() {
+        let mut sink = ScalarWriter(vec![]);
+        {
+            let mut w = RecordWriter::new(&mut sink, None);
+            w.write_all(b"hello").unwrap();
+            w.flush().unwrap();
+        }
+        assert_eq!(sink.0, b"\x05\x00\x00\x00hello");
     }
 }
