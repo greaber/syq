@@ -341,6 +341,12 @@
         },
         "activity": {
           "$ref": "#/$defs/activity"
+        },
+        "rate_bytes_per_second": {
+          "$ref": "#/$defs/u64"
+        },
+        "eta_ms": {
+          "$ref": "#/$defs/u64"
         }
       },
       "required": [

@@ -284,12 +284,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             mapping: args.native_mapping.is_some(),
         },
     )?;
-    let progress = Progress::new(
-        !args.quiet && !args.no_progress,
-        args.progress,
-        None,
-        args.progress_json,
-    );
+    let progress = Progress::new(!args.quiet && !args.no_progress, args.progress, None);
     if let Some(writer) = writer {
         progress.set_results(writer);
     }

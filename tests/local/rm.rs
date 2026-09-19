@@ -405,7 +405,6 @@ fn native_rm_accepts_bulk_typed_selectors() {
         "--src-dirs",
         "dir-a",
         "dir-b",
-        "--progress-json",
         "--no-progress",
     ]);
     assert!(listing(&t.path("base")).is_empty());

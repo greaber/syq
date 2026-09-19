@@ -37,12 +37,7 @@ pub fn run(mut args: Args) -> Result<i32> {
         .first()
         .is_some_and(|location| location.is_remote());
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
-    let progress = Progress::new(
-        show_progress,
-        args.progress,
-        args.width,
-        !args.quiet && args.progress_json,
-    );
+    let progress = Progress::new(show_progress, args.progress, args.width);
     let progress = {
         let mut value = Arc::try_unwrap(progress).ok().expect("fresh progress");
         value.rm = true;

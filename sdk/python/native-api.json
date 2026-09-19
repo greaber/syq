@@ -73,7 +73,6 @@
         "quiet",
         "progress",
         "no-progress",
-        "progress-json",
         "stats",
         "detach",
         "src-fd",
@@ -118,8 +117,7 @@
         "verbose",
         "quiet",
         "progress",
-        "no-progress",
-        "progress-json"
+        "no-progress"
       ],
       "follow_up": []
     },
@@ -161,7 +159,6 @@
         "quiet",
         "progress",
         "no-progress",
-        "progress-json",
         "syq-path",
         "no-bootstrap",
         "results",

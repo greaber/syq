@@ -207,8 +207,9 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 | "follow" | "follow_src" | "src_fd" => "Sources and selection",
                 "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
                 | "follow_dst" | "as_fd" => "Destination placement",
-                "results" | "results_fd" | "progress" | "no_progress" | "progress_json"
-                | "stats" => "Progress and results",
+                "results" | "results_fd" | "progress" | "no_progress" | "stats" => {
+                    "Progress and results"
+                }
                 "resource_limits_arg" => "Resource limits",
                 "integrity_checking_arg" | "hash" => "Integrity checking",
                 "performance_tuning" | "block_size" => "Performance tuning",
@@ -295,7 +296,7 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" => ("S3 connection settings", 6),
         "performance_tuning" | "resource_limits_arg" => ("Performance and resource limits", 7),
         "dry_run" | "verbose" | "quiet" | "results" | "results_fd" | "progress" | "no_progress"
-        | "progress_json" | "stats" => ("Preview, progress, and results", 8),
+        | "stats" => ("Preview, progress, and results", 8),
         "help" | "version" => ("Help and version", 9),
         _ => ("Other options", 10),
     }

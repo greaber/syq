@@ -66,9 +66,7 @@ can leave it missing.
 - Treat human `message` text as display only; parse structured fields.
 
 `--results` includes both progress samples and final outcomes; use it for new
-integrations, including live progress displays. `--progress-json` emits
-progress on stderr, where diagnostics can also appear. Its format may change,
-and it does not supply the results stream's completion contract.
+integrations, including live progress displays.
 
 ## Record envelope
 
@@ -107,7 +105,8 @@ directly or through a mapping.
 ### `progress`
 
 Sampled telemetry, approximately once per second, for displays rather than
-accounting. It includes bytes, files, exclusions, scan state, and elapsed time.
+accounting. It includes bytes, files, exclusions, scan state, elapsed time, and
+optional `rate_bytes_per_second` and `eta_ms` estimates.
 Removal has zero byte and unchanged/excluded counts; its file counts reflect
 outcomes received so far. The terminal record owns final totals.
 
