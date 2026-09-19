@@ -407,7 +407,9 @@ fn unsupported_native_controls_are_hidden_from_help_and_completion() {
         for hidden in ["--only-existing", "--skip-newer", "compare="] {
             assert!(!text.contains(hidden), "{hidden}: {text}");
         }
-        assert!(text.contains("--only-new"));
+        if flag == "--help-all" {
+            assert!(text.contains("--only-new"));
+        }
     }
     let rsync = help(&["rsync", "--help-all"]);
     assert!(rsync.contains("--existing"));

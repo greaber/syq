@@ -1620,14 +1620,7 @@ fn unsupported_copy_controls_warn_without_changing_behavior() {
     ] {
         write(&t.path("destination"), b"old");
         set_mtime(&t.path("destination"), 1_700_000_000);
-        let output = native_syq(&[
-            "cp",
-            "-q",
-            option,
-            &t.s("source"),
-            "--as",
-            &t.s("destination"),
-        ]);
+        let output = native_syq(&["cp", option, &t.s("source"), "--as", &t.s("destination")]);
         assert_output_ok(&output);
         assert_eq!(
             stderr_of(&output).contains("unsupported and may be removed without notice"),
@@ -1640,7 +1633,7 @@ fn unsupported_copy_controls_warn_without_changing_behavior() {
         );
     }
     for option in ["--existing", "--update"] {
-        let output = native_syq(&["rsync", "-q", option, &t.s("source"), &t.s("destination")]);
+        let output = native_syq(&["rsync", option, &t.s("source"), &t.s("destination")]);
         assert_output_ok(&output);
         assert!(!stderr_of(&output).contains("unsupported"), "{output:?}");
     }
