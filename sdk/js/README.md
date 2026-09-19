@@ -6,9 +6,8 @@ installed `syq` executable directly with an argument array; it never constructs
 a shell command and it has no install script that downloads or executes a
 binary.
 
-The preview API intentionally offers raw execution and version discovery only.
-A typed copy and event API will follow syq's versioned NDJSON automation
-interface.
+The API provides raw execution and version discovery. It does not provide
+typed copy results or event callbacks.
 
 ```js
 import { run, version } from "@syq/sdk";

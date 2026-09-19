@@ -5,9 +5,8 @@ Package `syq` is the official preview Go adapter for the
 installed `syq` executable directly with an argument slice; it never constructs
 a shell command and it does not download or install a binary.
 
-The preview API intentionally offers raw execution and version discovery only.
-A typed copy and event API will follow syq's versioned NDJSON automation
-interface.
+The API provides raw execution and version discovery. It does not provide
+typed copy results or event callbacks.
 
 ```go
 package main

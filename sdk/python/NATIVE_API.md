@@ -106,8 +106,7 @@ s3_header=["X-Tigris-Consistent: true"])` uploads local data using credentials
 from the subprocess environment or AWS configuration. Copies between two S3
 endpoints use server-side copying within the same service; content verification
 options that require reading object bodies are rejected. SSH/S3 combinations
-are not supported. S3 results use `EndpointKind.S3`; older SDKs reject this new
-endpoint kind instead of interpreting it as SSH.
+are not supported. S3 results use `EndpointKind.S3`.
 
 `pscope` selects an isolated scope for reusing SSH connections. For return
 copies or commands, use `syq persist connect server` and omit `pscope`. See
@@ -160,20 +159,18 @@ remaining bytes in Python memory and checks completion before returning.
 
 ### Writer completion
 
-Use a `with` block. Successful writer exit sends a separate commit signal
-after closing the payload; EOF alone cannot publish a managed upload. An
-exception in the writer body before commit aborts without replacing the destination.
-Writers support `io.BufferedWriter` and `io.TextIOWrapper`.
-`close()` only ends payload input, so a buffered or text wrapper can close it
-while unwinding an exception without publishing partial data. Successful
-context exit commits even if a wrapper already closed the payload. Calling
-`abort()` explicitly cancels that automatic commit.
+Use a `with` block to commit on successful exit or abort on an exception.
+An abort before commit does not replace the destination. `close()` only ends
+payload input; it does not publish the file. Successful context exit commits
+even if you already called `close()`, unless you also called `abort()`.
+
+Writers support `io.BufferedWriter` and `io.TextIOWrapper`. Close the wrapper
+before committing the underlying writer so its buffered data is flushed.
 
 Outside a context, finish with `commit()` or `abort()`; `close()` alone leaves
 the transfer pending. `commit()` can follow payload closure, is repeatable
 after success, and fails after an abort. Explicit commit publishes immediately,
-so later application errors cannot undo it. Closing an outer wrapper flushes
-its buffered data; do that before committing the underlying writer.
+so later application errors cannot undo it.
 A timeout or connection loss during commit can leave the outcome uncertain;
 the method reports failure rather than claiming rollback. Whole datasets
 need their own final publication step after all object transfers succeed.
@@ -211,8 +208,7 @@ forced termination. Missing or invalid completion records raise
 
 A bounded reader call can yield partial data before a later transfer error.
 An unbounded `read()` checks transfer completion before returning its bytes.
-Successful reader exit establishes transfer completion, not that downstream application
-work was successful. An exception inside either context cancels the transfer
+An exception inside either context cancels the transfer
 and preserves the original exception. Writers that have not committed are
 aborted during garbage collection, including after payload closure; cleanup
 can block, so use explicit contexts for timely cleanup.
@@ -223,8 +219,7 @@ transfer failures raise `SyqProcessError`,
 whose result contains the exit status and the last 8 KiB of diagnostics, without
 capturing payload bytes. The stream's `stderr` property exposes those same
 last 8 KiB as bytes, including on success. For example, request `stats=True`
-and read `output.stderr.decode()` after the writer context exits. This is a
-bounded diagnostic tail, not a complete progress-event history.
+and read `output.stderr.decode()` after the writer context exits.
 
 ### Async streams
 
@@ -318,6 +313,16 @@ remain independent. `map(root=..., srcs_in=...)` carries the selected directory
 as the consuming copy's root. The copy resolves that root again; it does not
 inherit an open directory handle or a snapshot of the source tree.
 
+Normal end of stream iteration checks the mapping process status. Leaving its
+context early stops the process. An exhausted or closed stream cannot be copied
+as an empty mapping.
+
+For `cp(mapping=iterable)`, the entire iterable is saved to a temporary manifest
+before copying starts. An iteration, transformation, or serialization failure
+starts no copy. Plain iterables and manifest paths have no source context; pass
+`cwd`, `root`, or `from_` explicitly as needed. See
+[mapping rules](https://greaber.github.io/syq/mappings.html).
+
 <a id="digest-and-hashalgorithm"></a>
 
 ### Hash and HashAlgorithm
@@ -328,16 +333,6 @@ regular file. `algorithm` accepts a `HashAlgorithm` value or its string:
 64 digits for BLAKE3 and SHA-256, 32 for MD5 and XXH3-128. The immutable object
 validates the length and characters and stores lowercase hex.
 
-```python
-client.cp(
-    mapping=[syq.MappingEntry(
-        "data.bin", "verified.bin",
-        expected_hash=syq.Hash("md5", "900150983cd24fb0d6963f7d28e17f72"),
-    )],
-    into="backup",
-)
-```
-
 The expectation covers the complete resulting file, including reused bytes.
 A mismatch fails the file rather than reporting a successful copy. Files excluded
 by selection rules are not hash-verified. `hash=True` still controls whether
@@ -346,7 +341,7 @@ Dry runs preview changes without validating the expectation. An expected
 whole-file hash is independent of the algorithm used for block comparison or
 transport checks. MD5 and XXH3-128 are useful for compatibility
 and accidental-error detection, but do not provide cryptographic collision
-resistance. Receiver receipt hashes continue to use BLAKE3.
+resistance.
 
 ### MappingEntry
 
@@ -417,16 +412,6 @@ Both types are immutable and provide:
 | `PathValue.display` | `str` | Same as `str(path)` |
 
 `RelativePath` also implements `os.PathLike`, returning bytes.
-
-Normal end of stream iteration checks the mapping process status. Leaving its
-context early stops the process. An exhausted or closed stream cannot be copied
-as an empty mapping.
-
-For `cp(mapping=iterable)`, the entire iterable is saved to a temporary manifest
-before copying starts. An iteration, transformation, or serialization failure
-starts no copy. Plain iterables and manifest paths have no source context; pass
-`cwd`, `root`, or `from_` explicitly as needed. See
-[mapping rules](https://greaber.github.io/syq/mappings.html).
 
 <a id="retry-data-not-automatic-retry-policy"></a>
 
@@ -843,19 +828,10 @@ Timeouts cover subprocess execution. Managed installation and mapping-input
 materialization happen before the copy process starts and are not covered by
 its timeout. Async cancellation still stops mapping-input preparation.
 
-`syq exec` is also available through `run`; its command output and exit status
-are a process result:
-
-```python
-result = syq.run(
-    ["exec", "--on", "@mac", "--cwd", "work/project", "--", "cargo", "test"],
-    executable="/path/to/syq",
-)
-```
-
-For `exec`, pass `--cwd` in the argument list to select the receiving working
-directory. The SDK's `cwd=` parameter selects the local working directory of
-the requesting syq process.
+For `syq exec`, pass `--cwd` in the argument list to select the receiving
+working directory. The SDK's `cwd=` parameter selects the local working
+directory of the requesting process. See the
+[command example](https://greaber.github.io/syq/python-guide.html#run-other-commands).
 
 ### Result
 
@@ -891,7 +867,7 @@ its executable.
 For callers using a separate cache, `Client(cache_dir=...)` downloads the matching executable on first use and verifies
 it against the package's embedded release manifest. It checks the cached binary
 before every use and replaces missing or corrupt entries. It does not search
-`PATH`. The existing `syq.managed_executable()` API also keeps this behavior.
+`PATH`. `syq.managed_executable()` uses the same download and verification checks.
 
 The default cache is `$XDG_CACHE_HOME/syq/sdk/python/v<version>/` when
 `XDG_CACHE_HOME` is absolute, or `~/.cache/syq/sdk/python/v<version>/` otherwise.
