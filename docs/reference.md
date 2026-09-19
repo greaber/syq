@@ -194,9 +194,7 @@ These options do not disable `--prune`; requested pruning still removes extras.
 ## Preview changes
 
 `--dry-run` shows planned changes without carrying out the copy or deletions.
-Add `--hash` to compare file contents, including edits that preserve size and
-modification time. This reads existing files and can take as long as verification.
-Equal contents can still need metadata changes. Add `-v` to list planned changes by path:
+Add `--hash` to compare contents and `-v` to list planned changes by path:
 
 ```sh
 syq cp --dry-run -v --srcs-in project --into backup
