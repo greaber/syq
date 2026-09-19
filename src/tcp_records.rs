@@ -3,8 +3,7 @@
 //! variant the body is ciphertext + 16-byte tag and the nonce is
 //! `direction(1) | conn_id(3) | counter(8)`.
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use std::io::{self, Read, Write};
 
 pub const RECORD_MAX: usize = 256 * 1024;
@@ -13,7 +12,7 @@ pub const KEY_LEN: usize = 32;
 pub const CONNECTION_ID_MAX: u32 = 0x00ff_ffff;
 
 pub struct Cipher {
-    aead: Aes256Gcm,
+    aead: LessSafeKey,
     conn_id: u32,
     dir: u8,
     counter: u64,
@@ -26,7 +25,7 @@ impl Cipher {
             "TCP connection id exceeds nonce space"
         );
         Cipher {
-            aead: Aes256Gcm::new_from_slice(key).expect("key length"),
+            aead: LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("key length")),
             conn_id,
             dir,
             counter: 0,
@@ -41,35 +40,29 @@ impl Cipher {
         n
     }
     pub fn seal(&mut self, plain: &[u8]) -> Vec<u8> {
-        let n = self.nonce();
-        let nonce = Nonce::try_from(n.as_slice()).expect("nonce length");
+        let nonce = Nonce::assume_unique_for_key(self.nonce());
+        let mut buffer = Vec::with_capacity(plain.len() + 16);
+        buffer.extend_from_slice(plain);
         self.aead
-            .encrypt(
-                &nonce,
-                Payload {
-                    msg: plain,
-                    aad: &[],
-                },
-            )
-            .expect("encrypt")
+            .seal_in_place_append_tag(nonce, Aad::empty(), &mut buffer)
+            .expect("encrypt");
+        buffer
     }
     pub fn open(&mut self, cipher: &[u8]) -> io::Result<Vec<u8>> {
-        let n = self.nonce();
-        let nonce = Nonce::try_from(n.as_slice()).expect("nonce length");
-        self.aead
-            .decrypt(
-                &nonce,
-                Payload {
-                    msg: cipher,
-                    aad: &[],
-                },
-            )
+        let nonce = Nonce::assume_unique_for_key(self.nonce());
+        let mut buffer = Vec::from(cipher);
+        let len = self
+            .aead
+            .open_in_place(nonce, Aad::empty(), &mut buffer)
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "authentication failed (wrong key or corrupted data)",
                 )
-            })
+            })?
+            .len();
+        buffer.truncate(len);
+        Ok(buffer)
     }
 }
 
@@ -177,6 +170,72 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn cipher_matches_previous_backend_at_record_boundaries() {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::Aes256Gcm;
+
+        let key = [7; KEY_LEN];
+        let previous = Aes256Gcm::new_from_slice(&key).unwrap();
+        for direction in [0, 1] {
+            for id in [0, 0x123456, CONNECTION_ID_MAX] {
+                let mut sender = Cipher::new(&key, id, direction);
+                let mut receiver = Cipher::new(&key, id, direction);
+                for (counter, len) in [0, 1, 15, 16, 17, 255, 256, RECORD_MAX - 1, RECORD_MAX]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let plain: Vec<u8> = (0..len).map(|i| (i * 31 + counter) as u8).collect();
+                    let mut nonce = [0; 12];
+                    nonce[0] = direction;
+                    nonce[1..4].copy_from_slice(&id.to_be_bytes()[1..]);
+                    nonce[4..].copy_from_slice(&(counter as u64).to_be_bytes());
+                    let expected = previous.encrypt((&nonce).into(), plain.as_slice()).unwrap();
+                    let encoded = sender.seal(&plain);
+                    assert_eq!(encoded, expected);
+                    assert_eq!(receiver.open(&expected).unwrap(), plain);
+                    assert_eq!(
+                        previous
+                            .decrypt((&nonce).into(), encoded.as_slice())
+                            .unwrap(),
+                        plain
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cipher_rejects_wrong_key_nonce_tag_and_truncation() {
+        let key = [7; KEY_LEN];
+        let mut sender = Cipher::new(&key, 42, 1);
+        let encoded = sender.seal(b"authenticated payload");
+        for mut receiver in [
+            Cipher::new(&[8; KEY_LEN], 42, 1),
+            Cipher::new(&key, 43, 1),
+            Cipher::new(&key, 42, 0),
+        ] {
+            assert_eq!(
+                receiver.open(&encoded).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        let second = sender.seal(b"next record");
+        assert!(Cipher::new(&key, 42, 1).open(&second).is_err());
+        let mut bad_tag = encoded.clone();
+        *bad_tag.last_mut().unwrap() ^= 1;
+        assert!(Cipher::new(&key, 42, 1).open(&bad_tag).is_err());
+        for len in [0, 1, 15, 16, encoded.len() - 1] {
+            assert_eq!(
+                Cipher::new(&key, 42, 1)
+                    .open(&encoded[..len])
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
 
     #[test]
     fn encrypted_records_preserve_v041_wire_bytes() {
