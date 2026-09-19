@@ -67,13 +67,15 @@
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
+<p>A script chooses beach.jpg for a.jpg and summit.jpg for b.jpg.</p>
 <div class="tool-example-commands">
-<div><p><strong>rsync</strong></p><pre><code>rsync -t photos/a.jpg archive/2024/a.jpg
-rsync -t photos/b.jpg archive/2025/b.jpg</code></pre></div>
-<div><p><strong>syq</strong></p><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div>
+<div><p><strong>rsync</strong></p><pre><code>rsync -t photos/a.jpg server:/archive/beach.jpg
+rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
+<div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
+{"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --to server --into /archive</code></pre></div>
 </div>
-<p>A script can generate the commands on the left, or a syq mapping file with source a.jpg and destination 2024/a.jpg, then b.jpg and 2025/b.jpg.</p>
-<p class="tool-example-note">Create destination parent folders first. Syq reads the <a href="mappings.html">mapping file</a> in one operation, checks collisions, and supports resuming.</p>
+<p class="tool-example-note">For rsync, /archive must already exist on server.</p>
+<p><a href="mappings.html">Generate a mapping with a script</a>.</p>
 </section>
 <!-- References: https://download.samba.org/pub/rsync/rsync.1 --></details>
 <details class="tool-examples-group" data-tool="rclone" data-unsupported="{&quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers without agent forwarding&quot;: &quot;Copies between distinct SFTP servers relay data through the rclone process on your laptop; the task requires a direct server-to-server data route.&quot;}" open><summary>rclone</summary>
@@ -119,7 +121,7 @@ rsync -t photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <div><p><strong>rclone</strong></p><pre><code>rclone copy s3:backups/reports reports</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --from s3://backups --srcs-in reports --into reports</code></pre></div>
 </div>
-<p>Downloads the reports folder from S3 into the local reports folder. S3 represents folders as shared key prefixes: here, reports/.</p>
+<p>Downloads reports/january.csv from S3 to reports/january.csv locally, keeping subfolders.</p>
 <p class="tool-example-note">Here s3 is an rclone S3 remote. Relative paths are kept; unrelated local files stay.</p>
 </section>
 <section class="tool-example" data-title="Copy a file between S3 buckets">
@@ -178,13 +180,15 @@ rsync -t photos/b.jpg archive/2025/b.jpg</code></pre></div>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
+<p>A script chooses beach.jpg for a.jpg and summit.jpg for b.jpg.</p>
 <div class="tool-example-commands">
-<div><p><strong>rclone</strong></p><pre><code>rclone copyto photos/a.jpg archive/2024/a.jpg
-rclone copyto photos/b.jpg archive/2025/b.jpg</code></pre></div>
-<div><p><strong>syq</strong></p><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div>
+<div><p><strong>rclone</strong></p><pre><code>rclone copyto photos/a.jpg archive/beach.jpg
+rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
+<div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
+{"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div>
 </div>
-<p>A script can generate the commands on the left, or a syq mapping file with source a.jpg and destination 2024/a.jpg, then b.jpg and 2025/b.jpg.</p>
-<p class="tool-example-note">Create destination parent folders first. Syq reads the <a href="mappings.html">mapping file</a> in one operation, checks collisions, and supports resuming. Rclone also supports <a href="https://rclone.org/docs/#name-transform">name transforms</a>.</p>
+<p class="tool-example-note">Rclone also supports <a href="https://rclone.org/docs/#name-transform">name transforms</a>.</p>
+<p><a href="mappings.html">Generate a mapping with a script</a>.</p>
 </section>
 <!-- References: https://rclone.org/commands/rclone_copy/ https://rclone.org/commands/rclone_sync/ https://rclone.org/commands/rclone_copyto/ https://rclone.org/commands/rclone_deletefile/ https://rclone.org/sftp/ https://rclone.org/docs/#name-transform --></details>
 <details class="tool-examples-group" data-tool="s5cmd" data-unsupported="{&quot;Send a folder to a server&quot;: &quot;S5cmd has no SSH endpoint; use an SSH transfer tool.&quot;, &quot;Download a file from a server&quot;: &quot;S5cmd has no SSH endpoint; use an SSH transfer tool.&quot;, &quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers without agent forwarding&quot;: &quot;S5cmd has no SSH endpoint. S3 staging changes the required direct server-to-server data route.&quot;}" open><summary>s5cmd</summary>
@@ -203,7 +207,7 @@ rclone copyto photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <div><p><strong>s5cmd</strong></p><pre><code>s5cmd cp &#x27;s3://backups/reports/*&#x27; reports/</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --from s3://backups --srcs-in reports --into reports</code></pre></div>
 </div>
-<p>Downloads the reports folder from S3 into the local reports folder, keeping subfolders. In S3, this means files whose keys start with reports/.</p>
+<p>Downloads reports/january.csv from S3 to reports/january.csv locally, keeping subfolders.</p>
 <p class="tool-example-note">The s5cmd wildcard is quoted so your shell does not expand it. Syq uses --srcs-in to select everything inside reports/. Other local files stay.</p>
 </section>
 <section class="tool-example" data-title="Copy a file between S3 buckets">
@@ -271,12 +275,14 @@ rclone copyto photos/b.jpg archive/2025/b.jpg</code></pre></div>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
+<p>A script chooses beach.jpg for a.jpg and summit.jpg for b.jpg.</p>
 <div class="tool-example-commands">
-<div><p><strong>s5cmd</strong></p><pre><code>s5cmd run copies.txt</code></pre></div>
-<div><p><strong>syq</strong></p><pre><code>syq cp --mapping files.ndjson -C photos --to s3://backups --into archive</code></pre></div>
+<div><p><strong>s5cmd</strong></p><p>copies.txt</p><pre><code>cp photos/a.jpg s3://backups/archive/beach.jpg
+cp photos/b.jpg s3://backups/archive/summit.jpg</code></pre><pre><code>s5cmd run copies.txt</code></pre></div>
+<div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
+{"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --to s3://backups --into archive</code></pre></div>
 </div>
-<p>Use a script to choose each photo’s destination name in S3. For syq, a mapping with source a.jpg and destination 2024/a.jpg produces archive/2024/a.jpg.</p>
-<p class="tool-example-note">A script writes copies.txt with commands such as cp photos/a.jpg s3://backups/archive/2024/a.jpg. S5cmd executes the batch with parallel workers. Syq instead reads source/destination pairs from files.ndjson, checks destination collisions, and supports resuming the copy.</p>
+<p><a href="mappings.html">Generate a mapping with a script</a>.</p>
 </section>
 <!-- References: https://github.com/peak/s5cmd#examples --></details>
 <details class="tool-examples-group" data-tool="scp" data-unsupported="{&quot;Upload a folder’s contents to S3&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Download a folder from S3&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Copy a file between S3 buckets&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Match a folder, deleting extra files&quot;: &quot;Scp has no mirroring/deletion option.&quot;, &quot;Preview a copy&quot;: &quot;Scp has no dry-run option.&quot;, &quot;Remove a file&quot;: &quot;Scp has no file-removal command; use a filesystem or SSH removal tool.&quot;, &quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers without agent forwarding&quot;: &quot;Scp -3 relays through the laptop. Scp -R requires source-server access to the destination; the task allows only laptop logins.&quot;}" open><summary>scp</summary>
@@ -327,13 +333,15 @@ rclone copyto photos/b.jpg archive/2025/b.jpg</code></pre></div>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
+<p>A script chooses beach.jpg for a.jpg and summit.jpg for b.jpg.</p>
 <div class="tool-example-commands">
-<div><p><strong>scp</strong></p><pre><code>scp photos/a.jpg archive/2024/a.jpg
-scp photos/b.jpg archive/2025/b.jpg</code></pre></div>
-<div><p><strong>syq</strong></p><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div>
+<div><p><strong>scp</strong></p><pre><code>scp photos/a.jpg server:/archive/beach.jpg
+scp photos/b.jpg server:/archive/summit.jpg</code></pre></div>
+<div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
+{"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --to server --into /archive</code></pre></div>
 </div>
-<p>A script can generate the commands on the left, or a syq mapping file with source a.jpg and destination 2024/a.jpg, then b.jpg and 2025/b.jpg.</p>
-<p class="tool-example-note">Create destination parent folders first. Syq reads the <a href="mappings.html">mapping file</a> in one operation, checks collisions, and supports resuming.</p>
+<p class="tool-example-note">For scp, /archive must already exist on server.</p>
+<p><a href="mappings.html">Generate a mapping with a script</a>.</p>
 </section>
 <!-- References: https://man.openbsd.org/scp --></details>
 <details class="tool-examples-group" data-tool="syq" data-unsupported="{}" open><summary>syq</summary>
@@ -353,13 +361,12 @@ scp photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <h3>Copy the files inside a folder</h3>
 <div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup</code></pre></div></div>
 <p>Copies project/index.html to /backup/index.html. Destination-only files stay.</p>
-<p class="tool-example-note">--srcs-in copies the contents. Unrelated destination files stay.</p>
 </section>
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
 <div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --prune</code></pre></div></div>
 <p>Updates /backup with the contents of project and removes destination entries absent from the source.</p>
-<p class="tool-example-note">--prune deletes destination entries absent from the source. Preview with --dry-run -v first.</p>
+<p class="tool-example-note">Preview with --dry-run -v first.</p>
 </section>
 <section class="tool-example" data-title="Download a file from a server">
 <h3>Download a file from a server</h3>
@@ -381,9 +388,13 @@ scp photos/b.jpg archive/2025/b.jpg</code></pre></div>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
-<div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div></div>
-<p>Copy photos to names chosen by your script. A mapping from a.jpg to 2024/a.jpg writes archive/2024/a.jpg.</p>
-<p class="tool-example-note">Generate files.ndjson with source/destination pairs first. Syq checks destination collisions and supports resuming the copy.</p>
+<p>A script chooses beach.jpg for a.jpg and summit.jpg for b.jpg.</p>
+<div class="tool-example-commands tool-example-single">
+
+<div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
+{"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div>
+</div>
+<p><a href="mappings.html">Generate a mapping with a script</a>.</p>
 </section>
 <section class="tool-example" data-title="Upload a folder’s contents to S3">
 <h3>Upload a folder’s contents to S3</h3>
@@ -394,7 +405,7 @@ scp photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <section class="tool-example" data-title="Download a folder from S3">
 <h3>Download a folder from S3</h3>
 <div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp --from s3://backups --srcs-in reports --into reports</code></pre></div></div>
-<p>Downloads the reports folder from S3 into the local reports folder. S3 represents folders as shared key prefixes: here, reports/.</p>
+<p>Downloads reports/january.csv from S3 to reports/january.csv locally, keeping subfolders.</p>
 <p class="tool-example-note">Select all keys under reports/ with --srcs-in. Other local files stay.</p>
 </section>
 <section class="tool-example" data-title="Copy a file between S3 buckets">

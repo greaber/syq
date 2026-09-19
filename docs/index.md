@@ -53,13 +53,7 @@ unless you request `--prune`.
 
 ## Start with a tool you know
 
-Choose a tool and task to compare commands.
-
 {{#include assets/tool-examples.html}}
-
-For a visual walkthrough, see [where files go](reference.md#see-where-files-go).
-You can also use familiar rsync syntax through `syq rsync`; check
-[rsync compatibility](rsync-compat.md) before substituting it in a script.
 
 ## Put syq in your workflow
 
