@@ -218,10 +218,9 @@ impl Opts {
     fn metadata_matches(&self, path: &[u8], source: &Entry, destination: &Entry) -> bool {
         // An earlier copy may have assigned this destination timestamp. Even
         // if the source now happens to match it, it is not content evidence.
-        !self
-            .mapping_metadata
+        self.mapping_metadata
             .get(path)
-            .is_some_and(|m| m.mtime.is_some())
+            .is_none_or(|m| m.mtime.is_none())
             && destination.kind == Kind::File
             && destination.size == source.size
             && self.flags & flags::TIMES != 0
