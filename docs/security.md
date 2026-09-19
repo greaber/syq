@@ -257,13 +257,13 @@ consistency, and durability considerations are covered in
 ## Persistent connections
 
 A persistent SSH login stays available to processes running as your local user
-without another key touch or agent approval. Receiving has a separate setting:
-it allows connected servers to request copies or commands on your machine.
+without another key touch or agent approval. Receiving is configured separately.
+When enabled, servers you have a persistent connection to can request copies
+to or commands on your machine.
 Receiving defaults to enabled, but `syq persist receive off` disables it while
 keeping SSH reuse. `syq persist off` closes both.
 
-When receiving is enabled, requests from a compromised server are subject to
-local approval:
+When receiving is enabled, requests from a server are subject to local approval:
 
 | Request | Approval on your machine |
 |---|---|
@@ -275,7 +275,9 @@ The prompt identifies the server account and requested operation. It cannot
 prove who typed the command there. Approving a copy does not approve a later
 command.
 
-### Named receiving destinations
+<a id="named-receiving-destinations"></a>
+
+### Receiving files on your laptop
 
 Copy approval permits the shown destination, overwrite policy, and limits;
 syq enforces them on every filesystem operation. The server can supply false
@@ -290,21 +292,18 @@ matching private key. This prevents another client from claiming your name,
 but the server account can replace its stored name assignments. The receiver's
 private key stays on your machine and grants no SSH login access.
 
-### Authorizing copies to another server
+<a id="authorizing-copies-to-another-server"></a>
 
-Approval uses your receiving machine's SSH configuration and host trust to
-connect to the destination and install a matching helper. That helper enforces
-the approved copy's paths, permissions, and limits. The requesting server gets
-no private key, SSH agent, or command-running interface. The destination
-account remains trusted; the source can still supply false contents.
+### Copying between servers
 
-### Approved commands on receiving machines
+A connected server can ask your laptop to authorize a copy to another server.
+The copy uses your laptop's SSH access and the restricted receiver protections
+described in [Copies between servers](#copies-between-servers).
 
-Approving [`syq exec`](exec.md) gives the program your local user's full
-authority, including access to that user's credentials. Copy roots and
-transfer limits do not constrain it. Approving a build or script also trusts
-the code it will run.
+<a id="approved-commands-on-receiving-machines"></a>
 
-Disconnecting cancels the foreground process group, but cannot undo completed
-effects; programs that start separate process sessions can survive cancellation.
-Commands are not replayed automatically. See [Execution details](commands/exec.md#execution-details).
+### Running commands on your laptop
+
+With [`syq exec`](exec.md), a connected server can request a command on your
+laptop. An approved command runs with your local user's full permissions;
+it is not sandboxed or confined to a copy destination directory.

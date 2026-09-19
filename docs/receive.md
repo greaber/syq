@@ -1,8 +1,15 @@
 # Send files home from a server
 
-Inspect files on your server, then copy them to your laptop from the same shell.
-The laptop opens and maintains the connection. It needs no SSH server, public
-address, or incoming network port.
+Receiving lets you do three things from a connected server:
+
+- **Copy files to your laptop**, as shown below.
+- **Run commands on your laptop** with [`syq exec`](exec.md).
+- **Authorize copies between servers** using your laptop's SSH credentials.
+  File data travels directly between the servers; see
+  [Run the copy from a server](remote-to-remote.md#run-the-copy-from-a-server).
+
+All three use the same receiving connection. Your laptop opens and maintains
+it; it needs no SSH server, public address, or incoming network port.
 
 With syq installed on both machines, run these commands on your laptop to
 receive files as `@laptop` in `~/Downloads/server`:
@@ -124,6 +131,3 @@ your laptop, run `syq persist connect server` again.
 If a connection fails to start, `syq persist receive status` shows the error.
 [Persistence details](persistence-reference.md) covers troubleshooting,
 upgrading, and using connections in scripts.
-
-To run a build or open a copied report on your laptop, see
-[Run commands on your receiving machine](exec.md). Each command needs its own approval.

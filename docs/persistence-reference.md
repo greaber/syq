@@ -2,7 +2,11 @@
 
 See [`syq persist`](commands/persist.md) for the option list.
 
-For everyday setup, start with [Send files home from a server](receive.md).
+Persistence keeps SSH logins open for reuse. Receiving adds three uses for
+those connections: copying files to your laptop, running commands on it, and
+authorizing copies between servers with its SSH access. Start with
+[Send files home from a server](receive.md) for setup and links
+to all three workflows.
 
 ## Names and profiles
 

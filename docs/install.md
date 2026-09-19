@@ -90,9 +90,11 @@ Keep an SSH connection ready for repeated copies:
 syq persist connect server
 ```
 
-This enables persistence and connects without copying files. It also lets you
-[send files back from the server](receive.md), with approval on your machine.
-Connections stay open until you close them with `syq persist off`.
+This enables persistence and connects without copying files. Receiving is
+enabled by default: it supports [file copies to your machine, commands on it,
+and authorizing copies between servers](receive.md). See that
+guide for local approval controls. Connections stay open until you close them
+with `syq persist off`.
 Use `syq persist status` to see them.
 
 See [background connections](receive.md#background-connections) for reconnecting,

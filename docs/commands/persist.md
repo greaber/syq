@@ -29,6 +29,10 @@ syq persist <COMMAND>
 
 ## syq persist receive
 
+Configure receiving and approve its requests. See the
+[three uses of receiving](../receive.md) for file copies to your
+machine, commands on it, and authorizing copies between servers.
+
 <!-- CLI: persist receive -->
 ```text
 syq persist receive <COMMAND>
