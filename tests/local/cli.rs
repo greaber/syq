@@ -1165,11 +1165,18 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
             "1",
             "--resource-limits",
             "bandwidth=512K",
+            "-vv",
         ],
         "",
     );
     assert_output_ok(&out);
     assert_eq!(out.stdout, payload);
+    assert_eq!(
+        stderr_of(&out).matches(" ready (local)").count(),
+        1,
+        "one-range download opened idle workers: {}",
+        stderr_of(&out)
+    );
     assert!(
         start.elapsed().as_millis() >= 240,
         "download ignored bandwidth limit"
@@ -1194,11 +1201,17 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
         .starts_with(".syq-stream-")));
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .current_dir(&t.0)
-        .env("SYQ_CP_OPTIONS", "--stats --performance-tuning workers=1")
-        .args(["cp", "source", "--as-fd", "1"])
+        .env("SYQ_CP_OPTIONS", "--stats --performance-tuning workers=2")
+        .args(["cp", "source", "--as-fd", "1", "-vv"])
         .run()
         .unwrap();
     assert_output_ok(&out);
     assert_eq!(out.stdout, payload);
     assert!(stderr_of(&out).contains("131072 bytes"));
+    assert_eq!(
+        stderr_of(&out).matches(" ready (local)").count(),
+        2,
+        "explicit worker count was changed: {}",
+        stderr_of(&out)
+    );
 }

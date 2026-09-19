@@ -34,6 +34,7 @@ struct Prepared {
     ticket: DescriptorTicket,
     size: Option<u64>,
     workers: usize,
+    worker_limit: usize,
     _local_session: Option<LocalSession>,
 }
 struct LocalSession(crate::descriptor_broker::DescriptorSessionSlot);
@@ -108,10 +109,22 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Prepared> {
         Endpoint::Remote(_) => tune::START_SSH,
         _ => tune::start_local(),
     };
-    let workers = if args.connections_default {
-        start.min(args.automatic_worker_limit())
+    let worker_limit = if args.connections_default {
+        // A download's complete range count is known. More workers cannot
+        // take useful work, even if a slow consumer keeps the tuner running.
+        let ranges = size.map_or(usize::MAX, |size| {
+            usize::try_from(size.div_ceil(controls.settings.request_size as u64))
+                .unwrap_or(usize::MAX)
+                .max(1)
+        });
+        args.automatic_worker_limit().min(ranges)
     } else {
         args.connections
+    };
+    let workers = if args.connections_default {
+        start.min(worker_limit)
+    } else {
+        worker_limit
     };
     if !args.connections_default {
         crate::fsops::require_source_descriptor_capacity(1, workers, 0)?;
@@ -121,7 +134,8 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Prepared> {
     }
     if args.verbose > 0 && !args.quiet {
         crate::output::diagnostic!(
-            "stream: {workers} data workers{}",
+            "stream: {workers} data worker{}{}",
+            if workers == 1 { "" } else { "s" },
             if args.connections_default {
                 " (automatic)"
             } else {
@@ -135,6 +149,7 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Prepared> {
         ticket,
         size,
         workers,
+        worker_limit,
         _local_session: local_session,
     })
 }
@@ -404,15 +419,7 @@ pub(super) async fn run(
     for id in gate.begin_warming(prepared.workers) {
         spawn(&mut tasks, id)?;
     }
-    let mut policy = tune::Policy::new(
-        prepared.workers,
-        1,
-        if args.connections_default {
-            args.automatic_worker_limit()
-        } else {
-            prepared.workers
-        },
-    );
+    let mut policy = tune::Policy::new(prepared.workers, 1, prepared.worker_limit);
     let mut sampler = tune::Sampler::default();
     let mut interval = tokio::time::interval(tune::SAMPLE);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
