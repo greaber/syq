@@ -1,14 +1,7 @@
 # Rsync compatibility
 
-See [`syq rsync`](commands/rsync.md) for the option list.
-
-`syq rsync` accepts common rsync commands for local copies, pushes, and pulls.
-It uses its own protocol: the remote program must be syq, not rsync.
-Run `syq rsync --help-all` for all accepted flags.
-
-```sh
-syq rsync -av project/ server:backup/project/
-```
+For examples, start with [Use rsync-style commands](rsync.md).
+See [`syq rsync`](commands/rsync.md) for all accepted options.
 
 ## Differences to check before switching
 
