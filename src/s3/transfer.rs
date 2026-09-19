@@ -38,7 +38,7 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, sync::Mutex};
 
-type DirectoryMetadata = Arc<Mutex<Vec<(String, Metadata, Option<u32>)>>>;
+type DirectoryMetadata = Arc<Mutex<Vec<(String, Metadata, Option<u32>, crate::mapping::Metadata)>>>;
 
 pub(super) struct Engine {
     args: Arc<Args>,
@@ -67,6 +67,7 @@ struct Download {
     path: String,
     size: u64,
     expected_hash: Option<Digest>,
+    metadata: Option<crate::mapping::Metadata>,
     copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -172,6 +173,12 @@ impl Engine {
             let (plan, prune) =
                 tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
             super::diagnostics::elapsed(scanning, "source_plan", plan.len() as u64);
+            if let Some(results) = self.progress.results_writer() {
+                results.mapping_metadata(
+                    plan.iter()
+                        .filter_map(|s| s.metadata.map(|m| (s.key.as_bytes().to_vec(), m))),
+                );
+            }
             self.check_upload_placement(plan.first().map(|s| s.kind() != ObjectKind::Dir))
                 .await?;
             self.discover_destination(plan.iter().map(|s| s.key.as_str()).collect())
@@ -246,14 +253,15 @@ impl Engine {
     ) -> Result<()> {
         if !self.args.dry_run {
             let mut directories = directories.lock().await;
-            directories.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
-            for (path, meta, mode) in directories.iter() {
+            directories.sort_by_key(|(path, _, _, _)| std::cmp::Reverse(path.len()));
+            for (path, meta, mode, explicit) in directories.iter() {
                 local::apply_metadata(
                     &destination.root,
                     &RelativePath::new(path.as_bytes())?,
                     meta,
                     &self.args,
                     *mode,
+                    *explicit,
                 )?;
             }
         }
@@ -470,14 +478,17 @@ impl Engine {
         Ok(())
     }
     fn upload_metadata_matches(&self, source: &Source, size: u64, object: &Object) -> bool {
+        let explicit = source.metadata.unwrap_or_default();
+        let desired = source.metadata(None);
         object.kind() == source.kind()
             && object.size == size
             && object.metadata.as_ref().is_some_and(|m| {
-                m.mtime == source.meta.mtime
-                    && m.nsec == source.meta.mtime_nsec
-                    && (!self.args.perms || m.mode == source.meta.mode & 0o7777)
-                    && (!(self.args.owner || self.args.group)
-                        || (m.uid == source.meta.uid && m.gid == source.meta.gid))
+                (m.mtime, m.nsec) == (desired.mtime, desired.nsec)
+                    && (!(self.args.perms || explicit.mode.is_some()) || m.mode == desired.mode)
+                    && (!(self.args.owner || self.args.group || explicit.uid.is_some())
+                        || m.uid == desired.uid)
+                    && (!(self.args.owner || self.args.group || explicit.gid.is_some())
+                        || m.gid == desired.gid)
             })
     }
 
@@ -519,7 +530,9 @@ impl Engine {
                 None
             }
         });
+        let can_compare_time = source.metadata.is_none_or(|m| m.mtime.is_none());
         if whole_algorithm.is_none()
+            && can_compare_time
             && existing
                 .as_ref()
                 .is_some_and(|o| self.upload_metadata_matches(&source, size, o))
@@ -692,8 +705,10 @@ impl Engine {
             self.upload_metadata_matches(&source, size, o)
                 && o.metadata.as_ref().is_some_and(|m| {
                     self.args.checksum
-                        || whole_digest.is_none()
-                        || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm)
+                        || (whole_digest.is_none() && can_compare_time)
+                        || (whole_digest.is_some()
+                            && m.hash == whole_digest
+                            && m.hash_algorithm == metadata.hash_algorithm)
                 })
         });
         let comparison_digest = if self.args.checksum {
@@ -1114,6 +1129,7 @@ impl Engine {
                     },
                     entry.kind.map(|kind| kind.label()),
                     entry.expected_hash,
+                    entry.metadata,
                 ));
             }
         } else {
@@ -1130,7 +1146,7 @@ impl Engine {
                         )?,
                     )
                 };
-                selectors.push((key, path, location.selection, None, None));
+                selectors.push((key, path, location.selection, None, None, None));
             }
         }
         if self.options.route.is_server_copy() && selectors.iter().any(|s| s.4.is_some()) {
@@ -1180,7 +1196,8 @@ impl Engine {
             })
             .buffered(32);
         while let Some(selector) = selectors.next().await {
-            let ((key, path, selection, declared_kind, expected_hash), mut copy_source) = selector?;
+            let ((key, path, selection, declared_kind, expected_hash, metadata), mut copy_source) =
+                selector?;
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
                 selection,
@@ -1373,12 +1390,19 @@ impl Engine {
                     path,
                     size,
                     expected_hash: expected_hash.clone(),
+                    metadata,
                     copy_source: copy_source.take().map(Box::new),
                 });
             }
         }
         if same_bucket {
             server_copy::check_overlap(&copy_sources, &copy_targets)?;
+        }
+        if let Some(results) = self.progress.results_writer() {
+            results.mapping_metadata(
+                out.iter()
+                    .filter_map(|j| j.metadata.map(|m| (j.path.as_bytes().to_vec(), m))),
+            );
         }
         Ok((out, prune))
     }
@@ -1441,7 +1465,7 @@ impl Engine {
         };
         job.kind = object.kind();
         let mut initial = initial.map(|output| output.body);
-        let metadata = object.metadata.clone().unwrap_or(Metadata {
+        let mut metadata = object.metadata.clone().unwrap_or(Metadata {
             kind: object.kind(),
             mode: if object.kind() == ObjectKind::Dir {
                 0o777
@@ -1455,7 +1479,15 @@ impl Engine {
             hash: None,
             hash_algorithm: HashAlgorithm::Blake3,
         });
-        if self.args.update && existing.is_some_and(|m| m.is_file() && m.mtime > metadata.mtime) {
+        let source_time = (metadata.mtime, metadata.nsec);
+        let explicit = job.metadata.unwrap_or_default();
+        explicit.validate_kind(match object.kind() {
+            ObjectKind::File => crate::proto::Kind::File,
+            ObjectKind::Dir => crate::proto::Kind::Dir,
+            ObjectKind::Symlink => crate::proto::Kind::Symlink,
+        })?;
+        metadata.override_with(&explicit);
+        if self.args.update && existing.is_some_and(|m| m.is_file() && m.mtime > source_time.0) {
             return Ok(None);
         }
         if let Some(m) = existing {
@@ -1484,6 +1516,7 @@ impl Engine {
                     job.path.clone(),
                     metadata,
                     existing.map(|m| m.mode & 0o7777),
+                    explicit,
                 ));
             }
             return Ok(Some(0));
@@ -1514,7 +1547,7 @@ impl Engine {
                     }
                     self.progress.symlinks_created.fetch_add(1, Relaxed);
                 }
-                local::apply_metadata(root, &path, &metadata, &self.args, None)?;
+                local::apply_metadata(root, &path, &metadata, &self.args, None, explicit)?;
             }
             if same {
                 return Ok(None);
@@ -1536,7 +1569,7 @@ impl Engine {
                     unchanged = metadata.hash.as_ref() == Some(&hash);
                 }
             } else {
-                unchanged = m.mtime == metadata.mtime && m.mtime_nsec == metadata.nsec;
+                unchanged = explicit.mtime.is_none() && (m.mtime, m.mtime_nsec) == source_time;
             }
         }
 
@@ -1554,6 +1587,7 @@ impl Engine {
                     &metadata,
                     &self.args,
                     existing.map(|m| m.mode & 0o7777),
+                    explicit,
                 )?;
             }
             self.progress
@@ -1572,7 +1606,7 @@ impl Engine {
                     &object,
                     root,
                     &path,
-                    (&metadata, expected_hash),
+                    (&metadata, expected_hash, explicit),
                     existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
                     initial,
                     initial_slot,
@@ -1713,6 +1747,7 @@ impl Engine {
             &metadata,
             &self.args,
             existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
+            explicit,
         )?;
         let m = file.metadata()?;
         if self.args.ignore_existing || self.args.target_existence == Existence::New {
@@ -1772,12 +1807,12 @@ impl Engine {
         object: &Object,
         root: &Root,
         path: &RelativePath,
-        validation: (&Metadata, Option<&Digest>),
+        validation: (&Metadata, Option<&Digest>, crate::mapping::Metadata),
         mode: Option<u32>,
         initial: Option<ByteStream>,
         initial_slot: Option<super::tuning::Permit>,
     ) -> Result<Option<u64>> {
-        let (metadata, expected_hash) = validation;
+        let (metadata, expected_hash, explicit) = validation;
         let path_buf = path.to_path_buf();
         let label = path_buf
             .to_str()
@@ -1833,7 +1868,7 @@ impl Engine {
                 tokio::task::spawn_blocking(move || expected.verify_reader(&mut &*f)).await??;
             }
             self.check_cancelled()?;
-            local::apply_file_metadata(&file, metadata, &self.args, mode)?;
+            local::apply_file_metadata(&file, metadata, &self.args, mode, explicit)?;
             let m = file.metadata()?;
             if self.args.ignore_existing || self.args.target_existence == Existence::New {
                 root.publish_new_regular(&partial, path, (m.dev(), m.ino()))?;

@@ -211,7 +211,8 @@ An outcome for a completed copy change or a failed mapping entry.
 | `kind` | `file`, `dir`, `symlink`, or `special`, when known |
 | `disposition` | `succeeded`, `failed`, `blocked`; attested streams also use `incomplete` and `observed` |
 | `bytes`, `attempts` | Optional transfer information |
-| `expected_hash` | Expected whole-file hash, when supplied: an object with `algorithm` and hexadecimal `value`; preserve it in retry mappings |
+| `expected_hash` | Expected whole-file digest, when supplied: an object with `algorithm` and hexadecimal `value`; preserve it in retry mappings |
+| `metadata` | Explicit destination attributes from the mapping, when supplied; preserve them in retry mappings |
 | `retryable` | On failures: `yes`, `no`, or `unknown` |
 | `class`, `os_kind`, `message` | Error details where available |
 | `provenance`, `scope`, `code` | Attested origin, signed destination-scope index, and receiver outcome code |
@@ -384,7 +385,7 @@ Add `--results r.ndjson` to record outcomes in a fresh file outside the copy
 trees.
 
 Failed mapping entries contain `src`, `dst`, and `kind`, so they can form a
-retry manifest. Preserve `expected_hash` too when present. First require a terminal `result` with `success` or `partial`:
+retry manifest. Preserve `expected_hash` and `metadata` too when present. First require a terminal `result` with `success` or `partial`:
 a missing terminal or an early stop means some entries may have no results.
 In those cases, rerun the original copy instead.
 
@@ -400,6 +401,7 @@ jq -cs 'if (.[-1].type? // "") != "result"
                           and .retryable != "no")
              | {src, dst, kind}
                + (if has("expected_hash") then {expected_hash} else {} end)
+               + (if has("metadata") then {metadata} else {} end)
         end' r.ndjson \
   | syq cp --mapping - -C src --to nas --into /data
 ```

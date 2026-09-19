@@ -1151,6 +1151,7 @@ const DOC_JQ_RETRY_GATE: &str = r#"if (.[-1].type? // "") != "result"
                           and .retryable != "no")
              | {src, dst, kind}
                + (if has("expected_hash") then {expected_hash} else {} end)
+               + (if has("metadata") then {metadata} else {} end)
         end"#;
 
 /// Assert the doc contains the complete invocation — flags included — that
@@ -1272,6 +1273,7 @@ fn automation_md_retry_gate_example_works_verbatim() {
     let mut missing: serde_json::Value =
         serde_json::from_str(&entry_line("gone.txt", "g.txt", None)).unwrap();
     missing["expected_hash"] = expected.clone();
+    missing["metadata"] = serde_json::json!({"mode": 0o640, "mtime": 123});
     let manifest = format!("{missing}\n{}", entry_line("ok.txt", "ok.txt", None));
     let cp = syq_cp_in(
         &t.path(""),
@@ -1297,6 +1299,7 @@ fn automation_md_retry_gate_example_works_verbatim() {
     let retry: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one retry entry");
     assert_eq!(retry["dst"]["value"], "g.txt");
     assert_eq!(retry["expected_hash"], expected);
+    assert_eq!(retry["metadata"], missing["metadata"]);
     // The emitted entry executes as a mapping after the source appears.
     write(&t.path("src/gone.txt"), b"late");
     let cp = syq_cp_in(
@@ -1306,6 +1309,8 @@ fn automation_md_retry_gate_example_works_verbatim() {
     );
     assert!(cp.status.success());
     assert_eq!(read(&t.path("dst/g.txt")), b"late");
+    let meta = fs::metadata(t.path("dst/g.txt")).unwrap();
+    assert_eq!((meta.mode() & 0o7777, meta.mtime()), (0o640, 123));
     // Truncated stream: refused.
     let truncated: Vec<u8> = results
         .split(|&b| b == b'\n')
@@ -1557,4 +1562,215 @@ fn native_cp_mapping_symlinked_manifest_failure_still_settles_the_stream() {
     let terminal = records.last().unwrap();
     assert_eq!(terminal["type"], "result");
     assert_eq!(terminal["status"], "failed");
+}
+#[test]
+fn native_mapping_destination_metadata_keeps_source_identity_and_repairs_attributes() {
+    use std::os::unix::fs::symlink;
+    let t = Tmp::new();
+    write(&t.path("src/small"), b"first");
+    write(&t.path("src/large"), &vec![7; 1024 * 1024]);
+    fs::create_dir(t.path("src/directory")).unwrap();
+    symlink("small", t.path("src/link")).unwrap();
+    let original = fs::metadata(t.path("src/small")).unwrap();
+    let metadata = serde_json::json!({"mode": 0o640, "uid": original.uid(), "gid": original.gid(),
+        "mtime": 946684800, "mtime_nsec": 123456789});
+    let manifest = [
+        ("small", "dir/small", "file"),
+        ("large", "large", "file"),
+        ("directory", "dir", "dir"),
+        ("link", "link", "symlink"),
+    ]
+    .map(|(src, dst, kind)| {
+        let mut entry: serde_json::Value =
+            serde_json::from_str(&entry_line(src, dst, Some(kind))).unwrap();
+        entry["metadata"] = metadata.clone();
+        if kind == "dir" {
+            entry["metadata"]["mode"] = 0o750.into();
+        }
+        if kind == "symlink" {
+            entry["metadata"].as_object_mut().unwrap().remove("mode");
+        }
+        // These historical fields remain information, not source identity or overrides.
+        entry["size"] = 0.into();
+        entry["mtime"] = 1.into();
+        entry.to_string()
+    })
+    .join("\n");
+    let args = ["--mapping", "-", "-C", "src", "--into", "dst", "-q"];
+    assert_output_ok(&syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes())));
+    for name in ["dir/small", "large", "dir", "link"] {
+        let actual = fs::symlink_metadata(t.path(&format!("dst/{name}"))).unwrap();
+        assert_eq!(
+            (actual.mtime(), actual.mtime_nsec()),
+            (946684800, 123456789),
+            "{name}"
+        );
+        assert_eq!(
+            (actual.uid(), actual.gid()),
+            (original.uid(), original.gid())
+        );
+        if name != "link" {
+            assert_eq!(
+                actual.mode() & 0o7777,
+                if name == "dir" { 0o750 } else { 0o640 }
+            );
+        }
+    }
+    let after = fs::metadata(t.path("src/small")).unwrap();
+    assert_eq!(
+        (after.mode(), after.mtime(), after.mtime_nsec()),
+        (original.mode(), original.mtime(), original.mtime_nsec())
+    );
+    // A fixed requested timestamp is not a reason to reuse stale contents.
+    write(&t.path("src/small"), b"other");
+    File::open(t.path("src/small"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(946684800, 123456789))
+        .unwrap();
+    assert_output_ok(&syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes())));
+    assert_eq!(read(&t.path("dst/dir/small")), b"other");
+    // Matching content still receives explicit permissions, including on reruns.
+    fs::set_permissions(t.path("dst/large"), fs::Permissions::from_mode(0o600)).unwrap();
+    let mut preview = args.to_vec();
+    preview.extend(["--dry-run", "--hash", "--results", "preview.jsonl"]);
+    assert_output_ok(&syq_cp_in(&t.path(""), &preview, Some(manifest.as_bytes())));
+    let records = fs::read_to_string(t.path("preview.jsonl")).unwrap();
+    assert!(records
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|record| record["type"] == "trace"
+            && record["dst"]["value"] == "large"
+            && record["reason"] == "metadata_differs"));
+    assert_eq!(
+        fs::metadata(t.path("dst/large")).unwrap().mode() & 0o7777,
+        0o600
+    );
+    assert_output_ok(&syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes())));
+    assert_eq!(
+        fs::metadata(t.path("dst/large")).unwrap().mode() & 0o7777,
+        0o640
+    );
+}
+
+#[test]
+fn native_mapping_metadata_failures_keep_retry_intent_and_validate_before_writes() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"content");
+    let mut entry: serde_json::Value =
+        serde_json::from_str(&entry_line("missing", "file", Some("file"))).unwrap();
+    entry["metadata"] = serde_json::json!({"mode": 0o640, "mtime": 100});
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--mapping",
+            "-",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "results",
+        ],
+        Some(entry.to_string().as_bytes()),
+    );
+    assert!(!out.status.success());
+    let records = fs::read_to_string(t.path("results")).unwrap();
+    let failure = records
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|r| r["type"] == "operation_result" && r["disposition"] == "failed")
+        .unwrap();
+    assert_eq!(failure["metadata"], entry["metadata"]);
+    entry["src"]["value"] = "file".into();
+    for metadata in [
+        serde_json::json!({"mode": 0o100644}),
+        serde_json::json!({"mtime_nsec": 1}),
+        serde_json::json!({"mtime": 1, "mtime_nsec": 1_000_000_000}),
+        serde_json::json!({"uid": 4294967295u64}),
+        serde_json::json!({"mod": 0o644}),
+    ] {
+        entry["metadata"] = metadata;
+        let out = syq_cp_in(
+            &t.path(""),
+            &["--mapping", "-", "-C", "src", "--into", "dst"],
+            Some(entry.to_string().as_bytes()),
+        );
+        assert!(!out.status.success(), "{entry}");
+        assert!(!t.path("dst/file").exists());
+    }
+}
+
+#[test]
+fn native_mapping_metadata_repairs_link_fraction() {
+    use std::os::unix::fs::symlink;
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"content");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    symlink("file", t.path("src/link")).unwrap();
+    symlink("file", t.path("dst/link")).unwrap();
+    set_mtime(&t.path("dst/link"), 123);
+    let mut entry: serde_json::Value =
+        serde_json::from_str(&entry_line("link", "link", Some("symlink"))).unwrap();
+    entry["metadata"] = serde_json::json!({"mtime":123,"mtime_nsec":456});
+    let args = [
+        "--mapping",
+        "-",
+        "-C",
+        "src",
+        "--into",
+        "dst",
+        "--no-progress",
+    ];
+    assert_output_ok(&syq_cp_in(
+        &t.path(""),
+        &args,
+        Some(entry.to_string().as_bytes()),
+    ));
+    let m = fs::symlink_metadata(t.path("dst/link")).unwrap();
+    assert_eq!((m.mtime(), m.mtime_nsec()), (123, 456));
+}
+
+#[test]
+fn native_mapping_metadata_rejects_unapplied_ownership() {
+    use std::os::unix::fs::symlink;
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"content");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    symlink("file", t.path("src/link")).unwrap();
+    symlink("file", t.path("dst/link")).unwrap();
+    let args = [
+        "--mapping",
+        "-",
+        "-C",
+        "src",
+        "--into",
+        "dst",
+        "--no-progress",
+    ];
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("ownership denial requires a non-root test process");
+        return;
+    }
+    // Test staged publication, unchanged file repair, and an existing symlink.
+    write(&t.path("dst/file"), b"content");
+    set_mtime(&t.path("src/file"), 100);
+    set_mtime(&t.path("dst/file"), 100);
+    for (src, dst, kind) in [
+        ("file", "new", "file"),
+        ("file", "file", "file"),
+        ("link", "link", "symlink"),
+    ] {
+        for field in ["uid", "gid"] {
+            let mut entry: serde_json::Value =
+                serde_json::from_str(&entry_line(src, dst, Some(kind))).unwrap();
+            entry["metadata"] = serde_json::json!({field: 4294967294u32});
+            let out = syq_cp_in(&t.path(""), &args, Some(entry.to_string().as_bytes()));
+            assert!(
+                !out.status.success(),
+                "unapplied {field} on {dst} reported success: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(read(&t.path("dst/file")), b"content");
+        }
+    }
 }

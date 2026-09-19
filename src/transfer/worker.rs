@@ -328,7 +328,6 @@ impl Worker {
             ));
         let mut reads = std::collections::VecDeque::new();
         let mut writes = std::collections::VecDeque::new();
-        let flags = publication_metadata_flags(self.opts.flags);
         let result = (|| -> Result<()> {
             'issuing: loop {
                 while reads.len() < read_window {
@@ -416,7 +415,7 @@ impl Worker {
                             continue;
                         }
                     };
-                    let mut meta = job.entry.meta();
+                    let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
                     meta.mode = self.create_mode(job);
                     puts.push(SmallPut {
                         path: job.dst.clone(),
@@ -424,7 +423,7 @@ impl Worker {
                         data,
                         hash,
                         meta,
-                        flags,
+                        flags: publication_metadata_flags(self.opts.flags_for(&job.rel_bytes)),
                         inplace: self.opts.inplace,
                         condition: job.target_condition,
                         guard: job.container_guard.clone(),
@@ -867,7 +866,7 @@ impl Worker {
             if final_is_file {
                 let diff = self.diff_final_and_hold(&job)?;
                 if diff.ranges.is_empty() && diff.held_len == Some(size) {
-                    let mut meta = job.entry.meta();
+                    let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
                     meta.mode = self.create_mode(&job);
                     ok(
                         self.dst.call(Request::FinishBasis {
@@ -875,7 +874,7 @@ impl Worker {
                             path: job.dst.clone(),
                             copy_id: self.copy_id(),
                             meta,
-                            flags: publication_metadata_flags(self.opts.flags),
+                            flags: publication_metadata_flags(self.opts.flags_for(&job.rel_bytes)),
                             condition: job.target_condition,
                             guard: job.container_guard.clone(),
                         })?,
@@ -1002,6 +1001,14 @@ impl Worker {
     /// with -p the source mode; without -p an existing file keeps its own mode
     /// and a new file gets the source mode minus the umask.
     pub(super) fn create_mode(&self, job: &WorkerJob) -> u32 {
+        if let Some(mode) = self
+            .opts
+            .mapping_metadata
+            .get(&job.rel_bytes)
+            .and_then(|m| m.mode)
+        {
+            return mode;
+        }
         match job.dst_entry.as_ref().filter(|d| d.kind == Kind::File) {
             Some(d) if !self.opts.perms => d.mode & 0o7777,
             _ => fresh_file_mode(&self.opts, &job.entry),
@@ -1018,7 +1025,12 @@ impl Worker {
     pub(super) fn published_entry(&self, job: &WorkerJob) -> Entry {
         let mut entry = job.entry.clone();
         entry.path = job.dst.clone();
+        let meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
         entry.mode = (entry.mode & !0o7777) | self.create_mode(job);
+        entry.uid = meta.uid;
+        entry.gid = meta.gid;
+        entry.mtime = meta.mtime;
+        entry.mtime_nsec = meta.mtime_nsec;
         entry
     }
 
@@ -1642,9 +1654,8 @@ impl Worker {
         if job.done.load(Relaxed) != job.entry.size {
             bail!("refusing to publish an incomplete file");
         }
-        let mut meta = job.entry.meta();
+        let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
         meta.mode = self.create_mode(&job);
-        let flags = publication_metadata_flags(self.opts.flags);
         let finalized = ok(
             self.dst.call(Request::Finalize {
                 expected_hash: self.opts.expected_for(&job.rel_bytes).cloned(),
@@ -1652,7 +1663,7 @@ impl Worker {
                 inplace: job.inplace,
                 copy_id: self.copy_id(),
                 meta,
-                flags,
+                flags: publication_metadata_flags(self.opts.flags_for(&job.rel_bytes)),
                 condition: job.target_condition,
                 guard: job.container_guard.clone(),
             })?,
@@ -1819,7 +1830,11 @@ impl Worker {
         let Some(destination) = job.dst_entry.as_deref() else {
             return Ok(false);
         };
-        if self.opts.checksum || !self.opts.metadata_matches(&job.entry, destination) {
+        if self.opts.checksum
+            || !self
+                .opts
+                .metadata_matches(&job.rel_bytes, &job.entry, destination)
+        {
             return Ok(false);
         }
         match self.dst.call(Request::ValidateDigest {
@@ -1841,8 +1856,10 @@ impl Worker {
                         TargetCondition::Any => target_identity(destination),
                         condition => condition,
                     },
-                    meta: job.entry.meta(),
-                    flags: self.opts.metadata_fix_flags(&job.entry, destination),
+                    meta: self.opts.metadata_for(&job.rel_bytes, &job.entry),
+                    flags: self
+                        .opts
+                        .metadata_fix_flags(&job.rel_bytes, &job.entry, destination),
                 }],
                 guard: job.container_guard.clone(),
             })?,
@@ -1897,7 +1914,11 @@ impl Worker {
                 .dst_entry
                 .as_ref()
                 .expect("preview comparison has a destination");
-            if self.opts.metadata_fix_flags(&job.entry, destination) == 0 {
+            if self
+                .opts
+                .metadata_fix_flags(&job.rel_bytes, &job.entry, destination)
+                == 0
+            {
                 return Ok(());
             }
             self.opts.dry_run_metadata_files.fetch_add(1, Relaxed);

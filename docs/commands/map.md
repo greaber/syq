@@ -59,6 +59,7 @@ sources; other programs can generate it too.
 | `dst` | Required path relative to the destination container (`--into`) |
 | `kind` | Optional `file`, `dir`, `symlink`, or `special` precondition |
 | `size`, `mtime` | Optional information for transforms; ignored during execution |
+| `metadata` | Optional destination attributes; see below |
 | `expected_hash` | Optional whole-file expectation: `{"algorithm":"md5","value":"900150983cd24fb0d6963f7d28e17f72"}` |
 
 Paths use `encoding: "utf-8"`, or `"base64"` with standard base64 of raw
@@ -68,6 +69,24 @@ refused. Unknown fields are refused too.
 `expected_hash` checks a regular file's complete contents, including reused
 bytes. A mismatch fails the entry. See [expected hashes](../integrity-checking.md#expected-hashes)
 for algorithms and behavior with in-place writes.
+
+To set destination attributes without changing the source, add a `metadata`
+object, for example `"metadata": {"mode": 416, "mtime": 1700000000}`. This sets
+permissions to `0640` and the modification time to the given Unix second.
+Optional fields are `mode` (permission bits, 0–4095), numeric `uid` and `gid`,
+`mtime` (Unix seconds), and `mtime_nsec` (0–999999999, requires `mtime`).
+A supplied `mtime` defaults to zero fractional seconds. Omitted attributes
+follow normal copy behavior; the top-level `mtime` remains informational.
+
+Explicit attributes apply without `--preserve`. Ownership requests fail if the
+filesystem refuses them; symlinks cannot have a requested `mode`.
+S3 uploads store the attributes in syq object metadata; downloads apply them
+to the filesystem. S3-to-S3 copies keep other object metadata and stay server-side.
+Restricted receivers also require matching `--preserve` permissions in the signed
+grant. Selection rules such as `--only-new` still take precedence. Supplied
+timestamps disable the size/time shortcut for those entries. Use `--hash` to
+compare contents when repeating a copy with a fixed destination timestamp.
+Older binaries that do not support `metadata` reject the manifest.
 
 Each entry copies one object. **A directory entry is not recursive.**
 `syq map` emits its descendants as separate entries. A missing source or
