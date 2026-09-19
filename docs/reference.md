@@ -288,7 +288,8 @@ completed file comes from one copy, but the whole tree is not a snapshot.
 delete another copy's completed files.
 
 Partials are named `.FILENAME.syq-tmp.RANDOM`, with 16 random characters at the
-end. The filename portion is shortened or omitted when space is tight. Syq
+end. The filename portion is shortened or omitted to fit the destination filesystem
+and available pathname space. Syq
 removes its own partial when it publishes the completed file. Interrupted runs
 can leave partials behind, including after a later successful retry. Partials
 with shortened or omitted filenames may not be reused.

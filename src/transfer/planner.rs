@@ -2275,16 +2275,15 @@ impl Planner<'_> {
                 .next()
                 .is_some_and(|name| is_partial_name(OsStr::from_bytes(name)));
             if reserved_payload {
-                if let Some(owner) = self.sidecar_paths.get(&dst_path) {
+                let reservation = crate::fsops::partial_reservation_key(&dst_path);
+                if let Some(owner) = self.sidecar_paths.get(&reservation) {
                     self.progress.error(&format!(
                         "syq: source payload {rel} maps to {}, which is the reserved sidecar for {owner}",
                         display(&dst_path)
                     ));
                     self.collision = true;
                 }
-                self.payload_paths
-                    .entry(dst_path.clone())
-                    .or_insert(rel.clone());
+                self.payload_paths.entry(reservation).or_insert(rel.clone());
             }
             if entry.kind == Kind::File && !self.opts.inplace && !self.opts.verify_only {
                 files.push((dst_path, rel));
@@ -2376,14 +2375,15 @@ impl Planner<'_> {
                     continue;
                 }
             };
-            if let Some(payload_rel) = self.payload_paths.get(&sidecar) {
+            let reservation = crate::fsops::partial_reservation_key(&sidecar);
+            if let Some(payload_rel) = self.payload_paths.get(&reservation) {
                 self.progress.error(&format!(
                     "syq: source payload {payload_rel} maps to {}, which is the reserved sidecar for {file_rel}",
                     display(&sidecar)
                 ));
                 self.collision = true;
             }
-            if let Some(other) = self.sidecar_paths.insert(sidecar.clone(), file_rel.clone()) {
+            if let Some(other) = self.sidecar_paths.insert(reservation, file_rel.clone()) {
                 if other != file_rel {
                     self.progress.error(&format!(
                         "syq: {other} and {file_rel} require the same sidecar {}",

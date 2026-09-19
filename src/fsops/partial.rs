@@ -8,10 +8,10 @@ impl FsOps {
         guard: Option<&ContainerGuard>,
     ) -> Result<Response> {
         if let Some(target) = self.rooted_destination_target(path, guard)? {
-            let (relative, _) = rooted_partial_target(&target, copy_id)?;
-            let partial_size = target
-                .root
-                .metadata_optional(&relative)?
+            let (_, _, metadata) = with_rooted_partial(&target, copy_id, |relative, _| {
+                target.root.metadata_optional(relative)
+            })?;
+            let partial_size = metadata
                 .filter(|metadata| is_owned_rooted_partial(*metadata))
                 .map(|metadata| metadata.len);
             return Ok(Response::PartialSize(partial_size));
@@ -280,9 +280,7 @@ impl FsOps {
             self.uncache_rooted(&target.root, &target.relative);
             // An interrupted non-inplace run must not strand this job's
             // adjacent sidecar when the retry switches to --inplace.
-            if let Ok((partial, _)) = rooted_partial_target(&target, copy_id) {
-                let _ = target.root.unlink(&partial);
-            }
+            let _ = with_rooted_partial(&target, copy_id, |partial, _| target.root.unlink(partial));
             for _ in 0..8 {
                 match target.root.metadata_optional(&target.relative)? {
                     Some(metadata) if metadata.is_file() => {
@@ -325,15 +323,17 @@ impl FsOps {
                 target.label.display()
             );
         }
-        let (relative, label) = rooted_partial_target(&target, copy_id)?;
-        let Some((file, basis_size)) = self.open_private_partial_rooted(
-            &target.root,
-            &relative,
-            &label,
-            create_if_missing,
-            PRIVATE_PARTIAL_MODE,
-        )?
-        else {
+        let (relative, _label, opened) =
+            with_rooted_partial(&target, copy_id, |relative, label| {
+                self.open_private_partial_rooted(
+                    &target.root,
+                    relative,
+                    label,
+                    create_if_missing,
+                    PRIVATE_PARTIAL_MODE,
+                )
+            })?;
+        let Some((file, basis_size)) = opened else {
             return Ok(Preparation::default());
         };
         if let Some(old_size) = basis_size {
@@ -516,16 +516,17 @@ impl FsOps {
             .held_basis
             .take()
             .filter(|held| held.location == expected && held.copy_id == *copy_id);
-        let (relative, label) = rooted_partial_target(&target, copy_id)?;
-        let (output, basis_size) = self
-            .open_private_partial_rooted(
-                &target.root,
-                &relative,
-                &label,
-                true,
-                PRIVATE_PARTIAL_MODE,
-            )?
-            .context("sidecar creation was requested")?;
+        let (relative, _label, opened) =
+            with_rooted_partial(&target, copy_id, |relative, label| {
+                self.open_private_partial_rooted(
+                    &target.root,
+                    relative,
+                    label,
+                    true,
+                    PRIVATE_PARTIAL_MODE,
+                )
+            })?;
+        let (output, basis_size) = opened.context("sidecar creation was requested")?;
         let location = FileLocation::Rooted {
             root: target.root.identity(),
             relative,
@@ -672,6 +673,7 @@ impl FsOps {
                 relative: destination_relative,
                 label: destination_label,
                 create_missing_parents: false,
+                query_partial_name_limit: false,
             },
         ))
     }
@@ -708,12 +710,8 @@ impl FsOps {
         let destination_root = target.root.clone();
         let source_key = file_system_key(&s, source_metadata.dev());
         self.uncache_rooted(&destination_root, &target.relative);
-        let (target_relative, target_label) = if inplace {
-            (target.relative, target.label)
-        } else {
-            rooted_partial_target(&target, copy_id)?
-        };
-        self.uncache_rooted(&destination_root, &target_relative);
+        let (mut target_relative, mut target_label) =
+            (target.relative.clone(), target.label.clone());
         let d = if inplace {
             let mut opened = None;
             for _ in 0..8 {
@@ -760,15 +758,19 @@ impl FsOps {
                 )
             })?
         } else {
-            let (d, basis_size) = self
-                .open_private_partial_rooted(
-                    &destination_root,
-                    &target_relative,
-                    &target_label,
-                    true,
-                    PRIVATE_PARTIAL_MODE,
-                )?
-                .context("sidecar creation was requested")?;
+            let (relative, label, opened) =
+                with_rooted_partial(&target, copy_id, |relative, label| {
+                    self.open_private_partial_rooted(
+                        &destination_root,
+                        relative,
+                        label,
+                        true,
+                        PRIVATE_PARTIAL_MODE,
+                    )
+                })?;
+            target_relative = relative;
+            target_label = label;
+            let (d, basis_size) = opened.context("sidecar creation was requested")?;
             if basis_size.is_some() {
                 // Preserve resumable data. The streaming path will hash and
                 // reuse it after CopyLocal reports that it is unavailable.
@@ -1186,10 +1188,11 @@ impl FsOps {
         // New/replace small files, and the existing guarded-receiver
         // policy, stage through the same private rooted sidecar as ranged
         // writes do.
-        let (relative, label) = rooted_partial_target(&rooted, target.id)?;
-        let (file, basis_size) = self
-            .open_private_partial_rooted(&rooted.root, &relative, &label, true, staged_mode)?
-            .context("sidecar creation was requested")?;
+        let (relative, label, opened) =
+            with_rooted_partial(&rooted, target.id, |relative, label| {
+                self.open_private_partial_rooted(&rooted.root, relative, label, true, staged_mode)
+            })?;
+        let (file, basis_size) = opened.context("sidecar creation was requested")?;
         if basis_size.is_some() {
             file.set_len(0)?;
         }
@@ -1241,19 +1244,21 @@ impl FsOps {
             // this legacy branch after source roots have been initialized.
         }
         if let Some(target) = self.rooted_destination_target(target.path, target.guard)? {
-            let (relative, label) = if which == Which::Partial {
-                rooted_partial_target(&target, copy_id)?
+            let open = |relative: &RelativePath, _: &Path| {
+                let location = FileLocation::Rooted {
+                    root: target.root.identity(),
+                    relative: relative.clone(),
+                };
+                self.cached_clone(location, attempt, which == Which::Partial)?
+                    .map(Ok)
+                    .unwrap_or_else(|| target.root.open_regular_read(relative))
+            };
+            let (relative, label, mut file) = if which == Which::Partial {
+                with_rooted_partial(&target, copy_id, open)?
             } else {
-                (target.relative.clone(), target.label.clone())
+                let file = open(&target.relative, &target.label)?;
+                (target.relative.clone(), target.label.clone(), file)
             };
-            let location = FileLocation::Rooted {
-                root: target.root.identity(),
-                relative: relative.clone(),
-            };
-            let mut file = self
-                .cached_clone(location, attempt, which == Which::Partial)?
-                .map(Ok)
-                .unwrap_or_else(|| target.root.open_regular_read(&relative))?;
             file.seek(SeekFrom::Start(0))?;
             if which == Which::Partial {
                 require_safe_rooted_named_partial(&target.root, &relative, &label, &file)?;
@@ -1400,18 +1405,22 @@ impl FsOps {
             bail!("block hash mismatch on receive @{off}");
         }
         let rooted = self.destination_mutation_target(target.path, target.guard)?;
-        let (relative, label) = if inplace {
-            (rooted.relative.clone(), rooted.label.clone())
-        } else {
-            rooted_partial_target(&rooted, target.id)?
+        let mut write = |relative: &RelativePath, label: &Path| {
+            let file = self.cached_rooted(label, &rooted.root, relative, attempt, !inplace)?;
+            let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
+            let result = file.write_range_at(data, off);
+            if result.is_ok() {
+                writing.bytes(data.len() as u64);
+            }
+            // Keep a write error inside the successful access result: only
+            // opening the name may trigger the filename-limit retry.
+            Ok(result.with_context(|| format!("write {} @{off}", label.display())))
         };
-        let file = self.cached_rooted(&label, &rooted.root, &relative, attempt, !inplace)?;
-        let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
-        let result = file.write_range_at(data, off);
-        if result.is_ok() {
-            writing.bytes(data.len() as u64);
+        if inplace {
+            write(&rooted.relative, &rooted.label)?
+        } else {
+            with_rooted_partial(&rooted, target.id, write)?.2
         }
-        result.with_context(|| format!("write {} @{off}", label.display()))
     }
 
     pub(super) fn verify_expected_inode(
@@ -1545,11 +1554,11 @@ impl FsOps {
             }
             return Ok(());
         }
-        let (src_relative, src) = rooted_partial_target(target, copy_id)?;
-        let file = self
-            .uncache_rooted(&target.root, &src_relative)
-            .map(Ok)
-            .unwrap_or_else(|| target.root.open_regular_write(&src_relative, false))?;
+        let (src_relative, src, file) = with_rooted_partial(target, copy_id, |relative, _| {
+            self.uncache_rooted(&target.root, relative)
+                .map(Ok)
+                .unwrap_or_else(|| target.root.open_regular_write(relative, false))
+        })?;
         require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
         if let Some(expected) = expected {
             let reader = target.root.open_regular_read(&src_relative)?;

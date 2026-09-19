@@ -2421,6 +2421,7 @@ fn rooted_mkdir_race_accepts_only_an_existing_real_directory() {
         relative: RelativePath::new(path).unwrap(),
         label: PathBuf::from(OsStr::from_bytes(path)),
         create_missing_parents: true,
+        query_partial_name_limit: false,
     };
 
     assert!(create_rooted_directory_or_existing(&target(b"winner"), 0o755).is_ok());
@@ -4526,6 +4527,25 @@ fn process_umask_matches_file_creation() {
         .unwrap();
     let created = file.metadata().unwrap().mode() & 0o777;
     assert_eq!(created, 0o777 & !process_umask());
+}
+
+#[test]
+fn partial_collision_reservation_covers_shortened_names() {
+    let path = PathBuf::from("parent").join("x".repeat(255));
+    let id = [9; 16];
+    let full = partial_path_with_name_max(&path, &id, 255).unwrap();
+    let key = partial_reservation_key(full.as_os_str().as_bytes());
+    for limit in [255, 143, 100, 26, 25] {
+        let partial = partial_path_with_name_max(&path, &id, limit).unwrap();
+        assert_eq!(partial_reservation_key(partial.as_os_str().as_bytes()), key);
+    }
+    let other = Path::new("other").join(full.file_name().unwrap());
+    assert_ne!(partial_reservation_key(other.as_os_str().as_bytes()), key);
+    let other_id = partial_path_with_name_max(&path, &[8; 16], 255).unwrap();
+    assert_ne!(
+        partial_reservation_key(other_id.as_os_str().as_bytes()),
+        key
+    );
 }
 
 #[test]
