@@ -30,6 +30,7 @@
 .tool-examples select:focus-visible { outline: 2px solid var(--links); outline-offset: 2px; }
 .tool-examples summary { cursor: pointer; font-weight: 600; padding: .6em 0; }
 .tool-example-commands > div { min-width: 0; }
+.tool-example p code { white-space: nowrap; }
 .tool-example pre > code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .tool-example .tooltiptext { white-space: nowrap; overflow-wrap: normal; width: max-content; }
 .tool-example-note { padding-left: .8em; border-left: 3px solid var(--table-border-color); }

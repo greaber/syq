@@ -79,7 +79,8 @@ separate file selection, endpoints, and placement. Its tool comparison widget
 uses curated examples in `docs/assets/tool-examples.html`; all examples remain
 readable without JavaScript. Native selectors provide keyboard navigation. Both keep their selected value;
 choices explicitly listed in each tool’s `data-unsupported` attribute are
-disabled, with a reason. Missing examples are not evidence of incompatibility. Run
+disabled without hover tooltips. The attributes record the reasons; missing
+examples are not evidence of incompatibility. Run
 `python3 scripts/test-tool-examples.py` to check coverage and known supported tasks. Keep at least one
 shared task across all tools so readers can switch between them. Comparisons keep the task’s starting point, endpoints, and data route fixed.
 The syq selection makes all tasks discoverable. Workarounds that change those

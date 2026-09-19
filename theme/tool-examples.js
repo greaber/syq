@@ -37,11 +37,9 @@
       }
       for (const option of tool.options) {
         option.disabled = Boolean(reason(option.value, task.value));
-        option.title = reason(option.value, task.value) || "";
       }
       for (const option of task.options) {
         option.disabled = Boolean(reason(tool.value, option.value));
-        option.title = reason(tool.value, option.value) || "";
       }
       examples.forEach((item) => {
         item.group.hidden = item.tool !== tool.value ||
