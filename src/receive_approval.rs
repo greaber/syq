@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn copy_notice_checks_names_without_scanning_or_following_links() {
         use std::os::unix::fs::symlink;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let missing = root.join("missing");
         let request = copy_request(&missing);
@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn non_overwriting_policies_do_not_warn_about_existing_entries() {
         use crate::delegation::{ExistingDestinationPolicy, RootExistence};
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().canonicalize().unwrap().join("file");
         std::fs::write(&path, b"keep").unwrap();
         let mut request = copy_request(&path);
@@ -890,7 +890,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_dialog_script_compiles_without_opening_a_prompt() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let output = Command::new("/usr/bin/osacompile")
             .arg("-o")
             .arg(temp.path().join("approval.scpt"))

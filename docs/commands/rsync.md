@@ -9,7 +9,7 @@ syq rsync -av project/ server:backup/project/
 Check [Rsync compatibility](../rsync-compat.md) before replacing a script.
 Trailing slashes follow rsync's rules. Here `-h` means human-readable sizes;
 use `--help` for help. `SYQ_RSYNC_OPTIONS` supplies
-[extra arguments](../reference.md#environment-variables-and-local-files).
+[extra arguments](../environment.md).
 
 <!-- CLI: rsync -->
 ```text

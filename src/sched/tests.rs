@@ -219,7 +219,7 @@ fn chunks_allow_append_retry_and_release_with_live_snapshots() {
 
 #[test]
 fn jobs_preserve_indexes_snapshots_retries_and_release_capacity() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let path = dir.path().join("file");
     std::fs::write(&path, b"payload").unwrap();
     let entry = crate::fsops::lstat_entry(b"file".to_vec(), &path).unwrap();

@@ -26,11 +26,7 @@ result = syq.cp(srcs_in="data", into="backup")
 Arguments follow the command-line names: replace hyphens with underscores,
 and add a trailing underscore for Python keywords, such as `from_` and `as_`.
 The [copy guide](https://greaber.github.io/syq/reference.html) explains placement,
-filtering, and verification options. Advanced groups take comma-separated
-strings, for example `resource_limits="bandwidth=10M"`,
-`performance_tuning="workers=4"`, or
-`integrity_checking="compare=blake3,transfer=sha256"`. They are optional;
-ordinary copies choose performance settings automatically.
+filtering, and verification options.
 
 ## Copy over SSH
 
@@ -153,8 +149,7 @@ For a complete program built on mappings, see
 ## Generated data and binary streams
 
 Use `open_writer` to generate one file or object without a temporary payload
-file. A successful context exit commits the upload; an exception aborts it.
-For example, the standard library can write an archive directly to S3:
+file. For example, the standard library can write an archive directly to S3:
 
 ```python
 import tarfile
@@ -173,18 +168,13 @@ with syq.open_reader("dataset.tar", from_="s3://backups") as source:
         consume(chunk)
 ```
 
-Writers work with `io.BufferedWriter` and `io.TextIOWrapper`. Closing a wrapper
-ends payload input; the outer syq context commits only on successful exit.
-Outside a context, explicitly call `commit()` or `abort()` to finish the transfer.
-
-The streams use bounded transport buffers. Reading without a size requests
-all remaining bytes into Python memory and checks transfer completion before
-returning them. Reader context exit drains unread
-bytes and checks transfer success, so archive readers may stop at their own
-end marker. Call `abort()` to cancel instead. If a consumer publishes files,
-keep them staged until both decoding and the reader context finish successfully.
-See [byte streams](https://greaber.github.io/syq/python-reference.html#byte-streams)
-for lifecycle, timeout, and async behavior.
+The writer commits when its `with` block exits successfully; an exception
+aborts it. The reader checks transfer success when its `with` block exits,
+reading any bytes your code left unread. To cancel instead, call `abort()`.
+If you extract or publish files from a stream, wait for both decoding and the
+reader context to finish successfully before making those files available.
+See [Byte streams](https://greaber.github.io/syq/python-reference.html#byte-streams)
+for wrappers, explicit completion, and async behavior.
 
 ## Use asyncio
 
@@ -250,3 +240,21 @@ Use it for commands without a typed method, including `rsync` and receiver
 administration. See the
 [API reference](https://greaber.github.io/syq/python-reference.html) for process
 options and exceptions.
+
+To request a command on your receiving machine, use the syq executable you use
+for receiving:
+
+```python
+import syq
+
+result = syq.run(
+    ["exec", "--on", "@laptop", "--cwd", "work/project", "--", "cargo", "test"],
+    executable="/path/to/syq",
+    timeout=600,
+)
+print(result.stdout.decode())
+```
+
+This captures output and raises on a nonzero exit. The receiving machine asks
+for approval before running the command. See
+[Run commands on your receiving machine](https://greaber.github.io/syq/exec.html).

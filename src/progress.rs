@@ -23,7 +23,13 @@ pub struct Progress {
     tuning_high_water: AtomicU64,
     pub bytes_unchanged: AtomicU64,
     pub files_total: AtomicU64,
+    // Confirmed completion for display/results. Tuned transfers normally use
+    // add_files; fast batches confirm directly after earlier acknowledgment credit.
     pub files_done: AtomicU64,
+    // Acknowledged batch files plus ordinary completed files. Provisional
+    // acknowledgments are rolled back on failure, independently of files_done.
+    tuning_files: AtomicU64,
+    tuning_files_high_water: AtomicU64,
     pub files_unchanged: AtomicU64,
     /// Source files deliberately not transferred (-u, size limits, --existing,
     /// symlinks without -l, ...); neither "transferred" nor "unchanged".
@@ -121,6 +127,8 @@ impl Progress {
             bytes_unchanged: AtomicU64::new(0),
             files_total: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
+            tuning_files: AtomicU64::new(0),
+            tuning_files_high_water: AtomicU64::new(0),
             files_unchanged: AtomicU64::new(0),
             files_excluded: AtomicU64::new(0),
             paths_ignored: AtomicU64::new(0),
@@ -175,6 +183,24 @@ impl Progress {
     pub fn add_bytes(&self, n: u64) {
         let done = self.bytes_done.fetch_add(n, Relaxed).saturating_add(n);
         self.tuning_high_water.fetch_max(done, Relaxed);
+    }
+
+    /// Complete ordinary file work that has not already received batch credit.
+    pub fn add_files(&self, n: u64) {
+        self.files_done.fetch_add(n, Relaxed);
+        self.add_tuning_files(n);
+    }
+
+    /// Give the tuner timely file activity without claiming source validation
+    /// has finished. Like bytes, retried files must catch up to the previous
+    /// high-water mark before they count as fresh throughput.
+    pub fn add_tuning_files(&self, n: u64) {
+        let done = self.tuning_files.fetch_add(n, Relaxed).saturating_add(n);
+        self.tuning_files_high_water.fetch_max(done, Relaxed);
+    }
+
+    pub fn undo_tuning_files(&self, n: u64) {
+        self.tuning_files.fetch_sub(n, Relaxed);
     }
 
     /// Print a line to stdout, keeping the progress area intact.
@@ -542,7 +568,7 @@ impl crate::tune::Meter for Progress {
         self.tuning_high_water.load(Relaxed)
     }
     fn files(&self) -> u64 {
-        self.files_done.load(Relaxed)
+        self.tuning_files_high_water.load(Relaxed)
     }
     fn set_active(&self, n: usize) {
         self.active_workers.store(n as u64, Relaxed);

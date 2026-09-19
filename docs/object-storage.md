@@ -5,7 +5,8 @@
 Use buckets with [`cp`](commands/cp.md) and [`rm`](commands/rm.md):
 `--from s3://BUCKET`, `--to s3://BUCKET`, or `--on s3://BUCKET`.
 Selectors and placement options name keys within the bucket.
-See [copy examples](reference.md#copy-over-the-network) and [removal examples](remove.md#on-another-machine).
+For examples, see [Copy over the network](reference.md#copy-over-the-network)
+and [On another machine](remove.md#on-another-machine).
 
 <a id="credentials-and-providers"></a>
 <a id="parallelism"></a>
@@ -21,28 +22,7 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-region REGION` | Set the signing region explicitly |
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
 
-See [S3 tuning](tuning.md#s3-copies) for concurrency, part sizes, and retries.
-
-<a id="shell-pipelines"></a>
-
-## Descriptor copies
-
-With [`--src-fd` or `--as-fd`](commands/cp.md#file-descriptors), `cp`
-transfers one exact UTF-8 key's raw contents, without path normalization or
-prefix selection. Regular-file uploads store syq's file metadata. Output
-descriptors receive raw bytes; use `--preserve` to apply attributes to a regular
-output file. Pipes carry only bytes. No local temporary file is created.
-
-S3 descriptor copies default to four parallel 16 MiB parts, with about one
-part of payload buffering per worker plus one input/output part. Use `s3-part-size` and `s3-retries` to change the part size and retry budget.
-The usual S3 request and part concurrency controls apply; object concurrency
-is always one. Unknown-length uploads stop at 10,000 parts: 156.25 GiB at the
-default part size. Select a larger part size before starting a larger upload.
-
-Buffered parts can be retried, but there is no restart recovery. Uploads
-replace the object only on completion. On failure, syq attempts to abort the
-multipart upload; unconfirmed cleanup may need provider tools. A lost
-completion response can mean an upload was published despite a reported failure.
+See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>
@@ -70,6 +50,27 @@ Bucket-to-bucket copies run within one service, using the same endpoint, region,
 and credentials. They preserve metadata and tags. Changes to tags, encryption,
 or storage class alone do not trigger a copy. Content hashing and expected hashes
 are unsupported on this route.
+
+<a id="shell-pipelines"></a>
+
+## Descriptor copies
+
+With `--src-fd` or `--as-fd`, `cp` transfers one exact UTF-8 key's raw contents, without path normalization or
+prefix selection. Regular-file uploads store syq's file metadata. Output
+descriptors receive raw bytes; use `--preserve` to apply attributes to a regular
+output file. Pipes carry only bytes. No local temporary file is created. See
+[File descriptors](commands/cp.md#file-descriptors) for command examples.
+
+S3 descriptor copies default to four parallel 16 MiB parts, with about one
+part of payload buffering per worker plus one input/output part. Use `s3-part-size` and `s3-retries` to change the part size and retry budget.
+The usual S3 request and part concurrency controls apply; object concurrency
+is always one. Unknown-length uploads stop at 10,000 parts: 156.25 GiB at the
+default part size. Select a larger part size before starting a larger upload.
+
+Buffered parts can be retried, but there is no restart recovery. Uploads
+replace the object only on completion. On failure, syq attempts to abort the
+multipart upload; unconfirmed cleanup may need provider tools. A lost
+completion response can mean an upload was published despite a reported failure.
 
 <a id="remove-objects-and-versions"></a>
 

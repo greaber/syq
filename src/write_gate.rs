@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn concurrent_opens_and_hardlinks_share_one_writer() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("file");
         File::create(&path).unwrap();
         let alias = dir.path().join("alias");
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn cached_gate_tracks_open_inode_across_path_replacement_and_reopening() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("file");
         let alias = dir.path().join("alias");
         let original = CachedFile::new(File::create(&path).unwrap());
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn unrelated_files_progress_and_write_errors_release_the_gate() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("first");
         let first = CachedFile::new(File::create(&path).unwrap());
         let second = CachedFile::new(File::create(dir.path().join("second")).unwrap());

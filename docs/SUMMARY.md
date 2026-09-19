@@ -7,7 +7,7 @@
 - [Install and setup](install.md)
 - [Copy files](reference.md)
 - [Remove files](remove.md)
-- [Send files home from a server](receive.md)
+- [Use your laptop from a server](receive.md)
 - [Run commands on your receiving machine](exec.md)
 - [Copy between servers](remote-to-remote.md)
 - [Rename and reorganize](mappings.md)
@@ -39,6 +39,7 @@
 - [Remote copy details](remote-reference.md)
 - [Persistence details](persistence-reference.md)
 - [Automation results](automation.md)
+- [Environment and local files](environment.md)
 - [Rsync compatibility](rsync-compat.md)
 
 # SDKs

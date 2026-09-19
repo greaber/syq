@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn command_permission_is_distinct_from_copy_autoapproval_and_one_use() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let (_broker, receiver, registration, _) =
             super::super::tests::broker(root.path(), Approval::Always);
         for allow in [false, true] {
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn pending_command_disconnect_and_revocation_never_spawn() {
         for revoke in [false, true] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::tempdir().unwrap();
             let (_broker, receiver, registration, _) =
                 super::super::tests::broker(root.path(), Approval::Always);
             let mut stream = UnixStream::connect(&registration.socket).unwrap();
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn command_cleanup_handles_disconnect_revocation_and_output_backpressure() {
         for mode in 0..3 {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::tempdir().unwrap();
             let (_broker, receiver, registration, _) =
                 super::super::tests::broker(root.path(), Approval::Always);
             let script = if mode == 2 {
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn command_preserves_cwd_literal_byte_arguments_and_binary_output() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let cwd = root.path().join("with spaces");
         fs::create_dir(&cwd).unwrap();
         let mut req = request("pwd -P; printf '%s' \"$1\"; printf '\\000\\377' >&2; exit 17");
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn relative_program_runs_in_selected_directory_with_closed_stdin() {
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let program = root.path().join("probe");
         fs::write(
             &program,
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn both_output_streams_are_drained_past_pipe_capacity() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let (code, stdout, stderr) = run_direct(
             request("head -c 262144 /dev/zero; head -c 262145 /dev/zero >&2"),
             root.path(),
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn command_status_reports_signal_and_rejects_truncated_output() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         assert_eq!(run_direct(request("kill -TERM $$"), root.path()).0, 143);
         let mut bytes = Vec::new();
         write_message(&mut bytes, &Event::Stdout(b"partial".to_vec())).unwrap();
@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn malformed_command_is_refused_before_prompting() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let (_broker, receiver, registration, _) =
             super::super::tests::broker(root.path(), Approval::Always);
         let mut req = request("touch marker");

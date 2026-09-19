@@ -41,31 +41,24 @@ use worker::*;
 
 const MAX_ATTEMPTS: u32 = 3;
 pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
-const FAST_BATCH_FILES: usize = 128;
-// Larger batches trade filesystem overlap for fewer request/ack turns. On the
-// measured 262 ms path, 4,096 one-byte files at eight workers improved from a
-// 9.68 s to an 8.72 s median at 512. Direct TCP exposes its RTT; remote SSH
-// does not, but needs the same amortization and remains bounded by bytes below.
-const HIGH_RTT_FAST_BATCH_FILES: usize = 512;
-const HIGH_RTT_US: u64 = 100_000;
-const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
+// Amortize metadata requests across enough files to keep their shared pool
+// busy. The scheduler still divides queued files fairly among active workers,
+// and the byte limit bounds each batch independently of this ceiling.
+const FAST_BATCH_FILES: usize = 2048;
+// Keep the startup worker budget independent of the larger batch ceiling.
+// Larger batches must not leave small trees with fewer transfer workers.
+const STARTUP_BATCH_FILES: usize = 128;
+// Source requests carry both display paths and registered references. Leave
+// room for framing within the metadata protocol's 8 MiB limit, even when a
+// large batch contains long paths rather than substantial file data.
+const SOURCE_BATCH_PATH_BYTES: usize = 4 << 20;
 
-fn fast_batch_file_limit(
-    src_rtt_us: Option<u64>,
-    dst_rtt_us: Option<u64>,
-    remote_ssh_data: bool,
-) -> usize {
-    if remote_ssh_data
-        || src_rtt_us
-            .into_iter()
-            .chain(dst_rtt_us)
-            .any(|rtt| rtt >= HIGH_RTT_US)
-    {
-        HIGH_RTT_FAST_BATCH_FILES
-    } else {
-        FAST_BATCH_FILES
-    }
+fn source_request_bytes(path: &[u8], source: Option<&RegisteredPath>) -> usize {
+    path.len()
+        .saturating_add(source.map_or(0, |source| source.relative().len()))
+        .saturating_add(64)
 }
+const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
 
 // Bound a window of small-file groups independently of the logical batch.
 const FAST_BATCH_READ_BYTES: u64 = 4 << 20;
@@ -805,7 +798,7 @@ fn attempt_small_copy(
             continue;
         }
         progress.add_bytes(entry.size);
-        progress.files_done.fetch_add(1, Relaxed);
+        progress.add_files(1);
         if let Some(results) = progress.results_writer() {
             results.emit_operation(&crate::results::OperationRecord {
                 action: "transfer_file",
@@ -1416,7 +1409,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),
-            opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
+            opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
             if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
         );
@@ -1666,13 +1659,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         }
                     };
                     gate.mark_ready(id);
-                    let remote_ssh_data = [&src_ep, &dst_ep]
-                        .into_iter()
-                        .filter_map(real_remote_spec)
-                        .any(|spec| spec.data_transport() == DataTransport::Ssh);
-                    let fast_batch_files = opts.tuning.batch_files.unwrap_or_else(|| {
-                        fast_batch_file_limit(src.tcp_rtt_us(), dst.tcp_rtt_us(), remote_ssh_data)
-                    });
+                    let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let mut worker = Worker {
                         id,
                         src,
@@ -2699,7 +2686,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 args.connections,
                 files,
                 bytes,
-                opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
+                opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
                 opts.tuning.batch_bytes(),
             ));
             workers_started = true;
@@ -2808,7 +2795,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             args.connections,
                             file_jobs,
                             file_bytes,
-                            opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
+                            opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
                             opts.tuning.batch_bytes(),
                         )
                     } else {
@@ -3250,8 +3237,8 @@ fn validate_range_reply(expected_off: u64, expected_len: u64, off: u64, len: usi
 
 fn stat_many_registered(
     conn: &mut dyn Conn,
-    paths: Vec<PathBytes>,
-    sources: Option<Vec<RegisteredPath>>,
+    mut paths: Vec<PathBytes>,
+    mut sources: Option<Vec<RegisteredPath>>,
     follow: bool,
 ) -> Result<Vec<Option<Entry>>> {
     if paths.is_empty() {
@@ -3261,6 +3248,25 @@ fn stat_many_registered(
         if sources.len() != paths.len() {
             bail!("source stat capability count does not match path count");
         }
+    }
+    let path_bytes = paths.iter().enumerate().fold(0usize, |bytes, (i, path)| {
+        bytes.saturating_add(source_request_bytes(
+            path,
+            sources.as_ref().map(|sources| &sources[i]),
+        ))
+    });
+    if paths.len() > 1 && path_bytes > SOURCE_BATCH_PATH_BYTES {
+        let middle = paths.len() / 2;
+        let tail_paths = paths.split_off(middle);
+        let tail_sources = sources.as_mut().map(|sources| sources.split_off(middle));
+        let mut entries = stat_many_registered(conn, paths, sources, follow)?;
+        entries.extend(stat_many_registered(
+            conn,
+            tail_paths,
+            tail_sources,
+            follow,
+        )?);
+        return Ok(entries);
     }
     match ok(
         conn.call(Request::StatMany {

@@ -362,7 +362,7 @@ mod tests {
         use std::fs;
         use std::os::unix::fs::symlink;
         for entry in ["absent", "file", "directory", "symlink", "dangling symlink"] {
-            let home = tempfile::tempdir().unwrap();
+            let home = crate::test_support::tempdir().unwrap();
             let bin = home.path().join(".local/bin");
             fs::create_dir_all(&bin).unwrap();
             let destination = bin.join("syq");
