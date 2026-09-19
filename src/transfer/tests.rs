@@ -64,6 +64,7 @@ struct PipelineState {
     received: usize,
     progress: Option<Arc<Progress>>,
     progress_at_receive: Vec<(u64, u64)>,
+    tuning_at_receive: Vec<u64>,
     sent_at_receive: Vec<usize>,
     peer: Option<Arc<Mutex<PipelineState>>>,
     peer_sent_at_receive: Vec<usize>,
@@ -131,7 +132,9 @@ impl Conn for PipelineConn {
                 progress.bytes_done.load(Relaxed),
                 progress.files_done.load(Relaxed),
             );
+            let tuning = crate::tune::Meter::files(&**progress);
             state.progress_at_receive.push(snapshot);
+            state.tuning_at_receive.push(tuning);
         }
         if let Some(sched) = state.steal_on_receive.take() {
             let Item::File(idx) = sched.next() else {
@@ -778,7 +781,7 @@ fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
         let mut worker = pipeline_worker(&sched, &src, &dst, false);
         // Other workers' progress must survive rollback of this batch.
         worker.progress.add_bytes(123);
-        worker.progress.files_done.store(7, Relaxed);
+        worker.progress.add_files(7);
         src.lock().unwrap().progress = Some(worker.progress.clone());
         dst.lock().unwrap().progress = Some(worker.progress.clone());
         let result = worker.fast_batch(&mut batch);
@@ -801,6 +804,27 @@ fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
             7 + expected_files,
             "{failure}"
         );
+        let acknowledged = if failure == "destination-drop" { 5 } else { 6 };
+        assert_eq!(
+            crate::tune::Meter::files(&*worker.progress),
+            7 + acknowledged
+        );
+        for (i, &files) in dst.lock().unwrap().tuning_at_receive.iter().enumerate() {
+            assert_eq!(files, 7 + i as u64, "{failure}: tuner before ack {i}");
+        }
+        // Retrying uncertain files must not produce a second burst of credit.
+        worker
+            .progress
+            .add_tuning_files(acknowledged - expected_files);
+        assert_eq!(
+            crate::tune::Meter::files(&*worker.progress),
+            7 + acknowledged
+        );
+        worker.progress.add_files(1);
+        assert_eq!(
+            crate::tune::Meter::files(&*worker.progress),
+            8 + acknowledged
+        );
         let snapshots = &dst.lock().unwrap().progress_at_receive;
         for (i, &(bytes, files)) in snapshots.iter().enumerate() {
             assert_eq!(bytes, 123 + ((i as u64) << 20), "{failure}: ack {i}");
@@ -821,6 +845,55 @@ fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
             assert_eq!(sched.jobs.lock().unwrap()[0].attempt, 1);
         }
     }
+}
+
+#[test]
+fn small_batch_tuning_counts_empty_files_but_not_failed_publications() {
+    use crate::tune::Meter;
+    let sched = Arc::new(Sched::new(512, 8192));
+    let src = Arc::new(Mutex::new(PipelineState::default()));
+    let dst = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let jobs = [0, 8, 0]
+        .into_iter()
+        .enumerate()
+        .map(|(i, size)| {
+            let job = pipeline_job(format!("file{i}").as_bytes(), size);
+            sched.push_file(job);
+            worker.job(i)
+        })
+        .collect::<Vec<_>>();
+    dst.lock()
+        .unwrap()
+        .replies
+        .push_back(Response::Applied(vec![
+            None,
+            Some(crate::fsops::wire_error(&anyhow::anyhow!(
+                "publication failed"
+            ))),
+            None,
+        ]));
+    let mut results = vec![None, None, None];
+    assert!(worker
+        .receive_small_batch(vec![0, 1, 2], &jobs, &mut results)
+        .unwrap());
+    assert_eq!(Meter::files(&*worker.progress), 2);
+    assert_eq!(Meter::bytes(&*worker.progress), 0);
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    assert!(results[1].as_ref().unwrap().is_err());
+
+    dst.lock()
+        .unwrap()
+        .replies
+        .push_back(Response::Applied(vec![]));
+    assert!(!worker
+        .receive_small_batch(vec![1], &jobs, &mut results)
+        .unwrap());
+    assert_eq!(
+        Meter::files(&*worker.progress),
+        2,
+        "malformed replies earn no credit"
+    );
 }
 
 #[test]

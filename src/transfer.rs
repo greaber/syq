@@ -797,7 +797,7 @@ fn attempt_small_copy(
             continue;
         }
         progress.add_bytes(entry.size);
-        progress.files_done.fetch_add(1, Relaxed);
+        progress.add_files(1);
         if let Some(results) = progress.results_writer() {
             results.emit_operation(&crate::results::OperationRecord {
                 action: "transfer_file",

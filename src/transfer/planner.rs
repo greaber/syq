@@ -1563,7 +1563,7 @@ impl Planner<'_> {
         } else if opts.dry_run {
             self.progress.files_total.fetch_add(1, Relaxed);
             self.progress.bytes_total.fetch_add(e.size, Relaxed);
-            self.progress.files_done.fetch_add(1, Relaxed);
+            self.progress.add_files(1);
             // Dry aggregates mean planned work, bytes included —
             // files_done already moves here, so bytes_done must
             // too or the terminal record contradicts its traces.

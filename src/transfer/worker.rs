@@ -282,16 +282,17 @@ impl Worker {
     ) -> Result<bool> {
         let response = self.dst.recv()?;
         let valid = Self::record_small_batch_reply(&sent, response, results);
-        // Report useful bytes per acknowledgment, without waiting for the
-        // whole logical batch. Final source checks still own file completion;
-        // fast_batch removes this provisional credit on failure or a retry.
-        let bytes = sent
+        // Acknowledgments advance both byte and file activity for the tuner.
+        // Confirmed file completion still belongs to the final source check.
+        let (bytes, files) = sent
             .iter()
             .filter(|&&idx| matches!(results[idx], Some(Ok(()))))
-            .map(|&idx| jobs[idx].entry.size)
-            .sum();
-        if bytes > 0 {
+            .fold((0, 0), |(bytes, files), &idx| {
+                (bytes + jobs[idx].entry.size, files + 1)
+            });
+        if files > 0 {
             self.progress.add_bytes(bytes);
+            self.progress.add_tuning_files(files);
         }
         Ok(valid)
     }
@@ -547,14 +548,16 @@ impl Worker {
             .zip(owned)
             .filter_map(|(result, own)| own.then_some(result))
             .collect();
-        let credited = jobs
+        let (credited, credited_files) = jobs
             .iter()
             .zip(&results)
             .filter(|(_, result)| matches!(result, Some(Ok(()))))
-            .map(|(job, _)| job.entry.size)
-            .sum();
+            .fold((0, 0), |(bytes, files), (job, _)| {
+                (bytes + job.entry.size, files + 1)
+            });
         if let Err(error) = result {
             self.progress.bytes_done.fetch_sub(credited, Relaxed);
+            self.progress.undo_tuning_files(credited_files);
             return Err(error);
         }
         // Recheck only acknowledged successes. Later errors must not discard
@@ -575,6 +578,7 @@ impl Worker {
                 Ok(now) => now,
                 Err(error) => {
                     self.progress.bytes_done.fetch_sub(credited, Relaxed);
+                    self.progress.undo_tuning_files(credited_files);
                     return Err(error);
                 }
             }
@@ -612,6 +616,7 @@ impl Worker {
             };
             if changed {
                 self.progress.bytes_done.fetch_sub(j.entry.size, Relaxed);
+                self.progress.undo_tuning_files(1);
                 if let (Some(e), true, true) = (
                     now,
                     j.attempt + 1 < MAX_ATTEMPTS,
@@ -651,6 +656,7 @@ impl Worker {
                 continue;
             }
             j.done.store(j.entry.size, Relaxed);
+            // Already counted for tuning when the destination acknowledged it.
             self.progress.files_done.fetch_add(1, Relaxed);
             if let Some(results) = self.progress.results_writer() {
                 results.emit_operation(&crate::results::OperationRecord {
@@ -1775,7 +1781,7 @@ impl Worker {
             self.progress.files_total.fetch_sub(1, Relaxed);
             self.progress.files_unchanged.fetch_add(1, Relaxed);
         } else {
-            self.progress.files_done.fetch_add(1, Relaxed);
+            self.progress.add_files(1);
             if let Some(results) = self.progress.results_writer() {
                 results.emit_operation_expected(
                     &crate::results::OperationRecord {
@@ -1900,7 +1906,7 @@ impl Worker {
             Ok(true) => {
                 self.progress.add_bytes(job.entry.size);
                 job.done.store(job.entry.size, Relaxed);
-                self.progress.files_done.fetch_add(1, Relaxed);
+                self.progress.add_files(1);
                 self.progress.files_unchanged.fetch_add(1, Relaxed);
                 self.progress
                     .bytes_unchanged
