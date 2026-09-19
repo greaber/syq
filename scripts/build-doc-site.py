@@ -171,6 +171,10 @@ def build_site(destination, releases):
             archive = work / "source.tar"
             subprocess.run(["git", "archive", f"--output={archive}", commit], cwd=ROOT, check=True)
             subprocess.run(["tar", "-xf", str(archive), "-C", str(source)], check=True)
+            # Site branding follows the current site, including archived books.
+            for name in ("favicon.svg", "favicon.png"):
+                (source / "theme").mkdir(exist_ok=True)
+                shutil.copyfile(ROOT / "theme" / name, source / "theme" / name)
             print(f"Building {tag} ({commit[:8]})", flush=True)
             build_book(source, books / tag, tag, f"{SITE}{tag}/")
             supported.append(tag)
