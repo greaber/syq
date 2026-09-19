@@ -194,7 +194,8 @@ for mapping entries, kind and bytes where applicable, plus a `reason`:
 `destination_missing`, `type_differs`, `content_differs`, `metadata_differs`,
 or `destination_only`.
 
-For filesystem copies, `content_differs` means sizes or compared hashes differ;
+For filesystem copies of regular files, `content_differs` means sizes or compared
+hashes differ;
 `metadata_differs` also covers copies selected by the metadata quick check.
 A `transfer_file` trace omits `bytes` when only metadata would change.
 
