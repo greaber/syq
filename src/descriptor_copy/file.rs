@@ -158,7 +158,7 @@ impl Session {
                         Root::from_directory(parent)?,
                         RelativePath::new(name.to_bytes())?,
                         if meta.is_file() {
-                            meta.mode & 0o777
+                            meta.mode & 0o7777
                         } else {
                             new_mode
                         },

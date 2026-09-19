@@ -1289,13 +1289,13 @@ fn stream_file_metadata_and_newer_selection() {
         let target = if remote { "remote" } else { "local" };
         for (preserve, exists, mode) in [
             (false, false, 0o750),
-            (false, true, 0o624),
+            (false, true, 0o1624),
             (true, true, 0o751),
         ] {
             input.try_clone().unwrap().seek(SeekFrom::Start(1)).unwrap();
             if exists {
                 write(&t.path(target), b"old");
-                fs::set_permissions(t.path(target), fs::Permissions::from_mode(0o624)).unwrap();
+                fs::set_permissions(t.path(target), fs::Permissions::from_mode(0o1624)).unwrap();
             }
             let mut args = vec!["--src-fd", "0"];
             args.extend(&endpoint);
