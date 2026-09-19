@@ -1,6 +1,6 @@
-//! One private SDK control socket. Payload bytes use separately owned FDs.
+//! Versioned subprocess control socket. Payload bytes use separately owned FDs.
 use anyhow::{ensure, Context, Result};
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{Read, Write},
@@ -12,10 +12,23 @@ use std::{
 const VERSION: u64 = 1;
 const MAX_FRAME: usize = 65536;
 
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(super) enum Message<'a> {
+    Hello { version: u64 },
+    Start { entry: u64, direction: &'a str },
+    Transferred { entry: u64, error: Option<String> },
+    End,
+}
+#[derive(Deserialize)]
+struct Hello {
+    version: u64,
+}
+
 pub(super) struct Channel(Mutex<UnixStream>);
 impl Channel {
     pub fn connect(fd: RawFd) -> Result<Self> {
-        // Take ownership before any helper can inherit the private SDK socket.
+        // Take ownership before any helper can inherit the stream control socket.
         ensure!(
             fd > 2,
             "stream mapping control descriptor must be greater than 2"
@@ -31,7 +44,7 @@ impl Channel {
             .peer_addr()
             .context("stream mapping control descriptor must be a connected Unix socket")?;
         let channel = Self(Mutex::new(socket));
-        channel.send(json!({"type": "hello", "version": VERSION}), &[])?;
+        channel.send(Message::Hello { version: VERSION }, &[])?;
         let mut socket = channel.0.lock().unwrap();
         let (marker, descriptors) =
             crate::descriptor_broker::receive_message(socket.as_raw_fd(), 1)?;
@@ -48,15 +61,15 @@ impl Channel {
         );
         let mut body = vec![0; length];
         socket.read_exact(&mut body)?;
-        let hello: Value = serde_json::from_slice(&body)?;
+        let hello: Hello = serde_json::from_slice(&body)?;
         ensure!(
-            hello == json!({"version": VERSION}),
+            hello.version == VERSION,
             "unsupported stream mapping protocol version"
         );
         drop(socket);
         Ok(channel)
     }
-    pub fn send(&self, message: Value, descriptors: &[RawFd]) -> Result<()> {
+    pub fn send(&self, message: Message<'_>, descriptors: &[RawFd]) -> Result<()> {
         let payload = serde_json::to_vec(&message)?;
         ensure!(
             payload.len() <= MAX_FRAME,

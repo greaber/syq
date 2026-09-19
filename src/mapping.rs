@@ -8,7 +8,7 @@ use crate::proto::{Kind, PathBytes};
 use anyhow::{bail, Context, Result};
 
 /// One parsed `--mapping` manifest entry.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ManifestEntry {
     pub src: PathBytes,
     pub dst: PathBytes,
@@ -50,76 +50,79 @@ impl DeclaredKind {
     }
 }
 
-pub(crate) fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
-    use base64::Engine as _;
-    // Unknown keys are rejected so a typo cannot be silently dropped; the
-    // known informational fields (`size`, `mtime`, a tagged path's `display`)
-    // are accepted and ignored so `syq map` output and future automation
-    // records round-trip.
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct WirePath {
-        encoding: String,
-        value: String,
-        #[serde(default)]
-        #[allow(dead_code)]
-        display: Option<String>,
-    }
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct WireEntry {
-        src: WirePath,
-        dst: WirePath,
-        #[serde(default)]
-        kind: Option<String>,
-        #[serde(default)]
-        expected_hash: Option<crate::hashing::Digest>,
-        #[serde(default)]
-        metadata: Option<Metadata>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        size: Option<u64>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        mtime: Option<i64>,
-    }
-    let entry: WireEntry = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let decode = |path: WirePath, which: &str| -> Result<PathBytes> {
-        let bytes = match path.encoding.as_str() {
-            "utf-8" => path.value.into_bytes(),
+/// Typed wire fields shared by pathname and live-stream mappings.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WirePath {
+    encoding: String,
+    value: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    display: Option<String>,
+}
+impl WirePath {
+    pub(crate) fn decode(self, which: &str) -> Result<PathBytes> {
+        use base64::Engine as _;
+        let bytes = match self.encoding.as_str() {
+            "utf-8" => self.value.into_bytes(),
             "base64" => base64::engine::general_purpose::STANDARD
-                .decode(path.value.as_bytes())
+                .decode(self.value.as_bytes())
                 .map_err(|e| anyhow::anyhow!("{which}: invalid base64 path: {e}"))?,
             other => bail!("{which}: unknown path encoding {other:?}"),
         };
         validate_manifest_path(&bytes, which)?;
         Ok(bytes)
-    };
-    let src = decode(entry.src, "src")?;
-    let dst = decode(entry.dst, "dst")?;
-    let kind = match entry.kind.as_deref() {
-        None => None,
-        Some("file") => Some(DeclaredKind::File),
-        Some("dir") => Some(DeclaredKind::Dir),
-        Some("symlink") => Some(DeclaredKind::Symlink),
-        Some("special") => Some(DeclaredKind::Special),
-        Some(other) => bail!("unknown kind {other:?}"),
-    };
-    if let Some(metadata) = &entry.metadata {
-        metadata.validate()?;
-        if matches!(kind, Some(DeclaredKind::Symlink)) {
-            metadata.validate_kind(Kind::Symlink)?;
-        }
     }
-    if let Some(digest) = &entry.expected_hash {
-        digest.validate()?;
-        if kind.is_some_and(|kind| !matches!(kind, DeclaredKind::File)) {
-            bail!("expected_hash requires a regular file");
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WireEntry<P> {
+    pub src: P,
+    pub dst: P,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    pub expected_hash: Option<crate::hashing::Digest>,
+    #[serde(default)]
+    pub metadata: Option<Metadata>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    size: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    mtime: Option<i64>,
+}
+impl<P> WireEntry<P> {
+    pub(crate) fn validate(&self) -> Result<Option<DeclaredKind>> {
+        let kind = match self.kind.as_deref() {
+            None => None,
+            Some("file") => Some(DeclaredKind::File),
+            Some("dir") => Some(DeclaredKind::Dir),
+            Some("symlink") => Some(DeclaredKind::Symlink),
+            Some("special") => Some(DeclaredKind::Special),
+            Some(other) => bail!("unknown kind {other:?}"),
+        };
+        if let Some(metadata) = &self.metadata {
+            metadata.validate()?;
+            if matches!(kind, Some(DeclaredKind::Symlink)) {
+                metadata.validate_kind(Kind::Symlink)?;
+            }
         }
+        if let Some(digest) = &self.expected_hash {
+            digest.validate()?;
+            if kind.is_some_and(|kind| !matches!(kind, DeclaredKind::File)) {
+                bail!("expected_hash requires a regular file");
+            }
+        }
+        Ok(kind)
     }
+}
+pub(crate) fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
+    let entry: WireEntry<WirePath> = serde_json::from_str(text)?;
+    let kind = entry.validate()?;
     Ok(ManifestEntry {
-        src,
-        dst,
+        src: entry.src.decode("src")?,
+        dst: entry.dst.decode("dst")?,
         kind,
         expected_hash: entry.expected_hash,
         metadata: entry.metadata,
@@ -153,7 +156,7 @@ pub(crate) fn validate_manifest_path(path: &[u8], which: &str) -> Result<()> {
 /// Immutable input shared by authorization and remote coordination. Bounds
 /// are checked while parsing, but enforced only when selecting a restricted
 /// receiver; ordinary mappings do not acquire new size limits.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Input {
     pub contents: Vec<u8>,
     restricted_bounds_error: Option<String>,
@@ -173,6 +176,7 @@ impl Input {
     }
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct ParsedManifest {
     pub input: Input,
     pub entries: Vec<(u64, ManifestEntry)>,
@@ -191,8 +195,6 @@ pub(crate) fn read_mapping_manifest(contents: Vec<u8>) -> Result<ParsedManifest>
     let mut reader = std::io::Cursor::new(&contents);
     let mut restricted_bounds_error = None;
     let mut entries: Vec<(u64, ManifestEntry)> = Vec::new();
-    let mut declared: std::collections::HashMap<PathBytes, (Option<DeclaredKind>, bool)> =
-        std::collections::HashMap::new();
     let mut line_number = 0u64;
     loop {
         let mut line = String::new();
@@ -221,48 +223,82 @@ pub(crate) fn read_mapping_manifest(contents: Vec<u8>) -> Result<ParsedManifest>
                 crate::delegation::MAX_PATH_BYTES
             ));
         }
-        if declared
-            .insert(entry.dst.clone(), (entry.kind, false))
-            .is_some()
-        {
-            bail!(
-                "--mapping line {line_number}: duplicate destination {} (duplicate entries are errors; deduplicate in the generator)",
-                display(&entry.dst)
-            );
-        }
         entries.push((line_number, entry));
     }
-    for (line_number, entry) in &entries {
-        for (i, &byte) in entry.dst.iter().enumerate() {
+    parsed_manifest(contents, entries, restricted_bounds_error)
+}
+
+pub(crate) fn validate_destinations<'a>(
+    entries: impl IntoIterator<Item = (u64, &'a [u8], Option<DeclaredKind>)>,
+) -> Result<std::collections::HashSet<PathBytes>> {
+    let mut declared = std::collections::HashMap::new();
+    for (line, path, kind) in entries {
+        if declared.insert(path, (line, kind)).is_some() {
+            bail!("--mapping line {line}: duplicate destination {} (duplicate entries are errors; deduplicate in the generator)", display(path));
+        }
+    }
+    let mut parents = std::collections::HashSet::new();
+    for (&path, &(line, _)) in &declared {
+        for (i, &byte) in path.iter().enumerate() {
             if byte != b'/' {
                 continue;
             }
-            if let Some((kind, is_parent)) = declared.get_mut(&entry.dst[..i]) {
-                *is_parent = true;
+            if let Some((_, kind)) = declared.get(&path[..i]) {
+                parents.insert(path[..i].to_vec());
                 if let Some(kind) = kind.filter(|kind| !matches!(kind, DeclaredKind::Dir)) {
-                    bail!(
-                        "--mapping line {line_number}: destination ancestor {} of {} is mapped with kind {:?}, not dir",
-                        display(&entry.dst[..i]),
-                        display(&entry.dst),
-                        kind.label()
-                    );
+                    bail!("--mapping line {line}: destination ancestor {} of {} is mapped with kind {:?}, not dir", display(&path[..i]), display(path), kind.label());
                 }
             }
         }
     }
+    Ok(parents)
+}
+
+pub(crate) fn parsed_manifest(
+    contents: Vec<u8>,
+    entries: Vec<(u64, ManifestEntry)>,
+    restricted_bounds_error: Option<String>,
+) -> Result<ParsedManifest> {
+    let explicit_parents = validate_destinations(
+        entries
+            .iter()
+            .map(|(line, entry)| (*line, entry.dst.as_slice(), entry.kind)),
+    )?;
     Ok(ParsedManifest {
         input: Input {
             contents,
             restricted_bounds_error,
         },
         entries,
-        // Reuse the validation keys; do not allocate the full implicit-parent
-        // expansion just to recognize explicit entries in later scan batches.
-        explicit_parents: declared
-            .into_iter()
-            .filter_map(|(path, (_, is_parent))| is_parent.then_some(path))
-            .collect(),
+        explicit_parents,
     })
+}
+
+/// Reuse an already validated in-process mapping without a JSON round trip.
+pub(crate) fn load(args: &crate::cli::Args) -> Result<std::sync::Arc<ParsedManifest>> {
+    use std::io::Read;
+    if let Some(parsed) = &args.parsed_mapping {
+        return Ok(parsed.clone());
+    }
+    let path = args.native_mapping.as_deref().context("missing mapping")?;
+    let mut contents = Vec::new();
+    if path == b"-" {
+        std::io::stdin()
+            .read_to_end(&mut contents)
+            .context("--mapping -: read stdin")?;
+    } else {
+        crate::fsops::open_operator_file_read(
+            path,
+            if args.native_follow {
+                crate::proto::OperatorSymlinkPolicy::FollowAll
+            } else {
+                crate::proto::OperatorSymlinkPolicy::Refuse
+            },
+        )?
+        .read_to_end(&mut contents)
+        .with_context(|| format!("--mapping {}", display(path)))?;
+    }
+    Ok(std::sync::Arc::new(read_mapping_manifest(contents)?))
 }
 
 /// The exact manifest authorized by the invoking/receiving machine. Contents

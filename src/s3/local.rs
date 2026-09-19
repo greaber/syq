@@ -180,32 +180,15 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
         .transpose()?
         .unwrap_or(u64::MAX);
     let mut selectors = Vec::new();
-    if let Some(mapping) = &args.native_mapping {
-        let contents = if mapping == b"-" {
-            let mut data = Vec::new();
-            std::io::stdin().read_to_end(&mut data)?;
-            data
-        } else {
-            let mut f = crate::fsops::open_operator_file_read(
-                mapping,
-                if args.native_follow {
-                    OperatorSymlinkPolicy::FollowAll
-                } else {
-                    OperatorSymlinkPolicy::Refuse
-                },
-            )?;
-            let mut data = Vec::new();
-            f.read_to_end(&mut data)?;
-            data
-        };
-        let manifest = crate::mapping::read_mapping_manifest(contents)?;
-        for (_, entry) in manifest.entries {
+    if args.native_mapping.is_some() {
+        let manifest = crate::mapping::load(args)?;
+        for (_, entry) in &manifest.entries {
             selectors.push((
-                entry.src,
+                entry.src.clone(),
                 join(&target, &key_path(&entry.dst)?),
                 SourceSelection::Named,
                 entry.kind,
-                entry.expected_hash,
+                entry.expected_hash.clone(),
                 entry.metadata,
             ));
         }

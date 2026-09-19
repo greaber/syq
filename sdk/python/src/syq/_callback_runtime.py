@@ -77,7 +77,7 @@ class Callbacks:
         try:
             hello, fds = receive(self.channel)
             try:
-                if hello != {"type": "hello", "version": VERSION} or fds:
+                if hello.get("type") != "hello" or type(hello.get("version")) is not int or hello["version"] != VERSION or fds:
                     raise SyqProtocolError("unsupported stream mapping handshake")
             finally:
                 for fd in fds:
@@ -143,9 +143,10 @@ class Callbacks:
 
     def _invoke(self, endpoint, state: TransferState, payload_fd: int, commit_fd: int) -> None:
         writer = isinstance(endpoint, StreamSource)
-        payload = io.FileIO(payload_fd, "wb" if writer else "rb", closefd=True)
-        stream = Writer(payload, state) if writer else Reader(payload, state)
+        payload = None
         try:
+            payload = io.FileIO(payload_fd, "wb" if writer else "rb", closefd=True)
+            stream = Writer(payload, state) if writer else Reader(payload, state)
             function = endpoint.produce if writer else endpoint.consume
             if _async(function):
                 async def invoke():
@@ -169,7 +170,10 @@ class Callbacks:
             if not self._cancelled.is_set():
                 self._fail(error)
         finally:
-            payload.close()
+            if payload is None:
+                os.close(payload_fd)
+            else:
+                payload.close()
             os.close(commit_fd)
 
     def raise_error(self) -> None:

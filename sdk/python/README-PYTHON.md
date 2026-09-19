@@ -193,8 +193,9 @@ syq.cp(mapping=[syq.MappingEntry(syq.StreamSource(partial(pack, name)), f"{name}
 
 A `StreamDestination(consumer)` receives downloaded bytes in the same way.
 Archive formats belong to your callback. The
-[RSB example](https://github.com/greaber/syq/blob/master/examples/rsb-streams/rsb_streams.py)
-shows sharded tar uploads and restoration using an RSB-compatible Parquet index.
+[Rust RSB client](https://github.com/greaber/syq/tree/master/examples/rsb-syq)
+uses the same subprocess interface for sharded tar uploads and restoration
+with an RSB-compatible Parquet index.
 See [Callback mappings](https://greaber.github.io/syq/python-reference.html#callback-mappings)
 for completion, retries, and async callbacks.
 

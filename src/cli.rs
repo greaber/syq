@@ -75,6 +75,8 @@ pub struct Args {
     pub(crate) stream_preserve_times: bool,
     #[arg(skip)]
     pub(crate) results_override: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+    #[arg(skip)]
+    pub(crate) parsed_mapping: Option<std::sync::Arc<crate::mapping::ParsedManifest>>,
     /// Process-local S3 transfer settings; never serialized into helper requests.
     #[arg(skip)]
     pub(crate) s3: Option<crate::s3::Options>,
@@ -1271,7 +1273,7 @@ struct NativeCopyFields {
     /// -C and dst paths are relative to the --into container
     #[arg(long, value_name = "FILE")]
     mapping: Option<OsString>,
-    /// Private SDK callback control socket; callbacks are not saved mappings.
+    /// Programmatic stream-mapping control socket (protocol in docs/stream-mappings.md).
     #[arg(long, hide = true, requires = "mapping", conflicts_with_all = ["src_fd", "as_fd"])]
     stream_mapping_fd: Option<i32>,
     #[arg(long, hide = true, requires = "stream_mapping_fd", value_parser = clap::value_parser!(u16).range(1..=256))]

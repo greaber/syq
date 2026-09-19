@@ -324,6 +324,8 @@ starts no copy. Plain iterables and manifest paths have no source context; pass
 `cwd`, `root`, or `from_` explicitly as needed. See
 [mapping rules](https://greaber.github.io/syq/mappings.html).
 
+<a id="callback-mappings"></a>
+
 ### Callback mappings
 
 `StreamSource(produce, *, size=None)` supplies bytes to one mapping entry.

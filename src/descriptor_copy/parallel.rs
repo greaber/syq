@@ -415,6 +415,7 @@ pub(super) async fn run(
             output.context("missing stream output")?,
             commit,
             controls,
+            None,
         )
         .await;
     }
@@ -703,10 +704,21 @@ pub(crate) async fn direct(
     mut output: fd::Descriptor,
     commit: Option<fd::Descriptor>,
     controls: Arc<Controls>,
+    budget: Option<Arc<Semaphore>>,
 ) -> Result<()> {
     let source_meta = input.metadata();
     let mut check = controls.expected.start();
     loop {
+        let _credit = if let Some(budget) = &budget {
+            Some(
+                budget
+                    .clone()
+                    .acquire_many_owned(controls.settings.request_size.div_ceil(GRANULE) as u32)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let (next, data) = input.read_available(controls.settings.request_size).await?;
         input = next;
         if data.is_empty() {

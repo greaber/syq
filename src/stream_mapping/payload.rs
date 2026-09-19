@@ -1,8 +1,7 @@
 //! Callback admission and completion, independent of byte-stream EOF.
-use super::channel::Channel;
+use super::channel::{Channel, Message};
 use crate::descriptor_copy::fd::Descriptor;
 use anyhow::Result;
-use serde_json::json;
 use std::{
     fs::File,
     os::{
@@ -41,8 +40,10 @@ impl Payload {
             Descriptor::owned(File::from(OwnedFd::from(native)), upload, cancelled.clone())?;
         let commit = Descriptor::owned(File::from(OwnedFd::from(commit)), true, cancelled)?;
         self.channel.send(
-            json!({"type": "start", "entry": self.id,
-            "direction": if upload { "produce" } else { "consume" }}),
+            Message::Start {
+                entry: self.id,
+                direction: if upload { "produce" } else { "consume" },
+            },
             &[callback.as_raw_fd(), acknowledge.as_raw_fd()],
         )?;
         self.started.store(true, Relaxed);
@@ -51,8 +52,10 @@ impl Payload {
     pub(crate) fn transferred(&self, error: Option<&anyhow::Error>) -> Result<()> {
         if self.started.load(Relaxed) && !self.completed.swap(true, Relaxed) {
             self.channel.send(
-                json!({"type": "transferred", "entry": self.id,
-                "error": error.map(|e| format!("{e:#}"))}),
+                Message::Transferred {
+                    entry: self.id,
+                    error: error.map(|e| format!("{e:#}")),
+                },
                 &[],
             )?;
         }

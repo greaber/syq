@@ -13,7 +13,7 @@ use crate::copy_policy::FreshCapacityAssessment;
 #[cfg(test)]
 use crate::fsops::content_digest;
 use crate::fsops::{destination_fraction_matches, is_partial_name, is_recovery_name, join};
-use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
+use crate::mapping::{DeclaredKind, ManifestEntry};
 use crate::output::debug;
 use crate::progress::{commas, human, Progress};
 use crate::proto::DestinationRoot as RegisteredDestinationRoot;
@@ -22,6 +22,7 @@ use crate::sched::{FileJob, FileJobData, Item, RangeHandle, RangeWork, Sched, Wo
 use crate::tune::{self, Gate};
 use anyhow::{bail, ensure, Context, Result};
 use std::ffi::OsStr;
+#[cfg(test)]
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -335,16 +336,6 @@ fn destination_operator_symlink_policy(
     if args.interface == Interface::Rsync {
         rsync_operator_symlink_policy(rsync_insecure_links(args, destination_is_local))
     } else if args.follows_native_destination_paths() {
-        OperatorSymlinkPolicy::FollowAll
-    } else {
-        OperatorSymlinkPolicy::Refuse
-    }
-}
-
-fn control_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
-    if args.interface == Interface::Rsync {
-        rsync_operator_symlink_policy(args.insecure_links)
-    } else if args.native_follow {
         OperatorSymlinkPolicy::FollowAll
     } else {
         OperatorSymlinkPolicy::Refuse
@@ -1148,21 +1139,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let mut args = args;
     // The executing build consumes stdin once, then shares immutable bytes with
     // authorization and remote coordination. Neither may reopen the manifest.
-    let mapping_entries = if let Some(mapping) = args.native_mapping.as_deref() {
+    let mapping_entries = if args.native_mapping.is_some() {
         if args.detach {
             bail!("--mapping requires an attached copy");
         }
-        let mut contents = Vec::new();
-        if mapping == b"-" {
-            std::io::stdin()
-                .read_to_end(&mut contents)
-                .context("--mapping -: read stdin")?;
-        } else {
-            crate::fsops::open_operator_file_read(mapping, control_operator_symlink_policy(&args))
-                .and_then(|mut input| input.read_to_end(&mut contents).map_err(Into::into))
-                .with_context(|| format!("--mapping {}", display(mapping)))?;
-        }
-        let parsed = read_mapping_manifest(contents)?;
+        let parsed = match args.parsed_mapping.take() {
+            Some(parsed) => parsed,
+            None => crate::mapping::load(&args)?,
+        };
+        let parsed = Arc::unwrap_or_clone(parsed);
         args.mapping_contents = Some(Arc::new(parsed.input));
         Some((parsed.entries, parsed.explicit_parents))
     } else {

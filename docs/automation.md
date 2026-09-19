@@ -77,7 +77,7 @@ Every record carries:
 | Field | Value |
 |---|---|
 | `schema` | `"syq.automation"` |
-| `schema_version` | `2`; Python callback mappings use `3` |
+| `schema_version` | `2`; Stream mappings use `3` |
 | `seq` | Integer starting at 0, strictly increasing |
 | `type` | Record type |
 
@@ -183,13 +183,13 @@ file. The normal terminal `result` still establishes completion. Its optional
 `bytes_total_known` field is false when the source length is unknown; preview
 byte totals then count only known bytes, rather than asserting an empty input.
 
-Python callback mappings use version 3 and emit one `stream_result` for each
+Stream mappings use version 3 and emit one `stream_result` for each
 callback entry, with an additional zero-based `entry` index. Each endpoint is
 `{"path": <tagged path>}` or `{"entry": N, "callback": true}`. Failed entries
 include `message`. These records identify callbacks within this invocation;
 they cannot be converted to a pathname retry manifest. Ordinary entries in a
 mixed mapping still emit their usual records. The
-[Python callback reference](python-reference.md#callback-mappings) describes
+[Python callback reference](https://greaber.github.io/syq/python-reference.html#callback-mappings) describes
 publication and application retries. Callback admission uses the SDK's private
 channel, so these runs do not emit `stream_ready`.
 

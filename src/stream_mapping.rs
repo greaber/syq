@@ -1,4 +1,4 @@
-//! Whole-manifest SDK callbacks over shared native stream sessions.
+//! Whole-manifest programmatic streams over shared native stream sessions.
 mod channel;
 mod manifest;
 mod payload;
@@ -14,8 +14,7 @@ use futures_util::{stream, StreamExt};
 use manifest::{Endpoint, Entry};
 use serde_json::{json, Value};
 use std::{
-    io::{Read, Write},
-    os::unix::ffi::OsStrExt,
+    io::Read,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
         Arc,
@@ -120,15 +119,13 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
         // Containers are checked before either phase. Per-entry placement then
         // addresses its final path, without repeating a container's -new test.
         runtime.block_on(sessions.prepare(args, &manifest, resources.clone()))?;
-        if !manifest.paths.is_empty() {
-            let mut file = tempfile::NamedTempFile::new()?;
-            file.write_all(&manifest.paths)?;
-            file.flush()?;
+        if !manifest.paths.entries.is_empty() {
             let mut ordinary = args.clone();
             ordinary.stream_mapping_fd = None;
-            ordinary.target_existence = Existence::Any;
-            ordinary.native_mapping =
-                Some(file.path().canonicalize()?.as_os_str().as_bytes().to_vec());
+            if manifest.callbacks.iter().any(|e| e.dst.path().is_some()) {
+                ordinary.target_existence = Existence::Any;
+            }
+            ordinary.parsed_mapping = Some(Arc::new(manifest.paths));
             let phase = ResultsWriter::phase(writer.clone());
             ordinary.results_override = Some(phase.clone());
             ordinary.suppress_summary = true;
@@ -197,7 +194,7 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
                     let payload = Arc::new(Payload::new(channel, entry.id));
                     let local_cancel = Arc::new(AtomicBool::new(false));
                     let result = if cancelled.load(Relaxed) { Err(anyhow::anyhow!("stream mapping cancelled before callback admission")) } else {
-                        let operation = sessions.execute(args, entry, controls.clone(), payload.clone(), local_cancel.clone());
+                        let operation = sessions.execute(args, entry, controls.clone(), payload.clone(), local_cancel.clone(), resources.budget.clone());
                         tokio::pin!(operation);
                         tokio::select! {
                             result = &mut operation => result,
@@ -242,7 +239,7 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
         }
         result
     })();
-    let ended = channel.send(json!({"type":"end"}), &[]);
+    let ended = channel.send(channel::Message::End, &[]);
     outcome.and(ended)
 }
 
@@ -255,7 +252,7 @@ fn entry_args(args: &Args) -> Args {
 fn validate(args: &Args, manifest: &manifest::Manifest) -> Result<()> {
     ensure!(
         !args.detach && matches!(args.coordinate_at, CoordinateAt::Auto | CoordinateAt::Local),
-        "SDK callbacks run on the invoking machine; use --coordinate-at local"
+        "Stream callbacks run on the invoking machine; use --coordinate-at local"
     );
     ensure!(!args.locations.iter().any(|l| l.host.as_deref().is_some_and(|h| h.starts_with('@'))), "callback mappings require unrestricted endpoints; named receiver grants authorize pathname entries");
     ensure!(
@@ -272,7 +269,7 @@ fn validate(args: &Args, manifest: &manifest::Manifest) -> Result<()> {
         args.min_size.is_none() && args.max_size.is_none(),
         "callback mappings require explicit entry selection; filter promised sizes in the script"
     );
-    if !manifest.paths.is_empty()
+    if !manifest.paths.entries.is_empty()
         && args.locations.iter().all(|l| l.host.is_some())
         && args.s3.as_ref().is_none_or(|o| !o.route.is_server_copy())
     {
@@ -429,6 +426,7 @@ impl Sessions {
         controls: Arc<Controls>,
         payload: Arc<Payload>,
         cancelled: Arc<AtomicBool>,
+        budget: Arc<tokio::sync::Semaphore>,
     ) -> Result<()> {
         if entry.src.callback() && entry.dst.callback() {
             if controls.report.only_new {
@@ -440,7 +438,7 @@ impl Sessions {
             }
             let (input, producer) = payload.open(true, cancelled.clone())?;
             let (output, consumer) = payload.open(false, cancelled)?;
-            copy::parallel::direct(input, output, Some(producer), controls).await?;
+            copy::parallel::direct(input, output, Some(producer), controls, Some(budget)).await?;
             payload.transferred(None)?;
             return copy::fd::await_commit(Some(consumer)).await;
         }
