@@ -309,6 +309,6 @@ described in [Copies between servers](#copies-between-servers).
 
 ### Running commands on your laptop
 
-With [`syq exec`](exec.md), a connected server can request a command on your
+With [`syq exec`](receive.md#run-commands-on-your-laptop), a connected server can request a command on your
 laptop. An approved command runs with your local user's full permissions;
 it is not sandboxed or confined to a copy destination directory.

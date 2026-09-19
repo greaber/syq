@@ -1,3 +1,5 @@
+<a id="run-commands-on-your-receiving-machine"></a>
+
 # syq exec
 
 Run a command on a connected receiving machine, with approval on that machine:
@@ -8,7 +10,8 @@ syq exec --on @laptop --cwd work/project -- cargo test
 
 Put `--` before the program and its arguments; use `sh -c` for shell syntax.
 The program runs with the receiving user's permissions. See
-[Run commands on your receiving machine](../exec.md) for setup, output, and cancellation.
+[Run commands on your laptop](../receive.md#run-commands-on-your-laptop)
+for setup and examples.
 
 <!-- CLI: exec -->
 ```text
@@ -36,6 +39,50 @@ syq exec [OPTIONS] --on <@NAME> -- <PROGRAM>...
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
+
+## Approve each command locally
+
+Every command requires approval on the receiving machine, even if copies are
+approved automatically. Review the program, arguments, requesting server, and
+working directory. If the desktop prompt is missing or truncated, inspect and
+answer the request from a local terminal:
+
+```sh
+syq persist receive pending
+syq persist receive approve REQUEST_ID
+syq persist receive deny REQUEST_ID
+```
+
+Requests expire after five minutes. Commands run with your local user's
+permissions; the receiving `--root` and copy limits do not contain them.
+See [Commands on your laptop](../security.md#running-commands-on-your-laptop) for the
+trust boundary.
+
+## Arguments and working directories
+
+Put `--` before the program. Everything after it is passed as a literal
+argument, including strings starting with `--`. There is no implicit shell
+expansion on the receiving machine. To use shell syntax, request a shell:
+
+```sh
+syq exec --on @laptop --cwd work/project -- sh -c 'cargo build && ./target/debug/demo'
+```
+
+`--cwd DIR` (or `-C DIR`) is relative to the directory selected by `persist receive on
+--cwd` or `persist receive on --root`. Its default is that directory. Absolute paths and
+`..` can select elsewhere. The directory must exist. Syq does not expand `~`
+on the receiving machine; use a relative path or an absolute path instead.
+
+The command inherits the receiving service's local environment, including
+`PATH` and its desktop session. It does not inherit the server's environment.
+Restart receiving from a terminal in the desired desktop session when those
+values change. Stdin is closed and there is no interactive terminal.
+
+## Output, completion and cancellation
+
+Stdout and stderr stream back to your terminal, and syq returns the command's
+exit code. A lost connection is an error; the command is not retried automatically.
+Completed changes to files are not rolled back.
 
 ## Execution details
 

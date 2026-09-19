@@ -62,7 +62,7 @@ unless you request `--prune`.
 | Mirror a directory | [Mirroring](reference.md#mirror-a-directory) |
 | Remove files in parallel | [Removal](remove.md) |
 | Send files to my laptop from a server’s shell | [Receiving files](receive.md) |
-| Run a build or open an artifact on my desktop from a server | [Commands on your receiving machine](exec.md) |
+| Run a build or open an artifact on my desktop from a server | [Commands on your receiving machine](receive.md#run-commands-on-your-laptop) |
 | Copy between two servers | [Remote-to-remote transfers](remote-to-remote.md) |
 | Rename or reorganize files during a copy | [Mappings](mappings.md) |
 | Use syq from Python | [Python SDK](python.md) |
