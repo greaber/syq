@@ -1728,6 +1728,11 @@ fn parse_descriptor_copy(
         if !matches!(
             id.as_str(),
             "src_fd"
+                | "dry_run"
+                | "ignore_existing"
+                | "existing"
+                | "results"
+                | "results_fd"
                 | "stream_commit_fd"
                 | "as_fd"
                 | "sources"
@@ -1779,6 +1784,16 @@ fn parse_descriptor_copy(
         }
     }
     let copy = parsed.copy;
+    validate_native_results_fd(copy.results_output.results_fd)?;
+    for payload in [copy.src_fd, copy.as_fd, copy.stream_commit_fd]
+        .into_iter()
+        .flatten()
+    {
+        anyhow::ensure!(
+            copy.results_output.results_fd != Some(payload),
+            "results and stream payload/completion descriptors must differ"
+        );
+    }
     let source_paths = copy
         .selection
         .source
@@ -1804,6 +1819,10 @@ fn parse_descriptor_copy(
         Some(crate::descriptor_copy::fd::Source::Descriptor(fd)) => Some(*fd),
         _ => None,
     };
+    anyhow::ensure!(
+        src_fd.is_none() || src_fd != copy.results_output.results_fd,
+        "results and stream payload descriptors must differ"
+    );
     let upload = source.is_some();
     let as_fd = copy.as_fd;
     anyhow::ensure!(
@@ -1967,6 +1986,9 @@ fn parse_descriptor_copy(
             },
     });
     args.s3 = s3;
+    args.native_results = copy.results_output.results.map(OsStringExt::into_vec);
+    args.native_results_fd = copy.results_output.results_fd;
+    args.native_follow = copy.selection.source.follow;
     args.pscope = parsed.pscope;
     apply_native_copy_operational(&mut args, copy.operational, matches)?;
     crate::descriptor_copy::validate_controls(&mut args)?;

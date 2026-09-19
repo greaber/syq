@@ -138,6 +138,17 @@ impl Descriptor {
         }
         Ok(result)
     }
+    pub(crate) fn remaining_len(&self) -> Result<Option<u64>> {
+        let metadata = self.file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        let offset = unsafe { libc::lseek(self.file.as_raw_fd(), 0, libc::SEEK_CUR) };
+        if offset < 0 {
+            return Err(std::io::Error::last_os_error()).context("inspect stream offset");
+        }
+        Ok(Some(metadata.len().saturating_sub(offset as u64)))
+    }
     fn check_cancelled(&self) -> Result<()> {
         if self.cancelled.load(Relaxed) {
             bail!("stream cancelled");

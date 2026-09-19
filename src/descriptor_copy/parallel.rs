@@ -43,7 +43,7 @@ impl Drop for LocalSession {
         self.0.close();
     }
 }
-fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Prepared> {
+fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Option<Prepared>> {
     let location = plan.location.as_ref().unwrap();
     let local_session = location
         .host
@@ -59,6 +59,33 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Prepared> {
         crate::transfer::endpoint(location, args)?
     };
     let mut control = endpoint.connect_control(args.compress)?;
+    if args.dry_run || args.ignore_existing || args.existing {
+        let response = conn::ok(
+            control.call(Request::DescriptorCopy(Operation::Inspect {
+                only_new: args.ignore_existing,
+                only_existing: args.existing,
+                path: location.path.clone(),
+                write: plan.source.is_some(),
+                follow: plan.follow,
+                root: plan.root.clone(),
+                placement: plan.placement.clone(),
+            }))?,
+            "inspect stream",
+        )?;
+        let Response::DescriptorInspected { size, skipped } = response else {
+            bail!("unexpected stream inspection response");
+        };
+        if let Some(size) = size {
+            controls.set_size(size);
+        }
+        if skipped || (plan.as_fd.is_some() && args.ignore_existing) {
+            controls.report.skip();
+            return Ok(None);
+        }
+        if args.dry_run {
+            return Ok(None);
+        }
+    }
     let (size, ticket) = match conn::ok(
         control.call(Request::DescriptorCopy(Operation::Open {
             path: plan.location.as_ref().unwrap().path.clone(),
@@ -143,7 +170,7 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Prepared> {
             }
         );
     }
-    Ok(Prepared {
+    Ok(Some(Prepared {
         endpoint,
         control,
         ticket,
@@ -151,7 +178,7 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Prepared> {
         workers,
         worker_limit,
         _local_session: local_session,
-    })
+    }))
 }
 
 #[derive(Clone)]
@@ -350,7 +377,28 @@ pub(super) async fn run(
         .as_fd
         .map(|fd| fd::Descriptor::open(fd, false, cancelled.clone()))
         .transpose()?;
+    if let Some(input) = &input {
+        if let Some(size) = input.remaining_len()? {
+            controls.set_size(size);
+        }
+    }
     if plan.location.is_none() {
+        if args.ignore_existing {
+            controls.report.skip();
+            return Ok(());
+        }
+        if args.dry_run {
+            return Ok(());
+        }
+        controls.report.ready();
+        if input.is_none() {
+            input = Some(
+                plan.source
+                    .context("missing stream source")?
+                    .open(cancelled.clone())
+                    .await?,
+            );
+        }
         return direct(
             input.context("missing stream input")?,
             output.context("missing stream output")?,
@@ -368,6 +416,10 @@ pub(super) async fn run(
         let (a, p, c) = (args.clone(), plan.clone(), controls.clone());
         tokio::task::spawn_blocking(move || prepare(&a, &p, &c)).await??
     };
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    controls.report.ready();
     if let Some(source @ fd::Source::Pipe { .. }) = plan.source.clone() {
         input = Some(source.open(cancelled.clone()).await?);
     }

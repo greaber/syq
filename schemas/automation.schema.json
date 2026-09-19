@@ -39,6 +39,12 @@
     },
     {
       "$ref": "#/$defs/final_state"
+    },
+    {
+      "$ref": "#/$defs/stream_result"
+    },
+    {
+      "$ref": "#/$defs/stream_ready"
     }
   ],
   "$defs": {
@@ -908,6 +914,10 @@
         },
         "copying_elapsed_ms": {
           "$ref": "#/$defs/u64"
+        },
+        "bytes_total_known": {
+          "type": "boolean",
+          "description": "For descriptor copies, false when the source length is unknown. Dry-run byte totals then count only known bytes."
         }
       },
       "required": [
@@ -1903,6 +1913,104 @@
           }
         }
       ]
+    },
+    "streamEndpoint": {
+      "type": "object",
+      "oneOf": [
+        {
+          "required": [
+            "path"
+          ]
+        },
+        {
+          "required": [
+            "fd"
+          ]
+        }
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/taggedPath"
+        },
+        "fd": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        }
+      },
+      "additionalProperties": false
+    },
+    "stream_result": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "syq.automation"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "seq": {
+          "$ref": "#/$defs/u64"
+        },
+        "type": {
+          "const": "stream_result"
+        },
+        "source": {
+          "$ref": "#/$defs/streamEndpoint"
+        },
+        "destination": {
+          "$ref": "#/$defs/streamEndpoint"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "disposition": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "planned",
+            "skipped"
+          ]
+        },
+        "bytes": {
+          "$ref": "#/$defs/u64"
+        }
+      },
+      "required": [
+        "source",
+        "destination",
+        "dry_run",
+        "disposition"
+      ],
+      "additionalProperties": false
+    },
+    "stream_ready": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "syq.automation"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "seq": {
+          "$ref": "#/$defs/u64"
+        },
+        "type": {
+          "const": "stream_ready"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

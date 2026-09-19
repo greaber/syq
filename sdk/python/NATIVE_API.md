@@ -142,8 +142,8 @@ endpoint, independently of the client's local `process_cwd`. Both accept `rsh`, 
 `no_bootstrap`, `no_compress`, `no_tcp`, `tcp_plain`, `tcp_ports`, `tcp_congestion`,
 `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
 `performance_tuning`, `resource_limits`, `integrity_checking`, `expected_digest`,
-`stats`, `verbose`, `quiet`, `progress`, `no_progress`, `progress_json`, and
-`timeout` with the same meanings as `cp`. Pass a `syq.Digest` as `expected_digest`
+`only_new`, `only_existing`, `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`, `progress_json`,
+and `timeout` with the same meanings as `cp`. Pass a `syq.Digest` as `expected_digest`
 to check the bytes during transfer. A mismatch prevents a writer from publishing;
 a reader may already have returned bytes when it reports the failure.
 See the CLI stream reference for the applicable tuning and integrity controls.
@@ -151,8 +151,8 @@ The client supplies the executable, process working directory, environment,
 and default timeout. Stream calls always check transfer failures.
 
 These methods transfer raw bytes, using the CLI's [stream semantics](https://greaber.github.io/syq/commands/cp.html#file-descriptors)
-for destination permissions, metadata, and endpoint restrictions. They do not
-emit `cp` result records. They are sequential, non-seekable interfaces; use one
+for destination permissions, metadata, and endpoint restrictions. They are
+sequential, non-seekable interfaces; use one
 operation at a time on each stream. No whole-object retry or restart recovery
 is attempted. S3 can retry buffered multipart parts.
 
@@ -177,6 +177,32 @@ its buffered data; do that before committing the underlying writer.
 A timeout or connection loss during commit can leave the outcome uncertain;
 the method reports failure rather than claiming rollback. Whole datasets
 need their own final publication step after all object transfers succeed.
+
+Writers wait for the destination decision before returning (before entry of an
+async context completes). With `only_new=True` or `only_existing=True`, check
+`output.skipped` before producing data:
+
+```python
+with client.open_writer(to="server", as_="archive.tar", only_new=True) as output:
+    if not output.skipped:
+        produce_archive(output)
+```
+
+A skipped writer rejects `write()` and exits its context successfully without
+committing anything. Skipped readers return no payload; their `skipped` property
+is settled at completion. Both count the skipped object in `files_excluded`.
+
+After completion, `stream.result` holds a `CpResult`, including byte counts and
+elapsed time. It remains `None` if no terminal result arrived, such as after
+forced termination. Payload bytes never enter the result decoder; missing or
+invalid completion records raise `SyqProtocolError` after an otherwise successful
+process exit.
+
+With `dry_run=True`, a context checks placement without transferring bytes.
+Enter and exit a writer context without calling `write()`; preview writers
+reject payload writes. Preview readers return no payload. The result contains
+planned totals; `bytes_total_known=False` distinguishes an unknown pipe length
+from an empty source. A dry run does not check an expected payload hash.
 
 A bounded reader call can yield partial data before a later transfer error.
 An unbounded `read()` checks transfer completion before returning its bytes.
@@ -392,6 +418,7 @@ unsuccessful copy. Read attributes directly, for example
 | `symlinks_created` | `int` | Symbolic links created |
 | `specials_created` | `int` | Special filesystem objects created |
 | `bytes_transferred` | `int` | File-content bytes transferred, not compressed network traffic |
+| `bytes_total_known` | `bool \| None` | For descriptor copies, whether the source length is known; otherwise absent (`None`) |
 | `bytes_unchanged` | `int` | Bytes in unchanged files |
 | `deletions_planned` | `int` or `None` | Entries selected for pruning |
 | `deletions_completed` | `int` or `None` | Entries pruned |

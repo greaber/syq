@@ -1221,3 +1221,153 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
         stderr_of(&out)
     );
 }
+
+#[test]
+fn stream_previews_and_results_do_not_consume_payload() {
+    use std::io::Seek;
+    let t = Tmp::new();
+    write(&t.path("payload"), b"bytes");
+    mkfifo(&t.path("pipe"));
+    let rsh = fake_rsh(&t);
+    let validator = automation_validator();
+    let input = File::open(t.path("payload")).unwrap();
+    let cp = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .current_dir(&t.0)
+            .env("HOME", &t.0)
+            .env("FAKE_REMOTE_HOME", &t.0)
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .args(args)
+            .stdin(input.try_clone().unwrap())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = command.start().unwrap();
+        let start = std::time::Instant::now();
+        let mut report_at = 1;
+        while child.try_wait().unwrap().is_none() {
+            let seconds = start.elapsed().as_secs();
+            if seconds >= 10 {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let output = child.wait_with_output().unwrap();
+                panic!("stream preview blocked: {args:?}: {}", stderr_of(&output));
+            }
+            if seconds >= report_at {
+                eprintln!("waiting for stream preview: {args:?} ({seconds}s)");
+                report_at += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.wait_with_output().unwrap()
+    };
+    let records = |path: &str| {
+        let text = fs::read_to_string(t.path(path)).unwrap();
+        assert_automation_stream(&validator, &text, path);
+        text.lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    };
+    for (index, args) in [
+        vec!["--src-fd", "0", "--as", "missing/file"],
+        vec!["pipe", "--into", "missing/container"],
+        vec!["pipe", "--to", "fixture", "--as-new", "missing/remote"],
+        vec!["--from", "fixture", "payload", "--as-fd", "1"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = format!("preview-{index}.json");
+        let mut args = args;
+        args.extend(["--dry-run", "--results", &file]);
+        let output = cp(&args);
+        assert!(output.status.success(), "{args:?}: {}", stderr_of(&output));
+        assert!(output.stdout.is_empty());
+        assert!(!t.path("missing").exists());
+        let records = records(&file);
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["files_transferred"], 1);
+        assert_eq!(terminal["bytes_total_known"], index == 0 || index == 3);
+        let stream = records
+            .iter()
+            .find(|r| r["type"] == "stream_result")
+            .unwrap();
+        assert_eq!(stream["disposition"], "planned");
+        if index == 0 || index == 3 {
+            assert_eq!(stream["bytes"], 5);
+        } else {
+            assert!(stream.get("bytes").is_none());
+        }
+    }
+    for (index, args) in [
+        vec!["pipe", "--as", "payload", "--only-new"],
+        vec!["pipe", "--as", "missing/skipped", "--only-existing"],
+        vec!["pipe", "--to", "fixture", "--as", "payload", "--only-new"],
+        vec!["--src-fd", "0", "--as", ".", "--only-new"],
+        vec!["--src-fd", "0", "--as-fd", "1", "--only-new"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = format!("skip-{index}.json");
+        let mut args = args;
+        args.extend(["--results", &file]);
+        let output = cp(&args);
+        assert!(output.status.success(), "{args:?}: {}", stderr_of(&output));
+        assert!(output.stdout.is_empty());
+        assert!(!t.path("missing").exists());
+        let values = records(&file);
+        assert_eq!(values.last().unwrap()["files_excluded"], 1);
+        assert_eq!(values.last().unwrap()["bytes_transferred"], 0);
+        assert!(values
+            .iter()
+            .any(|r| r["type"] == "stream_result" && r["disposition"] == "skipped"));
+    }
+    assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 0);
+    let failed = cp(&[
+        "pipe",
+        "--as-new",
+        "payload",
+        "--dry-run",
+        "--results",
+        "failed.json",
+    ]);
+    assert!(!failed.status.success());
+    assert_eq!(records("failed.json").last().unwrap()["errors"], 1);
+    assert_eq!(read(&t.path("payload")), b"bytes");
+    let download = cp(&["payload", "--as-fd", "1", "--results", "download.json"]);
+    assert!(download.status.success(), "{}", stderr_of(&download));
+    assert_eq!(download.stdout, b"bytes");
+    let downloaded = records("download.json");
+    let stream = downloaded
+        .iter()
+        .find(|r| r["type"] == "stream_result")
+        .unwrap();
+    assert_eq!(stream["destination"]["fd"], 1);
+    assert_eq!(stream["bytes"], 5);
+    assert_eq!(downloaded.last().unwrap()["bytes_total_known"], true);
+    for args in [
+        vec!["--src-fd", "3", "--as", "out", "--results-fd", "3"],
+        vec!["/dev/fd/3", "--as", "out", "--results-fd", "3"],
+        vec!["payload", "--as-fd", "3", "--results-fd", "3"],
+        vec![
+            "--src-fd",
+            "0",
+            "--as",
+            "out",
+            "--stream-commit-fd",
+            "3",
+            "--results-fd",
+            "3",
+        ],
+    ] {
+        let output = cp(&args);
+        assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
+        assert!(stderr_of(&output).contains("descriptors must differ"));
+    }
+}

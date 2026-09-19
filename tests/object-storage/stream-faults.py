@@ -4,6 +4,7 @@ import base64
 import hashlib
 import fcntl
 import http.server
+import json
 import os
 from pathlib import Path
 import signal
@@ -50,10 +51,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         STATE['requests'] += 1
+        if CASE == 'preview-results' and self.path.endswith('/missing'):
+            self.reply(404)
+            return
         self.reply(200, headers={'ETag': '"original"', 'x-amz-version-id': 'v1'}, length=len(DATA))
 
     def do_GET(self):
         STATE['requests'] += 1
+        if CASE == 'preview-results' and 'list-type=2' in self.path:
+            self.reply(200, b'<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>')
+            return
         assert self.headers['If-Match'] == '"original"'
         assert urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)['versionId'] == ['v1']
         start, end = map(int, self.headers['Range'].removeprefix('bytes=').split('-'))
@@ -179,7 +186,41 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
     get = base + ['--from', 's3://bucket', 'object']
     put = base + ['--to', 's3://bucket', '--as', 'object']
     try:
-        if CASE in ('download', 'retry', 'bad-range', 'truncated'):
+        if CASE == 'preview-results':
+            results = Path(temp) / 'download.json'
+            response = run(get + ['--dry-run', '--results', str(results)], env=env)
+            success(response)
+            assert not response.stdout
+            assert not STATE['gets']
+            records = [json.loads(line) for line in results.read_text().splitlines()]
+            assert records[-1]['bytes_transferred'] == len(DATA)
+            assert records[-1]['bytes_total_known'] is True
+            fifo = Path(temp) / 'pipe'
+            os.mkfifo(fifo)
+            results = Path(temp) / 'upload.json'
+            response = run(base + ['--src', str(fifo), '--to', 's3://bucket', '--as', 'object',
+                                  '--dry-run', '--results', str(results)], env=env)
+            success(response)
+            records = [json.loads(line) for line in results.read_text().splitlines()]
+            assert records[-1]['bytes_total_known'] is False
+            assert not STATE['completed'] and not STATE['parts']
+            for flag, key in [('--only-new', 'object'), ('--only-existing', 'missing')]:
+                results = Path(temp) / (flag + '.json')
+                response = run(base + ['--src', str(fifo), '--to', 's3://bucket', '--as', key,
+                                      flag, '--results', str(results)], env=env)
+                success(response)
+                records = [json.loads(line) for line in results.read_text().splitlines()]
+                assert records[-1]['files_excluded'] == 1
+                assert not STATE['completed'] and not STATE['parts']
+            response = run(put + ['--only-existing'], input=b'updated', env=env)
+            success(response)
+            assert STATE['published'] == b'updated'
+            response = run(base + ['--to', 's3://bucket', '--as', 'missing', '--only-new'],
+                           input=b'created', env=env)
+            success(response)
+            assert STATE['published'] == b'created'
+
+        elif CASE in ('download', 'retry', 'bad-range', 'truncated'):
             STATE['bad'] = 'etag'
             result = run(get, env=env)
             if CASE in ('bad-range', 'truncated'):

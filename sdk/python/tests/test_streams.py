@@ -19,6 +19,17 @@ import syq
 SYQ = Path(os.environ.get('SYQ_CANDIDATE_EXECUTABLE', Path(__file__).resolve().parents[3] / 'target/debug/syq'))
 
 
+def ready_stub() -> str:
+    fixture = Path(__file__).resolve().parents[3] / "tests/fixtures/automation/success.ndjson"
+    run = json.loads(fixture.read_text().splitlines()[0])
+    run["mapping"] = False
+    ready = dict(schema="syq.automation", schema_version=1, seq=1, type="stream_ready")
+    data = (json.dumps(run) + "\n" + json.dumps(ready) + "\n").encode()
+    return (f'#!{sys.executable}\nimport os, sys, time\n'
+            f'os.write(int(sys.argv[sys.argv.index("--results-fd") + 1]), {data!r})\n'
+            'time.sleep(60)\n')
+
+
 class StreamTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -59,6 +70,84 @@ class StreamTests(unittest.TestCase):
                     integrity_checking="transfer=md5", progress_json=True) as source:
                 self.assertEqual(await source.read(), payload)
             self.assertEqual(json.loads(source.stderr.splitlines()[-1])["files_done"], 1)
+        asyncio.run(asynchronous())
+
+    def test_stream_results_and_previews(self):
+        target = self.root / "result-object"
+        with self.client.open_writer(as_=target, dry_run=True) as out:
+            self.assertTrue(out.dry_run)
+            self.assertFalse(out.writable())
+            with self.assertRaises(ValueError):
+                out.write(b"not consumed")
+        self.assertFalse(target.exists())
+        self.assertTrue(out.result.dry_run)
+        self.assertFalse(out.result.bytes_total_known)
+        with self.client.open_writer(as_=target) as out:
+            out.write(b"completed")
+        self.assertEqual(out.result.bytes_transferred, 9)
+        self.assertTrue(out.result.bytes_total_known)
+        with self.client.open_reader(target, dry_run=True) as source:
+            self.assertEqual(source.read(), b"")
+        self.assertTrue(source.result.dry_run)
+        self.assertEqual(source.result.bytes_transferred, 9)
+        with self.assertRaises(syq.SyqProcessError):
+            with self.client.open_reader(self.root / "missing") as source:
+                source.read()
+        self.assertEqual(source.result.exit_code, 1)
+        fake = self.root / "missing-results"
+        fake.write_text('#!/bin/sh\nprintf truncated\n')
+        fake.chmod(0o700)
+        with self.assertRaises(syq.SyqProtocolError):
+            with syq.Client(executable=fake).open_reader("unused") as source:
+                source.read()
+
+        async def asynchronous():
+            client = syq.AsyncClient(executable=SYQ, env=self.env, timeout=10)
+            async with client.open_writer(as_=self.root / "preview", dry_run=True) as out:
+                self.assertTrue(out.dry_run)
+            self.assertTrue(out.result.dry_run)
+            self.assertFalse((self.root / "preview").exists())
+            async with client.open_reader(target, dry_run=True) as source:
+                self.assertEqual(await source.read(), b"")
+            self.assertEqual(source.result.bytes_transferred, 9)
+        asyncio.run(asynchronous())
+
+    def test_skip_is_known_before_producing_and_does_not_commit(self):
+        target = self.root / "existing"
+        target.write_bytes(b"old")
+        for option, destination in [("only_new", target), ("only_existing", self.root / "missing"),
+                                    ("only_new", self.root)]:
+            with self.client.open_writer(as_=destination, **{option: True}) as out:
+                self.assertTrue(out.skipped)
+                self.assertFalse(out.writable())
+                with self.assertRaises(ValueError):
+                    out.write(b"must not be accepted")
+            self.assertEqual(out.result.files_excluded, 1)
+            self.assertEqual(out.result.bytes_transferred, 0)
+        self.assertEqual(target.read_bytes(), b"old")
+        self.assertFalse((self.root / "missing").exists())
+        with self.client.open_writer(as_=target, only_existing=True) as out:
+            self.assertFalse(out.skipped)
+            out.write(b"new")
+        with self.client.open_writer(as_=self.root / "new", only_new=True) as out:
+            self.assertFalse(out.skipped)
+            out.write(b"created")
+        self.assertEqual(target.read_bytes(), b"new")
+        inherited = syq.Client(executable=SYQ, timeout=10,
+                               env={**self.env, "SYQ_CP_OPTIONS": "--only-new"})
+        with inherited.open_writer(as_=target) as out:
+            self.assertTrue(out.skipped)
+        inherited = syq.Client(executable=SYQ, timeout=10,
+                               env={**self.env, "SYQ_CP_OPTIONS": "--dry-run"})
+        with inherited.open_writer(as_=target) as out:
+            self.assertTrue(out.dry_run)
+        self.assertEqual(target.read_bytes(), b"new")
+
+        async def asynchronous():
+            client = syq.AsyncClient(executable=SYQ, env=self.env, timeout=10)
+            async with client.open_writer(as_=target, only_new=True) as out:
+                self.assertTrue(out.skipped)
+            self.assertEqual(out.result.files_excluded, 1)
         asyncio.run(asynchronous())
 
     def test_writer_placement_and_reader_source_bases(self):
@@ -255,7 +344,14 @@ class StreamTests(unittest.TestCase):
         fake = self.root / 'finished-reader'
         # The deadline can race with a successful exit. Arrange a child
         # that returns success on TERM, and arm the watchdog after it is ready.
-        fake.write_text(f'#!{sys.executable}\nimport signal, sys\n'
+        fixtures = Path(__file__).resolve().parents[3] / "tests/fixtures/automation/success.ndjson"
+        records = [json.loads(line) for line in fixtures.read_text().splitlines()]
+        run, terminal = records[0], records[-1]
+        run["mapping"] = False
+        terminal["seq"] = 1
+        result_bytes = (json.dumps(run) + "\n" + json.dumps(terminal) + "\n").encode()
+        fake.write_text(f'#!{sys.executable}\nimport os, signal, sys\n'
+                        f'os.write(int(sys.argv[sys.argv.index("--results-fd") + 1]), {result_bytes!r})\n'
                         'signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n'
                         'print("ready", end="", flush=True)\nsignal.pause()\n')
         fake.chmod(0o700)
@@ -291,7 +387,7 @@ class StreamTests(unittest.TestCase):
 
     def test_timeout_interrupts_blocking_write_and_reaps_child(self):
         fake = self.root / 'slow-syq'
-        fake.write_text('#!/bin/sh\nexec sleep 60\n')
+        fake.write_text(ready_stub())
         fake.chmod(0o700)
         client = syq.Client(executable=fake, timeout=.1)
         with self.assertRaises(subprocess.TimeoutExpired):
@@ -332,7 +428,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
             async with client.open_reader(root / 'file') as input:
                 self.assertEqual(await input.read(), b'async bytes')
             fake = root / 'slow-syq'
-            fake.write_text('#!/bin/sh\nexec sleep 60\n')
+            fake.write_text(ready_stub())
             fake.chmod(0o700)
             client = syq.AsyncClient(executable=fake)
             input = client.open_reader('ignored')
@@ -391,7 +487,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_commit_reaps_process(self):
         with tempfile.TemporaryDirectory() as temp:
             fake = Path(temp).resolve() / 'slow-syq'
-            fake.write_text('#!/bin/sh\nexec sleep 60\n')
+            fake.write_text(ready_stub())
             fake.chmod(0o700)
             output = syq.AsyncClient(executable=fake).open_writer(as_='ignored')
             await output.__aenter__()

@@ -1167,6 +1167,11 @@ pub enum Response {
         size: Option<u64>,
         ticket: DescriptorTicket,
     },
+    /// Dry-run inspection: a named source length, or unknown upload length.
+    DescriptorInspected {
+        skipped: bool,
+        size: Option<u64>,
+    },
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

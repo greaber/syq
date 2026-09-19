@@ -555,6 +555,9 @@ class AsyncClient:
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
         expected_digest: Digest | None = None,
+        only_new: bool = False,
+        only_existing: bool = False,
+        dry_run: bool = False,
         stats: bool = False,
         verbose: int = 0,
         quiet: bool = False,
@@ -564,12 +567,12 @@ class AsyncClient:
         timeout: Timeout = CLIENT_DEFAULT,
     ) -> AsyncStreamWriter:
         """Write one object, committing on successful context exit."""
-        from ._streams import _Process, arguments, StreamWriter, AsyncStreamWriter
+        from ._streams import _Process, arguments, StreamWriter, AsyncStreamWriter, _call
 
         async def start():
             argv = arguments(
                 executable=await self._executable_value(), writing=True, path=as_, endpoint=to,
-                options=dict(as_new=as_new, as_existing=as_existing,
+                options=dict(only_new=only_new, only_existing=only_existing, dry_run=dry_run, as_new=as_new, as_existing=as_existing,
                              rsh=rsh, syq_path=syq_path, pscope=pscope,
                              no_bootstrap=no_bootstrap, no_compress=no_compress,
                              no_tcp=no_tcp, tcp_plain=tcp_plain,
@@ -583,7 +586,8 @@ class AsyncClient:
                              performance_tuning=performance_tuning, follow_dst=follow_dst),
             )
             stream = StreamWriter(_Process(argv, writing=True, cwd=self.process_cwd, env=self.env,
-                                        timeout=resolve_timeout(timeout, self.timeout)))
+                                        timeout=resolve_timeout(timeout, self.timeout), dry_run=dry_run))
+            await _call(stream, stream._wait_prepared)
             return stream
 
         return AsyncStreamWriter(start)
@@ -613,6 +617,9 @@ class AsyncClient:
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
         expected_digest: Digest | None = None,
+        only_new: bool = False,
+        only_existing: bool = False,
+        dry_run: bool = False,
         stats: bool = False,
         verbose: int = 0,
         quiet: bool = False,
@@ -627,7 +634,7 @@ class AsyncClient:
         async def start():
             argv = arguments(
                 executable=await self._executable_value(), writing=False, path=src, endpoint=from_,
-                options=dict(cwd=cwd, root=root,
+                options=dict(only_new=only_new, only_existing=only_existing, dry_run=dry_run, cwd=cwd, root=root,
                              rsh=rsh, syq_path=syq_path, pscope=pscope,
                              no_bootstrap=no_bootstrap, no_compress=no_compress,
                              no_tcp=no_tcp, tcp_plain=tcp_plain,
@@ -641,7 +648,7 @@ class AsyncClient:
                              performance_tuning=performance_tuning, follow_src=follow_src),
             )
             stream = StreamReader(_Process(argv, writing=False, cwd=self.process_cwd, env=self.env,
-                                        timeout=resolve_timeout(timeout, self.timeout)))
+                                        timeout=resolve_timeout(timeout, self.timeout), dry_run=dry_run))
             return stream
 
         return AsyncStreamReader(start)

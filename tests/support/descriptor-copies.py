@@ -140,6 +140,13 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                 run([*options, *selector, str(fifo), *destination, '--into', str(directory / 'into')])
                 assert writer.wait(timeout=5) == 0
                 assert (directory / 'into' / 'fifo').read_bytes() == b'pipe contents'
+            if not ssh:
+                writer = subprocess.Popen([sys.executable, '-c',
+                    'import sys; open(sys.argv[1], "wb").write(b"pipe to descriptor")', str(fifo)],
+                    start_new_session=True)
+                CHILDREN.append(writer)
+                assert run([str(fifo), '--as-fd', '1']) == b'pipe to descriptor'
+                assert writer.wait(timeout=5) == 0
             # A shell descriptor path is consumed locally before starting the
             # SSH helper; its generated number never becomes a destination name.
             command = ['bash', '-c',
@@ -193,7 +200,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
         # Reject unsupported settings before opening input or mutating output.
         inherited_target = root / 'inherited-options'
         inherited_target.write_bytes(b'old')
-        for options, diagnostic in (('--dry-run', b'--dry-run'),
+        for options, diagnostic in (('--verify-only', b'--verify-only'),
                                     ('--performance-tuning batch-files=1', b'batch-files')):
             result = subprocess.run(
                 [SYQ, 'cp', '--src-fd', '0', '--as', str(inherited_target)],
@@ -231,7 +238,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
         created = root / 'umask-output'
         run(['--src-fd', '0', '--as', str(created)], input=b'new', umask=0o027)
         assert created.stat().st_mode & 0o777 == 0o640
-        for option in ('--prune', '--dry-run', '--hash', '--verify-only', '--detach'):
+        for option in ('--prune', '--hash', '--verify-only', '--detach'):
             result = fail(['--src-fd', '0', '--as', str(root / 'forbidden'), option], input=b'')
             assert not (root / 'forbidden').exists(), option
         for args in (['--src-fd', '0'], ['--as-fd', '1'], ['--src-fd', '2', '--as', 'bad'],

@@ -66,6 +66,11 @@ pub(crate) fn run(
             Some(Source::Pipe { .. }) => None,
             None => Some(Descriptor::open(as_fd.unwrap(), false, cancelled.clone())?),
         };
+        if plan.options.route == crate::s3::Route::Upload {
+            if let Some(descriptor) = &descriptor {
+                if let Some(size) = descriptor.remaining_len()? { controls.set_size(size); }
+            }
+        }
         let cancellation = Arc::new(super::upload_http::Cancellation::default());
         let (client, _) = tokio::select! {
             value = client::connect(&mut plan.options, Arc::default(), cancellation.clone()) => value?,
@@ -76,7 +81,10 @@ pub(crate) fn run(
             let operation = async {
                 if plan.options.route == crate::s3::Route::Upload {
                     check_placement(&client, &plan).await?;
+                    if controls.report.skipped() { return Ok(()); }
+                    if controls.report.dry_run { return Ok(()); }
                 }
+                if plan.options.route == crate::s3::Route::Upload { controls.report.ready(); }
                 let descriptor = match descriptor {
                     Some(descriptor) => descriptor,
                     None => source.unwrap().open(cancelled.clone()).await?,
@@ -127,7 +135,9 @@ pub(crate) fn source_key(path: &[u8], base: Option<&[u8]>) -> Result<String> {
 async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
     use crate::cli::Existence;
     let existence = plan.placement.existence;
-    if existence == Existence::Any {
+    let report = &plan.controls.report;
+    let policy = report.only_new || report.only_existing;
+    if existence == Existence::Any && !policy {
         return Ok(());
     }
     // Match ordinary S3 cp: a new target must have neither an exact object
@@ -152,6 +162,25 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
         || super::client::prefix_exists(client, &plan.options.bucket, &prefix).await?;
     if (existence == Existence::New && present) || (existence == Existence::Existing && !present) {
         bail!("S3 destination existence condition failed");
+    }
+    if policy {
+        let final_present = if container {
+            super::client::head_output(client, &plan.options.bucket, &plan.key, None)
+                .await?
+                .is_some()
+                || super::client::prefix_exists(
+                    client,
+                    &plan.options.bucket,
+                    &format!("{}/", plan.key.trim_end_matches('/')),
+                )
+                .await?
+        } else {
+            present
+        };
+        if (report.only_new && final_present) || (report.only_existing && !final_present) {
+            report.skip();
+            return Ok(());
+        }
     }
     if !container && present && !exact {
         bail!("S3 destination is a prefix, not an object");
@@ -194,7 +223,9 @@ async fn upload(
             .set_checksum_sha256(algorithm.is_sha256().then_some(hash.clone()))
             .set_content_md5((algorithm == Algorithm::Md5).then_some(hash))
             .set_if_none_match(
-                (plan.placement.existence == crate::cli::Existence::New).then(|| "*".into()),
+                (plan.placement.existence == crate::cli::Existence::New
+                    || plan.controls.report.only_new)
+                    .then(|| "*".into()),
             )
             .body(ByteStream::from(first))
             .send()
@@ -269,7 +300,9 @@ async fn upload(
         .key(&plan.key)
         .upload_id(&id)
         .set_if_none_match(
-            (plan.placement.existence == crate::cli::Existence::New).then(|| "*".into()),
+            (plan.placement.existence == crate::cli::Existence::New
+                || plan.controls.report.only_new)
+                .then(|| "*".into()),
         )
         .multipart_upload(
             CompletedMultipartUpload::builder()
@@ -335,6 +368,14 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
             .context("S3 HEAD omitted Content-Length")?,
     )?;
     controls.set_size(size);
+    if controls.report.only_new {
+        controls.report.skip();
+        return Ok(());
+    }
+    if controls.report.dry_run {
+        return Ok(());
+    }
+    controls.report.ready();
     let mut expected_hash = controls.expected_hasher();
     let etag = head.e_tag().context("S3 HEAD omitted ETag")?;
     let version = head.version_id();

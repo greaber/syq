@@ -20,7 +20,7 @@
 //! its provenance, omits source-side claims hostB cannot authenticate, and
 //! includes closure-time final-state records.
 
-use crate::cli::{Args, Interface, Location};
+use crate::cli::{Args, Interface};
 use crate::proto::OperatorSymlinkPolicy;
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
@@ -245,7 +245,7 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
         prune,
         mapping,
         dry_run: args.dry_run,
-        endpoints: run_endpoints(&args.locations, include_destination),
+        endpoints: run_endpoints(args, include_destination),
     });
     if writer.is_dead() {
         bail!("--results stream failed before the run record was written");
@@ -253,7 +253,41 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
     Ok(Some(writer))
 }
 
-fn run_endpoints(locations: &[Location], include_destination: bool) -> Vec<EndpointRecord> {
+fn run_endpoints(args: &Args, include_destination: bool) -> Vec<EndpointRecord> {
+    if let Some(plan) = &args.descriptor_copy {
+        let upload = plan.source.is_some();
+        return ["source", "destination"]
+            .into_iter()
+            .map(|role| {
+                let named = if upload {
+                    role == "destination" && plan.as_fd.is_none()
+                } else {
+                    role == "source"
+                };
+                let host = named
+                    .then(|| {
+                        args.s3
+                            .as_ref()
+                            .map(|s3| format!("s3://{}", s3.bucket))
+                            .or_else(|| {
+                                plan.location
+                                    .as_ref()
+                                    .and_then(|location| location.host.clone())
+                            })
+                    })
+                    .flatten();
+                let user = named
+                    .then(|| {
+                        plan.location
+                            .as_ref()
+                            .and_then(|location| location.user.clone())
+                    })
+                    .flatten();
+                EndpointRecord { role, host, user }
+            })
+            .collect();
+    }
+    let locations = &args.locations;
     let mut endpoints = Vec::new();
     if let Some(source) = locations.first() {
         endpoints.push(EndpointRecord {
@@ -530,6 +564,10 @@ impl ResultsWriter {
 
     /// The terminal record; flushes the stream. Nothing may be written after.
     pub fn emit_result(&self, result: &ResultRecord) {
+        self.emit_result_size_known(result, None);
+    }
+
+    pub(crate) fn emit_result_size_known(&self, result: &ResultRecord, known: Option<bool>) {
         let mut record = serde_json::json!({
             "type": "result",
             "status": result.status,
@@ -547,6 +585,9 @@ impl ResultsWriter {
             "elapsed_ms": result.elapsed_ms,
         });
         let object = record.as_object_mut().expect("record is an object");
+        if let Some(known) = known {
+            object.insert("bytes_total_known".into(), known.into());
+        }
         if let Some(ms) = result.copying_elapsed_ms {
             object.insert("copying_elapsed_ms".into(), ms.into());
         }
@@ -651,7 +692,7 @@ impl ResultsWriter {
     }
 }
 
-fn tagged(path: &[u8]) -> serde_json::Value {
+pub(crate) fn tagged(path: &[u8]) -> serde_json::Value {
     use base64::Engine as _;
     match std::str::from_utf8(path) {
         Ok(value) => serde_json::json!({"encoding": "utf-8", "value": value}),

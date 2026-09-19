@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import json
 import os
 import signal
 import subprocess
@@ -10,7 +11,9 @@ import threading
 from collections.abc import Awaitable, Callable, Mapping
 
 from ._paths import PathArgument
-from .errors import SyqInvocationError, SyqProcessError
+from .errors import SyqInvocationError, SyqProcessError, SyqProtocolError
+from .models import CpResult
+from .protocol import AutomationDecoder
 
 Argument = str | bytes
 
@@ -62,7 +65,7 @@ def arguments(*, executable: str, writing: bool, path: PathArgument | None,
                 _append_path_option(argv, option, _text_arg(header, label=name))
             continue
         if name in {"no_bootstrap", "no_compress", "no_tcp", "tcp_plain", "follow_src", "follow_dst",
-                    "stats", "quiet", "progress", "no_progress", "progress_json"}:
+                    "stats", "quiet", "progress", "no_progress", "progress_json", "dry_run", "only_new", "only_existing"}:
             if not isinstance(value, bool):
                 raise SyqInvocationError(f"{name} must be a boolean")
             argv.append(option)
@@ -90,10 +93,17 @@ def _signal_group(process: subprocess.Popen[bytes], sig: int) -> None:
 class _Process:
     def __init__(self, argv: list[Argument], *, writing: bool,
                  cwd: PathArgument | None, env: Mapping[str, str] | None,
-                 timeout: float | None) -> None:
+                 timeout: float | None, dry_run: bool = False) -> None:
         if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
                                     or not math.isfinite(timeout) or timeout < 0):
             raise SyqInvocationError("timeout must be a finite non-negative number or None")
+        self.prepared = threading.Event()
+        self.skipped = False
+        self.transfer_ready = False
+        self.dry_run = dry_run
+        self.result: CpResult | None = None
+        self.decoder = AutomationDecoder(dry_run=dry_run)
+        self.results_error: Exception | None = None
         self.timeout = timeout
         self.expired = False
         self.done = threading.Event()
@@ -102,8 +112,11 @@ class _Process:
         self._release_lock = threading.Lock()
         self._abort_lock = threading.Lock()
         self._released = False
-        read_fd = write_fd = None
+        read_fd = write_fd = results_read = results_write = None
         try:
+            from .client import _results_pipe
+            results_read, results_write = _results_pipe()
+            argv = [*argv, "--results-fd", str(results_write)]
             if writing:
                 from .client import _results_pipe
                 read_fd, write_fd = _results_pipe()
@@ -113,20 +126,24 @@ class _Process:
                 argv, cwd=cwd, env=env, start_new_session=True,
                 stdin=subprocess.PIPE if writing else subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL if writing else subprocess.PIPE,
-                stderr=subprocess.PIPE, pass_fds=() if read_fd is None else (read_fd,),
+                stderr=subprocess.PIPE, pass_fds=(results_write,) if read_fd is None else (results_write, read_fd),
                 bufsize=0,
             )
+            self.results_pipe = os.fdopen(results_read, "rb")
+            results_read = None
             if write_fd is not None:
                 self.control = os.fdopen(write_fd, "wb", buffering=0)
                 write_fd = None
         finally:
-            for fd in (read_fd, write_fd):
+            for fd in (read_fd, write_fd, results_read, results_write):
                 if fd is not None:
                     os.close(fd)
         self.payload = self.process.stdin if writing else self.process.stdout
         assert self.payload is not None and self.process.stderr is not None
         self.drain = threading.Thread(target=self._drain, daemon=True, name="syq-stream-stderr")
         self.drain.start()
+        self.results_drain = threading.Thread(target=self._drain_results, daemon=True, name="syq-stream-results")
+        self.results_drain.start()
         self.watchdog = None
         if timeout is not None:
             self.watchdog = threading.Thread(target=self._deadline, daemon=True, name="syq-stream-timeout")
@@ -137,10 +154,45 @@ class _Process:
             self.stderr.extend(chunk)
             del self.stderr[:-8192]
 
+    def _drain_results(self) -> None:
+        with self.results_pipe:
+            for line in self.results_pipe:
+                if self.results_error is None:
+                    try:
+                        record = json.loads(line)
+                        if record["type"] == "run":
+                            self.decoder.expected_dry_run = record.get("dry_run")
+                        event = self.decoder.feed(line)
+                        if record["type"] == "stream_ready":
+                            self.transfer_ready = True
+                            self.prepared.set()
+                        elif record["type"] == "stream_result":
+                            self.skipped = record["disposition"] == "skipped"
+                        if isinstance(event, CpResult):
+                            self.dry_run = event.dry_run
+                            self.result = event
+                    except Exception as error:
+                        self.results_error = error
+                        self.prepared.set()
+        self.prepared.set()  # EOF also wakes a failed/skipped/preview open.
+
+    def wait_prepared(self) -> None:
+        self.prepared.wait()
+        if self.results_error is not None:
+            self.abort()
+            raise self.results_error
+        if not self.transfer_ready:
+            self.finish()
+            if not self.skipped and not self.dry_run:
+                raise SyqProtocolError("stream ended without becoming ready")
+
     def _deadline(self) -> None:
         if not self.done.wait(self.timeout):
             self.expired = True
-            _signal_group(self.process, signal.SIGTERM)
+            # Let the coordinator close its helper sessions and discard staging.
+            # Signalling the entire group here also kills local SSH helpers before
+            # they can process Shutdown; the bounded fallback below kills leftovers.
+            self.process.terminate()
             if not self.done.wait(6):
                 _signal_group(self.process, signal.SIGKILL)
 
@@ -153,6 +205,7 @@ class _Process:
             if self.watchdog is not None:
                 self.watchdog.join()
             self.drain.join()
+            self.results_drain.join()
             self.process.stderr.close()
             control, self.control = self.control, None
             if control is not None:
@@ -163,6 +216,9 @@ class _Process:
         self.process.wait()
         self._release()
         if self.process.returncode == 0:
+            if self.results_error is not None:
+                raise self.results_error
+            self.decoder.finish(0)
             return
         if self.expired:
             raise subprocess.TimeoutExpired(self.argv, self.timeout, stderr=bytes(self.stderr))
@@ -178,7 +234,10 @@ class _Process:
             control, self.control = self.control, None
             if control is not None:
                 control.close()
-            _signal_group(self.process, signal.SIGTERM)
+            # Let the coordinator close its helper sessions and discard staging.
+            # Signalling the entire group here also kills local SSH helpers before
+            # they can process Shutdown; the bounded fallback below kills leftovers.
+            self.process.terminate()
             try:
                 self.process.wait(timeout=6)
             except subprocess.TimeoutExpired:
@@ -198,6 +257,19 @@ class StreamWriter:
         self._aborted = False
 
     @property
+    def result(self) -> CpResult | None:
+        """Terminal copy result, available after completion; None if interrupted."""
+        return self._process.result
+
+    @property
+    def skipped(self) -> bool:
+        return self._process.skipped
+
+    @property
+    def dry_run(self) -> bool:
+        return self._process.dry_run
+
+    @property
     def stderr(self) -> bytes:
         """The latest 8 KiB of diagnostics; complete after commit or reader close."""
         return bytes(self._process.stderr)
@@ -207,6 +279,13 @@ class StreamWriter:
             self.abort()
         except Exception:
             pass
+
+    def _wait_prepared(self) -> None:
+        try:
+            self._process.wait_prepared()
+        except BaseException:
+            self.abort()
+            raise
 
     def __enter__(self) -> StreamWriter:
         self._check_open()
@@ -227,13 +306,17 @@ class StreamWriter:
         return False
 
     def writable(self) -> bool:
-        return True
+        return not (self.dry_run or self.skipped)
 
     def seekable(self) -> bool:
         return False
 
     def write(self, data: bytes | bytearray | memoryview) -> int:
         self._check_open()
+        if self.skipped:
+            raise ValueError("the stream destination was skipped")
+        if self.dry_run:
+            raise ValueError("a dry run does not accept payload bytes")
         remaining = memoryview(data).cast("B")
         total = len(remaining)
         try:
@@ -269,8 +352,12 @@ class StreamWriter:
             raise ValueError("cannot commit an aborted stream")
         try:
             self.close()
+            if self.skipped or self.dry_run:
+                self._process.finish()
+                self._committed = True
+                return
             assert self._process.control is not None
-            if not self._process.expired:
+            if not self._process.expired and not self.dry_run:
                 self._process.control.write(b"C")
             self._process.control.close()
             self._process.control = None
@@ -302,6 +389,19 @@ class StreamReader:
         self._process = process
         self.closed = False
         self._ended = False
+
+    @property
+    def result(self) -> CpResult | None:
+        """Terminal copy result, available after completion; None if interrupted."""
+        return self._process.result
+
+    @property
+    def skipped(self) -> bool:
+        return self._process.skipped
+
+    @property
+    def dry_run(self) -> bool:
+        return self._process.dry_run
 
     @property
     def stderr(self) -> bytes:
@@ -390,6 +490,18 @@ class _AsyncStream:
         self._factory = factory
         self._stream = None
         self._entered = False
+
+    @property
+    def result(self) -> CpResult | None:
+        return self._active().result
+
+    @property
+    def skipped(self) -> bool:
+        return self._active().skipped
+
+    @property
+    def dry_run(self) -> bool:
+        return self._active().dry_run
 
     @property
     def stderr(self) -> bytes:

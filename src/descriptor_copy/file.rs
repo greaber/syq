@@ -72,6 +72,7 @@ fn resolve_destination(
     path: &[u8],
     follow: bool,
     placement: &StreamPlacement,
+    create_container: bool,
 ) -> Result<PinnedPath> {
     let path = crate::fsops::resolve(path);
     let policy = if follow {
@@ -113,6 +114,9 @@ fn resolve_destination(
     let directory = match selected {
         PinnedPath::Directory(directory) => directory.into_parts().0,
         PinnedPath::Missing(missing) => {
+            if !create_container {
+                return Ok(PinnedPath::Missing(missing));
+            }
             let (parent, components) = missing.into_parts();
             let root = Root::from_directory(parent)?;
             let path = RelativePath::new(&components.into_iter().collect::<Vec<_>>().join(&b'/'))?;
@@ -150,7 +154,7 @@ impl Session {
                 root.is_none(),
                 "source root does not apply to a destination"
             );
-            resolve_destination(path, follow, placement)?
+            resolve_destination(path, follow, placement, true)?
         } else {
             resolve_source(path, root, follow)?
         };
@@ -252,6 +256,49 @@ impl Session {
         descriptors: &crate::descriptor_broker::DescriptorSessionSlot,
     ) -> Result<Response> {
         let result = (|| match operation {
+            Operation::Inspect {
+                only_new,
+                only_existing,
+                path,
+                write,
+                follow,
+                root,
+                placement,
+            } => {
+                anyhow::ensure!(slot.is_none(), "descriptor stream already open");
+                let selected = if *write {
+                    anyhow::ensure!(
+                        root.is_none(),
+                        "source root does not apply to a destination"
+                    );
+                    resolve_destination(path, *follow, placement, false)?
+                } else {
+                    resolve_source(path, root.as_deref(), *follow)?
+                };
+                let exists = !matches!(selected, PinnedPath::Missing(_));
+                if *write && ((*only_new && exists) || (*only_existing && !exists)) {
+                    return Ok(Response::DescriptorInspected {
+                        skipped: true,
+                        size: None,
+                    });
+                }
+                let size = match selected {
+                    PinnedPath::Leaf(leaf) if leaf.metadata().is_file() => {
+                        (!*write).then_some(leaf.metadata().len)
+                    }
+                    PinnedPath::Leaf(leaf) if *write && leaf.metadata().is_symlink() => None,
+                    PinnedPath::Missing(_) if *write => None,
+                    _ => bail!(
+                        "stream {} must be a regular file{}",
+                        if *write { "destination" } else { "source" },
+                        if *write { " or an absent path" } else { "" }
+                    ),
+                };
+                Ok(Response::DescriptorInspected {
+                    skipped: false,
+                    size,
+                })
+            }
             Operation::Open {
                 path,
                 write,

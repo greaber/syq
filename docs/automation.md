@@ -222,6 +222,31 @@ emit per-operation records for metadata-only updates, though dry runs emit
 `metadata_differs` traces. Failed implicit parent creation can lack `src` and
 is non-retryable. Do not construct a retry source from its destination name.
 
+### `stream_ready`
+
+A descriptor copy has passed its initial checks and can accept or deliver
+payload. This is useful for deciding whether to start a producer. Skipped
+copies and dry runs finish without this record. It does not promise successful
+transfer or publication; require the terminal result for that.
+
+### `stream_result`
+
+Descriptor copies emit one `stream_result` instead of pathname-based
+`operation_result` or `trace` records. `source` and `destination` each contain
+one of `path` (a tagged path) or `fd` (the caller's descriptor number). Paths
+are source/destination operands, with a source basename appended for `--into`;
+the run's endpoints identify where they belong. An FD is a handle for this
+invocation, not a reusable source or retry identity.
+
+`disposition` is `succeeded`, `failed`, `skipped`, or `planned`; `dry_run` identifies a
+preview. `bytes` counts transferred bytes, including partial work on failure,
+or planned bytes in a dry run. It is absent for a preview of unknown-length
+input. A failed upload may have transferred bytes without publishing them.
+Skipped copies consume no payload, report zero bytes, and count as one excluded
+file. The normal terminal `result` still establishes completion. Its optional
+`bytes_total_known` field is false when the source length is unknown; preview
+byte totals then count only known bytes, rather than asserting an empty input.
+
 ### Removal records
 
 For S3 version removal, `removal_trace` and `removal_result` include optional
