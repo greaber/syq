@@ -320,7 +320,7 @@ cp photos/b.jpg s3://backups/archive/summit.jpg</code></pre><pre><code>s5cmd run
 <div><p><strong>scp</strong></p><pre><code>scp -pr project server:/backup/</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp project --to server --into /backup</code></pre></div>
 </div>
-<p>Copies <code>project</code> to <code>/backup/project</code>; <code>/backup</code> must already exist for the scp command.</p>
+<p>Copies <code>project</code> to <code>/backup/project</code>.</p>
 <details class="tool-example-differences"><summary>Differences</summary><p>Scp <code>-p</code> preserves source permission bits and access times as well as modification times. Syq preserves modification times, leaves existing destination permissions alone, and creates files with source read/write/execute bits limited by the destination umask; it does not preserve source access times.</p><p>Scp transfers each file again and writes directly to the destination. Syq can skip unchanged files and normally stages changed files before replacing them, keeping the old file available until replacement.</p><p>Scp follows symlinks inside the copied tree and copies their targets. Syq copies those links themselves.</p><p>The scp destination directory must already exist for the placement shown. Syq creates missing destination directories.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
