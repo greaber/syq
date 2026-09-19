@@ -28,8 +28,10 @@ See [S3 tuning](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 ## Descriptor copies
 
 With [`--src-fd` or `--as-fd`](commands/cp.md#file-descriptors), `cp`
-transfers one exact UTF-8 key's raw contents, without path normalization,
-prefix selection, or syq file metadata. No local temporary file is created.
+transfers one exact UTF-8 key's raw contents, without path normalization or
+prefix selection. Regular-file uploads store syq's file metadata. Output
+descriptors receive raw bytes; use `--preserve` to apply attributes to a regular
+output file. Pipes carry only bytes. No local temporary file is created.
 
 S3 descriptor copies default to four parallel 16 MiB parts, with about one
 part of payload buffering per worker plus one input/output part. Use `s3-part-size` and `s3-retries` to change the part size and retry budget.
@@ -66,7 +68,7 @@ completion response can mean an upload was published despite a reported failure.
 
 Bucket-to-bucket copies run within one service, using the same endpoint, region,
 and credentials. They preserve metadata and tags. Changes to tags, encryption,
-or storage class alone do not trigger a copy. Content hashing, expected digests,
+or storage class alone do not trigger a copy. Content hashing, expected hashes,
 and `--verify-only` are unsupported on this route.
 
 <a id="remove-objects-and-versions"></a>

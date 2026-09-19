@@ -95,6 +95,18 @@ See [S3 options and behavior](object-storage.md) for credentials and filesystem 
 
 For two SSH endpoints, see [Copy between servers](remote-to-remote.md).
 
+### Transport compression
+
+Remote filesystem copies compress data in transit by default. Each connection
+starts with LZ4 and can switch to Zstd level 1 or 3 when its writes drain more
+slowly, then back to LZ4 as they speed up. This uses the observed transport
+write rate, which includes SSH and receiver backpressure, rather than the
+network interface's advertised speed.
+
+Each block is compressed independently and sent compressed only when that
+saves at least 1% of its size. A poorly compressing block does not stop syq
+from trying the next one. Use `--no-compress` to disable transport compression.
+
 ## Progress
 
 Syq shows a progress bar when running in a terminal. It tracks bytes processed;
@@ -169,6 +181,8 @@ placement path, rather than every copied entry.
 regular-file pairs; replacements between non-directory entry types still
 occur, but replacing a directory with a non-directory or the reverse is
 refused. Combine it with `--only-existing` to avoid creating missing entries too.
+It cannot combine with `--as-fd`; use a named destination so syq can check its
+timestamp before opening it.
 
 `--only-new` cannot combine with either policy. Neither `--only-new` nor
 `--skip-newer` can combine with `--inplace`: an interrupted write could leave
@@ -180,7 +194,7 @@ These options do not disable `--prune`; requested pruning still removes extras.
 ## Preview changes
 
 `--dry-run` shows planned changes without carrying out the copy or deletions.
-Add `-v` to list the changes by path:
+Add `--hash` to compare contents and `-v` to list planned changes by path:
 
 ```sh
 syq cp --dry-run -v --srcs-in project --into backup
@@ -206,7 +220,7 @@ and the command exits 25.
 
 Pruning stays inside the copied directories. Copying named directories `a`
 and `b` into `backup` prunes `backup/a` and `backup/b`, leaving `backup/c` alone.
-Ignored paths and files skipped by size limits are protected.
+Ignored paths are protected.
 
 Scan or copy errors prevent deletion. An interruption after deletion starts
 can leave some extras removed. Do not prune while another copy is writing into
@@ -330,11 +344,8 @@ metadata does not prove that contents match; use `--hash` to compare contents:
 syq cp --hash --srcs-in project --into backup
 ```
 
-To require a known whole-file digest, use `--expected-hash ALGORITHM:HEX` with
-one named regular file or descriptor stream. Syq checks the complete result, including reused bytes.
-A mismatch fails the file; with normal staging it does not replace the destination.
-Selection filters still exclude files from checking. For batch copies, use
-[expected digests in mappings](mappings.md#the-format).
+Use [per-file expected hashes in mappings](mappings.md#the-format) to require
+known contents, including when reusing destination bytes.
 
 To compare without copying:
 
@@ -347,7 +358,7 @@ symlink targets, and entry types, without comparing metadata or looking for
 extra destination files.
 
 The [Integrity checking reference](integrity-checking.md) covers timestamp
-precision, every comparison and payload-check algorithm, expected digests,
+precision, every comparison and payload-check algorithm, expected hashes,
 and verification restrictions. For consistent source data, stop concurrent
 writers or copy a snapshot.
 
@@ -386,8 +397,11 @@ syq cp --preserve=permissions,ownership project --into backup
 ```
 
 `permissions` preserves modes; `ownership` requests numeric owner and group;
-`specials` enables device, FIFO, and socket nodes. Ownership needs suitable
-permissions on the destination. Hard links, ACLs, and xattrs are not preserved.
+`specials` enables device, FIFO, and socket nodes. `times` requests source
+modification times, which are already preserved for named destinations but are
+opt-in for [output descriptors](commands/cp.md#file-descriptors). Setting ownership
+or explicit timestamps needs suitable permissions on the destination. Hard links,
+ACLs, and xattrs are not preserved.
 
 ## Symlinks
 
@@ -529,7 +543,6 @@ installed helper or pass `--no-bootstrap` when one is already on the server's
 ## More options
 
 `--src-non-dir` and `--src-dir` require a non-directory or directory respectively.
-Use `--min-size` and `--max-size` to select regular files by size.
 
 For parallelism and bandwidth controls, see [Speed](speed.md). For scripts,
 see [Automation results](automation.md).

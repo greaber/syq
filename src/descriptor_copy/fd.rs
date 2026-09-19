@@ -78,6 +78,7 @@ impl Source {
                     enlarge_pipe(&file);
                     Ok(Descriptor {
                         file,
+                        metadata: None,
                         original: -1,
                         descriptor_flags: 0,
                         cancelled,
@@ -91,6 +92,7 @@ impl Source {
 
 pub(crate) struct Descriptor {
     file: File,
+    metadata: Option<std::fs::Metadata>,
     original: i32,
     descriptor_flags: i32,
     cancelled: Arc<AtomicBool>,
@@ -126,6 +128,7 @@ impl Descriptor {
         let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         let result = Self {
             file,
+            metadata: kind.is_file().then_some(metadata),
             original: fd,
             descriptor_flags,
             cancelled,
@@ -139,15 +142,34 @@ impl Descriptor {
         Ok(result)
     }
     pub(crate) fn remaining_len(&self) -> Result<Option<u64>> {
-        let metadata = self.file.metadata()?;
-        if !metadata.is_file() {
+        let Some(metadata) = &self.metadata else {
             return Ok(None);
-        }
+        };
         let offset = unsafe { libc::lseek(self.file.as_raw_fd(), 0, libc::SEEK_CUR) };
         if offset < 0 {
             return Err(std::io::Error::last_os_error()).context("inspect stream offset");
         }
         Ok(Some(metadata.len().saturating_sub(offset as u64)))
+    }
+    pub(crate) fn metadata(&self) -> Option<crate::proto::Meta> {
+        self.metadata.as_ref().map(super::metadata::from_file)
+    }
+    pub(crate) fn metadata_file(&self) -> Result<Option<File>> {
+        self.metadata
+            .as_ref()
+            .map(|_| self.file.try_clone())
+            .transpose()
+            .map_err(Into::into)
+    }
+    pub(crate) fn apply_metadata(
+        &self,
+        policy: super::metadata::Policy,
+        source: Option<crate::proto::Meta>,
+    ) -> Result<()> {
+        if self.metadata.is_some() {
+            policy.apply(&self.file, source)?;
+        }
+        Ok(())
     }
     fn check_cancelled(&self) -> Result<()> {
         if self.cancelled.load(Relaxed) {

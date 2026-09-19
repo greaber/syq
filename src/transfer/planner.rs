@@ -1520,7 +1520,8 @@ impl Planner<'_> {
             } else {
                 self.progress.error(&format!("MISSING {rel}"));
             }
-        } else if same && !opts.checksum && opts.expected_for(&dst_rel).is_none() {
+        } else if same && !opts.checksum && (opts.dry_run || opts.expected_for(&dst_rel).is_none())
+        {
             // Content is up to date, but still reconcile metadata
             // (mode/owner/group) the way rsync does — a skipped file
             // shouldn't keep stale permissions.
@@ -1560,6 +1561,15 @@ impl Planner<'_> {
             }
             self.progress.files_unchanged.fetch_add(1, Relaxed);
             self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
+        } else if opts.dry_run
+            && opts.checksum
+            && dst_entry
+                .as_ref()
+                .is_some_and(|d| d.kind == Kind::File && d.size == e.size)
+        {
+            // Equal-size files need a real comparison. Hash them through the
+            // workers so large trees do not serialize all reads in the planner.
+            self.enqueue((src_path, source), dst_path, rel, dst_rel, e, dst_entry);
         } else if opts.dry_run {
             self.progress.files_total.fetch_add(1, Relaxed);
             self.progress.bytes_total.fetch_add(e.size, Relaxed);
@@ -1580,7 +1590,8 @@ impl Planner<'_> {
                 match &dst_entry {
                     None => "destination_missing",
                     Some(d) if d.kind != Kind::File => "type_differs",
-                    Some(_) => "content_differs",
+                    Some(d) if d.size != e.size => "content_differs",
+                    Some(_) => "metadata_differs",
                 },
             );
             if opts.verbose > 0 {
@@ -2494,7 +2505,7 @@ impl Planner<'_> {
                 .error_classified(&message, Some("conflict"), None);
             self.emit_mapping_entry_failed(
                 &ManifestEntry {
-                    expected_digest: self.opts.expected_for(dst_rel).cloned(),
+                    expected_hash: self.opts.expected_for(dst_rel).cloned(),
                     src: self
                         .mapping_source_rel(dst_rel)
                         .expect("mapping parent failure"),

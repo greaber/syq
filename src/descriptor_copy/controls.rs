@@ -1,10 +1,6 @@
 //! Controls shared by filesystem and S3 byte streams.
 use super::Settings;
-use crate::{
-    cli::Args,
-    hashing::{Digest, Hasher},
-    progress::Progress,
-};
+use crate::{cli::Args, progress::Progress};
 use anyhow::{bail, Result};
 use std::{
     sync::{atomic::Ordering::Relaxed, Arc},
@@ -34,7 +30,7 @@ pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
             bail!("descriptor copies always transfer the selected bytes; content comparison is not supported");
         }
         if s3 && checks.transfer.flatten().is_some() {
-            bail!("extra S3 stream verification is not supported: raw objects have no syq digest metadata; use --expected-hash with a known digest (provider checksums remain enabled)");
+            bail!("extra S3 stream verification is not supported: raw objects have no syq hash metadata (provider checksums remain enabled)");
         }
     }
     if let Some(options) = &mut args.s3 {
@@ -52,11 +48,11 @@ pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
 
 pub(crate) struct Controls {
     pub report: super::report::Report,
+    pub metadata: super::metadata::Policy,
     pub settings: Settings,
     pub pipeline: usize,
     pub progress: Arc<Progress>,
     limit: Option<crate::bwlimit::BandwidthLimit>,
-    expected: Option<Digest>,
     stats: bool,
     quiet: bool,
 }
@@ -109,11 +105,11 @@ impl Controls {
         }
         Self {
             report,
+            metadata: super::metadata::Policy::new(args),
             settings,
             pipeline: tuning.pipeline_depth(),
             progress,
             limit,
-            expected: args.expected_digest.clone(),
             stats: args.stats,
             quiet: args.quiet,
         }
@@ -135,17 +131,6 @@ impl Controls {
             }
         }
     }
-    pub fn expected_hasher(&self) -> Option<Hasher> {
-        self.expected
-            .as_ref()
-            .map(|digest| digest.algorithm.hasher())
-    }
-    pub fn verify(&self, hash: Option<Hasher>) -> Result<()> {
-        if let Some(expected) = &self.expected {
-            expected.verify(&hash.expect("expected hash state").finalize())?;
-        }
-        Ok(())
-    }
     pub fn finish(&self, error: Option<&anyhow::Error>) {
         let success = error.is_none();
         let bytes = self.progress.bytes_done.load(Relaxed);
@@ -159,7 +144,7 @@ impl Controls {
                 .bytes_done
                 .store(self.progress.bytes_total.load(Relaxed), Relaxed);
         }
-        if self.report.skipped() {
+        if success && self.report.skipped() {
             self.progress.files_excluded.store(1, Relaxed);
         }
         self.progress.errors.store(u64::from(!success), Relaxed);

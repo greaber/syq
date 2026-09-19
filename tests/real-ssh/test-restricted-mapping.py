@@ -25,7 +25,7 @@ def manifest(entries, expected=None):
     for src, dst, kind in entries:
         record = {"src": {"encoding": "utf-8", "value": src}, "dst": {"encoding": "utf-8", "value": dst}, "kind": kind}
         if expected is not None:
-            record["expected_digest"] = expected
+            record["expected_hash"] = expected
         records.append(json.dumps(record) + "\n")
     return "".join(records).encode()
 
@@ -41,20 +41,32 @@ def hashing(root, source, temporary):
     for name, flags in [("encrypted", []), ("plain", ["--tcp-plain"])]:
         print(f"hash policy: ordinary {name} TCP", flush=True)
         destination = root + "/hash-" + name
-        command = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=1", str(local), "--to", "destination", "--as", destination,
+        command = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=1", "-C", str(local.parent), "--mapping", "-", "--to", "destination", "--into", root,
                    "--integrity-checking", "compare=xxh3-128", "--integrity-checking=transfer=blake3", "--performance-tuning", "copy-path=ranges"] + flags
-        run(command + ["--expected-hash", "sha256:" + sha256])
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "sha256", "value": sha256}))
         results = str(Path(temporary) / ("hash-repeat-" + name + ".ndjson"))
-        run(command + ["--expected-hash", "sha256:" + sha256, "--results", results])
+        run(command + ["--results", results], data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "sha256", "value": sha256}))
         summary = json.loads(Path(results).read_text().splitlines()[-1])
         assert summary["files_unchanged"] == 1 and summary["bytes_transferred"] == 0, summary
+        # Hash previews read both endpoints, retain mapping identities, and do not publish.
+        preview = str(Path(temporary) / ("hash-preview-" + name + ".ndjson"))
+        run(command + ["--dry-run", "--results", preview], data=manifest([(local.name, "hash-" + name, "file")]))
+        summary = json.loads(Path(preview).read_text().splitlines()[-1])
+        assert summary["files_unchanged"] == 1 and summary["files_transferred"] == 0, summary
+        ssh("destination", f"from pathlib import Path; import os; p=Path({destination!r}); m=p.stat(); p.write_bytes(b'x'*{len(payload)}); os.utime(p, ns=(m.st_atime_ns,m.st_mtime_ns))")
+        preview = str(Path(temporary) / ("hash-preview-changed-" + name + ".ndjson"))
+        run(command + ["--dry-run", "--results", preview], data=manifest([(local.name, "hash-" + name, "file")]))
+        records = [json.loads(line) for line in Path(preview).read_text().splitlines()]
+        assert records[-1]["files_transferred"] == 1 and records[-1]["status"] == "success", records
+        assert any(r["type"] == "trace" and r["reason"] == "content_differs" and r["src"]["value"] == local.name for r in records), records
+        ssh("destination", f"from pathlib import Path; assert Path({destination!r}).read_bytes()==b'x'*{len(payload)}")
         # compare=xxh3-128 checks the existing file with the selected algorithm.
-        run(command + ["--expected-hash", "md5:" + md5])
-        run(command + ["--expected-hash", "md5:" + wrong_md5], expected=23)
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "md5", "value": md5}))
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "md5", "value": wrong_md5}), expected=23)
         ssh("destination", f"from pathlib import Path; import hashlib; assert hashlib.sha256(Path({destination!r}).read_bytes()).hexdigest()=={sha256!r}")
         # A changed target must remain intact when staged validation fails.
         ssh("destination", f"from pathlib import Path; Path({destination!r}).write_bytes(b'keep existing')")
-        run(command + ["--expected-hash", "md5:" + wrong_md5], expected=23)
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "md5", "value": wrong_md5}), expected=23)
         ssh("destination", f"from pathlib import Path; assert Path({destination!r}).read_bytes()==b'keep existing'")
 
     print("hash policy: signed mapping with independent expected digest", flush=True)

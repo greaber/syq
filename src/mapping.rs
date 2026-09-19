@@ -10,7 +10,7 @@ pub(crate) struct ManifestEntry {
     pub src: PathBytes,
     pub dst: PathBytes,
     pub kind: Option<DeclaredKind>,
-    pub expected_digest: Option<crate::hashing::Digest>,
+    pub expected_hash: Option<crate::hashing::Digest>,
 }
 
 /// The manifest's `kind` field: disambiguation of the request, not a
@@ -69,7 +69,7 @@ pub(crate) fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
         #[serde(default)]
         kind: Option<String>,
         #[serde(default)]
-        expected_digest: Option<crate::hashing::Digest>,
+        expected_hash: Option<crate::hashing::Digest>,
         #[serde(default)]
         #[allow(dead_code)]
         size: Option<u64>,
@@ -99,17 +99,17 @@ pub(crate) fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
         Some("special") => Some(DeclaredKind::Special),
         Some(other) => bail!("unknown kind {other:?}"),
     };
-    if let Some(digest) = &entry.expected_digest {
+    if let Some(digest) = &entry.expected_hash {
         digest.validate()?;
         if kind.is_some_and(|kind| !matches!(kind, DeclaredKind::File)) {
-            bail!("expected_digest requires a regular file");
+            bail!("expected_hash requires a regular file");
         }
     }
     Ok(ManifestEntry {
         src,
         dst,
         kind,
-        expected_digest: entry.expected_digest,
+        expected_hash: entry.expected_hash,
     })
 }
 
@@ -273,7 +273,7 @@ impl Authorization {
 /// Ancestors only authorize directory creation, never arbitrary child paths.
 #[derive(Debug)]
 pub(crate) struct Permissions {
-    expected_digests: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
+    expected_hashes: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
     entries: std::collections::HashMap<PathBytes, Option<DeclaredKind>>,
     parents: std::collections::HashSet<PathBytes>,
 }
@@ -281,7 +281,7 @@ pub(crate) struct Permissions {
 impl Permissions {
     fn new() -> Self {
         Self {
-            expected_digests: Default::default(),
+            expected_hashes: Default::default(),
             entries: Default::default(),
             parents: [Vec::new()].into(),
         }
@@ -323,8 +323,8 @@ impl Permissions {
             }
         }
         self.parents.remove(&entry.dst);
-        if let Some(expected) = entry.expected_digest {
-            self.expected_digests.insert(entry.dst.clone(), expected);
+        if let Some(expected) = entry.expected_hash {
+            self.expected_hashes.insert(entry.dst.clone(), expected);
         }
         self.entries.insert(entry.dst, entry.kind);
         self.check_limit(max_entries)
@@ -434,8 +434,8 @@ impl Admission {
         result
     }
 
-    pub(crate) fn expected_digest(&self, path: &[u8]) -> Result<Option<&crate::hashing::Digest>> {
-        Ok(self.permissions()?.expected_digests.get(path))
+    pub(crate) fn expected_hash(&self, path: &[u8]) -> Result<Option<&crate::hashing::Digest>> {
+        Ok(self.permissions()?.expected_hashes.get(path))
     }
 
     pub(crate) fn permissions(&self) -> Result<&Permissions> {
@@ -476,6 +476,15 @@ mod tests {
             r#"{{"src":{{"encoding":"utf-8","value":"{src}"}},"dst":{{"encoding":"utf-8","value":"{dst}"}}}}
 "#
         )
+    }
+
+    #[test]
+    fn old_expected_digest_field_is_rejected() {
+        let old = r#"{"src":{"encoding":"utf-8","value":"a"},"dst":{"encoding":"utf-8","value":"b"},"expected_digest":{"algorithm":"md5","value":"900150983cd24fb0d6963f7d28e17f72"}}"#;
+        assert!(parse_manifest_entry(old)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field `expected_digest`"));
     }
 
     #[test]

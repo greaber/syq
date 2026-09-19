@@ -90,9 +90,8 @@ Most syq-specific options carry a `--syq-` prefix. Common ones are
 `--syq-verify-only`. The last compares selected contents without writing;
 it does not produce rsync's itemized-change format.
 
-The [hashing controls](reference.md#check-file-contents) are
-`--integrity-checking` and `--syq-expected-hash`
-in rsync mode. `-c` still selects content comparison.
+Use [`--integrity-checking`](integrity-checking.md) to choose comparison and
+transfer hashes in rsync mode. `-c` selects content comparison.
 
 Filters are last-match-wins with `!` re-inclusion, unlike rsync's first-match
 rules. Check the [gitignore examples](reference.md#ignoring-paths) when

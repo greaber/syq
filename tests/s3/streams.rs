@@ -79,3 +79,13 @@ fn managed_streams_commit_only_after_producer_success() {
 fn stream_previews_inspect_without_transferring_payload() {
     scenario("preview-results");
 }
+
+#[test]
+fn size_filters_select_without_consuming_input() {
+    scenario("size-filters");
+}
+
+#[test]
+fn file_descriptors_preserve_metadata_and_skip_newer_objects() {
+    scenario("file-metadata");
+}

@@ -55,7 +55,6 @@ from .errors import (
 from .models import (
     AutomationEvent,
     CpResult,
-    Digest,
     MappingEntry,
     OperationStatus,
     OperationSummary,
@@ -554,7 +553,6 @@ class AsyncClient:
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
-        expected_digest: Digest | None = None,
         only_new: bool = False,
         only_existing: bool = False,
         dry_run: bool = False,
@@ -580,7 +578,7 @@ class AsyncClient:
                              s3_endpoint=s3_endpoint, s3_region=s3_region,
                              s3_profile=s3_profile, s3_header=s3_header,
                              resource_limits=resource_limits, integrity_checking=integrity_checking,
-                             expected_digest=expected_digest, stats=stats, verbose=verbose,
+                             stats=stats, verbose=verbose,
                              quiet=quiet, progress=progress, no_progress=no_progress,
                              progress_json=progress_json,
                              performance_tuning=performance_tuning, follow_dst=follow_dst),
@@ -616,7 +614,6 @@ class AsyncClient:
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
-        expected_digest: Digest | None = None,
         only_new: bool = False,
         only_existing: bool = False,
         dry_run: bool = False,
@@ -642,7 +639,7 @@ class AsyncClient:
                              s3_endpoint=s3_endpoint, s3_region=s3_region,
                              s3_profile=s3_profile, s3_header=s3_header,
                              resource_limits=resource_limits, integrity_checking=integrity_checking,
-                             expected_digest=expected_digest, stats=stats, verbose=verbose,
+                             stats=stats, verbose=verbose,
                              quiet=quiet, progress=progress, no_progress=no_progress,
                              progress_json=progress_json,
                              performance_tuning=performance_tuning, follow_src=follow_src),
@@ -772,7 +769,6 @@ class AsyncClient:
         dry_run: bool = False,
         hash: bool = False,
         integrity_checking: str | None = None,
-        expected_digest: Digest | None = None,
         verify_only: bool = False,
         only_new: bool = False,
         only_existing: bool = False,
@@ -785,7 +781,6 @@ class AsyncClient:
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
         auth_from: str | None = None,
-        via: str | None = None,
         coordinate_at: str | None = None,
         rsh: str | None = None,
         pscope: PathArgument | None = None,
@@ -803,8 +798,6 @@ class AsyncClient:
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
         inplace: bool = False,
-        max_size: str | int | None = None,
-        min_size: str | int | None = None,
         max_delete: int | None = None,
         on_event: AsyncEventCallback | None = None,
         timeout: Timeout = CLIENT_DEFAULT,
@@ -823,8 +816,6 @@ class AsyncClient:
                 f"a remote-to-remote {'verification' if verify_only else 'dry run'} cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
-        if expected_digest is not None and mapping is not None:
-            raise SyqInvocationError("expected_digest with mapping belongs on each MappingEntry")
         cwd, root, follow_src = _source_options(
             mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
         )
@@ -855,7 +846,6 @@ class AsyncClient:
             dry_run=dry_run,
             hash=hash,
             integrity_checking=integrity_checking,
-            expected_digest=expected_digest,
             verify_only=verify_only,
             only_new=only_new,
             only_existing=only_existing,
@@ -870,17 +860,11 @@ class AsyncClient:
             ignore_from=ignore_from,
             preserve=preserve,
             inplace=inplace,
-            max_size=max_size,
-            min_size=min_size,
             max_delete=max_delete,
         )
         _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
-        if auth_from is not None and via is not None:
-            raise SyqInvocationError("auth_from conflicts with via")
         if auth_from is not None:
             argv.extend(("--auth-from", _text_arg(auth_from, label="auth_from")))
-        if via is not None:
-            argv.extend(("--via", _text_arg(via, label="via")))
         _append_remote_arguments(
             argv,
             coordinate_at=coordinate_at,
@@ -1103,8 +1087,6 @@ class AsyncClient:
             ignore_from=None,
             preserve=None,
             inplace=False,
-            max_size=None,
-            min_size=None,
             max_delete=None,
         )
         if source_count == 0:

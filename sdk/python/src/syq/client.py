@@ -32,7 +32,6 @@ from .errors import (
 from .models import (
     AutomationEvent,
     CpResult,
-    Digest,
     IgnoreFrom,
     MappingEntry,
     OperationStatus,
@@ -608,11 +607,8 @@ def _copy_arguments(
     ignore_from: Selector | None,
     preserve: str | Iterable[str] | None,
     inplace: bool,
-    max_size: str | int | None,
-    min_size: str | int | None,
     max_delete: int | None,
     integrity_checking: str | None = None,
-    expected_digest: Digest | None = None,
 ) -> tuple[list[Argument], int, int]:
     argv: list[Argument] = [command]
     source_count = 0
@@ -683,12 +679,6 @@ def _copy_arguments(
     if hash:
         argv.append("--hash")
     _append_text(argv, "--integrity-checking", integrity_checking)
-    if expected_digest is not None:
-        if not isinstance(expected_digest, Digest):
-            raise SyqInvocationError("expected_digest must be a Digest")
-        if source_count != 1 or contents_count or src_dir is not None:
-            raise SyqInvocationError("expected_digest requires exactly one regular-file source")
-        argv.extend(("--expected-hash", f"{expected_digest.algorithm}:{expected_digest.value}"))
     if verify_only and (dry_run or prune or inplace or only_new or only_existing or skip_newer):
         raise SyqInvocationError("verify_only conflicts with dry_run, prune, inplace, and overwrite policies")
     if only_new and (only_existing or skip_newer or inplace):
@@ -717,8 +707,8 @@ def _copy_arguments(
     _append_text(argv, "--receiver-max-bytes", receiver_max_bytes)
     if receiver_receipt is not None:
         receipt_value = _text_arg(receiver_receipt, label="receiver_receipt")
-        if receipt_value not in {"sizes", "digests"}:
-            raise SyqInvocationError("--receiver-receipt must be sizes or digests")
+        if receipt_value not in {"sizes", "hashes"}:
+            raise SyqInvocationError("--receiver-receipt must be sizes or hashes")
         argv.extend(("--receiver-receipt", receipt_value))
     if ignore is not None:
         rules = (ignore,) if isinstance(ignore, (str, IgnoreFrom)) else tuple(ignore)
@@ -739,15 +729,13 @@ def _copy_arguments(
     if preserve is not None:
         attributes = (preserve,) if isinstance(preserve, str) else tuple(preserve)
         for attribute in attributes:
-            if attribute not in {"permissions", "ownership", "specials"}:
+            if attribute not in {"times", "permissions", "ownership", "specials"}:
                 raise SyqInvocationError(
-                    "--preserve must contain permissions, ownership, or specials"
+                    "--preserve must contain times, permissions, ownership, or specials"
                 )
             argv.extend(("--preserve", attribute))
     if inplace:
         argv.append("--inplace")
-    _append_text(argv, "--max-size", max_size)
-    _append_text(argv, "--min-size", min_size)
     max_delete = _nonnegative_integer(max_delete, option="--max-delete")
     if max_delete is not None:
         if not prune:
@@ -1002,7 +990,6 @@ class Client:
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
-        expected_digest: Digest | None = None,
         only_new: bool = False,
         only_existing: bool = False,
         dry_run: bool = False,
@@ -1026,7 +1013,7 @@ class Client:
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
                          s3_profile=s3_profile, s3_header=s3_header,
                          resource_limits=resource_limits, integrity_checking=integrity_checking,
-                         expected_digest=expected_digest, stats=stats, verbose=verbose,
+                         stats=stats, verbose=verbose,
                          quiet=quiet, progress=progress, no_progress=no_progress,
                          progress_json=progress_json,
                          performance_tuning=performance_tuning, follow_dst=follow_dst),
@@ -1060,7 +1047,6 @@ class Client:
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
-        expected_digest: Digest | None = None,
         only_new: bool = False,
         only_existing: bool = False,
         dry_run: bool = False,
@@ -1084,7 +1070,7 @@ class Client:
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
                          s3_profile=s3_profile, s3_header=s3_header,
                          resource_limits=resource_limits, integrity_checking=integrity_checking,
-                         expected_digest=expected_digest, stats=stats, verbose=verbose,
+                         stats=stats, verbose=verbose,
                          quiet=quiet, progress=progress, no_progress=no_progress,
                          progress_json=progress_json,
                          performance_tuning=performance_tuning, follow_src=follow_src),
@@ -1180,7 +1166,6 @@ class Client:
         dry_run: bool = False,
         hash: bool = False,
         integrity_checking: str | None = None,
-        expected_digest: Digest | None = None,
         verify_only: bool = False,
         only_new: bool = False,
         only_existing: bool = False,
@@ -1193,7 +1178,6 @@ class Client:
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
         auth_from: str | None = None,
-        via: str | None = None,
         coordinate_at: str | None = None,
         rsh: str | None = None,
         pscope: PathArgument | None = None,
@@ -1211,8 +1195,6 @@ class Client:
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
         inplace: bool = False,
-        max_size: str | int | None = None,
-        min_size: str | int | None = None,
         max_delete: int | None = None,
         on_event: Callable[[AutomationEvent], object] | None = None,
         timeout: Timeout = CLIENT_DEFAULT,
@@ -1231,8 +1213,6 @@ class Client:
                 f"a remote-to-remote {'verification' if verify_only else 'dry run'} cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
-        if expected_digest is not None and mapping is not None:
-            raise SyqInvocationError("expected_digest with mapping belongs on each MappingEntry")
         cwd, root, follow_src = _source_options(
             mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
         )
@@ -1261,7 +1241,6 @@ class Client:
             dry_run=dry_run,
             hash=hash,
             integrity_checking=integrity_checking,
-            expected_digest=expected_digest,
             verify_only=verify_only,
             only_new=only_new,
             only_existing=only_existing,
@@ -1276,17 +1255,11 @@ class Client:
             ignore_from=ignore_from,
             preserve=preserve,
             inplace=inplace,
-            max_size=max_size,
-            min_size=min_size,
             max_delete=max_delete,
         )
         _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
-        if auth_from is not None and via is not None:
-            raise SyqInvocationError("auth_from conflicts with via")
         if auth_from is not None:
             argv.extend(("--auth-from", _text_arg(auth_from, label="auth_from")))
-        if via is not None:
-            argv.extend(("--via", _text_arg(via, label="via")))
         _append_remote_arguments(
             argv,
             coordinate_at=coordinate_at,
@@ -1481,8 +1454,6 @@ class Client:
             ignore_from=None,
             preserve=None,
             inplace=False,
-            max_size=None,
-            min_size=None,
             max_delete=None,
         )
         if source_count == 0:

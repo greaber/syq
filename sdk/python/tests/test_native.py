@@ -73,14 +73,14 @@ if command == "rm":
         for arg in args
     ) or 1
     records = [{
-        "schema": "syq.automation", "schema_version": 1, "seq": 0,
+        "schema": "syq.automation", "schema_version": 2, "seq": 0,
         "type": "run", "run_id": "fake-rm", "started_at": 123,
         "syq_version": "9.8.7", "mode": "rm", "dry_run": dry_run,
         "endpoints": [{"role": "source", "kind": "local"}],
     }]
     for selector in range(selector_total):
         records.append({
-            "schema": "syq.automation", "schema_version": 1,
+            "schema": "syq.automation", "schema_version": 2,
             "seq": len(records), "type": "selection_result",
             "selector": selector,
             "path": {"encoding": "utf-8", "value": f"victim-{selector}"},
@@ -88,7 +88,7 @@ if command == "rm":
         })
     if dry_run:
         records.append({
-            "schema": "syq.automation", "schema_version": 1,
+            "schema": "syq.automation", "schema_version": 2,
             "seq": len(records),
             "type": "removal_trace", "selector": 0,
             "path": {"encoding": "utf-8", "value": "victim"},
@@ -96,7 +96,7 @@ if command == "rm":
         })
     elif status == "success":
         records.append({
-            "schema": "syq.automation", "schema_version": 1,
+            "schema": "syq.automation", "schema_version": 2,
             "seq": len(records),
             "type": "removal_result", "selector": 0,
             "path": {"encoding": "utf-8", "value": "victim"},
@@ -104,7 +104,7 @@ if command == "rm":
         })
     else:
         records.extend([{
-            "schema": "syq.automation", "schema_version": 1,
+            "schema": "syq.automation", "schema_version": 2,
             "seq": len(records),
             "type": "removal_result", "selector": 0,
             "path": {"encoding": "utf-8", "value": "victim"},
@@ -112,13 +112,13 @@ if command == "rm":
             "retryable": "unknown", "class": "io",
             "os_kind": "permission_denied", "message": "denied",
         }, {
-            "schema": "syq.automation", "schema_version": 1,
+            "schema": "syq.automation", "schema_version": 2,
             "seq": len(records) + 1,
             "type": "error", "class": "io",
             "os_kind": "permission_denied", "message": "denied",
         }])
     records.append({
-        "schema": "syq.automation", "schema_version": 1,
+        "schema": "syq.automation", "schema_version": 2,
         "seq": len(records), "type": "result", "mode": "rm",
         "status": status, "exit_code": exit_code, "dry_run": dry_run,
         "selectors_total": selector_total, "selectors_resolved": selector_total,
@@ -134,7 +134,7 @@ if command == "rm":
 
 prune = "--prune" in args
 records = [{
-    "schema": "syq.automation", "schema_version": 1, "seq": 0,
+    "schema": "syq.automation", "schema_version": 2, "seq": 0,
     "type": "run", "run_id": "fake-run", "started_at": 123,
     "syq_version": "9.8.7", "mode": "cp", "prune": prune,
     "dry_run": dry_run, "mapping": "--mapping" in args,
@@ -143,7 +143,7 @@ records = [{
         {"role": "destination", "kind": "ssh", "host": "target", "user": "u"},
     ],
 }, {
-    "schema": "syq.automation", "schema_version": 1, "seq": 1,
+    "schema": "syq.automation", "schema_version": 2, "seq": 1,
     "type": "progress", "bytes_done": 0, "bytes_total": 3,
     "bytes_unchanged": 0, "files_done": 0, "files_total": 1,
     "files_unchanged": 0, "files_excluded": 0, "scanned": 1,
@@ -152,14 +152,14 @@ records = [{
 if os.environ.get("SYQ_FAKE_SHAPE") != "empty":
     if dry_run:
         records.append({
-            "schema": "syq.automation", "schema_version": 1, "seq": 2,
+            "schema": "syq.automation", "schema_version": 2, "seq": 2,
             "type": "trace", "action": "transfer_file",
             "dst": {"encoding": "utf-8", "value": "a.txt"},
             "kind": "file", "reason": "destination_missing", "bytes": 3,
         })
     else:
         records.append({
-            "schema": "syq.automation", "schema_version": 1, "seq": 2,
+            "schema": "syq.automation", "schema_version": 2, "seq": 2,
             "type": "operation_result", "action": "transfer_file",
             "dst": {"encoding": "utf-8", "value": "a.txt"},
             "kind": "file", "disposition": "succeeded", "bytes": 3,
@@ -168,7 +168,7 @@ if os.environ.get("SYQ_FAKE_SHAPE") != "empty":
 status = os.environ.get("SYQ_FAKE_STATUS", "success")
 exit_code = 0 if status == "success" else 23
 records.append({
-    "schema": "syq.automation", "schema_version": 1, "seq": len(records),
+    "schema": "syq.automation", "schema_version": 2, "seq": len(records),
     "type": "result", "status": status, "exit_code": exit_code,
     "dry_run": dry_run, "files_transferred": 1, "files_unchanged": 0,
     "files_excluded": 0, "directories_created": 0, "symlinks_created": 0,
@@ -202,7 +202,7 @@ elif shape == "failed-operation":
     })
 elif shape == "unknown-event":
     records.insert(-1, {
-        "schema": "syq.automation", "schema_version": 1,
+        "schema": "syq.automation", "schema_version": 2,
         "seq": records[-1]["seq"], "type": "future_addition", "value": 1,
     })
     records[-1]["seq"] += 1
@@ -212,7 +212,7 @@ elif shape == "attested":
         "scope": 0,
     })
     records.insert(-1, {
-        "schema": "syq.automation", "schema_version": 1,
+        "schema": "syq.automation", "schema_version": 2,
         "seq": records[-1]["seq"], "type": "final_state",
         "provenance": "receiver_attested", "scope": 0,
         "dst": {"encoding": "utf-8", "value": "a.txt"},
@@ -290,14 +290,12 @@ class NativeClientTests(unittest.TestCase):
             performance_tuning="workers=4",
             receiver_max_entries=100,
             receiver_max_bytes="2G",
-            receiver_receipt="digests",
+            receiver_receipt="hashes",
             pscope="-scope",
             ignore=["*.tmp", "cache/"],
             ignore_from="ignore.txt",
-            preserve=["permissions", "ownership"],
+            preserve=["times", "permissions", "ownership"],
             inplace=True,
-            max_size="2G",
-            min_size=3,
             on_event=events.append,
         )
 
@@ -324,8 +322,8 @@ class NativeClientTests(unittest.TestCase):
             "--hash", "--no-compress", "--resource-limits", "--performance-tuning",
             "--receiver-max-entries", "--receiver-max-bytes",
             "--receiver-receipt", "--ignore", "--ignore-from",
-            "--preserve",
-            "--inplace", "--max-size", "--min-size",
+            "--preserve", "times", "permissions", "ownership",
+            "--inplace",
         ):
             self.assertIn(expected, argv)
         self.assertTrue(
@@ -335,7 +333,7 @@ class NativeClientTests(unittest.TestCase):
         self.assertNotIn("--results", argv)
         self.assertNotIn("--quiet", argv)
         self.assertIn("--pscope=-scope", argv)
-        self.assertEqual(argv[argv.index("--receiver-receipt") + 1], "digests")
+        self.assertEqual(argv[argv.index("--receiver-receipt") + 1], "hashes")
         self.assertEqual(argv.count("--src"), 2)
 
     def test_hyphen_prefixed_paths_use_attached_option_values(self) -> None:
@@ -572,13 +570,13 @@ class NativeClientTests(unittest.TestCase):
         self.client.cp("source", to="backup", auth_from="@laptop", into="out")
         argv = self.argv()
         self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
-        with self.assertRaises(syq.SyqInvocationError):
+        with self.assertRaises(TypeError):
             self.client.cp("source", to="backup", auth_from="ssh", via="laptop", into="out")
 
     def test_cp_can_request_permission_via_a_return_connection(self) -> None:
-        self.client.cp("source", to="backup", via="@laptop", into="out")
+        self.client.cp("source", to="backup", auth_from="@laptop", into="out")
         argv = self.argv()
-        self.assertEqual(argv[argv.index("--via") + 1], "@laptop")
+        self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
 
     def test_cp_forwards_native_remote_controls(self) -> None:
         self.client.cp(
@@ -895,7 +893,7 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
             json.dumps(
                 {
                     "schema": "syq.automation",
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "seq": 0,
                     "type": "run",
                     "run_id": "attested",
@@ -918,7 +916,7 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
     def _final_state(metadata=None, digest=None):
         record = {
             "schema": "syq.automation",
-            "schema_version": 1,
+            "schema_version": 2,
             "seq": 1,
             "type": "final_state",
             "provenance": "receiver_attested",
@@ -940,7 +938,7 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
             },
         }
         if digest is not None:
-            record["object"]["digest"] = digest
+            record["object"]["hash"] = digest
         return json.dumps(record).encode()
 
     def test_signed_mtimes_decode_and_bad_digests_are_rejected(self) -> None:
@@ -974,7 +972,7 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
     def _terminal(seq=1, **overrides):
         record = {
             "schema": "syq.automation",
-            "schema_version": 1,
+            "schema_version": 2,
             "seq": seq,
             "type": "result",
             "status": "success",
@@ -1005,7 +1003,7 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
         }
         base = {
             "schema": "syq.automation",
-            "schema_version": 1,
+            "schema_version": 2,
             "seq": 1,
             "type": "final_state",
             "provenance": "receiver_attested",
@@ -1061,7 +1059,7 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
     def test_attested_operation_and_error_fields_are_discriminated(self) -> None:
         base = {
             "schema": "syq.automation",
-            "schema_version": 1,
+            "schema_version": 2,
             "seq": 1,
         }
         operation = {
@@ -1151,7 +1149,7 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
         from syq.protocol import AutomationDecoder
 
         decoder = AutomationDecoder(prune=True, mapping=False, dry_run=False)
-        envelope = {"schema": "syq.automation", "schema_version": 1}
+        envelope = {"schema": "syq.automation", "schema_version": 2}
         records = [
             {
                 **envelope,
@@ -1209,7 +1207,7 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
                         "mtime_nsec": 0,
                         "rdev": 0,
                     },
-                    "digest": {"algorithm": "blake3", "value": "ab" * 32},
+                    "hash": {"algorithm": "blake3", "value": "ab" * 32},
                 },
             },
             {
@@ -1250,9 +1248,9 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
         final = events[3]
         self.assertIsInstance(final, syq.FinalStateEvent)
         self.assertIs(final.state, syq.FinalObjectState.PRESENT)
-        assert final.digest is not None
-        self.assertEqual(final.digest.algorithm, "blake3")
-        self.assertEqual(final.digest.value, "ab" * 32)
+        assert final.hash is not None
+        self.assertEqual(final.hash.algorithm, "blake3")
+        self.assertEqual(final.hash.value, "ab" * 32)
         assert final.metadata is not None
         self.assertEqual(final.metadata.mode, 0o644)
         result = decoder.finish(0)

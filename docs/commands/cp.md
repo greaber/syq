@@ -35,8 +35,6 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--srcs <PATH>...` | Select several named source objects |
 | `--ignore <PATTERN>` | Skip paths matching a gitignore-style pattern (repeatable) |
 | `--ignore-from <FILE>` | Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order) |
-| `--max-size <SIZE>` | Skip regular source files larger than SIZE; --prune protects their destination paths |
-| `--min-size <SIZE>` | Skip regular source files smaller than SIZE; --prune protects their destination paths |
 | `[PATH]...` | Named source objects (shorthand for --src) |
 
 ## Destination and mapping
@@ -61,7 +59,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--only-existing` | Update only entries already present; create no missing entries or directories |
 | `--skip-newer` | Skip regular files newer at the destination; non-directory type replacements still occur |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
-| `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored and size-excluded source paths remain protected |
+| `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
 | `--max-delete <N>` | With --prune, refuse all removals if more than N are planned |
 
 ## Metadata and symlinks
@@ -71,14 +69,13 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow` | Follow symlinks in all directly supplied filesystem paths |
 | `--follow-src` | Follow symlinks in directly supplied source paths |
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
-| `--preserve <FEATURE>` | Preserve permissions or ownership, or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files |
+| `--preserve <FEATURE>` | Preserve times, permissions or ownership, or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- times: Preserve modification times (already the default for named destinations)<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files |
 
 ## Verification
 
 | Argument / option | Meaning |
 |---|---|
 | `--hash` | Hash existing source and destination files instead of trusting size and modification time |
-| `--expected-hash <ALGORITHM:HEX>` | Require one regular file to match ALGORITHM:HEX |
 | `--verify-only` | Compare selected contents without writing; fail on differences or inspection errors |
 | `--integrity-checking <KEY=VALUE,...>` | [Comparison and transfer checksums](../integrity-checking.md) |
 
@@ -89,9 +86,8 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--no-compress` | Disable transport compression |
 | `--receiver-max-entries <N>` | Command-restricted receiver ceiling: refuse to touch more than N destination entries |
 | `--receiver-max-bytes <SIZE>` | Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total |
-| `--receiver-receipt <DETAIL>` | Command-restricted receiver receipt detail: final sizes (default) or also final BLAKE3 file digests<br><br>Possible values:<br>- sizes: Final type and size of every path the transfer could have changed<br>- digests: Sizes plus a closure-time BLAKE3 digest of every regular file |
+| `--receiver-receipt <DETAIL>` | Command-restricted receiver receipt detail: final sizes (default) or also final BLAKE3 file hashes<br><br>Possible values:<br>- sizes: Final type and size of every path the transfer could have changed<br>- hashes: Sizes plus a closure-time BLAKE3 hash of every regular file |
 | `--auth-from <auto\|ssh\|@NAME>` | Authorize with a live receiving machine, or use SSH from this machine (default: auto) |
-| `--via <@NAME>` | Alias for --auth-from @NAME |
 | `--coordinate-at <COORDINATE_AT>` | Choose the endpoint that runs the coordinator<br><br>Possible values:<br>- auto: Run locally unless both endpoints are remote, then run at the source<br>- src: Run the coordinator at the source endpoint<br>- dst: Run the coordinator at the destination endpoint<br>- local: Keep the coordinator on the invoking machine and relay the data there<br><br>[default: auto] |
 | `--rsh <COMMAND>` | Remote shell command (default: ssh); the command owns SSH and agent policy when set |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
@@ -191,9 +187,7 @@ destination.
 
 Progress, `--stats`, and `-v` go to stderr, leaving stdout for payload.
 Statistics report bytes, elapsed time, and average rate; pipe lengths are
-unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput
-or an [expected hash](../integrity-checking.md#expected-digests) to check bytes
-during transfer without a second read.
+unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput.
 
 Native streams accept `request-size`, `pipeline-depth`, and `bw-pacing` tuning.
 S3 uses its [multipart controls](../object-storage.md#descriptor-copies).
@@ -201,7 +195,7 @@ Filesystem streams use parallel data workers over SSH or encrypted TCP, with
 automatic worker tuning as in regular-file copies. `workers=N` fixes the worker
 count; `--no-tcp` keeps data on SSH. S3 transfers one object, with concurrent
 parts. Restart recovery, named receiving destinations, detached execution,
-directory selection, content comparison, and metadata preservation are unsupported.
+directory selection, and content comparison are unsupported.
 
 `--only-new` skips a destination that exists; `--only-existing` skips one that
 is missing. Existing directories, S3 key prefixes, and dangling symlinks also
@@ -218,12 +212,30 @@ results and payload/completion descriptors must differ.
 
 Other inherited descriptors work too, except 2, which is reserved for
 diagnostics. Dedicate each descriptor to the copy. Syq advances its offset,
-respects append mode, and leaves its blocking mode and metadata alone;
+respects append mode, and leaves its blocking mode alone;
 it does not truncate it. A literal `-` is a filename.
 
-Streams carry no source metadata. Existing files keep their permissions;
-new files use `0666` limited by the destination umask. Ownership follows file
-creation rules and timestamps reflect the write. Parent directories are
-created as needed. The usual [symlink rules](../reference.md#symlinks) and
-source `--cwd` / `--root` options apply, but `--root` cannot confine a descriptor
-that is already open. Named remote sources must be regular files.
+When a regular file is copied to a named destination, syq preserves its
+modification time. New named files use the source permissions limited by the
+destination umask; existing files keep their permissions. S3 uploads store file
+attributes in object metadata.
+
+Output descriptors use the timestamps from normal writes, including when
+appending to an existing file. Add `--preserve=times` to copy the source
+modification time instead; this changes the whole destination file's timestamp
+even for a partial write. `--preserve=permissions,ownership` copies those
+attributes without changing timestamps. S3 downloads interpret object metadata
+when attributes are requested; time preservation uses S3's modification time if
+no syq attributes are stored.
+
+`--skip-newer` leaves input unread when the named destination file is newer.
+It cannot be used with `--as-fd`: shell redirection such as `> out` empties and
+updates the file before syq can check it. Use `--as out` instead.
+Input pipes, sockets, and devices have no payload metadata, so they reject
+`--skip-newer` and `--preserve`. Their new named destinations use `0666` limited
+by the umask and the time of the write; existing files keep their permissions.
+Output pipes likewise cannot preserve times, permissions, or ownership. Parent
+directories are created as needed. The usual
+[symlink rules](../reference.md#symlinks) and source `--cwd` / `--root` options
+apply, but `--root` cannot confine a descriptor that is already open. Named remote
+sources must be regular files.

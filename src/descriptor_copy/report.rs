@@ -69,7 +69,17 @@ impl Report {
         };
         // Without a skip policy, input can queue while the destination connects.
         // Decide this after CLI/environment parsing so the SDK need not duplicate it.
-        if plan.source.is_some() && !report.dry_run && !report.only_new && !report.only_existing {
+        if plan.source.is_some()
+            && !report.dry_run
+            && !report.only_new
+            && !report.only_existing
+            && !args.update
+            && !args.times
+            && !args.perms
+            && !args.owner
+            && !args.group
+            && !args.devices
+        {
             report.ready();
         }
         Ok(report)
@@ -100,7 +110,7 @@ impl Report {
         } else {
             progress.bytes_done.load(Relaxed)
         };
-        let skipped = self.skipped();
+        let skipped = self.skipped() && success;
         if skipped && !self.quiet {
             crate::output::diagnostic!(
                 "Skipped stream destination {}",

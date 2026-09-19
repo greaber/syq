@@ -74,7 +74,7 @@ Every record carries:
 | Field | Value |
 |---|---|
 | `schema` | `"syq.automation"` |
-| `schema_version` | `1` |
+| `schema_version` | `2` |
 | `seq` | Integer starting at 0, strictly increasing |
 | `type` | Record type |
 
@@ -194,6 +194,11 @@ for mapping entries, kind and bytes where applicable, plus a `reason`:
 `destination_missing`, `type_differs`, `content_differs`, `metadata_differs`,
 or `destination_only`.
 
+For filesystem copies of regular files, `content_differs` means sizes or compared
+hashes differ;
+`metadata_differs` also covers copies selected by the metadata quick check.
+A `transfer_file` trace omits `bytes` when only metadata would change.
+
 A trace cannot be matched by identity to a later live operation: the filesystem
 may change between runs.
 
@@ -209,7 +214,7 @@ An outcome for a completed copy change or a failed mapping entry.
 | `kind` | `file`, `dir`, `symlink`, or `special`, when known |
 | `disposition` | `succeeded`, `failed`, `blocked`; attested streams also use `incomplete` and `observed` |
 | `bytes`, `attempts` | Optional transfer information |
-| `expected_digest` | Expected whole-file digest, when supplied: an object with `algorithm` and hexadecimal `value`; preserve it in retry mappings |
+| `expected_hash` | Expected whole-file hash, when supplied: an object with `algorithm` and hexadecimal `value`; preserve it in retry mappings |
 | `retryable` | On failures: `yes`, `no`, or `unknown` |
 | `class`, `os_kind`, `message` | Error details where available |
 | `provenance`, `scope`, `code` | Attested origin, signed destination-scope index, and receiver outcome code |
@@ -226,7 +231,8 @@ is non-retryable. Do not construct a retry source from its destination name.
 
 A producer may start supplying payload. Uploads without a skip policy emit this
 before destination setup finishes, allowing several writers to connect concurrently.
-With `--only-new` or `--only-existing`, the destination decision comes first.
+With `--only-new`, `--only-existing`, `--skip-newer`, or metadata
+preservation requested, source selection and destination checks come first.
 Skipped copies and dry runs finish without this record. Setup, transfer, or
 publication can still fail; require the terminal result for completion.
 
@@ -293,8 +299,8 @@ the receiver's `code`.
 Attested streams only: the destination's final observation of a path the
 transfer could have changed. Includes `scope`, `dst`, and an `object`:
 absent, an observation failure, or present with kind, size, applicable
-metadata, and symlink target. With `--receiver-receipt digests`, regular
-files also have a BLAKE3 digest.
+metadata, and symlink target. With `--receiver-receipt hashes`, regular
+files also have a BLAKE3 hash.
 
 Object kinds distinguish directories, files, symlinks, FIFOs, sockets,
 character/block devices, and other objects. Metadata fields are `mode`, `uid`,
