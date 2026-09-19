@@ -64,7 +64,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 
 | Argument / option | Meaning |
 |---|---|
-| `-z, --compress` | Compress remote data in transit with zstd (default) |
+| `-z, --compress` | Compress remote data in transit automatically (default) |
 | `--no-compress` | Disable transport compression |
 | `-e, --rsh <COMMAND>` | Remote shell command (default: ssh); controls agent forwarding when set |
 | `--rsync-path <PATH>` | Use this exact syq executable on the remote instead of the managed helper |

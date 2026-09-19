@@ -3,9 +3,9 @@
 //! Every connection (control or data) begins each direction with a plain-byte
 //! preamble containing a fixed magic string and the sender's build identity.
 //! Only after that identity matches do frames begin. Frames are
-//! `u32 len | u8 flags | payload`, payload is postcard; flag bit 0 means the
-//! payload is zstd-compressed. Each writer decides independently whether to
-//! compress, readers always accept both.
+//! `u32 len | u8 codec | payload`: 0 is raw postcard, 1 is Zstd, and 2 is
+//! an LZ4 block prefixed by its decoded u32 little-endian size. Each direction
+//! selects compression independently; readers accept all three representations.
 
 use crate::descriptor_broker::{DescriptorTicket, RegisteredRootId};
 use anyhow::{bail, Result};
@@ -30,7 +30,6 @@ pub const MAX_HASH_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 32;
 const HASH_RESPONSE_OVERHEAD: u64 = 24;
 const COMPRESS_MIN: usize = 512;
-const COMPRESS_LEVEL: i32 = 1;
 const WIRE_PREAMBLE_MAGIC: &[u8; 8] = b"SYQWIRE\0";
 const WIRE_PREAMBLE_FIXED_LEN: usize = WIRE_PREAMBLE_MAGIC.len() + 2;
 const MAX_BUILD_IDENTITY_BYTES: usize = 512;
@@ -1467,14 +1466,23 @@ pub struct FrameWriter<W: Write> {
     w: BufWriter<W>,
     pub compress: bool,
     preamble_written: bool,
+    compression: crate::compression::Compressor,
 }
 
 impl<W: Write> FrameWriter<W> {
+    fn compressor() -> crate::compression::Compressor {
+        // SYQ_HELPER_RELEASE=v0.6.0 explicitly selects released helpers. Their
+        // codec byte only accepts raw and Zstd; preserve that concrete case.
+        // Other peers must match our exact build before reading any frame.
+        crate::compression::Compressor::new(crate::identity::build() == "v0.6.0")
+    }
+
     pub fn new(w: W, compress: bool) -> Self {
         FrameWriter {
             w: BufWriter::with_capacity(1 << 20, w),
             compress,
             preamble_written: false,
+            compression: Self::compressor(),
         }
     }
 
@@ -1485,6 +1493,7 @@ impl<W: Write> FrameWriter<W> {
             w: BufWriter::with_capacity(1 << 20, w),
             compress,
             preamble_written: true,
+            compression: Self::compressor(),
         }
     }
 
@@ -1562,19 +1571,32 @@ impl<W: Write> FrameWriter<W> {
         let payload = postcard::to_extend(msg, Vec::with_capacity(msg.size_hint()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Self::check_message_size(payload.len(), msg.frame_limit())?;
-        let mut flag = 0u8;
-        let mut body = payload;
-        if self.compress && body.len() > COMPRESS_MIN {
-            if let Ok(c) = zstd::bulk::compress(&body, COMPRESS_LEVEL) {
-                if c.len() < body.len() {
-                    body = c;
-                    flag = 1;
-                }
+        let encoded = if self.compress && payload.len() > COMPRESS_MIN {
+            self.compression.encode(&payload).ok().flatten()
+        } else {
+            None
+        };
+        let (flag, len) = encoded.unwrap_or((0, payload.len()));
+        // Time only the write and flush, excluding serialization/compression.
+        // Tiny messages do not provide useful bandwidth evidence.
+        let start = (self.compress && payload.len() >= 64 << 10).then(std::time::Instant::now);
+        self.write_frame_header(len, flag)?;
+        if flag == 0 {
+            self.w.write_all(&payload)?;
+        } else {
+            self.w.write_all(self.compression.output(len))?;
+        }
+        self.w.flush()?;
+        if let Some(start) = start {
+            if self.compression.observe_write(len + 5, start.elapsed()) && crate::output::debug() {
+                crate::output::emit_diagnostic(format_args!(
+                    "transport compression changed to {}",
+                    self.compression.name()
+                ));
             }
         }
-        self.write_frame_header(body.len(), flag)?;
-        self.w.write_all(&body)?;
-        self.w.flush()
+        self.compression.finish_frame();
+        Ok(())
     }
 }
 
@@ -1706,7 +1728,7 @@ impl<R: Read> FrameReader<R> {
         }
         let mut flag = [0u8; 1];
         self.r.read_exact(&mut flag)?;
-        if flag[0] > 1 {
+        if flag[0] > crate::compression::LZ4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unknown frame flags",
@@ -1716,7 +1738,7 @@ impl<R: Read> FrameReader<R> {
         // limit. Their queue count is bounded by the connection's read-ahead.
         let mut body = vec![0u8; len - 1];
         self.r.read_exact(&mut body)?;
-        let payload = if flag[0] == 1 {
+        let payload = if flag[0] == crate::compression::ZSTD {
             // Bound zstd's advertised window as well as its output. Level-1
             // frames from the released writer use windows below this ceiling.
             let mut decoder = zstd::stream::read::Decoder::new(&body[..])?;
@@ -1739,6 +1761,8 @@ impl<R: Read> FrameReader<R> {
                 output.extend_from_slice(&chunk[..n]);
             }
             output
+        } else if flag[0] == crate::compression::LZ4 {
+            crate::compression::decode_lz4(&body, self.limit)?
         } else {
             body
         };

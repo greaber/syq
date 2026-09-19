@@ -7,6 +7,7 @@ mod bwlimit;
 mod cli;
 mod completion;
 mod completion_details;
+mod compression;
 mod conn;
 mod copy_policy;
 mod delegation;

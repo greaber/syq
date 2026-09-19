@@ -157,8 +157,8 @@ See [Resource limits](resource-limits.md) for all units and supported routes.
 
 ## Compression and in-place writes
 
-`--no-compress` can help when compression costs more CPU time than it saves in
-network traffic. `--inplace` saves temporary disk space, but exposes incomplete
+`--no-compress` can help when [automatic transport compression](reference.md#transport-compression)
+costs more CPU time than it saves in network traffic. `--inplace` saves temporary disk space, but exposes incomplete
 updates to readers. Read [in-place writes](reference.md#in-place-writes) before
 using it.
 
