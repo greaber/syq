@@ -32,6 +32,13 @@ These protections bound where the operation can go. They do not prevent an
 authorized writer from changing the contents of that tree. In a removal race,
 a single replacement entry can still be unlinked.
 
+On macOS, selecting a FIFO keeps its parent directory open and checks the
+FIFO's identity without opening a stream reader. This avoids disturbing a
+producer during mapping, removal previews, or FIFO-node copies. Deleting a
+FIFO and creating another with the same inode number can defeat that identity
+check. A concurrent replacement of a regular file with a FIFO between its
+last check and open can also briefly connect a producer before syq rejects it.
+
 ## Relationship to rsync 3.5.0
 
 Syq's path protection is inspired by

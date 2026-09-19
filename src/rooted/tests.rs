@@ -833,28 +833,38 @@ fn selecting_fifo_metadata_does_not_connect_a_writer() {
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     let base = File::open(tree.path()).unwrap();
     let resolver = OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
-    let selected = resolver
-        .resolve(
-            b"pipe",
-            OperatorFinalComponent::StreamSource {
-                follow_symlink: false,
-            },
-            false,
-            &mut Vec::new(),
-        )
-        .unwrap();
-    assert!(matches!(&selected, PinnedPath::Leaf(leaf) if leaf.metadata().is_fifo()));
-    // A nonblocking writer must still see no reader while metadata is held.
-    let writer = unsafe { libc::open(fifo.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
-    let error = io::Error::last_os_error();
-    if writer >= 0 {
-        unsafe {
-            libc::close(writer);
+    for final_component in [
+        OperatorFinalComponent::Entry {
+            follow_symlink: false,
+        },
+        OperatorFinalComponent::StreamSource {
+            follow_symlink: false,
+        },
+        OperatorFinalComponent::ReadableEntry {
+            follow_symlink: false,
+        },
+    ] {
+        let selected = resolver
+            .resolve(b"pipe", final_component, false, &mut Vec::new())
+            .unwrap();
+        assert!(matches!(&selected, PinnedPath::Leaf(leaf) if leaf.metadata().is_fifo()));
+        // Holding a metadata selection must not let a producer connect.
+        let writer = unsafe {
+            libc::open(
+                fifo.as_ptr(),
+                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        let error = io::Error::last_os_error();
+        if writer >= 0 {
+            unsafe {
+                libc::close(writer);
+            }
         }
+        assert_eq!(writer, -1, "{final_component:?} connected a FIFO reader");
+        assert_eq!(error.raw_os_error(), Some(libc::ENXIO));
+        drop(selected);
     }
-    assert_eq!(writer, -1, "metadata selection connected a FIFO reader");
-    assert_eq!(error.raw_os_error(), Some(libc::ENXIO));
-    drop(selected);
 }
 
 #[test]
