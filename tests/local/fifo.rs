@@ -97,6 +97,7 @@ fn rejected_control_fifos_do_not_connect_a_producer() {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn replaced_control_fifo_does_not_connect_a_producer() {
     let t = Tmp::new();

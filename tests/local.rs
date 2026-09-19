@@ -154,7 +154,6 @@ fn native_syq(args: &[&str]) -> Output {
         .expect("run native syq command")
 }
 
-#[cfg(debug_assertions)]
 fn wait_for_confinement_marker(child: &mut std::process::Child, marker: &Path, stage: &str) {
     let started = std::time::Instant::now();
     let deadline = started + std::time::Duration::from_secs(5);
@@ -965,7 +964,6 @@ mod confinement;
 mod copy;
 #[path = "local/data_safety.rs"]
 mod data_safety;
-#[cfg(debug_assertions)]
 #[path = "local/fifo.rs"]
 mod fifo;
 #[path = "local/hashing.rs"]
