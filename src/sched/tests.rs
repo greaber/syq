@@ -643,6 +643,37 @@ fn eager_connections_wait_for_a_planned_file_and_skip_empty_scans() {
 }
 
 #[test]
+fn queued_files_wait_for_planning_and_wake_on_completion_or_abort() {
+    for abort in [false, true] {
+        let sched = Arc::new(Sched::new(64, 128));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let sched = sched.clone();
+            std::thread::spawn(move || tx.send(sched.next()).unwrap())
+        };
+        sched.anticipate_file_work();
+        let idx = sched.push_file(test_job(b"source", 4096));
+        sched.anticipate_file_work();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        if abort {
+            sched.abort();
+        } else {
+            sched.scan_done();
+        }
+        let item = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        if abort {
+            assert!(matches!(item, Item::Exit));
+        } else {
+            assert!(matches!(item, Item::File(actual) if actual == idx));
+        }
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn queued_file_bytes_follow_claims_retries_and_stolen_groups() {
     let sched = Sched::new(64, 128);
     let big = sched.push_file(test_job(b"big", 1024));
