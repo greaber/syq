@@ -1737,7 +1737,9 @@ fn native_mapping_metadata_rejects_unapplied_ownership() {
     write(&t.path("src/file"), b"content");
     fs::create_dir_all(t.path("dst")).unwrap();
     symlink("file", t.path("src/link")).unwrap();
-    symlink("file", t.path("dst/link")).unwrap();
+    symlink("file", t.path("dst/renamed-link")).unwrap();
+    fs::create_dir(t.path("src/dir")).unwrap();
+    fs::create_dir(t.path("dst/renamed-dir")).unwrap();
     let args = [
         "--mapping",
         "-",
@@ -1746,19 +1748,23 @@ fn native_mapping_metadata_rejects_unapplied_ownership() {
         "--into",
         "dst",
         "--no-progress",
+        "--results",
+        "results",
     ];
     if unsafe { libc::geteuid() } == 0 {
         eprintln!("ownership denial requires a non-root test process");
         return;
     }
-    // Test staged publication, unchanged file repair, and an existing symlink.
-    write(&t.path("dst/file"), b"content");
+    // Metadata-only failures must survive the documented retry filter, including
+    // renamed mappings and deferred directory metadata. Keep staged denial coverage.
+    write(&t.path("dst/renamed-file"), b"content");
     set_mtime(&t.path("src/file"), 100);
-    set_mtime(&t.path("dst/file"), 100);
+    set_mtime(&t.path("dst/renamed-file"), 100);
     for (src, dst, kind) in [
+        ("file", "renamed-file", "file"),
         ("file", "new", "file"),
-        ("file", "file", "file"),
-        ("link", "link", "symlink"),
+        ("link", "renamed-link", "symlink"),
+        ("dir", "renamed-dir", "dir"),
     ] {
         for field in ["uid", "gid"] {
             let mut entry: serde_json::Value =
@@ -1770,7 +1776,30 @@ fn native_mapping_metadata_rejects_unapplied_ownership() {
                 "unapplied {field} on {dst} reported success: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            assert_eq!(read(&t.path("dst/file")), b"content");
+            assert_eq!(read(&t.path("dst/renamed-file")), b"content");
+            let results = fs::read(t.path("results")).unwrap();
+            fs::remove_file(t.path("results")).unwrap();
+            if dst == "new" {
+                continue;
+            }
+            assert_eq!(
+                out.status.code(),
+                Some(23),
+                "{field} on {dst}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let retry = jq(DOC_JQ_RETRY_GATE, &["-cs"], &results);
+            assert_output_ok(&retry);
+            let entries: Vec<serde_json::Value> = String::from_utf8(retry.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                entries,
+                [entry],
+                "missing retry intent for {field} on {dst}"
+            );
         }
     }
 }

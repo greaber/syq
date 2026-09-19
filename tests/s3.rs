@@ -4663,3 +4663,60 @@ fn expected_mapping(root: &Path, source: &str, destination: &str, expected: &str
     std::fs::write(&path, record.to_string()).unwrap();
     path.to_str().unwrap().to_owned()
 }
+
+#[test]
+fn s3_mapping_metadata_dry_run_reports_repairs_on_unchanged_download() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let server = Server::start("single-ok");
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("renamed");
+    std::fs::write(&path, vec![b'x'; 65536]).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::File::open(&path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1700000000))
+        .unwrap();
+    let entry = serde_json::json!({"src":{"encoding":"utf-8","value":"file"},
+        "dst":{"encoding":"utf-8","value":"renamed"}, "metadata":{"mode":0o640}});
+    std::fs::write(temp.path().join("mapping"), entry.to_string()).unwrap();
+    for (dry_run, expect_trace) in [(true, true), (false, false), (true, false)] {
+        let mut args = vec![
+            "--mapping",
+            "mapping",
+            "--from",
+            "s3://bucket",
+            "--into",
+            ".",
+            "--hash",
+            "--results",
+            "results.jsonl",
+            "-v",
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let before = server.requests.load(Ordering::Relaxed);
+        let out = server.cp(temp.path(), &args);
+        assert!(out.status.success(), "{}", output_text(&out));
+        let records = parsed_results(temp.path());
+        let traces: Vec<_> = records.iter().filter(|r| r["type"] == "trace").collect();
+        assert_eq!(traces.len(), usize::from(expect_trace), "{records:?}");
+        if expect_trace {
+            assert_eq!(traces[0]["reason"], "metadata_differs");
+            assert_eq!(traces[0]["src"], entry["src"]);
+            assert_eq!(traces[0]["dst"], entry["dst"]);
+            assert_eq!(traces[0]["action"], "transfer_file");
+            assert!(output_text(&out).contains("update metadata"));
+        }
+        assert_eq!(records.last().unwrap()["files_unchanged"], 1);
+        assert_eq!(records.last().unwrap()["bytes_transferred"], 0);
+        assert_eq!(server.requests.load(Ordering::Relaxed) - before, 2);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            meta.mode() & 0o7777,
+            if expect_trace { 0o600 } else { 0o640 }
+        );
+        assert_eq!((meta.mtime(), meta.mtime_nsec()), (1700000000, 0));
+        std::fs::remove_file(temp.path().join("results.jsonl")).unwrap();
+    }
+}

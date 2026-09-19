@@ -1073,12 +1073,16 @@ impl Planner<'_> {
         self.blocked_mapping_parents = std::collections::HashSet::new();
         self.blocked_directory_paths = std::collections::HashSet::new();
         self.unusable_files = std::collections::HashSet::new();
-        // Dry-run directory traces are intentionally deferred until after
-        // planning, when a later explicit directory can have upgraded an
-        // implicit ancestor. They still need these two source-mapping sets.
-        if !self.opts.dry_run {
-            self.src_overrides = std::collections::HashMap::new();
-            self.implicit_dirs = std::collections::HashSet::new();
+        // Dry-run traces need every directory identity. Live copies only need
+        // identities for deferred metadata failures; retire the leaf mappings.
+        if self.mapping_mode && !self.opts.dry_run {
+            let deferred: std::collections::HashSet<_> =
+                self.deferred.iter().map(|(path, ..)| path).collect();
+            self.src_overrides
+                .retain(|dst, _| deferred.contains(&join(&self.dst_root, dst)));
+            self.implicit_dirs.retain(|path| deferred.contains(path));
+            self.src_overrides.shrink_to_fit();
+            self.implicit_dirs.shrink_to_fit();
         }
         if !self.opts.delete {
             self.dst_seen = std::collections::HashMap::new();
@@ -1542,15 +1546,19 @@ impl Planner<'_> {
                         }
                         return;
                     }
-                    leaf_ops.meta_fixes.push(Op::SetFileMetaIfSame {
-                        path: dst_path.clone(),
-                        condition: match target_condition {
-                            TargetCondition::Any => target_identity(d),
-                            condition => condition,
+                    leaf_ops.meta_fixes.push((
+                        Op::SetFileMetaIfSame {
+                            path: dst_path.clone(),
+                            condition: match target_condition {
+                                TargetCondition::Any => target_identity(d),
+                                condition => condition,
+                            },
+                            meta: opts.metadata_for(&dst_rel, &e),
+                            flags: ff,
                         },
-                        meta: opts.metadata_for(&dst_rel, &e),
-                        flags: ff,
-                    });
+                        dst_rel,
+                        DeclaredKind::File,
+                    ));
                     return;
                 }
             }
@@ -1667,12 +1675,20 @@ impl Planner<'_> {
                 "metadata_differs",
             );
         } else {
-            ops.meta_fixes.push(Op::SetMeta {
-                path: path.clone(),
-                meta,
-                flags,
-                condition: target_identity(destination),
-            });
+            ops.meta_fixes.push((
+                Op::SetMeta {
+                    path: path.clone(),
+                    meta,
+                    flags,
+                    condition: target_identity(destination),
+                },
+                rel.to_vec(),
+                if source.kind == Kind::Symlink {
+                    DeclaredKind::Symlink
+                } else {
+                    DeclaredKind::Special
+                },
+            ));
         }
     }
 
@@ -2205,19 +2221,44 @@ impl Planner<'_> {
     }
 
     /// Apply metadata corrections for files whose content is already current.
-    fn flush_meta_fixes(&mut self, meta_fixes: Vec<Op>) -> Result<()> {
+    fn flush_meta_fixes(&mut self, meta_fixes: Vec<(Op, PathBytes, DeclaredKind)>) -> Result<()> {
         if meta_fixes.is_empty() {
             return Ok(());
         }
-        let errors = self.apply(meta_fixes)?;
+        let (ops, entries): (Vec<_>, Vec<_>) = meta_fixes
+            .into_iter()
+            .map(|(op, dst, kind)| (op, (dst, kind)))
+            .unzip();
+        let errors = self.apply(ops)?;
         let capacity_error = first_capacity_error(&errors);
-        for err in errors.into_iter().flatten() {
-            self.progress.error(&format!("syq: {err}"));
+        for ((dst, kind), error) in entries.iter().zip(errors) {
+            if let Some(error) = error {
+                self.report_metadata_failure(Some(dst), *kind, &error);
+            }
         }
         if let Some(error) = capacity_error {
             return Err(endpoint_error(error)).context("apply destination changes");
         }
         Ok(())
+    }
+
+    fn report_metadata_failure(&self, dst: Option<&[u8]>, kind: DeclaredKind, error: &WireError) {
+        let os_kind = wire_os_kind(error);
+        self.progress
+            .error_classified(&format!("syq: {error}"), Some("io"), os_kind);
+        if let Some(dst) = dst {
+            self.emit_entry_failed(
+                FailedEntry {
+                    dst,
+                    src: self.mapping_source_rel(dst).as_deref(),
+                    kind: Some(kind),
+                },
+                "unknown",
+                "io",
+                os_kind,
+                error.as_str(),
+            );
+        }
     }
 
     /// Apply the queued symlink and special-file operations and report each
@@ -3218,8 +3259,13 @@ impl Planner<'_> {
                 .collect();
             let errors = self.apply(ops)?;
             let capacity_error = first_capacity_error(&errors);
-            for err in errors.into_iter().flatten() {
-                self.progress.error(&format!("syq: {err}"));
+            for ((path, ..), error) in chunk.iter().zip(errors) {
+                if let Some(error) = error {
+                    let dst = (!self.implicit_dirs.contains(path))
+                        .then(|| strip_dst_root(path, &self.dst_root))
+                        .flatten();
+                    self.report_metadata_failure(dst, DeclaredKind::Dir, &error);
+                }
             }
             if let Some(error) = capacity_error {
                 return Err(endpoint_error(error)).context("apply destination changes");
@@ -3258,7 +3304,8 @@ pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
 struct LeafOps {
     ops: Vec<Op>,
     names: Vec<QueuedLeafOp>,
-    meta_fixes: Vec<Op>,
+    // Metadata-only operations retain the same retry identity as content copies.
+    meta_fixes: Vec<(Op, PathBytes, DeclaredKind)>,
 }
 
 /// A queued symlink/special creation: the display string for -v plus the

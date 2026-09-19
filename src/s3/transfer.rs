@@ -1580,7 +1580,32 @@ impl Engine {
                 .is_ok();
         }
         if unchanged {
-            if !self.args.dry_run {
+            if self.args.dry_run {
+                let current = existing.expect("unchanged file exists");
+                let differs = ((self.args.perms || explicit.mode.is_some())
+                    && metadata.mode & 0o7777 != current.mode & 0o7777)
+                    || ((self.args.owner || explicit.uid.is_some()) && metadata.uid != current.uid)
+                    || ((self.args.group || explicit.gid.is_some()) && metadata.gid != current.gid)
+                    || (metadata.mtime, metadata.nsec) != (current.mtime, current.mtime_nsec);
+                if differs {
+                    if self.args.verbose > 0 {
+                        self.progress.println(&format!(
+                            "update metadata {} (requested file metadata differs)",
+                            job.path
+                        ));
+                    }
+                    if let Some(writer) = self.progress.results_writer() {
+                        writer.emit_trace(&crate::results::TraceRecord {
+                            action: "transfer_file",
+                            src: Some(job.key.as_bytes()),
+                            dst: job.path.as_bytes(),
+                            kind: "file",
+                            bytes: None,
+                            reason: "metadata_differs",
+                        });
+                    }
+                }
+            } else {
                 local::apply_metadata(
                     root,
                     &path,
