@@ -295,9 +295,6 @@ pub struct Args {
     pub transfer_integrity: bool,
     #[arg(skip)]
     pub transfer_hash_type: Option<crate::hashing::HashAlgorithm>,
-    /// Syq extension: only compare source and destination contents; transfer nothing
-    #[arg(long = "syq-verify-only")]
-    pub verify_only: bool,
     /// Update files in place instead of writing a partial and renaming. Use this to modify a
     /// large existing file without copying it first (saves time and disk space when only part
     /// of it changes). Cannot be combined with -u or --ignore-existing: an interrupted
@@ -375,11 +372,11 @@ pub struct Args {
     /// have). Deletion happens after the transfer and is skipped entirely if the source scan
     /// reported any error. Ignored paths (--syq-ignore) are protected on both sides. rsync's
     /// --delete-after and --delete-delay mean the same thing and are accepted. Cannot be combined
-    /// with --syq-verify-only or --files-from
+    /// with --files-from
     #[arg(
         long,
         aliases = ["delete-after", "delete-delay"],
-        conflicts_with_all = ["verify_only", "files_from"]
+        conflicts_with = "files_from"
     )]
     pub delete: bool,
     /// With --delete, also remove destination paths that the --syq-ignore patterns exclude
@@ -1021,9 +1018,6 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
-    /// Compare selected contents without writing; fail on differences or inspection errors
-    #[arg(long, conflicts_with_all = ["dry_run", "prune", "inplace", "update", "ignore_existing", "existing"])]
-    verify_only: bool,
     /// Copy entries found missing; keep metadata of entries found present; adding children requires write access
     #[arg(long = "only-new", conflicts_with_all = ["existing", "update", "inplace"])]
     ignore_existing: bool,
@@ -2139,12 +2133,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         // follow-up), remote dry-run streams are refused up front.
         let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
         let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
-        if args.verify_only && src_remote && dst_remote && args.coordinate_at != CoordinateAt::Local
-        {
-            bail!(
-                "--verify-only with --results needs --coordinate-at local for a remote-to-remote copy: a receiver receipt cannot attest source comparison claims"
-            );
-        }
+
         if args.dry_run && src_remote && dst_remote && args.coordinate_at != CoordinateAt::Local {
             bail!(
                 "--dry-run with --results needs a local coordinator for a remote-to-remote copy; pass --coordinate-at local to preview with the full trace stream"
@@ -2155,9 +2144,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         if args.devices {
             bail!("--preserve=specials is not supported for S3 copies");
         }
-        if options.route.is_server_copy()
-            && (args.checksum || args.verify_only || args.transfer_integrity)
-        {
+        if options.route.is_server_copy() && (args.checksum || args.transfer_integrity) {
             bail!("S3-to-S3 copies stay server-side; content hash and verification options require reading object contents and are not supported");
         }
         let (destination, sources) = args.locations.split_last_mut().unwrap();
@@ -2555,7 +2542,6 @@ fn apply_native_copy_operational(
     let NativeCopyOperationalArgs {
         common,
         hash,
-        verify_only,
         ignore_existing,
         existing,
         update,
@@ -2575,7 +2561,6 @@ fn apply_native_copy_operational(
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
-    args.verify_only = verify_only;
     args.ignore_existing = ignore_existing;
     args.existing = existing;
     args.update = update;
@@ -2947,7 +2932,7 @@ fn unsupported_message(tok: &str) -> Option<String> {
 }
 
 const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The Syq extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See \"Ignoring paths\" in docs/reference.md.";
-const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. --syq-verify-only can compare contents without mutation, but it does not produce rsync's itemized output.";
+const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. Use -n -c to preview content changes; this does not produce rsync's itemized output.";
 const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 const SOURCE_LINK_TRAVERSAL_MSG: &str = "syq does not implement rsync's source descendant-link traversal (-L/--copy-links, --copy-unsafe-links, or -k/--copy-dirlinks); -l copies symlinks as symlinks, and --insecure-links does not enable these modes.";
 const DESTINATION_LINK_TRAVERSAL_MSG: &str = "syq does not implement -K/--keep-dirlinks because it follows existing destination directory symlinks; syq refuses to copy a directory onto an in-tree symlink.";

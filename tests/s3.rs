@@ -1734,13 +1734,22 @@ fn s3_one_request_slot_supports_multipart_and_content_verification() {
         "--resource-limits=s3-max-concurrent-requests=1,s3-max-concurrent-objects=1",
     ] {
         let temp = crate::test_support::tempdir().unwrap();
-        for extra in [None, Some("--verify-only")] {
+        for extra in [false, true] {
             let mut args = vec!["--from", "s3://bucket", "data", "--as", "result", control];
-            if let Some(flag) = extra {
-                args.push(flag);
+            if extra {
+                args.extend(["--dry-run", "--hash", "--results", "results.jsonl"]);
             }
             let output = server.cp(temp.path(), &args);
             assert!(output.status.success(), "{}", output_text(&output));
+            if extra {
+                let records = parsed_results(temp.path());
+                let terminal = records.last().unwrap();
+                assert_eq!(terminal["status"], "success");
+                assert_eq!(terminal["files_transferred"], 0);
+                assert_eq!(terminal["files_unchanged"], 1);
+                assert_eq!(terminal["bytes_unchanged"], SIZE);
+                assert!(!records.iter().any(|r| r["type"] == "trace"), "{records:?}");
+            }
         }
         assert_eq!(
             std::fs::metadata(temp.path().join("result")).unwrap().len(),
@@ -2387,41 +2396,6 @@ fn s3_review_upload_hash_compares_objects_without_matching_stored_digest() {
             "{fault}: unchanged object was uploaded again"
         );
     }
-}
-
-#[test]
-fn s3_review_verify_only_reports_expected_hash_mismatch() {
-    let server = Server::start("single-ok");
-    let temp = crate::test_support::tempdir().unwrap();
-    std::fs::write(temp.path().join("result"), vec![b'x'; 65536]).unwrap();
-    let output = server.cp(
-        temp.path(),
-        &[
-            "--verify-only",
-            "--mapping",
-            &expected_mapping(
-                temp.path(),
-                "object",
-                "result",
-                "md5:00000000000000000000000000000000",
-            ),
-            "--from",
-            "s3://bucket",
-            "--into",
-            ".",
-        ],
-    );
-    assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
-    let message = output_text(&output);
-    assert!(message.contains("expected md5 hash"), "{message}");
-    assert!(
-        !message.contains("file missing, type differs, or size differs"),
-        "{message}"
-    );
-    assert_eq!(
-        std::fs::read(temp.path().join("result")).unwrap(),
-        vec![b'x'; 65536]
-    );
 }
 
 #[test]

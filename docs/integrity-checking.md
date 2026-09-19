@@ -62,7 +62,7 @@ hash. See [Filesystem differences](object-storage.md#filesystem-differences).
 
 Server-side S3 copies preserve stored hashes without reading or verifying
 object bodies. They do not support content-hash comparison, extra transfer
-hashing, expected hashes, or `--verify-only`.
+hashing, or expected hashes.
 
 Filesystem descriptor copies accept `transfer=ALGORITHM` for optional payload
 checks. S3 descriptor copies reject extra transfer hashing: they keep provider
@@ -84,31 +84,15 @@ hash matches. Selection filters still apply. Dry runs do not check expectations.
 
 ## Compare without copying
 
-To compare without writing, use `--verify-only`:
+Use `--dry-run --hash` to compare without copying:
 
 ```sh
-syq cp --verify-only --srcs-in project --into backup
+syq cp --dry-run --hash --srcs-in project --into backup
 ```
 
-This compares file contents, symlink targets, and entry types without writing.
-It reads both files even when their sizes and modification times match. It
-does not compare metadata or look for extra destination files.
-
-The summary counts matching files and differences or errors. Diagnostics on
-stderr identify missing or different entries and inspection failures. Exit
-status is `0` when all selected entries match, `23` for differences or
-inspection failures, and `1` for setup failures. `-v` also lists matching
-regular files as `ok`. Use [Automation results](automation.md) for structured
-output.
-
-For two servers, add `--coordinate-at local` to compare through your machine
-using ordinary SSH access, with no restricted receiver enrollment. This also
-supports `--results`. See [Verification](remote-reference.md#verification).
-
-`--verify-only` cannot combine with `--dry-run`, `--prune`, `--inplace`, or
-an overwrite policy. Filters still select what is compared;
-special files require `--preserve=specials`. In rsync syntax, use
-`--syq-verify-only`.
+Differences appear as planned changes. For machine-readable output, add
+[`--results`](automation.md); for two servers, see
+[remote comparisons](remote-reference.md#verification).
 
 ## Consistency and durability
 

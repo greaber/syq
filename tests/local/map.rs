@@ -1559,24 +1559,3 @@ fn native_cp_mapping_symlinked_manifest_failure_still_settles_the_stream() {
     assert_eq!(terminal["type"], "result");
     assert_eq!(terminal["status"], "failed");
 }
-
-#[test]
-fn native_verify_only_mapping_keeps_missing_parents_absent() {
-    let t = Tmp::new();
-    write(&t.path("src/file"), b"source");
-    write(&t.path("mapping"), br#"{"src":{"encoding":"utf-8","value":"file"},"dst":{"encoding":"utf-8","value":"missing/parent/file"}}"#);
-    let out = native_syq(&[
-        "cp",
-        "--verify-only",
-        "--mapping",
-        &t.s("mapping"),
-        "-C",
-        &t.s("src"),
-        "--into",
-        &t.s("dst"),
-        "--results",
-        &t.s("results"),
-    ]);
-    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
-    assert!(!t.path("dst").exists());
-}

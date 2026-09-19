@@ -518,7 +518,7 @@ fn unsupported_rsync_flags_explain_themselves() {
         "should explain rsync -i: {err}"
     );
     assert!(
-        err.contains("--syq-verify-only"),
+        err.contains("-n -c"),
         "should name syq's nearest comparison operation: {err}"
     );
     assert!(!t.path("itemized-dst").exists());
@@ -753,12 +753,6 @@ fn native_copy_policy_conflicts_refuse_before_writing() {
     let t = Tmp::new();
     write(&t.path("source"), b"source");
     for pair in [
-        ["--verify-only", "--prune"],
-        ["--verify-only", "--dry-run"],
-        ["--verify-only", "--inplace"],
-        ["--verify-only", "--only-new"],
-        ["--verify-only", "--only-existing"],
-        ["--verify-only", "--skip-newer"],
         ["--only-new", "--only-existing"],
         ["--only-new", "--skip-newer"],
         ["--only-new", "--inplace"],
@@ -1584,4 +1578,23 @@ fn stream_previews_and_results_do_not_consume_payload() {
         assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
         assert!(stderr_of(&output).contains("descriptors must differ"));
     }
+}
+
+#[test]
+fn removed_verify_only_options_are_rejected_without_changes() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    write(&t.path("destination"), b"keep");
+    let native = native_syq(&[
+        "cp",
+        "--verify-only",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+    ]);
+    let compat = syq(&["--syq-verify-only", &t.s("source"), &t.s("destination")]);
+    for output in [native, compat] {
+        assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
+    }
+    assert_eq!(read(&t.path("destination")), b"keep");
 }

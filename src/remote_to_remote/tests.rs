@@ -261,14 +261,6 @@ fn relay_passes_output_through_and_spools_receipt_frames() {
 }
 
 #[test]
-fn read_only_operations_never_allow_automatic_enrollment() {
-    assert!(automatic_enrollment_allowed(false, false));
-    assert!(!automatic_enrollment_allowed(true, false));
-    assert!(!automatic_enrollment_allowed(false, true));
-    assert!(!automatic_enrollment_allowed(true, true));
-}
-
-#[test]
 fn relay_output_failure_preserves_verified_receipt_and_rejects_corruption() {
     use crate::receipt::*;
     struct FailingOutput {

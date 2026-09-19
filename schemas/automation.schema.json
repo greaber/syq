@@ -170,10 +170,6 @@
         "mode": {
           "const": "cp"
         },
-        "verify_only": {
-          "type": "boolean",
-          "description": "Compare-only copy; absent means false."
-        },
         "prune": {
           "type": "boolean"
         },

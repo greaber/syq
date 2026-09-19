@@ -62,10 +62,6 @@ for its named behavior, not a score for compatibility as a whole.
 
 *Test: `ignore_existing_keeps_a_file_where_a_source_directory_maps`.*
 
-### Verification scope
-
-*Test: `verify_only_checks_the_filtered_scope`.*
-
 ### Source listing failure
 
 *Tests:

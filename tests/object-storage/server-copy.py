@@ -50,8 +50,7 @@ def check():
         assert (root / 'restored/copy/large').read_bytes() == (source / 'large').read_bytes()
         assert (root / 'restored/copy/link').is_symlink()
         # Explicit hash policies cannot quietly turn into local reads.
-        for option in ['--hash', '--verify-only', '--integrity-checking=transfer=sha256',
-                       '--expected-hash=sha256:' + '0' * 64]:
+        for option in ['--hash', '--integrity-checking=transfer=sha256']:
             out = c.run(['--from', remote, src + '/large', '--to', remote,
                          '--as', c.PREFIX + '/refused', option], ok=False, capture=True)
             assert 'server-side' in out.stderr, out.stderr

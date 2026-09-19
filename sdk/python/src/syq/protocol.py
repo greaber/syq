@@ -318,13 +318,14 @@ class AutomationDecoder:
                     raise SyqProtocolError(
                         f"automation run {label} disagrees with the invocation"
                     )
+            if record.get("verify_only", False):
+                raise SyqProtocolError("verify-only result streams are no longer supported")
             event = RunEvent(
                 **common,
                 run_id=run_id,
                 started_at=_integer(record, "started_at"),
                 syq_version=_string(record, "syq_version"),
                 mode=mode,
-                verify_only=_boolean(record, "verify_only") if "verify_only" in record else False,
                 prune=prune,
                 mapping=mapping,
                 dry_run=dry_run,

@@ -16,6 +16,20 @@ def run(argv, *, data=None, expected=0):
     return result
 
 
+def matching_preview(argv, *, data, files):
+    with tempfile.TemporaryDirectory(prefix="syq-mapping-preview-") as temporary:
+        path = Path(temporary) / "results.ndjson"
+        run(argv + ["--dry-run", "--hash", "--results", str(path)], data=data)
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        terminal = records[-1]
+        assert terminal["type"] == "result" and terminal["status"] == "success", records
+        assert terminal["dry_run"] and terminal["errors"] == 0, terminal
+        assert terminal["files_unchanged"] == files, terminal
+        assert terminal["files_transferred"] == 0, terminal
+        assert terminal["symlinks_created"] == terminal["specials_created"] == 0, terminal
+        assert not any(r["type"] == "trace" and r.get("bytes") is not None for r in records), records
+
+
 def ssh(host, script):
     return run(["ssh", host, "python3 -c " + shlex.quote(script)])
 
@@ -126,7 +140,7 @@ def direct():
                 assert b"data over ssh" in result.stderr, result.stderr
             ssh("destination", f"from pathlib import Path; p=Path({destination!r}); assert (p/'nested'/'renamed').read_bytes()==b'mapped contents'; assert (p/'link').is_symlink(); assert (p/'nested').stat().st_mode & 0o777 == 0o755; assert (p/'directory').is_dir(); assert not (p/'directory'/'unselected').exists()")
         destination = root + "/tcp"
-        run(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--verify-only"], data=contents)
+        matching_preview(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--coordinate-at", "local"], data=contents, files=1)
         # Selection uses source mtimes; --only-existing remains independently enforced.
         ssh("destination", f"from pathlib import Path; import os; p=Path({destination!r})/'nested'/'renamed'; p.write_bytes(b'newer destination'); os.utime(p,(1700000000,1700000000))")
         updating = manifest([("file", "nested/renamed", "file"), ("file", "nested/missing", "file")])
@@ -205,7 +219,7 @@ def named():
     contents = manifest([("message.txt", "nested/renamed", "file")])
     prefix = ["syq", "cp", "--no-progress", "-C", source, "--mapping", "-", "--to", "@laptop", "--into", "mapped-return"]
     run(prefix, data=contents)
-    run(prefix + ["--verify-only"], data=contents)
+    matching_preview(prefix, data=contents, files=1)
     run(prefix + ["--skip-newer", "--only-existing"], data=contents)
     # Here the source-side caller receives coordinator operation records, so
     # a parent obstruction must produce a retryable per-entry failure too.
@@ -217,7 +231,7 @@ def named():
         failed = [r for r in records if r.get("disposition") == "failed"]
         assert [(r["src"]["value"], r["dst"]["value"]) for r in failed] == [("message.txt", "nested/renamed/child")], failed
         assert records[-1]["status"] == "partial", records[-1]
-    run(prefix + ["--verify-only"], data=contents + manifest([("message.txt", "nested/good", "file")]))
+    matching_preview(prefix, data=contents + manifest([("message.txt", "nested/good", "file")]), files=2)
     print("Named mapping and timestamp selection passed", flush=True)
 
 

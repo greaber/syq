@@ -234,7 +234,6 @@ fn pipeline_worker(
         devices: false,
         checksum: false,
         precise_mtime: true,
-        verify_only: false,
         inplace: false,
         same_host: false,
         allow_sequential_nfs_fallback: false,

@@ -187,6 +187,7 @@ pub(crate) struct CopyOptions {
     pub preserve_devices: bool,
     pub compare_existing_by_content: bool,
     pub dry_run: bool,
+    // Legacy signed grants use this bit to forbid writes; preserve its encoding.
     pub verify_only: bool,
     pub compressed_transport: bool,
     pub tcp_port_lo: u16,

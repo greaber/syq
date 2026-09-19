@@ -255,26 +255,15 @@ to compare their contents instead:
 syq cp --hash --srcs-in project --into backup
 ```
 
-This copies missing or changed files. To check whether the destination already
-matches, without changing it, use `--verify-only`:
+Use [per-file expected hashes in mappings](mappings.md#the-format) to require
+known contents, including when reusing destination bytes.
 
-```sh
-syq cp --verify-only --srcs-in project --into backup
-```
+Use [`--dry-run --hash`](#preview-changes) to compare without copying.
 
-This checks each selected source entry against its destination without copying
-or deleting anything. It reads and compares file contents even when sizes and
-timestamps match. It also compares entry types and symlink targets, but ignores
-permissions, timestamps, and extra destination files.
-
-The final summary reports the number of matching files and differences or
-errors. Missing or different paths are listed on stderr as `MISSING path` or
-`DIFFERS path`. The command exits with status `0` if everything selected matches,
-or `23` if any entry differs, is missing, or cannot be checked. Setup failures
-return `1`. For scripts, use the exit status and [Automation results](automation.md).
-
-See [Integrity checking](integrity-checking.md) for comparison options and
-checking against known hashes.
+The [Integrity checking reference](integrity-checking.md) covers timestamp
+precision, every comparison and payload-check algorithm, expected hashes,
+and transfer checks. For consistent source data, stop concurrent
+writers or copy a snapshot.
 
 ## In-place writes
 

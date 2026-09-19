@@ -101,6 +101,24 @@ assert_same_tree() {
     diff -u "$source_manifest" "$destination_manifest"
 }
 
+assert_preview_counts() {
+    python3 - "$1" "$2" "$3" <<'PYTHON'
+import json, sys
+from pathlib import Path
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+result = records[-1]
+assert result['type'] == 'result' and result['status'] == 'success', records
+assert result['dry_run'] and result['errors'] == 0, result
+assert result['files_transferred'] == int(sys.argv[2]), result
+assert result['files_unchanged'] == int(sys.argv[3]), result
+assert result['symlinks_created'] == result['specials_created'] == 0, result
+changes = [r for r in records if r['type'] == 'trace' and r['action'] == 'transfer_file' and 'bytes' in r]
+assert len(changes) == int(sys.argv[2]), records
+if changes:
+    assert [(r['dst']['value'], r['reason']) for r in changes] == [('policy-new', 'destination_missing')], changes
+PYTHON
+}
+
 make_tree() {
     host=$1
     root=$2
@@ -415,7 +433,8 @@ remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.ma
     } | LC_ALL=C sort
 ) > /tmp/syq-return-local.manifest
 diff -u /tmp/syq-return-source.manifest /tmp/syq-return-local.manifest
-ssh source 'syq cp --verify-only --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
+ssh source 'syq cp --dry-run --hash --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first --results-fd 3 3>&1 1>/dev/null' > /tmp/syq-return-preview.ndjson
+assert_preview_counts /tmp/syq-return-preview.ndjson 0 3
 ssh source 'syq cp --only-new /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as first/message.txt'
 
 ssh source 'python3 /usr/local/libexec/syq-test-restricted-mapping.py named'
@@ -861,10 +880,12 @@ ssh source 'test -d /tmp/syq-real-ssh/rm-policy/tree; test ! -e /tmp/syq-real-ss
 syq rm --on source --root /tmp/syq-real-ssh/rm-policy --src-dir tree
 ssh source 'test ! -e /tmp/syq-real-ssh/rm-policy/tree'
 
-printf 'case: native verification and overwrite policies through the restricted receiver\n'
-syq cp --verify-only --no-progress --performance-tuning workers=2 \
+printf 'case: comparison results and restricted receiver overwrite policies\n'
+syq cp --dry-run --hash --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
-    --to destination --into /tmp/syq-real-ssh/direct-destination
+    --to destination --into /tmp/syq-real-ssh/direct-destination --coordinate-at local \
+    --results /tmp/syq-matching-preview.ndjson
+assert_preview_counts /tmp/syq-matching-preview.ndjson 0 2
 ssh source 'printf source > /tmp/syq-real-ssh/direct-source/policy-file; printf new > /tmp/syq-real-ssh/direct-source/policy-new'
 ssh destination 'printf destination > /tmp/syq-real-ssh/direct-destination/policy-file'
 ssh source 'mkdir -p /tmp/syq-real-ssh/direct-source/policy-dir/new; chmod 750 /tmp/syq-real-ssh/direct-source/policy-dir /tmp/syq-real-ssh/direct-source/policy-dir/new'
@@ -880,11 +901,11 @@ syq cp --only-existing --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = source; test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
-policy_status=0
-syq cp --verify-only --no-progress --performance-tuning workers=2 \
+syq cp --dry-run --hash --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
-    --to destination --into /tmp/syq-real-ssh/direct-destination || policy_status=$?
-test "$policy_status" -eq 23
+    --to destination --into /tmp/syq-real-ssh/direct-destination --coordinate-at local \
+    --results /tmp/syq-missing-preview.ndjson
+assert_preview_counts /tmp/syq-missing-preview.ndjson 1 3
 ssh destination 'test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
 ssh source 'touch -m -d @1600000000 /tmp/syq-real-ssh/direct-source/policy-file'
 ssh destination 'printf newer > /tmp/syq-real-ssh/direct-destination/policy-file; touch -m -d @1700000000 /tmp/syq-real-ssh/direct-destination/policy-file'

@@ -186,7 +186,6 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "quiet"
                     | "ignore"
                     | "preserve"
-                    | "verify_only"
                     | "hash"
                     | "bwlimit"
                     | "no_progress"
@@ -276,7 +275,7 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
             ("Updates and deletion", 2)
         }
         "preserve" | "follow" | "follow_src" | "follow_dst" => ("Metadata and symlinks", 3),
-        "verify_only" | "integrity_checking_arg" | "hash" => ("Verification", 4),
+        "integrity_checking_arg" | "hash" => ("Verification", 4),
         "auth_from"
         | "rsh"
         | "syq_path"

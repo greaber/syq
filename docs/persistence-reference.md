@@ -82,7 +82,7 @@ Unix filename bytes.
 ## Copy limits
 
 Copies support directories, symlinks, modification times, filters, hashing,
-resume, mappings, `--preserve=permissions`, `--verify-only`, and the
+resume, mappings, `--preserve=permissions`, and the
 [overwrite policies](reference.md#choose-which-existing-files-to-update).
 Ownership preservation, special-file preservation, and `--inplace` are
 unsupported. Timestamp comparisons trust the source's reported modification

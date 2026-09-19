@@ -313,7 +313,6 @@ class RunEvent:
     mapping: bool | None
     dry_run: bool
     endpoints: tuple[Endpoint, ...]
-    verify_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)

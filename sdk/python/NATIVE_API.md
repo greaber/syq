@@ -75,7 +75,7 @@ In addition to the shared arguments above, it accepts:
 | `as_`, `as_new`, `as_existing` | Exact destination paths |
 | `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
 | `follow_dst` | Boolean: follow destination symlinks |
-| `prune`, `dry_run`, `hash`, `verify_only` | Boolean: mirror, preview, compare content, or verify without copying |
+| `prune`, `dry_run`, `hash` | Boolean: mirror, preview, or compare content |
 | `integrity_checking` | Comma-separated string, e.g. `"compare=blake3,transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
 | `only_new`, `only_existing`, `skip_newer` | Boolean: copy missing entries, copy existing entries, or skip newer destination files |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
@@ -117,7 +117,7 @@ for setup and cleanup, and
 for executable selection.
 
 Typed SSH-to-SSH copies require an enrolled receiver or
-`coordinate_at="local"`. With `dry_run=True` or `verify_only=True`, they require
+`coordinate_at="local"`. With `dry_run=True`, they require
 `coordinate_at="local"`. Use `run` for detached commands and human output options.
 
 `IgnoreFrom(path)` is a frozen dataclass holding a rule-file path (`str`,
@@ -439,9 +439,8 @@ unsuccessful copy. Read attributes directly, for example
 | `deletions_blocked` | `int` or `None` | Pruning deletions blocked by a safety limit |
 | `receipt` | `ReceiptSummary` or `None` | Verified receiver receipt details; `None` for ordinary copies |
 
-With `dry_run=True`, mutation totals describe planned changes. With
-`verify_only=True`, matching files count as unchanged; transfer and creation
-totals are zero. A failed call reports work completed before it stopped.
+With `dry_run=True`, mutation totals describe planned changes.
+A failed call reports work completed before it stopped.
 
 Ordinary copies have all three deletion fields only with `prune=True`;
 otherwise they are `None`. Receiver-attested results have only
@@ -552,7 +551,7 @@ The client does not retry automatically.
 ### RunEvent
 
 Invocation details. `started_at` is Unix seconds; `mode` is `"cp"` or `"rm"`.
-`prune` and `mapping` are `None` for removal; `verify_only` defaults to `False`.
+`prune` and `mapping` are `None` for removal.
 
 `protocol.type = "run"`. Fields in addition to the common envelope:
 
@@ -565,13 +564,12 @@ prune: bool | None
 mapping: bool | None
 dry_run: bool
 endpoints: tuple[Endpoint, ...]
-verify_only: bool
 ```
 
 ### ProgressEvent
 
 Sampled progress for displays; use the terminal result for final totals.
-Byte fields measure file content (comparison work with `verify_only=True`),
+Byte fields measure file content,
 `scanned` counts scanned entries, and `elapsed_ms` is milliseconds. Optional
 `activity` contains [diagnostic measurements](https://greaber.github.io/syq/automation.html#progress)
 when the producer collects them; otherwise it is `None`.
