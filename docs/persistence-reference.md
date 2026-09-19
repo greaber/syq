@@ -23,19 +23,7 @@ New profiles start with the usual defaults, including asking for approval; they
 do not inherit another profile's trust or confinement settings. Up to 32 profiles
 can be saved.
 
-Profiles default to all connected servers. `receive on --name NAME --server HOST`
-restricts a profile to the exact SSH destination used on the receiving machine.
-Use the endpoint shown by `persist status`: for example `work`, `alice@work`,
-or `alice@work:2222`. Matching includes an explicitly selected user and port;
-it does not expand SSH aliases or equate omitted ports with explicit ports.
-An alias uses the account and host configured for it in your local SSH settings.
-The server cannot select its own identity for this check. Changing your local
-SSH configuration can change which account an allowed alias reaches.
-
-Repeat `--server` to supply several destinations. Each supplied list replaces
-the saved list; `--all-servers` clears the restriction. Changes apply to existing
-persistent connections too. `receive wait HOST` waits only for profiles allowed
-on HOST.
+### Change or stop a profile
 
 `receive on --name NAME` creates a profile or updates that name's settings;
 omitted options keep their saved values.
@@ -63,16 +51,36 @@ removed. `pending`, `approve`, and `deny` work across all profiles; prompts name
 the receiving profile. Without `--name`, `receive wait` waits for every enabled
 profile on that server.
 
+### Choose allowed servers
+
+Profiles default to all connected servers. `receive on --name NAME --server HOST`
+restricts a profile to the exact SSH destination used on the receiving machine.
+Use the endpoint shown by `persist status`: for example `work`, `alice@work`,
+or `alice@work:2222`. Matching includes an explicitly selected user and port;
+it does not expand SSH aliases or equate omitted ports with explicit ports.
+An alias uses the account and host configured for it in your local SSH settings.
+The server cannot select its own identity for this check. Changing your local
+SSH configuration can change which account an allowed alias reaches.
+
+Repeat `--server` to supply several destinations. Each supplied list replaces
+the saved list; `--all-servers` clears the restriction. Changes apply to existing
+persistent connections too. `receive wait HOST` waits only for profiles allowed
+on HOST.
+
+### Move a name to another machine
+
 Names belong to a server account and stay assigned to their original receiving
 machine when it disconnects. Another laptop cannot claim the same name, even
 while the original is offline. Stopping receiving or removing a local profile
-does not release its server-side name. Other profiles remain usable.
+does not release its server-side name.
 
 To replace a laptop, stop its receiving connection, then run
 `syq persist destinations forget laptop` on the server. Run
 `syq persist connect server` on the replacement laptop to claim the released
 name. A rejected connection needs this explicit retry. Forgetting a live
 connection is refused.
+
+### Back up the receiving identity
 
 Syq generates one receiver key per local account, shared by receiving profiles
 and syq versions. It lives in `~/.syq-receiver-identity/identity_ed25519` and is
@@ -86,18 +94,22 @@ must time out before its name can reconnect.
 
 ## Directories
 
-`--cwd`, `--root`, and `--auto-approve-root` are independent settings. Each
-requires an existing directory with a UTF-8 path; neither root can be `/`.
+The three directory settings are independent:
+
+| Setting | Purpose | Clear it with |
+|---|---|---|
+| `--cwd DIR` | Starting directory for relative paths | `--auto-cwd` |
+| `--root DIR` | Hard boundary for downloads, even with approval | `--no-root` |
+| `--auto-approve-root DIR` | Downloads confined here skip approval | `--no-auto-approve-root` |
+
+Each requires an existing directory with a UTF-8 path; neither root can be `/`.
 An explicit cwd must be inside the hard root, if set. Otherwise the starting
 directory is the hard root, the automatic approval root, or your home directory,
-in that order. `--auto-cwd` clears an explicit cwd. `--no-root` and
-`--no-auto-approve-root` clear their respective roots. Status reports the
-effective cwd and whether it is explicit.
+in that order. Status reports the effective cwd and whether it is explicit.
 
-The hard root prohibits downloads outside it, even with approval. The automatic
-approval root skips the prompt only for downloads confined inside it; other
-downloads ask. Symlinks cannot grant automatic writes outside that root.
-Replacing the automatic root directory itself requires approval, and is
+Downloads outside the automatic approval root ask for approval, provided they
+stay within the hard root if one is set. Symlinks cannot grant automatic writes
+outside the approval root. Replacing the automatic root directory itself requires approval, and is
 prohibited when it is also the hard root. These roots do not restrict approved
 commands or the destinations of approved copies to other servers.
 

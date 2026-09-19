@@ -8,9 +8,7 @@ Run a command on a connected receiving machine, with approval on that machine:
 syq exec --on @laptop --cwd work/project -- cargo test
 ```
 
-Put `--` before the program and its arguments; use `sh -c` for shell syntax.
-The program runs with the receiving user's permissions. See
-[Run commands on your laptop](../receive.md#run-commands-on-your-laptop)
+See [Run commands on your laptop](../receive.md#run-commands-on-your-laptop)
 for setup and examples.
 
 <!-- CLI: exec -->
@@ -81,20 +79,19 @@ values change. Stdin is closed and there is no interactive terminal.
 ## Output, completion and cancellation
 
 Stdout and stderr stream back to your terminal, and syq returns the command's
-exit code. A lost connection is an error; the command is not retried automatically.
-Completed changes to files are not rolled back.
+exit code, or `128 + signal` if it was killed by a signal. Setup and connection
+failures return nonzero; losing the exit status is an error. Commands are not
+retried automatically, and completed file changes are not rolled back.
 
-## Execution details
-
-Requests allow up to 256 arguments (16 KiB total) and a 4096-byte working-directory
-path. Each server connection permits one pending approval and eight active
-commands.
-
-If the command is killed by a signal, syq returns `128 + signal`. Setup and
-connection failures return nonzero; losing the exit status is an error.
 Interrupting the request, stopping or changing receiving, or losing the
 connection forcibly stops the command's process group. Cleanup handlers do not
 run. Remaining children in that group are also stopped when the foreground
 program exits. Detached processes and applications launched through macOS
 `open` can survive this cleanup. Commands do not emit copy receipts or copy
 automation records.
+
+## Execution details
+
+Requests allow up to 256 arguments (16 KiB total) and a 4096-byte working-directory
+path. Each server connection permits one pending approval and eight active
+commands.

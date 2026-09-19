@@ -1,10 +1,9 @@
 # Remote copy reference
 
+For setup and examples, start with [Copy between servers](remote-to-remote.md).
+This page covers copies from hostA (the source) to hostB (the destination).
 See [`syq cp`](commands/cp.md) and [`syq receiver`](commands/receiver.md) for
 the option lists.
-
-For the usual setup and copy commands, start with
-[Copy between servers](remote-to-remote.md).
 
 ## SSH configurations
 
@@ -135,7 +134,6 @@ Once approval is requested, refusal or failure ends the attempt.
 to authorize the copy. `--auth-from ssh` uses the source machine's SSH access.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
-
 
 Authorization through a receiving machine does not support `--detach`, custom
 `--rsh` or `--syq-path`, `--no-bootstrap`, `--pscope`, alternative `--peer-auth`
