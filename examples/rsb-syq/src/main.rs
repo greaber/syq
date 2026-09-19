@@ -171,7 +171,7 @@ fn scan(source: &Path, shard_bytes: u64) -> Result<Shards> {
     Ok((shards, empty, rows))
 }
 fn archive(source: &Path, names: &[PathBuf], output: &mut File) -> Result<()> {
-    let mut tar = tar::Builder::new(output);
+    let mut tar = tar::Builder::new(std::io::BufWriter::with_capacity(1024 * 1024, output));
     tar.follow_symlinks(false);
     for name in names {
         let path = source.join(name);
@@ -186,11 +186,11 @@ fn archive(source: &Path, names: &[PathBuf], output: &mut File) -> Result<()> {
         tar.append_pax_extensions([("mtime", stamp.as_bytes())])?;
         tar.append_path_with_name(path, name)?;
     }
-    tar.finish()?;
+    tar.into_inner()?.flush()?;
     Ok(())
 }
 fn empty_archive(names: &[PathBuf], output: &mut File) -> Result<()> {
-    let mut tar = tar::Builder::new(output);
+    let mut tar = tar::Builder::new(std::io::BufWriter::with_capacity(1024 * 1024, output));
     for name in names {
         let mut header = tar::Header::new_ustar();
         header.set_entry_type(tar::EntryType::Directory);
@@ -202,7 +202,7 @@ fn empty_archive(names: &[PathBuf], output: &mut File) -> Result<()> {
         header.set_cksum();
         tar.append_data(&mut header, name, std::io::empty())?;
     }
-    tar.finish()?;
+    tar.into_inner()?.flush()?;
     Ok(())
 }
 fn write_manifest(rows: &[Row], output: &mut File) -> Result<()> {

@@ -34,10 +34,20 @@ impl Payload {
         upload: bool,
         cancelled: Arc<AtomicBool>,
     ) -> Result<(Descriptor, Descriptor)> {
-        let (native, callback) = UnixStream::pair()?;
+        // Each payload has one direction. Pipes also reuse the descriptor
+        // engine's bounded capacity hint, reducing producer/consumer wakeups.
+        let (reader, writer) = std::io::pipe()?;
+        let (reader, writer) = (
+            File::from(OwnedFd::from(reader)),
+            File::from(OwnedFd::from(writer)),
+        );
+        let (native, callback) = if upload {
+            (reader, writer)
+        } else {
+            (writer, reader)
+        };
         let (commit, acknowledge) = UnixStream::pair()?;
-        let descriptor =
-            Descriptor::owned(File::from(OwnedFd::from(native)), upload, cancelled.clone())?;
+        let descriptor = Descriptor::owned(native, upload, cancelled.clone())?;
         let commit = Descriptor::owned(File::from(OwnedFd::from(commit)), true, cancelled)?;
         self.channel.send(
             Message::Start {

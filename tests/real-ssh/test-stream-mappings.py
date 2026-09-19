@@ -109,14 +109,15 @@ def run(directory, upload, options, payloads, *, abort=False, skipped=False):
 
 
 def main():
+    host = os.environ.get('SYQ_TEST_STREAM_HOST', 'destination')
     payloads = [bytes([i]) * (1024 * 1024 + i) for i in range(4)]
     with tempfile.TemporaryDirectory(prefix='syq-stream-mapping-') as temp:
         directory = Path(temp)
         for name, transport in [('tcp', []), ('ssh', ['--no-tcp'])]:
             prefix = '/tmp/syq-stream-mapping-' + name
             common = ['--no-progress', '--performance-tuning=workers=2', '-vv', *transport]
-            upload = ['--to', 'destination', '--into', prefix, *common]
-            download = ['--from', 'destination', '--cwd', prefix, '--into', '.', *common]
+            upload = ['--to', host, '--into', prefix, *common]
+            download = ['--from', host, '--cwd', prefix, '--into', '.', *common]
             for options, sending in [(upload, True), (download, False)]:
                 diagnostic = run(directory, sending, options, payloads)
                 expected = b'EncryptedTcp' if name == 'tcp' else b'Ssh'
