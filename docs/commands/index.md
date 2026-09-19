@@ -6,7 +6,7 @@ Look up commands and options below. For copy examples, start with
 The advanced option groups have separate references:
 
 - [Performance tuning](../tuning.md): workers, request sizes, and copy methods.
-- [Resource limits](../resource-limits.md): bandwidth.
+- [Resource limits](../resource-limits.md): bandwidth and concurrency ceilings.
 - [Integrity checking](../integrity-checking.md): comparisons and checksums.
 
 Angle brackets mark values you supply; square brackets mark optional arguments,
