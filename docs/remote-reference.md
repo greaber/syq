@@ -17,11 +17,6 @@ instead of relaxing host verification.
 Your local SSH configuration selects hostB's login, address, port, and trusted
 host keys. HostA's SSH configuration does not override those choices.
 
-The constrained authentication broker admits at most 129 simultaneous clients
-by default, independently of automatic copy-worker tuning. An explicit worker
-setting or ceiling adjusts that bound to the requested count plus one control
-connection. Command-restricted copies never exceed 129 broker clients.
-
 ## Enrollment
 
 Enrollment needs normal command authority on the destination during setup.
@@ -93,7 +88,7 @@ Receipts allow up to four million records and 512 MiB of plaintext. Reaching
 a cap stops further changes and reports an incomplete outcome.
 
 A receipt does not prove that the source supplied every intended file or the
-right contents. See the [threat model](security.md#a-compromised-source-server).
+right contents. See [A compromised source server](security.md#a-compromised-source-server).
 
 ## Other authentication modes
 
@@ -103,6 +98,10 @@ right contents. See the [threat model](security.md#a-compromised-source-server).
 | `--peer-auth broker` | Your full destination-account authority, limited to that host and user |
 | `--peer-auth full-agent` | Ordinary, unrestricted agent forwarding |
 | `--rsh COMMAND` | Whatever your supplied SSH command permits |
+
+The authentication broker allows 129 simultaneous clients by default. An
+explicit worker count or ceiling changes this to that count plus one control
+connection; restricted copies remain capped at 129 clients.
 
 To make hostB pull from hostA using credentials already on hostB:
 
@@ -164,7 +163,7 @@ produce `--results`; a receiver receipt cannot attest to the source's comparison
 Verification never installs an enrollment.
 
 `--verify-only` cannot combine with `--dry-run`, `--prune`, `--inplace`, or
-overwrite policies. Filters and size limits select the entries to compare;
+overwrite policies. Filters select the entries to compare;
 special files require `--preserve=specials`. Metadata is not compared, but device
 identity is. A requested results file may still be written, and remote setup may
 still cache the helper or [install syq](install.md#automatic-installation-on-ssh-servers).

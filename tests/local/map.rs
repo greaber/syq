@@ -1132,8 +1132,8 @@ fn native_mapping_and_map_respect_typed_selectors() {
 }
 
 // Each documented jq transform lives here as a constant. Tests assert the
-// constant appears in docs/mappings.md (whitespace-normalized, so formatting can
-// change but semantics cannot drift silently), then execute the real
+// constant appears in its documentation page (ignoring whitespace changes),
+// so semantics cannot drift silently. They then execute the real
 // pipeline with jq against a local tree. Endpoints are adapted from the
 // documented `--to nas --into /...` to local directories.
 const DOC_JQ_LOWERCASE: &str = ".dst.value |= ascii_downcase";
@@ -1157,13 +1157,18 @@ const DOC_JQ_RETRY_GATE: &str = r#"if (.[-1].type? // "") != "result"
 /// Assert the doc contains the complete invocation — flags included — that
 /// the test executes, so an undocumented flag can never make a broken
 /// example pass.
-fn assert_documented(flags: &[&str], program: &str) {
-    let doc = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/mappings.md")).unwrap();
+fn assert_documented(page: &str, flags: &[&str], program: &str) {
+    let doc = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join(page),
+    )
+    .unwrap();
     let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let invocation = format!("jq {} '{program}'", flags.join(" "));
     assert!(
         squash(&doc).contains(&squash(&invocation)),
-        "docs/mappings.md no longer contains this documented jq invocation; update the doc and this test together:\n{invocation}"
+        "docs/{page} no longer contains this documented jq invocation; update the doc and this test together:\n{invocation}"
     );
 }
 
@@ -1180,8 +1185,8 @@ fn jq(program: &str, args: &[&str], input: &[u8]) -> Output {
     child.wait_with_output().unwrap()
 }
 
-fn run_doc_pipeline(t: &Tmp, program: &str, jq_args: &[&str], src: &str, dst: &str) {
-    assert_documented(jq_args, program);
+fn run_doc_pipeline(t: &Tmp, page: &str, program: &str, jq_args: &[&str], src: &str, dst: &str) {
+    assert_documented(page, jq_args, program);
     let map_out = syq_map_in(&t.path(""), &["--srcs-in", src]);
     assert!(map_out.status.success());
     let jq_out = jq(program, jq_args, &map_out.stdout);
@@ -1207,7 +1212,7 @@ fn mappings_md_lowercase_example_works_verbatim() {
     let t = Tmp::new();
     write(&t.path("src/Berlin/IMG_1234.JPG"), b"img");
     write(&t.path("src/Notes.TXT"), b"hello");
-    run_doc_pipeline(&t, DOC_JQ_LOWERCASE, &["-c"], "src", "pub");
+    run_doc_pipeline(&t, "mappings.md", DOC_JQ_LOWERCASE, &["-c"], "src", "pub");
     assert_eq!(read(&t.path("pub/berlin/img_1234.jpg")), b"img");
     assert_eq!(read(&t.path("pub/notes.txt")), b"hello");
 }
@@ -1221,19 +1226,33 @@ fn mappings_md_date_partition_example_works_verbatim() {
     set_mtime(&t.path("photos/IMG_1234.JPG"), 1721900000); // 2024-07
     set_mtime(&t.path("photos/IMG_8812.JPG"), 1730500000); // 2024-11
     set_mtime(&t.path("photos/clip.mp4"), 1736000000); // 2025-01
-    run_doc_pipeline(&t, DOC_JQ_DATE_PARTITION, &["-c"], "photos", "archive");
+    run_doc_pipeline(
+        &t,
+        "mappings.md",
+        DOC_JQ_DATE_PARTITION,
+        &["-c"],
+        "photos",
+        "archive",
+    );
     assert_eq!(read(&t.path("archive/2024/07/IMG_1234.JPG")), b"july");
     assert_eq!(read(&t.path("archive/2024/11/IMG_8812.JPG")), b"november");
     assert_eq!(read(&t.path("archive/2025/01/clip.mp4")), b"january");
 }
 
 #[test]
-fn mappings_md_min_size_example_works_verbatim() {
+fn map_reference_md_min_size_example_works_verbatim() {
     let t = Tmp::new();
     write(&t.path("data/big.bin"), &vec![7u8; 1048576]);
     write(&t.path("data/small.txt"), b"tiny");
     write(&t.path("data/sub/also-small.txt"), b"tiny");
-    run_doc_pipeline(&t, DOC_JQ_MIN_SIZE, &["-c"], "data", "big");
+    run_doc_pipeline(
+        &t,
+        "commands/map.md",
+        DOC_JQ_MIN_SIZE,
+        &["-c"],
+        "data",
+        "big",
+    );
     assert_eq!(read(&t.path("big/big.bin")).len(), 1048576);
     assert!(!t.path("big/small.txt").exists());
     assert!(
@@ -1244,7 +1263,7 @@ fn mappings_md_min_size_example_works_verbatim() {
 }
 
 #[test]
-fn mappings_md_retry_gate_example_works_verbatim() {
+fn automation_md_retry_gate_example_works_verbatim() {
     let t = Tmp::new();
     write(&t.path("src/ok.txt"), b"ok");
     let expected = serde_json::json!({
@@ -1272,7 +1291,7 @@ fn mappings_md_retry_gate_example_works_verbatim() {
     );
     assert_eq!(cp.status.code(), Some(23));
     let results = read(&t.path("r1.ndjson"));
-    assert_documented(&["-cs"], DOC_JQ_RETRY_GATE);
+    assert_documented("automation.md", &["-cs"], DOC_JQ_RETRY_GATE);
     // Complete partial stream: the gate passes and emits the retry entry.
     let out = jq(DOC_JQ_RETRY_GATE, &["-cs"], &results);
     assert!(out.status.success());
@@ -1308,13 +1327,20 @@ fn mappings_md_retry_gate_example_works_verbatim() {
 const DOC_JQ_DROP_SPECIALS: &str = r#"select(.kind != "special")"#;
 
 #[test]
-fn mappings_md_drop_specials_example_works_verbatim() {
+fn map_reference_md_drop_specials_example_works_verbatim() {
     let t = Tmp::new();
     write(&t.path("src/a.txt"), b"ok");
     let fifo = t.path("src/pipe");
     let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
-    run_doc_pipeline(&t, DOC_JQ_DROP_SPECIALS, &["-c"], "src", "dst");
+    run_doc_pipeline(
+        &t,
+        "commands/map.md",
+        DOC_JQ_DROP_SPECIALS,
+        &["-c"],
+        "src",
+        "dst",
+    );
     assert_eq!(read(&t.path("dst/a.txt")), b"ok");
     assert!(!t.path("dst/pipe").exists());
 }
