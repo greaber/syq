@@ -702,14 +702,11 @@ fn ensure_inner(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<bool
     }
     // Persist current preferences before reuse so older binaries cannot weaken policy.
     let config = ensure_current_settings()?;
-    if !config
+    let allowed = config
         .profiles
         .iter()
-        .any(|p| p.allows_server(&remote.label()))
-    {
-        return Ok(false);
-    }
-    if is_running(control) {
+        .any(|p| p.allows_server(&remote.label()));
+    if allowed && is_running(control) {
         let state = status(control, false)?;
         if state.identity != crate::identity::build() {
             stop_inner(control, false)?;
@@ -728,7 +725,12 @@ fn ensure_inner(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<bool
         },
         program: remote.program_command(&[]),
     };
+    // Keep the connected endpoint even when no profile currently allows it:
+    // a later preference change can start receiving without another connect.
     atomic_json(&suffixed(control, RECORD), &spec)?;
+    if !allowed {
+        return Ok(false);
+    }
     spawn(control)?;
     Ok(true)
 }

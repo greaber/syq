@@ -169,6 +169,23 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     other_root = root / "other"
     other_root.mkdir()
     try:
+        # First-ever connection while every profile excludes the server. Later
+        # permission changes must activate receiving without another connect.
+        for allow in [("--server", "source"), ("--all-servers",)]:
+            print(f"case: first-time receiving activation with {allow[0]}", flush=True)
+            receive("on", "--name", "other-client", "--root", str(other_root),
+                    "--server", "another-server", "--notify", "off", env=other_env)
+            run("syq", "persist", "connect", "source", "--timeout", "30", env=other_env)
+            connection = next(c for c in json.loads(run("syq", "persist", "status", "--json", env=other_env).stdout)["connections"]
+                              if c["endpoint"] == "source")
+            assert connection["receiving_enabled"] is False, connection
+            assert connection["state"] == "ready", connection
+            assert not any(c["profiles"] for c in state(other_env)["connections"])
+            receive("on", "--name", "other-client", *allow, env=other_env)
+            receive("wait", "source", "--name", "other-client", "--timeout", "10", env=other_env)
+            # Remove the connection and its service record before the next case.
+            run("syq", "persist", "off", env=other_env)
+        receive("on", "--name", "other-client", "--all-servers", env=other_env)
         receive("on", "--name", "laptop", "--root", str(other_root), "--notify", "off", env=other_env)
         receive("on", "--name", "other-client", "--root", str(other_root), "--notify", "off", "--auto-approve-root", str(other_root), env=other_env)
         conflict = run("syq", "persist", "connect", "source", "--timeout", "30", env=other_env, ok=False)
