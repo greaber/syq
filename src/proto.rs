@@ -1602,10 +1602,14 @@ impl<W: Write> FrameWriter<W> {
     }
 }
 
+// Retain buffers for ordinary 2/4 MiB payloads, but release unusually large frames.
+const FRAME_REUSE_LIMIT: usize = 8 << 20;
+
 pub struct FrameReader<R: Read> {
     r: BufReader<R>,
     preamble_read: bool,
     limit: usize,
+    body: Vec<u8>,
 }
 
 impl<R: Read> FrameReader<R> {
@@ -1614,6 +1618,7 @@ impl<R: Read> FrameReader<R> {
             r: BufReader::with_capacity(16 << 10, r),
             preamble_read: false,
             limit: MAX_FRAME,
+            body: Vec::new(),
         }
     }
 
@@ -1719,6 +1724,18 @@ impl<R: Read> FrameReader<R> {
     fn read_frame<T: for<'de> Deserialize<'de> + SizeHint>(
         &mut self,
     ) -> io::Result<crate::wire_budget::Budgeted<T>> {
+        let mut body = std::mem::take(&mut self.body);
+        let result = self.read_frame_into(&mut body);
+        if body.capacity() <= FRAME_REUSE_LIMIT {
+            self.body = body;
+        }
+        result
+    }
+
+    fn read_frame_into<T: for<'de> Deserialize<'de> + SizeHint>(
+        &mut self,
+        body: &mut Vec<u8>,
+    ) -> io::Result<crate::wire_budget::Budgeted<T>> {
         let mut hdr = [0u8; 4];
         self.r.read_exact(&mut hdr)?;
         let len = u32::from_le_bytes(hdr) as usize;
@@ -1738,8 +1755,11 @@ impl<R: Read> FrameReader<R> {
         }
         // Encoded bytes and decompression are bounded by this reader's frame
         // limit. Their queue count is bounded by the connection's read-ahead.
-        let mut body = vec![0u8; len - 1];
-        self.r.read_exact(&mut body)?;
+        // Reserve exactly so growth does not double retained per-channel memory.
+        body.reserve_exact((len - 1).saturating_sub(body.len()));
+        body.resize(len - 1, 0);
+        self.r.read_exact(body)?;
+        let decompressed;
         let payload = if flag[0] == crate::compression::ZSTD {
             // Bound zstd's advertised window as well as its output. Level-1
             // frames from the released writer use windows below this ceiling.
@@ -1762,13 +1782,15 @@ impl<R: Read> FrameReader<R> {
                 output.try_reserve_exact(n).map_err(io::Error::other)?;
                 output.extend_from_slice(&chunk[..n]);
             }
-            output
+            decompressed = output;
+            decompressed.as_slice()
         } else if flag[0] == crate::compression::LZ4 {
-            crate::compression::decode_lz4(&body, self.limit)?
+            decompressed = crate::compression::decode_lz4(body, self.limit)?;
+            decompressed.as_slice()
         } else {
-            body
+            body.as_slice()
         };
-        let decoded = crate::wire_budget::decode::<T>(&payload)?;
+        let decoded = crate::wire_budget::decode::<T>(payload)?;
         if payload.len() >= decoded.value.frame_limit() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -764,3 +764,63 @@ fn released_v060_zstd_frame_remains_decodable() {
         );
     }
 }
+
+#[test]
+fn frame_reader_reuse_preserves_owned_messages_and_rejects_short_bodies() {
+    let inputs = [
+        vec![1; 128 << 10],
+        vec![2; 128 << 10],
+        vec![3; 7],
+        vec![4; 256 << 10],
+    ];
+    let mut bytes = Vec::new();
+    {
+        let mut writer = FrameWriter::new(&mut bytes, false);
+        for input in &inputs {
+            writer.write_msg(&block_message(input.clone())).unwrap();
+        }
+    }
+    // A short final body must not decode stale bytes from the previous frame.
+    bytes.extend_from_slice(&((256u32 << 10) + 1).to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&[0; 13]);
+    let mut reader = FrameReader::new(bytes.as_slice());
+    let messages: Vec<Response> = inputs.iter().map(|_| reader.read_msg().unwrap()).collect();
+    assert_eq!(
+        reader.read_msg::<Response>().unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    for (message, expected) in messages.into_iter().zip(inputs) {
+        let Response::Block { data, .. } = message else {
+            panic!("expected block")
+        };
+        assert_eq!(data, expected);
+    }
+}
+
+#[test]
+fn frame_reader_releases_large_scratch_on_success_and_failure() {
+    let frame = block_frame(vec![0x53; FRAME_REUSE_LIMIT + 1], false);
+    for truncated in [false, true] {
+        let input = if truncated {
+            &frame[..frame.len() - 1]
+        } else {
+            &frame[..]
+        };
+        let mut reader = FrameReader::new(input);
+        let result = reader.read_msg::<Response>();
+        if truncated {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        } else {
+            let Response::Block { data, .. } = result.unwrap() else {
+                panic!("expected block")
+            };
+            assert_eq!(data, vec![0x53; FRAME_REUSE_LIMIT + 1]);
+        }
+        assert_eq!(
+            reader.body.capacity(),
+            0,
+            "large frames must not stay allocated on an idle channel"
+        );
+    }
+}
