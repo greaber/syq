@@ -98,7 +98,10 @@ impl Compressor {
             // compression before the periodic whole-frame probe is due.
             let mut sample_output = [0; 8192];
             let mut promising = false;
-            for start in [0, (input.len() - 4096) / 2, input.len() - 4096] {
+            // Avoid frame headers/trailers: their repeated metadata does not
+            // predict whether the bulk payload will compress.
+            let span = input.len() - 4096;
+            for start in [span / 8, span / 2, span * 7 / 8] {
                 let sample = &input[start..start + 4096];
                 let len = lz4::block::compress_to_buffer(
                     sample,
@@ -403,16 +406,17 @@ mod tests {
             *byte = state as u8;
         }
         let mut compressor = Compressor::new(false);
-        for _ in 0..6 {
+        for _ in 0..7 {
             assert!(compressor.encode(&noise).unwrap().is_none());
         }
         let mut mixed = noise;
-        mixed[16 << 10..512 << 10].fill(b'x');
+        mixed[16 << 10..128 << 10].fill(b'x');
         let mut skipped = 0;
         while compressor.encode(&mixed).unwrap().is_none() {
             skipped += 1;
             assert!(skipped <= 2);
         }
+        assert_eq!(skipped, 2, "whole-frame probing must recover a sample miss");
         assert!(compressor.encode(&mixed).unwrap().is_some());
     }
 }
