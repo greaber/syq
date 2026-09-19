@@ -17,11 +17,6 @@ instead of relaxing host verification.
 Your local SSH configuration selects hostB's login, address, port, and trusted
 host keys. HostA's SSH configuration does not override those choices.
 
-The constrained authentication broker admits at most 129 simultaneous clients
-by default, independently of automatic copy-worker tuning. An explicit worker
-setting or ceiling adjusts that bound to the requested count plus one control
-connection. Command-restricted copies never exceed 129 broker clients.
-
 ## Enrollment
 
 Enrollment needs normal command authority on the destination during setup.
@@ -69,8 +64,6 @@ their original limits.
 | `--tcp-plain` | Unsupported; data connections must be encrypted |
 | `--mapping` | Listed destinations and necessary parent creation are authorized |
 | `--skip-newer` | Timestamp selection uses source-reported modification times |
-| `--min-size` | Unsupported |
-| `--max-size` with `--prune` | Unsupported |
 | Fixed `workers` above 128 | Unsupported |
 | `--inplace` with `--as-new` | Unsupported |
 | `--detach` | Unsupported; the local broker must remain attached |
@@ -90,12 +83,12 @@ results. Use `-v` for totals or `--results FILE` for
 than as live per-file progress. For `--dry-run --results`, use
 `--coordinate-at local` to get the preview stream.
 
-`--receiver-receipt digests` adds BLAKE3 hashes of affected regular files.
+`--receiver-receipt hashes` adds BLAKE3 hashes of affected regular files.
 Receipts allow up to four million records and 512 MiB of plaintext. Reaching
 a cap stops further changes and reports an incomplete outcome.
 
 A receipt does not prove that the source supplied every intended file or the
-right contents. See the [threat model](security.md#a-compromised-source-server).
+right contents. See [A compromised source server](security.md#a-compromised-source-server).
 
 ## Other authentication modes
 
@@ -105,6 +98,10 @@ right contents. See the [threat model](security.md#a-compromised-source-server).
 | `--peer-auth broker` | Your full destination-account authority, limited to that host and user |
 | `--peer-auth full-agent` | Ordinary, unrestricted agent forwarding |
 | `--rsh COMMAND` | Whatever your supplied SSH command permits |
+
+The authentication broker allows 129 simultaneous clients by default. An
+explicit worker count or ceiling changes this to that count plus one control
+connection; restricted copies remain capped at 129 clients.
 
 To make hostB pull from hostA using credentials already on hostB:
 
@@ -135,7 +132,7 @@ for each reply. Offline or unsupported connections are skipped. With none
 available, or with unsupported options, it uses the source machine's SSH access.
 Once approval is requested, refusal or failure ends the attempt.
 
-`--auth-from @NAME` and its alias `--via @NAME` require that receiving machine
+`--auth-from @NAME` requires that receiving machine
 to authorize the copy. `--auth-from ssh` uses the source machine's SSH access.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
@@ -155,18 +152,8 @@ but automatic selection uses ordinary SSH, where it resolves to `/archive`.
 
 ## Verification
 
-For comparisons between two servers, `--coordinate-at local` uses ordinary
-SSH access from your machine to both endpoints. It needs no restricted receiver
-enrollment and supports `--verify-only --results FILE`. Files are hashed on
-the servers; your machine compares their hashes and receives listings and
-results, not the full file contents.
-
-Direct restricted verification requires an existing enrollment and cannot
-produce `--results`; a receiver receipt cannot attest to the source's comparison.
-Verification never installs an enrollment.
-
-`--verify-only` cannot combine with `--dry-run`, `--prune`, `--inplace`, or
-overwrite policies. Filters and size limits select the entries to compare;
-special files require `--preserve=specials`. Metadata is not compared, but device
-identity is. A requested results file may still be written, and remote setup may
-still cache the helper or [install syq](install.md#automatic-installation-on-ssh-servers).
+For comparisons between two servers, use `--dry-run --hash --coordinate-at local`.
+This uses ordinary SSH access and supports `--results FILE` without restricted
+receiver enrollment. Files are hashed on the servers; your machine receives
+hashes, listings, and results. Remote setup may still cache the helper or
+[install syq](install.md#automatic-installation-on-ssh-servers).

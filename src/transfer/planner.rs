@@ -1357,7 +1357,7 @@ impl Planner<'_> {
             let planned = self.filter_dirs(dirs, stats, dst_root);
             if opts.dry_run {
                 self.trace_dry_run_dirs(&planned, dst_root);
-            } else if !opts.verify_only {
+            } else {
                 let Some(reopened_dirs) = self.create_directories(&planned, dst_root)? else {
                     return Ok(());
                 };
@@ -1516,20 +1516,7 @@ impl Planner<'_> {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;
         }
-        if opts.verify_only {
-            if dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File) {
-                self.enqueue(
-                    (src_path.clone(), source.clone()),
-                    dst_path.clone(),
-                    rel.clone(),
-                    dst_rel.clone(),
-                    e.clone(),
-                    dst_entry.clone(),
-                );
-            } else {
-                self.progress.error(&format!("MISSING {rel}"));
-            }
-        } else if same && !opts.checksum && opts.expected_for(&dst_rel).is_none() {
+        if same && !opts.checksum && (opts.dry_run || opts.expected_for(&dst_rel).is_none()) {
             // Content is up to date, but still reconcile metadata
             // (mode/owner/group) the way rsync does — a skipped file
             // shouldn't keep stale permissions.
@@ -1569,10 +1556,19 @@ impl Planner<'_> {
             }
             self.progress.files_unchanged.fetch_add(1, Relaxed);
             self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
+        } else if opts.dry_run
+            && opts.checksum
+            && dst_entry
+                .as_ref()
+                .is_some_and(|d| d.kind == Kind::File && d.size == e.size)
+        {
+            // Equal-size files need a real comparison. Hash them through the
+            // workers so large trees do not serialize all reads in the planner.
+            self.enqueue((src_path, source), dst_path, rel, dst_rel, e, dst_entry);
         } else if opts.dry_run {
             self.progress.files_total.fetch_add(1, Relaxed);
             self.progress.bytes_total.fetch_add(e.size, Relaxed);
-            self.progress.files_done.fetch_add(1, Relaxed);
+            self.progress.add_files(1);
             // Dry aggregates mean planned work, bytes included —
             // files_done already moves here, so bytes_done must
             // too or the terminal record contradicts its traces.
@@ -1589,7 +1585,8 @@ impl Planner<'_> {
                 match &dst_entry {
                     None => "destination_missing",
                     Some(d) if d.kind != Kind::File => "type_differs",
-                    Some(_) => "content_differs",
+                    Some(d) if d.size != e.size => "content_differs",
+                    Some(_) => "metadata_differs",
                 },
             );
             if opts.verbose > 0 {
@@ -1701,12 +1698,7 @@ impl Planner<'_> {
         let same = dst_entry
             .as_ref()
             .is_some_and(|d| d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..]));
-        if opts.verify_only {
-            if !same {
-                self.progress.error(&format!("DIFFERS {rel} (symlink)"));
-            }
-            return;
-        }
+
         if same {
             self.plan_explicit_leaf_metadata(
                 &dst_path,
@@ -1797,17 +1789,6 @@ impl Planner<'_> {
         let same = dst_entry
             .as_ref()
             .is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
-        if opts.verify_only {
-            if !same {
-                let what = if dst_entry.is_none() {
-                    "MISSING"
-                } else {
-                    "DIFFERS"
-                };
-                self.progress.error(&format!("{what} {rel} (special file)"));
-            }
-            return;
-        }
         if same {
             self.plan_explicit_leaf_metadata(
                 &dst_path,
@@ -1896,16 +1877,7 @@ impl Planner<'_> {
                 continue;
             }
             let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
-            if opts.verify_only {
-                if !is_dir {
-                    self.progress.error(&format!(
-                        "{} {}/ (directory)",
-                        if st.is_none() { "MISSING" } else { "DIFFERS" },
-                        display(&p)
-                    ));
-                }
-                continue;
-            }
+
             // --existing creates nothing. A non-directory at the path (a
             // file, a symlink even to a directory — in-tree symlinks are
             // never traversed) counts as missing: we won't
@@ -2353,7 +2325,7 @@ impl Planner<'_> {
                 }
                 self.payload_paths.entry(reservation).or_insert(rel.clone());
             }
-            if entry.kind == Kind::File && !self.opts.inplace && !self.opts.verify_only {
+            if entry.kind == Kind::File && !self.opts.inplace {
                 files.push((dst_path, rel));
             }
         }
@@ -2498,7 +2470,7 @@ impl Planner<'_> {
         kind: Kind,
         entry: Option<&Entry>,
     ) -> bool {
-        if self.opts.verify_only || !entry.is_some_and(|entry| entry.kind == Kind::Dir) {
+        if !entry.is_some_and(|entry| entry.kind == Kind::Dir) {
             return false;
         }
         self.fail_directory_type_change(dst, dst_rel, kind);
@@ -2562,7 +2534,7 @@ impl Planner<'_> {
                 .error_classified(&message, Some("conflict"), None);
             self.emit_mapping_entry_failed(
                 &ManifestEntry {
-                    expected_digest: self.opts.expected_for(dst_rel).cloned(),
+                    expected_hash: self.opts.expected_for(dst_rel).cloned(),
                     metadata: self.opts.mapping_metadata.get(dst_rel).copied(),
                     src: self
                         .mapping_source_rel(dst_rel)

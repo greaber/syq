@@ -21,7 +21,7 @@ def check():
             c.request('PUT', prefix + '/' + key)
         c.request('PUT', c.PREFIX + '/sibling')
         args = ['--srcs-in', source, '--to', remote, '--into', prefix,
-                '--prune', '--ignore', 'ignored/', '--min-size', '2']
+                '--prune', '--ignore', 'ignored/', '--ignore', 'small']
         before = set(c.listing())
         c.run(args + ['--dry-run', '-v'])
         assert set(c.listing()) == before
@@ -127,7 +127,7 @@ def check():
         (dst / 'recovery/.syq-swap-123-4').mkdir()
         (dst / 'recovery/.syq-swap-123-4/data').write_bytes(b'recover')
         download = ['--from', remote, '--srcs-in', prefix, '--into', dst,
-                    '--prune', '--ignore', 'ignored/', '--min-size', '2']
+                    '--prune', '--ignore', 'ignored/', '--ignore', 'small']
         c.run(download + ['--dry-run'])
         assert (dst / 'extra').exists() and not (dst / 'keep').exists()
         limited = c.run(download + ['--max-delete', '2'], ok=False, capture=True)

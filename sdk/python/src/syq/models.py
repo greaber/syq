@@ -219,8 +219,8 @@ class HashAlgorithm(_StringEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class Digest:
-    """An expected digest of all file bytes, independent of transfer blocks."""
+class Hash:
+    """An expected hash of all file bytes, independent of transfer blocks."""
 
     algorithm: HashAlgorithm
     value: str
@@ -229,9 +229,9 @@ class Digest:
         object.__setattr__(self, "algorithm", HashAlgorithm(self.algorithm))
         length = 32 if self.algorithm in {HashAlgorithm.MD5, HashAlgorithm.XXH3_128} else 64
         if not isinstance(self.value, str):
-            raise TypeError("digest value must be a hexadecimal string")
+            raise TypeError("hash value must be a hexadecimal string")
         if len(self.value) != length or any(c not in "0123456789abcdefABCDEF" for c in self.value):
-            raise ValueError(f"{self.algorithm} digest must contain {length} hexadecimal digits")
+            raise ValueError(f"{self.algorithm} hash must contain {length} hexadecimal digits")
         object.__setattr__(self, "value", self.value.lower())
 
 
@@ -273,7 +273,7 @@ class MappingEntry:
     kind: EntryKind | None = None
     size: int | None = None
     mtime: int | None = None
-    expected_digest: Digest | None = None
+    expected_hash: Hash | None = None
     metadata: DestinationMetadata | None = None
 
     def __post_init__(self) -> None:
@@ -289,11 +289,11 @@ class MappingEntry:
         for label, value in (("size", self.size), ("mtime", self.mtime)):
             if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
                 raise TypeError(f"{label} must be an integer or None")
-        if self.expected_digest is not None:
-            if not isinstance(self.expected_digest, Digest):
-                raise TypeError("expected_digest must be a Digest or None")
+        if self.expected_hash is not None:
+            if not isinstance(self.expected_hash, Hash):
+                raise TypeError("expected_hash must be a Hash or None")
             if self.kind not in {None, EntryKind.FILE}:
-                raise ValueError("expected_digest requires a regular file")
+                raise ValueError("expected_hash requires a regular file")
         if self.metadata is not None:
             if not isinstance(self.metadata, DestinationMetadata):
                 raise TypeError("metadata must be DestinationMetadata or None")
@@ -350,7 +350,6 @@ class RunEvent:
     mapping: bool | None
     dry_run: bool
     endpoints: tuple[Endpoint, ...]
-    verify_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,7 +396,7 @@ class OperationResult:
     provenance: str | None = None
     scope: int | None = None
     code: ReceiptCode | None = None
-    expected_digest: Digest | None = None
+    expected_hash: Hash | None = None
     metadata: DestinationMetadata | None = None
 
     @property
@@ -415,7 +414,7 @@ class OperationResult:
                 RelativePath(self.src.raw),
                 RelativePath(self.dst.raw),
                 self.kind,
-                expected_digest=self.expected_digest,
+                expected_hash=self.expected_hash,
                 metadata=self.metadata,
             )
         except ValueError:
@@ -481,8 +480,8 @@ class ObjectMetadata:
 
 
 @dataclass(frozen=True, slots=True)
-class AttestedDigest:
-    """A content digest from the receipt, algorithm included."""
+class AttestedHash:
+    """A content hash from the receipt, algorithm included."""
 
     algorithm: str
     value: str
@@ -500,7 +499,7 @@ class FinalStateEvent:
     kind: FinalObjectKind | None
     size: int | None
     metadata: ObjectMetadata | None
-    digest: AttestedDigest | None
+    hash: AttestedHash | None
     symlink_target: PathValue | None
     observation_error: str | None
     code: ReceiptCode | None
@@ -598,10 +597,10 @@ def _mapping_json(entry: MappingEntry) -> dict[str, Any]:
         record["size"] = entry.size
     if entry.mtime is not None:
         record["mtime"] = entry.mtime
-    if entry.expected_digest is not None:
-        record["expected_digest"] = {
-            "algorithm": entry.expected_digest.algorithm.value,
-            "value": entry.expected_digest.value,
+    if entry.expected_hash is not None:
+        record["expected_hash"] = {
+            "algorithm": entry.expected_hash.algorithm.value,
+            "value": entry.expected_hash.value,
         }
     if entry.metadata is not None:
         record["metadata"] = _metadata_json(entry.metadata)

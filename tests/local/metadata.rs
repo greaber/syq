@@ -293,17 +293,11 @@ fn root_meta_failure_is_visible() {
     assert_eq!(read(&t.path("dst/f")), b"data");
 }
 
-// The read-only modes create nothing, not even the destination directory.
+// A dry run creates nothing, not even the destination directory.
 #[test]
-fn readonly_modes_create_nothing() {
+fn dry_run_creates_nothing() {
     let t = Tmp::new();
     write(&t.path("src/f"), b"data");
-    let out = syq(&["-a", "--syq-verify-only", &t.s("src/"), &t.s("dst/")]);
-    assert!(
-        !t.path("dst").exists(),
-        "--syq-verify-only must not create the destination"
-    );
-    assert!(!out.status.success(), "everything is missing");
     let out = syq(&["-a", "-n", &t.s("src/"), &t.s("dst/")]);
     assert!(out.status.success());
     assert!(

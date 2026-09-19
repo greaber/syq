@@ -69,55 +69,18 @@ fn checksum_repairs_silent_corruption() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
-fn hash_policy_verify_only_expected_mismatch_exits() {
-    let t = Tmp::new();
-    write(&t.path("source"), b"abc");
-    write(&t.path("destination"), b"abc");
-    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "cp",
-            &t.s("source"),
-            "--as",
-            &t.s("destination"),
-            "--verify-only",
-            "--expected-hash",
-            "md5:00000000000000000000000000000000",
-            "--results",
-            &t.s("results.ndjson"),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .start()
-        .unwrap();
-    let output = wait_for_control_path_output(child);
-    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
-    assert!(
-        stderr_of(&output).contains("expected md5 hash"),
-        "{}",
-        stderr_of(&output)
-    );
-    assert_eq!(read(&t.path("destination")), b"abc");
-    let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
-    let terminal: serde_json::Value =
-        serde_json::from_str(records.lines().last().unwrap()).unwrap();
-    assert_eq!(terminal["type"], "result");
-    assert_eq!(terminal["status"], "partial");
-}
-
-#[test]
 fn hash_policy_independent_compare_and_payload_hashes_cross_transports() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     let data = prng(5 * 1024 * 1024 + 13, 999);
-    write(&t.path("source"), &data);
+    write(&t.path("src/source"), &data);
     for tcp in [false, true] {
         for path in ["ranges", "streaming"] {
             let destination = format!("destination-{tcp}-{path}");
             let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
             command.args([
                 "cp",
-                &t.s("source"),
+                &t.s("src/source"),
                 "--to",
                 "fake",
                 "--as",
@@ -148,7 +111,7 @@ fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
     let t = Tmp::new();
     // Three default 4 MiB hash blocks; only the last block differs.
     let contents = prng(12 << 20, 1000);
-    write(&t.path("source"), &contents);
+    write(&t.path("src/source"), &contents);
     for (compare, transfer) in [("blake3", "sha256"), ("xxh3-128", "blake3")] {
         let results = t.s(&format!("results-{compare}-{transfer}.ndjson"));
         let mut previous = contents.clone();
@@ -156,7 +119,7 @@ fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
         write(&t.path("destination"), &previous);
         let output = native_syq(&[
             "cp",
-            &t.s("source"),
+            &t.s("src/source"),
             "--as",
             &t.s("destination"),
             "--performance-tuning=workers=1,copy-path=ranges",
@@ -177,22 +140,28 @@ fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
 #[test]
 fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
     let t = Tmp::new();
-    write(&t.path("source"), b"abc");
+    write(&t.path("src/source"), b"abc");
     write(&t.path("destination"), b"abc");
-    set_mtime(&t.path("source"), 1_700_000_000);
+    set_mtime(&t.path("src/source"), 1_700_000_000);
     set_mtime(&t.path("destination"), 1_700_000_000);
-    fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o640)).unwrap();
+    fs::set_permissions(t.path("src/source"), fs::Permissions::from_mode(0o640)).unwrap();
     fs::set_permissions(t.path("destination"), fs::Permissions::from_mode(0o600)).unwrap();
     let inode = fs::metadata(t.path("destination")).unwrap().ino();
     let copy = |results: &str| {
         let output = native_syq(&[
             "cp",
-            &t.s("source"),
-            "--as",
-            &t.s("destination"),
+            "--mapping",
+            &expected_mapping(
+                &t,
+                "source",
+                "destination",
+                Some("md5:900150983cd24fb0d6963f7d28e17f72"),
+            ),
+            "-C",
+            &t.s("src"),
+            "--into",
+            &t.s(""),
             "--preserve=permissions",
-            "--expected-hash",
-            "md5:900150983cd24fb0d6963f7d28e17f72",
             "--results",
             &t.s(results),
         ]);
@@ -214,16 +183,22 @@ fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
     assert_eq!(read(&t.path("destination")), b"abc");
     // --hash must still compare source contents even when the expectation
     // matches the destination and metadata agrees.
-    write(&t.path("source"), b"bad");
-    set_mtime(&t.path("source"), 1_700_000_000);
+    write(&t.path("src/source"), b"bad");
+    set_mtime(&t.path("src/source"), 1_700_000_000);
     let output = native_syq(&[
         "cp",
         "--hash",
-        &t.s("source"),
-        "--as",
-        &t.s("destination"),
-        "--expected-hash",
-        "md5:900150983cd24fb0d6963f7d28e17f72",
+        "--mapping",
+        &expected_mapping(
+            &t,
+            "source",
+            "destination",
+            Some("md5:900150983cd24fb0d6963f7d28e17f72"),
+        ),
+        "-C",
+        &t.s("src"),
+        "--into",
+        &t.s(""),
     ]);
     assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
     assert_eq!(read(&t.path("destination")), b"abc");
@@ -238,7 +213,7 @@ fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
     }
     let t = Tmp::new();
     let contents = prng(5 << 20, 993);
-    write(&t.path("source"), &contents);
+    write(&t.path("src/source"), &contents);
     let correct = format!("blake3:{}", blake3::hash(&contents).to_hex());
     let wrong = format!("blake3:{}", "0".repeat(64));
     for (name, expected, succeeds) in [
@@ -250,14 +225,14 @@ fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command.args([
             "cp",
-            &t.s("source"),
-            "--as",
-            &t.s(name),
+            "--mapping",
+            &expected_mapping(&t, "source", name, expected),
+            "-C",
+            &t.s("src"),
+            "--into",
+            &t.s(""),
             "--integrity-checking=transfer=xxh3-128",
         ]);
-        if let Some(expected) = expected {
-            command.args(["--expected-hash", expected]);
-        }
         let output = command
             .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_FAIL_READ_RANGE", "1")
@@ -285,16 +260,21 @@ fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
 fn hash_policy_expected_mismatch_preserves_destination() {
     for size in [3, 5 * 1024 * 1024] {
         let t = Tmp::new();
-        write(&t.path("source"), &vec![b'n'; size]);
+        write(&t.path("src/source"), &vec![b'n'; size]);
         write(&t.path("destination"), b"previous contents");
         let output = native_syq(&[
             "cp",
-            "--src",
-            &t.s("source"),
-            "--as",
-            &t.s("destination"),
-            "--expected-hash",
-            "md5:00000000000000000000000000000000",
+            "--mapping",
+            &expected_mapping(
+                &t,
+                "source",
+                "destination",
+                Some("md5:00000000000000000000000000000000"),
+            ),
+            "-C",
+            &t.s("src"),
+            "--into",
+            &t.s(""),
             "--results",
             &t.s("results.ndjson"),
         ]);
@@ -319,7 +299,7 @@ fn hash_policy_expected_mismatch_preserves_destination() {
             })
             .unwrap();
         assert_eq!(
-            failed["expected_digest"],
+            failed["expected_hash"],
             serde_json::json!({"algorithm": "md5", "value": "0".repeat(32)})
         );
     }
@@ -328,15 +308,20 @@ fn hash_policy_expected_mismatch_preserves_destination() {
 #[test]
 fn hash_policy_expected_empty_file_is_checked_before_publication() {
     let t = Tmp::new();
-    write(&t.path("empty"), b"");
+    write(&t.path("src/empty"), b"");
     run_native_ok(&[
         "cp",
-        "--src",
-        &t.s("empty"),
-        "--as",
-        &t.s("good"),
-        "--expected-hash",
-        "md5:d41d8cd98f00b204e9800998ecf8427e",
+        "--mapping",
+        &expected_mapping(
+            &t,
+            "empty",
+            "good",
+            Some("md5:d41d8cd98f00b204e9800998ecf8427e"),
+        ),
+        "-C",
+        &t.s("src"),
+        "--into",
+        &t.s(""),
         "--integrity-checking",
         "compare=xxh3-128",
         "--integrity-checking=transfer=blake3",
@@ -344,12 +329,17 @@ fn hash_policy_expected_empty_file_is_checked_before_publication() {
     assert_eq!(read(&t.path("good")), b"");
     let output = native_syq(&[
         "cp",
-        "--src",
-        &t.s("empty"),
-        "--as",
-        &t.s("bad"),
-        "--expected-hash",
-        "md5:00000000000000000000000000000000",
+        "--mapping",
+        &expected_mapping(
+            &t,
+            "empty",
+            "bad",
+            Some("md5:00000000000000000000000000000000"),
+        ),
+        "-C",
+        &t.s("src"),
+        "--into",
+        &t.s(""),
     ]);
     assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
     assert!(
@@ -359,22 +349,28 @@ fn hash_policy_expected_empty_file_is_checked_before_publication() {
 }
 
 #[test]
-fn hash_policy_xxh3_compares_repairs_and_verifies() {
+fn hash_policy_xxh3_compares_repairs_and_previews() {
     let t = Tmp::new();
     let contents = prng(5 * 1024 * 1024, 992);
     let mut bad = contents.clone();
     bad[1_234_567] ^= 1;
-    write(&t.path("source"), &contents);
+    write(&t.path("src/source"), &contents);
     write(&t.path("destination"), &bad);
-    set_mtime(&t.path("source"), 1_600_000_000);
+    set_mtime(&t.path("src/source"), 1_600_000_000);
     set_mtime(&t.path("destination"), 1_600_000_000);
     // The default metadata comparison cannot detect this same-size, same-time edit.
-    run_native_ok(&["cp", "--src", &t.s("source"), "--as", &t.s("destination")]);
+    run_native_ok(&[
+        "cp",
+        "--src",
+        &t.s("src/source"),
+        "--as",
+        &t.s("destination"),
+    ]);
     assert_eq!(read(&t.path("destination")), bad);
     run_native_ok(&[
         "cp",
         "--src",
-        &t.s("source"),
+        &t.s("src/source"),
         "--as",
         &t.s("destination"),
         "--integrity-checking",
@@ -382,64 +378,42 @@ fn hash_policy_xxh3_compares_repairs_and_verifies() {
         "--integrity-checking=transfer=blake3",
     ]);
     assert_eq!(read(&t.path("destination")), contents);
-    run_native_ok(&[
-        "cp",
-        "--verify-only",
-        "--src",
-        &t.s("source"),
-        "--as",
-        &t.s("destination"),
-        "--integrity-checking",
-        "compare=xxh3-128",
-    ]);
+    let preview = |name: &str, changed: bool| {
+        let output = native_syq(&[
+            "cp",
+            "--dry-run",
+            "--src",
+            &t.s("src/source"),
+            "--as",
+            &t.s("destination"),
+            "--integrity-checking",
+            "compare=xxh3-128",
+            "--results",
+            &t.s(name),
+        ]);
+        assert_output_ok(&output);
+        let records: Vec<serde_json::Value> = fs::read_to_string(t.path(name))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["type"], "result");
+        assert_eq!(terminal["status"], "success");
+        assert_eq!(terminal["files_transferred"], u64::from(changed));
+        assert_eq!(terminal["files_unchanged"], u64::from(!changed));
+        let traces: Vec<_> = records.iter().filter(|r| r["type"] == "trace").collect();
+        assert_eq!(traces.len(), usize::from(changed), "{records:?}");
+        if changed {
+            assert_eq!(traces[0]["dst"]["value"], "");
+            assert_eq!(traces[0]["reason"], "content_differs");
+            assert_eq!(traces[0]["bytes"], contents.len());
+        }
+    };
+    preview("matching.ndjson", false);
     write(&t.path("destination"), &bad);
-    let output = native_syq(&[
-        "cp",
-        "--verify-only",
-        "--src",
-        &t.s("source"),
-        "--as",
-        &t.s("destination"),
-        "--integrity-checking",
-        "compare=xxh3-128",
-    ]);
-    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
-    assert_eq!(
-        read(&t.path("destination")),
-        bad,
-        "verification must not repair"
-    );
-}
-
-#[test]
-fn verify_only_detects_differences() {
-    let t = Tmp::new();
-    make_tree(&t.path("src"));
-    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
-    let out = syq(&["-a", "--syq-verify-only", &t.s("src/"), &t.s("dst/")]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let mut bad = read(&t.path("dst/a/med.bin"));
-    bad[1000] ^= 1;
-    write(&t.path("dst/a/med.bin"), &bad);
-    set_mtime(
-        &t.path("dst/a/med.bin"),
-        fs::metadata(t.path("src/a/med.bin")).unwrap().mtime(),
-    );
-    fs::remove_file(t.path("dst/hello.txt")).unwrap();
-
-    let out = syq(&["-a", "--syq-verify-only", &t.s("src/"), &t.s("dst/")]);
-    assert_eq!(out.status.code(), Some(23));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("DIFFERS a/med.bin"), "{err}");
-    assert!(err.contains("MISSING hello.txt"), "{err}");
-    // verify-only must not modify anything
-    assert!(read(&t.path("dst/a/med.bin")) == bad);
-    assert!(!t.path("dst/hello.txt").exists());
+    preview("different.ndjson", true);
+    assert_eq!(read(&t.path("destination")), bad, "preview must not repair");
 }
 
 #[test]
@@ -473,47 +447,6 @@ fn quick_skipped_file_still_claims_destination() {
         !out.status.success(),
         "quick-skipped file must still block a colliding directory"
     );
-}
-
-#[test]
-fn verify_only_flags_missing_directory() {
-    let t = Tmp::new();
-    write(&t.path("s/sub/f"), b"f");
-    fs::create_dir_all(t.path("d")).unwrap(); // d exists but d/sub does not
-    let out = syq(&[
-        "-a",
-        "--syq-verify-only",
-        &format!("{}/", t.s("s")),
-        &format!("{}/", t.s("d")),
-    ]);
-    assert_eq!(out.status.code(), Some(23));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("MISSING")
-            && String::from_utf8_lossy(&out.stderr)
-                .to_lowercase()
-                .contains("director")
-    );
-}
-
-#[test]
-fn verify_only_flags_missing_special() {
-    let t = Tmp::new();
-    fs::create_dir_all(t.path("s")).unwrap();
-    fs::create_dir_all(t.path("d")).unwrap();
-    // create a fifo in the source
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(t.path("s/pipe").as_os_str().as_bytes()).unwrap();
-    unsafe {
-        assert_eq!(libc::mkfifo(c.as_ptr(), 0o644), 0);
-    }
-    let out = syq(&[
-        "-a",
-        "--syq-verify-only",
-        &format!("{}/", t.s("s")),
-        &format!("{}/", t.s("d")),
-    ]);
-    assert_eq!(out.status.code(), Some(23));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("special"));
 }
 
 /// Quick checks use the scan-time snapshot in both transfer paths, even if
@@ -687,125 +620,190 @@ fn checksum_identical_file_preserves_destination_inode() {
     assert!(partial_files(&t.0).is_empty());
 }
 
-#[test]
-fn verify_only_checks_the_filtered_scope() {
-    let t = Tmp::new();
-    write(&t.path("src/big"), b"abc");
-    write(&t.path("dst/big"), b"xyz");
-    let out = syq(&["-a", "--syq-verify-only", &t.s("src/"), &t.s("dst")]);
-    assert_eq!(out.status.code(), Some(23));
-    let so = run_ok(&[
-        "-a",
-        "--syq-verify-only",
-        "--max-size",
-        "1",
-        &t.s("src/"),
-        &t.s("dst"),
-    ]);
-    assert!(so.contains("verified 0 files"), "{so}");
-    set_mtime(&t.path("src/big"), 1000);
-    set_mtime(&t.path("dst/big"), 2000);
-    let so = run_ok(&["-a", "--syq-verify-only", "-u", &t.s("src/"), &t.s("dst")]);
-    assert!(so.contains("verified 0 files"), "{so}");
+pub(super) fn expected_mapping(
+    t: &Tmp,
+    source: &str,
+    destination: &str,
+    expected: Option<&str>,
+) -> String {
+    let mut entry = serde_json::json!({
+        "src": {"encoding": "utf-8", "value": source},
+        "dst": {"encoding": "utf-8", "value": destination}, "kind": "file"
+    });
+    if let Some(expected) = expected {
+        let (algorithm, value) = expected.split_once(':').unwrap();
+        entry["expected_hash"] = serde_json::json!({"algorithm": algorithm, "value": value});
+    }
+    let path = format!("{destination}.mapping");
+    write(&t.path(&path), entry.to_string().as_bytes());
+    t.s(&path)
 }
 
 #[test]
-fn native_verify_only_compares_contents_without_mutations() {
-    let t = Tmp::new();
-    write(&t.path("src/same"), b"same");
-    write(&t.path("src/different"), b"AAAA");
-    write(&t.path("src/missing"), b"missing");
-    fs::create_dir_all(t.path("src/empty")).unwrap();
-    std::os::unix::fs::symlink("same", t.path("src/link")).unwrap();
-    write(&t.path("dst/same"), b"same");
-    write(&t.path("dst/different"), b"BBBB");
-    write(&t.path("dst/extra"), b"extra");
-    std::os::unix::fs::symlink("different", t.path("dst/link")).unwrap();
-    for path in ["src/same", "src/different", "dst/same", "dst/different"] {
-        set_mtime(&t.path(path), 1_600_000_000);
-    }
-    let before = fs::metadata(t.path("dst/different")).unwrap();
-    let out = native_syq(&[
-        "cp",
-        "--verify-only",
-        "--stats",
-        "--srcs-in",
-        &t.s("src"),
-        "--into",
-        &t.s("dst"),
-        "--results",
-        &t.s("results"),
-    ]);
-    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
-    assert!(stderr_of(&out).contains("DIFFERS"));
-    assert!(stderr_of(&out).contains("MISSING"));
-    assert_eq!(read(&t.path("dst/different")), b"BBBB");
-    assert_eq!(read(&t.path("dst/extra")), b"extra");
-    assert!(!t.path("dst/missing").exists());
-    assert!(!t.path("dst/empty").exists());
-    assert_eq!(
-        fs::read_link(t.path("dst/link")).unwrap(),
-        Path::new("different")
-    );
-    let after = fs::metadata(t.path("dst/different")).unwrap();
-    assert_eq!(
-        (before.ino(), before.mtime(), before.mode()),
-        (after.ino(), after.mtime(), after.mode())
-    );
-    let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results"))
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../schemas/automation.schema.json")).unwrap();
-    let validator = jsonschema::validator_for(&schema).unwrap();
-    for record in &records {
-        assert!(
-            validator.is_valid(record),
-            "invalid verification record: {record}"
-        );
-    }
-    assert_eq!(records[0]["verify_only"], true);
-    let result = records.last().unwrap();
-    assert_eq!(result["status"], "partial");
-    assert_eq!(result["files_transferred"], 0);
-    assert_eq!(result["bytes_transferred"], 0);
-    assert_eq!(result["files_unchanged"], 1);
-    assert_eq!(result["bytes_unchanged"], 4);
-    assert_eq!(result["directories_created"], 0);
-    assert_eq!(result["symlinks_created"], 0);
-    assert!(!records.iter().any(|r| r["type"] == "operation_result"));
-
-    // Filtering is selection, not verification of the entire destination tree.
-    let filtered = native_syq(&[
-        "cp",
-        "--verify-only",
-        "--ignore",
-        "different",
-        "--ignore",
-        "missing",
-        "--ignore",
-        "empty",
-        "--ignore",
-        "link",
-        "--srcs-in",
-        &t.s("src"),
-        "--into",
-        &t.s("dst"),
-    ]);
-    assert_output_ok(&filtered);
-
-    // A missing destination container must not be created, even for an exact placement.
-    for placement in ["--into", "--as"] {
-        let out = native_syq(&[
+fn dry_run_hash_compares_contents_and_metadata_without_writing() {
+    for route in [
+        "local", "push-tcp", "push-ssh", "pull-tcp", "pull-ssh", "relay",
+    ] {
+        let t = Tmp::new();
+        for (name, source, destination) in [
+            ("same", b"same".as_slice(), Some(b"same".as_slice())),
+            ("corrupt", b"aaaa", Some(b"bbbb".as_slice())),
+            ("metadata", b"bytes", Some(b"bytes".as_slice())),
+            ("missing", b"new", None),
+            ("size", b"new", Some(b"old data".as_slice())),
+            ("ignored", b"x", Some(b"z".as_slice())),
+        ] {
+            write(&t.path(&format!("src/{name}")), source);
+            set_mtime(&t.path(&format!("src/{name}")), 1_700_000_000);
+            if let Some(bytes) = destination {
+                write(&t.path(&format!("dst/{name}")), bytes);
+                set_mtime(&t.path(&format!("dst/{name}")), 1_700_000_000);
+            }
+        }
+        fs::set_permissions(t.path("src/metadata"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(t.path("dst/metadata"), fs::Permissions::from_mode(0o600)).unwrap();
+        set_mtime(&t.path("dst/metadata"), 1_700_000_001);
+        let before = fs::metadata(t.path("dst/metadata")).unwrap();
+        let rsh = fake_rsh(&t);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
             "cp",
-            "--verify-only",
-            &t.s("src"),
-            placement,
-            &t.s("absent"),
+            "--dry-run",
+            "--hash",
+            "--preserve=permissions",
+            "--ignore=ignored",
+            "--performance-tuning=workers=2",
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--tcp-ports",
+            EPHEMERAL_TCP_PORTS,
         ]);
-        assert!(!out.status.success());
-        assert!(!t.path("absent").exists());
+        if route.ends_with("ssh") {
+            command.arg("--no-tcp");
+        }
+        if route.starts_with("pull") || route == "relay" {
+            command.args(["--from", "source"]);
+        }
+        command.args(["--srcs-in", &t.s("src")]);
+        if route.starts_with("push") || route == "relay" {
+            command.args(["--to", "destination"]);
+        }
+        if route == "relay" {
+            command.args(["--coordinate-at", "local"]);
+        }
+        command.args([
+            "--into",
+            &t.s("dst"),
+            "--results",
+            &t.s("result.ndjson"),
+            "-v",
+        ]);
+        let output = command.run().unwrap();
+        assert_output_ok(&output);
+        let text = fs::read_to_string(t.path("result.ndjson")).unwrap();
+        assert_automation_stream(&automation_validator(), &text, route);
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let summary = records.last().unwrap();
+        assert_eq!(summary["files_transferred"], 3, "{route}: {summary}");
+        assert_eq!(summary["bytes_transferred"], 10, "{route}: {summary}");
+        assert_eq!(summary["files_unchanged"], 2, "{route}: {summary}");
+        assert_eq!(summary["bytes_unchanged"], 9, "{route}: {summary}");
+        assert_eq!(
+            summary["files_excluded"], 0,
+            "ignore exclusions use paths_ignored"
+        );
+        assert!(!records.iter().any(|r| r["type"] == "operation_result"));
+        for (name, reason, bytes) in [
+            ("corrupt", "content_differs", Some(4)),
+            ("size", "content_differs", Some(3)),
+            ("missing", "destination_missing", Some(3)),
+            ("metadata", "metadata_differs", None),
+        ] {
+            let trace = records
+                .iter()
+                .find(|r| r["type"] == "trace" && r["dst"]["value"] == name)
+                .unwrap();
+            assert_eq!(trace["reason"], reason, "{route}: {trace}");
+            assert_eq!(trace.get("bytes").and_then(|b| b.as_u64()), bytes);
+        }
+        assert!(!records.iter().any(|r| r["type"] == "trace"
+            && ["same", "ignored"].contains(&r["dst"]["value"].as_str().unwrap_or(""))));
+        assert_eq!(read(&t.path("dst/corrupt")), b"bbbb");
+        assert_eq!(read(&t.path("dst/size")), b"old data");
+        assert_eq!(read(&t.path("dst/ignored")), b"z");
+        assert!(!t.path("dst/missing").exists());
+        let after = fs::metadata(t.path("dst/metadata")).unwrap();
+        assert_eq!(
+            (after.ino(), after.mode(), after.mtime(), after.mtime_nsec()),
+            (
+                before.ino(),
+                before.mode(),
+                before.mtime(),
+                before.mtime_nsec()
+            )
+        );
+        assert!(partial_files(&t.0).is_empty());
+    }
+}
+
+#[test]
+fn dry_run_hash_mapping_reports_source_names_and_timestamp_only_changes() {
+    let t = Tmp::new();
+    write(&t.path("src/input"), b"abc");
+    write(&t.path("output"), b"abc");
+    set_mtime(&t.path("src/input"), 1_700_000_000);
+    set_mtime(&t.path("output"), 1_700_000_001);
+    for hash in [false, true] {
+        let results = t.s(if hash { "hash.ndjson" } else { "quick.ndjson" });
+        let mapping = expected_mapping(&t, "input", "output", None);
+        let source = t.s("src");
+        let destination = t.s("");
+        let mut args = vec![
+            "cp",
+            "--dry-run",
+            "--mapping",
+            &mapping,
+            "-C",
+            &source,
+            "--into",
+            &destination,
+            "--results",
+            &results,
+        ];
+        if hash {
+            args.push("--integrity-checking=compare=md5");
+        }
+        let output = native_syq(&args);
+        assert_output_ok(&output);
+        let records: Vec<serde_json::Value> = fs::read_to_string(results)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let trace = records
+            .iter()
+            .find(|r| r["type"] == "trace" && r["kind"] == "file")
+            .unwrap();
+        assert_eq!(trace["src"]["value"], "input");
+        assert_eq!(trace["dst"]["value"], "output");
+        assert_eq!(trace["reason"], "metadata_differs");
+        assert_eq!(
+            trace.get("bytes").and_then(|b| b.as_u64()),
+            if hash { None } else { Some(3) }
+        );
+        assert_eq!(
+            records.last().unwrap()["files_transferred"],
+            u64::from(!hash)
+        );
+        assert_eq!(records.last().unwrap()["files_unchanged"], u64::from(hash));
+        assert_eq!(
+            fs::metadata(t.path("output")).unwrap().mtime(),
+            1_700_000_001
+        );
     }
 }

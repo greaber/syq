@@ -1,4 +1,7 @@
 //! Exercise the actual Cargo build script in isolated source directories.
+#[path = "support/temp.rs"]
+mod test_support;
+
 #[allow(dead_code)]
 #[path = "../build.rs"]
 mod build_script;
@@ -13,7 +16,7 @@ fn emit_build_script() {
 #[test]
 fn packaged_provenance_and_helper_selection() {
     use std::{fs, process::Command};
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::tempdir().unwrap();
     let package = root.path().join("package");
     fs::create_dir(&package).unwrap();
     fs::write(

@@ -2,7 +2,11 @@
 
 See [`syq persist`](commands/persist.md) for the option list.
 
-For everyday setup, start with [Send files home from a server](receive.md).
+Persistence keeps SSH logins open for reuse. Receiving adds three uses for
+those connections: copying files to your laptop, running commands on it, and
+authorizing copies between servers with its SSH access. Start with
+[Use your laptop from a server](receive.md) for setup and links
+to all three workflows.
 
 ## Names and profiles
 
@@ -78,9 +82,9 @@ Unix filename bytes.
 ## Copy limits
 
 Copies support directories, symlinks, modification times, filters, hashing,
-resume, mappings, `--preserve=permissions`, `--verify-only`, and the
+resume, mappings, `--preserve=permissions`, and the
 [overwrite policies](reference.md#choose-which-existing-files-to-update).
-Ownership and special-file preservation, `--inplace`, and `--min-size` are
+Ownership preservation, special-file preservation, and `--inplace` are
 unsupported. Timestamp comparisons trust the source's reported modification
 times.
 

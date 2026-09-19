@@ -273,13 +273,13 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client.cp("source", to="backup", auth_from="@laptop", into="out")
         argv = self.argv()
         self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
-        with self.assertRaises(syq.SyqInvocationError):
-            await self.client.cp("source", to="backup", auth_from="ssh", via="laptop", into="out")
+        with self.assertRaises(TypeError):
+            await self.client.cp("source", to="backup", via="laptop", into="out")
 
     async def test_cp_can_request_permission_via_a_return_connection(self) -> None:
-        await self.client.cp("source", to="backup", via="@laptop", into="out")
+        await self.client.cp("source", to="backup", auth_from="@laptop", into="out")
         argv = self.argv()
-        self.assertEqual(argv[argv.index("--via") + 1], "@laptop")
+        self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
 
     async def test_cp_forwards_native_remote_controls(self) -> None:
         await self.client.cp(

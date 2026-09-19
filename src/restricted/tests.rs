@@ -1187,7 +1187,7 @@ fn prepare_request(path: &Path) -> Request {
 
 fn finalize_request(path: &Path, condition: proto::TargetCondition) -> Request {
     Request::Finalize {
-        expected_digest: None,
+        expected_hash: None,
         path: path_bytes(path),
         inplace: false,
         copy_id: [1; 16],
@@ -1970,7 +1970,7 @@ fn signed_skip_policy_retains_preexisting_objects() {
     // Content repair of a pre-existing file is refused; deletion remains
     // governed by the separately signed deletion policy.
     let mut finish = Request::FinishBasis {
-        expected_digest: None,
+        expected_hash: None,
         path: path_bytes(&kept),
         copy_id: [1; 16],
         meta: plain_meta(),
@@ -2059,7 +2059,7 @@ fn signed_must_exist_policy_creates_nothing() {
     assert!(authority.authorize(&mut create_link, false).is_err());
 
     let mut finish = Request::FinishBasis {
-        expected_digest: None,
+        expected_hash: None,
         path: path_bytes(&present),
         copy_id: [1; 16],
         meta: plain_meta(),
@@ -2256,7 +2256,7 @@ fn must_exist_pins_update_only_operations() {
     authority.authorize(&mut same, false).unwrap();
     assert_eq!(op_condition(&same), expected);
     let mut finish = Request::FinishBasis {
-        expected_digest: None,
+        expected_hash: None,
         path: path_bytes(&present),
         copy_id: [1; 16],
         meta: plain_meta(),
@@ -2941,7 +2941,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
     let settlement = finished.authorize(&mut prepare, false).unwrap();
     finished.settle(settlement, &proto::Response::Ok);
     let mut finalize = Request::Finalize {
-        expected_digest: None,
+        expected_hash: None,
         path: path_bytes(&image),
         inplace: true,
         copy_id: [2; 16],
@@ -3866,7 +3866,7 @@ fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
     let expected = Digest::hash_bytes(HashAlgorithm::Sha256, b"data");
     authority.hashing = Some(CopyHashing {
         policy,
-        expected_digest: Some(expected.clone()),
+        expected_hash: Some(expected.clone()),
     });
     let mut accepted = Request::ConfigureHashing(policy);
     authority.authorize(&mut accepted, false).unwrap();
@@ -3877,7 +3877,7 @@ fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
     });
     assert!(authority.authorize(&mut changed, false).is_err());
     let mut finish = Request::FinishBasis {
-        expected_digest: None,
+        expected_hash: None,
         path: path_bytes(&target),
         copy_id: [1; 16],
         meta: plain_meta(),
@@ -3887,7 +3887,7 @@ fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
     };
     authority.authorize(&mut finish, false).unwrap();
     assert!(
-        matches!(finish, Request::FinishBasis { expected_digest: Some(ref value), .. } if *value == expected)
+        matches!(finish, Request::FinishBasis { expected_hash: Some(ref value), .. } if *value == expected)
     );
     assert!(authority.authorize(&mut small_put(&target), false).is_err());
 }
@@ -4101,7 +4101,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         .authorize(&mut prepare("empty", 0), false)
         .unwrap();
     let mut publish_empty = Request::Finalize {
-        expected_digest: None,
+        expected_hash: None,
         path: root.join("target/empty").as_os_str().as_bytes().to_vec(),
         inplace: false,
         copy_id: [1; 16],
@@ -4119,7 +4119,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
     authority.authorize(&mut publish_empty, false).unwrap();
     // A file never declared under this grant cannot be published.
     let mut publish_foreign = Request::Finalize {
-        expected_digest: None,
+        expected_hash: None,
         path: root.join("target/foreign").as_os_str().as_bytes().to_vec(),
         inplace: false,
         copy_id: [9; 16],

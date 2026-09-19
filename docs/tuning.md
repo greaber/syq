@@ -6,6 +6,10 @@ Leave performance tuning unset for everyday copies. These experimental controls
 are available in `syq cp` and `syq rsync`; `syq rm` and `syq clean-partials` accept
 only `workers` for filesystem removal.
 
+Performance-tuning keys, accepted values, and behavior may change or be removed
+between releases without deprecation. Pin the syq version when a script depends
+on these overrides.
+
 ## Transfer controls
 
 `syq cp` and `syq rsync` accept `--performance-tuning`. Supply
@@ -24,7 +28,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `request-size` | Hash block size (normally 4 MiB) for ordinary requests; at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
 | `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
-| `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
+| `batch-files` | Up to 2048, sharing queued files across active workers | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
 | `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
 | `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--resource-limits bandwidth=RATE` |
@@ -64,8 +68,8 @@ copies, an explicit part size also selects the multipart threshold, capped at
 5 GiB. Without an explicit part limit, server-side copies can use the shared
 request budget's full tuning range.
 
-See [S3 parallelism](object-storage.md#s3-options) for memory use and buffering
-limits. S3 tuning is not saved between runs.
+For S3 streams, see [Descriptor copies](object-storage.md#descriptor-copies)
+for buffering and upload-size limits. S3 tuning is not saved between runs.
 
 <a id="s3-streams"></a>
 
@@ -172,4 +176,4 @@ Use the same reporting options and fresh destinations for each run.
 Prefer `-v`; `--stats` can change which copy optimizations run.
 With overrides, `-v` reports effective settings and a final
 `syq: tuning observed:` diagnostic. Check elapsed time, exit status, and copied
-contents. See [Speed](speed.md#quick-comparison) for the benchmark script.
+contents. See [Quick comparison](speed.md#quick-comparison) for the benchmark script.

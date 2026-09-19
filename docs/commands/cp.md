@@ -8,7 +8,7 @@ syq cp --srcs-in project --to server --into backup --dry-run -v
 ```
 
 Put source selectors and `--mapping` before `--to` or a placement option.
-For scripting, see [environment variables](../reference.md#environment-variables-and-local-files)
+For scripting, see [environment variables](../environment.md)
 and [results](../automation.md).
 
 <!-- CLI: cp -->
@@ -17,6 +17,8 @@ syq cp [OPTIONS] SOURCE... [PLACEMENT]
 syq cp [OPTIONS] --src-fd FD --as PATH
 syq cp [OPTIONS] SOURCE --as-fd FD
 ```
+
+<a id="sources-and-selection"></a>
 
 ## Sources and filtering
 
@@ -35,9 +37,9 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--srcs <PATH>...` | Select several named source objects |
 | `--ignore <PATTERN>` | Skip paths matching a gitignore-style pattern (repeatable) |
 | `--ignore-from <FILE>` | Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order) |
-| `--max-size <SIZE>` | Skip regular source files larger than SIZE; --prune protects their destination paths |
-| `--min-size <SIZE>` | Skip regular source files smaller than SIZE; --prune protects their destination paths |
 | `[PATH]...` | Named source objects (shorthand for --src) |
+
+<a id="destination-placement"></a>
 
 ## Destination and mapping
 
@@ -53,6 +55,8 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--as-existing <PATH>` | Map one named source exactly to PATH; its final entry must exist and is never followed |
 | `--mapping <FILE>` | Copy the entries of a local NDJSON mapping manifest (`-` reads stdin), acquired before destination changes, instead of selecting sources; entry src paths are relative to -C and dst paths are relative to the --into container |
 
+<a id="copy-policy-and-filtering"></a>
+
 ## Updates and deletion
 
 | Argument / option | Meaning |
@@ -61,7 +65,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--only-existing` | Update only entries already present; create no missing entries or directories |
 | `--skip-newer` | Skip regular files newer at the destination; non-directory type replacements still occur |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
-| `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored and size-excluded source paths remain protected |
+| `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
 | `--max-delete <N>` | With --prune, refuse all removals if more than N are planned |
 
 ## Metadata and symlinks
@@ -73,14 +77,18 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
 | `--preserve <FEATURE>` | Preserve times, permissions or ownership, or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- times: Preserve modification times (already the default for named destinations)<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files |
 
+<a id="integrity-checking"></a>
+
 ## Verification
 
 | Argument / option | Meaning |
 |---|---|
 | `--hash` | Hash existing source and destination files instead of trusting size and modification time |
-| `--expected-hash <ALGORITHM:HEX>` | Require one regular file to match ALGORITHM:HEX |
-| `--verify-only` | Compare selected contents without writing; fail on differences or inspection errors |
 | `--integrity-checking <KEY=VALUE,...>` | [Comparison and transfer checksums](../integrity-checking.md) |
+
+<a id="ssh-and-transport"></a>
+
+<a id="remote-to-remote-transfers"></a>
 
 ## Connections and remote execution
 
@@ -89,9 +97,8 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--no-compress` | Disable transport compression |
 | `--receiver-max-entries <N>` | Command-restricted receiver ceiling: refuse to touch more than N destination entries |
 | `--receiver-max-bytes <SIZE>` | Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total |
-| `--receiver-receipt <DETAIL>` | Command-restricted receiver receipt detail: final sizes (default) or also final BLAKE3 file digests<br><br>Possible values:<br>- sizes: Final type and size of every path the transfer could have changed<br>- digests: Sizes plus a closure-time BLAKE3 digest of every regular file |
+| `--receiver-receipt <DETAIL>` | Command-restricted receiver receipt detail: final sizes (default) or also final BLAKE3 file hashes<br><br>Possible values:<br>- sizes: Final type and size of every path the transfer could have changed<br>- hashes: Sizes plus a closure-time BLAKE3 hash of every regular file |
 | `--auth-from <auto\|ssh\|@NAME>` | Authorize with a live receiving machine, or use SSH from this machine (default: auto) |
-| `--via <@NAME>` | Alias for --auth-from @NAME |
 | `--coordinate-at <COORDINATE_AT>` | Choose the endpoint that runs the coordinator<br><br>Possible values:<br>- auto: Run locally unless both endpoints are remote, then run at the source<br>- src: Run the coordinator at the source endpoint<br>- dst: Run the coordinator at the destination endpoint<br>- local: Keep the coordinator on the invoking machine and relay the data there<br><br>[default: auto] |
 | `--rsh <COMMAND>` | Remote shell command (default: ssh); the command owns SSH and agent policy when set |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
@@ -113,12 +120,20 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--s3-profile <NAME>` | AWS shared configuration/credentials profile |
 | `--s3-header <NAME: VALUE>` | Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused) |
 
+<a id="performance-tuning"></a>
+
+<a id="resource-limits"></a>
+
 ## Performance and resource limits
 
 | Argument / option | Meaning |
 |---|---|
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
 | `--resource-limits <KEY=VALUE,...>` | [Bandwidth and concurrency ceilings](../resource-limits.md) |
+
+<a id="progress-and-results"></a>
+
+<a id="preview-and-output"></a>
 
 ## Preview, progress, and results
 
@@ -144,21 +159,88 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 <!-- /CLI -->
 
+## Update policies
+
+`--into-existing` requires the destination directory to exist but allows new
+files inside it. `--only-existing` skips missing destination entries and
+subdirectories instead of adding them.
+
+`--only-new` can add children to an existing directory, but does not change
+that directory's permissions to make it writable. `--skip-newer` compares
+timestamps only for
+regular-file pairs; it does not prevent other entry-type replacements.
+
+`--only-new` cannot combine with `--only-existing` or `--skip-newer`.
+`--only-existing` conflicts with `--into-new` and `--as-new`, which require
+the destination to be absent.
+
+`--only-new` and `--skip-newer` cannot combine with `--inplace`: an interrupted
+write could leave a file that a retry skips. Restricted receivers also reject
+`--only-existing --inplace` and `--as-new --inplace`, because direct writes do
+not enforce those destination conditions. S3 and named receiving destinations
+do not support `--inplace`; see [Copy limits](../persistence-reference.md#copy-limits).
+
+These policies do not disable requested pruning. Descriptor-specific
+restrictions are listed under [file descriptors](#file-descriptors).
+
+## Pruning
+
+`--prune` deletes only within the copied directories, after copying succeeds.
+Ignored paths, syq partial files, and recovery entries are
+kept. This also keeps their parent directories; extra hard links to copied
+files may be kept too. An interruption during deletion can leave some extras
+already removed.
+
+Keep the source outside the destination. Syq detects overlap locally and for
+remote paths using the same host name, user, and port. Different SSH aliases
+or shared storage can hide overlap from this check. Wait for other copies
+into the destination to finish before pruning, so their new files are not
+deleted as extras.
+
+## Filename and type conflicts
+
+If the source has both `Report.txt` and `report.txt`, a case-insensitive
+destination cannot store both. Syq does not check for that before copying,
+and one file can replace the other. The same problem applies to distinct
+Unicode spellings that the destination treats as one name. Rename the source
+entries or use a destination that can distinguish them. Unsupported names
+are reported as copy errors.
+
+Syq refuses replacements between directories and non-directories, including
+empty directories. Move or remove the conflicting destination before retrying.
+Other replacements can fail if the filesystem lacks the operation needed to
+replace an entry safely; the old entry is kept.
+
+## Capacity checks
+
+For missing or empty filesystem destinations, syq checks available bytes and
+capacity for new files when the filesystem reports them. A clear shortage
+fails before copying. Updates to populated destinations do not use this whole-copy
+estimate: existing data may be reused or replaced. Allocation errors still
+fail the affected copy.
+
+## Metadata details
+
+Source setuid, setgid, and sticky bits are not copied without
+`--preserve=permissions`. Ownership uses numeric IDs. On macOS, an existing
+destination directory must be readable before syq can temporarily repair
+missing write or search permission.
+
+Modification times are preserved for named file destinations. Output
+descriptors require explicit `--preserve=times`; see below.
+
 ## File descriptors
 
-Connect a copy to another program without saving its output in a temporary
-file. For example, compress while uploading, or decompress while downloading:
+`--src-fd 0` reads stdin; `--as-fd 1` writes stdout. Use them to connect local,
+SSH, or S3 copies to other programs; see
+[Shell pipelines and file descriptors](../reference.md#shell-pipelines-and-file-descriptors).
+Bash process substitution also works with ordinary source syntax:
 
 ```sh
-gzip -c data | syq cp --src-fd 0 --to server --as data.gz
-syq cp --from server data.gz --as-fd 1 | gzip -dc > data
+syq cp --src <(gzip -c data) --to server --as data.gz
 ```
 
-`--src-fd 0` reads stdin; `--as-fd 1` writes stdout. The file can also be local
-or in S3. Bash process substitution works with ordinary source syntax:
-`syq cp --src <(gzip -c data) --to server --as data.gz`.
 Paths such as `/dev/fd/63` refer to descriptors in the local syq process.
-Small writes can be forwarded without filling a transfer block.
 
 Each stream copy takes one source. Stdin and process substitution have no
 filename, so use `--as` to choose one, or `--as-fd` to write to a descriptor.
@@ -179,7 +261,7 @@ If the producer fails halfway through, syq can still successfully save the
 bytes it received: EOF does not tell it whether the producer succeeded.
 Bash's `set -o pipefail` detects failures in a pipeline but cannot undo a file
 already saved. Process substitution needs a separate check of the producer's
-status. In Python, [managed streams](../python-reference.md) let you commit
+status. In Python, [managed streams](https://greaber.github.io/syq/python-reference.html#byte-streams) let you commit
 only after your producer succeeds.
 
 An output descriptor may contain incomplete data after a failure. Check syq's
@@ -191,23 +273,9 @@ destination.
 
 Progress, `--stats`, and `-v` go to stderr, leaving stdout for payload.
 Statistics report bytes, elapsed time, and average rate; pipe lengths are
-unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput
-or an [expected hash](../integrity-checking.md#expected-digests) to check bytes
-during transfer without a second read.
+unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput.
 
-`--min-size` and `--max-size` can select a named file or S3 object before reading
-its contents. With a regular-file `--src-fd`, they use the bytes remaining from
-the current offset. A size-filtered skip succeeds and leaves input unread.
-These options require a known length, so pipes, sockets, and devices are rejected
-before reading; syq does not buffer a stream to discover its size.
-
-Native streams accept `request-size`, `pipeline-depth`, and `bw-pacing` tuning.
-S3 uses its [multipart controls](../object-storage.md#descriptor-copies).
-Filesystem streams use parallel data workers over SSH or encrypted TCP, with
-automatic worker tuning as in regular-file copies. `workers=N` fixes the worker
-count; `--no-tcp` keeps data on SSH. S3 transfers one object, with concurrent
-parts. Restart recovery, named receiving destinations, detached execution,
-directory selection, and content comparison are unsupported.
+<a id="selection-and-previews"></a>
 
 `--only-new` skips a destination that exists; `--only-existing` skips one that
 is missing. Existing directories, S3 key prefixes, and dangling symlinks also
@@ -219,8 +287,21 @@ opening a named FIFO. A shell producer can therefore receive SIGPIPE; in Python,
 Use `--dry-run` to check source and destination placement without reading input,
 opening a named pipe, or changing the destination. It cannot check a payload
 hash or predict the length of a pipe. `--results` and `--results-fd` report
-[stream outcomes](../automation.md#stream_result) separately from payload;
+[`stream_result`](../automation.md#stream_result) records separately from payload;
 results and payload/completion descriptors must differ.
+
+### Transport and limits
+
+Filesystem streams use parallel data workers over SSH or encrypted TCP, with
+automatic worker tuning as in regular-file copies. They accept `workers`,
+`request-size`, `pipeline-depth`, and `bw-pacing` tuning; `workers=N` fixes the
+worker count, and `--no-tcp` keeps data on SSH. S3 transfers one object using
+multipart controls; see [Descriptor copies](../object-storage.md#descriptor-copies).
+
+Restart recovery, named receiving destinations, detached execution,
+directory selection, and content comparison are unsupported.
+
+### Descriptor offsets and metadata
 
 Other inherited descriptors work too, except 2, which is reserved for
 diagnostics. Dedicate each descriptor to the copy. Syq advances its offset,
@@ -247,7 +328,7 @@ Input pipes, sockets, and devices have no payload metadata, so they reject
 `--skip-newer` and `--preserve`. Their new named destinations use `0666` limited
 by the umask and the time of the write; existing files keep their permissions.
 Output pipes likewise cannot preserve times, permissions, or ownership. Parent
-directories are created as needed. The usual
-[symlink rules](../reference.md#symlinks) and source `--cwd` / `--root` options
-apply, but `--root` cannot confine a descriptor that is already open. Named remote
+directories are created as needed. The source `--cwd` / `--root` options
+apply, but `--root` cannot confine a descriptor that is already open. Symlink
+handling is unchanged; see [Symlinks](../reference.md#symlinks). Named remote
 sources must be regular files.

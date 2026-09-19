@@ -16,6 +16,20 @@ def run(argv, *, data=None, expected=0):
     return result
 
 
+def matching_preview(argv, *, data, files):
+    with tempfile.TemporaryDirectory(prefix="syq-mapping-preview-") as temporary:
+        path = Path(temporary) / "results.ndjson"
+        run(argv + ["--dry-run", "--hash", "--results", str(path)], data=data)
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        terminal = records[-1]
+        assert terminal["type"] == "result" and terminal["status"] == "success", records
+        assert terminal["dry_run"] and terminal["errors"] == 0, terminal
+        assert terminal["files_unchanged"] == files, terminal
+        assert terminal["files_transferred"] == 0, terminal
+        assert terminal["symlinks_created"] == terminal["specials_created"] == 0, terminal
+        assert not any(r["type"] == "trace" and r.get("bytes") is not None for r in records), records
+
+
 def ssh(host, script):
     return run(["ssh", host, "python3 -c " + shlex.quote(script)])
 
@@ -25,7 +39,7 @@ def manifest(entries, expected=None):
     for src, dst, kind in entries:
         record = {"src": {"encoding": "utf-8", "value": src}, "dst": {"encoding": "utf-8", "value": dst}, "kind": kind}
         if expected is not None:
-            record["expected_digest"] = expected
+            record["expected_hash"] = expected
         records.append(json.dumps(record) + "\n")
     return "".join(records).encode()
 
@@ -41,20 +55,32 @@ def hashing(root, source, temporary):
     for name, flags in [("encrypted", []), ("plain", ["--tcp-plain"])]:
         print(f"hash policy: ordinary {name} TCP", flush=True)
         destination = root + "/hash-" + name
-        command = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=1", str(local), "--to", "destination", "--as", destination,
+        command = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=1", "-C", str(local.parent), "--mapping", "-", "--to", "destination", "--into", root,
                    "--integrity-checking", "compare=xxh3-128", "--integrity-checking=transfer=blake3", "--performance-tuning", "copy-path=ranges"] + flags
-        run(command + ["--expected-hash", "sha256:" + sha256])
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "sha256", "value": sha256}))
         results = str(Path(temporary) / ("hash-repeat-" + name + ".ndjson"))
-        run(command + ["--expected-hash", "sha256:" + sha256, "--results", results])
+        run(command + ["--results", results], data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "sha256", "value": sha256}))
         summary = json.loads(Path(results).read_text().splitlines()[-1])
         assert summary["files_unchanged"] == 1 and summary["bytes_transferred"] == 0, summary
+        # Hash previews read both endpoints, retain mapping identities, and do not publish.
+        preview = str(Path(temporary) / ("hash-preview-" + name + ".ndjson"))
+        run(command + ["--dry-run", "--results", preview], data=manifest([(local.name, "hash-" + name, "file")]))
+        summary = json.loads(Path(preview).read_text().splitlines()[-1])
+        assert summary["files_unchanged"] == 1 and summary["files_transferred"] == 0, summary
+        ssh("destination", f"from pathlib import Path; import os; p=Path({destination!r}); m=p.stat(); p.write_bytes(b'x'*{len(payload)}); os.utime(p, ns=(m.st_atime_ns,m.st_mtime_ns))")
+        preview = str(Path(temporary) / ("hash-preview-changed-" + name + ".ndjson"))
+        run(command + ["--dry-run", "--results", preview], data=manifest([(local.name, "hash-" + name, "file")]))
+        records = [json.loads(line) for line in Path(preview).read_text().splitlines()]
+        assert records[-1]["files_transferred"] == 1 and records[-1]["status"] == "success", records
+        assert any(r["type"] == "trace" and r["reason"] == "content_differs" and r["src"]["value"] == local.name for r in records), records
+        ssh("destination", f"from pathlib import Path; assert Path({destination!r}).read_bytes()==b'x'*{len(payload)}")
         # compare=xxh3-128 checks the existing file with the selected algorithm.
-        run(command + ["--expected-hash", "md5:" + md5])
-        run(command + ["--expected-hash", "md5:" + wrong_md5], expected=23)
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "md5", "value": md5}))
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "md5", "value": wrong_md5}), expected=23)
         ssh("destination", f"from pathlib import Path; import hashlib; assert hashlib.sha256(Path({destination!r}).read_bytes()).hexdigest()=={sha256!r}")
         # A changed target must remain intact when staged validation fails.
         ssh("destination", f"from pathlib import Path; Path({destination!r}).write_bytes(b'keep existing')")
-        run(command + ["--expected-hash", "md5:" + wrong_md5], expected=23)
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "md5", "value": wrong_md5}), expected=23)
         ssh("destination", f"from pathlib import Path; assert Path({destination!r}).read_bytes()==b'keep existing'")
 
     print("hash policy: signed mapping with independent expected digest", flush=True)
@@ -135,7 +161,7 @@ def direct():
             run(command + ["--preserve=permissions,ownership"], data=denied_manifest, expected=23)
             ssh("destination", f"from pathlib import Path; assert (Path({destination!r})/'file').read_bytes()==b'ordinary mapping'")
         destination = root + "/tcp"
-        run(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--verify-only"], data=contents)
+        matching_preview(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--coordinate-at", "local"], data=contents, files=1)
         # Selection uses source mtimes; --only-existing remains independently enforced.
         ssh("destination", f"from pathlib import Path; import os; p=Path({destination!r})/'nested'/'renamed'; p.write_bytes(b'newer destination'); os.utime(p,(1700000000,1700000000))")
         updating = manifest([("file", "nested/renamed", "file"), ("file", "nested/missing", "file")])
@@ -214,7 +240,7 @@ def named():
     contents = manifest([("message.txt", "nested/renamed", "file")])
     prefix = ["syq", "cp", "--no-progress", "-C", source, "--mapping", "-", "--to", "@laptop", "--into", "mapped-return"]
     run(prefix, data=contents)
-    run(prefix + ["--verify-only"], data=contents)
+    matching_preview(prefix, data=contents, files=1)
     run(prefix + ["--skip-newer", "--only-existing"], data=contents)
     # Here the source-side caller receives coordinator operation records, so
     # a parent obstruction must produce a retryable per-entry failure too.
@@ -226,7 +252,7 @@ def named():
         failed = [r for r in records if r.get("disposition") == "failed"]
         assert [(r["src"]["value"], r["dst"]["value"]) for r in failed] == [("message.txt", "nested/renamed/child")], failed
         assert records[-1]["status"] == "partial", records[-1]
-    run(prefix + ["--verify-only"], data=contents + manifest([("message.txt", "nested/good", "file")]))
+    matching_preview(prefix, data=contents + manifest([("message.txt", "nested/good", "file")]), files=2)
     print("Named mapping and timestamp selection passed", flush=True)
 
 

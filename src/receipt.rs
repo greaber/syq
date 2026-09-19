@@ -944,7 +944,7 @@ pub(crate) fn emit_automation_records(
                         let fields = object.as_object_mut().expect("final object is an object");
                         if let Some(digest) = digest {
                             fields.insert(
-                                "digest".into(),
+                                "hash".into(),
                                 serde_json::json!({
                                     "algorithm": "blake3",
                                     "value": encode_hex(&digest),
@@ -1201,7 +1201,7 @@ fn verify_stream(stream: &mut File, terminal: &TerminalReceipt) -> Result<()> {
         || terminal.content_digest_algorithm
             != terminal.policy.hashed.then_some(DigestAlgorithm::Blake3)
     {
-        bail!("receipt schema or digest algorithms are inconsistent with its policy");
+        bail!("receipt schema or hash algorithms are inconsistent with its policy");
     }
     if terminal.record_count > terminal.policy.max_records
         || terminal.plaintext_bytes > terminal.policy.max_plaintext_bytes
@@ -1266,7 +1266,7 @@ fn verify_stream(stream: &mut File, terminal: &TerminalReceipt) -> Result<()> {
         bail!("receipt final-state coverage does not match its touched-path count");
     }
     if *hasher.finalize().as_bytes() != terminal.stream_digest {
-        bail!("receipt stream does not match its signed digest");
+        bail!("receipt stream does not match its signed hash");
     }
     if summary != terminal.summary {
         bail!("receipt summary does not match its record stream");

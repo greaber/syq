@@ -55,7 +55,7 @@
           "const": "syq.automation"
         },
         "schema_version": {
-          "const": 1
+          "const": 2
         },
         "seq": {
           "$ref": "#/$defs/u64"
@@ -169,10 +169,6 @@
         },
         "mode": {
           "const": "cp"
-        },
-        "verify_only": {
-          "type": "boolean",
-          "description": "Compare-only copy; absent means false."
         },
         "prune": {
           "type": "boolean"
@@ -496,8 +492,8 @@
         "code": {
           "$ref": "#/$defs/receiptCode"
         },
-        "expected_digest": {
-          "$ref": "#/$defs/expectedDigest"
+        "expected_hash": {
+          "$ref": "#/$defs/expectedHash"
         },
         "metadata": {
           "$ref": "#/$defs/destinationMetadata"
@@ -1102,7 +1098,7 @@
                   ],
                   "additionalProperties": false
                 },
-                "digest": {
+                "hash": {
                   "type": "object",
                   "properties": {
                     "algorithm": {
@@ -1868,7 +1864,7 @@
       ],
       "additionalProperties": false
     },
-    "expectedDigest": {
+    "expectedHash": {
       "type": "object",
       "properties": {
         "algorithm": {
@@ -1955,7 +1951,7 @@
           "const": "syq.automation"
         },
         "schema_version": {
-          "const": 1
+          "const": 2
         },
         "seq": {
           "$ref": "#/$defs/u64"
@@ -2004,7 +2000,7 @@
           "const": "syq.automation"
         },
         "schema_version": {
-          "const": 1
+          "const": 2
         },
         "seq": {
           "$ref": "#/$defs/u64"

@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 pub const SCHEMA: &str = "syq.automation";
-pub const SCHEMA_VERSION: u64 = 1;
+pub const SCHEMA_VERSION: u64 = 2;
 
 pub struct ResultsWriter {
     mapping_metadata: std::sync::OnceLock<
@@ -69,7 +69,6 @@ pub struct RunRecord<'a> {
     pub run_id: &'a str,
     pub started_at: i64,
     pub mode: &'static str,
-    pub verify_only: bool,
     /// Copy-only fields. Omitting them gives rm a distinct shape instead of
     /// assigning copy semantics to false values.
     pub prune: Option<bool>,
@@ -244,7 +243,6 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
         run_id: &run_id,
         started_at,
         mode: name,
-        verify_only: args.verify_only,
         prune,
         mapping,
         dry_run: args.dry_run,
@@ -355,9 +353,7 @@ impl ResultsWriter {
             "endpoints": endpoints,
         });
         let object = record.as_object_mut().expect("record is an object");
-        if run.verify_only {
-            object.insert("verify_only".into(), true.into());
-        }
+
         if let Some(prune) = run.prune {
             object.insert("prune".into(), prune.into());
         }
@@ -551,7 +547,7 @@ impl ResultsWriter {
         });
         let object = record.as_object_mut().expect("record is an object");
         if let Some(expected) = expected {
-            object.insert("expected_digest".into(), serde_json::json!(expected));
+            object.insert("expected_hash".into(), serde_json::json!(expected));
         }
         if let Some(metadata) = self
             .mapping_metadata

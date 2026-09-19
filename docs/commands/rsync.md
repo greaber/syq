@@ -9,7 +9,7 @@ syq rsync -av project/ server:backup/project/
 Check [Rsync compatibility](../rsync-compat.md) before replacing a script.
 Trailing slashes follow rsync's rules. Here `-h` means human-readable sizes;
 use `--help` for help. `SYQ_RSYNC_OPTIONS` supplies
-[extra arguments](../reference.md#environment-variables-and-local-files).
+[extra arguments](../environment.md).
 
 <!-- CLI: rsync -->
 ```text
@@ -37,11 +37,10 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-P` | Same as --progress --partial |
 | `--partial` | No-op accepted for rsync compatibility (syq always keeps partial files) |
 | `-c, --checksum` | Skip quick check; compare file contents block by block and repair differences |
-| `--syq-verify-only` | Syq extension: only compare source and destination contents; transfer nothing |
 | `--inplace` | Update files in place instead of writing a partial and renaming. Use this to modify a large existing file without copying it first (saves time and disk space when only part of it changes). Cannot be combined with -u or --ignore-existing: an interrupted in-place write leaves a newer-looking final file those filters would then skip forever |
 | `--syq-ignore <PATTERN>` | Syq extension: skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only at the source root, `foo/` only directories, `!pat` re-includes). Repeatable; together with --syq-ignore-from the patterns act like the lines of one .gitignore file, in command-line order, anchored at each source root. Skipping a directory skips its whole subtree, so to copy only *.jpg use: --syq-ignore '*' --syq-ignore '!*/' --syq-ignore '!*.jpg' |
 | `--syq-ignore-from <FILE>` | Syq extension: securely open and read ignore patterns from raw-byte FILE (one per line, # comments); repeatable |
-| `--delete` | Delete extraneous files from the destination directories (paths the source does not have). Deletion happens after the transfer and is skipped entirely if the source scan reported any error. Ignored paths (--syq-ignore) are protected on both sides. rsync's --delete-after and --delete-delay mean the same thing and are accepted. Cannot be combined with --syq-verify-only or --files-from |
+| `--delete` | Delete extraneous files from the destination directories (paths the source does not have). Deletion happens after the transfer and is skipped entirely if the source scan reported any error. Ignored paths (--syq-ignore) are protected on both sides. rsync's --delete-after and --delete-delay mean the same thing and are accepted. Cannot be combined with --files-from |
 | `--delete-excluded` | With --delete, also remove destination paths that the --syq-ignore patterns exclude |
 | `--max-delete <N>` | With --delete, refuse all deletions if more than N are planned (exit 25). Unlike positive rsync limits, this is atomic; 0 and -1 both prohibit deletion |
 | `-u, --update` | Skip regular files that are newer on the destination (directories, symlinks and specials are unaffected) |
@@ -93,7 +92,6 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | Argument / option | Meaning |
 |---|---|
 | `--integrity-checking <KEY=VALUE,...>` | [Comparison and transfer checksums](../integrity-checking.md) |
-| `--syq-expected-hash <ALGORITHM:HEX>` | Require one regular file to match ALGORITHM:HEX |
 
 ## Progress and results
 

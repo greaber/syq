@@ -30,7 +30,7 @@ fn rooted(dir: &Path) -> FsOps {
 
 #[test]
 fn mapping_keeps_batch_and_range_payload_allocations() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     for prefix in [false, true] {
         let ops = if prefix {
             rooted(dir.path())
@@ -94,7 +94,7 @@ fn mapping_keeps_batch_and_range_payload_allocations() {
 
 #[test]
 fn dispatch_validates_before_mapping_or_writing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let mut ops = FsOps::new();
     // Set only a prefix so mapping would fail if it ran before validation.
     ops.destination_prefix = Some(b"logical".to_vec());
@@ -112,7 +112,7 @@ fn dispatch_validates_before_mapping_or_writing() {
 
 #[test]
 fn invalid_later_batch_path_prevents_all_writes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let mut ops = rooted(dir.path());
     let mut request = Request::PutSmallBatch(vec![put(b"logical/valid"), put(b"outside/invalid")]);
     assert!(matches!(
@@ -124,7 +124,7 @@ fn invalid_later_batch_path_prevents_all_writes() {
 
 #[test]
 fn mapped_batch_preserves_hash_checks_conditions_and_publication() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let mut ops = rooted(dir.path());
     fs::write(dir.path().join("bad-hash"), b"old").unwrap();
     fs::write(dir.path().join("exists"), b"old").unwrap();
@@ -156,7 +156,7 @@ fn mapped_batch_preserves_hash_checks_conditions_and_publication() {
 
 #[test]
 fn guarded_batch_keeps_absolute_paths_and_rejects_mixed_authority() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let root = Root::open(dir.path()).unwrap();
     let identity = root.identity();
     let path = dir.path().join("guarded");
@@ -186,7 +186,7 @@ fn guarded_batch_keeps_absolute_paths_and_rejects_mixed_authority() {
 #[cfg(target_os = "linux")]
 #[test]
 fn optimistic_partial_batch_retries_only_the_rejected_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     fs::create_dir(dir.path().join("nested")).unwrap();
     let mut ops = rooted(dir.path());
     let root = ops.destination_root.as_ref().unwrap().clone();
@@ -221,7 +221,7 @@ fn optimistic_partial_batch_retries_only_the_rejected_file() {
 #[cfg(target_os = "linux")]
 #[test]
 fn ordinary_partial_planning_and_copy_do_not_query_name_limits() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     fs::create_dir(dir.path().join("nested")).unwrap();
     let mut ops = rooted(dir.path());
     let root = ops.destination_root.as_ref().unwrap().clone();
@@ -260,7 +260,7 @@ fn ordinary_partial_planning_and_copy_do_not_query_name_limits() {
 #[cfg(target_os = "linux")]
 #[test]
 fn optimistic_partial_reopens_legacy_short_name_across_workers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let name = "x".repeat(120);
     // Exact name produced at d695902d with NAME_MAX=143, logical/<120 x's>,
     // and copy id [9;16]. Keep this fixture independent of the new resolver.
@@ -330,7 +330,7 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
         flags: 0,
         condition: TargetCondition::Absent,
         guard: None,
-        expected_digest: None,
+        expected_hash: None,
     });
     assert!(matches!(reply, Response::Ok), "{reply:?}");
     assert_eq!(fs::read(dir.path().join(&name)).unwrap(), b"new data");
@@ -350,7 +350,7 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
 #[cfg(target_os = "linux")]
 #[test]
 fn learned_conservative_limit_does_not_change_a_successful_partial_name() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let ops = rooted(dir.path());
     let target = ops
         .rooted_destination_target("x".repeat(120).as_bytes(), None)
@@ -377,7 +377,7 @@ fn learned_conservative_limit_does_not_change_a_successful_partial_name() {
 #[cfg(target_os = "linux")]
 #[test]
 fn guarded_partials_keep_the_authoritys_exact_name_selection() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let root = Arc::new(Root::open(dir.path()).unwrap());
     root.test_name_limit
         .store(143, std::sync::atomic::Ordering::Relaxed);
@@ -405,7 +405,7 @@ fn guarded_partials_keep_the_authoritys_exact_name_selection() {
 #[cfg(target_os = "linux")]
 #[test]
 fn optimistic_partial_does_not_retry_unrelated_or_unchanged_names() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let ops = rooted(dir.path());
     let target = ops
         .rooted_destination_target(b"short", None)

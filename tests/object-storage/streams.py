@@ -35,20 +35,15 @@ def main():
         for name, data in [('empty', b''), ('small', b'raw\x00\xff'),
                            ('multipart', bytes(range(256)) * 50000)]:
             key = check.PREFIX + '/' + name
-            expected = 'sha256:' + hashlib.sha256(data).hexdigest()
-            stream(['--to', bucket, '--as', key, '--expected-hash', expected,
+            stream(['--to', bucket, '--as', key,
                     '--resource-limits', 's3-max-concurrent-requests=1', '--stats'], input=data)
             headers, actual = check.request('GET', key)
             assert actual == data, name
             assert not any(k.lower().startswith('x-amz-meta-syq-') for k in headers)
-            actual = stream(['--from', bucket, key, '--expected-hash', expected,
+            actual = stream(['--from', bucket, key,
                              '--resource-limits', 's3-max-concurrent-requests=1'])
             assert actual == data, name
-            wrong = 'sha256:' + '0' * 64
-            stream(['--to', bucket, '--as', key, '--expected-hash', wrong], input=data, success=False)
-            assert check.request('GET', key)[1] == data, 'hash failure replaced object'
-            stream(['--from', bucket, key, '--expected-hash', wrong], success=False)
-            print('Stream round trip and hashes:', name, flush=True)
+            print('Stream round trip:', name, flush=True)
         # Placement constraints retain the raw-object upload contract.
         for name, data in [('empty', b''), ('small', b'new'), ('multipart', b'x' * (6 << 20))]:
             key = check.PREFIX + '/placement-' + name

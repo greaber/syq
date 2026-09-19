@@ -1,10 +1,7 @@
 # Rename and reorganize during a copy
 
-See [`syq map`](commands/map.md) for the option list.
-
-`syq map` lists source/destination pairs as one JSON object per line.
-Transform that list with a script, then give it to `syq cp --mapping`.
-The copy checks for destination collisions and supports normal resume.
+List the files, change their destination names, then copy them. `syq map`
+produces the list, a script changes it, and `syq cp --mapping` makes the copy.
 
 For Python scripts, see the [Python SDK](python.md) and its
 [mapping examples](python-guide.md).
@@ -28,6 +25,18 @@ If another entry also claims `notes.txt`, the copy is refused before files
 are transferred. Symlink target text is not rewritten: renaming its target
 can leave a link dangling on a case-sensitive destination.
 
+## Emitting a mapping
+
+```sh
+syq map --srcs-in photos     # contents; paths relative to photos
+syq map photos              # named directory; paths include photos/
+syq map photo.jpg --as albums/cover.jpg
+```
+
+`map` lists local files without copying them. Use the same source directory
+when making the copy: a list produced with `--srcs-in photos` needs `-C photos`
+on `cp`. Each listed directory includes separate entries for its contents.
+
 ## Group photos by modification month
 
 ```bash
@@ -41,15 +50,6 @@ syq map --srcs-in photos \
 A July 2024 file `IMG_1234.JPG` lands at `/archive/2024/07/IMG_1234.JPG`.
 The filter keeps regular files only; missing parent directories are created.
 Dates use file modification time in UTC, not photo EXIF dates.
-
-Other filters can replace the `jq` stage:
-
-```sh
-# Keep files of at least 1 MiB, plus directory and link entries:
-jq -c 'select(.kind != "file" or .size >= 1048576)'
-# Drop device, FIFO, and socket entries:
-jq -c 'select(.kind != "special")'
-```
 
 ## Check the producer before copying
 
@@ -75,55 +75,21 @@ A manifest contains one JSON object per line (NDJSON):
 {"src":{"encoding":"utf-8","value":"IMG_1234.JPG"},"dst":{"encoding":"utf-8","value":"2024/07/photo.jpg"},"kind":"file","size":4194304,"mtime":1721900000}
 ```
 
-| Field | Meaning |
-|---|---|
-| `src` | Required path relative to the copy's source base (`-C` or `--root`) |
-| `dst` | Required path relative to the destination container (`--into`) |
-| `kind` | Optional `file`, `dir`, `symlink`, or `special` precondition |
-| `size`, `mtime` | Optional information for transforms; ignored during execution |
-| `metadata` | Optional destination attributes; see below |
-| `expected_digest` | Optional whole-file expectation: `{"algorithm":"md5","value":"900150983cd24fb0d6963f7d28e17f72"}` |
-
-Paths use `encoding: "utf-8"`, or `"base64"` with standard base64 of raw
-filename bytes. Absolute or empty paths, and any `.` or `..` component, are
-refused. Unknown fields are refused too.
-
-`expected_digest` requires a regular file. Algorithms are `blake3`, `sha256`,
-`md5`, and `xxh3-128`; the hex value contains 64 digits for BLAKE3 or SHA-256,
-and 32 for MD5 or XXH3-128. It checks the complete resulting file, including
-reused bytes, and a mismatch fails the entry. See [content checks](reference.md#check-file-contents)
-for staging, in-place writes, and selection filters. Older binaries that do not
-support this field reject the manifest.
-
-To set destination attributes without changing the source, add a `metadata`
-object, for example `"metadata": {"mode": 416, "mtime": 1700000000}`. This sets
-permissions to `0640` and the modification time to the given Unix second.
-Optional fields are `mode` (permission bits, 0–4095), numeric `uid` and `gid`,
-`mtime` (Unix seconds), and `mtime_nsec` (0–999999999, requires `mtime`).
-A supplied `mtime` defaults to zero fractional seconds. Omitted attributes
-follow normal copy behavior; the top-level `mtime` remains informational.
-
-Explicit attributes apply without `--preserve`. Ownership requests fail if the
-filesystem refuses them; symlinks cannot have a requested `mode`.
-S3 uploads store the attributes in syq object metadata; downloads apply them
-to the filesystem. S3-to-S3 copies keep other object metadata and stay server-side.
-Restricted receivers also require matching `--preserve` permissions in the signed
-grant. Selection rules such as `--only-new` still take precedence. Supplied
-timestamps disable the size/time shortcut for those entries. Use `--hash` to
-compare contents when repeating a copy with a fixed destination timestamp.
-Older binaries that do not support `metadata` reject the manifest.
-
-Each entry copies one object. **A directory entry is not recursive.**
-`syq map` emits its descendants as separate entries. A missing source or
-wrong `kind` fails that entry while independent entries continue. A kind
-mismatch is a non-retryable conflict; a missing source is an I/O failure
-whose retryability is unknown.
-
-Any program can generate this format:
+Each line names a source and destination relative to the directories you give
+`cp`. You can generate this list with any program:
 
 ```sh
 syq cp --mapping pairs.ndjson -C photos --to nas --into /archive
 ```
+
+See [Mapping format](commands/map.md#mapping-format) for fields, encodings,
+and validation rules.
+
+<a id="semantics-and-limits"></a>
+
+Use `--mapping` in place of source selectors, with an `--into` placement.
+For supported combinations and path rules, see
+[Mapping restrictions](commands/map.md#mapping-restrictions).
 
 ## Copy between servers
 
@@ -135,89 +101,12 @@ the destination container:
 syq cp --from hostA -C /data --mapping pairs.ndjson --to hostB --into /archive
 ```
 
-`--mapping -` reads the manifest from stdin. File contents follow the selected
-copy route. The restricted receiver permits writes only at the listed
-destinations and creates missing parent directories as needed. New parents use
-permissions limited by the receiver's umask; existing parents keep theirs.
-If a file or symlink blocks a parent directory, move or remove it before
-retrying. The affected entries fail while unrelated mappings continue.
-
-Mapped destinations and their parent directories count against the receiver's
-entry limit. Each manifest line can be up to 1 MiB, and each destination path
-up to 4096 bytes. There is no separate limit on the total manifest size.
-
-## Emitting a mapping
-
-```sh
-syq map --srcs-in photos     # contents; paths relative to photos
-syq map photos              # named directory; paths include photos/
-syq map photo.jpg --as albums/cover.jpg
-```
-
-`map` is local and does not contact a destination. It takes source selectors,
-`-C` or `--root`, source follow options, and `--as` for one named selection.
-Copy options and filters belong to the later `cp` command or your transform.
-`map` refuses non-UTF-8 names; hand-written manifests may use base64.
-
-## Semantics and limits
-
-- `--mapping` replaces `cp` source selectors. Use `--into`, `--into-new`, or
-  `--into-existing` for the destination. It cannot combine with `--as` or
-  `--prune` or `--detach`. Both endpoints may be remote.
-- A contents selection emits paths relative to the selected directory. Use
-  that same directory as the consuming copy's `-C` base. Named `map`
-  selectors must be relative and resolve inside their base; a contents
-  selector may point outside it. `--root` confines either kind of selection.
-- Follow options apply to command-line paths, never to manifest entries.
-  A manifest entry that would traverse a symlink fails. Named `map`
-  selectors followed with `--follow-src` emit the referent path relative to
-  their base and refuse referents outside it.
-- Named manifest paths follow the normal control-path rules: only `--follow`
-  permits link traversal in that path. Use `--mapping -` for portable stream
-  input; named FIFOs need Linux with procfs.
-- The whole manifest is read and validated before copying. Malformed input,
-  duplicate destinations (including identical duplicate lines), and declared
-  file/ancestor conflicts refuse the run. The destination container may
-  already have been created. Memory grows with manifest size.
-- Conflicts found only when inspecting actual source or destination objects
-  fail individual entries. A missing destination parent is created implicitly.
-- Normal native preservation applies. `kind: "special"` checks the type but
-  does not enable special-file copying: use `--preserve=specials` or those
-  entries are visibly excluded.
+File contents travel directly between the servers. See
+[Copy between servers](remote-to-remote.md) for setup.
 
 ## Machine-readable results
 
 Add `--results r.ndjson` to record outcomes in a fresh file outside the copy
-trees. See [Automation results](automation.md) for the stream contract.
-
-Failed mapping entries contain `src`, `dst`, and `kind`, so they can form a
-retry manifest. Preserve `expected_digest` and `metadata` too when present. First require a terminal `result` with `success` or `partial`:
-a missing terminal or an early stop means some entries may have no results.
-In those cases, rerun the original copy instead.
-
-```bash
-set -o pipefail
-syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
-jq -cs 'if (.[-1].type? // "") != "result"
-        then "incomplete results stream (no terminal record)" | halt_error
-        elif (.[-1].status != "success" and .[-1].status != "partial")
-        then "run stopped early (status \(.[-1].status)); rerun it instead of retrying" | halt_error
-        else .[] | select(.type == "operation_result"
-                          and .disposition == "failed"
-                          and .retryable != "no")
-             | {src, dst, kind}
-               + (if has("expected_digest") then {expected_digest} else {} end)
-               + (if has("metadata") then {metadata} else {} end)
-        end' r.ndjson \
-  | syq cp --mapping - -C src --to nas --into /data
-```
-
-The filter skips non-retryable entries, including failed implicit parent
-creation without a source path. It does not guarantee that retrying will
-succeed; fix the underlying error first. Unchanged and excluded files appear
-only in summary totals, not as individual results.
-
-For command-restricted copies between servers, `--results` contains verified
-[receiver receipts](remote-reference.md#signed-results). These describe
-destination changes rather than source entry failures; retry the original
-mapping instead of applying the `operation_result` filter above.
+trees. After fixing a failure, rerun the original mapping to finish the copy.
+For scripts that select only failed entries to retry, see
+[Retry failed mapping entries](automation.md#retry-failed-mapping-entries).

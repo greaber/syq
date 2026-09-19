@@ -10,7 +10,7 @@ import syq
 
 def _python_name(option: str) -> str:
     if option == "expected-hash":
-        return "expected_digest"
+        return "expected_hash"
     name = option.replace("-", "_")
     return f"{name}_" if name in {"as", "from"} else name
 

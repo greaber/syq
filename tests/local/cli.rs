@@ -518,7 +518,7 @@ fn unsupported_rsync_flags_explain_themselves() {
         "should explain rsync -i: {err}"
     );
     assert!(
-        err.contains("--syq-verify-only"),
+        err.contains("-n -c"),
         "should name syq's nearest comparison operation: {err}"
     );
     assert!(!t.path("itemized-dst").exists());
@@ -753,12 +753,6 @@ fn native_copy_policy_conflicts_refuse_before_writing() {
     let t = Tmp::new();
     write(&t.path("source"), b"source");
     for pair in [
-        ["--verify-only", "--prune"],
-        ["--verify-only", "--dry-run"],
-        ["--verify-only", "--inplace"],
-        ["--verify-only", "--only-new"],
-        ["--verify-only", "--only-existing"],
-        ["--verify-only", "--skip-newer"],
         ["--only-new", "--only-existing"],
         ["--only-new", "--skip-newer"],
         ["--only-new", "--inplace"],
@@ -1077,13 +1071,6 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
     let t = Tmp::new();
     let payload = vec![73; 128 << 10];
     write(&t.path("source"), &payload);
-    let digest = format!(
-        "sha256:{}",
-        Sha256::digest(&payload)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    );
     let cp = |args: &[&str], inherited: &str| {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .current_dir(&t.0)
@@ -1118,8 +1105,6 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
             "0",
             "--as",
             "target",
-            "--expected-hash",
-            &digest,
             "--resource-limits",
             "bandwidth=512K,workers=1",
             "--performance-tuning",
@@ -1161,8 +1146,6 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
                 "target",
                 "--as-fd",
                 "1",
-                "--expected-hash",
-                &digest,
                 "--integrity-checking",
                 &format!("transfer={algorithm}"),
                 "--progress-json",
@@ -1201,18 +1184,6 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
         "download ignored bandwidth limit"
     );
     write(&t.path("target"), b"old");
-    let wrong = format!("sha256:{}", "0".repeat(64));
-    let out = cp(
-        &["--src-fd", "0", "--as", "target", "--expected-hash", &wrong],
-        "",
-    );
-    assert!(!out.status.success());
-    assert!(
-        stderr_of(&out).contains("expected sha256 hash"),
-        "{}",
-        stderr_of(&out)
-    );
-    assert_eq!(read(&t.path("target")), b"old");
     assert!(!fs::read_dir(&t.0).unwrap().any(|e| e
         .unwrap()
         .file_name()
@@ -1537,83 +1508,6 @@ fn stream_previews_and_results_do_not_consume_payload() {
             .iter()
             .any(|r| r["type"] == "stream_result" && r["disposition"] == "skipped"));
     }
-    // File descriptors and named local/SSH reads have a known length. Size
-    // exclusion must leave the source offset and destination untouched.
-    for (index, args) in [
-        vec!["--src-fd", "0", "--as", "missing/small", "--max-size", "4"],
-        vec!["--src-fd", "0", "--as-fd", "1", "--min-size", "6"],
-        vec![
-            "--src-fd",
-            "0",
-            "--to",
-            "fixture",
-            "--as",
-            "payload",
-            "--min-size",
-            "6",
-        ],
-        vec!["payload", "--as-fd", "1", "--min-size", "6", "--dry-run"],
-        vec![
-            "--from",
-            "fixture",
-            "payload",
-            "--as-fd",
-            "1",
-            "--max-size",
-            "4",
-        ],
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let file = format!("size-skip-{index}.json");
-        let mut args = args;
-        args.extend(["--results", &file]);
-        let output = cp(&args);
-        assert!(output.status.success(), "{args:?}: {}", stderr_of(&output));
-        assert!(output.stdout.is_empty());
-        assert!(!t.path("missing").exists());
-        assert_eq!(read(&t.path("payload")), b"bytes");
-        let values = records(&file);
-        assert_eq!(values.last().unwrap()["files_excluded"], 1);
-        assert_eq!(values.last().unwrap()["bytes_transferred"], 0);
-        assert_eq!(values.last().unwrap()["bytes_total_known"], true);
-        assert!(!values.iter().any(|r| r["type"] == "stream_ready"));
-    }
-    // Placement requirements still apply even when the source is excluded.
-    for (index, destination) in [vec![], vec!["--to", "fixture"]].into_iter().enumerate() {
-        let file = format!("size-placement-failed-{index}.json");
-        let mut args = vec!["--src-fd", "0"];
-        args.extend(destination);
-        args.extend(["--as-new", "payload", "--max-size", "4", "--results", &file]);
-        let output = cp(&args);
-        assert_eq!(output.status.code(), Some(1));
-        assert!(stderr_of(&output).contains("destination existence condition failed"));
-        assert!(!stderr_of(&output).contains("Skipped"));
-        let values = records(&file);
-        let terminal = values.last().unwrap();
-        assert_eq!(terminal["status"], "failed");
-        assert_eq!(terminal["errors"], 1);
-        assert_eq!(terminal["files_excluded"], 0);
-        assert!(values
-            .iter()
-            .any(|r| r["type"] == "stream_result" && r["disposition"] == "failed"));
-    }
-    // No writer: opening this FIFO would hang. Reject unknown length before
-    // opening it, including for a preview and a destination descriptor.
-    for args in [
-        vec!["pipe", "--as", "missing/pipe", "--min-size", "1"],
-        vec!["pipe", "--as-fd", "1", "--max-size", "1K", "--dry-run"],
-    ] {
-        let output = cp(&args);
-        assert!(!output.status.success());
-        assert!(
-            stderr_of(&output).contains("require a known source length"),
-            "{}",
-            stderr_of(&output)
-        );
-        assert!(!t.path("missing").exists());
-    }
     for flag in [
         "--skip-newer",
         "--preserve=times",
@@ -1644,17 +1538,7 @@ fn stream_previews_and_results_do_not_consume_payload() {
     assert!(!failed.status.success());
     assert_eq!(records("failed.json").last().unwrap()["errors"], 1);
     assert_eq!(read(&t.path("payload")), b"bytes");
-    let download = cp(&[
-        "payload",
-        "--as-fd",
-        "1",
-        "--min-size",
-        "5",
-        "--max-size",
-        "5",
-        "--results",
-        "download.json",
-    ]);
+    let download = cp(&["payload", "--as-fd", "1", "--results", "download.json"]);
     assert!(download.status.success(), "{}", stderr_of(&download));
     assert_eq!(download.stdout, b"bytes");
     let downloaded = records("download.json");
@@ -1671,18 +1555,7 @@ fn stream_previews_and_results_do_not_consume_payload() {
         .unwrap()
         .seek(std::io::SeekFrom::Start(2))
         .unwrap();
-    let uploaded = cp(&[
-        "--src-fd",
-        "0",
-        "--to",
-        "fixture",
-        "--as",
-        "suffix",
-        "--min-size",
-        "3",
-        "--max-size",
-        "3",
-    ]);
+    let uploaded = cp(&["--src-fd", "0", "--to", "fixture", "--as", "suffix"]);
     assert!(uploaded.status.success(), "{}", stderr_of(&uploaded));
     assert_eq!(read(&t.path("suffix")), b"tes");
     assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 5);
@@ -1705,4 +1578,23 @@ fn stream_previews_and_results_do_not_consume_payload() {
         assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
         assert!(stderr_of(&output).contains("descriptors must differ"));
     }
+}
+
+#[test]
+fn removed_verify_only_options_are_rejected_without_changes() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    write(&t.path("destination"), b"keep");
+    let native = native_syq(&[
+        "cp",
+        "--verify-only",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+    ]);
+    let compat = syq(&["--syq-verify-only", &t.s("source"), &t.s("destination")]);
+    for output in [native, compat] {
+        assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
+    }
+    assert_eq!(read(&t.path("destination")), b"keep");
 }

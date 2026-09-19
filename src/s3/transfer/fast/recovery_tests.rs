@@ -126,7 +126,7 @@ impl HttpConnector for Responses {
 }
 
 async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let mut extra = vec!["--integrity-checking=transfer=blake3"];
     if paced {
         extra.extend(["--resource-limits", "bandwidth=16KiB"]);
@@ -294,7 +294,7 @@ async fn downloads_without_peers_can_wait_through_long_pauses() {
 #[tokio::test(start_paused = true)]
 async fn direct_download_can_resume_after_a_long_pause_within_one_read() {
     use std::os::unix::fs::FileExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let path = dir.path().join("large");
     let size = 256 * 1024 * 1024;
     let file = Arc::new(

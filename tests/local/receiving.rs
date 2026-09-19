@@ -957,7 +957,7 @@ fn return_via_rejects_unsupported_routes_and_never_falls_back_to_ssh() {
         b"#!/bin/sh\ntouch \"$HOME/ssh-used\"\nexit 99\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
-    for option in ["--via", "--auth-from"] {
+    for option in ["--auth-from"] {
         for extra in [
             vec![],
             vec!["--no-tcp"],
@@ -1137,7 +1137,6 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
         vec!["--no-tcp"],
         vec!["--preserve", "ownership"],
         vec!["--inplace"],
-        vec!["--min-size", "1"],
         vec!["--prune", "--into", "out"],
         vec!["--into", "~//archive"],
     ] {
@@ -1167,15 +1166,22 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
         .collect();
     let legacy = run(&argv);
     assert!(
-        stderr_of(&legacy).contains("receiver references require @NAME"),
+        stderr_of(&legacy).contains("unexpected argument '--via'"),
         "{}",
         stderr_of(&legacy)
     );
     assert!(!t.path("ssh-used").exists());
     // The released fixture stays unchanged: its bare receiver reference is
-    // explicitly rejected, and adding @ is the recovery path.
+    // explicitly rejected; --auth-from with an explicit @NAME is the recovery path.
     let explicit = run(&[
-        "cp", "source", "--to", "backup", "--via", "@ssh", "--into", "out",
+        "cp",
+        "source",
+        "--to",
+        "backup",
+        "--auth-from",
+        "@ssh",
+        "--into",
+        "out",
     ]);
     assert!(stderr_of(&explicit).contains("copy denied by fixture"));
     let messages = responder.join().unwrap();

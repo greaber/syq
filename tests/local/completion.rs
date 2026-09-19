@@ -1490,7 +1490,7 @@ fn return_via_completes_only_explicit_names_without_contacting_hosts() {
         b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 99\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
-    for option in ["--via", "--auth-from"] {
+    for option in ["--auth-from"] {
         for (prefix, expected) in [
             ("lap", b"".as_slice()),
             ("@lap", b"@laptop\0"),
@@ -1561,7 +1561,6 @@ fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
         vec![],
         vec!["--auth-from", "@laptop"],
         vec!["--auth-from", "auto"],
-        vec!["--via", "@laptop"],
     ] {
         let mut words = vec!["syq", "cp", "source", "--to", "backup"];
         words.extend(selector);

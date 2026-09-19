@@ -36,3 +36,18 @@ syq exec [OPTIONS] --on <@NAME> -- <PROGRAM>...
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
+
+## Execution details
+
+Requests allow up to 256 arguments (16 KiB total) and a 4096-byte working-directory
+path. Each server connection permits one pending approval and eight active
+commands.
+
+If the command is killed by a signal, syq returns `128 + signal`. Setup and
+connection failures return nonzero; losing the exit status is an error.
+Interrupting the request, stopping or changing receiving, or losing the
+connection forcibly stops the command's process group. Cleanup handlers do not
+run. Remaining children in that group are also stopped when the foreground
+program exits. Detached processes and applications launched through macOS
+`open` can survive this cleanup. Commands do not emit copy receipts or copy
+automation records.

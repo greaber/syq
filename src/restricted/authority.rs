@@ -253,12 +253,12 @@ impl RestrictedAuthority {
         )
     }
 
-    pub(super) fn expected_digest(&self, path: &[u8]) -> Result<Option<crate::hashing::Digest>> {
+    pub(super) fn expected_hash(&self, path: &[u8]) -> Result<Option<crate::hashing::Digest>> {
         if let Some(mapping) = &self.mapping {
             return Ok(mapping
                 .lock()
                 .unwrap()
-                .expected_digest(self.mapping_relative(path)?)?
+                .expected_hash(self.mapping_relative(path)?)?
                 .cloned());
         }
         let selected = match self.copy.policy.placement {
@@ -276,7 +276,7 @@ impl RestrictedAuthority {
             .then(|| {
                 self.hashing
                     .as_ref()
-                    .and_then(|hashing| hashing.expected_digest.clone())
+                    .and_then(|hashing| hashing.expected_hash.clone())
             })
             .flatten())
     }
@@ -1880,7 +1880,7 @@ impl RestrictedAuthority {
             _ => false,
         };
         self.check_mutation_path(path, is_dir)?;
-        if self.expected_digest(path)?.is_some()
+        if self.expected_hash(path)?.is_some()
             && matches!(
                 operation,
                 Op::Mkdir { .. } | Op::Symlink { .. } | Op::Mknod { .. }
@@ -2164,7 +2164,7 @@ impl RestrictedAuthority {
                 guard,
             } => {
                 self.check_observation_path(path)?;
-                if let Some(authorized) = self.expected_digest(path)? {
+                if let Some(authorized) = self.expected_hash(path)? {
                     if *expected != authorized {
                         bail!("expected hash differs from the authorized copy");
                     }
@@ -2371,7 +2371,7 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::FinishBasis {
-                expected_digest,
+                expected_hash,
                 path,
                 meta,
                 flags,
@@ -2379,7 +2379,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                *expected_digest = self.expected_digest(path)?;
+                *expected_hash = self.expected_hash(path)?;
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
@@ -2469,7 +2469,7 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::Finalize {
-                expected_digest,
+                expected_hash,
                 path,
                 inplace,
                 copy_id,
@@ -2479,7 +2479,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                *expected_digest = self.expected_digest(path)?;
+                *expected_hash = self.expected_hash(path)?;
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file finalization does not match the signed publication policy");
                 }
@@ -2523,7 +2523,7 @@ impl RestrictedAuthority {
                     }
                 }
                 for (index, put) in puts.iter_mut().enumerate() {
-                    if self.expected_digest(&put.path)?.is_some() {
+                    if self.expected_hash(&put.path)?.is_some() {
                         bail!("expected-hash files require checked finalization");
                     }
                     self.charge_bytes(&put.path, 0, put.data.len())?;

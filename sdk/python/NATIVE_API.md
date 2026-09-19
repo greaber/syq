@@ -75,28 +75,26 @@ In addition to the shared arguments above, it accepts:
 | `as_`, `as_new`, `as_existing` | Exact destination paths |
 | `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
 | `follow_dst` | Boolean: follow destination symlinks |
-| `prune`, `dry_run`, `hash`, `verify_only` | Boolean: mirror, preview, compare content, or verify without copying |
+| `prune`, `dry_run`, `hash` | Boolean: mirror, preview, or compare content |
 | `integrity_checking` | Comma-separated string, e.g. `"compare=blake3,transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
-| `expected_digest` | `Digest` for one regular-file source; with mappings, set it on each `MappingEntry` instead |
 | `only_new`, `only_existing`, `skip_newer` | Boolean: copy missing entries, copy existing entries, or skip newer destination files |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
 | `preserve` | Preservation string or iterable: `times`, `permissions`, `ownership`, `specials` |
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
-| `min_size`, `max_size` | Native size strings or integer bytes |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` |
 | `resource_limits` | Comma-separated ceilings that keep automatic tuning, e.g. `"bandwidth=10M,workers=4"`; a concurrency key conflicts with the same key in `performance_tuning` |
 | `performance_tuning` | Comma-separated overrides, e.g. `"workers=4"` or `"s3-max-concurrent-objects=32,s3-max-concurrent-parts-per-object=8,s3-part-size=16M"`; omitted means automatic |
 | `s3_endpoint`, `s3_region`, `s3_profile` | Endpoint URL, signing region, and AWS profile strings |
 | `s3_header` | Iterable of `"NAME: VALUE"` strings; applied before signing every request |
-| `auth_from`, `via` | Credential source string; aliases, so use only one |
+| `auth_from` | Credential source string |
 | `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
 | `pscope` | Existing ephemeral scope path for forward SSH connection reuse |
 | `syq_path` | Remote executable path |
 | `no_bootstrap`, `tcp_plain`, `no_tcp` | Boolean remote/transport controls |
 | `tcp_ports`, `tcp_congestion` | Port range and congestion-control strings |
 | `receiver_max_entries`, `receiver_max_bytes` | Receiver ceilings: integer entries, native size string or integer bytes |
-| `receiver_receipt` | `"sizes"` or `"digests"` |
+| `receiver_receipt` | `"sizes"` or `"hashes"` |
 | `on_event`, `results`, `check` | See events and failures below |
 
 Option behavior is covered in [Copy files](https://greaber.github.io/syq/reference.html),
@@ -119,14 +117,12 @@ for setup and cleanup, and
 for executable selection.
 
 Typed SSH-to-SSH copies require an enrolled receiver or
-`coordinate_at="local"`. With `dry_run=True` or `verify_only=True`, they require
+`coordinate_at="local"`. With `dry_run=True`, they require
 `coordinate_at="local"`. Use `run` for detached commands and human output options.
 
 `IgnoreFrom(path)` is a frozen dataclass holding a rule-file path (`str`,
 `bytes`, or `os.PathLike`). To interleave rule files and inline patterns:
 `ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`. The last matching rule wins.
-
-<a id="removal"></a>
 
 ## Byte streams
 
@@ -138,16 +134,12 @@ source basename, so they require an exact destination path.
 `client.open_reader(src, *, from_=None, cwd=None, root=None, follow_src=False, ...)`
 returns a `StreamReader`. `cwd` resolves relative sources; `root` also confines
 them. Choose at most one, as with `cp`. These bases belong to the source
-endpoint, independently of the client's local `process_cwd`. Readers also accept
-`min_size` and `max_size` (size strings as in `cp`); excluded files or objects
-return no payload and set `skipped` at completion. Both accept `rsh`, `syq_path`, `pscope`,
-`no_bootstrap`, `no_compress`, `no_tcp`, `tcp_plain`, `tcp_ports`, `tcp_congestion`,
-`s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
-`performance_tuning`, `resource_limits`, `integrity_checking`, `expected_digest`,
-`only_new`, `only_existing`, `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`, `progress_json`,
-and `timeout` with the same meanings as `cp`. Pass a `syq.Digest` as `expected_digest`
-to check the bytes during transfer. A mismatch prevents a writer from publishing;
-a reader may already have returned bytes when it reports the failure.
+endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
+`syq_path`, `pscope`, `no_bootstrap`, `no_compress`, `no_tcp`, `tcp_plain`,
+`tcp_ports`, `tcp_congestion`, `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
+`performance_tuning`, `resource_limits`, `integrity_checking`, `only_new`,
+`only_existing`, `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
+`progress_json`, and `timeout` with the same meanings as `cp`.
 See the CLI stream reference for the applicable tuning and integrity controls.
 The client supplies the executable, process working directory, environment,
 and default timeout. Stream calls always check transfer failures.
@@ -163,9 +155,15 @@ is attempted. S3 can retry buffered multipart parts.
 | `StreamWriter` | `write(bytes)` writes the complete buffer and returns its length; `flush()` has no Python buffer to flush; `close()` ends payload input; `commit()` publishes and checks completion; `abort()` cancels |
 | `StreamReader` | `read(size=-1)`, `readinto(buffer)`; `close()` drains remaining bytes in bounded chunks and checks completion; `abort()` cancels |
 
+Streams use bounded transport buffers. `read()` without a size collects all
+remaining bytes in Python memory and checks completion before returning.
+
+### Writer completion
+
 Use a `with` block. Successful writer exit sends a separate commit signal
 after closing the payload; EOF alone cannot publish a managed upload. An
 exception in the writer body before commit aborts without replacing the destination.
+Writers support `io.BufferedWriter` and `io.TextIOWrapper`.
 `close()` only ends payload input, so a buffered or text wrapper can close it
 while unwinding an exception without publishing partial data. Successful
 context exit commits even if a wrapper already closed the payload. Calling
@@ -179,6 +177,8 @@ its buffered data; do that before committing the underlying writer.
 A timeout or connection loss during commit can leave the outcome uncertain;
 the method reports failure rather than claiming rollback. Whole datasets
 need their own final publication step after all object transfers succeed.
+
+### Skips and previews
 
 Writers normally return while destination setup continues, so opening several
 writers lets their connections start concurrently. Setup errors can surface at
@@ -196,17 +196,18 @@ A skipped writer rejects `write()` and exits its context successfully without
 committing anything. Skipped readers return no payload; their `skipped` property
 is settled at completion. Both count the skipped object in `files_excluded`.
 
-After completion, `stream.result` holds a `CpResult`, including byte counts and
-elapsed time. It remains `None` if no terminal result arrived, such as after
-forced termination. Payload bytes never enter the result decoder; missing or
-invalid completion records raise `SyqProtocolError` after an otherwise successful
-process exit.
-
 With `dry_run=True`, a context checks placement without transferring bytes.
 Enter and exit a writer context without calling `write()`; preview writers
 reject payload writes. Preview readers return no payload. The result contains
 planned totals; `bytes_total_known=False` distinguishes an unknown pipe length
 from an empty source. A dry run does not check an expected payload hash.
+
+### Results and failures
+
+After completion, `stream.result` holds a `CpResult`, including byte counts and
+elapsed time. It remains `None` if no terminal result arrived, such as after
+forced termination. Missing or invalid completion records raise
+`SyqProtocolError` even if the process exits successfully.
 
 A bounded reader call can yield partial data before a later transfer error.
 An unbounded `read()` checks transfer completion before returning its bytes.
@@ -225,6 +226,8 @@ last 8 KiB as bytes, including on success. For example, request `stats=True`
 and read `output.stderr.decode()` after the writer context exits. This is a
 bounded diagnostic tail, not a complete progress-event history.
 
+### Async streams
+
 Async streams use `async with` directly and await I/O and explicit closure:
 
 ```python
@@ -241,6 +244,8 @@ transfer process and releases blocked I/O. `AsyncStreamReader` and
 `AsyncStreamWriter` expose async `read`/`write`, `close`, and `abort` methods.
 `AsyncStreamWriter.commit()` explicitly publishes, with the same semantics
 as its synchronous counterpart; successful async context exit commits automatically.
+
+<a id="removal"></a>
 
 ## rm
 
@@ -313,9 +318,11 @@ remain independent. `map(root=..., srcs_in=...)` carries the selected directory
 as the consuming copy's root. The copy resolves that root again; it does not
 inherit an open directory handle or a snapshot of the source tree.
 
-### Digest and HashAlgorithm
+<a id="digest-and-hashalgorithm"></a>
 
-`Digest(algorithm, value)` describes the expected digest of all bytes in one
+### Hash and HashAlgorithm
+
+`Hash(algorithm, value)` describes the expected hash of all bytes in one
 regular file. `algorithm` accepts a `HashAlgorithm` value or its string:
 `"blake3"`, `"sha256"`, `"md5"`, or `"xxh3-128"`. `value` is hexadecimal:
 64 digits for BLAKE3 and SHA-256, 32 for MD5 and XXH3-128. The immutable object
@@ -323,22 +330,25 @@ validates the length and characters and stores lowercase hex.
 
 ```python
 client.cp(
-    "data.bin", as_="verified.bin",
-    expected_digest=syq.Digest("md5", "900150983cd24fb0d6963f7d28e17f72"),
+    mapping=[syq.MappingEntry(
+        "data.bin", "verified.bin",
+        expected_hash=syq.Hash("md5", "900150983cd24fb0d6963f7d28e17f72"),
+    )],
+    into="backup",
 )
 ```
 
 The expectation covers the complete resulting file, including reused bytes.
 A mismatch fails the file rather than reporting a successful copy. Files excluded
-by selection rules are not digest-verified. `hash=True` still controls whether
+by selection rules are not hash-verified. `hash=True` still controls whether
 existing contents are compared instead of trusting size and modification time;
 `integrity_checking="compare=HASH"` selects and enables content comparison;
 `hash=True` is a shorthand for `compare=blake3`.
 Dry runs preview changes without validating the expectation. An expected
-whole-file digest is independent of the algorithm used for block comparison or
+whole-file hash is independent of the algorithm used for block comparison or
 transport checks. MD5 and XXH3-128 are useful for compatibility
 and accidental-error detection, but do not provide cryptographic collision
-resistance. Receiver receipt digests continue to use BLAKE3.
+resistance. Receiver receipt hashes continue to use BLAKE3.
 
 ### MappingEntry
 
@@ -352,24 +362,24 @@ of these to `cp(mapping=...)`; use `dataclasses.replace` to change an entry.
 | `kind` | `EntryKind` or `None` | Object kind, when known; default `None` |
 | `size` | `int` or `None` | Informational size in bytes; default `None` |
 | `mtime` | `int` or `None` | Informational modification time in Unix seconds; default `None` |
-| `expected_digest` | `Digest` or `None` | Expected whole-file digest; requires a regular file; default `None` |
+| `expected_hash` | `Hash` or `None` | Expected whole-file hash; requires a regular file; default `None` |
 | `metadata` | `DestinationMetadata` or `None` | Explicit destination attributes; default `None` |
 
-`MappingEntry(src, dst, kind=None, size=None, mtime=None, expected_digest=None, metadata=None)` also accepts text or
+`MappingEntry(src, dst, kind=None, size=None, mtime=None, expected_hash=None, metadata=None)` also accepts text or
 byte paths for `src` and `dst` and converts them to `RelativePath`. `size` and
-`mtime` do not impose preconditions on the copy. `expected_digest` does: a file
+`mtime` do not impose preconditions on the copy. `expected_hash` does: a file
 cannot succeed unless its contents match. For example, an adapter can supply
 an MD5 from a DVC manifest without changing syq's ordinary comparison algorithm:
 
 ```python
 entry = syq.MappingEntry(
     "cache/object", "data.bin", kind="file",
-    expected_digest=syq.Digest("md5", "900150983cd24fb0d6963f7d28e17f72"),
+    expected_hash=syq.Hash("md5", "900150983cd24fb0d6963f7d28e17f72"),
 )
 client.cp(mapping=[entry], cwd="source", into="download")
 ```
 
-Mapping files encode it as `"expected_digest": {"algorithm": "md5", "value": "..."}`.
+Mapping files encode it as `"expected_hash": {"algorithm": "md5", "value": "..."}`.
 Older syq versions that do not support this field reject the mapping.
 
 ### DestinationMetadata
@@ -450,9 +460,8 @@ unsuccessful copy. Read attributes directly, for example
 | `deletions_blocked` | `int` or `None` | Pruning deletions blocked by a safety limit |
 | `receipt` | `ReceiptSummary` or `None` | Verified receiver receipt details; `None` for ordinary copies |
 
-With `dry_run=True`, mutation totals describe planned changes. With
-`verify_only=True`, matching files count as unchanged; transfer and creation
-totals are zero. A failed call reports work completed before it stopped.
+With `dry_run=True`, mutation totals describe planned changes.
+A failed call reports work completed before it stopped.
 
 Ordinary copies have all three deletion fields only with `prune=True`;
 otherwise they are `None`. Receiver-attested results have only
@@ -502,7 +511,7 @@ or diagnosing a stream.
 | Attribute | Type | Meaning |
 |---|---|---|
 | `schema` | `str` | `"syq.automation"` |
-| `schema_version` | `int` | `1` |
+| `schema_version` | `int` | `2` |
 | `seq` | `int` | Record sequence number, starting at zero |
 | `type` | `str` | Wire record type; `"result"` for terminal totals |
 
@@ -552,7 +561,7 @@ It withholds the terminal record if stream validation, process completion, or
 a callback fails. Sink failures raise and abort the operation.
 
 `OperationResult.is_retryable` identifies retryable failures; `retry_entry()`
-preserves `expected_digest` and `metadata` and returns a `MappingEntry` when a complete mapping
+preserves `expected_hash` and `metadata` and returns a `MappingEntry` when a complete mapping
 identity is available, otherwise `None`. Only use collected entries after the call returns a validated `success`
 or `partial` result. A terminal callback alone does not establish completion.
 The client does not retry automatically.
@@ -563,7 +572,7 @@ The client does not retry automatically.
 ### RunEvent
 
 Invocation details. `started_at` is Unix seconds; `mode` is `"cp"` or `"rm"`.
-`prune` and `mapping` are `None` for removal; `verify_only` defaults to `False`.
+`prune` and `mapping` are `None` for removal.
 
 `protocol.type = "run"`. Fields in addition to the common envelope:
 
@@ -576,13 +585,12 @@ prune: bool | None
 mapping: bool | None
 dry_run: bool
 endpoints: tuple[Endpoint, ...]
-verify_only: bool
 ```
 
 ### ProgressEvent
 
 Sampled progress for displays; use the terminal result for final totals.
-Byte fields measure file content (comparison work with `verify_only=True`),
+Byte fields measure file content,
 `scanned` counts scanned entries, and `elapsed_ms` is milliseconds. Optional
 `activity` contains [diagnostic measurements](https://greaber.github.io/syq/automation.html#progress)
 when the producer collects them; otherwise it is `None`.
@@ -642,7 +650,7 @@ retryable: Retryability | None
 class_: ErrorClass | None
 os_kind: OsKind | None
 message: str | None
-expected_digest: Digest | None
+expected_hash: Hash | None
 provenance: str | None
 scope: int | None
 code: ReceiptCode | None
@@ -719,7 +727,7 @@ code: ReceiptCode | None
 
 Receiver-attested destination state. `dst` is relative to the signed `scope`.
 `provenance` is `"receiver_attested"`. Present objects have `kind` and byte
-`size`; `metadata`, `digest`, and `symlink_target` are present where available.
+`size`; `metadata`, `hash`, and `symlink_target` are present where available.
 `observation_error` describes a partial observation. Absent objects have no
 object details; failed observations have `code` and optional `message`.
 
@@ -733,14 +741,16 @@ state: FinalObjectState
 kind: FinalObjectKind | None
 size: int | None
 metadata: ObjectMetadata | None
-digest: AttestedDigest | None
+hash: AttestedHash | None
 symlink_target: PathValue | None
 observation_error: str | None
 code: ReceiptCode | None
 message: str | None
 ```
 
-### Endpoint, ObjectMetadata, and AttestedDigest
+<a id="endpoint-objectmetadata-and-attesteddigest"></a>
+
+### Endpoint, ObjectMetadata, and AttestedHash
 
 Nested frozen dataclasses used by events:
 
@@ -748,7 +758,7 @@ Nested frozen dataclasses used by events:
 |---|---|---|
 | `Endpoint` | `role: EndpointRole`, `kind: EndpointKind`, `host: str \| None`, `user: str \| None` | Source/destination and local/SSH/S3 identity; host and user are optional |
 | `ObjectMetadata` | `mode: int`, `uid: int`, `gid: int`, `mtime: int`, `mtime_nsec: int`, `rdev: int` | Unix mode, owner/group IDs, modification time (seconds plus nanoseconds), and device ID |
-| `AttestedDigest` | `algorithm: str`, `value: str` | `"blake3"` and its 64 lowercase hexadecimal digest characters |
+| `AttestedHash` | `algorithm: str`, `value: str` | `"blake3"` and its 64 lowercase hexadecimal hash characters |
 
 ## Enums
 

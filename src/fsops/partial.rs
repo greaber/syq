@@ -1910,7 +1910,7 @@ impl FsOps {
                 .hash_and_hold(path, copy_id, *block, *len, *condition, guard.as_ref())
                 .map(|(hashes, len)| Response::HeldHashes { hashes, len }),
             Request::FinishBasis {
-                expected_digest,
+                expected_hash,
                 path,
                 copy_id,
                 meta,
@@ -1925,7 +1925,7 @@ impl FsOps {
                     *flags,
                     *condition,
                     guard.as_ref(),
-                    expected_digest.as_ref(),
+                    expected_hash.as_ref(),
                 )
                 .map(|_| Response::Ok),
             Request::SeedBasis {
@@ -2069,7 +2069,7 @@ impl FsOps {
                 )
                 .map(|_| Response::Ok),
             Request::Finalize {
-                expected_digest,
+                expected_hash,
                 path,
                 inplace,
                 copy_id,
@@ -2079,7 +2079,7 @@ impl FsOps {
                 guard,
             } => self
                 .finalize_expected(
-                    expected_digest.as_ref(),
+                    expected_hash.as_ref(),
                     path,
                     *inplace,
                     copy_id,
