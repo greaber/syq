@@ -137,27 +137,7 @@ fn resolve_destination(
 }
 
 impl Session {
-    fn open(
-        path: &[u8],
-        write: bool,
-        follow: bool,
-        root: Option<&[u8]>,
-        placement: &StreamPlacement,
-        settings: Settings,
-    ) -> Result<Self> {
-        anyhow::ensure!(
-            (512..=64 << 20).contains(&settings.request_size),
-            "invalid stream request size"
-        );
-        let selected = if write {
-            anyhow::ensure!(
-                root.is_none(),
-                "source root does not apply to a destination"
-            );
-            resolve_destination(path, follow, placement, true)?
-        } else {
-            resolve_source(path, root, follow)?
-        };
+    fn open(selected: PinnedPath, write: bool) -> Result<Self> {
         let (file, destination) = if write {
             let (root, target, mode) = match selected {
                 PinnedPath::Leaf(leaf) => {
@@ -256,7 +236,8 @@ impl Session {
         descriptors: &crate::descriptor_broker::DescriptorSessionSlot,
     ) -> Result<Response> {
         let result = (|| match operation {
-            Operation::Inspect {
+            Operation::Open {
+                dry_run,
                 only_new,
                 only_existing,
                 path,
@@ -264,14 +245,20 @@ impl Session {
                 follow,
                 root,
                 placement,
+                settings,
             } => {
                 anyhow::ensure!(slot.is_none(), "descriptor stream already open");
-                let selected = if *write {
+                anyhow::ensure!(
+                    (512..=64 << 20).contains(&settings.request_size),
+                    "invalid stream request size"
+                );
+                let check_only = *dry_run || *only_new || *only_existing;
+                let mut selected = if *write {
                     anyhow::ensure!(
                         root.is_none(),
                         "source root does not apply to a destination"
                     );
-                    resolve_destination(path, *follow, placement, false)?
+                    resolve_destination(path, *follow, placement, !check_only)?
                 } else {
                     resolve_source(path, root.as_deref(), *follow)?
                 };
@@ -282,7 +269,7 @@ impl Session {
                         size: None,
                     });
                 }
-                let size = match selected {
+                let size = match &selected {
                     PinnedPath::Leaf(leaf) if leaf.metadata().is_file() => {
                         (!*write).then_some(leaf.metadata().len)
                     }
@@ -294,22 +281,22 @@ impl Session {
                         if *write { " or an absent path" } else { "" }
                     ),
                 };
-                Ok(Response::DescriptorInspected {
-                    skipped: false,
-                    size,
-                })
-            }
-            Operation::Open {
-                path,
-                write,
-                follow,
-                root,
-                placement,
-                settings,
-            } => {
-                anyhow::ensure!(slot.is_none(), "descriptor stream already open");
-                let stream =
-                    Self::open(path, *write, *follow, root.as_deref(), placement, *settings)?;
+                if *dry_run || (!*write && *only_new) {
+                    return Ok(Response::DescriptorInspected {
+                        skipped: !*write && *only_new,
+                        size,
+                    });
+                }
+                // A policy check must not create directories for a skipped copy.
+                // An eligible --into copy can create its missing container now.
+                if *write
+                    && check_only
+                    && placement.name.is_some()
+                    && matches!(selected, PinnedPath::Missing(_))
+                {
+                    selected = resolve_destination(path, *follow, placement, true)?;
+                }
+                let stream = Self::open(selected, *write)?;
                 let size = (!*write).then_some(stream.original.len());
                 let ticket = descriptors.register_stream(stream.file.try_clone()?, *write)?;
                 *slot = Some(stream);
@@ -425,6 +412,9 @@ mod tests {
         let descriptors = DescriptorSessionSlot::default();
         let mut slot = None;
         let open = Operation::Open {
+            dry_run: false,
+            only_new: false,
+            only_existing: false,
             path: target.as_os_str().as_bytes().to_vec(),
             write: true,
             follow: false,
@@ -506,6 +496,9 @@ mod tests {
         let Response::DescriptorOpened { size, ticket } = Session::handle(
             &mut slot,
             &Operation::Open {
+                dry_run: false,
+                only_new: false,
+                only_existing: false,
                 path: target.as_os_str().as_bytes().to_vec(),
                 write: false,
                 follow: false,

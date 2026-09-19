@@ -19,6 +19,7 @@ pub(crate) struct Report {
     pub only_new: bool,
     pub only_existing: bool,
     skipped: AtomicBool,
+    ready_sent: AtomicBool,
     quiet: bool,
     writer: Option<Arc<ResultsWriter>>,
     source: Value,
@@ -49,11 +50,12 @@ impl Report {
             None => named(),
         };
         let destination = plan.as_fd.map_or_else(named, |fd| json!({ "fd": fd }));
-        Ok(Self {
+        let report = Self {
             dry_run: args.dry_run,
             only_new: args.ignore_existing,
             only_existing: args.existing,
             skipped: AtomicBool::new(false),
+            ready_sent: AtomicBool::new(false),
             quiet: args.quiet,
             writer: results::start(
                 args,
@@ -64,7 +66,13 @@ impl Report {
             )?,
             source,
             destination,
-        })
+        };
+        // Without a skip policy, input can queue while the destination connects.
+        // Decide this after CLI/environment parsing so the SDK need not duplicate it.
+        if plan.source.is_some() && !report.dry_run && !report.only_new && !report.only_existing {
+            report.ready();
+        }
+        Ok(report)
     }
     pub fn skip(&self) {
         self.skipped.store(true, Relaxed);
@@ -73,6 +81,9 @@ impl Report {
         self.skipped.load(Relaxed)
     }
     pub fn ready(&self) {
+        if self.ready_sent.swap(true, Relaxed) {
+            return;
+        }
         if let Some(writer) = &self.writer {
             writer.emit_value(json!({ "type": "stream_ready" }));
         }

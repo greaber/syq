@@ -3801,6 +3801,9 @@ fn receiver_rejects_descriptor_copy_operations() {
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     for operation in [
         crate::descriptor_copy::Operation::Open {
+            dry_run: false,
+            only_new: false,
+            only_existing: false,
             path: path_bytes(&root.join("file")),
             write: true,
             follow: false,

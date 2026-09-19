@@ -59,35 +59,11 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Option<Prepa
         crate::transfer::endpoint(location, args)?
     };
     let mut control = endpoint.connect_control(args.compress)?;
-    if args.dry_run || args.ignore_existing || args.existing {
-        let response = conn::ok(
-            control.call(Request::DescriptorCopy(Operation::Inspect {
-                only_new: args.ignore_existing,
-                only_existing: args.existing,
-                path: location.path.clone(),
-                write: plan.source.is_some(),
-                follow: plan.follow,
-                root: plan.root.clone(),
-                placement: plan.placement.clone(),
-            }))?,
-            "inspect stream",
-        )?;
-        let Response::DescriptorInspected { size, skipped } = response else {
-            bail!("unexpected stream inspection response");
-        };
-        if let Some(size) = size {
-            controls.set_size(size);
-        }
-        if skipped || (plan.as_fd.is_some() && args.ignore_existing) {
-            controls.report.skip();
-            return Ok(None);
-        }
-        if args.dry_run {
-            return Ok(None);
-        }
-    }
     let (size, ticket) = match conn::ok(
         control.call(Request::DescriptorCopy(Operation::Open {
+            dry_run: args.dry_run,
+            only_new: args.ignore_existing,
+            only_existing: args.existing,
             path: plan.location.as_ref().unwrap().path.clone(),
             write: plan.source.is_some(),
             follow: plan.follow,
@@ -98,6 +74,16 @@ fn prepare(args: &Args, plan: &Plan, controls: &Controls) -> Result<Option<Prepa
         "open stream",
     )? {
         Response::DescriptorOpened { size, ticket } => (size, ticket),
+        Response::DescriptorInspected { size, skipped } => {
+            anyhow::ensure!(args.dry_run || skipped, "stream was not opened");
+            if let Some(size) = size {
+                controls.set_size(size);
+            }
+            if skipped {
+                controls.report.skip();
+            }
+            return Ok(None);
+        }
         _ => bail!("unexpected stream open response"),
     };
     anyhow::ensure!(

@@ -1785,10 +1785,7 @@ fn parse_descriptor_copy(
     }
     let copy = parsed.copy;
     validate_native_results_fd(copy.results_output.results_fd)?;
-    for payload in [copy.src_fd, copy.as_fd, copy.stream_commit_fd]
-        .into_iter()
-        .flatten()
-    {
+    for payload in [copy.as_fd, copy.stream_commit_fd].into_iter().flatten() {
         anyhow::ensure!(
             copy.results_output.results_fd != Some(payload),
             "results and stream payload/completion descriptors must differ"

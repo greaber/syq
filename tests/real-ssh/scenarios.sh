@@ -152,7 +152,8 @@ path = "/tmp/syq-real-ssh/stream 'with spaces'"
 import re
 for transport, extra in (("EncryptedTcp", []), ("Ssh", ["--no-tcp"])):
     parallel = [*controls, "--performance-tuning", "workers=2", "--resource-limits", "bandwidth=8M", *extra]
-    upload = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path, *parallel],
+    policy = '--only-new' if transport == 'EncryptedTcp' else '--only-existing'
+    upload = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path, policy, *parallel],
                             input=payload, capture_output=True, check=True, timeout=60)
     result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1', *parallel],
                             capture_output=True, check=True, timeout=60)

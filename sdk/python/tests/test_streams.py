@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from array import array
 import io
 import hashlib
@@ -148,6 +149,46 @@ class StreamTests(unittest.TestCase):
             async with client.open_writer(as_=target, only_new=True) as out:
                 self.assertTrue(out.skipped)
             self.assertEqual(out.result.files_excluded, 1)
+        asyncio.run(asynchronous())
+
+    def test_writers_open_while_remote_setup_is_blocked(self):
+        # A barrier proves setup can overlap, without a timing threshold. The
+        # SDK timeout bounds failure if opening starts waiting for SSH again.
+        gate = self.root / "setup-gate"
+        os.mkfifo(gate)
+        gate_fd = os.open(gate, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, gate_fd)
+        rsh = self.root / "gated-rsh"
+        rsh.write_text(f'#!{sys.executable}\nimport os, sys\n'
+                       f'with open({str(gate)!r}, "rb", buffering=0) as gate: gate.read(1)\n'
+                       'os.execl("/bin/sh", "sh", "-c", sys.argv[-1])\n')
+        rsh.chmod(0o700)
+        options = dict(to="fixture", rsh=str(rsh), syq_path=str(SYQ),
+                       no_tcp=True, performance_tuning="workers=1", timeout=3)
+        env = {**self.env, "SYQ_CP_OPTIONS": "--no-compress"}
+        client = syq.Client(executable=SYQ, env=env)
+        with contextlib.ExitStack() as stack:
+            outputs = [stack.enter_context(client.open_writer(as_=self.root / f"sync-{i}", **options))
+                       for i in range(2)]
+            self.assertTrue(all(not out.skipped for out in outputs))
+            self.assertFalse((self.root / "sync-0").exists())
+            os.write(gate_fd, b"xxxx")  # Two control sessions and two data workers.
+            for out in outputs:
+                out.write(b"overlapped")
+        for i in range(2):
+            self.assertEqual((self.root / f"sync-{i}").read_bytes(), b"overlapped")
+
+        async def asynchronous():
+            client = syq.AsyncClient(executable=SYQ, env=env)
+            async with contextlib.AsyncExitStack() as stack:
+                outputs = [await stack.enter_async_context(client.open_writer(
+                    as_=self.root / f"async-{i}", **options)) for i in range(2)]
+                self.assertFalse((self.root / "async-0").exists())
+                os.write(gate_fd, b"xxxx")
+                for out in outputs:
+                    await out.write(b"overlapped")
+            for i in range(2):
+                self.assertEqual((self.root / f"async-{i}").read_bytes(), b"overlapped")
         asyncio.run(asynchronous())
 
     def test_writer_placement_and_reader_source_bases(self):

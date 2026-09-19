@@ -178,9 +178,11 @@ A timeout or connection loss during commit can leave the outcome uncertain;
 the method reports failure rather than claiming rollback. Whole datasets
 need their own final publication step after all object transfers succeed.
 
-Writers wait for the destination decision before returning (before entry of an
-async context completes). With `only_new=True` or `only_existing=True`, check
-`output.skipped` before producing data:
+Writers normally return while destination setup continues, so opening several
+writers lets their connections start concurrently. Setup errors can surface at
+`write()` or `commit()`. With `only_new=True`, `only_existing=True`, or `dry_run=True`,
+opening waits for the destination decision (also for options inherited from the
+environment). Check `output.skipped` before producing data:
 
 ```python
 with client.open_writer(to="server", as_="archive.tar", only_new=True) as output:

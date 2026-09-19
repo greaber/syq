@@ -224,10 +224,11 @@ is non-retryable. Do not construct a retry source from its destination name.
 
 ### `stream_ready`
 
-A descriptor copy has passed its initial checks and can accept or deliver
-payload. This is useful for deciding whether to start a producer. Skipped
-copies and dry runs finish without this record. It does not promise successful
-transfer or publication; require the terminal result for that.
+A producer may start supplying payload. Uploads without a skip policy emit this
+before destination setup finishes, allowing several writers to connect concurrently.
+With `--only-new` or `--only-existing`, the destination decision comes first.
+Skipped copies and dry runs finish without this record. Setup, transfer, or
+publication can still fail; require the terminal result for completion.
 
 ### `stream_result`
 

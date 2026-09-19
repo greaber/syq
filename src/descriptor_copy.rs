@@ -72,6 +72,9 @@ pub(crate) struct StreamPlacement {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Operation {
     Open {
+        dry_run: bool,
+        only_new: bool,
+        only_existing: bool,
         path: Vec<u8>,
         write: bool,
         follow: bool,
@@ -81,16 +84,6 @@ pub(crate) enum Operation {
     },
     Finish {
         size: u64,
-    },
-    /// Validate a dry run without opening payload files or creating directories.
-    Inspect {
-        only_new: bool,
-        only_existing: bool,
-        path: Vec<u8>,
-        write: bool,
-        follow: bool,
-        root: Option<Vec<u8>>,
-        placement: StreamPlacement,
     },
 }
 pub(crate) use file::{resolve_source, FileWorker, Session};

@@ -1310,6 +1310,7 @@ fn stream_previews_and_results_do_not_consume_payload() {
         vec!["pipe", "--to", "fixture", "--as", "payload", "--only-new"],
         vec!["--src-fd", "0", "--as", ".", "--only-new"],
         vec!["--src-fd", "0", "--as-fd", "1", "--only-new"],
+        vec!["--from", "fixture", "payload", "--as-fd", "1", "--only-new"],
     ]
     .into_iter()
     .enumerate()

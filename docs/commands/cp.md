@@ -204,8 +204,9 @@ parts. Restart recovery, named receiving destinations, detached execution,
 directory selection, content comparison, and metadata preservation are unsupported.
 
 `--only-new` skips a destination that exists; `--only-existing` skips one that
-is missing. Skips succeed without reading input or opening a named FIFO. A
-shell producer can therefore receive SIGPIPE; in Python, check the writer's
+is missing. Existing directories, S3 key prefixes, and dangling symlinks also
+count as existing for `--only-new`. Skips succeed without reading input or
+opening a named FIFO. A shell producer can therefore receive SIGPIPE; in Python, check the writer's
 `skipped` property before producing bytes. An output FD already exists, so
 `--only-new --as-fd N` always skips after validating the source.
 
