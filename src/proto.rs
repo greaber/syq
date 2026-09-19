@@ -1275,9 +1275,19 @@ pub trait SizeHint {
     fn direct_payload(&self) -> bool {
         false
     }
+    /// Large contiguous data can be sampled before serializing its message.
+    fn compression_data(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 impl SizeHint for Request {
+    fn compression_data(&self) -> Option<&[u8]> {
+        match self {
+            Request::WriteRange { data, .. } => Some(data),
+            _ => None,
+        }
+    }
     fn direct_payload(&self) -> bool {
         matches!(self, Request::WriteRange { .. })
     }
@@ -1347,6 +1357,12 @@ impl SizeHint for Request {
 }
 
 impl SizeHint for Response {
+    fn compression_data(&self) -> Option<&[u8]> {
+        match self {
+            Response::Block { data, .. } => Some(data),
+            _ => None,
+        }
+    }
     fn direct_payload(&self) -> bool {
         matches!(self, Response::Block { .. })
     }
@@ -1458,9 +1474,66 @@ impl<W: Write> postcard::ser_flavors::Flavor for MessageOutput<'_, W> {
     }
 }
 
+// After an unsuccessful full compression, probe each large data frame cheaply.
+// Periodic full attempts catch patterns longer than a sample. Separate contexts
+// keep tiny probes from repeatedly resizing the full encoder's tables.
+struct FrameCompression {
+    encoder: zstd::bulk::Compressor<'static>,
+    sampler: zstd::bulk::Compressor<'static>,
+    sample: Vec<u8>,
+    sample_output: Vec<u8>,
+    output: Vec<u8>,
+    remaining_probes: usize,
+}
+
+impl FrameCompression {
+    const SAMPLE_BYTES: usize = 16 * 1024;
+    const PROBE_MIN: usize = 128 * 1024;
+
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            encoder: zstd::bulk::Compressor::new(COMPRESS_LEVEL)?,
+            sampler: zstd::bulk::Compressor::new(COMPRESS_LEVEL)?,
+            sample: Vec::with_capacity(Self::SAMPLE_BYTES),
+            sample_output: Vec::with_capacity(zstd::zstd_safe::compress_bound(Self::SAMPLE_BYTES)),
+            output: Vec::new(),
+            remaining_probes: 0,
+        })
+    }
+
+    fn worth_compressing(&mut self, data: &[u8]) -> bool {
+        debug_assert!(data.len() >= Self::PROBE_MIN);
+        if self.remaining_probes == 0 {
+            return true;
+        }
+        self.remaining_probes -= 1;
+        self.sample.clear();
+        let chunk = Self::SAMPLE_BYTES / 4;
+        for index in 0..4 {
+            let start = (data.len() - chunk) * index / 3;
+            self.sample.extend_from_slice(&data[start..start + chunk]);
+        }
+        self.sample_output.clear();
+        // An uncertain probe keeps the existing full compression attempt.
+        self.sampler
+            .compress_to_buffer(&self.sample, &mut self.sample_output)
+            .map_or(true, |size| size < self.sample.len())
+    }
+
+    fn compress(&mut self, data: &[u8]) -> bool {
+        self.output.clear();
+        self.output
+            .reserve(zstd::zstd_safe::compress_bound(data.len()));
+        self.encoder
+            .compress_to_buffer(data, &mut self.output)
+            .is_ok_and(|size| size < data.len())
+    }
+}
+
 pub struct FrameWriter<W: Write> {
     w: BufWriter<W>,
     pub compress: bool,
+    compression: Option<FrameCompression>,
     preamble_written: bool,
 }
 
@@ -1469,6 +1542,7 @@ impl<W: Write> FrameWriter<W> {
         FrameWriter {
             w: BufWriter::with_capacity(1 << 20, w),
             compress,
+            compression: None,
             preamble_written: false,
         }
     }
@@ -1479,6 +1553,7 @@ impl<W: Write> FrameWriter<W> {
         FrameWriter {
             w: BufWriter::with_capacity(1 << 20, w),
             compress,
+            compression: None,
             preamble_written: true,
         }
     }
@@ -1531,7 +1606,21 @@ impl<W: Write> FrameWriter<W> {
 
     pub fn write_msg<T: Serialize + SizeHint>(&mut self, msg: &T) -> io::Result<()> {
         self.write_preamble()?;
-        if !self.compress && msg.direct_payload() {
+        let mut compress = self.compress;
+        if compress {
+            if let Some(data) = msg
+                .compression_data()
+                .filter(|data| data.len() >= FrameCompression::PROBE_MIN)
+            {
+                if self.compression.is_none() {
+                    self.compression = FrameCompression::new().ok();
+                }
+                if let Some(compression) = &mut self.compression {
+                    compress = compression.worth_compressing(data);
+                }
+            }
+        }
+        if !compress && msg.direct_payload() {
             // serde_bytes payloads contribute their length without visiting
             // each byte. The second pass writes those slices directly.
             let size = postcard::experimental::serialized_size(msg)
@@ -1557,18 +1646,44 @@ impl<W: Write> FrameWriter<W> {
         let payload = postcard::to_extend(msg, Vec::with_capacity(msg.size_hint()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Self::check_message_size(payload.len(), msg.frame_limit())?;
-        let mut flag = 0u8;
-        let mut body = payload;
-        if self.compress && body.len() > COMPRESS_MIN {
-            if let Ok(c) = zstd::bulk::compress(&body, COMPRESS_LEVEL) {
-                if c.len() < body.len() {
-                    body = c;
-                    flag = 1;
-                }
+        let compressed = if compress && payload.len() > COMPRESS_MIN {
+            if self.compression.is_none() {
+                self.compression = FrameCompression::new().ok();
+            }
+            self.compression
+                .as_mut()
+                .is_some_and(|compression| compression.compress(&payload))
+        } else {
+            false
+        };
+        if compress
+            && msg
+                .compression_data()
+                .is_some_and(|data| data.len() >= FrameCompression::PROBE_MIN)
+        {
+            if let Some(compression) = &mut self.compression {
+                compression.remaining_probes = if compressed { 0 } else { 7 };
             }
         }
-        self.write_frame_header(body.len(), flag)?;
-        self.w.write_all(&body)?;
+        let size = if compressed {
+            self.compression.as_ref().unwrap().output.len()
+        } else {
+            payload.len()
+        };
+        self.write_frame_header(size, u8::from(compressed))?;
+        if compressed {
+            self.w
+                .write_all(&self.compression.as_ref().unwrap().output)?;
+        } else {
+            self.w.write_all(&payload)?;
+        }
+        // Common data frames reuse their output allocation. A one-off maximum
+        // frame must not retain tens of MiB on each idle connection.
+        if let Some(compression) = &mut self.compression {
+            if compression.output.capacity() > 4 * 1024 * 1024 {
+                compression.output = Vec::new();
+            }
+        }
         self.w.flush()
     }
 }

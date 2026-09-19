@@ -622,3 +622,70 @@ fn copy_local_fallback_has_a_structured_wire_response() {
         Response::CopyLocalUnsupported
     ));
 }
+
+#[test]
+fn compression_learning_recovers_after_incompressible_data() {
+    let mut random = vec![0; 256 * 1024];
+    let mut state = 0x9e3779b97f4a7c15u64;
+    for byte in &mut random {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state as u8;
+    }
+    let mut mixed = random.clone();
+    mixed[64 * 1024..].fill(0);
+    let blocks = [random.clone(), random, mixed, vec![b'a'; 256 * 1024]];
+    let mut wire = Vec::new();
+    {
+        let mut writer = FrameWriter::new(&mut wire, true);
+        for data in &blocks {
+            writer
+                .write_msg(&Response::Block {
+                    off: 0,
+                    hash: [11; 32],
+                    data: data.clone(),
+                })
+                .unwrap();
+        }
+    }
+    let mut offset = local_preamble_len();
+    for expected_flag in [0, 0, 1, 1] {
+        let length = u32::from_le_bytes(wire[offset..offset + 4].try_into().unwrap()) as usize;
+        assert_eq!(wire[offset + 4], expected_flag);
+        offset += 4 + length;
+    }
+    assert_eq!(offset, wire.len());
+    let mut reader = FrameReader::new(wire.as_slice());
+    for expected in blocks {
+        let Response::Block { data, .. } = reader.read_msg().unwrap() else {
+            panic!("expected block");
+        };
+        assert_eq!(data, expected);
+    }
+}
+
+#[test]
+fn compression_learning_periodically_tries_patterns_beyond_the_samples() {
+    let mut random = vec![0; 256 * 1024];
+    let mut state = 0x9e3779b97f4a7c15u64;
+    for byte in &mut random {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state as u8;
+    }
+    let mut compression = FrameCompression::new().unwrap();
+    assert!(
+        compression.worth_compressing(&random),
+        "first frame gets a full attempt"
+    );
+    compression.remaining_probes = 7;
+    for _ in 0..7 {
+        assert!(!compression.worth_compressing(&random));
+    }
+    assert!(
+        compression.worth_compressing(&random),
+        "full attempts must resume even when probes find nothing"
+    );
+}
