@@ -49,13 +49,13 @@ impl Policy {
         let rate = self.bytes as f64 / self.elapsed.as_secs_f64() / (1 << 20) as f64;
         self.bytes = 0;
         self.elapsed = Duration::ZERO;
-        // Conservative per-channel MiB/s thresholds, with hysteresis around
-        // 8 and 64 MiB/s. Writes include encryption, SSH and receiver pressure;
+        // Per-channel MiB/s thresholds with hysteresis. Favor Zstd on
+        // intermediate-speed paths. Writes include encryption and receiver pressure;
         // this is an effective drain rate, not the physical interface speed.
         let next = match self.mode {
             _ if rate < 6.0 => Mode::Zstd3,
-            _ if rate > 80.0 => Mode::Lz4,
-            Mode::Lz4 if rate < 48.0 => Mode::Zstd1,
+            _ if rate > 200.0 => Mode::Lz4,
+            Mode::Lz4 if rate < 150.0 => Mode::Zstd1,
             Mode::Zstd3 if rate > 10.0 => Mode::Zstd1,
             current => current,
         };
@@ -176,29 +176,43 @@ mod tests {
     use super::*;
 
     fn observe(policy: &mut Policy, mib_per_second: u64) {
-        let bytes = 4 << 20;
-        policy.observe(bytes, Duration::from_secs_f64(4.0 / mib_per_second as f64));
+        let bytes = (mib_per_second as usize) << 20;
+        policy.observe(bytes, Duration::from_secs(1));
     }
 
     #[test]
     fn transport_rate_selects_codecs_in_both_directions_with_hysteresis() {
         let mut policy = Policy::new(false);
         assert_eq!(policy.mode, Mode::Lz4);
-        observe(&mut policy, 100);
-        assert_eq!(policy.mode, Mode::Lz4);
-        observe(&mut policy, 32);
+        for rate in [256, 200, 175, 150] {
+            observe(&mut policy, rate);
+            assert_eq!(policy.mode, Mode::Lz4);
+        }
+        observe(&mut policy, 149);
         assert_eq!(policy.mode, Mode::Zstd1);
-        for rate in [55, 70, 79] {
+        for rate in [150, 175, 199, 200] {
             observe(&mut policy, rate);
             assert_eq!(policy.mode, Mode::Zstd1);
         }
+        observe(&mut policy, 201);
+        assert_eq!(policy.mode, Mode::Lz4);
+        for rate in [64, 100, 112] {
+            let mut intermediate = Policy::new(false);
+            assert_eq!(intermediate.mode, Mode::Lz4);
+            observe(&mut intermediate, rate);
+            assert_eq!(intermediate.mode, Mode::Zstd1);
+        }
         observe(&mut policy, 4);
         assert_eq!(policy.mode, Mode::Zstd3);
-        observe(&mut policy, 9);
-        assert_eq!(policy.mode, Mode::Zstd3);
-        observe(&mut policy, 16);
+        for rate in [6, 9, 10] {
+            observe(&mut policy, rate);
+            assert_eq!(policy.mode, Mode::Zstd3);
+        }
+        observe(&mut policy, 11);
         assert_eq!(policy.mode, Mode::Zstd1);
-        observe(&mut policy, 128);
+        observe(&mut policy, 6);
+        assert_eq!(policy.mode, Mode::Zstd1);
+        observe(&mut policy, 256);
         assert_eq!(policy.mode, Mode::Lz4);
     }
 
