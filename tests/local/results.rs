@@ -1258,28 +1258,6 @@ fn native_remote_dry_run_results_need_a_local_coordinator() {
 }
 
 #[test]
-fn native_verify_only_remote_results_require_local_coordination() {
-    let t = Tmp::new();
-    let out = native_syq(&[
-        "cp",
-        "--verify-only",
-        "--from",
-        "source.invalid",
-        "--srcs-in",
-        "data",
-        "--to",
-        "destination.invalid",
-        "--into",
-        "data",
-        "--results",
-        &t.s("results"),
-    ]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
-    assert!(stderr_of(&out).contains("--coordinate-at local"));
-    assert!(!t.path("results").exists());
-}
-
-#[test]
 fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;

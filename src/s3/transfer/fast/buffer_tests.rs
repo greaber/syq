@@ -427,8 +427,8 @@ async fn whole_object_batches_start_conservatively_and_can_tune_higher() {
         assert_eq!(requests.preparation_limit(), 33);
         assert_eq!(requests.begin_objects(concurrency.initial), Some(32));
     }
-    for mode in ["--verify-only", "--dry-run"] {
-        let engine = planning_engine(&[mode]);
+    {
+        let engine = planning_engine(&["--dry-run"]);
         let concurrency = engine
             .object_workers(std::iter::repeat_n(1024 * 1024, 512))
             .unwrap();

@@ -86,9 +86,7 @@ created as needed.
 ## Syq extensions
 
 Most syq-specific options carry a `--syq-` prefix. Common ones are
-`--syq-ignore`, `--syq-ignore-from`, and
-`--syq-verify-only`. The last compares selected contents without writing;
-it does not produce rsync's itemized-change format.
+`--syq-ignore` and `--syq-ignore-from`.
 
 Use [`--integrity-checking`](integrity-checking.md) to choose comparison and
 transfer hashes in rsync mode. `-c` selects content comparison.
@@ -103,11 +101,10 @@ record comparison evidence and version-specific details.
 ## Compare without copying
 
 ```sh
-syq rsync -a --syq-verify-only project/ backup/
+syq rsync -ancv project/ backup/
 ```
 
-Hashes selected contents on both sides, writes nothing, and reports `DIFFERS`
-or `MISSING`. Differences or inspection failures produce a nonzero exit status.
+Compares contents without copying and lists planned changes.
 
 Performance controls use `--performance-tuning`; resource ceilings use
 `--resource-limits`. The standard rsync spelling `--bwlimit` remains available

@@ -347,19 +347,11 @@ syq cp --hash --srcs-in project --into backup
 Use [per-file expected hashes in mappings](mappings.md#the-format) to require
 known contents, including when reusing destination bytes.
 
-To compare without copying:
-
-```sh
-syq cp --verify-only --srcs-in project --into backup
-```
-
-Missing or different entries make the command fail. This compares contents,
-symlink targets, and entry types, without comparing metadata or looking for
-extra destination files.
+Use [`--dry-run --hash`](#preview-changes) to compare without copying.
 
 The [Integrity checking reference](integrity-checking.md) covers timestamp
 precision, every comparison and payload-check algorithm, expected hashes,
-and verification restrictions. For consistent source data, stop concurrent
+and transfer checks. For consistent source data, stop concurrent
 writers or copy a snapshot.
 
 ## In-place writes

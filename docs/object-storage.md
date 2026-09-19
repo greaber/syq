@@ -68,8 +68,8 @@ completion response can mean an upload was published despite a reported failure.
 
 Bucket-to-bucket copies run within one service, using the same endpoint, region,
 and credentials. They preserve metadata and tags. Changes to tags, encryption,
-or storage class alone do not trigger a copy. Content hashing, expected hashes,
-and `--verify-only` are unsupported on this route.
+or storage class alone do not trigger a copy. Content hashing and expected hashes
+are unsupported on this route.
 
 <a id="remove-objects-and-versions"></a>
 

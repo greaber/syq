@@ -85,7 +85,6 @@ impl Engine {
         let maximum = if count > starting as u64
             && fixed_workers.is_none()
             && !self.args.dry_run
-            && !self.args.verify_only
             && single_request
         {
             let capacity = if self.options.route.is_server_copy() {

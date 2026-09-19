@@ -200,8 +200,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
         # Reject unsupported settings before opening input or mutating output.
         inherited_target = root / 'inherited-options'
         inherited_target.write_bytes(b'old')
-        for options, diagnostic in (('--verify-only', b'--verify-only'),
-                                    ('--performance-tuning batch-files=1', b'batch-files')):
+        for options, diagnostic in (('--performance-tuning batch-files=1', b'batch-files'),):
             result = subprocess.run(
                 [SYQ, 'cp', '--src-fd', '0', '--as', str(inherited_target)],
                 input=b'new', stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -238,7 +237,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
         created = root / 'umask-output'
         run(['--src-fd', '0', '--as', str(created)], input=b'new', umask=0o027)
         assert created.stat().st_mode & 0o777 == 0o640
-        for option in ('--prune', '--hash', '--verify-only', '--detach'):
+        for option in ('--prune', '--hash', '--detach'):
             result = fail(['--src-fd', '0', '--as', str(root / 'forbidden'), option], input=b'')
             assert not (root / 'forbidden').exists(), option
         for args in (['--src-fd', '0'], ['--as-fd', '1'], ['--src-fd', '2', '--as', 'bad'],

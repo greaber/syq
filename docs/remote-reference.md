@@ -153,18 +153,8 @@ but automatic selection uses ordinary SSH, where it resolves to `/archive`.
 
 ## Verification
 
-For comparisons between two servers, `--coordinate-at local` uses ordinary
-SSH access from your machine to both endpoints. It needs no restricted receiver
-enrollment and supports `--verify-only --results FILE`. Files are hashed on
-the servers; your machine compares their hashes and receives listings and
-results, not the full file contents.
-
-Direct restricted verification requires an existing enrollment and cannot
-produce `--results`; a receiver receipt cannot attest to the source's comparison.
-Verification never installs an enrollment.
-
-`--verify-only` cannot combine with `--dry-run`, `--prune`, `--inplace`, or
-overwrite policies. Filters and size limits select the entries to compare;
-special files require `--preserve=specials`. Metadata is not compared, but device
-identity is. A requested results file may still be written, and remote setup may
-still cache the helper or [install syq](install.md#automatic-installation-on-ssh-servers).
+For comparisons between two servers, use `--dry-run --hash --coordinate-at local`.
+This uses ordinary SSH access and supports `--results FILE` without restricted
+receiver enrollment. Files are hashed on the servers; your machine receives
+hashes, listings, and results. Remote setup may still cache the helper or
+[install syq](install.md#automatic-installation-on-ssh-servers).

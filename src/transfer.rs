@@ -136,7 +136,6 @@ pub struct Opts {
     pub devices: bool,
     pub checksum: bool,
     pub precise_mtime: bool,
-    pub verify_only: bool,
     pub inplace: bool,
     pub same_host: bool,
     /// Automatic copies and explicit -j1 may use one direct userspace writer
@@ -216,7 +215,6 @@ impl Opts {
             bandwidth_limited,
             receiver_copy_disabled: !cfg!(any(target_os = "linux", target_os = "macos"))
                 || !self.local_copy_fd_budget
-                || self.verify_only
                 || self.dry_run
                 || self.restricted_receiver
                 || (cfg!(target_os = "macos") && self.inplace),
@@ -449,7 +447,6 @@ fn small_copy_eligible(
         && !srcs.iter().any(Location::is_remote)
         && args.restricted_grant.is_none()
         && !args.dry_run
-        && !args.verify_only
         && !args.inplace
         && !args.delete
         && !args.update
@@ -1022,7 +1019,6 @@ pub fn run(mut args: Args) -> Result<i32> {
         progress.set_results(writer);
     }
     let dry_run = args.dry_run;
-    let verify_only = args.verify_only;
     let prune = args.delete;
     let outcome = handoff.and_then(|()| run_transfer(args, Arc::clone(&progress)));
     if outcome.is_err() {
@@ -1038,11 +1034,7 @@ pub fn run(mut args: Args) -> Result<i32> {
                 status: "failed",
                 exit_code: 1,
                 dry_run,
-                files_transferred: if verify_only {
-                    0
-                } else {
-                    progress.files_done.load(Relaxed)
-                },
+                files_transferred: progress.files_done.load(Relaxed),
                 files_unchanged: progress.files_unchanged.load(Relaxed),
                 files_excluded: progress.files_excluded.load(Relaxed),
                 // Mutations that settled (and streamed their records)
@@ -1051,13 +1043,9 @@ pub fn run(mut args: Args) -> Result<i32> {
                 symlinks_created: progress.symlinks_created.load(Relaxed),
                 specials_created: progress.specials_created.load(Relaxed),
                 errors: progress.errors.load(Relaxed),
-                bytes_transferred: if verify_only {
-                    0
-                } else {
-                    progress.bytes_done.load(Relaxed)
-                },
+                bytes_transferred: progress.bytes_done.load(Relaxed),
                 bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-                copying_elapsed_ms: if verify_only || dry_run {
+                copying_elapsed_ms: if dry_run {
                     None
                 } else {
                     progress.copying_elapsed_ms()
@@ -1398,7 +1386,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         devices: args.devices,
         checksum: args.checksum,
         precise_mtime: !matches!(args.placement, Placement::Rsync),
-        verify_only: args.verify_only,
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         allow_sequential_nfs_fallback: args.connections_default || args.connections == 1,
@@ -2001,7 +1988,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !srcs[0].is_remote()
         && dst_is_dir
         && dst_entry_is_dir
-        && !args.verify_only
         && !args.existing;
     let mut prepared_anchor = None;
     let mut prepared_filesystem = None;
@@ -2096,7 +2082,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         || operator_directory == operator_dst_root
         || exact_capacity_target.is_some();
     let initial_destination_filesystem = if use_operator_anchor
-        && !args.verify_only
         && !args.existing
         && (dst_root_entry.is_none() || (dst_entry_is_dir && can_inspect_existing_destination))
     {
@@ -2130,8 +2115,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             overflowed: false,
         })
     });
-    let defer_destination_mutations = multiple_distinct_sources
-        || (fresh_capacity.is_some() && !args.dry_run && !args.verify_only);
+    let defer_destination_mutations =
+        multiple_distinct_sources || (fresh_capacity.is_some() && !args.dry_run);
     // Native new/existing forms are intentionally only the lightweight
     // pathname checks above. Once they pass, use the ordinary engine's target
     // conditions and publication behavior; this adapter does not add an
@@ -2307,24 +2292,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // and never under --existing. With several sources, or while a fresh-target
     // capacity check is pending, this waits until the complete scan has passed
     // its namespace and capacity preflights.
-    let create_root = dst_root_entry.is_none()
-        && dst_is_dir
-        && !args.dry_run
-        && !args.verify_only
-        && !args.existing;
+    let create_root = dst_root_entry.is_none() && dst_is_dir && !args.dry_run && !args.existing;
     let dry_run_creates_root =
         args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
     let root_create_condition = TargetCondition::Any;
     let defer_operator_directory_creation = use_operator_anchor
         && directory_selection.is_none()
         && !args.dry_run
-        && !args.verify_only
         && !args.existing
         && defer_destination_mutations;
     if use_operator_anchor {
         let create_operator_directory_now = directory_selection.is_none()
             && !args.dry_run
-            && !args.verify_only
             && !args.existing
             && !defer_operator_directory_creation;
         if create_operator_directory_now {
@@ -2489,7 +2468,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && destination_tree_known_missing
         && !opts.dry_run
         && !opts.inplace
-        && !opts.verify_only
         && (!destination_anchor_required || destination_anchor.get().is_some())
     {
         // The planner signals as soon as a source batch contains regular files,
@@ -2695,7 +2673,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .as_ref()
             .is_some_and(|plan| plan.root_existed)
         && !opts.dry_run
-        && !opts.verify_only
         && !opts.inplace
         && !opts.checksum
         && !opts.update
@@ -2789,8 +2766,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 let (multiplex_small_files, file_jobs, file_bytes) = {
                     let jobs = sched.jobs.lock().unwrap();
                     (
-                        !opts.verify_only
-                            && !opts.dry_run
+                        !opts.dry_run
                             && !opts.tuning.force_ranges()
                             && bwlimit.is_none()
                             && jobs.iter().enumerate().all(|(idx, job)| {
@@ -2966,7 +2942,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     }
-    if !aborted && !opts.dry_run && !opts.verify_only {
+    if !aborted && !opts.dry_run {
         st.apply_deferred()?;
     }
     if debug() {
@@ -3083,11 +3059,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         status,
         exit_code,
         dry_run: opts.dry_run,
-        files_transferred: if opts.verify_only {
-            0
-        } else {
-            progress.files_done.load(Relaxed)
-        },
+        files_transferred: progress.files_done.load(Relaxed),
         files_unchanged: progress.files_unchanged.load(Relaxed),
         files_excluded: progress.files_excluded.load(Relaxed),
         // Live counters only move when mutations run; a dry run reports the
@@ -3108,13 +3080,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             created_counts.2
         },
         errors,
-        bytes_transferred: if opts.verify_only {
-            0
-        } else {
-            progress.bytes_done.load(Relaxed)
-        },
+        bytes_transferred: progress.bytes_done.load(Relaxed),
         bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-        copying_elapsed_ms: if opts.verify_only || opts.dry_run {
+        copying_elapsed_ms: if opts.dry_run {
             None
         } else {
             progress.copying_elapsed_ms()
@@ -3128,7 +3096,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if !aborted
         && errors == 0
         && !opts.dry_run
-        && !opts.verify_only
         && scan_err.is_none()
         && !collision
         // A capped run can use an unrestricted hint, but cannot replace it.
@@ -3179,14 +3146,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 &dry_run_changes,
                 fresh_capacity_assessment,
             );
-        } else if opts.verify_only {
-            crate::output::human_stdout!(
-                "syq: verified {} files match, {} differences or errors, checked {} in {}",
-                commas(terminal.files_unchanged),
-                errors,
-                human(done),
-                crate::progress::hms(elapsed)
-            );
         } else {
             print_transfer_summary(
                 &terminal,
@@ -3195,7 +3154,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
-    if args.stats && show_statistics(&args) && !args.quiet && !opts.verify_only && !opts.dry_run {
+    if args.stats && show_statistics(&args) && !args.quiet && !opts.dry_run {
         if let Some(ms) = progress.copying_elapsed_ms() {
             crate::output::human_stdout!(
                 "  copying interval: {:.3}s (may overlap planning)",
@@ -3215,14 +3174,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     "logical bytes needing content work",
                     "logical bytes with unchanged content",
                     progress.bytes_total.load(Relaxed),
-                )
-            } else if opts.verify_only {
-                (
-                    "regular files to compare",
-                    "regular files matched",
-                    "bytes checked",
-                    "bytes matched",
-                    done,
                 )
             } else {
                 (

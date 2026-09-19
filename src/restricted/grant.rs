@@ -55,7 +55,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
             "--inplace cannot be combined with --only-new, --only-existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
-    if !args.dry_run && !args.verify_only && args.delete && args.max_delete.is_none() {
+    if !args.dry_run && args.delete && args.max_delete.is_none() {
         // The signed deletion count is the only bound on what a compromised
         // hostA can remove inside the scope, so make it an explicit choice
         // instead of a silent hundred-million default.
@@ -95,7 +95,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
             "--pscope is not available with the command-restricted receiver: its host-bound authentication is verified per fresh connection"
         );
     }
-    if !args.dry_run && !args.verify_only && args.delete && args.max_size.is_some() {
+    if !args.dry_run && args.delete && args.max_size.is_some() {
         bail!(
             "--max-size with deletion is not yet independently enforceable by the command-restricted receiver"
         );
@@ -123,7 +123,7 @@ pub(super) fn grant_for(
 ) -> Result<Grant> {
     validate_restricted_args(args)?;
     let issued_at = now()?;
-    let read_only = args.dry_run || args.verify_only;
+    let read_only = args.dry_run;
     // `--max-delete 0` means nothing may be deleted, which the grant states
     // directly as a forbidding policy rather than a zero budget.
     let deletion = if !read_only && args.delete && args.max_delete != Some(0) {
@@ -236,7 +236,7 @@ pub(super) fn grant_for(
                 preserve_devices: args.devices,
                 compare_existing_by_content: args.checksum,
                 dry_run: args.dry_run,
-                verify_only: args.verify_only,
+                verify_only: false,
                 compressed_transport: args.compress,
                 tcp_port_lo,
                 tcp_port_hi,

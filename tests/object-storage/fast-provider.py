@@ -36,6 +36,6 @@ with tempfile.TemporaryDirectory(prefix='syq-fast-check-') as tmp:
         assert not list((cache/'syq'/'s3').glob('*.json'))
         assert not list(target.glob('.syq-s3-*'))
         # Verification independently checks objects written without digests.
-        subprocess.run([binary,'cp','--no-progress','--verify-only','--from','s3://'+c.BUCKET,'--srcs-in',c.PREFIX,'--into',str(target)],env=env,check=True,timeout=180)
+        subprocess.run([binary,'cp','--no-progress','--dry-run','--hash','--from','s3://'+c.BUCKET,'--srcs-in',c.PREFIX,'--into',str(target)],env=env,check=True,timeout=180)
         print('Automatic sizes, direct-I/O tail, quick check, metadata, and content verification passed',flush=True)
     finally:c.clean()

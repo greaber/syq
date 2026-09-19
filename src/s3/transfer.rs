@@ -244,7 +244,7 @@ impl Engine {
         destination: &Destination,
         directories: &DirectoryMetadata,
     ) -> Result<()> {
-        if !self.args.dry_run && !self.args.verify_only {
+        if !self.args.dry_run {
             let mut directories = directories.lock().await;
             directories.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
             for (path, meta, mode) in directories.iter() {
@@ -513,7 +513,7 @@ impl Engine {
         let whole_algorithm = expected_hash.map(|d| d.algorithm).or_else(|| {
             if self.args.transfer_integrity {
                 Some(self.args.transfer_hash_type.unwrap_or_default())
-            } else if self.args.checksum || self.args.verify_only {
+            } else if self.args.checksum {
                 Some(self.args.hash_algorithm)
             } else {
                 None
@@ -696,7 +696,7 @@ impl Engine {
                         || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm)
                 })
         });
-        let comparison_digest = if self.args.checksum || self.args.verify_only {
+        let comparison_digest = if self.args.checksum {
             if whole_algorithm == Some(self.args.hash_algorithm) {
                 whole_digest.clone()
             } else {
@@ -721,17 +721,7 @@ impl Engine {
                         == *comparison_digest.as_ref().unwrap();
             }
         }
-        if self.args.verify_only {
-            let object = existing.context("verification failed: destination object is missing")?;
-            self.verify_upload(
-                &source,
-                &object,
-                comparison_digest.as_deref().unwrap(),
-                self.args.hash_algorithm,
-            )
-            .await?;
-            return Ok(None);
-        }
+
         if unchanged && expected_hash.is_some() {
             unchanged = self
                 .verify_expected_remote(existing.as_ref().unwrap(), expected_hash)
@@ -1077,44 +1067,7 @@ impl Engine {
         }
         Ok(Some(size))
     }
-    async fn verify_upload(
-        &self,
-        source: &Source,
-        object: &Object,
-        digest: &str,
-        algorithm: HashAlgorithm,
-    ) -> Result<()> {
-        let _slot = self.tuning.requests.acquire().await;
-        if object.kind() != source.kind()
-            || object.size != source.meta.len && source.kind() != ObjectKind::Dir
-        {
-            bail!("verification failed: object type or size differs");
-        }
-        let output = self
-            .client
-            .get_object()
-            .bucket(&self.options.bucket)
-            .key(&object.key)
-            .if_match(&object.etag)
-            .set_version_id(object.version.clone())
-            .send()
-            .await
-            .map_err(|e| e.into_service_error())?;
-        let mut reader = output.body.into_async_read();
-        let mut hasher = algorithm.hasher();
-        let mut buffer = vec![0; 1024 * 1024];
-        loop {
-            let n = reader.read(&mut buffer).await?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buffer[..n]);
-        }
-        if Digest::from_hash(algorithm, &hasher.finalize()).value != digest {
-            bail!("verification failed: contents differ");
-        }
-        Ok(())
-    }
+
     async fn download_plan(
         &self,
         destination_prefix: &str,
@@ -1463,11 +1416,7 @@ impl Engine {
         // other ranges; the first body is consumed alongside them.
         // Existing files still use HEAD so an unchanged object is not fetched.
         let mut initial_slot = None;
-        let initial = if existing.is_none()
-            && !self.args.dry_run
-            && !self.args.verify_only
-            && !job.key.ends_with('/')
-        {
+        let initial = if existing.is_none() && !self.args.dry_run && !job.key.ends_with('/') {
             initial_slot = Some(self.tuning.requests.acquire().await);
             Some(
                 self.client
@@ -1518,12 +1467,6 @@ impl Engine {
             bail!("an expected hash requires a regular file");
         }
         if object.kind() == ObjectKind::Dir {
-            if self.args.verify_only {
-                if existing.is_none() {
-                    bail!("verification failed: directory is missing");
-                }
-                return Ok(None);
-            }
             if !self.args.dry_run {
                 if existing.is_none() {
                     root.create_missing_parents(&path, 0o777)?;
@@ -1560,12 +1503,7 @@ impl Engine {
                 }
             }
             let same = existing.is_some_and(|m| m.is_symlink()) && root.read_link(&path)? == bytes;
-            if self.args.verify_only {
-                if !same {
-                    bail!("verification failed: symlink differs");
-                }
-                return Ok(None);
-            }
+
             if !self.args.dry_run {
                 root.create_missing_parents(&path, 0o777)?;
                 if !same {
@@ -1586,11 +1524,8 @@ impl Engine {
         }
         let mut unchanged = false;
         if let Some(m) = existing.filter(|m| m.is_file() && m.len == object.size) {
-            if self.args.verify_only || self.args.checksum {
-                if self.args.verify_only
-                    || metadata.hash.is_none()
-                    || metadata.hash_algorithm != self.args.hash_algorithm
-                {
+            if self.args.checksum {
+                if metadata.hash.is_none() || metadata.hash_algorithm != self.args.hash_algorithm {
                     unchanged = self.verify_download(root, &path, &object).await?;
                 } else {
                     let file = root.open_regular_read(&path)?;
@@ -1604,17 +1539,7 @@ impl Engine {
                 unchanged = m.mtime == metadata.mtime && m.mtime_nsec == metadata.nsec;
             }
         }
-        if self.args.verify_only {
-            if !unchanged {
-                if existing.is_some_and(|m| m.is_file() && m.len == object.size) {
-                    bail!("verification failed: contents differ");
-                }
-                bail!("verification failed: file missing, type differs, or size differs");
-            }
-            self.verify_expected_local(root, &path, expected_hash)
-                .await?;
-            return Ok(None);
-        }
+
         if unchanged && expected_hash.is_some() {
             unchanged = self
                 .verify_expected_local(root, &path, expected_hash)

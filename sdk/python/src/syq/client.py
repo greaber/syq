@@ -593,7 +593,6 @@ def _copy_arguments(
     prune: bool,
     dry_run: bool,
     hash: bool,
-    verify_only: bool,
     only_new: bool,
     only_existing: bool,
     skip_newer: bool,
@@ -679,8 +678,6 @@ def _copy_arguments(
     if hash:
         argv.append("--hash")
     _append_text(argv, "--integrity-checking", integrity_checking)
-    if verify_only and (dry_run or prune or inplace or only_new or only_existing or skip_newer):
-        raise SyqInvocationError("verify_only conflicts with dry_run, prune, inplace, and overwrite policies")
     if only_new and (only_existing or skip_newer or inplace):
         raise SyqInvocationError("only_new conflicts with only_existing, skip_newer, and inplace")
     if only_existing and (into_new is not None or as_new is not None):
@@ -688,7 +685,6 @@ def _copy_arguments(
     if skip_newer and inplace:
         raise SyqInvocationError("skip_newer conflicts with inplace")
     for enabled, option in (
-        (verify_only, "--verify-only"),
         (only_new, "--only-new"),
         (only_existing, "--only-existing"),
         (skip_newer, "--skip-newer"),
@@ -1166,7 +1162,6 @@ class Client:
         dry_run: bool = False,
         hash: bool = False,
         integrity_checking: str | None = None,
-        verify_only: bool = False,
         only_new: bool = False,
         only_existing: bool = False,
         skip_newer: bool = False,
@@ -1204,13 +1199,13 @@ class Client:
             from_ is not None
             and to is not None
             and not (str(from_).startswith("s3://") and str(to).startswith("s3://"))
-            and (dry_run or verify_only)
+            and dry_run
             and coordinate_at != "local"
         ):
             # Mirrors the CLI's usage-lane refusal: a dry run's traces exist
             # only on the coordinator, which these placements move remote.
             raise SyqInvocationError(
-                f"a remote-to-remote {'verification' if verify_only else 'dry run'} cannot produce the results "
+                "a remote-to-remote dry run cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
         cwd, root, follow_src = _source_options(
@@ -1241,7 +1236,6 @@ class Client:
             dry_run=dry_run,
             hash=hash,
             integrity_checking=integrity_checking,
-            verify_only=verify_only,
             only_new=only_new,
             only_existing=only_existing,
             skip_newer=skip_newer,
@@ -1440,7 +1434,6 @@ class Client:
             prune=False,
             dry_run=False,
             hash=False,
-            verify_only=False,
             only_new=False,
             only_existing=False,
             skip_newer=False,

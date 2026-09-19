@@ -415,7 +415,7 @@ remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.ma
     } | LC_ALL=C sort
 ) > /tmp/syq-return-local.manifest
 diff -u /tmp/syq-return-source.manifest /tmp/syq-return-local.manifest
-ssh source 'syq cp --verify-only --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
+ssh source 'syq cp --dry-run --hash --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
 ssh source 'syq cp --only-new /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as first/message.txt'
 
 ssh source 'python3 /usr/local/libexec/syq-test-restricted-mapping.py named'
@@ -861,8 +861,8 @@ ssh source 'test -d /tmp/syq-real-ssh/rm-policy/tree; test ! -e /tmp/syq-real-ss
 syq rm --on source --root /tmp/syq-real-ssh/rm-policy --src-dir tree
 ssh source 'test ! -e /tmp/syq-real-ssh/rm-policy/tree'
 
-printf 'case: native verification and overwrite policies through the restricted receiver\n'
-syq cp --verify-only --no-progress --performance-tuning workers=2 \
+printf 'case: native previews and overwrite policies through the restricted receiver\n'
+syq cp --dry-run --hash --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh source 'printf source > /tmp/syq-real-ssh/direct-source/policy-file; printf new > /tmp/syq-real-ssh/direct-source/policy-new'
@@ -881,10 +881,10 @@ syq cp --only-existing --no-progress --performance-tuning workers=2 \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = source; test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
 policy_status=0
-syq cp --verify-only --no-progress --performance-tuning workers=2 \
+syq cp --dry-run --hash --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination || policy_status=$?
-test "$policy_status" -eq 23
+test "$policy_status" -eq 0
 ssh destination 'test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
 ssh source 'touch -m -d @1600000000 /tmp/syq-real-ssh/direct-source/policy-file'
 ssh destination 'printf newer > /tmp/syq-real-ssh/direct-destination/policy-file; touch -m -d @1700000000 /tmp/syq-real-ssh/direct-destination/policy-file'

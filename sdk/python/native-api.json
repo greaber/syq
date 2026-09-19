@@ -41,7 +41,6 @@
         "receiver-max-bytes",
         "receiver-receipt",
         "hash",
-        "verify-only",
         "only-new",
         "only-existing",
         "skip-newer",

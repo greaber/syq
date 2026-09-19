@@ -653,10 +653,6 @@ fn broker_connection_limit(worker_limit: Option<usize>, restricted: bool) -> Res
     }
 }
 
-fn automatic_enrollment_allowed(dry_run: bool, verify_only: bool) -> bool {
-    !(dry_run || verify_only)
-}
-
 fn append_delegated_helper_selection(
     command: &mut Vec<String>,
     syq_path: Option<&str>,
@@ -825,7 +821,7 @@ fn run_remote(
                     dst,
                     &coordinator_policy.login_user,
                     &peer_policy.login_user,
-                    automatic_enrollment_allowed(args.dry_run, args.verify_only),
+                    !args.dry_run,
                 )
             })
             .transpose()
@@ -955,7 +951,6 @@ fn run_remote(
     }
 
     for (enabled, option) in [
-        (args.verify_only, "--verify-only"),
         (args.ignore_existing, "--only-new"),
         (args.existing, "--only-existing"),
         (args.update, "--skip-newer"),

@@ -169,8 +169,6 @@ impl Worker {
                     } else {
                         let res = if self.opts.dry_run {
                             self.preview_file(idx)
-                        } else if self.opts.verify_only {
-                            self.verify_file(idx)
                         } else {
                             self.handle_file(idx)
                         };
@@ -234,8 +232,7 @@ impl Worker {
     pub(super) fn fast_eligible(&self, idx: usize) -> bool {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
-        !self.opts.verify_only
-            && !self.opts.dry_run
+        !self.opts.dry_run
             && self.opts.expected_for(&j.rel_bytes).is_none()
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
@@ -674,7 +671,7 @@ impl Worker {
     ) {
         // Verification reports differences and inspection failures as errors,
         // never as a transfer operation that could be mistaken for a write.
-        if self.opts.verify_only || self.opts.dry_run {
+        if self.opts.dry_run {
             return;
         }
         if let Some(results) = self.progress.results_writer() {
@@ -1885,43 +1882,6 @@ impl Worker {
             } else {
                 format!("update file {} (contents differ)", display(&job.dst))
             });
-        }
-        Ok(())
-    }
-
-    pub(super) fn verify_file(&mut self, idx: usize) -> Result<()> {
-        let job = self.job(idx);
-
-        let r = (|| -> Result<bool> {
-            self.validate_expected_destination(&job)?;
-            self.contents_match(&job)
-        })();
-        self.sched.ranges_ready(idx, vec![]);
-        match r {
-            Ok(true) => {
-                self.progress.add_bytes(job.entry.size);
-                job.done.store(job.entry.size, Relaxed);
-                self.progress.files_done.fetch_add(1, Relaxed);
-                self.progress.files_unchanged.fetch_add(1, Relaxed);
-                self.progress
-                    .bytes_unchanged
-                    .fetch_add(job.entry.size, Relaxed);
-                if self.opts.verbose > 0 {
-                    self.progress.println(&format!("ok      {}", job.rel));
-                }
-            }
-            Ok(false) => {
-                self.progress.add_bytes(job.entry.size);
-                job.done.store(job.entry.size, Relaxed);
-                self.progress.error(&format!("DIFFERS {}", job.rel));
-                self.sched.fail_file(idx);
-            }
-            Err(e) => {
-                if self.transport_dead() {
-                    self.sched.requeue(idx);
-                }
-                return Err(e);
-            }
         }
         Ok(())
     }

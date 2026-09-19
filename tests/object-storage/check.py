@@ -176,7 +176,7 @@ def check():
                 assert actual.read_bytes() == path.read_bytes(), path.name
                 assert actual.stat().st_mode & 0o7777 == path.stat().st_mode & 0o7777
                 assert actual.stat().st_mtime_ns == path.stat().st_mtime_ns
-        run(['--from', remote, placement + '/source', '--into', dst, '--verify-only'])
+        run(['--from', remote, placement + '/source', '--into', dst, '--dry-run','--hash'])
         owned = root / 'owned'
         owned.mkdir()
         run(['--from', remote, placement + '/source', '--as', owned, '--preserve=ownership'])
@@ -193,7 +193,7 @@ def check():
         assert (restored / 'script').read_bytes() == b'local edits'
         run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--only-new'])
         assert (restored / 'script').read_bytes() == b'local edits'
-        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--verify-only'], ok=False)
+        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--dry-run','--hash'])
         run(['--from', remote, placement + '/source/script', '--as-new', restored / 'script'], ok=False)
         run(['--from', remote, placement + '/source/script', '--as', root / 'absent', '--only-existing'])
         assert not (root / 'absent').exists()

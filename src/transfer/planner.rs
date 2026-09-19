@@ -1348,7 +1348,7 @@ impl Planner<'_> {
             let planned = self.filter_dirs(dirs, stats, dst_root);
             if opts.dry_run {
                 self.trace_dry_run_dirs(&planned, dst_root);
-            } else if !opts.verify_only {
+            } else {
                 let Some(reopened_dirs) = self.create_directories(&planned, dst_root)? else {
                     return Ok(());
                 };
@@ -1507,21 +1507,7 @@ impl Planner<'_> {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;
         }
-        if opts.verify_only {
-            if dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File) {
-                self.enqueue(
-                    (src_path.clone(), source.clone()),
-                    dst_path.clone(),
-                    rel.clone(),
-                    dst_rel.clone(),
-                    e.clone(),
-                    dst_entry.clone(),
-                );
-            } else {
-                self.progress.error(&format!("MISSING {rel}"));
-            }
-        } else if same && !opts.checksum && (opts.dry_run || opts.expected_for(&dst_rel).is_none())
-        {
+        if same && !opts.checksum && (opts.dry_run || opts.expected_for(&dst_rel).is_none()) {
             // Content is up to date, but still reconcile metadata
             // (mode/owner/group) the way rsync does — a skipped file
             // shouldn't keep stale permissions.
@@ -1654,12 +1640,7 @@ impl Planner<'_> {
         let same = dst_entry
             .as_ref()
             .is_some_and(|d| d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..]));
-        if opts.verify_only {
-            if !same {
-                self.progress.error(&format!("DIFFERS {rel} (symlink)"));
-            }
-            return;
-        }
+
         if same {
             return;
         }
@@ -1743,17 +1724,7 @@ impl Planner<'_> {
         let same = dst_entry
             .as_ref()
             .is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
-        if opts.verify_only {
-            if !same {
-                let what = if dst_entry.is_none() {
-                    "MISSING"
-                } else {
-                    "DIFFERS"
-                };
-                self.progress.error(&format!("{what} {rel} (special file)"));
-            }
-            return;
-        }
+
         if same || opts.dry_run {
             if opts.dry_run && !same {
                 self.dry_run_changes.specials += 1;
@@ -1834,16 +1805,7 @@ impl Planner<'_> {
                 continue;
             }
             let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
-            if opts.verify_only {
-                if !is_dir {
-                    self.progress.error(&format!(
-                        "{} {}/ (directory)",
-                        if st.is_none() { "MISSING" } else { "DIFFERS" },
-                        display(&p)
-                    ));
-                }
-                continue;
-            }
+
             // --existing creates nothing. A non-directory at the path (a
             // file, a symlink even to a directory — in-tree symlinks are
             // never traversed) counts as missing: we won't
@@ -2296,7 +2258,7 @@ impl Planner<'_> {
                 }
                 self.payload_paths.entry(reservation).or_insert(rel.clone());
             }
-            if entry.kind == Kind::File && !self.opts.inplace && !self.opts.verify_only {
+            if entry.kind == Kind::File && !self.opts.inplace {
                 files.push((dst_path, rel));
             }
         }
@@ -2441,7 +2403,7 @@ impl Planner<'_> {
         kind: Kind,
         entry: Option<&Entry>,
     ) -> bool {
-        if self.opts.verify_only || !entry.is_some_and(|entry| entry.kind == Kind::Dir) {
+        if !entry.is_some_and(|entry| entry.kind == Kind::Dir) {
             return false;
         }
         self.fail_directory_type_change(dst, dst_rel, kind);

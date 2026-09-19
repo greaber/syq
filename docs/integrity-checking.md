@@ -59,7 +59,7 @@ hash. See [S3 metadata and integrity](object-storage.md#filesystem-differences).
 
 Server-side S3 copies preserve stored hashes without reading or verifying
 object bodies. They do not support content-hash comparison, extra transfer
-hashing, expected hashes, or `--verify-only`.
+hashing, or expected hashes.
 
 Descriptor copies use the same optional payload checks as regular-file
 copies: `transfer=ALGORITHM` enables them and selects the hash. Raw S3 streams keep
@@ -80,23 +80,14 @@ hash matches. Selection filters still apply. Dry runs do not check expectations.
 
 ## Compare without copying
 
-To compare without writing, use `--verify-only`:
+Use `--dry-run --hash` to compare without copying:
 
 ```sh
-syq cp --verify-only --srcs-in project --into backup
+syq cp --dry-run --hash --srcs-in project --into backup
 ```
 
-This compares file contents, symlink targets, and entry types without writing.
-Missing or different entries make the command fail. It does not compare metadata
-or look for extra destination files.
-
-For two servers, add `--coordinate-at local` to compare through your machine
-using ordinary SSH access, with no restricted receiver enrollment. This also
-supports `--results`. See [remote verification](remote-reference.md#verification).
-
-`--verify-only` cannot combine with `--dry-run`, `--prune`, `--inplace`, or
-an overwrite policy. Filters and size limits still select what is compared;
-special files require `--preserve=specials`. In rsync syntax, use
-`--syq-verify-only`.
+Differences appear as planned changes. For machine-readable output, add
+[`--results`](automation.md); for two servers, see
+[remote comparisons](remote-reference.md#verification).
 
 For files being changed by another program, stop the writer or copy a snapshot.

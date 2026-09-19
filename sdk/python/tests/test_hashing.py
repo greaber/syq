@@ -24,6 +24,13 @@ class HashTests(unittest.TestCase):
         with self.assertRaisesRegex(syq.SyqProtocolError, "unknown"):
             parse_mapping_line(old)
 
+    def test_saved_verify_only_stream_is_rejected(self):
+        # Unchanged output from the last binary with this mode (2de544d2).
+        fixture = Path(__file__).parent / "fixtures/automation-v2-verify-only.ndjson"
+        decoder = AutomationDecoder(prune=False, mapping=False, dry_run=False)
+        with self.assertRaisesRegex(syq.SyqProtocolError, "verify-only"):
+            decoder.feed(fixture.read_bytes().splitlines()[0])
+
     def test_algorithms_lengths_and_immutable_canonical_value(self):
         for algorithm, length in (("blake3", 64), ("sha256", 64), ("md5", 32), ("xxh3-128", 32)):
             with self.subTest(algorithm=algorithm):

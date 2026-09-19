@@ -407,11 +407,11 @@ class CopyPolicyCandidateTests(unittest.TestCase):
                     result = client.cp(srcs_in="src", into="dst", **options)
                     return asyncio.run(result) if asynchronous else result
 
-                different = copy(verify_only=True, check=False, on_event=events.append)
-                self.assertEqual(different.exit_code, 23)
-                self.assertEqual(different.files_transferred, 0)
-                self.assertEqual(different.bytes_transferred, 0)
-                self.assertTrue(events[0].verify_only)
+                different = copy(dry_run=True, hash=True, on_event=events.append)
+                self.assertEqual(different.exit_code, 0)
+                self.assertEqual(different.files_transferred, 2)
+                self.assertEqual(different.bytes_transferred, 9)
+                self.assertTrue(events[0].dry_run)
                 self.assertFalse((root / "dst/new").exists())
                 self.assertEqual((root / "dst/file").read_bytes(), b"target")
                 kept = copy(only_new=True)
@@ -424,12 +424,10 @@ class CopyPolicyCandidateTests(unittest.TestCase):
                 copy(only_existing=True)
                 self.assertEqual((root / "dst/file").read_bytes(), b"source")
                 self.assertFalse((root / "dst/new").exists())
-                matched = copy(verify_only=True, ignore="new")
+                matched = copy(dry_run=True, hash=True, ignore="new")
                 self.assertEqual(matched.files_unchanged, 1)
                 self.assertEqual(matched.bytes_unchanged, 6)
                 self.assertEqual(matched.files_transferred, 0)
-                with self.assertRaises(syq.SyqInvocationError):
-                    copy(verify_only=True, prune=True)
 
     def test_sync_and_async_removal_keeps_final_link_identity(self) -> None:
         for asynchronous in (False, True):
