@@ -51,8 +51,10 @@ pub(crate) struct Controls {
     pub metadata: super::metadata::Policy,
     pub settings: Settings,
     pub pipeline: usize,
+    pub s3_requests: Option<usize>,
+    pub s3_objects: usize,
     pub progress: Arc<Progress>,
-    limit: Option<crate::bwlimit::BandwidthLimit>,
+    limit: Option<Arc<crate::bwlimit::BandwidthLimit>>,
     stats: bool,
     quiet: bool,
 }
@@ -60,10 +62,13 @@ impl Controls {
     pub fn new(args: &Args, report: super::report::Report) -> Self {
         let tuning = args.tuning_options.unwrap_or_default();
         let limit = (args.bwlimit_bytes != 0)
-            .then(|| crate::bwlimit::BandwidthLimit::new(args.bwlimit_bytes));
+            .then(|| Arc::new(crate::bwlimit::BandwidthLimit::new(args.bwlimit_bytes)));
         let settings = Settings {
-            request_size: tuning.streaming_request_size(super::CHUNK as u64, limit.as_ref(), false)
-                as usize,
+            request_size: tuning.streaming_request_size(
+                super::CHUNK as u64,
+                limit.as_deref(),
+                false,
+            ) as usize,
             algorithm: args.transfer_hash_type.unwrap_or_default(),
             verify: args.transfer_integrity,
         };
@@ -103,6 +108,15 @@ impl Controls {
             metadata: super::metadata::Policy::new(args),
             settings,
             pipeline: tuning.pipeline_depth(),
+            s3_requests: tuning
+                .s3_requests
+                .or_else(|| args.resource_limits.as_ref().and_then(|l| l.s3_requests)),
+            s3_objects: tuning.s3_object_workers.unwrap_or(32).min(
+                args.resource_limits
+                    .as_ref()
+                    .and_then(|l| l.s3_object_workers)
+                    .unwrap_or(usize::MAX),
+            ),
             progress,
             limit,
             stats: args.stats,
@@ -113,10 +127,8 @@ impl Controls {
         self.progress.bytes_total.store(size, Relaxed);
         self.progress.scan_done.store(true, Relaxed);
     }
-    pub fn pace_blocking(&self, bytes: u64) {
-        if let Some(limit) = &self.limit {
-            limit.wait_prepaid(bytes);
-        }
+    pub(crate) fn bandwidth(&self) -> Option<Arc<crate::bwlimit::BandwidthLimit>> {
+        self.limit.clone()
     }
     pub async fn pace(&self, bytes: u64) {
         if let Some(limit) = &self.limit {

@@ -1,4 +1,4 @@
-//! One pinned regular file per connection, with private staging for writes.
+//! Entry-scoped pinned files and private staging, owned by a control session.
 use super::{Operation, Settings, StreamPlacement};
 use crate::{
     proto::{OperatorSymlinkPolicy, Response},
@@ -13,10 +13,50 @@ use std::{
     },
 };
 
+#[derive(Default)]
 pub(crate) struct Session {
+    entries: std::collections::HashMap<u64, FileSession>,
+}
+impl Session {
+    pub(crate) fn handle(
+        slot: &mut Self,
+        operation: &Operation,
+        descriptors: &crate::descriptor_broker::DescriptorSessionSlot,
+    ) -> Result<Response> {
+        let entry = match operation {
+            Operation::Open { entry, .. } => {
+                anyhow::ensure!(
+                    !slot.entries.contains_key(entry),
+                    "descriptor entry already open"
+                );
+                *entry
+            }
+            Operation::Finish { entry, .. } | Operation::Abort { entry } => *entry,
+        };
+        let mut file = slot.entries.remove(&entry);
+        let result = FileSession::handle(&mut file, operation, descriptors);
+        if let Some(file) = file {
+            slot.entries.insert(entry, file);
+        }
+        result
+    }
+}
+
+struct Registration {
+    slot: crate::descriptor_broker::DescriptorSessionSlot,
+    ticket: crate::descriptor_broker::DescriptorTicket,
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.slot.release_stream(&self.ticket);
+    }
+}
+
+struct FileSession {
     file: File,
     original: Metadata,
     destination: Option<Destination>,
+    registration: Option<Registration>,
 }
 struct Destination {
     root: Root,
@@ -138,7 +178,7 @@ fn resolve_destination(
     )
 }
 
-impl Session {
+impl FileSession {
     fn open(
         selected: PinnedPath,
         write: bool,
@@ -231,6 +271,7 @@ impl Session {
             original,
             file,
             destination,
+            registration: None,
         })
     }
     fn unchanged(&self) -> Result<()> {
@@ -252,6 +293,7 @@ impl Session {
     ) -> Result<Response> {
         let result = (|| match operation {
             Operation::Open {
+                entry: _,
                 dry_run,
                 only_new,
                 only_existing,
@@ -336,9 +378,13 @@ impl Session {
                 {
                     selected = resolve_destination(path, *follow, placement, true)?;
                 }
-                let stream = Self::open(selected, *write, *metadata, *source_meta)?;
+                let mut stream = Self::open(selected, *write, *metadata, *source_meta)?;
                 let size = (!*write).then_some(stream.original.len());
                 let ticket = descriptors.register_stream(stream.file.try_clone()?, *write)?;
+                stream.registration = Some(Registration {
+                    slot: descriptors.clone(),
+                    ticket: ticket.clone(),
+                });
                 let metadata = (!*write).then(|| super::metadata::from_file(&stream.original));
                 *slot = Some(stream);
                 Ok(Response::DescriptorOpened {
@@ -347,7 +393,7 @@ impl Session {
                     metadata,
                 })
             }
-            Operation::Finish { size } => {
+            Operation::Finish { size, .. } => {
                 let stream = slot.as_ref().context("no descriptor stream is open")?;
                 anyhow::ensure!(
                     stream.file.metadata()?.len() == *size,
@@ -377,6 +423,10 @@ impl Session {
                 } else {
                     stream.unchanged()?;
                 }
+                slot.take();
+                Ok(Response::Ok)
+            }
+            Operation::Abort { .. } => {
                 slot.take();
                 Ok(Response::Ok)
             }
@@ -466,8 +516,9 @@ mod tests {
         let target = temporary.path().join("target");
         std::fs::write(&target, b"old").unwrap();
         let descriptors = DescriptorSessionSlot::default();
-        let mut slot = None;
+        let mut slot = Session::default();
         let open = Operation::Open {
+            entry: 1,
             dry_run: false,
             only_new: false,
             only_existing: false,
@@ -529,15 +580,29 @@ mod tests {
         }
         assert!(first.handle(&corrupt).is_err());
         assert!(first
-            .handle(&Request::DescriptorCopy(Operation::Finish { size: 6 }))
+            .handle(&Request::DescriptorCopy(Operation::Finish {
+                entry: 1,
+                size: 6
+            }))
             .is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
-        Session::handle(&mut slot, &Operation::Finish { size: 6 }, &descriptors).unwrap();
+        Session::handle(
+            &mut slot,
+            &Operation::Finish { entry: 1, size: 6 },
+            &descriptors,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"onetwo");
-        assert!(slot.is_none());
+        assert!(descriptors.acquire(&ticket).is_err());
+        assert!(slot.entries.is_empty());
         // Bad lengths and abandoned sessions preserve the already-published file.
         Session::handle(&mut slot, &open, &descriptors).unwrap();
-        assert!(Session::handle(&mut slot, &Operation::Finish { size: 1 }, &descriptors).is_err());
+        assert!(Session::handle(
+            &mut slot,
+            &Operation::Finish { entry: 1, size: 1 },
+            &descriptors
+        )
+        .is_err());
         Session::handle(&mut slot, &open, &descriptors).unwrap();
         drop(slot);
         assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
@@ -550,10 +615,11 @@ mod tests {
         let target = temporary.path().join("source");
         std::fs::write(&target, b"old").unwrap();
         let descriptors = DescriptorSessionSlot::default();
-        let mut slot = None;
+        let mut slot = Session::default();
         let Response::DescriptorOpened { size, ticket, .. } = Session::handle(
             &mut slot,
             &Operation::Open {
+                entry: 1,
                 dry_run: false,
                 only_new: false,
                 only_existing: false,
@@ -591,6 +657,11 @@ mod tests {
             })
             .is_err());
         std::fs::write(target, b"changed").unwrap();
-        assert!(Session::handle(&mut slot, &Operation::Finish { size: 3 }, &descriptors).is_err());
+        assert!(Session::handle(
+            &mut slot,
+            &Operation::Finish { entry: 1, size: 3 },
+            &descriptors
+        )
+        .is_err());
     }
 }

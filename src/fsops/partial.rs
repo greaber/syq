@@ -1690,10 +1690,22 @@ impl FsOps {
         let _handling = self
             .operation
             .span(crate::transfer_observations::Stage::Handling);
-        if let Some(worker) = &self.stream_worker {
-            return worker
-                .handle(req)
-                .unwrap_or_else(|e| Response::Err(format!("{e:#}")));
+        if self.stream_ticket.is_some() {
+            let result = match req {
+                Request::BindStream(Some((ticket, settings))) => self
+                    .initialize_stream(ticket, *settings)
+                    .map(|()| Response::Ok),
+                Request::BindStream(None) => {
+                    self.stream_worker = None;
+                    Ok(Response::Ok)
+                }
+                _ => self
+                    .stream_worker
+                    .as_ref()
+                    .context("stream worker has no active entry")
+                    .and_then(|worker| worker.handle(req)),
+            };
+            return result.unwrap_or_else(|e| Response::Err(format!("{e:#}")));
         }
         if let Err(error) = self
             .validate_source_session_request(req)
@@ -2108,7 +2120,8 @@ impl FsOps {
                     Ok(Response::Path(path_bytes(&normalize(&resolve(path)))))
                 }
             }
-            Request::Hello { .. }
+            Request::BindStream(_)
+            | Request::Hello { .. }
             | Request::Scan { .. }
             | Request::NativeRemove { .. }
             | Request::TransportStats

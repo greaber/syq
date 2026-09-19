@@ -970,3 +970,146 @@ fn unauthenticated_sockets_do_not_consume_signed_worker_permits() {
     authority.close_control();
     descriptor_session.close();
 }
+
+#[test]
+fn stream_worker_rebinds_only_live_files_from_its_original_session() {
+    use crate::descriptor_copy::Settings;
+    use std::fs::File;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let target = temporary.path().join("target");
+    std::fs::write(&source, b"source").unwrap();
+    let slot = DescriptorSessionSlot::managed().unwrap();
+    let read = slot
+        .register_stream(File::open(&source).unwrap(), false)
+        .unwrap();
+    let write = slot
+        .register_stream(File::create(&target).unwrap(), true)
+        .unwrap();
+    let foreign = DescriptorSessionSlot::managed().unwrap();
+    let foreign_ticket = foreign
+        .register_stream(File::open(&source).unwrap(), false)
+        .unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let shared = slot.clone();
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        serve(
+            socket.try_clone().unwrap(),
+            socket.try_clone().unwrap(),
+            false,
+            None,
+            None,
+            Some(socket),
+            ServeSession {
+                handshake_pending: None,
+                ssh_worker_ticket: None,
+                allow_tcp: false,
+                named_socket: None,
+                authority: None,
+                descriptor_session: shared,
+            },
+        )
+        .unwrap();
+    });
+    let socket = TcpStream::connect(address).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut reader = FrameReader::new(socket.try_clone().unwrap());
+    let mut writer = FrameWriter::new(socket.try_clone().unwrap(), true);
+    writer
+        .write_msg(&Request::Hello {
+            identity: crate::identity::build().to_string(),
+            compress: true,
+            debug: false,
+            token: Vec::new(),
+            role: ConnectionRole::StreamWorker {
+                ticket: read.clone(),
+                settings: Settings::default(),
+            },
+        })
+        .unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::HelloOk { .. }
+    ));
+    let range = Request::ReadRange {
+        path: Vec::new(),
+        source: None,
+        attempt: 0,
+        off: 0,
+        len: 6,
+    };
+    writer.write_msg(&range).unwrap();
+    assert!(
+        matches!(reader.read_msg::<Response>().unwrap(), Response::Block { data, .. } if data == b"source")
+    );
+    // Pipelined release/rebind must have exactly two checked replies.
+    writer.write_msg(&Request::BindStream(None)).unwrap();
+    writer
+        .write_msg(&Request::BindStream(Some((write, Settings::default()))))
+        .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Ok
+        ));
+    }
+    writer
+        .write_msg(&Request::WriteRange {
+            path: Vec::new(),
+            inplace: true,
+            copy_id: [0; 16],
+            attempt: 0,
+            off: 0,
+            hash: [0; 32],
+            data: b"written".to_vec(),
+            guard: None,
+        })
+        .unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::Ok
+    ));
+    assert_eq!(std::fs::read(&target).unwrap(), b"written");
+    writer.write_msg(&range).unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::Err(_)
+    ));
+    writer
+        .write_msg(&Request::BindStream(Some((
+            foreign_ticket,
+            Settings::default(),
+        ))))
+        .unwrap();
+    assert!(
+        matches!(reader.read_msg::<Response>().unwrap(), Response::Err(error) if error.contains("sessions"))
+    );
+    writer.write_msg(&Request::BindStream(None)).unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::Ok
+    ));
+    writer.write_msg(&range).unwrap();
+    assert!(
+        matches!(reader.read_msg::<Response>().unwrap(), Response::Err(error) if error.contains("no active entry"))
+    );
+    slot.release_stream(&read);
+    writer
+        .write_msg(&Request::BindStream(Some((read, Settings::default()))))
+        .unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::Err(_)
+    ));
+    socket.shutdown(std::net::Shutdown::Both).unwrap();
+    server.join().unwrap();
+    slot.close();
+    foreign.close();
+}

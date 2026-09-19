@@ -1,5 +1,5 @@
-//! One raw S3 object and one inherited local byte stream. Regular-file
-//! descriptors use the same object metadata as pathname copies.
+//! Raw S3 streams with shared client/admission and entry-scoped completion.
+//! Regular-file descriptors use the same object metadata as pathname copies.
 use super::{checksum::Algorithm, client, Options};
 use crate::descriptor_copy::fd::{Descriptor, Source};
 use anyhow::{bail, Context, Result};
@@ -18,7 +18,79 @@ use std::{
     time::Duration,
 };
 
+/// One client/discovery context and shared part/request admission for the
+/// lifetime of a batch. Entry failures do not cancel this client's other jobs.
+struct Session {
+    client: Client,
+    options: Options,
+    cancellation: Arc<super::upload_http::Cancellation>,
+    parts: Arc<tokio::sync::Semaphore>,
+    requests: tokio::sync::Semaphore,
+    objects: tokio::sync::Semaphore,
+    bandwidth: Option<Arc<crate::bwlimit::BandwidthLimit>>,
+}
+impl Session {
+    async fn connect(
+        mut options: Options,
+        controls: &crate::descriptor_copy::controls::Controls,
+    ) -> Result<Self> {
+        let cancellation = Arc::new(super::upload_http::Cancellation::default());
+        let (client, _) =
+            client::connect(&mut options, Arc::default(), cancellation.clone()).await?;
+        Ok(Self {
+            client,
+            // Keep the existing single-stream window, shared across entries
+            // instead of multiplying it by the number of concurrent producers.
+            parts: Arc::new(tokio::sync::Semaphore::new(options.concurrency)),
+            requests: tokio::sync::Semaphore::new(
+                controls.s3_requests.unwrap_or(options.concurrency),
+            ),
+            objects: tokio::sync::Semaphore::new(controls.s3_objects),
+            options,
+            cancellation,
+            bandwidth: controls.bandwidth(),
+        })
+    }
+    async fn pace(&self, length: u64) {
+        if let Some(limit) = &self.bandwidth {
+            if length != 0 {
+                tokio::time::sleep_until(
+                    limit
+                        .reserve_prepaid_at(std::time::Instant::now(), length)
+                        .into(),
+                )
+                .await;
+            }
+        }
+    }
+    async fn read(&self, input: Descriptor) -> Result<(Descriptor, Part)> {
+        // Reserve before reading, so concurrent producers cannot each retain a
+        // separate full multipart window. The permit travels with the bytes.
+        let credit = self.parts.clone().acquire_owned().await?;
+        let (input, bytes) = input
+            .read_chunk(usize::try_from(self.options.part_size)?)
+            .await?;
+        Ok((
+            input,
+            Part {
+                bytes,
+                _credit: credit,
+            },
+        ))
+    }
+}
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+struct Part {
+    bytes: Bytes,
+    _credit: tokio::sync::OwnedSemaphorePermit,
+}
+
 struct Plan<'a> {
+    session: &'a Session,
     controls: &'a crate::descriptor_copy::controls::Controls,
     options: Options,
     key: String,
@@ -43,14 +115,6 @@ pub(crate) fn run(
         ),
         None => key,
     };
-    let mut plan = Plan {
-        controls,
-        options,
-        key,
-        placement,
-        target,
-        source_meta: None,
-    };
     let cancelled = Arc::new(AtomicBool::new(false));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -68,54 +132,31 @@ pub(crate) fn run(
             Some(Source::Pipe { .. }) => None,
             None => Some(Descriptor::open(as_fd.unwrap(), false, cancelled.clone())?),
         };
-        if plan.options.route == crate::s3::Route::Upload {
-            plan.source_meta = descriptor.as_ref().and_then(Descriptor::metadata);
-            controls.metadata.source(plan.source_meta)?;
+        let source_meta = descriptor.as_ref().and_then(Descriptor::metadata);
+        if options.route == crate::s3::Route::Upload {
+            controls.metadata.source(source_meta)?;
             if let Some(size) = descriptor.as_ref().map(Descriptor::remaining_len).transpose()?.flatten() {
                 controls.set_size(size);
             }
         }
-        if plan.options.route == crate::s3::Route::Download {
+        if options.route == crate::s3::Route::Download {
             controls.metadata.output(descriptor.as_ref().and_then(Descriptor::metadata).is_some())?;
         }
-        let cancellation = Arc::new(super::upload_http::Cancellation::default());
-        let (client, _) = tokio::select! {
-            value = client::connect(&mut plan.options, Arc::default(), cancellation.clone()) => value?,
+        let session = tokio::select! {
+            value = Session::connect(options, controls) => value?,
             value = &mut interrupt => { value?; bail!("stream cancelled"); }
         };
-        let mut upload_id = None;
-        let result = {
-            let operation = async {
-                if plan.options.route == crate::s3::Route::Upload {
-                    check_placement(&client, &plan).await?;
-                    if controls.report.skipped() { return Ok(()); }
-                    if controls.report.dry_run { return Ok(()); }
-                }
-                if plan.options.route == crate::s3::Route::Upload { controls.report.ready(); }
-                let descriptor = match descriptor {
-                    Some(descriptor) => descriptor,
-                    None => source.unwrap().open(cancelled.clone()).await?,
-                };
-                if plan.options.route == crate::s3::Route::Upload { upload(&client, &plan, descriptor, &mut upload_id, commit).await }
-                else { download(&client, &plan, descriptor).await }
-            };
-            tokio::select! {
-                result = operation => result,
-                result = &mut interrupt => { result?; Err(anyhow::anyhow!("stream cancelled")) }
-            }
-        };
-        cancelled.store(true, Relaxed);
-        if result.is_err() {
-            if let Some(id) = upload_id {
-                let abort = client.abort_multipart_upload().bucket(&plan.options.bucket).key(&plan.key).upload_id(&id).send();
-                match tokio::time::timeout(Duration::from_secs(5), abort).await {
-                    Ok(Ok(_)) => {},
-                    _ => crate::output::diagnostic!("syq cp: could not confirm multipart cleanup; inspect incomplete uploads for this object"),
-                }
+        let plan = Plan { session: &session, controls, options: session.options.clone(), key, placement, target, source_meta };
+        let operation = execute(&plan, source, descriptor, commit, cancelled.clone());
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => result,
+            result = &mut interrupt => {
+                result?;
+                cancelled.store(true, Relaxed);
+                operation.await
             }
         }
-        cancellation.cancel();
-        result
     });
     cancelled.store(true, Relaxed);
     // A quiet inherited pipe can keep a blocking worker alive indefinitely.
@@ -123,6 +164,88 @@ pub(crate) fn run(
     // result. Finish multipart cleanup above, then let process exit stop I/O.
     runtime.shutdown_background();
     result.map(|()| 0)
+}
+
+async fn execute(
+    plan: &Plan<'_>,
+    source: Option<Source>,
+    descriptor: Option<Descriptor>,
+    commit: Option<Descriptor>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut retirements: Vec<_> = descriptor
+        .iter()
+        .chain(commit.iter())
+        .filter_map(Descriptor::retirement)
+        .collect();
+    let _cancel = crate::descriptor_copy::fd::CancelOnDrop(cancelled.clone());
+    let client = &plan.session.client;
+    let controls = plan.controls;
+    let mut upload_id = None;
+    let mut _object = None;
+    let result = {
+        let operation = async {
+            _object = Some(plan.session.objects.acquire().await?);
+            if plan.options.route == crate::s3::Route::Upload {
+                {
+                    let _request = plan.session.requests.acquire().await?;
+                    check_placement(client, plan).await?;
+                }
+                if controls.report.skipped() || controls.report.dry_run {
+                    return Ok(());
+                }
+                controls.report.ready();
+            }
+            let descriptor = match descriptor {
+                Some(descriptor) => descriptor,
+                None => {
+                    let descriptor = source
+                        .context("missing stream input")?
+                        .open(cancelled.clone())
+                        .await?;
+                    if let Some(retired) = descriptor.retirement() {
+                        retirements.push(retired);
+                    }
+                    descriptor
+                }
+            };
+            if plan.options.route == crate::s3::Route::Upload {
+                upload(client, plan, descriptor, &mut upload_id, commit).await
+            } else {
+                download(client, plan, descriptor).await
+            }
+        };
+        tokio::select! {
+            result = operation => result,
+            _ = async { while !cancelled.load(Relaxed) { tokio::time::sleep(Duration::from_millis(50)).await; } } => Err(anyhow::anyhow!("stream cancelled")),
+        }
+    };
+    if result.is_err() {
+        cancelled.store(true, Relaxed);
+        if let Some(id) = upload_id {
+            let abort = async {
+                let _request = plan.session.requests.acquire().await?;
+                client
+                    .abort_multipart_upload()
+                    .bucket(&plan.options.bucket)
+                    .key(&plan.key)
+                    .upload_id(&id)
+                    .send()
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(5), abort).await,
+                Ok(Ok(()))
+            ) {
+                crate::output::diagnostic!("syq cp: could not confirm multipart cleanup; inspect incomplete uploads for this object");
+            }
+        }
+    }
+    for retired in retirements {
+        retired.wait().await;
+    }
+    result
 }
 
 /// With a source base, keys use ordinary cp's relative path semantics.
@@ -251,12 +374,13 @@ async fn upload(
 
     let size = usize::try_from(options.part_size)?;
     let algorithm = Algorithm::for_endpoint(options.endpoint.as_deref());
-    let (mut input, first) = input.read_chunk(size).await?;
-    if first.len() < size {
-        let length = first.len() as u64;
-        controls.pace(length).await;
+    let (mut input, first) = plan.session.read(input).await?;
+    if first.bytes.len() < size {
+        let length = first.bytes.len() as u64;
+        plan.session.pace(length).await;
         crate::descriptor_copy::fd::await_commit(commit).await?;
-        let hash = digest(algorithm, &first);
+        let hash = digest(algorithm, &first.bytes);
+        let _request = plan.session.requests.acquire().await?;
         client
             .put_object()
             .set_metadata(metadata)
@@ -269,7 +393,7 @@ async fn upload(
                     || plan.controls.report.only_new)
                     .then(|| "*".into()),
             )
-            .body(ByteStream::from(first))
+            .body(ByteStream::from(first.bytes))
             .send()
             .await
             .map_err(|e| e.into_service_error())
@@ -277,6 +401,7 @@ async fn upload(
         controls.progress.add_bytes(length);
         return Ok(());
     }
+    let request = plan.session.requests.acquire().await?;
     let created = client
         .create_multipart_upload()
         .set_metadata(metadata)
@@ -291,6 +416,7 @@ async fn upload(
         .await
         .map_err(|e| e.into_service_error())
         .context("create multipart upload")?;
+    drop(request);
     let id = created
         .upload_id()
         .context("S3 omitted upload ID")?
@@ -304,7 +430,7 @@ async fn upload(
         if number > 10_000 {
             bail!("stream exceeds 10,000 multipart parts; rerun with a larger --performance-tuning s3-part-size=SIZE");
         }
-        let last = data.len() < size;
+        let last = data.bytes.len() < size;
         pending.push(upload_part(client, plan, &id, number, data, algorithm));
         number += 1;
         if pending.len() >= options.concurrency {
@@ -314,7 +440,7 @@ async fn upload(
             break;
         }
         // Poll network futures while reading a possibly slow producer.
-        let read = input.read_chunk(size);
+        let read = plan.session.read(input);
         tokio::pin!(read);
         let next = loop {
             tokio::select! {
@@ -324,7 +450,8 @@ async fn upload(
         };
         input = next.0;
         data = next.1;
-        if data.is_empty() {
+        if data.bytes.is_empty() {
+            drop(data);
             break;
         }
     }
@@ -333,6 +460,7 @@ async fn upload(
     }
     completed.sort_by_key(|p| p.part_number());
     crate::descriptor_copy::fd::await_commit(commit).await?;
+    let _request = plan.session.requests.acquire().await?;
     client
         .complete_multipart_upload()
         .bucket(&options.bucket)
@@ -363,13 +491,14 @@ async fn upload_part(
     plan: &Plan<'_>,
     id: &str,
     number: i32,
-    data: Bytes,
+    data: Part,
     algorithm: Algorithm,
 ) -> Result<CompletedPart> {
     let controls = plan.controls;
-    let length = data.len() as u64;
-    controls.pace(length).await;
-    let hash = digest(algorithm, &data);
+    let length = data.bytes.len() as u64;
+    plan.session.pace(length).await;
+    let hash = digest(algorithm, &data.bytes);
+    let _request = plan.session.requests.acquire().await?;
     let output = client
         .upload_part()
         .bucket(&plan.options.bucket)
@@ -378,7 +507,7 @@ async fn upload_part(
         .part_number(number)
         .set_checksum_sha256(algorithm.is_sha256().then_some(hash.clone()))
         .set_content_md5((algorithm == Algorithm::Md5).then_some(hash.clone()))
-        .body(ByteStream::from(data))
+        .body(ByteStream::from(data.bytes))
         .send()
         .await
         .map_err(|e| e.into_service_error())
@@ -394,6 +523,7 @@ async fn upload_part(
 async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> Result<()> {
     let controls = plan.controls;
     // Read raw objects, including objects carrying another tool's metadata.
+    let request = plan.session.requests.acquire().await?;
     let head = client
         .head_object()
         .bucket(&plan.options.bucket)
@@ -402,6 +532,7 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
         .await
         .map_err(|e| e.into_service_error())
         .context("inspect source object")?;
+    drop(request);
     let size = u64::try_from(
         head.content_length()
             .context("S3 HEAD omitted Content-Length")?,
@@ -457,8 +588,8 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
         })
         .buffered(plan.options.concurrency);
     while let Some(bytes) = parts.try_next().await? {
-        let length = bytes.len() as u64;
-        output = output.write_chunk(bytes).await?;
+        let length = bytes.bytes.len() as u64;
+        output = output.write_chunk(bytes.bytes).await?;
         controls.progress.add_bytes(length);
     }
     output.apply_metadata(controls.metadata, source_meta)
@@ -472,8 +603,10 @@ async fn read_part(
     size: u64,
     offset: u64,
     length: u64,
-) -> Result<Bytes> {
-    plan.controls.pace(length).await;
+) -> Result<Part> {
+    let credit = plan.session.parts.clone().acquire_owned().await?;
+    plan.session.pace(length).await;
+    let _request = plan.session.requests.acquire().await?;
     let range = format!("bytes={offset}-{}", offset + length - 1);
     let expected = format!("bytes {offset}-{}/{size}", offset + length - 1);
     for attempt in 0..=plan.options.retries {
@@ -523,7 +656,10 @@ async fn read_part(
             }
         }
         if !failed && buffer.len() as u64 == length {
-            return Ok(Bytes::from(buffer));
+            return Ok(Part {
+                bytes: Bytes::from(buffer),
+                _credit: credit,
+            });
         }
         if attempt == plan.options.retries {
             bail!("S3 range was interrupted or truncated");
@@ -532,3 +668,6 @@ async fn read_part(
     }
     unreachable!()
 }
+
+#[cfg(test)]
+mod tests;

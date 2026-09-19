@@ -1,5 +1,10 @@
 //! Bounded pipe adapters over the normal data transports and range frames.
-use super::{controls::Controls, fd, Operation, Plan};
+use super::{
+    controls::Controls,
+    fd,
+    session::{Entry, Session},
+    Operation, Plan, GRANULE,
+};
 use crate::{
     cli::Args,
     conn::{self, Conn, Endpoint},
@@ -12,16 +17,14 @@ use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
-        Arc, Mutex,
+        Arc,
     },
     time::Instant,
 };
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 
 // Bound queued input and out-of-order output independently of tuning products.
 // Allocation is lazy; a short stream never allocates the entire window.
-const BUFFER_BYTES: usize = 128 << 20;
-const GRANULE: usize = 1024;
 struct Job {
     off: u64,
     len: usize,
@@ -29,47 +32,28 @@ struct Job {
     _credit: OwnedSemaphorePermit,
 }
 struct Prepared {
-    endpoint: Endpoint,
-    control: Box<dyn Conn>,
+    entry: Entry,
     ticket: DescriptorTicket,
     size: Option<u64>,
     source_meta: Option<crate::proto::Meta>,
     workers: usize,
     worker_limit: usize,
-    _local_session: Option<LocalSession>,
-}
-struct LocalSession(crate::descriptor_broker::DescriptorSessionSlot);
-impl Drop for LocalSession {
-    fn drop(&mut self) {
-        self.0.close();
-    }
 }
 fn prepare(
-    args: &Args,
+    session: Arc<Session>,
     plan: &Plan,
     controls: &Controls,
     input_meta: Option<crate::proto::Meta>,
 ) -> Result<Option<Prepared>> {
-    let location = plan.location.as_ref().unwrap();
-    let local_session = location
-        .host
-        .is_none()
-        .then(crate::descriptor_broker::DescriptorSessionSlot::managed)
-        .transpose()?
-        .map(LocalSession);
-    let endpoint = if let Some(session) = &local_session {
-        Endpoint::Local {
-            descriptor_session: session.0.clone(),
-        }
-    } else {
-        crate::transfer::endpoint(location, args)?
-    };
-    let mut control = endpoint.connect_control(args.compress)?;
+    let args = &session.args;
+    let endpoint = &session.endpoint;
+    let mut entry = session.entry()?;
     // Excluded uploads still check explicit placement conditions, but must not
     // create a container or a staged destination. Reuse the inspection path.
     let inspect_only = args.dry_run || controls.report.skipped();
     let (size, ticket, source_meta) = match conn::ok(
-        control.call(Request::DescriptorCopy(Operation::Open {
+        session.call(Request::DescriptorCopy(Operation::Open {
+            entry: entry.id,
             dry_run: inspect_only,
             only_new: args.ignore_existing,
             only_existing: args.existing,
@@ -108,6 +92,7 @@ fn prepare(
         }
         _ => bail!("unexpected stream open response"),
     };
+    entry.opened();
     anyhow::ensure!(
         plan.source.is_some() || size.is_some(),
         "stream source did not report its length"
@@ -118,29 +103,8 @@ fn prepare(
             controls.set_size(size);
         }
     }
-    if let Endpoint::Remote(spec) = &endpoint {
-        if !args.no_tcp {
-            let result = spec
-                .begin_tcp_setup(
-                    &mut *control,
-                    args.tcp_plain,
-                    conn::parse_ports(&args.tcp_ports)?,
-                    args.tcp_congestion.as_deref(),
-                )
-                .and_then(|pending| spec.finish_tcp_setup(pending));
-            if let Err(error) = result {
-                if conn::is_tcp_congestion_error(&error) {
-                    return Err(error);
-                }
-                if !args.quiet {
-                    crate::output::diagnostic!(
-                        "syq: stream data over SSH (TCP setup failed: {error:#})"
-                    );
-                }
-            }
-        }
-    }
-    let start = match &endpoint {
+    session.start_data()?;
+    let start = match endpoint {
         Endpoint::Remote(spec) if spec.data_transport() != conn::DataTransport::Ssh => {
             tune::START_TCP
         }
@@ -182,52 +146,56 @@ fn prepare(
         );
     }
     Ok(Some(Prepared {
-        endpoint,
-        control,
+        entry,
         ticket,
         size,
         source_meta,
         workers,
         worker_limit,
-        _local_session: local_session,
     }))
 }
 
 #[derive(Clone)]
 struct Workers {
-    endpoint: Endpoint,
+    session: Arc<Session>,
     ticket: DescriptorTicket,
     args: Arc<Args>,
     controls: Arc<Controls>,
     jobs: Arc<Mutex<mpsc::Receiver<Job>>>,
     results: mpsc::Sender<Job>,
-    buffers: std::sync::mpsc::SyncSender<Vec<u8>>,
     gate: Arc<tune::Gate>,
     cancelled: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
+    ready: Arc<tokio::sync::Notify>,
     upload: bool,
+    runtime: tokio::runtime::Handle,
 }
 impl Workers {
     fn run(&self, id: usize) -> Result<()> {
-        let mut connection = self.endpoint.connect_stream(
-            self.args.compress,
+        let mut worker = self.session.worker(
             self.ticket.clone(),
             self.controls.settings,
             self.args.connections_default && id < 2,
+            &self.cancelled,
         )?;
         self.gate.mark_ready(id);
+        self.ready.notify_one();
         if self.args.verbose > 1 && !self.args.quiet {
-            let transport = match &self.endpoint {
+            let transport = match &self.session.endpoint {
                 Endpoint::Remote(spec) => format!("{:?}", spec.data_transport()),
                 Endpoint::Local { .. } => "local".into(),
             };
             crate::output::diagnostic!("stream data worker {id} ready ({transport})");
         }
-        if self.upload {
-            self.write(&mut *connection, id)
+        let result = if self.upload {
+            self.write(worker.connection(), id)
         } else {
-            self.read(&mut *connection, id)
+            self.read(worker.connection(), id)
+        };
+        if result.is_ok() {
+            worker.completed()?;
         }
+        result
     }
     fn next(&self, id: usize) -> Result<Option<Job>> {
         anyhow::ensure!(!self.cancelled.load(Relaxed), "stream cancelled");
@@ -236,7 +204,16 @@ impl Workers {
         }) {
             return Ok(None);
         }
-        Ok(self.jobs.lock().unwrap().blocking_recv())
+        self.runtime.block_on(async {
+            let mut jobs = self.jobs.lock().await;
+            loop {
+                anyhow::ensure!(!self.cancelled.load(Relaxed), "stream cancelled");
+                tokio::select! {
+                    job = jobs.recv() => return Ok(job),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+                }
+            }
+        })
     }
     fn write(&self, connection: &mut dyn Conn, id: usize) -> Result<()> {
         let streaming = self
@@ -253,7 +230,7 @@ impl Workers {
         let mut pending = 0;
         let result = (|| {
             while let Some(job) = self.next(id)? {
-                self.controls.pace_blocking(job.len as u64);
+                self.session.pace(job.len as u64);
                 if streaming {
                     connection.check_streaming_writes()?;
                 }
@@ -269,7 +246,7 @@ impl Workers {
                     guard: None,
                 })?;
                 if let Some(buffer) = buffer {
-                    let _ = self.buffers.try_send(buffer);
+                    self.session.recycle(buffer);
                 }
                 sent += 1;
                 bytes += job.len as u64;
@@ -326,7 +303,7 @@ impl Workers {
                     ended = true;
                     break;
                 };
-                self.controls.pace_blocking(job.len as u64);
+                self.session.pace(job.len as u64);
                 connection.send(Request::ReadRange {
                     path: Vec::new(),
                     source: None,
@@ -360,11 +337,22 @@ impl Workers {
         Ok(())
     }
 }
-async fn credit(budget: &Arc<Semaphore>, bytes: usize) -> Result<OwnedSemaphorePermit> {
-    Ok(budget
+async fn credit(
+    budget: &Arc<Semaphore>,
+    bytes: usize,
+    cancelled: &AtomicBool,
+) -> Result<OwnedSemaphorePermit> {
+    let acquire = budget
         .clone()
-        .acquire_many_owned(bytes.div_ceil(GRANULE) as u32)
-        .await?)
+        .acquire_many_owned(bytes.div_ceil(GRANULE) as u32);
+    tokio::pin!(acquire);
+    loop {
+        anyhow::ensure!(!cancelled.load(Relaxed), "stream cancelled");
+        tokio::select! {
+            permit = &mut acquire => return Ok(permit?),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+        }
+    }
 }
 
 pub(super) async fn run(
@@ -429,49 +417,75 @@ pub(super) async fn run(
         )
         .await;
     }
-    let prepared = if plan.location.as_ref().unwrap().host.is_none() {
-        // Keep local staging owned by this future from the instant it exists.
-        // A detached blocking task could create it just as cancellation drops
-        // the receiver, then lose its cleanup when the CLI exits.
-        prepare(&args, &plan, &controls, input_meta)?
+    let session = if plan.location.as_ref().unwrap().host.is_none() {
+        Session::connect(&args, plan.location.as_ref().unwrap())?
     } else {
-        let (a, p, c) = (args.clone(), plan.clone(), controls.clone());
-        tokio::task::spawn_blocking(move || prepare(&a, &p, &c, input_meta)).await??
+        let (args, location) = (args.clone(), plan.location.clone().unwrap());
+        tokio::task::spawn_blocking(move || Session::connect(&args, &location)).await??
     };
-    let Some(prepared) = prepared else {
+    execute(
+        session, plan, controls, cancelled, input, output, commit, input_meta,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute(
+    session: Arc<Session>,
+    plan: Plan,
+    controls: Arc<Controls>,
+    cancelled: Arc<AtomicBool>,
+    mut input: Option<fd::Descriptor>,
+    output: Option<fd::Descriptor>,
+    commit: Option<fd::Descriptor>,
+    input_meta: Option<crate::proto::Meta>,
+) -> Result<()> {
+    let _cancel = fd::CancelOnDrop(cancelled.clone());
+    let args = &session.args;
+    let prepared = if !session.endpoint.is_remote() {
+        prepare(session.clone(), &plan, &controls, input_meta)?
+    } else {
+        let (s, p, c) = (session.clone(), plan.clone(), controls.clone());
+        tokio::task::spawn_blocking(move || prepare(s, &p, &c, input_meta)).await??
+    };
+    let Some(mut prepared) = prepared else {
         return Ok(());
     };
     controls.report.ready();
     if let Some(source @ fd::Source::Pipe { .. }) = plan.source.clone() {
         input = Some(source.open(cancelled.clone()).await?);
     }
+    let retirements: Vec<_> = input
+        .iter()
+        .chain(output.iter())
+        .chain(commit.iter())
+        .filter_map(fd::Descriptor::retirement)
+        .collect();
     let metadata_output = output
         .as_ref()
         .filter(|_| controls.metadata.preserve != 0)
         .map(fd::Descriptor::metadata_file)
         .transpose()?
         .flatten();
-    let budget = Arc::new(Semaphore::new(BUFFER_BYTES / GRANULE));
+    let budget = session.budget.clone();
     let (jobs_tx, jobs_rx) = mpsc::channel(64);
     let (results_tx, mut results_rx) = mpsc::channel(64);
-    // Return buffers before releasing their memory credits. The reader can
-    // reuse them without another allocation or zeroing newly mapped pages.
-    let (buffers_tx, buffers_rx) =
-        std::sync::mpsc::sync_channel(BUFFER_BYTES / controls.settings.request_size);
     let gate = tune::Gate::new(prepared.workers);
     let draining = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(tokio::sync::Notify::new());
     let workers = Workers {
-        endpoint: prepared.endpoint.clone(),
+        session: session.clone(),
         ticket: prepared.ticket,
         args: Arc::new(args.clone()),
         controls: controls.clone(),
         jobs: Arc::new(Mutex::new(jobs_rx)),
         results: results_tx,
-        buffers: buffers_tx,
         gate: gate.clone(),
         cancelled: cancelled.clone(),
         draining: draining.clone(),
+        ready: ready.clone(),
         upload: input.is_some(),
+        runtime: tokio::runtime::Handle::current(),
     };
     let mut tasks = tokio::task::JoinSet::new();
     let spawn = |tasks: &mut tokio::task::JoinSet<Result<()>>, id| -> Result<()> {
@@ -505,20 +519,31 @@ pub(super) async fn run(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last = (Instant::now(), controls.progress.bytes_done.load(Relaxed));
     let transfer = async {
+        // An entry must have a worker before reserving shared payload memory:
+        // queued entries must not starve the entries holding the connections.
+        ready.notified().await;
         let size = if let Some(mut input) = input {
-            let (controls, budget) = (controls.clone(), budget.clone());
+            let (controls, budget, session, cancelled) = (
+                controls.clone(),
+                budget.clone(),
+                session.clone(),
+                cancelled.clone(),
+            );
             let runtime = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || -> Result<u64> {
                 let mut off = 0u64;
                 loop {
                     // Reserve one request, not request-size times depth. Only
                     // bytes actually read become initialized buffer contents.
-                    let permit =
-                        runtime.block_on(credit(&budget, controls.settings.request_size))?;
+                    let permit = runtime.block_on(credit(
+                        &budget,
+                        controls.settings.request_size,
+                        &cancelled,
+                    ))?;
                     let data = input.read_reusing(
                         controls.settings.request_size,
                         false,
-                        buffers_rx.try_recv().unwrap_or_default(),
+                        session.buffer(),
                     )?;
                     if data.is_empty() {
                         break;
@@ -547,7 +572,7 @@ pub(super) async fn run(
                 let mut off = 0;
                 while off < size {
                     let len = (size - off).min(controls.settings.request_size as u64) as usize;
-                    let permit = credit(&budget, len).await?;
+                    let permit = credit(&budget, len, &cancelled).await?;
                     jobs_tx
                         .send(Job {
                             off,
@@ -589,7 +614,7 @@ pub(super) async fn run(
         };
         Ok::<_, anyhow::Error>(size)
     };
-    tokio::pin!(transfer);
+    let mut transfer = Box::pin(transfer);
     let result = async {
         let size = loop {
             tokio::select! {
@@ -617,15 +642,10 @@ pub(super) async fn run(
         draining.store(true, Relaxed);
         while let Some(result) = tasks.join_next().await { result??; }
         fd::await_commit(commit).await?;
-        let mut control = prepared.control;
-        let mut finish = move || {
-            conn::ok(control.call(Request::DescriptorCopy(Operation::Finish { size }))?, "finish stream")?;
-            Ok::<_, anyhow::Error>(())
-        };
-        if prepared.endpoint.is_remote() {
+        let mut finish = move || prepared.entry.finish(size);
+        if session.endpoint.is_remote() {
             tokio::task::spawn_blocking(finish).await??;
         } else {
-            // As with opening, local publication and cleanup stay owned here.
             finish()?;
         }
         if let Some(output) = metadata_output {
@@ -636,7 +656,15 @@ pub(super) async fn run(
     draining.store(true, Relaxed);
     if result.is_err() {
         cancelled.store(true, Relaxed);
-        budget.close();
+        // The shared session budget remains available to other entries.
+    }
+    drop(transfer);
+    while let Some(joined) = tasks.join_next().await {
+        // Preserve the first copy error; these joins only retire its workers.
+        let _ = joined;
+    }
+    for retired in retirements {
+        retired.wait().await;
     }
     result
 }
@@ -661,3 +689,6 @@ async fn direct(
     fd::await_commit(commit).await?;
     output.apply_metadata(controls.metadata, source_meta)
 }
+
+#[cfg(test)]
+mod tests;

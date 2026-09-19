@@ -467,6 +467,25 @@ impl DescriptorSessionSlot {
         session.ticket_for(id, kind)
     }
 
+    /// Release a completed entry without reusing its capability identifier.
+    pub(crate) fn release_stream(&self, ticket: &DescriptorTicket) {
+        let session = self.session.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(session) = session.as_ref() {
+            if ticket.secret == session.secret
+                && ticket.socket_path == session.broker.socket_path().as_os_str().as_bytes()
+                && ticket.stream_write().is_ok()
+            {
+                session
+                    .registry
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .roots
+                    .remove(&ticket.root_id);
+            }
+        }
+    }
+
     pub(crate) fn register(&self, directory: File) -> Result<DescriptorTicket> {
         Ok(self.register_many(vec![directory])?.remove(0))
     }

@@ -5,7 +5,8 @@ pub(crate) mod fd;
 mod file;
 pub(crate) mod metadata;
 mod parallel;
-mod report;
+pub(crate) mod report;
+mod session;
 pub(crate) use controls::validate_controls;
 use controls::Controls;
 
@@ -17,6 +18,9 @@ use std::sync::{
     Arc,
 };
 
+// Active payloads and idle reusable buffers each have a session-wide bound.
+const BUFFER_BYTES: usize = 128 << 20;
+const GRANULE: usize = 1024;
 const CHUNK: usize = 4 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) struct Settings {
@@ -73,6 +77,7 @@ pub(crate) struct StreamPlacement {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Operation {
     Open {
+        entry: u64,
         dry_run: bool,
         only_new: bool,
         only_existing: bool,
@@ -86,7 +91,11 @@ pub(crate) enum Operation {
         source_meta: Option<crate::proto::Meta>,
     },
     Finish {
+        entry: u64,
         size: u64,
+    },
+    Abort {
+        entry: u64,
     },
 }
 pub(crate) use file::{resolve_source, FileWorker, Session};
