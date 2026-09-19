@@ -1068,7 +1068,7 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
             attempt: 0,
             off: 0,
             hash: [0; 32],
-            data: b"written".to_vec(),
+            data: b"written".to_vec().into(),
             guard: None,
         })
         .unwrap();
