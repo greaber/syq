@@ -73,7 +73,7 @@ fn mapping_keeps_batch_and_range_payload_allocations() {
             attempt: 0,
             off: 0,
             hash: content_digest(&data),
-            data,
+            data: data.into(),
             guard: None,
         };
         ops.map_request(&mut request).unwrap();
@@ -316,7 +316,7 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
         attempt: 0,
         off: 0,
         hash: content_digest(b"new data"),
-        data: b"new data".to_vec(),
+        data: b"new data".to_vec().into(),
         guard: None,
     });
     assert!(matches!(reply, Response::Ok), "{reply:?}");

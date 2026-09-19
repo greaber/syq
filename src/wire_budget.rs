@@ -431,12 +431,12 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Limited<'_, D> {
     }
 }
 
-pub(crate) fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> io::Result<Budgeted<T>> {
+pub(crate) fn decode<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> io::Result<Budgeted<T>> {
     decode_with_hold(bytes, Hold::new())
 }
 
-fn decode_with_hold<T: for<'de> Deserialize<'de>>(
-    bytes: &[u8],
+fn decode_with_hold<'de, T: Deserialize<'de>>(
+    bytes: &'de [u8],
     mut hold: Hold,
 ) -> io::Result<Budgeted<T>> {
     hold.grow(std::mem::size_of::<T>())?;

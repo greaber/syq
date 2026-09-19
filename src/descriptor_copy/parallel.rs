@@ -265,7 +265,7 @@ impl Workers {
                     attempt: 0,
                     off: job.off,
                     hash,
-                    data: job.data,
+                    data: job.data.into(),
                     guard: None,
                 })?;
                 if let Some(buffer) = buffer {

@@ -942,7 +942,7 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
         attempt: 0,
         off: 0,
         hash: [0; 32],
-        data: vec![0; 5],
+        data: vec![0; 5].into(),
         guard: None,
     };
     assert!(authority.authorize(&mut write, false).is_err());
@@ -2897,7 +2897,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         attempt: 0,
         off: 0,
         hash: crate::fsops::content_digest(b"ha"),
-        data: b"ha".to_vec(),
+        data: b"ha".to_vec().into(),
         guard: None,
     };
     let settlement = authority.authorize(&mut write, false).unwrap();
@@ -3705,7 +3705,7 @@ fn signed_file_data_rate_is_enforced_across_requests() {
         attempt: 0,
         off,
         hash: [0; 32],
-        data: vec![0; 256],
+        data: vec![0; 256].into(),
         guard: None,
     };
 
@@ -3733,7 +3733,7 @@ fn signed_file_data_rate_is_enforced_across_requests() {
 
     let mut oversized = request(0);
     if let Request::WriteRange { data, .. } = &mut oversized {
-        data.resize(513, 0);
+        *data = vec![0; 513].into();
     }
     assert_eq!(
         authority

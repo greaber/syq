@@ -513,7 +513,7 @@ mod tests {
             attempt: 0,
             off,
             hash: Settings::default().algorithm.hash(data),
-            data: data.to_vec(),
+            data: data.to_vec().into(),
             guard: None,
         };
         second.handle(&write(3, b"two")).unwrap();
@@ -586,7 +586,7 @@ mod tests {
                 attempt: 0,
                 off: 0,
                 hash: [0; 32],
-                data: b"bad".to_vec(),
+                data: b"bad".to_vec().into(),
                 guard: None
             })
             .is_err());
