@@ -667,7 +667,7 @@ fn compression_learning_recovers_after_incompressible_data() {
 
 #[test]
 fn compression_learning_periodically_tries_patterns_beyond_the_samples() {
-    let mut random = vec![0; 256 * 1024];
+    let mut random = vec![0; 2 * 1024 * 1024];
     let mut state = 0x9e3779b97f4a7c15u64;
     for byte in &mut random {
         state ^= state << 13;
@@ -675,17 +675,43 @@ fn compression_learning_periodically_tries_patterns_beyond_the_samples() {
         state ^= state << 17;
         *byte = state as u8;
     }
-    let mut compression = FrameCompression::new().unwrap();
-    assert!(
-        compression.worth_compressing(&random),
-        "first frame gets a full attempt"
-    );
-    compression.remaining_probes = 7;
-    for _ in 0..7 {
-        assert!(!compression.worth_compressing(&random));
+    // Each sample looks random, but a whole-frame attempt can discover the
+    // recurring 256KiB block. Learning must not disable compression forever.
+    let repeated = random[..256 * 1024].repeat(8);
+    let mut wire = Vec::new();
+    {
+        let mut writer = FrameWriter::new(&mut wire, true);
+        writer.write_msg(&block_message(random.clone())).unwrap();
+        for _ in 0..10 {
+            writer.write_msg(&block_message(repeated.clone())).unwrap();
+        }
+    }
+    let mut offset = local_preamble_len();
+    let first_length = u32::from_le_bytes(wire[offset..offset + 4].try_into().unwrap()) as usize;
+    assert_eq!(wire[offset + 4], 0);
+    offset += 4 + first_length;
+    let mut recovered = false;
+    for _ in 0..10 {
+        let length = u32::from_le_bytes(wire[offset..offset + 4].try_into().unwrap()) as usize;
+        if recovered {
+            assert_eq!(wire[offset + 4], 1, "useful full compression must continue");
+        }
+        recovered |= wire[offset + 4] == 1;
+        offset += 4 + length;
     }
     assert!(
-        compression.worth_compressing(&random),
-        "full attempts must resume even when probes find nothing"
+        recovered,
+        "full attempts must discover long repeating patterns"
     );
+    let mut reader = FrameReader::new(wire.as_slice());
+    let Response::Block { data, .. } = reader.read_msg().unwrap() else {
+        panic!("expected block");
+    };
+    assert_eq!(data, random);
+    for _ in 0..10 {
+        let Response::Block { data, .. } = reader.read_msg().unwrap() else {
+            panic!("expected block");
+        };
+        assert_eq!(data, repeated);
+    }
 }
