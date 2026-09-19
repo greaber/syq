@@ -125,24 +125,27 @@ def assert_comparison(path, *, changed, unchanged):
 
 
 def interrupted(args, threshold=5*1024*1024):
-    command=[SYQ,'cp','--no-progress','--progress-json','--performance-tuning=s3-part-size=5M,s3-max-concurrent-parts-per-object=1,s3-retries=1','--resource-limits=bandwidth=1MiB']
+    reader, writer = os.pipe()
+    command=[SYQ,'cp','--no-progress','--results-fd',str(writer),'--performance-tuning=s3-part-size=5M,s3-max-concurrent-parts-per-object=1,s3-retries=1','--resource-limits=bandwidth=1MiB']
     for name,value in HEADERS.items(): command+=['--s3-header',name+': '+value]
-    process=subprocess.Popen(command+list(map(str,args)),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,start_new_session=True)
+    process=subprocess.Popen(command+list(map(str,args)),stdout=subprocess.DEVNULL,stderr=None,pass_fds=(writer,),start_new_session=True)
+    os.close(writer)
     deadline=time.monotonic()+60
     observed=0
-    selector=selectors.DefaultSelector();selector.register(process.stderr,selectors.EVENT_READ)
+    selector=selectors.DefaultSelector();selector.register(reader,selectors.EVENT_READ)
     pending=b''
     try:
         while observed<threshold and time.monotonic()<deadline:
             for _,_ in selector.select(timeout=1):
-                block=os.read(process.stderr.fileno(),65536)
+                block=os.read(reader,65536)
                 if not block: raise AssertionError('copy exited before interruption point')
                 pending+=block
                 while b'\n' in pending:
                     line,pending=pending.split(b'\n',1)
                     try: event=json.loads(line)
-                    except ValueError: continue
-                    observed=max(observed,event.get('bytes_done',0))
+                    except ValueError: raise AssertionError(f'invalid results record: {line!r}')
+                    if event['type'] == 'progress':
+                        observed=max(observed,event['bytes_done'])
             if process.poll() is not None: raise AssertionError('copy exited before interruption point')
         assert observed>=threshold, f'interruption deadline expired; last progress {observed}'
         os.killpg(process.pid,signal.SIGINT)
@@ -152,7 +155,7 @@ def interrupted(args, threshold=5*1024*1024):
         selector.close()
         if process.poll() is None:
             os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=15)
-        process.stderr.close()
+        os.close(reader)
         try: os.killpg(process.pid,0)
         except ProcessLookupError: pass
         else: raise AssertionError('copy process group survived interruption')

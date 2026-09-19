@@ -92,6 +92,8 @@ pub struct ProgressRecord<'a> {
     pub scanned: u64,
     pub scan_done: bool,
     pub elapsed_ms: u64,
+    pub rate_bytes_per_second: u64,
+    pub eta_ms: Option<u64>,
 }
 
 pub struct TraceRecord<'a> {
@@ -372,7 +374,11 @@ impl ResultsWriter {
             "scanned": progress.scanned,
             "scan_done": progress.scan_done,
             "elapsed_ms": progress.elapsed_ms,
+            "rate_bytes_per_second": progress.rate_bytes_per_second,
         });
+        if let Some(eta_ms) = progress.eta_ms {
+            record["eta_ms"] = eta_ms.into();
+        }
         if let Some(activity) = progress.activity {
             record["activity"] =
                 serde_json::to_value(activity).expect("finite observation fractions");
@@ -770,6 +776,8 @@ mod tests {
             scanned: 1,
             scan_done: true,
             elapsed_ms: 1,
+            rate_bytes_per_second: 0,
+            eta_ms: None,
         });
         writer.emit_result(&ResultRecord {
             status: "success",

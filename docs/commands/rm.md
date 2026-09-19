@@ -66,7 +66,6 @@ syq rm [OPTIONS] --srcs-in DIR
 |---|---|
 | `--progress` | Show progress even when stderr is not a terminal |
 | `--no-progress` | Never show the human progress display |
-| `--progress-json` | Emit machine-readable progress lines (JSON) on stderr |
 | `--results <FILE>` | Write the machine-readable NDJSON result stream to FILE (created fresh; an existing file is refused) |
 | `--results-fd <FD>` | Write the result stream to an inherited file descriptor the caller opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2 |
 

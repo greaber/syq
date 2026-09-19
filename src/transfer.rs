@@ -986,12 +986,7 @@ pub fn run(mut args: Args) -> Result<i32> {
     // failure in this process settles with a terminal record (spec: automation
     // results). A successful exec hands that responsibility to the helper.
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
-    let progress = Progress::new(
-        show_progress,
-        args.progress,
-        args.width,
-        !args.quiet && args.progress_json,
-    );
+    let progress = Progress::new(show_progress, args.progress, args.width);
     if args.stats || debug() {
         progress
             .observations
@@ -2726,8 +2721,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if st.source_partials > 0 && !args.quiet && scan_err.is_none() && !st.collision {
         let count = st.source_partials;
         progress.warning(
-            "source_partials",
-            count,
             &format!(
                 "source contains {count} recognizable SYQ partial path{}; {} treated as ordinary payload",
                 if count == 1 { "" } else { "s" },

@@ -94,6 +94,9 @@ Differences appear as planned changes. For machine-readable output, add
 [`--results`](automation.md); for two servers, see
 [remote comparisons](remote-reference.md#verification).
 
+For S3 downloads, comparisons can use a stored object hash instead of reading
+the object body. This does not independently check the object against its stored hash.
+
 ## Consistency and durability
 
 A copy reads files over time. If another program changes them while syq is

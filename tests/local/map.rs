@@ -548,7 +548,6 @@ fn native_map_exposes_only_manifest_shaping_options() {
         "--performance-tuning",
         "--progress",
         "--no-progress",
-        "--progress-json",
         "--hash",
         "--no-compress",
         "--resource-limits",

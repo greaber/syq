@@ -98,14 +98,6 @@ pub(crate) fn emit_diagnostic(args: Arguments<'_>) {
         .diagnostic(&mut io::stderr().lock(), args);
 }
 
-/// Already serialized JSON must retain its encoding, including Unicode values.
-pub(crate) fn emit_json_stderr(args: Arguments<'_>) {
-    let _ = TERMINAL
-        .lock()
-        .unwrap()
-        .write_line(&mut io::stderr().lock(), args);
-}
-
 pub(crate) fn emit_human_stdout(args: Arguments<'_>) {
     if let Err(error) = write_stdout(format_args!("{}", safe_message(args))) {
         warn_stdout(&error);

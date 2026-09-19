@@ -139,7 +139,7 @@ endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
 `tcp_ports`, `tcp_congestion`, `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
 `performance_tuning`, `resource_limits`, `integrity_checking`, `only_new`,
 `only_existing`, `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
-`progress_json`, and `timeout` with the same meanings as `cp`.
+and `timeout` with the same meanings as `cp`.
 See the CLI stream reference for the applicable tuning and integrity controls.
 The client supplies the executable, process working directory, environment,
 and default timeout. Stream calls always check transfer failures.

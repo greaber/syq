@@ -67,12 +67,7 @@ impl Controls {
             algorithm: args.transfer_hash_type.unwrap_or_default(),
             verify: args.transfer_integrity,
         };
-        let mut progress = Progress::new(
-            !args.quiet && !args.no_progress,
-            args.progress,
-            None,
-            args.progress_json && !args.quiet,
-        );
+        let mut progress = Progress::new(!args.quiet && !args.no_progress, args.progress, None);
         Arc::get_mut(&mut progress).unwrap().stream = true;
         if let Some(writer) = report.writer() {
             progress.set_results(writer.clone());

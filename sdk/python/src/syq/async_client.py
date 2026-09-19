@@ -561,7 +561,6 @@ class AsyncClient:
         quiet: bool = False,
         progress: bool = False,
         no_progress: bool = False,
-        progress_json: bool = False,
         timeout: Timeout = CLIENT_DEFAULT,
     ) -> AsyncStreamWriter:
         """Write one object, committing on successful context exit."""
@@ -580,7 +579,6 @@ class AsyncClient:
                              resource_limits=resource_limits, integrity_checking=integrity_checking,
                              stats=stats, verbose=verbose,
                              quiet=quiet, progress=progress, no_progress=no_progress,
-                             progress_json=progress_json,
                              performance_tuning=performance_tuning, follow_dst=follow_dst),
             )
             stream = StreamWriter(_Process(argv, writing=True, cwd=self.process_cwd, env=self.env,
@@ -622,7 +620,6 @@ class AsyncClient:
         quiet: bool = False,
         progress: bool = False,
         no_progress: bool = False,
-        progress_json: bool = False,
         timeout: Timeout = CLIENT_DEFAULT,
     ) -> AsyncStreamReader:
         """Read one object; context exit drains and verifies the transfer."""
@@ -641,7 +638,6 @@ class AsyncClient:
                              resource_limits=resource_limits, integrity_checking=integrity_checking,
                              stats=stats, verbose=verbose,
                              quiet=quiet, progress=progress, no_progress=no_progress,
-                             progress_json=progress_json,
                              performance_tuning=performance_tuning, follow_src=follow_src),
             )
             stream = StreamReader(_Process(argv, writing=False, cwd=self.process_cwd, env=self.env,
