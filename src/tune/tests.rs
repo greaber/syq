@@ -351,33 +351,130 @@ fn cache_is_read_when_its_lock_cannot_be_created() {
 
 #[test]
 fn sampler_waits_for_a_stable_rate() {
-    let mut s = Sampler::default();
-    s.reset();
-    assert_eq!(
-        s.push(50.0),
-        None,
-        "first sample after a change is discarded"
-    );
+    let mut s = Sampler::new(Duration::from_millis(7500));
+    let second = Duration::from_secs(1);
+    assert_eq!(s.push(50.0, second), None, "discard settling interval");
     // A burst that gets throttled: 100, 60, 40, 39 -> stable at ~40.
-    assert_eq!(s.push(100.0), None);
-    assert_eq!(s.push(60.0), None);
-    assert_eq!(s.push(40.0), None);
-    assert_eq!(s.push(39.0), Some(39.5));
+    for rate in [100.0, 60.0, 40.0] {
+        assert_eq!(s.push(rate, second), None);
+    }
+    assert_eq!(s.push(39.0, second), Some(Observation::Stable(39.5)));
     // A link that ramps up: 10, 20, 30, 31 -> stable at ~30.
-    assert_eq!(s.push(10.0), None);
-    assert_eq!(s.push(20.0), None);
-    assert_eq!(s.push(30.0), None);
-    assert_eq!(s.push(31.0), Some(30.5));
+    for rate in [10.0, 20.0, 30.0] {
+        assert_eq!(s.push(rate, second), None);
+    }
+    assert_eq!(s.push(31.0, second), Some(Observation::Stable(30.5)));
 }
 
 #[test]
-fn sampler_gives_up_eventually() {
-    let mut s = Sampler::default();
-    let mut out = None;
-    for i in 0..MAX_SAMPLES {
-        out = s.push(100.0 * (i as f64 + 1.0)); // never stable
+fn noisy_experiment_expires_without_a_score_or_cacheable_comparison() {
+    let mut policy = Policy::new(16, MIN, MAX);
+    measure(&mut policy, 100.0);
+    assert_eq!(policy.n, 21);
+    let points = policy.points.len();
+    let mut sampler = Sampler::new(Duration::from_millis(7500));
+    for i in 0..7 {
+        assert_eq!(
+            sampler.push(
+                if i % 2 == 0 { 100.0 } else { 150.0 },
+                Duration::from_secs(1)
+            ),
+            None
+        );
     }
-    assert!(out.is_some(), "no score after {MAX_SAMPLES} samples");
+    assert_eq!(
+        sampler.next_interval(Duration::from_secs(1)),
+        Duration::from_millis(500)
+    );
+    assert_eq!(
+        sampler.push(150.0, Duration::from_millis(500)),
+        Some(Observation::Inconclusive)
+    );
+    policy.inconclusive();
+    assert_eq!(policy.n, 16);
+    assert_eq!(policy.settled(), 16);
+    assert!(!policy.measured());
+    assert_eq!(policy.points.len(), points, "no invented bound at21");
+    policy.activated();
+    assert!(policy.due[Direction::Up.index()] > policy.tick);
+}
+
+#[test]
+fn unstable_start_does_not_invent_a_candidate() {
+    let mut policy = Policy::new(16, MIN, MAX);
+    policy.inconclusive();
+    assert_eq!(policy.n, 16);
+    assert!(!policy.measured());
+    assert!(policy.points.is_empty());
+    measure(&mut policy, 100.0);
+    assert_eq!(
+        policy.n, 21,
+        "later stable evidence can still start exploring"
+    );
+}
+
+#[test]
+fn observations_grow_slower_than_retry_spacing_and_stop_at_the_cap() {
+    let mut policy = Policy::new(16, MIN, MAX);
+    let mut previous_interval = policy.observation_interval(SAMPLE);
+    let mut previous_wait = policy.retry_after(Direction::Up);
+    assert_eq!(previous_interval * 3, Duration::from_secs(3));
+    for _ in 0..5 {
+        assert!(policy.begin(Direction::Up, 100.0));
+        policy.activated();
+        policy.inconclusive();
+        policy.activated();
+        assert_eq!(
+            policy.observation_interval(SAMPLE),
+            SAMPLE,
+            "hold pacing unchanged"
+        );
+        let wait = policy.retry_after(Direction::Up);
+        assert!(policy.begin(Direction::Up, 100.0));
+        let interval = policy.observation_interval(SAMPLE);
+        assert!(interval >= previous_interval);
+        assert!(interval <= SAMPLE);
+        let growth = interval.as_secs_f64() / previous_interval.as_secs_f64();
+        let wait_growth = wait as f64 / previous_wait as f64;
+        assert!(growth <= wait_growth);
+        if wait > previous_wait {
+            assert!(growth < wait_growth);
+        }
+        previous_interval = interval;
+        previous_wait = wait;
+        // Restore the known count without adding another failed measurement.
+        policy.cancel_unapplied();
+    }
+    assert_eq!(previous_interval * 3, Duration::from_millis(7500));
+}
+
+#[test]
+fn a_successful_probe_resumes_short_observations() {
+    let mut policy = Policy::new(16, MIN, MAX);
+    measure(&mut policy, 100.0);
+    policy.inconclusive();
+    policy.activated();
+    policy.begin(Direction::Up, 100.0);
+    policy.activated();
+    assert!(policy.observation_interval(SAMPLE) > Duration::from_secs(1));
+    measure(&mut policy, 140.0);
+    assert_eq!(policy.settled(), 21);
+    assert_eq!(policy.observation_interval(SAMPLE), Duration::from_secs(1));
+}
+
+#[test]
+fn reset_discards_rates_from_the_previous_worker_count() {
+    let mut sampler = Sampler::new(Duration::from_millis(7500));
+    let second = Duration::from_secs(1);
+    sampler.push(100.0, second);
+    sampler.push(100.0, second);
+    sampler.reset();
+    assert_eq!(sampler.push(100.0, second), None);
+    assert_eq!(sampler.push(100.0, second), None);
+    assert_eq!(
+        sampler.push(100.0, second),
+        Some(Observation::Stable(100.0))
+    );
 }
 
 #[test]

@@ -86,7 +86,10 @@ Supplying `--performance-tuning` bypasses the cache. With
 `--resource-limits workers=N`, syq starts from the remembered count or the
 ceiling, whichever is lower, and leaves the cache unchanged. A bandwidth limit
 alone still reads and updates it.
-Live tuning continues unless you fix `workers`. Use `-vv` to see the starting count.
+Live tuning continues unless you fix `workers`. Initial experiments use shorter
+observations; retries become less frequent and observe for longer. Unstable
+experiments do not establish a better worker count. Use `-vv` to see the starting
+count.
 
 ## Filesystem tuning examples
 

@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering::Relaxed},
         Arc, Mutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
@@ -500,8 +500,8 @@ pub(super) async fn run(
         spawn(&mut tasks, id)?;
     }
     let mut policy = tune::Policy::new(prepared.workers, 1, prepared.worker_limit);
-    let mut sampler = tune::Sampler::default();
-    let mut interval = tokio::time::interval(tune::SAMPLE);
+    let mut sampler = tune::Sampler::new(tune::SAMPLE * 3);
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last = (Instant::now(), controls.progress.bytes_done.load(Relaxed));
     let transfer = async {
@@ -596,15 +596,22 @@ pub(super) async fn run(
                 value = &mut transfer => break value?,
                 value = tasks.join_next(), if !tasks.is_empty() => { value.unwrap()??; }
                 _ = interval.tick(), if args.connections_default => {
-                    if !gate.ready_through(policy.n) { continue; }
+                    if !gate.ready_through(policy.n) {
+                        sampler.reset();
+                        last = (Instant::now(), controls.progress.bytes_done.load(Relaxed));
+                        continue;
+                    }
                     if gate.active() != policy.n { gate.set_active(policy.n); policy.activated(); sampler.reset(); last = (Instant::now(), controls.progress.bytes_done.load(Relaxed)); continue; }
                     let now = (Instant::now(), controls.progress.bytes_done.load(Relaxed));
-                    let elapsed = now.0.duration_since(last.0).as_secs_f64();
-                    if elapsed < tune::SAMPLE.as_secs_f64() / 2.0 { continue; }
-                    let rate = (now.1.saturating_sub(last.1)) as f64 / elapsed;
+                    let elapsed = now.0.duration_since(last.0);
+                    if elapsed < sampler.next_interval(policy.observation_interval(tune::SAMPLE)) { continue; }
+                    let rate = (now.1.saturating_sub(last.1)) as f64 / elapsed.as_secs_f64();
                     last = now;
-                    if let Some(score) = sampler.push(rate) {
-                        let target = policy.observe(score);
+                    if let Some(observation) = sampler.push(rate, elapsed) {
+                        let target = match observation {
+                            tune::Observation::Stable(score) => policy.observe(score),
+                            tune::Observation::Inconclusive => { policy.inconclusive(); policy.n }
+                        };
                         if target != gate.active() {
                             if target < gate.active() { gate.set_active(target); gate.set_retain(target.max(2)); policy.activated(); }
                             for id in gate.begin_warming(target) { spawn(&mut tasks, id)?; }

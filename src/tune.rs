@@ -65,14 +65,13 @@ const PROBE_BACKOFF_MAX: u32 = 3;
 /// Old high-water measurements must not permanently prevent adaptation when
 /// the path changes during a long transfer.
 const EVIDENCE_MAX_AGE: usize = PROBE_EVERY * 4;
-/// How often progress is sampled.
+/// Settled sampling interval. Initial experiments use a shorter interval,
+/// growing toward this one as their direction backs off.
 pub const SAMPLE: Duration = Duration::from_millis(2500);
 /// One discarded warm-up interval plus the two samples needed for stability.
 const MEASUREMENT_SAMPLES: f64 = 3.0;
 /// Two consecutive samples this close count as a stable rate.
 const STABLE_WITHIN: f64 = 0.10;
-/// Give up waiting for stability after this many samples and use what we have.
-const MAX_SAMPLES: usize = 8;
 /// Conservative requirement before the first rate sample. Every real probe is
 /// based on a measured duration estimate; this is only a startup fallback.
 const TAIL_FALLBACK_BYTES_PER_WORKER: u64 = 64 << 20;
@@ -280,43 +279,65 @@ pub fn step_down(n: usize) -> usize {
     ((n as f64 / STEP).round() as usize).min(n.saturating_sub(1))
 }
 
-/// Turns per-sample rates into one score per *stable* stretch: the first
-/// sample after a change is discarded (connections coming up, congestion
-/// control adapting), then samples are collected until two in a row agree
-/// within STABLE_WITHIN, or MAX_SAMPLES have passed. The score is the mean
-/// of the last two samples.
-#[derive(Debug, Default)]
-pub struct Sampler {
-    samples: Vec<f64>,
+/// A bounded observation can finish without evidence worth comparing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Observation {
+    Stable(f64),
+    Inconclusive,
+}
+
+/// Ignore one settling interval, then wait for two similar rates. Never turn
+/// an unstable window into a score merely because its time budget expired.
+pub(crate) struct Sampler {
+    previous: Option<(f64, Duration)>,
+    elapsed: Duration,
+    limit: Duration,
     discard: bool,
 }
 
 impl Sampler {
-    /// The worker count just changed: start over, ignoring the next sample.
-    pub fn reset(&mut self) {
-        self.samples.clear();
+    pub(crate) fn new(limit: Duration) -> Self {
+        Self {
+            previous: None,
+            elapsed: Duration::ZERO,
+            limit,
+            discard: true,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.previous = None;
+        self.elapsed = Duration::ZERO;
         self.discard = true;
     }
 
-    /// Feed one sample; returns a score once the rate is stable.
-    pub fn push(&mut self, rate: f64) -> Option<f64> {
+    pub(crate) fn next_interval(&self, preferred: Duration) -> Duration {
+        preferred.min(self.limit.saturating_sub(self.elapsed))
+    }
+
+    pub(crate) fn push(&mut self, rate: f64, duration: Duration) -> Option<Observation> {
+        self.elapsed += duration;
+        let previous = self.previous;
         if self.discard {
             self.discard = false;
-            return None;
-        }
-        self.samples.push(rate);
-        let n = self.samples.len();
-        if n < 2 {
-            return None;
-        }
-        let (a, b) = (self.samples[n - 2], self.samples[n - 1]);
-        let stable = (a - b).abs() <= STABLE_WITHIN * a.max(b) || (a == 0.0 && b == 0.0);
-        if stable || n >= MAX_SAMPLES {
-            self.samples.clear();
-            Some(0.5 * (a + b))
         } else {
-            None
+            self.previous = Some((rate, duration));
+            if let Some((a, a_duration)) = previous {
+                let stable = (a - rate).abs() <= STABLE_WITHIN * a.max(rate);
+                if stable {
+                    let score = (a * a_duration.as_secs_f64() + rate * duration.as_secs_f64())
+                        / (a_duration + duration).as_secs_f64();
+                    self.previous = None;
+                    self.elapsed = Duration::ZERO;
+                    return Some(Observation::Stable(score));
+                }
+            }
         }
+        if self.elapsed >= self.limit {
+            self.reset();
+            return Some(Observation::Inconclusive);
+        }
+        None
     }
 }
 
@@ -500,6 +521,38 @@ impl Policy {
         true
     }
 
+    /// First experiments take at least three seconds (one discarded interval
+    /// and two agreeing rates). A doubled retry wait grows their duration by
+    /// sqrt(2), capped at the settled 7.5-second observation window. Keep hold
+    /// sampling unchanged so shorter experiments do not accelerate later probes.
+    pub(crate) fn observation_interval(&self, settled_interval: Duration) -> Duration {
+        let failures = match self.state {
+            State::Initial => 0,
+            State::Explore { direction, .. } => self.fails[direction.index()],
+            State::Hold => return settled_interval,
+        };
+        let factor = (0.4 * 2.0_f64.powf(failures.min(PROBE_BACKOFF_MAX) as f64 / 2.0)).min(1.0);
+        settled_interval.mul_f64(factor)
+    }
+
+    /// Abandon an unstable experiment without recording a throughput bound or
+    /// making its candidate cacheable. Back off retries just as for an unhelpful
+    /// probe, giving the next experiment longer to settle.
+    pub(crate) fn inconclusive(&mut self) {
+        if let State::Explore {
+            from, direction, ..
+        } = self.state
+        {
+            let index = direction.index();
+            self.fails[index] = self.fails[index].saturating_add(1);
+            self.due[index] = self.tick + self.retry_after(direction);
+            let inverse = direction.opposite().index();
+            self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
+            self.n = from;
+            self.state = State::Hold;
+        }
+    }
+
     fn retry_after(&self, direction: Direction) -> usize {
         let backoff = self.fails[direction.index()].min(PROBE_BACKOFF_MAX);
         PROBE_EVERY << backoff
@@ -661,7 +714,7 @@ impl Policy {
                     // in the same direction, so continue immediately.
                     self.begin(direction, score);
                 } else {
-                    self.fails[idx] += 1;
+                    self.fails[idx] = self.fails[idx].saturating_add(1);
                     self.due[idx] = self.tick + self.retry_after(direction);
                     // Do not mechanically bounce to the opposite side after
                     // a failed probe. Let current throughput settle first.
@@ -868,13 +921,12 @@ pub fn run(
     mut spawn: impl FnMut(usize),
 ) -> Policy {
     let mut policy = policy;
-    let mut sampler = Sampler::default();
-    sampler.reset();
+    let sample = sample_interval();
+    let mut sampler = Sampler::new(sample.mul_f64(MEASUREMENT_SAMPLES));
     let mut last = (meter.bytes(), meter.files());
     let mut sample_start = std::time::Instant::now();
     let mut active = policy.active();
     let mut collapse_samples = 0;
-    let sample = sample_interval();
     let poll = Duration::from_millis(250).min(sample);
     let mut last_rate = None;
     meter.set_active(policy.n);
@@ -910,6 +962,8 @@ pub fn run(
             continue;
         }
 
+        let interval = policy.observation_interval(sample);
+
         // Apply reductions immediately. An increase leaves the current set
         // active while its candidate workers connect in the background.
         if policy.n < active {
@@ -932,7 +986,7 @@ pub fn run(
             continue;
         }
         if policy.n > active {
-            if !enough_work(&sched, policy.n, last_rate, sample) {
+            if !enough_work(&sched, policy.n, last_rate, interval) {
                 policy.cancel_unapplied();
                 gate.set_retain(if active == 1 { 2 } else { active });
                 continue;
@@ -975,9 +1029,10 @@ pub fn run(
             // The settled workers keep providing a fresh comparison while an
             // upward candidate connects. This prevents handshake delay from
             // turning unrelated path drift into an apparent candidate effect.
-            if sample_start.elapsed() >= sample {
+            if sample_start.elapsed() >= sampler.next_interval(interval) {
                 let now = (meter.bytes(), meter.files());
-                let secs = sample_start.elapsed().as_secs_f64();
+                let duration = sample_start.elapsed();
+                let secs = duration.as_secs_f64();
                 sample_start = std::time::Instant::now();
                 if !gate.ready_through(active) {
                     last = now;
@@ -991,13 +1046,13 @@ pub fn run(
                 };
                 last = now;
                 last_rate = Some(rate);
-                if !enough_work(&sched, policy.n, last_rate, sample) {
+                if !enough_work(&sched, policy.n, last_rate, interval) {
                     policy.cancel_unapplied();
                     gate.set_retain(if active == 1 { 2 } else { active });
                     sampler.reset();
                     continue;
                 }
-                if let Some(score) = sampler.push(rate) {
+                if let Some(Observation::Stable(score)) = sampler.push(rate, duration) {
                     policy.refresh_warming_baseline(score);
                     if crate::output::debug() {
                         crate::output::diagnostic!(
@@ -1032,11 +1087,12 @@ pub fn run(
             sched.abort();
             break;
         }
-        if sample_start.elapsed() < sample {
+        if sample_start.elapsed() < sampler.next_interval(interval) {
             continue;
         }
         let now = (meter.bytes(), meter.files());
-        let secs = sample_start.elapsed().as_secs_f64();
+        let duration = sample_start.elapsed();
+        let secs = duration.as_secs_f64();
         sample_start = std::time::Instant::now();
         // Only judge a configuration once every requested worker is actually
         // connected (ssh sessions can take seconds each).
@@ -1061,7 +1117,7 @@ pub fn run(
         // Estimate the time left at the rate just observed. In the tail, idle
         // workers say nothing; unlike a fixed byte threshold this remains
         // useful on both very slow and very fast paths.
-        if !enough_work(&sched, active, last_rate, sample) {
+        if !enough_work(&sched, active, last_rate, interval) {
             sampler.reset();
             collapse_samples = 0;
             continue;
@@ -1080,10 +1136,23 @@ pub fn run(
             collapse_samples = 0;
             continue;
         }
-        let Some(score) = sampler.push(rate) else {
+        let Some(observation) = sampler.push(rate, duration) else {
             continue;
         };
         let before = policy.n;
+        let score = match observation {
+            Observation::Stable(score) => score,
+            Observation::Inconclusive => {
+                policy.inconclusive();
+                if crate::output::debug() {
+                    crate::output::diagnostic!(
+                        "syq: tune: inconclusive observation at {active} workers; returning to {}",
+                        policy.n
+                    );
+                }
+                continue;
+            }
+        };
         policy.observe(score);
         if policy.n != before {
             sampler.reset();
