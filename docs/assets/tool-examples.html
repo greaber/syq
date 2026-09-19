@@ -33,12 +33,12 @@
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
 <div class="tool-example-commands">
-<div><p><strong>rsync</strong></p><pre><code>rsync -a --delete project/ server:/backup/</code></pre></div>
-<div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --prune</code></pre></div>
+<div><p><strong>rsync</strong></p><pre><code>rsync --delete -a project/ server:/backup/</code></pre></div>
+<div><p><strong>syq</strong></p><pre><code>syq cp --prune --srcs-in project --to server --into /backup</code></pre></div>
 </div>
 <p>Updates /backup with the contents of project and removes destination entries absent from the source.</p>
 <p class="tool-example-note">Deletes destination-only files. Preview syq with --dry-run -v. <a href="reference.html#mirror-a-directory">Mirroring details</a>.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>The command above uses archive mode (-a), which preserves permissions, ownership and special files as well as timestamps and symlinks, where permitted. Syq normally preserves timestamps and links; it keeps existing destination permissions and limits new-file permissions by the destination umask. It does not preserve ownership or copy special files by default.</p><p>For a closer match (rsync 3.2.3+):</p><pre><code>rsync -rlt --mkpath --modify-window=-1 --delete-after project/ server:/backup/</code></pre><p>-t preserves modification times; -r recurses into directories and -l preserves symlinks. --mkpath creates missing destination parents. --modify-window=-1 compares fractional seconds too; the simpler command compares only whole seconds.</p><p>--delete-after postpones deletion until after the transfer phase, closer to syq’s copy-then-prune ordering.</p><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p><p>Rsync can replace an empty destination directory with a source file. Syq refuses file/directory type conflicts, even for empty directories.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>The command above uses archive mode (-a), which preserves permissions, ownership and special files as well as timestamps and symlinks, where permitted. Syq normally preserves timestamps and links; it keeps existing destination permissions and limits new-file permissions by the destination umask. It does not preserve ownership or copy special files by default.</p><p>For a closer match (rsync 3.2.3+):</p><pre><code>rsync --delete-after -rlt --mkpath --modify-window=-1 project/ server:/backup/</code></pre><p>-t preserves modification times; -r recurses into directories and -l preserves symlinks. --mkpath creates missing destination parents. --modify-window=-1 compares fractional seconds too; the simpler command compares only whole seconds.</p><p>--delete-after postpones deletion until after the transfer phase, closer to syq’s copy-then-prune ordering.</p><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p><p>Rsync can replace an empty destination directory with a source file. Syq refuses file/directory type conflicts, even for empty directories.</p></details>
 </section>
 <section class="tool-example" data-title="Download a file from a server">
 <h3>Download a file from a server</h3>
@@ -52,11 +52,11 @@
 <section class="tool-example" data-title="Preview a copy">
 <h3>Preview a copy</h3>
 <div class="tool-example-commands">
-<div><p><strong>rsync</strong></p><pre><code>rsync -a --dry-run --itemize-changes project/ server:/backup/</code></pre></div>
-<div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --dry-run -v</code></pre></div>
+<div><p><strong>rsync</strong></p><pre><code>rsync --dry-run --itemize-changes -a project/ server:/backup/</code></pre></div>
+<div><p><strong>syq</strong></p><pre><code>syq cp --dry-run -v --srcs-in project --to server --into /backup</code></pre></div>
 </div>
 <p>Lists planned changes without copying file data.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>The command above uses archive mode (-a), which preserves permissions, ownership and special files as well as timestamps and symlinks, where permitted. Syq normally preserves timestamps and links; it keeps existing destination permissions and limits new-file permissions by the destination umask. It does not preserve ownership or copy special files by default.</p><p>For a closer match (rsync 3.2.3+):</p><pre><code>rsync -rlt --mkpath --modify-window=-1 --dry-run --itemize-changes project/ server:/backup/</code></pre><p>-t preserves modification times; -r recurses into directories and -l preserves symlinks. --mkpath creates missing destination parents. --modify-window=-1 compares fractional seconds too; the simpler command compares only whole seconds.</p><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p><p>Rsync can replace an empty destination directory with a source file. Syq refuses file/directory type conflicts, even for empty directories.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>The command above uses archive mode (-a), which preserves permissions, ownership and special files as well as timestamps and symlinks, where permitted. Syq normally preserves timestamps and links; it keeps existing destination permissions and limits new-file permissions by the destination umask. It does not preserve ownership or copy special files by default.</p><p>For a closer match (rsync 3.2.3+):</p><pre><code>rsync --dry-run --itemize-changes -rlt --mkpath --modify-window=-1 project/ server:/backup/</code></pre><p>-t preserves modification times; -r recurses into directories and -l preserves symlinks. --mkpath creates missing destination parents. --modify-window=-1 compares fractional seconds too; the simpler command compares only whole seconds.</p><p>With --modify-window=-1, rsync compares modification times to the nanosecond. Syq accepts differences below the precision suggested by the destination timestamp; for example, a destination time ending in .000000000 ignores the source’s fractional second when checking for an unchanged file.</p><p>Rsync can replace an empty destination directory with a source file. Syq refuses file/directory type conflicts, even for empty directories.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -115,7 +115,7 @@ rsync -t --mkpath --modify-window=-1 photos/b.jpg server:/archive/summit.jpg</co
 <h3>Match a folder, deleting extra files</h3>
 <div class="tool-example-commands">
 <div><p><strong>rclone</strong></p><pre><code>rclone sync project backup</code></pre></div>
-<div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --into backup --prune</code></pre></div>
+<div><p><strong>syq</strong></p><pre><code>syq cp --prune --srcs-in project --into backup</code></pre></div>
 </div>
 <p>Updates backup with the contents of project and removes destination entries absent from the source.</p>
 <p class="tool-example-note">Deletes destination-only files. Preview syq with --dry-run -v.</p>
@@ -144,11 +144,11 @@ rsync -t --mkpath --modify-window=-1 photos/b.jpg server:/archive/summit.jpg</co
 <section class="tool-example" data-title="Preview a copy">
 <h3>Preview a copy</h3>
 <div class="tool-example-commands">
-<div><p><strong>rclone</strong></p><pre><code>rclone copy project backup --dry-run</code></pre></div>
-<div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --into backup --dry-run -v</code></pre></div>
+<div><p><strong>rclone</strong></p><pre><code>rclone copy --dry-run project backup</code></pre></div>
+<div><p><strong>syq</strong></p><pre><code>syq cp --dry-run -v --srcs-in project --into backup</code></pre></div>
 </div>
 <p>Previews copying the contents of project into backup.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>The command above does not request empty-directory or symlink preservation. For a closer match:</p><pre><code>rclone copy --links --create-empty-src-dirs project backup --dry-run</code></pre><p>--create-empty-src-dirs includes empty directories. --links preserves symlinks through rclone’s link representation, restoring real links on a local destination.</p><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Without --metadata, rclone does not restore source Unix permission bits. Syq gives new files the source read/write/execute bits limited by the destination umask and keeps existing destination permissions. Rclone’s --metadata would additionally restore ownership and other metadata, so it does not match syq’s default either.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>The command above does not request empty-directory or symlink preservation. For a closer match:</p><pre><code>rclone copy --dry-run --links --create-empty-src-dirs project backup</code></pre><p>--create-empty-src-dirs includes empty directories. --links preserves symlinks through rclone’s link representation, restoring real links on a local destination.</p><p>When sizes match but modification times differ, rclone can compare available hashes and update only the timestamp if the contents match. Syq’s default unchanged-file check uses size and modification time, without that hash fallback.</p><p>Without --metadata, rclone does not restore source Unix permission bits. Syq gives new files the source read/write/execute bits limited by the destination umask and keeps existing destination permissions. Rclone’s --metadata would additionally restore ownership and other metadata, so it does not match syq’s default either.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -234,7 +234,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <h3>Preview a copy</h3>
 <div class="tool-example-commands">
 <div><p><strong>s5cmd</strong></p><pre><code>s5cmd --dry-run cp report.csv s3://backups/report.csv</code></pre></div>
-<div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to s3://backups --as report.csv --dry-run -v</code></pre></div>
+<div><p><strong>syq</strong></p><pre><code>syq cp --dry-run -v report.csv --to s3://backups --as report.csv</code></pre></div>
 </div>
 <p>Previews uploading report.csv without writing the object.</p>
 <details class="tool-example-differences"><summary>Differences</summary><p>S5cmd cp copies selected files again even when the destination already matches. Syq can skip unchanged entries. S5cmd’s size-only and source-newer conditions do not reproduce syq’s default comparison.</p><p>S5cmd uploads regular file contents without automatically recording source Unix permissions or modification times. Syq records those in its S3 metadata and restores modification times on download.</p></details>
@@ -280,7 +280,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <h3>Match a folder, deleting extra files</h3>
 <div class="tool-example-commands">
 <div><p><strong>s5cmd</strong></p><pre><code>s5cmd sync --delete project/ s3://backups/project/</code></pre></div>
-<div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to s3://backups --into project --prune</code></pre></div>
+<div><p><strong>syq</strong></p><pre><code>syq cp --prune --srcs-in project --to s3://backups --into project</code></pre></div>
 </div>
 <p>Updates the project/ folder in S3 and removes objects absent from the local project folder.</p>
 <p class="tool-example-note">Preview with s5cmd --dry-run sync --delete or add --dry-run -v to syq. Bucket versioning affects recovery.</p>
@@ -377,7 +377,7 @@ scp -p photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 </section>
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
-<div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --prune</code></pre></div></div>
+<div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp --prune --srcs-in project --to server --into /backup</code></pre></div></div>
 <p>Updates /backup with the contents of project and removes destination entries absent from the source.</p>
 <p class="tool-example-note">Preview with --dry-run -v first.</p>
 </section>
@@ -389,7 +389,7 @@ scp -p photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 </section>
 <section class="tool-example" data-title="Preview a copy">
 <h3>Preview a copy</h3>
-<div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --dry-run -v</code></pre></div></div>
+<div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp --dry-run -v --srcs-in project --to server --into /backup</code></pre></div></div>
 <p>Lists planned changes without copying file data.</p>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
