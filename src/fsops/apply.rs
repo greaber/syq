@@ -138,7 +138,7 @@ pub(super) fn rooted_partial_target(
     copy_id: &CopyId,
 ) -> Result<(RelativePath, PathBuf)> {
     let relative_path = target.relative.to_path_buf();
-    let component_limit = target.root.name_max_for_parent(&target.relative)?;
+    let component_limit = target.root.partial_name_max(&target.relative)?;
     // Derive the visible component from the logical command-line spelling so
     // PartialPaths and every state-machine request keep one stable sidecar
     // name, including the PATH_MAX compact form. Only the resulting component
@@ -155,6 +155,33 @@ pub(super) fn rooted_partial_target(
         RelativePath::new(relative_partial.as_os_str().as_bytes())?,
         label,
     ))
+}
+
+/// Retry only the initial access to a partial. Later writes and publication
+/// must use the returned name; never replay a completed mutation or a batch.
+pub(super) fn with_rooted_partial<T>(
+    target: &RootedTarget,
+    copy_id: &CopyId,
+    mut access: impl FnMut(&RelativePath, &Path) -> Result<T>,
+) -> Result<(RelativePath, PathBuf, T)> {
+    let (relative, label) = rooted_partial_target(target, copy_id)?;
+    match access(&relative, &label) {
+        Ok(value) => Ok((relative, label, value)),
+        Err(error) => {
+            let too_long = error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG));
+            if !too_long || !target.root.learn_partial_name_max(&target.relative)? {
+                return Err(error);
+            }
+            let (short, label) = rooted_partial_target(target, copy_id)?;
+            if short == relative {
+                return Err(error);
+            }
+            let value = access(&short, &label)?;
+            Ok((short, label, value))
+        }
+    }
 }
 
 pub(super) fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {

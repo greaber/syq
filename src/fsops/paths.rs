@@ -237,6 +237,21 @@ pub fn is_recovery_name(name: &OsStr) -> bool {
     decimal(fields.next()) && decimal(fields.next()) && fields.next().is_none()
 }
 
+/// Identify a temporary-name reservation independently of its readable prefix.
+/// The opaque suffix already includes the complete destination spelling and
+/// copy identity. Reserving it covers every shorter spelling after a rejected
+/// filename without another filesystem lookup during collision preflight.
+pub(crate) fn partial_reservation_key(path: &[u8]) -> Vec<u8> {
+    let parent_end = path
+        .iter()
+        .rposition(|&byte| byte == b'/')
+        .map_or(0, |at| at + 1);
+    debug_assert!(is_partial_name(OsStr::from_bytes(&path[parent_end..])));
+    let mut key = path[..parent_end].to_vec();
+    key.extend_from_slice(&path[path.len() - 16..]);
+    key
+}
+
 pub fn is_partial_name(name: &OsStr) -> bool {
     let name = name.as_bytes();
     name.starts_with(b".")

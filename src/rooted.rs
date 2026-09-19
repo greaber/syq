@@ -179,6 +179,12 @@ impl RelativePath {
 pub(crate) struct Root {
     directory: File,
     identity: RootIdentity,
+    #[cfg(target_os = "linux")]
+    partial_name_limits: OnceLock<Mutex<HashMap<Vec<Vec<u8>>, usize>>>,
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) test_name_limit: std::sync::atomic::AtomicUsize,
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) test_name_queries: std::sync::atomic::AtomicUsize,
 }
 
 impl Root {
@@ -206,6 +212,12 @@ impl Root {
         }
         Ok(Self {
             directory,
+            #[cfg(target_os = "linux")]
+            partial_name_limits: OnceLock::new(),
+            #[cfg(all(test, target_os = "linux"))]
+            test_name_limit: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, target_os = "linux"))]
+            test_name_queries: std::sync::atomic::AtomicUsize::new(0),
             identity: RootIdentity {
                 dev: metadata.dev(),
                 ino: metadata.ino(),
@@ -343,6 +355,8 @@ impl Root {
     // the descriptor walk for unsupported syscalls and paths it cannot handle
     // (for example, paths longer than a single syscall accepts).
     fn open_leaf(&self, path: &RelativePath, flags: libc::c_int, mode: u32) -> Result<File> {
+        #[cfg(all(test, target_os = "linux"))]
+        self.check_test_name_limit(path)?;
         path.leaf()?;
         #[cfg(target_os = "linux")]
         match open_components_openat2(&self.directory, &path.components, flags, mode) {
@@ -724,10 +738,69 @@ impl Root {
         directory_names(readable).context("read confined directory")
     }
 
+    /// Start with the common Linux limit. Only a rejected partial name creates
+    /// this cache; ordinary copies do not resolve, stat, or hash the parent here.
+    pub(crate) fn partial_name_max(&self, path: &RelativePath) -> Result<usize> {
+        let (parents, _) = path.leaf()?;
+        #[cfg(target_os = "linux")]
+        {
+            Ok(self
+                .partial_name_limits
+                .get()
+                .and_then(|limits| limits.lock().unwrap().get(parents).copied())
+                .unwrap_or(COMMON_NAME_MAX))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = parents;
+            self.name_max_for_parent(path)
+        }
+    }
+
+    /// Learn a smaller limit after ENAMETOOLONG. The cache belongs to this
+    /// retained root, so separate mount views cannot share an observation.
+    pub(crate) fn learn_partial_name_max(&self, path: &RelativePath) -> Result<bool> {
+        let actual = self.name_max_for_parent(path)?;
+        if actual >= COMMON_NAME_MAX {
+            return Ok(false);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let (parents, _) = path.leaf()?;
+            let mut limits = self
+                .partial_name_limits
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap();
+            if limits.len() >= NAME_MAX_CACHE_CAP {
+                limits.clear();
+            }
+            limits.insert(parents.to_vec(), actual);
+        }
+        Ok(true)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn check_test_name_limit(&self, path: &RelativePath) -> Result<()> {
+        let limit = self.test_name_limit.load(Ordering::Relaxed);
+        if limit != 0 && path.components.iter().any(|part| part.len() > limit) {
+            return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG).into());
+        }
+        Ok(())
+    }
+
     /// Component limit for a sidecar beside `path`. Missing or non-directory
     /// suffixes are walked back to the nearest existing real directory, never
     /// through a symlink.
     pub(crate) fn name_max_for_parent(&self, path: &RelativePath) -> Result<usize> {
+        #[cfg(all(test, target_os = "linux"))]
+        {
+            self.test_name_queries.fetch_add(1, Ordering::Relaxed);
+            let limit = self.test_name_limit.load(Ordering::Relaxed);
+            if limit != 0 {
+                return Ok(limit);
+            }
+        }
         static CACHE: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
         let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         self.name_max_for_parent_cached(path, cache, &|directory| {
@@ -1313,6 +1386,8 @@ impl Root {
     }
 
     fn resolve_parent(&self, path: &RelativePath) -> Result<ResolvedParent<'_>> {
+        #[cfg(all(test, target_os = "linux"))]
+        self.check_test_name_limit(path)?;
         let (parents, leaf) = path.leaf()?;
         let directory = if parents.is_empty() {
             DirectoryHandle::Borrowed(&self.directory)

@@ -1011,16 +1011,16 @@ impl FsOps {
             .rooted_destination_target(&path, None)?
             .context("small copy requires the destination root")?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
-        let (partial, label) = rooted_partial_target(&rooted, copy_id)?;
-        let (file, basis_size) = self
-            .open_private_partial_rooted(
+        let (partial, label, opened) = with_rooted_partial(&rooted, copy_id, |partial, label| {
+            self.open_private_partial_rooted(
                 &rooted.root,
-                &partial,
-                &label,
+                partial,
+                label,
                 true,
                 staged_file_mode(meta, flags),
-            )?
-            .context("sidecar creation was requested")?;
+            )
+        })?;
+        let (file, basis_size) = opened.context("sidecar creation was requested")?;
         if basis_size.is_some() {
             file.set_len(0)?;
         }
@@ -1670,7 +1670,7 @@ impl FsOps {
             .destination_root
             .as_ref()
             .context("destination prefix has no retained root")?
-            .name_max_for_parent(&strict_relative)?;
+            .partial_name_max(&strict_relative)?;
         let logical_partial = partial_path_with_name_max(&logical, copy_id, component_limit)?;
         Ok(PathBuf::from(OsStr::from_bytes(
             &self.destination_relative(logical_partial.as_os_str().as_bytes())?,
@@ -2273,7 +2273,7 @@ impl FsOps {
                     .parent()
                     .context("operation requires a descendant path")?;
                 let limit = limits.get_or_query(&target.root, parent, || {
-                    target.root.name_max_for_parent(&target.relative)
+                    target.root.partial_name_max(&target.relative)
                 })?;
                 partial_path_with_name_max(&target.label, copy_id, limit)?
             } else {

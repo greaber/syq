@@ -709,7 +709,8 @@ pub enum Request {
         check_empty: bool,
         target: Option<DestinationFilesystemTarget>,
     },
-    /// Compute the exact receiver-side sidecar names for collision preflight.
+    /// Compute receiver-side sidecar names for collision preflight. The opaque
+    /// suffix also reserves shortened spellings after a filename-limit retry.
     PartialPaths {
         paths: Vec<PathBytes>,
         copy_id: CopyId,
