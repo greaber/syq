@@ -10,6 +10,9 @@ syq persist connect server
 You can close the terminal afterward. To enable persistence for connections
 opened by later syq commands instead, run `syq persist on`.
 
+Persistence also speeds up [remote path completion](install.md#shell-completion):
+completion reuses the open connection, avoiding a new SSH login for each lookup.
+
 Receiving is enabled by default. It lets connected servers request file copies
 to your machine, commands on it, and authorization for copies between servers,
 with approval on your machine. See [Use your laptop from a server](receive.md)
