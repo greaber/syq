@@ -1,8 +1,7 @@
 <div class="tool-examples">
 <div class="tool-examples-controls" hidden></div>
-<p class="tool-examples-hint" hidden>Dimmed choices do not meet the task’s starting point, endpoints, or data route. Select syq to explore all tasks. Alternatives that change these constraints are described separately.</p>
 <p class="tool-examples-status" role="status"></p>
-<details class="tool-examples-group" data-tool="rsync" data-unsupported="{&quot;Upload a folder’s contents to S3&quot;: &quot;Rsync has no native S3 endpoint.&quot;, &quot;Download a folder from S3&quot;: &quot;Rsync has no native S3 endpoint.&quot;, &quot;Copy a file between S3 buckets&quot;: &quot;Rsync has no native S3 endpoint.&quot;, &quot;Remove a file&quot;: &quot;Rsync has no standalone file-removal command; use a filesystem or SSH removal tool.&quot;, &quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers using only laptop logins&quot;: &quot;Running rsync on the source requires that server to have destination access. Relaying through the laptop changes the direct data route.&quot;}" open><summary>rsync</summary>
+<details class="tool-examples-group" data-tool="rsync" data-unsupported="{&quot;Upload a folder’s contents to S3&quot;: &quot;Rsync has no native S3 endpoint.&quot;, &quot;Download a folder from S3&quot;: &quot;Rsync has no native S3 endpoint.&quot;, &quot;Copy a file between S3 buckets&quot;: &quot;Rsync has no native S3 endpoint.&quot;, &quot;Remove a file&quot;: &quot;Rsync has no standalone file-removal command; use a filesystem or SSH removal tool.&quot;, &quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers without agent forwarding&quot;: &quot;Running rsync on the source requires that server to have destination access. Relaying through the laptop changes the direct data route.&quot;}" open><summary>rsync</summary>
 <section class="tool-example" data-title="Copy a file">
 <h3>Copy a file</h3>
 <div class="tool-example-commands">
@@ -19,7 +18,7 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project to /backup/project. Other entries in /backup stay.</p>
-<p class="tool-example-note">The rsync destination /backup must already exist for this placement. Syq makes the container explicit with --into. These examples use regular files and directories; rsync -rt skips symlinks, while syq copies links as links.</p>
+<p class="tool-example-note">For rsync, /backup must exist. Rsync -rt skips symlinks; syq copies them as links.</p>
 </section>
 <section class="tool-example" data-title="Copy the files inside a folder">
 <h3>Copy the files inside a folder</h3>
@@ -37,7 +36,7 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --prune</code></pre></div>
 </div>
 <p>Updates /backup with the contents of project and removes destination entries absent from the source.</p>
-<p class="tool-example-note">Deletion is permanent. Add --dry-run -v to the syq command to preview changes. Syq comparison and deletion rules differ from rsync; check the mirroring guide before using this in a backup script.</p>
+<p class="tool-example-note">Deletes destination-only files. Preview syq with --dry-run -v. <a href="reference.html#mirror-a-directory">Mirroring details</a>.</p>
 </section>
 <section class="tool-example" data-title="Download a file from a server">
 <h3>Download a file from a server</h3>
@@ -74,10 +73,10 @@ rsync -t photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div>
 </div>
 <p>A script can generate the commands on the left, or a syq mapping file with source a.jpg and destination 2024/a.jpg, then b.jpg and 2025/b.jpg.</p>
-<p class="tool-example-note">These examples copy regular files; create the destination parent folders first. Separate commands give each file its chosen name. Syq reads all pairs in one operation, checks destination collisions, and supports resuming the copy.</p>
+<p class="tool-example-note">Create destination parent folders first. Syq reads the <a href="mappings.html">mapping file</a> in one operation, checks collisions, and supports resuming.</p>
 </section>
-<p class="tool-example-links"><a href="https://download.samba.org/pub/rsync/rsync.1">rsync documentation</a></p></details>
-<details class="tool-examples-group" data-tool="rclone" data-unsupported="{&quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers using only laptop logins&quot;: &quot;Copies between distinct SFTP servers relay data through the rclone process on your laptop; the task requires a direct server-to-server data route.&quot;}" open><summary>rclone</summary>
+<!-- References: https://download.samba.org/pub/rsync/rsync.1 --></details>
+<details class="tool-examples-group" data-tool="rclone" data-unsupported="{&quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers without agent forwarding&quot;: &quot;Copies between distinct SFTP servers relay data through the rclone process on your laptop; the task requires a direct server-to-server data route.&quot;}" open><summary>rclone</summary>
 <section class="tool-example" data-title="Copy a file">
 <h3>Copy a file</h3>
 <div class="tool-example-commands">
@@ -103,7 +102,7 @@ rsync -t photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to s3://backups --into project</code></pre></div>
 </div>
 <p>Uploads project/index.html to the key project/index.html in bucket backups.</p>
-<p class="tool-example-note">Here s3 is an rclone remote configured for S3. Syq uses its own AWS credentials and endpoint settings. Other rclone storage backends are not implied by this example.</p>
+<p class="tool-example-note">s3 is an rclone S3 remote. Syq uses <a href="object-storage.html#s3-options">AWS credentials and endpoint settings</a>.</p>
 </section>
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
@@ -112,7 +111,7 @@ rsync -t photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --into backup --prune</code></pre></div>
 </div>
 <p>Updates backup with the contents of project and removes destination entries absent from the source.</p>
-<p class="tool-example-note">Deletion is permanent. Preview syq with --dry-run -v first. These commands share a task, but their comparison rules, metadata handling, and failure behavior differ.</p>
+<p class="tool-example-note">Deletes destination-only files. Preview syq with --dry-run -v. Comparison and metadata rules differ.</p>
 </section>
 <section class="tool-example" data-title="Download a folder from S3">
 <h3>Download a folder from S3</h3>
@@ -166,7 +165,7 @@ rsync -t photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project to /backup/project on the server.</p>
-<p class="tool-example-note">Configure server as an rclone SFTP remote first. Rclone copies contents, so its destination includes project. Syq uses your SSH host or alias and --into keeps the folder name.</p>
+<p class="tool-example-note">Configure server as an <a href="https://rclone.org/sftp/">rclone SFTP remote</a>. Rclone’s destination includes project; syq’s --into keeps the source name.</p>
 </section>
 <section class="tool-example" data-title="Download a file from a server">
 <h3>Download a file from a server</h3>
@@ -185,10 +184,10 @@ rclone copyto photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div>
 </div>
 <p>A script can generate the commands on the left, or a syq mapping file with source a.jpg and destination 2024/a.jpg, then b.jpg and 2025/b.jpg.</p>
-<p class="tool-example-note">These examples copy regular files; create the destination parent folders first. Separate commands give each file its chosen name. Syq reads all pairs in one operation, checks destination collisions, and supports resuming the copy. Rclone also has --name-transform for built-in renaming rules during a copy.</p>
+<p class="tool-example-note">Create destination parent folders first. Syq reads the <a href="mappings.html">mapping file</a> in one operation, checks collisions, and supports resuming. Rclone also supports <a href="https://rclone.org/docs/#name-transform">name transforms</a>.</p>
 </section>
-<p class="tool-example-links"><a href="https://rclone.org/commands/rclone_copy/">rclone copy</a> · <a href="https://rclone.org/commands/rclone_sync/">rclone sync</a> · <a href="https://rclone.org/commands/rclone_copyto/">copyto</a> · <a href="https://rclone.org/commands/rclone_deletefile/">deletefile</a> · <a href="https://rclone.org/sftp/">SFTP setup</a> · <a href="https://rclone.org/docs/#name-transform">name transforms</a></p></details>
-<details class="tool-examples-group" data-tool="s5cmd" data-unsupported="{&quot;Send a folder to a server&quot;: &quot;S5cmd has no SSH endpoint; use an SSH transfer tool.&quot;, &quot;Download a file from a server&quot;: &quot;S5cmd has no SSH endpoint; use an SSH transfer tool.&quot;, &quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers using only laptop logins&quot;: &quot;S5cmd has no SSH endpoint. S3 staging changes the required direct server-to-server data route.&quot;}" open><summary>s5cmd</summary>
+<!-- References: https://rclone.org/commands/rclone_copy/ https://rclone.org/commands/rclone_sync/ https://rclone.org/commands/rclone_copyto/ https://rclone.org/commands/rclone_deletefile/ https://rclone.org/sftp/ https://rclone.org/docs/#name-transform --></details>
+<details class="tool-examples-group" data-tool="s5cmd" data-unsupported="{&quot;Send a folder to a server&quot;: &quot;S5cmd has no SSH endpoint; use an SSH transfer tool.&quot;, &quot;Download a file from a server&quot;: &quot;S5cmd has no SSH endpoint; use an SSH transfer tool.&quot;, &quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers without agent forwarding&quot;: &quot;S5cmd has no SSH endpoint. S3 staging changes the required direct server-to-server data route.&quot;}" open><summary>s5cmd</summary>
 <section class="tool-example" data-title="Copy a file">
 <h3>Copy a file</h3>
 <div class="tool-example-commands">
@@ -279,8 +278,8 @@ rclone copyto photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <p>Use a script to choose each photo’s destination name in S3. For syq, a mapping with source a.jpg and destination 2024/a.jpg produces archive/2024/a.jpg.</p>
 <p class="tool-example-note">A script writes copies.txt with commands such as cp photos/a.jpg s3://backups/archive/2024/a.jpg. S5cmd executes the batch with parallel workers. Syq instead reads source/destination pairs from files.ndjson, checks destination collisions, and supports resuming the copy.</p>
 </section>
-<p class="tool-example-links"><a href="https://github.com/peak/s5cmd#examples">s5cmd documentation</a></p></details>
-<details class="tool-examples-group" data-tool="scp" data-unsupported="{&quot;Upload a folder’s contents to S3&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Download a folder from S3&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Copy a file between S3 buckets&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Match a folder, deleting extra files&quot;: &quot;Scp has no mirroring/deletion option.&quot;, &quot;Preview a copy&quot;: &quot;Scp has no dry-run option.&quot;, &quot;Remove a file&quot;: &quot;Scp has no file-removal command; use a filesystem or SSH removal tool.&quot;, &quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers using only laptop logins&quot;: &quot;Scp -3 relays through the laptop. Scp -R requires source-server access to the destination; the task allows only laptop logins.&quot;}" open><summary>scp</summary>
+<!-- References: https://github.com/peak/s5cmd#examples --></details>
+<details class="tool-examples-group" data-tool="scp" data-unsupported="{&quot;Upload a folder’s contents to S3&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Download a folder from S3&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Copy a file between S3 buckets&quot;: &quot;Scp has no native S3 endpoint.&quot;, &quot;Match a folder, deleting extra files&quot;: &quot;Scp has no mirroring/deletion option.&quot;, &quot;Preview a copy&quot;: &quot;Scp has no dry-run option.&quot;, &quot;Remove a file&quot;: &quot;Scp has no file-removal command; use a filesystem or SSH removal tool.&quot;, &quot;Send from a server shell to a laptop with no SSH server&quot;: &quot;No built-in receiving connection for a send initiated in the server shell when the laptop has no SSH server or incoming ports. A laptop-initiated pull or S3 staging changes that task.&quot;, &quot;Copy directly between servers without agent forwarding&quot;: &quot;Scp -3 relays through the laptop. Scp -R requires source-server access to the destination; the task allows only laptop logins.&quot;}" open><summary>scp</summary>
 <section class="tool-example" data-title="Copy a file">
 <h3>Copy a file</h3>
 <div class="tool-example-commands">
@@ -288,7 +287,7 @@ rclone copyto photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --into /backup</code></pre></div>
 </div>
 <p>Copies report.csv to /backup/report.csv on server.</p>
-<p class="tool-example-note">The scp destination /backup must already be a directory. Syq creates it if needed and can skip an unchanged file. Metadata handling differs.</p>
+<p class="tool-example-note">For scp, /backup must exist. Syq creates it if needed and can skip unchanged files.</p>
 </section>
 <section class="tool-example" data-title="Download a file from a server">
 <h3>Download a file from a server</h3>
@@ -306,7 +305,7 @@ rclone copyto photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project to /backup/project; /backup must already exist for the scp command.</p>
-<p class="tool-example-note">Syq copies directories without -r. Scp follows symlinks during recursive copies; syq normally copies them as links. Use this comparison for trees of regular files and directories.</p>
+<p class="tool-example-note">Syq copies folders without -r. Scp follows symlinks; syq normally copies links as links.</p>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -334,9 +333,9 @@ scp photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div>
 </div>
 <p>A script can generate the commands on the left, or a syq mapping file with source a.jpg and destination 2024/a.jpg, then b.jpg and 2025/b.jpg.</p>
-<p class="tool-example-note">These examples copy regular files; create the destination parent folders first. Separate commands give each file its chosen name. Syq reads all pairs in one operation, checks destination collisions, and supports resuming the copy.</p>
+<p class="tool-example-note">Create destination parent folders first. Syq reads the <a href="mappings.html">mapping file</a> in one operation, checks collisions, and supports resuming.</p>
 </section>
-<p class="tool-example-links"><a href="https://man.openbsd.org/scp">scp documentation</a></p></details>
+<!-- References: https://man.openbsd.org/scp --></details>
 <details class="tool-examples-group" data-tool="syq" data-unsupported="{}" open><summary>syq</summary>
 <section class="tool-example" data-title="Copy a file">
 <h3>Copy a file</h3>
@@ -372,13 +371,13 @@ scp photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <h3>Preview a copy</h3>
 <div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --dry-run -v</code></pre></div></div>
 <p>Lists planned changes without copying file data.</p>
-<p class="tool-example-note">No file data is copied. Remote setup may still install or cache the helper.</p>
+<p class="tool-example-note">Remote setup may still install or cache the helper.</p>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
 <div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --as /backup/latest.csv</code></pre></div></div>
 <p>Copies report.csv to /backup/latest.csv; the source stays.</p>
-<p class="tool-example-note">--as chooses the exact destination name; the source stays.</p>
+<p class="tool-example-note">--as chooses the exact destination name.</p>
 </section>
 <section class="tool-example" data-title="Choose destination names with a script">
 <h3>Choose destination names with a script</h3>
@@ -414,18 +413,17 @@ scp photos/b.jpg archive/2025/b.jpg</code></pre></div>
 <h3>Send from a server shell to a laptop with no SSH server</h3>
 <div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code># On the server:
 syq cp results --to @laptop</code></pre></div></div>
-<p>Start the copy from the server shell. Your laptop needs no SSH server or incoming network port.</p>
-<p class="tool-example-note">First establish a receiving connection from your laptop and register the receiving name laptop. Approve the incoming copy on your laptop. <a href="receive.html">Receiving setup</a>.</p>
-<details><summary>Alternatives that change the task</summary><p>Rsync, scp, and rclone can pull from the laptop, but that starts the copy on a different machine. S5cmd can stage files in S3, but that adds intermediate storage. Neither is the task selected here.</p></details>
+<p>Sends results home from the server shell. Your laptop needs no SSH server or incoming port.</p>
+<p class="tool-example-note"><a href="receive.html">Set up the receiving name laptop</a>, then approve the copy on your laptop.</p>
+<details><summary>Alternatives that change the task</summary><p>Rsync, scp, and rclone can pull from the laptop instead. S5cmd can stage files in S3.</p></details>
 </section>
-<section class="tool-example" data-title="Copy directly between servers using only laptop logins">
-<h3>Copy directly between servers using only laptop logins</h3>
+<section class="tool-example" data-title="Copy directly between servers without agent forwarding">
+<h3>Copy directly between servers without agent forwarding</h3>
 <div class="tool-example-commands tool-example-single"><div><p><strong>syq</strong></p><pre><code># On your laptop:
 syq cp --from hostA --srcs-in results --to hostB --into results</code></pre></div></div>
-<p>Your laptop authorizes the copy using its logins to both servers. File data travels directly between the servers; no SSH agent is forwarded and the source needs no login credentials for the destination.</p>
-<p class="tool-example-note">The servers must be able to connect for the data transfer. This copies the contents of hostA’s results folder into hostB’s results folder. <a href="remote-to-remote.html">Direct transfer setup</a>.</p>
-<details><summary>Alternatives that change the task</summary><p>Scp -3 and rclone with two SFTP remotes relay file data through your laptop. Running rsync on hostA or using scp -R requires hostA to have access to hostB. S5cmd can stage files in S3. Each changes a constraint of this task.</p></details>
+<p>Uses your laptop’s SSH logins. Files travel directly between servers; neither server gets your keys or access to your SSH agent.</p>
+<p class="tool-example-note">The servers need a connection to each other. <a href="remote-to-remote.html">Setup</a>.</p>
+<details><summary>Alternatives that change the task</summary><p>Scp -3 and rclone relay through your laptop. Rsync on hostA or scp -R requires hostA to have its own access to hostB. S5cmd can stage files in S3.</p></details>
 </section>
 </details>
-<p class="tool-example-links">More about syq: <a href="reference.html#preserve-metadata">metadata</a> · <a href="reference.html#mirror-a-directory">mirroring</a> · <a href="remove.html">removal</a> · <a href="object-storage.html">S3 setup and behavior</a></p>
 </div>

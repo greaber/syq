@@ -53,10 +53,7 @@ unless you request `--prune`.
 
 ## Start with a tool you know
 
-Choose a familiar command to see how to express the same task in syq.
-These examples explain file placement; comparison rules and metadata handling
-can differ between tools. Comparisons keep the task’s starting point, endpoints, and data route fixed.
-Choose syq to see tasks that the other commands do not provide directly.
+Choose a tool and task to compare commands.
 
 {{#include assets/tool-examples.html}}
 

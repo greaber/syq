@@ -14,7 +14,8 @@
 .tool-examples select {
   width: 100%;
   min-width: 0;
-  padding: .65em;
+  appearance: none;
+  padding: .65em 2.5em .65em .65em;
   font: inherit;
   color: var(--fg);
   background: var(--bg);
@@ -27,7 +28,6 @@
 .tool-example-commands pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .tool-example-commands code { white-space: inherit; }
 .tool-example-note { padding-left: .8em; border-left: 3px solid var(--table-border-color); }
-.tool-example-links { font-size: .9em; }
 .tool-examples-status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 @media (max-width: 600px) {
   .tool-examples { padding: .8em; }
@@ -40,7 +40,20 @@
 .tool-example-note { font-size: .9em; }
 
 .content .tool-example-commands pre code { font-size: 15px; }
-.tool-examples-hint { font-size: .85em; }
 .tool-examples option:disabled { color: GrayText; }
 
 .tool-example-commands.tool-example-single { grid-template-columns: 1fr; }
+
+.tool-examples-select { position: relative; min-width: 0; }
+.tool-examples-select::after {
+  content: "";
+  position: absolute;
+  right: 1em;
+  top: 50%;
+  width: .4em;
+  height: .4em;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: translateY(-75%) rotate(45deg);
+  pointer-events: none;
+}

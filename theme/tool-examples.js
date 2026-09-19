@@ -11,7 +11,10 @@
       text.id = `tool-example-${index}-${title.replaceAll(" ", "-")}`;
       const select = document.createElement("select");
       select.setAttribute("aria-labelledby", text.id);
-      label.append(text, select);
+      const wrapper = document.createElement("span");
+      wrapper.className = "tool-examples-select";
+      wrapper.append(select);
+      label.append(text, wrapper);
       controls.append(label);
       return select;
     }
@@ -56,6 +59,5 @@
     task.addEventListener("change", update);
     update();
     controls.hidden = false;
-    widget.querySelector(".tool-examples-hint").hidden = false;
   });
 })();

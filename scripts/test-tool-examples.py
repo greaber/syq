@@ -60,7 +60,7 @@ class ComparisonCoverage(unittest.TestCase):
     def test_workarounds_do_not_enable_a_different_task(self):
         exact_tasks = {
             "Send from a server shell to a laptop with no SSH server",
-            "Copy directly between servers using only laptop logins",
+            "Copy directly between servers without agent forwarding",
         }
         self.assertLessEqual(exact_tasks, set(self.groups["syq"]["tasks"]))
         for tool in ("rsync", "rclone", "s5cmd", "scp"):
