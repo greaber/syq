@@ -62,8 +62,6 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--only-new` | Copy entries found missing; keep metadata of entries found present; adding children requires write access |
-| `--only-existing` | Update only entries already present; create no missing entries or directories |
-| `--skip-newer` | Skip regular files newer at the destination; non-directory type replacements still occur |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
 | `--max-delete <N>` | With --prune, refuse all removals if more than N are planned |
@@ -84,7 +82,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--hash` | Hash existing source and destination files instead of trusting size and modification time |
-| `--integrity-checking <KEY=VALUE,...>` | [Comparison and transfer checksums](../integrity-checking.md) |
+| `--integrity-checking <KEY=VALUE,...>` | [Payload checks](../integrity-checking.md) |
 
 <a id="ssh-and-transport"></a>
 
@@ -161,23 +159,14 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 ## Update policies
 
 `--into-existing` requires the destination directory to exist but allows new
-files inside it. `--only-existing` skips missing destination entries and
-subdirectories instead of adding them.
+files inside it. `--only-new` can add children to an existing directory, but
+does not change that directory's permissions to make it writable.
 
-`--only-new` can add children to an existing directory, but does not change
-that directory's permissions to make it writable. `--skip-newer` compares
-timestamps only for
-regular-file pairs; it does not prevent other entry-type replacements.
-
-`--only-new` cannot combine with `--only-existing` or `--skip-newer`.
-`--only-existing` conflicts with `--into-new` and `--as-new`, which require
-the destination to be absent.
-
-`--only-new` and `--skip-newer` cannot combine with `--inplace`: an interrupted
-write could leave a file that a retry skips. Restricted receivers also reject
-`--only-existing --inplace` and `--as-new --inplace`, because direct writes do
-not enforce those destination conditions. S3 and named receiving destinations
-do not support `--inplace`; see [Copy limits](../persistence-reference.md#copy-limits).
+`--only-new` cannot combine with `--inplace`: an interrupted write could leave
+a file that a retry skips. Restricted receivers also reject `--as-new --inplace`,
+because direct writes do not enforce that destination condition. S3 and named
+receiving destinations do not support `--inplace`; see
+[Copy limits](../persistence-reference.md#copy-limits).
 
 These policies do not disable requested pruning. Descriptor-specific
 restrictions are listed under [file descriptors](#file-descriptors).
@@ -276,9 +265,8 @@ unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput.
 
 <a id="selection-and-previews"></a>
 
-`--only-new` skips a destination that exists; `--only-existing` skips one that
-is missing. Existing directories, S3 key prefixes, and dangling symlinks also
-count as existing for `--only-new`. Skips succeed without reading input or
+`--only-new` skips a destination that exists. Existing directories, S3 key
+prefixes, and dangling symlinks also count as existing for `--only-new`. Skips succeed without reading input or
 opening a named FIFO. A shell producer can therefore receive SIGPIPE; in Python, check the writer's
 `skipped` property before producing bytes. An output FD already exists, so
 `--only-new --as-fd N` always skips after validating the source.
@@ -320,12 +308,9 @@ attributes without changing timestamps. S3 downloads interpret object metadata
 when attributes are requested; time preservation uses S3's modification time if
 no syq attributes are stored.
 
-`--skip-newer` leaves input unread when the named destination file is newer.
-It cannot be used with `--as-fd`: shell redirection such as `> out` empties and
-updates the file before syq can check it. Use `--as out` instead.
 Input pipes, sockets, and devices have no payload metadata, so they reject
-`--skip-newer` and `--preserve`. Their new named destinations use `0666` limited
-by the umask and the time of the write; existing files keep their permissions.
+`--preserve`. Their new named destinations use `0666` limited by the umask
+and the time of the write; existing files keep their permissions.
 Output pipes likewise cannot preserve times, permissions, or ownership. Parent
 directories are created as needed. The source `--cwd` / `--root` options
 apply, but `--root` cannot confine a descriptor that is already open. Symlink

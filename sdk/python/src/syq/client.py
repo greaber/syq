@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -569,6 +570,25 @@ def _s3_arguments(
             argv.append("--s3-header=" + _text_arg(header, label="s3_header"))
 
 
+def _warn_unsupported_copy_options(*, only_existing=False, skip_newer=False,
+                                   integrity_checking=None) -> None:
+    options = []
+    if only_existing:
+        options.append("only_existing")
+    if skip_newer:
+        options.append("skip_newer")
+    if isinstance(integrity_checking, str) and any(
+        pair.partition("=")[0] == "compare" for pair in integrity_checking.split(",")
+    ):
+        options.append("integrity_checking compare")
+    if options:
+        warnings.warn(
+            f"{', '.join(options)}: unsupported and may be removed without notice",
+            FutureWarning,
+            stacklevel=3,
+        )
+
+
 def _copy_arguments(
     command: str,
     sources: tuple[PathArgument, ...],
@@ -678,6 +698,8 @@ def _copy_arguments(
     if hash:
         argv.append("--hash")
     _append_text(argv, "--integrity-checking", integrity_checking)
+    _warn_unsupported_copy_options(only_existing=only_existing, skip_newer=skip_newer,
+                                   integrity_checking=integrity_checking)
     if only_new and (only_existing or skip_newer or inplace):
         raise SyqInvocationError("only_new conflicts with only_existing, skip_newer, and inplace")
     if only_existing and (into_new is not None or as_new is not None):

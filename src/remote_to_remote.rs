@@ -930,13 +930,18 @@ fn run_remote(
     if !args.compress {
         remote.push("--no-compress".into());
     }
-    remote.push(format!(
-        "--integrity-checking=compare={},transfer={}",
-        if args.checksum {
-            args.hash_algorithm.to_string()
+    if args.checksum {
+        if args.hash_algorithm == crate::hashing::HashAlgorithm::Blake3 {
+            remote.push("--hash".into());
         } else {
-            "size-mtime".into()
-        },
+            remote.push(format!(
+                "--integrity-checking=compare={}",
+                args.hash_algorithm
+            ));
+        }
+    }
+    remote.push(format!(
+        "--integrity-checking=transfer={}",
         if args.transfer_integrity {
             args.transfer_hash_type.unwrap_or_default().to_string()
         } else {

@@ -249,7 +249,7 @@ pub struct Args {
     pub resource_limits_arg: Vec<String>,
     #[arg(skip)]
     pub resource_limits: Option<crate::advanced::ResourceLimits>,
-    /// compare=size-mtime|blake3|sha256|md5|xxh3-128; transfer=off|HASH
+    /// Extra payload checks: transfer=off|blake3|sha256|md5|xxh3-128
     #[arg(
         long = "integrity-checking",
         long_help = crate::advanced::INTEGRITY_HELP,
@@ -689,6 +689,30 @@ impl Args {
         Ok(())
     }
 
+    pub(crate) fn warn_unsupported_options(&self) {
+        let mut options = Vec::new();
+        if self.interface == Interface::NativeCp {
+            if self.existing {
+                options.push("--only-existing");
+            }
+            if self.update {
+                options.push("--skip-newer");
+            }
+        }
+        if self
+            .integrity_checking
+            .is_some_and(|checks| checks.compare.is_some())
+        {
+            options.push("--integrity-checking compare");
+        }
+        if !options.is_empty() {
+            crate::output::diagnostic!(
+                "syq: warning: {}: unsupported and may be removed without notice",
+                options.join(", ")
+            );
+        }
+    }
+
     pub fn automatic_worker_limit(&self) -> usize {
         let requested = self
             .resource_limits
@@ -1016,10 +1040,10 @@ struct NativeCopyOperationalArgs {
     #[arg(long = "only-new", conflicts_with_all = ["existing", "update", "inplace"])]
     ignore_existing: bool,
     /// Update only entries already present; create no missing entries or directories
-    #[arg(long = "only-existing", conflicts_with_all = ["ignore_existing", "into_new", "as_new"])]
+    #[arg(long = "only-existing", hide = true, conflicts_with_all = ["ignore_existing", "into_new", "as_new"])]
     existing: bool,
     /// Skip regular files newer at the destination; non-directory type replacements still occur
-    #[arg(long = "skip-newer", conflicts_with_all = ["ignore_existing", "inplace"])]
+    #[arg(long = "skip-newer", hide = true, conflicts_with_all = ["ignore_existing", "inplace"])]
     update: bool,
     /// Disable transport compression
     #[arg(long)]
@@ -1032,7 +1056,7 @@ struct NativeCopyOperationalArgs {
         help_heading = "Advanced controls"
     )]
     resource_limits_arg: Vec<String>,
-    /// compare=size-mtime|blake3|sha256|md5|xxh3-128; transfer=off|HASH
+    /// Extra payload checks: transfer=off|blake3|sha256|md5|xxh3-128
     #[arg(
         long = "integrity-checking",
         long_help = crate::advanced::INTEGRITY_HELP,
@@ -1251,7 +1275,7 @@ struct NativeCopyFields {
     version,
     about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.\nExplicit local pipe sources and --src-fd FD read raw bytes; --as-fd FD writes them.",
     before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
-    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --preserve=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --preserve and --skip-newer; pipes have no source metadata. Output descriptors receive source timestamps only with --preserve=times and cannot use --skip-newer; use a named destination to check its timestamp before opening it. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
+    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --preserve=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --preserve; pipes have no source metadata. Output descriptors receive source timestamps only with --preserve=times. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]\n       syq cp [OPTIONS] --src-fd FD --as PATH\n       syq cp [OPTIONS] SOURCE --as-fd FD"
 )]
 struct NativeCopyCommand {

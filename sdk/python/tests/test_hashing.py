@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import syq
@@ -102,6 +103,16 @@ class HashArgumentsTests(unittest.TestCase):
         self.log = root / "argv.json"
         self.client = syq.Client(executable=self.executable, env={**os.environ, "SYQ_FAKE_ARGV": str(self.log)})
 
+    def test_unsupported_copy_controls_warn(self):
+        for options in ({"only_existing": True}, {"skip_newer": True},
+                        {"integrity_checking": "compare=md5"}):
+            with self.subTest(options=options), self.assertWarnsRegex(FutureWarning, "unsupported.*removed"):
+                self.client.cp("source", as_="destination", **options)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.client.cp("source", as_="destination", hash=True, integrity_checking="transfer=sha256")
+        self.assertEqual(caught, [])
+
     def test_choices_forward_independently_of_comparison_and_encryption(self):
         self.client.cp("source", as_="destination", integrity_checking="compare=xxh3-128,transfer=sha256")
         argv = json.loads(self.log.read_bytes())
@@ -130,7 +141,8 @@ class AsyncHashArgumentsTests(unittest.IsolatedAsyncioTestCase):
             executable.chmod(0o755)
             log = root / "argv.json"
             client = syq.AsyncClient(executable=executable, env={**os.environ, "SYQ_FAKE_ARGV": str(log)})
-            await client.cp("source", as_="destination", integrity_checking="compare=md5,transfer=sha256")
+            with self.assertWarnsRegex(FutureWarning, "compare.*unsupported"):
+                await client.cp("source", as_="destination", integrity_checking="compare=md5,transfer=sha256")
             argv = json.loads(log.read_bytes())
             self.assertEqual(argv[argv.index("--integrity-checking") + 1], "compare=md5,transfer=sha256")
 

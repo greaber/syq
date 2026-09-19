@@ -98,7 +98,7 @@ their existing representation.
 Copy runs also carry `prune` and `mapping`. Removal has one source endpoint
 regardless of selector count and omits those copy fields.
 
-For S3 downloads using `--only-new` or `--only-existing`, unchanged-file totals
+For S3 downloads using `--only-new`, unchanged-file totals
 include skipped symlinks selected through a prefix, but exclude symlinks named
 directly or through a mapping.
 
@@ -229,8 +229,7 @@ is non-retryable. Do not construct a retry source from its destination name.
 
 A producer may start supplying payload. Uploads without a skip policy emit this
 before destination setup finishes, allowing several writers to connect concurrently.
-With `--only-new`, `--only-existing`, `--skip-newer`, or metadata
-preservation requested, source selection and destination checks come first.
+With `--only-new` or metadata preservation requested, source selection and destination checks come first.
 Skipped copies and dry runs finish without this record. Setup, transfer, or
 publication can still fail; require the terminal result for completion.
 

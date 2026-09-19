@@ -313,6 +313,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    args.warn_unsupported_options();
     args.normalize();
     if args.self_update {
         if let Err(e) = update::self_update() {
