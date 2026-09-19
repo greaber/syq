@@ -14,6 +14,29 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
+struct Control {
+    connection: Box<dyn Conn>,
+    pending_aborts: usize,
+}
+impl Control {
+    fn send_aborts(&mut self, entries: Vec<u64>) -> Result<()> {
+        for entry in entries {
+            self.connection
+                .send(Request::DescriptorCopy(super::Operation::Abort { entry }))?;
+            self.pending_aborts += 1;
+        }
+        Ok(())
+    }
+    fn drain(&mut self) -> Result<()> {
+        while self.pending_aborts != 0 {
+            let reply = self.connection.recv()?;
+            self.pending_aborts -= 1;
+            conn::ok(reply, "abort stream entry")?;
+        }
+        Ok(())
+    }
+}
+
 struct Connections {
     idle: Vec<Box<dyn Conn>>,
     leased: usize,
@@ -27,7 +50,8 @@ impl Drop for LocalSession {
 pub(super) struct Session {
     pub endpoint: Endpoint,
     pub args: Args,
-    control: Mutex<Box<dyn Conn>>,
+    control: Mutex<Control>,
+    abandoned: Mutex<Vec<u64>>,
     next_entry: AtomicU64,
     connections: Mutex<Connections>,
     available: Condvar,
@@ -63,7 +87,11 @@ impl Session {
         Ok(Arc::new(Self {
             endpoint,
             args: args.clone(),
-            control: Mutex::new(control),
+            control: Mutex::new(Control {
+                connection: control,
+                pending_aborts: 0,
+            }),
+            abandoned: Mutex::new(Vec::new()),
             next_entry: AtomicU64::new(1),
             connections: Mutex::new(Connections {
                 idle: Vec::new(),
@@ -96,8 +124,24 @@ impl Session {
             complete: true,
         })
     }
+    fn abandoned(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.abandoned.lock().unwrap())
+    }
     pub fn call(&self, request: Request) -> Result<Response> {
-        self.control.lock().unwrap().call(request)
+        let mut control = self.control.lock().unwrap();
+        control.send_aborts(self.abandoned())?;
+        control.drain()?;
+        control.connection.call(request)
+    }
+    fn abandon(&self, entry: u64) {
+        self.abandoned.lock().unwrap().push(entry);
+        // Dropping an entry must not wait behind another entry's control call,
+        // or wait for an abort reply from an unresponsive helper. Flush now if
+        // idle; otherwise the next control call flushes and checks the replies.
+        // Closing the session itself also discards all unpublished entries.
+        if let Ok(mut control) = self.control.try_lock() {
+            let _ = control.send_aborts(self.abandoned());
+        }
     }
     pub fn start_data(&self) -> Result<()> {
         let mut started = self.data_started.lock().unwrap();
@@ -107,13 +151,15 @@ impl Session {
         if let Endpoint::Remote(spec) = &self.endpoint {
             if !self.args.no_tcp && spec.tcp.lock().unwrap().is_none() {
                 let mut control = self.control.lock().unwrap();
+                control.send_aborts(self.abandoned())?;
+                control.drain()?;
                 // Serialize both the check and listener setup across entry opens.
                 if spec.tcp.lock().unwrap().is_some() {
                     return Ok(());
                 }
                 let result = spec
                     .begin_tcp_setup(
-                        &mut **control,
+                        &mut *control.connection,
                         self.args.tcp_plain,
                         conn::parse_ports(&self.args.tcp_ports)?,
                         self.args.tcp_congestion.as_deref(),
@@ -219,13 +265,7 @@ impl Entry {
 impl Drop for Entry {
     fn drop(&mut self) {
         if !self.complete {
-            // A failed/disconnected control leaves every unpublished entry owned
-            // by helper cleanup. Never substitute a new endpoint connection.
-            let _ = self
-                .session
-                .call(Request::DescriptorCopy(super::Operation::Abort {
-                    entry: self.id,
-                }));
+            self.session.abandon(self.id);
         }
     }
 }
@@ -256,5 +296,62 @@ impl Drop for Worker {
                 .push(self.connection.take().expect("completed worker connection"));
         }
         self.session.available.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Unresponsive {
+        reads: Arc<AtomicU64>,
+    }
+    impl Conn for Unresponsive {
+        fn send(&mut self, _: Request) -> Result<()> {
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Response> {
+            self.reads.fetch_add(1, Relaxed);
+            anyhow::bail!("unresponsive helper")
+        }
+    }
+    #[test]
+    fn abandoned_entry_does_not_wait_for_a_control_reply() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let args = Args::parse_args(&[
+            "cp".into(),
+            "--src-fd".into(),
+            "0".into(),
+            "--as".into(),
+            dir.path().join("file").into_os_string(),
+        ])
+        .unwrap();
+        let session = Session::connect(
+            &args,
+            args.descriptor_copy
+                .as_ref()
+                .unwrap()
+                .location
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        let reads = Arc::new(AtomicU64::new(0));
+        session.control.lock().unwrap().connection = Box::new(Unresponsive {
+            reads: reads.clone(),
+        });
+        let mut entry = session.entry().unwrap();
+        entry.opened();
+        drop(entry);
+        assert_eq!(reads.load(Relaxed), 0);
+        // A later control operation must check the pending abort reply, so a
+        // transport failure cannot be mistaken for the next entry's response.
+        assert!(session
+            .call(Request::DescriptorCopy(super::super::Operation::Abort {
+                entry: 999
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("unresponsive"));
+        assert_eq!(reads.load(Relaxed), 1);
     }
 }
