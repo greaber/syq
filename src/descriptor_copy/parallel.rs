@@ -223,7 +223,8 @@ impl Workers {
             .pipeline_depth
             .is_none();
         if streaming {
-            connection.begin_streaming_writes()?;
+            // Descriptor uploads accept arbitrary short chunks, unlike file ranges.
+            connection.begin_streaming_writes(None)?;
         }
         let mut sent = 0;
         let mut bytes = 0;

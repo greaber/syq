@@ -668,7 +668,7 @@ fn ordinary_range_drain_consumes_errors_but_not_the_next_operation() {
     assert!(error.to_string().contains("first failed write"));
     assert!(matches!(conn.recv().unwrap(), Response::Path(path) if path == b"next operation"));
     assert!(conn.pending.is_empty());
-    conn.begin_streaming_writes().unwrap();
+    conn.begin_streaming_writes(None).unwrap();
     let fence = conn.fence_streaming_writes();
     conn.finish_streaming_writes(0, fence).unwrap();
 }

@@ -16,6 +16,8 @@ pub struct Progress {
     pub stream: bool,
     pub bytes_total: AtomicU64,
     pub bytes_done: AtomicU64,
+    /// Streaming payload submitted but not yet successfully acknowledged.
+    pub(crate) outstanding_bytes: AtomicU64,
     /// Monotonic high-water mark of logical completion. Recovery may roll
     /// `bytes_done` back, but retransmitting the same range is not fresh useful
     /// throughput and cannot advance this meter until progress passes the mark.
@@ -120,6 +122,7 @@ impl Progress {
             stream: false,
             bytes_total: AtomicU64::new(0),
             bytes_done: AtomicU64::new(0),
+            outstanding_bytes: AtomicU64::new(0),
             tuning_high_water: AtomicU64::new(0),
             bytes_unchanged: AtomicU64::new(0),
             files_total: AtomicU64::new(0),
@@ -534,6 +537,9 @@ impl crate::tune::Meter for Progress {
     }
     fn files(&self) -> u64 {
         self.tuning_files_high_water.load(Relaxed)
+    }
+    fn outstanding_bytes(&self) -> u64 {
+        self.outstanding_bytes.load(Relaxed)
     }
     fn set_active(&self, n: usize) {
         self.active_workers.store(n as u64, Relaxed);

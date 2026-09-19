@@ -250,7 +250,7 @@ fn unsplit_or_exhausted_blocks_need_no_extra_hash() {
 #[test]
 fn streaming_replies_drain_without_a_block_credit_window() {
     let (tx, rx) = mpsc::sync_channel(1);
-    let replies = WriteReplies::spawn(rx);
+    let replies = WriteReplies::spawn(rx, None);
     let (finished, done) = mpsc::channel();
     let sender = std::thread::spawn(move || {
         for _ in 0..10_000 {
@@ -276,7 +276,7 @@ fn streaming_replies_drain_without_a_block_credit_window() {
 #[test]
 fn streaming_replies_preserve_errors_and_wait_for_the_fence() {
     let (tx, rx) = mpsc::channel();
-    let replies = WriteReplies::spawn(rx);
+    let replies = WriteReplies::spawn(rx, None);
     tx.send(queued(Response::Ok)).unwrap();
     tx.send(queued(Response::EndpointError(WireError {
         message: "disk full".into(),
@@ -298,13 +298,13 @@ fn streaming_replies_preserve_errors_and_wait_for_the_fence() {
 #[test]
 fn streaming_replies_eof_is_not_success_and_abort_wakes_a_quiet_collector() {
     let (tx, rx) = mpsc::channel();
-    let replies = WriteReplies::spawn(rx);
+    let replies = WriteReplies::spawn(rx, None);
     tx.send(queued(Response::Ok)).unwrap();
     drop(tx);
     let (_, state) = replies.finish(false);
     assert!(!state.fenced && matches!(state.error, Some(Failure::Transport(_))));
     let (_tx, rx) = mpsc::channel();
-    let replies = WriteReplies::spawn(rx);
+    let replies = WriteReplies::spawn(rx, None);
     let start = std::time::Instant::now();
     let _ = replies.finish(true);
     assert!(start.elapsed() < Duration::from_secs(2));
@@ -318,4 +318,134 @@ fn queued(value: Response) -> io::Result<crate::conn::ReceivedResponse> {
         },
         std::time::Instant::now(),
     )))
+}
+
+fn test_credit(block: u64, count: u64) -> Arc<WriteCredit> {
+    let credit = WriteCredit::new(
+        crate::progress::Progress::new(false, false, None),
+        Arc::new(AtomicU64::new(0)),
+        block,
+        Arc::new(AtomicU64::new(0)),
+    );
+    for _ in 0..count {
+        credit.submit(block).unwrap();
+    }
+    credit
+}
+
+#[test]
+fn streaming_credit_waits_for_acknowledgments_and_counts_short_tail_exactly() {
+    let progress = crate::progress::Progress::new(false, false, None);
+    let done = Arc::new(AtomicU64::new(0));
+    let credit = WriteCredit::new(
+        progress.clone(),
+        done.clone(),
+        4096,
+        Arc::new(AtomicU64::new(0)),
+    );
+    for n in [4096, 4096, 13] {
+        credit.submit(n).unwrap();
+    }
+    assert_eq!(progress.bytes_done.load(Ordering::Relaxed), 0);
+    assert_eq!(progress.outstanding_bytes.load(Ordering::Relaxed), 8205);
+    let (tx, rx) = mpsc::channel();
+    let replies = WriteReplies::spawn(rx, Some(credit.clone()));
+    for _ in 0..3 {
+        tx.send(queued(Response::Ok)).unwrap();
+    }
+    tx.send(queued(Response::WriteStreamDone)).unwrap();
+    let (_, state) = replies.finish(false);
+    assert!(state.error.is_none());
+    assert_eq!(credit.acknowledged(), 8205);
+    assert_eq!(progress.bytes_done.load(Ordering::Relaxed), 8205);
+    assert_eq!(done.load(Ordering::Relaxed), 8205);
+    assert_eq!(progress.outstanding_bytes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn failed_stream_credit_retracts_before_retry_and_never_scores_failed_writes() {
+    use crate::tune::Meter;
+    let progress = crate::progress::Progress::new(false, false, None);
+    let done = Arc::new(AtomicU64::new(0));
+    let credit = WriteCredit::new(
+        progress.clone(),
+        done.clone(),
+        4096,
+        Arc::new(AtomicU64::new(0)),
+    );
+    for n in [4096, 4096, 7] {
+        credit.submit(n).unwrap();
+    }
+    let (tx, rx) = mpsc::channel();
+    let replies = WriteReplies::spawn(rx, Some(credit.clone()));
+    tx.send(queued(Response::Ok)).unwrap();
+    tx.send(queued(Response::Err("disk full".into()))).unwrap();
+    tx.send(queued(Response::Ok)).unwrap();
+    tx.send(queued(Response::WriteStreamDone)).unwrap();
+    let (_, state) = replies.finish(false);
+    assert!(matches!(state.error, Some(Failure::Rejected(_))));
+    assert_eq!(credit.acknowledged(), 4096);
+    assert_eq!(progress.bytes_done.load(Ordering::Relaxed), 4096);
+    assert_eq!(progress.outstanding_bytes.load(Ordering::Relaxed), 4103);
+    drop(state);
+    drop(credit);
+    assert_eq!(progress.outstanding_bytes.load(Ordering::Relaxed), 0);
+    progress.bytes_done.fetch_sub(4096, Ordering::Relaxed);
+    done.fetch_sub(4096, Ordering::Relaxed);
+    assert_eq!(progress.bytes(), 4096);
+    let credit = WriteCredit::new(
+        progress.clone(),
+        done.clone(),
+        4096,
+        Arc::new(AtomicU64::new(0)),
+    );
+    credit.submit(4096).unwrap();
+    let mut completed = Completions::new(Some(credit.clone()));
+    completed.record(Response::Ok);
+    assert_eq!(
+        progress.bytes(),
+        4096,
+        "retry is not fresh useful throughput"
+    );
+    credit.submit(11).unwrap();
+    completed.record(Response::Ok);
+    assert_eq!(progress.bytes(), 4107);
+    assert_eq!(done.load(Ordering::Relaxed), 4107);
+}
+
+#[test]
+fn cancelled_collector_cannot_credit_after_caller_recovers() {
+    let progress = crate::progress::Progress::new(false, false, None);
+    let credit = WriteCredit::new(
+        progress.clone(),
+        Arc::new(AtomicU64::new(0)),
+        4096,
+        Arc::new(AtomicU64::new(0)),
+    );
+    credit.submit(4096).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let replies = WriteReplies::spawn(rx, Some(credit.clone()));
+    let (rx, state) = replies.finish(true);
+    tx.send(queued(Response::Ok)).unwrap();
+    assert_eq!(credit.acknowledged(), 0);
+    drop(rx);
+    drop(state);
+    drop(credit);
+    assert_eq!(progress.bytes_done.load(Ordering::Relaxed), 0);
+    assert_eq!(progress.outstanding_bytes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn streaming_credit_rejects_extra_acknowledgments_and_nonfinal_short_blocks() {
+    let credit = test_credit(4096, 1);
+    let mut completed = Completions::new(Some(credit.clone()));
+    completed.record(Response::Ok);
+    completed.record(Response::Ok);
+    assert!(matches!(completed.error, Some(Failure::Transport(_))));
+    assert_eq!(credit.acknowledged(), 4096);
+    let credit = test_credit(4096, 0);
+    assert!(credit.submit(0).is_err());
+    assert!(credit.submit(4097).is_err());
+    credit.submit(3).unwrap();
+    assert!(credit.submit(4096).is_err());
 }

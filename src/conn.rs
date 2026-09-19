@@ -52,7 +52,10 @@ pub trait Conn: Send {
         Ok((response, start.elapsed()))
     }
     /// The experimental writer must not retain one reply per sent block.
-    fn begin_streaming_writes(&mut self) -> Result<()> {
+    fn begin_streaming_writes(
+        &mut self,
+        _credit: Option<std::sync::Arc<crate::streaming::WriteCredit>>,
+    ) -> Result<()> {
         bail!("this connection does not support experimental streaming writes")
     }
     fn check_streaming_writes(&mut self) -> Result<()> {
@@ -703,13 +706,17 @@ impl Conn for RemoteConn {
     fn is_dead(&self) -> bool {
         self.dead
     }
-    fn begin_streaming_writes(&mut self) -> Result<()> {
+    fn begin_streaming_writes(
+        &mut self,
+        credit: Option<std::sync::Arc<crate::streaming::WriteCredit>>,
+    ) -> Result<()> {
         anyhow::ensure!(
             self.write_stream.is_none(),
             "streaming writes already active"
         );
         self.write_stream = Some(crate::streaming::WriteReplies::spawn(
             self.rx.take().context("response reader missing")?,
+            credit,
         ));
         Ok(())
     }

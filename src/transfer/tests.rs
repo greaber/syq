@@ -97,7 +97,10 @@ impl Conn for PipelineConn {
     fn is_dead(&self) -> bool {
         self.0.lock().unwrap().dead
     }
-    fn begin_streaming_writes(&mut self) -> Result<()> {
+    fn begin_streaming_writes(
+        &mut self,
+        _credit: Option<std::sync::Arc<crate::streaming::WriteCredit>>,
+    ) -> Result<()> {
         Ok(())
     }
     fn check_streaming_writes(&mut self) -> Result<()> {
@@ -260,6 +263,7 @@ fn pipeline_worker(
     });
     Worker {
         id: 0,
+        activity: Arc::new(AtomicU64::new(0)),
         src: Box::new(PipelineConn(src.clone())),
         dst: Box::new(PipelineConn(dst.clone())),
         sched: sched.clone(),

@@ -2,7 +2,7 @@
 //!
 //! When `-j` is not given, syq starts with a modest (or previously learned)
 //! count and measures. Progress (bytes, plus a small credit per completed
-//! file so small-file transfers count too) is sampled every few seconds; a
+//! file so small-file transfers count too) is sampled in short intervals; a
 //! worker count has been *measured* once the rate has stopped changing. A
 //! successful move keeps exploring in the same direction. A failed move
 //! returns to the last good count and leaves a measured bound that later
@@ -19,18 +19,20 @@
 //! probe). Parking takes effect within one block even in a huge range: the
 //! worker hands the rest of its range back to the scheduler.
 //!
-//! [`Sampler`] turns raw samples into stable measurements and [`Policy`] is
-//! the decision state machine; both are pure and unit tested. [`Gate`] is the
+//! Sequential observations assess delivery, buffering, and rate trends;
+//! [`Policy`] chooses worker counts. The descriptor-stream tuner still uses
+//! [`Sampler`]. These components are pure and unit tested. [`Gate`] is the
 //! shared switch the workers consult; [`run`] is the driver.
 
 use crate::conn::{DataTransport, Endpoint};
 use crate::sched::Sched;
+mod observation;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -443,6 +445,40 @@ impl Policy {
         }
     }
 
+    fn comparison_threshold(&self) -> Option<f64> {
+        match self.state {
+            State::Explore {
+                base,
+                direction: Direction::Up,
+                ..
+            } => {
+                let floor = self.recent_best() * (1.0 - NEAR_BEST_TOLERANCE);
+                Some(if base < floor {
+                    floor
+                } else {
+                    base / (1.0 - NEAR_BEST_TOLERANCE)
+                })
+            }
+            State::Explore {
+                direction: Direction::Down,
+                ..
+            } => Some(self.recent_best() * (1.0 - NEAR_BEST_TOLERANCE)),
+            _ => None,
+        }
+    }
+
+    /// A timing limit or lack of useful work is not a throughput measurement.
+    fn inconclusive(&mut self) {
+        if let State::Explore {
+            from, direction, ..
+        } = self.state
+        {
+            self.set_candidate(from);
+            self.state = State::Hold;
+            self.due[direction.index()] = self.tick + PROBE_EVERY;
+        }
+    }
+
     /// Refresh an upward probe's comparison while its extra workers warm. The
     /// settled count remains active, so this is baseline evidence rather than
     /// a new policy tick or worker-count comparison.
@@ -686,12 +722,14 @@ enum SlotPhase {
 #[derive(Debug, Clone)]
 struct Slot {
     phase: SlotPhase,
+    activity: Arc<AtomicU64>,
 }
 
 impl Default for Slot {
     fn default() -> Self {
         Self {
             phase: SlotPhase::Absent,
+            activity: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -726,6 +764,23 @@ impl Gate {
             slots: Mutex::new(Vec::new()),
             cv: Condvar::new(),
         })
+    }
+
+    /// Each worker holds its counter, avoiding a gate lock on acknowledgments.
+    pub(crate) fn activity(&self, id: usize) -> Arc<AtomicU64> {
+        let mut slots = self.slots.lock().unwrap();
+        grow_to(&mut slots, id + 1);
+        slots[id].activity.clone()
+    }
+
+    fn activity_counts(&self, n: usize) -> Vec<u64> {
+        let mut slots = self.slots.lock().unwrap();
+        grow_to(&mut slots, n);
+        slots
+            .iter()
+            .take(n)
+            .map(|slot| slot.activity.load(Relaxed))
+            .collect()
     }
 
     pub fn allowed(&self, id: usize) -> bool {
@@ -781,7 +836,7 @@ impl Gate {
     pub fn mark_absent(&self, id: usize) {
         let mut slots = self.slots.lock().unwrap();
         grow_to(&mut slots, id + 1);
-        slots[id] = Slot::default();
+        slots[id].phase = SlotPhase::Absent;
         self.cv.notify_all();
     }
 
@@ -819,7 +874,7 @@ impl Gate {
         let mut slots = self.slots.lock().unwrap();
         for slot in slots.iter_mut().skip(first) {
             if slot.phase == SlotPhase::Failed {
-                *slot = Slot::default();
+                slot.phase = SlotPhase::Absent;
             }
         }
     }
@@ -848,6 +903,9 @@ impl Gate {
 pub trait Meter: Send + Sync {
     fn bytes(&self) -> u64;
     fn files(&self) -> u64;
+    fn outstanding_bytes(&self) -> u64 {
+        0
+    }
     fn set_active(&self, n: usize);
 }
 
@@ -861,168 +919,85 @@ fn activity_rate(last: (u64, u64), now: (u64, u64), seconds: f64) -> Option<f64>
 /// apply its decisions to the gate and spawn workers that don't exist yet.
 /// Returns the final policy (for stats).
 pub fn run(
-    policy: Policy,
+    mut policy: Policy,
     gate: Arc<Gate>,
     sched: Arc<Sched>,
     meter: Arc<dyn Meter>,
     mut spawn: impl FnMut(usize),
 ) -> Policy {
-    let mut policy = policy;
-    let mut sampler = Sampler::default();
-    sampler.reset();
+    let cadence = Duration::from_millis(250).min(sample_interval());
+    let hold_interval = sample_interval() * 2;
+    let mut observation = observation::Observation::new(cadence, meter.outstanding_bytes());
+    // Tail admission estimates the minimum useful observation, not the old
+    // three long samples. An inconclusive probe never invents a cache result.
+    let tail_sample = observation.minimum().div_f64(MEASUREMENT_SAMPLES);
+    let mut active = policy.active();
+    let mut activity_start = gate.activity_counts(active);
     let mut last = (meter.bytes(), meter.files());
     let mut sample_start = std::time::Instant::now();
-    let mut active = policy.active();
-    let mut collapse_samples = 0;
-    let sample = sample_interval();
-    let poll = Duration::from_millis(250).min(sample);
+    let mut activated_at = sample_start;
+    let mut decided_at = sample_start;
     let mut last_rate = None;
-    meter.set_active(policy.n);
+    let mut baseline_variation = 0.0;
+    meter.set_active(active);
     loop {
-        sched.wait_for_tuning(poll);
+        sched.wait_for_tuning(cadence);
         if sched.is_aborted() || sched.finished() {
             break;
         }
-
-        // A same-machine single-file copy starts with one cheap kernel copy
-        // probe. If the receiver reports a partial or unsupported kernel
-        // offload, skip the measurement ramp and restore the ordinary local
-        // starting count before userspace ranges become the bottleneck.
+        // A partial/unsupported local kernel-copy probe asks for ordinary
+        // userspace parallelism without first climbing from one worker.
         let requested = sched.take_worker_count_request().min(policy.max);
+        let previous_active = active;
+        let mut changed = false;
         if requested > active {
-            let before = active;
             policy = Policy::new(requested, policy.min, policy.max);
-            active = requested;
             gate.set_retain(requested);
             for id in gate.begin_warming(requested) {
                 spawn(id);
             }
             gate.set_active(requested);
-            meter.set_active(requested);
-            sampler.reset();
-            last = (meter.bytes(), meter.files());
-            sample_start = std::time::Instant::now();
-            if crate::output::debug() {
-                crate::output::diagnostic!(
-                    "syq: tune: {before} -> {requested} workers (direct copy needs userspace transfer)"
-                );
-            }
-            continue;
+            active = requested;
+            changed = true;
         }
-
-        // Apply reductions immediately. An increase leaves the current set
-        // active while its candidate workers connect in the background.
         if policy.n < active {
-            let before = active;
             gate.set_active(policy.n);
             active = policy.n;
             policy.activated();
-            meter.set_active(active);
-            gate.set_retain(if active == 1 { 2 } else { active });
-            sampler.reset();
-            collapse_samples = 0;
-            last = (meter.bytes(), meter.files());
-            sample_start = std::time::Instant::now();
-            if crate::output::debug() {
-                crate::output::diagnostic!(
-                    "syq: tune: {before} -> {active} workers (state {:?})",
-                    policy.state
-                );
-            }
-            continue;
+            changed = true;
         }
         if policy.n > active {
-            if !enough_work(&sched, policy.n, last_rate, sample) {
+            if !enough_work(&sched, policy.n, last_rate, tail_sample) {
                 policy.cancel_unapplied();
-                gate.set_retain(if active == 1 { 2 } else { active });
-                continue;
-            }
-            gate.set_retain(policy.n);
-            for id in gate.begin_warming(policy.n) {
-                spawn(id);
-            }
-            if gate.permanent_failure_through(policy.n) {
-                if gate.permanent_failure_through(active) {
-                    sched.abort();
-                    break;
+            } else {
+                gate.set_retain(policy.n);
+                for id in gate.begin_warming(policy.n) {
+                    spawn(id);
                 }
-                // Failure to provision an optional upward probe is not a
-                // throughput result and must not fail the copy.
-                policy.cancel_unapplied();
-                gate.set_retain(if active == 1 { 2 } else { active });
-                gate.clear_failed_from(active);
-                continue;
-            }
-            if gate.ready_through(policy.n) {
-                let before = active;
-                gate.set_active(policy.n);
-                active = policy.n;
-                policy.activated();
-                meter.set_active(active);
-                sampler.reset();
-                collapse_samples = 0;
-                last = (meter.bytes(), meter.files());
-                sample_start = std::time::Instant::now();
-                if crate::output::debug() {
-                    crate::output::diagnostic!(
-                        "syq: tune: {before} -> {active} workers (candidate ready, state {:?})",
-                        policy.state
-                    );
-                }
-                continue;
-            }
-
-            // The settled workers keep providing a fresh comparison while an
-            // upward candidate connects. This prevents handshake delay from
-            // turning unrelated path drift into an apparent candidate effect.
-            if sample_start.elapsed() >= sample {
-                let now = (meter.bytes(), meter.files());
-                let secs = sample_start.elapsed().as_secs_f64();
-                sample_start = std::time::Instant::now();
-                if !gate.ready_through(active) {
-                    last = now;
-                    sampler.reset();
-                    continue;
-                }
-                let Some(rate) = activity_rate(last, now, secs) else {
-                    last = now;
-                    sampler.reset();
-                    continue;
-                };
-                last = now;
-                last_rate = Some(rate);
-                if !enough_work(&sched, policy.n, last_rate, sample) {
-                    policy.cancel_unapplied();
-                    gate.set_retain(if active == 1 { 2 } else { active });
-                    sampler.reset();
-                    continue;
-                }
-                if let Some(score) = sampler.push(rate) {
-                    policy.refresh_warming_baseline(score);
-                    if crate::output::debug() {
-                        crate::output::diagnostic!(
-                            "syq: tune: refreshed {active}-worker baseline to {:.1} MB/s while {} workers warm",
-                            score / 1e6,
-                            policy.n
-                        );
+                if gate.permanent_failure_through(policy.n) {
+                    if gate.permanent_failure_through(active) {
+                        sched.abort();
+                        break;
                     }
+                    policy.cancel_unapplied();
+                    gate.clear_failed_from(active);
+                } else if gate.ready_through(policy.n) {
+                    gate.set_active(policy.n);
+                    active = policy.n;
+                    policy.activated();
+                    changed = true;
                 }
             }
-            continue;
         }
-
-        // Heal an unexpectedly missing active slot. At one active worker keep
-        // exactly one ready spare so the important 1→2 probe is instantaneous.
-        let retain = if active == 1 {
+        let warming = policy.n > active;
+        let retain = if warming {
+            policy.n
+        } else if active == 1 {
             2.min(policy.max)
         } else {
             active
         };
         gate.set_retain(retain);
-        // A pipelined whole-file batch is already owned and cannot be stolen.
-        // Do not repeatedly reconnect slots that drained the queue while the
-        // remaining owners finish. Queued/retried work or an ordinary
-        // large-file probe re-enables healing on the next poll.
         if sched.needs_worker_capacity() {
             for id in gate.begin_warming(retain) {
                 spawn(id);
@@ -1032,68 +1007,92 @@ pub fn run(
             sched.abort();
             break;
         }
-        if sample_start.elapsed() < sample {
+        if changed {
+            meter.set_active(active);
+            activity_start = gate.activity_counts(active);
+            last = (meter.bytes(), meter.files());
+            observation.reset(meter.outstanding_bytes());
+            sample_start = std::time::Instant::now();
+            activated_at = sample_start;
+            decided_at = sample_start;
+            if crate::output::debug() {
+                crate::output::diagnostic!(
+                    "syq: tune: {previous_active} -> {active} workers (candidate ready, state {:?})",
+                    policy.state
+                );
+            }
+            continue;
+        }
+        if sample_start.elapsed() < cadence {
             continue;
         }
         let now = (meter.bytes(), meter.files());
-        let secs = sample_start.elapsed().as_secs_f64();
+        let seconds = sample_start.elapsed().as_secs_f64();
         sample_start = std::time::Instant::now();
-        // Only judge a configuration once every requested worker is actually
-        // connected (ssh sessions can take seconds each).
-        if !gate.ready_through(active) {
+        let outstanding = meter.outstanding_bytes();
+        let Some(rate) = activity_rate(last, now, seconds) else {
             last = now;
-            sampler.reset();
-            continue;
-        }
-        // Per second, so jitter in the sample length doesn't masquerade as a
-        // throughput change.
-        let Some(rate) = activity_rate(last, now, secs) else {
-            // Progress can be retracted after uncertain acknowledgements. The
-            // production meter is monotonic, but keep the generic driver safe
-            // and discard any interval from a regressing implementation.
-            last = now;
-            sampler.reset();
-            collapse_samples = 0;
+            observation.reset(outstanding);
+            activity_start = gate.activity_counts(active);
             continue;
         };
         last = now;
         last_rate = Some(rate);
-        // Estimate the time left at the rate just observed. In the tail, idle
-        // workers say nothing; unlike a fixed byte threshold this remains
-        // useful on both very slow and very fast paths.
-        if !enough_work(&sched, active, last_rate, sample) {
-            sampler.reset();
-            collapse_samples = 0;
+        if !gate.ready_through(active) {
+            observation.reset(outstanding);
+            activity_start = gate.activity_counts(active);
             continue;
         }
-        if policy
-            .probe_base()
-            .is_some_and(|base| base > 0.0 && rate < 0.5 * base)
-        {
-            collapse_samples += 1;
+        if !enough_work(&sched, active, last_rate, tail_sample) {
+            observation.reset(outstanding);
+            continue;
+        }
+        let activity = gate.activity_counts(active);
+        let contributing = activity
+            .iter()
+            .zip(&activity_start)
+            .filter(|(now, before)| now > before)
+            .count();
+        let threshold = if warming {
+            None
         } else {
-            collapse_samples = 0;
-        }
-        if collapse_samples >= 2 {
-            policy.observe(rate);
-            sampler.reset();
-            collapse_samples = 0;
-            continue;
-        }
-        let Some(score) = sampler.push(rate) else {
-            continue;
+            policy
+                .comparison_threshold()
+                .map(|v| (v, baseline_variation))
         };
-        let before = policy.n;
-        policy.observe(score);
-        if policy.n != before {
-            sampler.reset();
+        let estimate = observation.push(
+            rate,
+            seconds,
+            outstanding,
+            contributing == active,
+            threshold,
+        );
+        if crate::output::debug() {
+            crate::output::diagnostic!("syq: tune sample: workers={active} rate={:.3}MB/s outstanding={outstanding} contributing={contributing}/{active} since_activation={:.3}s", rate/1e6, activated_at.elapsed().as_secs_f64());
+        }
+        if let Some(estimate) = estimate {
+            if warming {
+                policy.refresh_warming_baseline(estimate.rate);
+                baseline_variation = estimate.variation;
+                observation.reset(outstanding);
+            } else if !matches!(policy.state, State::Hold) || decided_at.elapsed() >= hold_interval
+            {
+                policy.observe(estimate.rate);
+                baseline_variation = estimate.variation;
+                decided_at = std::time::Instant::now();
+                observation.reset(outstanding);
+                if crate::output::debug() {
+                    crate::output::diagnostic!("syq: tune: measured {active} workers {:.3}MB/s margin={:.3}MB/s over {:.3}s; candidate={} (state {:?})",estimate.rate/1e6,estimate.variation/1e6,estimate.seconds,policy.n,policy.state);
+                }
+            }
+        } else if !warming
+            && policy.probe_base().is_some()
+            && activated_at.elapsed() >= observation.maximum()
+        {
+            policy.inconclusive();
+            observation.reset(outstanding);
             if crate::output::debug() {
-                crate::output::diagnostic!(
-                    "syq: tune: candidate {before} -> {} workers (measured {:.1} MB/s at {before}, state {:?})",
-                    policy.n,
-                    score / 1e6,
-                    policy.state
-                );
+                crate::output::diagnostic!("syq: tune: {active}-worker probe inconclusive; return to {} without throughput evidence",policy.n);
             }
         }
     }

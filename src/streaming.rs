@@ -4,7 +4,7 @@
 
 use crate::proto::{Response, WireError};
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -135,6 +135,86 @@ pub(crate) fn claim_block_with_digest(
     }
 }
 
+/// One range uses full-size blocks followed by at most one short block (EOF
+/// or a stolen suffix). This lets ordered acknowledgments credit exact bytes
+/// with constant storage, including a reply arriving before send returns.
+pub(crate) struct WriteCredit {
+    progress: Arc<crate::progress::Progress>,
+    done: Arc<AtomicU64>,
+    block: u64,
+    activity: Arc<AtomicU64>,
+    submitted: AtomicU64,
+    acknowledged: AtomicU64,
+}
+
+impl WriteCredit {
+    pub(crate) fn new(
+        progress: Arc<crate::progress::Progress>,
+        done: Arc<AtomicU64>,
+        block: u64,
+        activity: Arc<AtomicU64>,
+    ) -> Arc<Self> {
+        assert!(block > 0);
+        Arc::new(Self {
+            progress,
+            done,
+            block,
+            activity,
+            submitted: AtomicU64::new(0),
+            acknowledged: AtomicU64::new(0),
+        })
+    }
+
+    /// Called by the single range producer before sending the payload.
+    pub(crate) fn submit(&self, bytes: u64) -> anyhow::Result<()> {
+        let previous = self.submitted.load(Ordering::Relaxed);
+        anyhow::ensure!(
+            bytes > 0 && bytes <= self.block && previous.is_multiple_of(self.block),
+            "streaming write must contain full blocks followed by at most one short block"
+        );
+        anyhow::ensure!(
+            previous.checked_add(bytes).is_some(),
+            "streaming byte count overflow"
+        );
+        self.progress
+            .outstanding_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.submitted.store(previous + bytes, Ordering::Release);
+        Ok(())
+    }
+
+    /// Called only by the ordered reply consumer. Errors stop useful credit.
+    fn acknowledge(&self, count: u64) -> bool {
+        let submitted = self.submitted.load(Ordering::Acquire);
+        if count > submitted.div_ceil(self.block) {
+            return false;
+        }
+        let total = count.saturating_mul(self.block).min(submitted);
+        let bytes = total - self.acknowledged.swap(total, Ordering::Relaxed);
+        self.progress
+            .outstanding_bytes
+            .fetch_sub(bytes, Ordering::Relaxed);
+        self.progress.add_bytes(bytes);
+        self.done.fetch_add(bytes, Ordering::Relaxed);
+        self.activity.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Read after the collector has joined, before the caller can retry.
+    pub(crate) fn acknowledged(&self) -> u64 {
+        self.acknowledged.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for WriteCredit {
+    fn drop(&mut self) {
+        let uncertain = *self.submitted.get_mut() - *self.acknowledged.get_mut();
+        self.progress
+            .outstanding_bytes
+            .fetch_sub(uncertain, Ordering::Relaxed);
+    }
+}
+
 pub(crate) type Responses = mpsc::Receiver<io::Result<crate::conn::ReceivedResponse>>;
 
 #[derive(Clone, Debug)]
@@ -147,15 +227,35 @@ pub(crate) enum Failure {
 #[derive(Clone, Default)]
 pub(crate) struct Completions {
     pub count: u64,
+    credit: Option<Arc<WriteCredit>>,
     pub error: Option<Failure>,
     pub fenced: bool,
 }
 
 impl Completions {
+    pub fn new(credit: Option<Arc<WriteCredit>>) -> Self {
+        Self {
+            credit,
+            ..Self::default()
+        }
+    }
+
     pub fn record(&mut self, response: Response) {
         self.count += 1;
         let error = match response {
-            Response::Ok => return,
+            Response::Ok => {
+                if self.error.is_none()
+                    && self
+                        .credit
+                        .as_ref()
+                        .is_some_and(|credit| !credit.acknowledge(self.count))
+                {
+                    self.error = Some(Failure::Transport(
+                        "streaming acknowledgment exceeds submitted writes".into(),
+                    ));
+                }
+                return;
+            }
             Response::EndpointError(error) => Failure::Endpoint(error),
             Response::Err(error) => Failure::Rejected(error),
             _ => Failure::Transport("unexpected response to a streaming write".into()),
@@ -171,8 +271,8 @@ pub(crate) struct WriteReplies {
 }
 
 impl WriteReplies {
-    pub fn spawn(rx: Responses) -> Self {
-        let state = Arc::new(Mutex::new(Completions::default()));
+    pub fn spawn(rx: Responses, credit: Option<Arc<WriteCredit>>) -> Self {
+        let state = Arc::new(Mutex::new(Completions::new(credit)));
         let abort = Arc::new(AtomicBool::new(false));
         let (status, stopped) = (state.clone(), abort.clone());
         let thread = std::thread::spawn(move || {

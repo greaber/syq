@@ -201,12 +201,15 @@ impl Conn for LocalConn {
     fn supports_request_pipelining(&self) -> bool {
         false
     }
-    fn begin_streaming_writes(&mut self) -> Result<()> {
+    fn begin_streaming_writes(
+        &mut self,
+        credit: Option<std::sync::Arc<crate::streaming::WriteCredit>>,
+    ) -> Result<()> {
         anyhow::ensure!(
             self.pending.is_empty() && self.write_stream.is_none(),
             "streaming writes require an idle connection"
         );
-        self.write_stream = Some(crate::streaming::Completions::default());
+        self.write_stream = Some(crate::streaming::Completions::new(credit));
         Ok(())
     }
     fn check_streaming_writes(&mut self) -> Result<()> {
