@@ -1838,3 +1838,58 @@ fn overlay_addresses_are_recognized_in_both_families() {
     assert!(!is_overlay_address("192.168.1.2"));
     assert!(!is_overlay_address("gpu01.example.net"));
 }
+
+#[test]
+fn local_source_recycles_after_write_without_consuming_pending_replies() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let input = temporary.path().join("source");
+    let output = temporary.path().join("destination");
+    let block = 128 << 10;
+    let contents: Vec<u8> = (1..=3).flat_map(|value| vec![value; block]).collect();
+    std::fs::write(&input, &contents).unwrap();
+    std::fs::write(&output, []).unwrap();
+    let mut source = LocalConn::new(&ConnectionRole::Control, Default::default());
+    let mut destination = LocalConn::new(&ConnectionRole::Control, Default::default());
+    let request = |off| Request::ReadRange {
+        path: input.as_os_str().as_bytes().to_vec(),
+        source: None,
+        attempt: 0,
+        off,
+        len: block as u32,
+    };
+    source.send(request(0)).unwrap();
+    source.send(request(block as u64)).unwrap();
+    let Response::Block { data, hash, .. } = source.recv().unwrap() else {
+        panic!("expected first block");
+    };
+    let first_pointer = data.as_ptr();
+    let returned = destination
+        .send_recycling(Request::WriteRange {
+            path: output.as_os_str().as_bytes().to_vec(),
+            inplace: true,
+            copy_id: [0; 16],
+            attempt: 0,
+            off: 0,
+            hash,
+            data: data.into(),
+            guard: None,
+        })
+        .unwrap()
+        .expect("local write returns consumed payload");
+    assert_eq!(returned.as_ptr(), first_pointer);
+    source.recycle_read_buffer(returned);
+    source.send(request((2 * block) as u64)).unwrap();
+    // Neither the queued second source response nor the unread write ACK
+    // keeps a reference to the storage now used by the third source read.
+    let Response::Block { data: second, .. } = source.recv().unwrap() else {
+        panic!("expected second block");
+    };
+    let Response::Block { data: third, .. } = source.recv().unwrap() else {
+        panic!("expected third block");
+    };
+    assert_eq!(second, contents[block..2 * block]);
+    assert_eq!(third, contents[2 * block..]);
+    assert_eq!(third.as_ptr(), first_pointer);
+    assert!(matches!(destination.recv().unwrap(), Response::Ok));
+    assert_eq!(std::fs::read(&output).unwrap(), contents[..block]);
+}
