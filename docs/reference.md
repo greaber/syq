@@ -102,7 +102,9 @@ For two SSH endpoints, see [Copy between servers](remote-to-remote.md).
 
 Remote filesystem copies compress data in transit by default, adjusting
 compression to the observed transfer speed. Blocks that do not shrink enough
-are sent uncompressed. Use `--no-compress` to disable transport compression,
+are sent uncompressed. On fast links, syq samples data after repeated unsuccessful
+compression attempts and periodically retries whole blocks. Use `--no-compress`
+to disable transport compression,
 for example when comparing its effect on CPU use and copy speed.
 
 <a id="output-and-diagnostics"></a>

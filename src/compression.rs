@@ -7,6 +7,7 @@ use std::time::Duration;
 pub(crate) const ZSTD: u8 = 1;
 pub(crate) const LZ4: u8 = 2;
 const REUSE_LIMIT: usize = 8 << 20;
+const MAX_SKIPPED_BYTES: usize = 4 << 20;
 const MIN_SAMPLE_BYTES: usize = 64 << 10;
 const SAMPLE_BYTES: usize = 4 << 20;
 const SAMPLE_TIME: Duration = Duration::from_millis(100);
@@ -69,6 +70,9 @@ pub(crate) struct Compressor {
     policy: Policy,
     output: Vec<u8>,
     zstd: Option<(i32, zstd::bulk::Compressor<'static>)>,
+    misses: u8,
+    skip_frames: u8,
+    skip_bytes: usize,
 }
 
 impl Compressor {
@@ -77,12 +81,42 @@ impl Compressor {
             policy: Policy::new(legacy),
             output: Vec::new(),
             zstd: None,
+            misses: 0,
+            skip_frames: 0,
+            skip_bytes: 0,
         }
     }
 
-    /// Every eligible frame is attempted, including after incompressible data.
     /// A compressed representation must save at least 1%, including its prefix.
+    /// On fast links, repeated misses skip at most two bulk frames (4 MiB)
+    /// before a full probe, checking small samples meanwhile. Small messages
+    /// and slower-link codecs always try.
     pub(crate) fn encode(&mut self, input: &[u8]) -> io::Result<Option<(u8, usize)>> {
+        let bulk_lz4 = self.policy.mode == Mode::Lz4 && input.len() >= MIN_SAMPLE_BYTES;
+        if bulk_lz4 && self.skip_frames > 0 && input.len() <= self.skip_bytes {
+            // Probe separated samples so a change of content can resume full
+            // compression before the periodic whole-frame probe is due.
+            let mut sample_output = [0; 8192];
+            let mut promising = false;
+            for start in [0, (input.len() - 4096) / 2, input.len() - 4096] {
+                let sample = &input[start..start + 4096];
+                let len = lz4::block::compress_to_buffer(
+                    sample,
+                    Some(lz4::block::CompressionMode::FAST(4)),
+                    false,
+                    &mut sample_output,
+                )?;
+                if len <= sample.len() - sample.len().div_ceil(100) {
+                    promising = true;
+                    break;
+                }
+            }
+            if !promising {
+                self.skip_frames -= 1;
+                self.skip_bytes -= input.len();
+                return Ok(None);
+            }
+        }
         let bound = match self.policy.mode {
             Mode::Lz4 => lz4::block::compress_bound(input.len())? + 4,
             _ => zstd::zstd_safe::compress_bound(input.len()),
@@ -119,7 +153,17 @@ impl Compressor {
                 )
             }
         };
-        Ok((len <= input.len().saturating_sub(input.len().div_ceil(100))).then_some((flag, len)))
+        let useful = len <= input.len().saturating_sub(input.len().div_ceil(100));
+        if bulk_lz4 {
+            self.misses = if useful {
+                0
+            } else {
+                self.misses.saturating_add(1)
+            };
+            self.skip_frames = self.misses.saturating_sub(1).min(2);
+            self.skip_bytes = MAX_SKIPPED_BYTES;
+        }
+        Ok(useful.then_some((flag, len)))
     }
 
     pub(crate) fn output(&self, len: usize) -> &[u8] {
@@ -134,7 +178,13 @@ impl Compressor {
     }
 
     pub(crate) fn observe_write(&mut self, bytes: usize, elapsed: Duration) -> bool {
-        self.policy.observe(bytes, elapsed)
+        let changed = self.policy.observe(bytes, elapsed);
+        if changed {
+            self.misses = 0;
+            self.skip_frames = 0;
+            self.skip_bytes = 0;
+        }
+        changed
     }
 
     pub(crate) fn name(&self) -> &'static str {
@@ -281,5 +331,88 @@ mod tests {
         let mut false_size = body;
         false_size[..4].copy_from_slice(&1025u32.to_le_bytes());
         assert!(decode_lz4(&false_size, 1026).is_err());
+    }
+
+    fn random() -> Vec<u8> {
+        let mut input = vec![0; 2 << 20];
+        let mut state = 0x123456789abcdefu64;
+        for byte in &mut input {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        input
+    }
+
+    #[test]
+    fn random_backoff_recovers_within_two_frames_and_four_mib() {
+        let random = random();
+        let text = vec![b'x'; 2 << 20];
+        let mut compressor = Compressor::new(false);
+        for _ in 0..12 {
+            assert!(compressor.encode(&random).unwrap().is_none());
+        }
+        let mut skipped = 0;
+        loop {
+            if let Some((flag, len)) = compressor.encode(&text).unwrap() {
+                assert_eq!(flag, LZ4);
+                assert_eq!(
+                    decode_lz4(compressor.output(len), text.len() + 1).unwrap(),
+                    text
+                );
+                break;
+            }
+            skipped += 1;
+            assert!(skipped <= 2);
+        }
+        assert_eq!(
+            skipped, 0,
+            "samples must detect the new compressible content"
+        );
+        assert!(compressor.encode(&text).unwrap().is_some());
+    }
+
+    #[test]
+    fn large_small_and_slow_link_frames_are_not_suppressed_by_backoff() {
+        let random = random();
+        for kind in 0..3 {
+            let mut compressor = Compressor::new(false);
+            for _ in 0..2 {
+                assert!(compressor.encode(&random).unwrap().is_none());
+            }
+            let size = match kind {
+                0 => MAX_SKIPPED_BYTES + 1,
+                1 => 4096,
+                _ => {
+                    assert!(compressor.observe_write(4 << 20, Duration::from_secs(1)));
+                    2 << 20
+                }
+            };
+            assert!(compressor.encode(&vec![b'x'; size]).unwrap().is_some());
+        }
+    }
+    #[test]
+    fn unsampled_compressible_content_gets_a_full_probe_within_two_frames() {
+        let mut noise = vec![0; 2 << 20];
+        let mut state = 7u64;
+        for byte in &mut noise {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        let mut compressor = Compressor::new(false);
+        for _ in 0..6 {
+            assert!(compressor.encode(&noise).unwrap().is_none());
+        }
+        let mut mixed = noise;
+        mixed[16 << 10..512 << 10].fill(b'x');
+        let mut skipped = 0;
+        while compressor.encode(&mixed).unwrap().is_none() {
+            skipped += 1;
+            assert!(skipped <= 2);
+        }
+        assert!(compressor.encode(&mixed).unwrap().is_some());
     }
 }
