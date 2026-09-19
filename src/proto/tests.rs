@@ -411,7 +411,11 @@ fn compression_is_per_frame_and_never_expands_the_wire_payload() {
     let compressed = block_frame(data.clone(), true);
     assert_eq!(
         compressed[local_preamble_len() + 4],
-        1,
+        if crate::identity::build() == "v0.6.0" {
+            1
+        } else {
+            2
+        },
         "compressible frame was not compressed"
     );
 
@@ -621,4 +625,142 @@ fn copy_local_fallback_has_a_structured_wire_response() {
             .unwrap(),
         Response::CopyLocalUnsupported
     ));
+}
+
+#[test]
+fn frames_mix_lz4_zstd_and_raw_without_losing_boundaries() {
+    let mut bytes = Vec::new();
+    let inputs = [
+        vec![b'a'; 128 << 10],
+        vec![b'b'; 128 << 10],
+        b"short".to_vec(),
+        vec![b'c'; 128 << 10],
+    ];
+    {
+        let mut writer = FrameWriter::new(&mut bytes, true);
+        writer.write_msg(&block_message(inputs[0].clone())).unwrap();
+        writer
+            .compression
+            .observe_write(4 << 20, std::time::Duration::from_secs(1));
+        writer.write_msg(&block_message(inputs[1].clone())).unwrap();
+        writer.write_msg(&block_message(inputs[2].clone())).unwrap();
+        writer
+            .compression
+            .observe_write(4 << 20, std::time::Duration::from_millis(1));
+        writer.write_msg(&block_message(inputs[3].clone())).unwrap();
+    }
+    let mut reader = FrameReader::new(bytes.as_slice());
+    for expected in inputs {
+        let Response::Block { data, .. } = reader.read_msg().unwrap() else {
+            panic!("expected block")
+        };
+        assert_eq!(data, expected);
+    }
+    let mut offset = local_preamble_len();
+    let mut codecs = Vec::new();
+    while offset < bytes.len() {
+        let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        codecs.push(bytes[offset + 4]);
+        offset += 4 + len;
+    }
+    assert_eq!(
+        codecs,
+        if crate::identity::build() == "v0.6.0" {
+            vec![1, 1, 0, 1]
+        } else {
+            vec![2, 1, 0, 2]
+        }
+    );
+}
+
+#[test]
+fn lz4_frames_enforce_handshake_and_message_limits_and_reject_corruption() {
+    let payload = postcard::to_stdvec(&Response::Err("x".repeat(4096))).unwrap();
+    let compressed = lz4::block::compress(&payload, None, true).unwrap();
+    let bytes = raw_frame(&compressed, crate::compression::LZ4);
+    let mut reader = FrameReader::new(bytes.as_slice());
+    reader.set_limit(1024);
+    assert!(reader
+        .read_msg::<Response>()
+        .unwrap_err()
+        .to_string()
+        .contains("decompressed frame exceeds"));
+
+    let payload = postcard::to_stdvec(&Response::Err("x".repeat(MAX_METADATA_FRAME))).unwrap();
+    let compressed = lz4::block::compress(&payload, None, true).unwrap();
+    let bytes = raw_frame(&compressed, crate::compression::LZ4);
+    assert!(FrameReader::new(bytes.as_slice())
+        .read_msg::<Response>()
+        .unwrap_err()
+        .to_string()
+        .contains("message exceeds its size limit"));
+
+    for body in [
+        vec![],
+        vec![1, 2, 3],
+        u32::MAX.to_le_bytes().to_vec(),
+        compressed[..compressed.len() - 1].to_vec(),
+    ] {
+        let bytes = raw_frame(&body, crate::compression::LZ4);
+        assert!(FrameReader::new(bytes.as_slice())
+            .read_msg::<Response>()
+            .is_err());
+    }
+    let bytes = raw_frame(&[0], 3);
+    assert!(FrameReader::new(bytes.as_slice())
+        .read_msg::<Response>()
+        .unwrap_err()
+        .to_string()
+        .contains("unknown frame flags"));
+}
+
+#[test]
+fn compressed_frames_preserve_transport_write_and_flush_failures() {
+    struct Broken(bool);
+    impl Write for Broken {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.0 {
+                Ok(bytes.len())
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        }
+    }
+    for flush in [false, true] {
+        let error = FrameWriter::with_preamble_written(Broken(flush), true)
+            .write_msg(&block_message(vec![b'x'; 65536]))
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+}
+
+#[test]
+fn released_v060_zstd_frame_remains_decodable() {
+    // Captured from the published v0.6.0 Linux x86-64 helper, not regenerated
+    // by today's encoder. Its ListDir response contains 64 empty-file names.
+    // The preamble is tested separately: frame compatibility does not bypass
+    // the build identity check when connecting to a different executable.
+    let fixture =
+        include_bytes!("../../tests/fixtures/completion/directory-entries-zstd-v0.6.0.bin");
+    let mut bytes = Vec::new();
+    FrameWriter::new(&mut bytes, false)
+        .write_preamble()
+        .unwrap();
+    bytes.extend_from_slice(fixture);
+    let Response::DirectoryEntries { entries, truncated } =
+        FrameReader::new(bytes.as_slice()).read_msg().unwrap()
+    else {
+        panic!("expected released directory listing")
+    };
+    assert!(!truncated);
+    assert_eq!(entries.len(), 64);
+    for (index, entry) in entries.iter().enumerate() {
+        assert_eq!(
+            entry.name,
+            format!("compressible-entry-{index:03}").as_bytes()
+        );
+    }
 }

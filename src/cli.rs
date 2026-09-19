@@ -202,7 +202,7 @@ pub struct Args {
     /// Suppress non-error messages
     #[arg(short = 'q', long)]
     pub quiet: bool,
-    /// Compress remote data in transit with zstd (default)
+    /// Compress remote data in transit automatically (default)
     #[arg(
         short = 'z',
         long,
