@@ -432,6 +432,40 @@ Use dotenvx 2.21.0 for this inventory. Initialize it once with
 `scripts/init-release-secrets.sh`, and run the sync without `--execute` before
 every actual update. See `RELEASING.md` for provisioning, backup, and rotation.
 
+## Performance evidence
+
+Match the benchmark to the claim: startup latency, total time for a small copy,
+and sustained transfer throughput are different measurements. Short tests are
+useful for real short operations and controlled microbenchmarks, but a few
+subsecond or one-to-two-second copies are preliminary evidence for a throughput
+change, not sufficient validation of a new performance default.
+
+- For sustained-throughput comparisons, pilot the workload and enlarge it so
+  the faster variant normally spends at least 30 seconds doing transfer work;
+  aim for 30–60 seconds per measured copy. This is a working target to expose
+  startup, autotuning and system-state effects, not a statistical guarantee.
+  Setup, verification, cleanup and sleeps do not count toward it. Preserve the
+  relevant file-size and directory distribution, and report changes in working
+  set or cache behavior. Repeatedly launching a short copy measures repeated
+  startup; it does not substitute for one sustained transfer.
+- Choose the run count and order before comparing results. Normally use at
+  least five independent baseline/candidate pairs with balanced or randomized
+  order. Keep all observations and report absolute times, variation and paired
+  differences, not just a percentage between medians. If the result remains
+  noisy, report it as inconclusive and plan further measurements; do not stop
+  collecting when the numbers become favorable. Longer duration alone does
+  not remove bias or replace repetition.
+- Record exact builds, workload, cache/warmup policy, concurrency and relevant
+  host load. Keep competing measurements off the hosts. Measure unprofiled
+  elapsed time separately from profiles; collect enough samples for the code
+  being attributed and report sampling limitations. Aggregate CPU seconds
+  across many cores are not elapsed measurement duration. CPU and syscall
+  reductions support a mechanism but do not establish a throughput gain.
+- Keep representative small-copy/startup tests too, using enough independent
+  repetitions to establish their variability. When a resource constraint
+  prevents a sustained test, state that limitation and keep the throughput
+  conclusion provisional. Verify copied content outside the timed interval.
+
 ## Verification
 
 **Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
