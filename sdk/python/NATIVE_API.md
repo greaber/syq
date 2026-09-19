@@ -126,8 +126,6 @@ Typed SSH-to-SSH copies require an enrolled receiver or
 `bytes`, or `os.PathLike`). To interleave rule files and inline patterns:
 `ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`. The last matching rule wins.
 
-<a id="removal"></a>
-
 ## Byte streams
 
 `client.open_writer(*, as_=None, as_new=None, as_existing=None, to=None,
@@ -163,6 +161,8 @@ is attempted. S3 can retry buffered multipart parts.
 | `StreamWriter` | `write(bytes)` writes the complete buffer and returns its length; `flush()` has no Python buffer to flush; `close()` ends payload input; `commit()` publishes and checks completion; `abort()` cancels |
 | `StreamReader` | `read(size=-1)`, `readinto(buffer)`; `close()` drains remaining bytes in bounded chunks and checks completion; `abort()` cancels |
 
+### Writer completion
+
 Use a `with` block. Successful writer exit sends a separate commit signal
 after closing the payload; EOF alone cannot publish a managed upload. An
 exception in the writer body before commit aborts without replacing the destination.
@@ -180,6 +180,8 @@ A timeout or connection loss during commit can leave the outcome uncertain;
 the method reports failure rather than claiming rollback. Whole datasets
 need their own final publication step after all object transfers succeed.
 
+### Skips and previews
+
 Writers normally return while destination setup continues, so opening several
 writers lets their connections start concurrently. Setup errors can surface at
 `write()` or `commit()`. With `only_new=True`, `only_existing=True`, or `dry_run=True`,
@@ -196,17 +198,18 @@ A skipped writer rejects `write()` and exits its context successfully without
 committing anything. Skipped readers return no payload; their `skipped` property
 is settled at completion. Both count the skipped object in `files_excluded`.
 
-After completion, `stream.result` holds a `CpResult`, including byte counts and
-elapsed time. It remains `None` if no terminal result arrived, such as after
-forced termination. Payload bytes never enter the result decoder; missing or
-invalid completion records raise `SyqProtocolError` after an otherwise successful
-process exit.
-
 With `dry_run=True`, a context checks placement without transferring bytes.
 Enter and exit a writer context without calling `write()`; preview writers
 reject payload writes. Preview readers return no payload. The result contains
 planned totals; `bytes_total_known=False` distinguishes an unknown pipe length
 from an empty source. A dry run does not check an expected payload hash.
+
+### Results and failures
+
+After completion, `stream.result` holds a `CpResult`, including byte counts and
+elapsed time. It remains `None` if no terminal result arrived, such as after
+forced termination. Missing or invalid completion records raise
+`SyqProtocolError` even if the process exits successfully.
 
 A bounded reader call can yield partial data before a later transfer error.
 An unbounded `read()` checks transfer completion before returning its bytes.
@@ -225,6 +228,8 @@ last 8 KiB as bytes, including on success. For example, request `stats=True`
 and read `output.stderr.decode()` after the writer context exits. This is a
 bounded diagnostic tail, not a complete progress-event history.
 
+### Async streams
+
 Async streams use `async with` directly and await I/O and explicit closure:
 
 ```python
@@ -241,6 +246,8 @@ transfer process and releases blocked I/O. `AsyncStreamReader` and
 `AsyncStreamWriter` expose async `read`/`write`, `close`, and `abort` methods.
 `AsyncStreamWriter.commit()` explicitly publishes, with the same semantics
 as its synchronous counterpart; successful async context exit commits automatically.
+
+<a id="removal"></a>
 
 ## rm
 

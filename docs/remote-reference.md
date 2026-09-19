@@ -17,11 +17,6 @@ instead of relaxing host verification.
 Your local SSH configuration selects hostB's login, address, port, and trusted
 host keys. HostA's SSH configuration does not override those choices.
 
-The constrained authentication broker admits at most 129 simultaneous clients
-by default, independently of automatic copy-worker tuning. An explicit worker
-setting or ceiling adjusts that bound to the requested count plus one control
-connection. Command-restricted copies never exceed 129 broker clients.
-
 ## Enrollment
 
 Enrollment needs normal command authority on the destination during setup.

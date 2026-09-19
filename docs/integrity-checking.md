@@ -26,8 +26,10 @@ compares whole seconds exactly and ignores as many trailing fractional digits
 as are zero in the destination timestamp. For example, destination `.120000000`
 seconds matches source `.123456789`; a whole-second destination timestamp
 ignores the source fraction entirely. This accommodates destinations that
-truncate fractional seconds. Directory metadata previews use the same fractional
-precision rule. `syq rsync` compares whole seconds only when checking file contents.
+truncate fractional seconds, but it also ignores coincidental trailing zeros;
+the rule uses the timestamp, not a measurement of filesystem precision.
+Directory metadata previews use the same fractional precision rule. `syq rsync`
+compares whole seconds only when checking file contents.
 
 A timestamp difference outside that precision triggers checking even when the
 source is older, unless you request `--skip-newer`. Use `--hash` to check contents
@@ -61,11 +63,10 @@ Server-side S3 copies preserve stored digests without reading or verifying
 object bodies. They do not support content-hash comparison, extra transfer
 hashing, expected digests, or `--verify-only`.
 
-Descriptor copies use the same optional payload checks as regular-file
-copies: `transfer=ALGORITHM` enables them and selects the hash. Raw S3 streams keep
-provider checksums but do not store syq digest metadata, so they cannot use
-that metadata for extra verification. Use a known expected hash instead.
-Neither backend rereads the object after transfer by default.
+Filesystem descriptor copies accept `transfer=ALGORITHM` for optional payload
+checks. S3 descriptor copies reject extra transfer hashing: they keep provider
+checksums but do not store syq digest metadata. Use a known expected hash to
+check an S3 stream. Descriptor copies do not reread the result by default.
 
 ## Expected digests
 

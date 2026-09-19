@@ -97,15 +97,10 @@ For two SSH endpoints, see [Copy between servers](remote-to-remote.md).
 
 ### Transport compression
 
-Remote filesystem copies compress data in transit by default. Each connection
-starts with LZ4 and can switch to Zstd level 1 or 3 when its writes drain more
-slowly, then back to LZ4 as they speed up. This uses the observed transport
-write rate, which includes SSH and receiver backpressure, rather than the
-network interface's advertised speed.
-
-Each block is compressed independently and sent compressed only when that
-saves at least 1% of its size. A poorly compressing block does not stop syq
-from trying the next one. Use `--no-compress` to disable transport compression.
+Remote filesystem copies compress data in transit by default, adjusting
+compression to the observed transfer speed. Blocks that do not shrink enough
+are sent uncompressed. Use `--no-compress` to disable transport compression,
+for example when comparing its effect on CPU use and copy speed.
 
 ## Progress
 

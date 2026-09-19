@@ -18,6 +18,8 @@ syq cp [OPTIONS] --src-fd FD --as PATH
 syq cp [OPTIONS] SOURCE --as-fd FD
 ```
 
+<a id="sources-and-selection"></a>
+
 ## Sources and filtering
 
 | Argument / option | Meaning |
@@ -39,6 +41,8 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--min-size <SIZE>` | Skip regular source files smaller than SIZE; --prune protects their destination paths |
 | `[PATH]...` | Named source objects (shorthand for --src) |
 
+<a id="destination-placement"></a>
+
 ## Destination and mapping
 
 | Argument / option | Meaning |
@@ -52,6 +56,8 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--as-new <PATH>` | Map one named source exactly to PATH; its final entry must not exist and is never followed |
 | `--as-existing <PATH>` | Map one named source exactly to PATH; its final entry must exist and is never followed |
 | `--mapping <FILE>` | Copy the entries of a local NDJSON mapping manifest (`-` reads stdin), acquired before destination changes, instead of selecting sources; entry src paths are relative to -C and dst paths are relative to the --into container |
+
+<a id="copy-policy-and-filtering"></a>
 
 ## Updates and deletion
 
@@ -73,6 +79,8 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
 | `--preserve <FEATURE>` | Preserve times, permissions or ownership, or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- times: Preserve modification times (already the default for named destinations)<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files |
 
+<a id="integrity-checking"></a>
+
 ## Verification
 
 | Argument / option | Meaning |
@@ -81,6 +89,10 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--expected-hash <ALGORITHM:HEX>` | Require one regular file to match ALGORITHM:HEX |
 | `--verify-only` | Compare selected contents without writing; fail on differences or inspection errors |
 | `--integrity-checking <KEY=VALUE,...>` | [Comparison and transfer checksums](../integrity-checking.md) |
+
+<a id="ssh-and-transport"></a>
+
+<a id="remote-to-remote-transfers"></a>
 
 ## Connections and remote execution
 
@@ -113,12 +125,20 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--s3-profile <NAME>` | AWS shared configuration/credentials profile |
 | `--s3-header <NAME: VALUE>` | Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused) |
 
+<a id="performance-tuning"></a>
+
+<a id="resource-limits"></a>
+
 ## Performance and resource limits
 
 | Argument / option | Meaning |
 |---|---|
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
 | `--resource-limits <KEY=VALUE,...>` | [Bandwidth and concurrency ceilings](../resource-limits.md) |
+
+<a id="progress-and-results"></a>
+
+<a id="preview-and-output"></a>
 
 ## Preview, progress, and results
 
@@ -146,19 +166,15 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 ## File descriptors
 
-Connect a copy to another program without saving its output in a temporary
-file. For example, compress while uploading, or decompress while downloading:
+`--src-fd 0` reads stdin; `--as-fd 1` writes stdout. Use them to connect local,
+SSH, or S3 copies to [shell pipelines](../reference.md#shell-pipelines-and-file-descriptors).
+Bash process substitution also works with ordinary source syntax:
 
 ```sh
-gzip -c data | syq cp --src-fd 0 --to server --as data.gz
-syq cp --from server data.gz --as-fd 1 | gzip -dc > data
+syq cp --src <(gzip -c data) --to server --as data.gz
 ```
 
-`--src-fd 0` reads stdin; `--as-fd 1` writes stdout. The file can also be local
-or in S3. Bash process substitution works with ordinary source syntax:
-`syq cp --src <(gzip -c data) --to server --as data.gz`.
 Paths such as `/dev/fd/63` refer to descriptors in the local syq process.
-Small writes can be forwarded without filling a transfer block.
 
 Each stream copy takes one source. Stdin and process substitution have no
 filename, so use `--as` to choose one, or `--as-fd` to write to a descriptor.
@@ -179,7 +195,7 @@ If the producer fails halfway through, syq can still successfully save the
 bytes it received: EOF does not tell it whether the producer succeeded.
 Bash's `set -o pipefail` detects failures in a pipeline but cannot undo a file
 already saved. Process substitution needs a separate check of the producer's
-status. In Python, [managed streams](../python-reference.md) let you commit
+status. In Python, [managed streams](https://greaber.github.io/syq/python-reference.html#byte-streams) let you commit
 only after your producer succeeds.
 
 An output descriptor may contain incomplete data after a failure. Check syq's
@@ -195,19 +211,13 @@ unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput
 or an [expected hash](../integrity-checking.md#expected-digests) to check bytes
 during transfer without a second read.
 
+### Selection and previews
+
 `--min-size` and `--max-size` can select a named file or S3 object before reading
 its contents. With a regular-file `--src-fd`, they use the bytes remaining from
 the current offset. A size-filtered skip succeeds and leaves input unread.
 These options require a known length, so pipes, sockets, and devices are rejected
 before reading; syq does not buffer a stream to discover its size.
-
-Native streams accept `request-size`, `pipeline-depth`, and `bw-pacing` tuning.
-S3 uses its [multipart controls](../object-storage.md#descriptor-copies).
-Filesystem streams use parallel data workers over SSH or encrypted TCP, with
-automatic worker tuning as in regular-file copies. `workers=N` fixes the worker
-count; `--no-tcp` keeps data on SSH. S3 transfers one object, with concurrent
-parts. Restart recovery, named receiving destinations, detached execution,
-directory selection, and content comparison are unsupported.
 
 `--only-new` skips a destination that exists; `--only-existing` skips one that
 is missing. Existing directories, S3 key prefixes, and dangling symlinks also
@@ -221,6 +231,19 @@ opening a named pipe, or changing the destination. It cannot check a payload
 hash or predict the length of a pipe. `--results` and `--results-fd` report
 [stream outcomes](../automation.md#stream_result) separately from payload;
 results and payload/completion descriptors must differ.
+
+### Transport and limits
+
+Filesystem streams use parallel data workers over SSH or encrypted TCP, with
+automatic worker tuning as in regular-file copies. They accept `workers`,
+`request-size`, `pipeline-depth`, and `bw-pacing` tuning; `workers=N` fixes the
+worker count, and `--no-tcp` keeps data on SSH. S3 transfers one object using
+its [multipart controls](../object-storage.md#descriptor-copies).
+
+Restart recovery, named receiving destinations, detached execution,
+directory selection, and content comparison are unsupported.
+
+### Descriptor offsets and metadata
 
 Other inherited descriptors work too, except 2, which is reserved for
 diagnostics. Dedicate each descriptor to the copy. Syq advances its offset,
