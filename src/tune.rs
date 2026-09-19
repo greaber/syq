@@ -66,7 +66,7 @@ const PROBE_BACKOFF_MAX: u32 = 3;
 /// the path changes during a long transfer.
 const EVIDENCE_MAX_AGE: usize = PROBE_EVERY * 4;
 /// How often progress is sampled.
-pub const SAMPLE: Duration = Duration::from_millis(2500);
+pub const SAMPLE: Duration = Duration::from_millis(500);
 /// One discarded warm-up interval plus the two samples needed for stability.
 const MEASUREMENT_SAMPLES: f64 = 3.0;
 /// Two consecutive samples this close count as a stable rate.

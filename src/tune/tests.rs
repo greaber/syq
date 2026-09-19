@@ -162,8 +162,8 @@ fn activity_rate_discards_a_regressing_sample() {
 fn remaining_work_requirement_scales_with_rate_not_worker_count() {
     let slow = required_remaining_activity(Some(1_000_000.0), 8, SAMPLE);
     let fast = required_remaining_activity(Some(1_000_000_000.0), 8, SAMPLE);
-    assert_eq!(slow, 7_500_000);
-    assert_eq!(fast, 7_500_000_000);
+    assert_eq!(slow, 1_500_000);
+    assert_eq!(fast, 1_500_000_000);
     assert_eq!(
         required_remaining_activity(None, 8, SAMPLE),
         8 * TAIL_FALLBACK_BYTES_PER_WORKER
