@@ -1148,14 +1148,19 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
                 "1",
                 "--integrity-checking",
                 &format!("transfer={algorithm}"),
-                "--progress-json",
+                "--results",
+                &format!("stream-{algorithm}.ndjson"),
             ],
             "",
         );
         assert_output_ok(&out);
         assert_eq!(out.stdout, payload);
-        let progress: serde_json::Value =
-            serde_json::from_str(stderr_of(&out).lines().last().unwrap()).unwrap();
+        let records = fs::read_to_string(t.path(&format!("stream-{algorithm}.ndjson"))).unwrap();
+        let progress: serde_json::Value = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|record| record["type"] == "progress" && record["files_done"] == 1)
+            .expect("final stream progress");
         assert_eq!(progress["bytes_done"], payload.len());
         assert_eq!(progress["files_done"], 1);
     }

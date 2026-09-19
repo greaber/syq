@@ -40,14 +40,10 @@ fn closed_human_streams_preserve_copy_and_removal_results() {
         for (mode, args, result) in [
             (
                 "copy",
-                vec!["cp", "--src", "src", "--as", "dst", "-v", "--progress-json"],
+                vec!["cp", "--src", "src", "--as", "dst", "-v"],
                 "copy.json",
             ),
-            (
-                "remove",
-                vec!["rm", "dst", "--progress-json"],
-                "remove.json",
-            ),
+            ("remove", vec!["rm", "dst"], "remove.json"),
         ] {
             let output = command(&root)
                 .args(args)

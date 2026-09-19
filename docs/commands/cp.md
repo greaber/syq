@@ -146,7 +146,6 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `-q, --quiet` | Suppress non-error messages |
 | `--progress` | Show progress even when stderr is not a terminal |
 | `--no-progress` | Never show the human progress display |
-| `--progress-json` | Emit machine-readable progress lines (JSON) on stderr |
 | `--stats` | Print transfer statistics, worker waits, endpoint operations and CPU at the end |
 
 ## Help and version

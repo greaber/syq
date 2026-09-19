@@ -687,24 +687,7 @@ fn source_partials_are_copied_and_warned_about() {
         b"ordinary payload"
     );
 
-    let output = syq(&["-a", "--syq-progress-json", &t.s("src/"), &t.s("json-dst/")]);
-    assert_output_ok(&output);
-    let warning = String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|value| value["code"] == "source_partials")
-        .expect("missing structured source-partial warning");
-    assert_eq!(warning["type"], "warning");
-    assert_eq!(warning["count"], 2);
-
-    let quiet = syq(&[
-        "-q",
-        "-v",
-        "-a",
-        "--syq-progress-json",
-        &t.s("src/"),
-        &t.s("quiet-dst/"),
-    ]);
+    let quiet = syq(&["-q", "-v", "-a", &t.s("src/"), &t.s("quiet-dst/")]);
     assert_output_ok(&quiet);
     assert!(
         quiet.stdout.is_empty(),

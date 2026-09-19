@@ -359,6 +359,8 @@ class AutomationDecoder:
                 scan_done=_boolean(record, "scan_done"),
                 elapsed_ms=_integer(record, "elapsed_ms"),
                 activity=record.get("activity"),
+                rate_bytes_per_second=_optional_integer(record, "rate_bytes_per_second"),
+                eta_ms=_optional_integer(record, "eta_ms"),
             )
         if record_type == "trace":
             if self.run.mode != "cp":

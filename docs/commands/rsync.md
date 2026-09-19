@@ -99,7 +99,6 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 |---|---|
 | `--progress` | Show progress (default when stderr is a terminal) |
 | `--no-progress` | Never show progress |
-| `--syq-progress-json` | Syq extension: emit machine-readable progress lines (JSON) on stderr |
 | `--stats` | Print transfer statistics, worker waits, endpoint operations and CPU at the end |
 
 ## Sources and selection

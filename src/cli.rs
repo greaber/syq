@@ -277,9 +277,6 @@ pub struct Args {
     /// No-op accepted for rsync compatibility (syq always keeps partial files)
     #[arg(long)]
     pub partial: bool,
-    /// Syq extension: emit machine-readable progress lines (JSON) on stderr
-    #[arg(long = "syq-progress-json")]
-    pub progress_json: bool,
     /// Print transfer statistics, worker waits, endpoint operations and CPU at the end
     #[arg(long)]
     pub stats: bool,
@@ -994,9 +991,6 @@ struct NativeOperationalArgs {
     /// Never show the human progress display
     #[arg(long)]
     no_progress: bool,
-    /// Emit machine-readable progress lines (JSON) on stderr
-    #[arg(long)]
-    progress_json: bool,
 }
 
 #[derive(clap::Args, Debug, Default)]
@@ -1714,7 +1708,6 @@ fn parse_descriptor_copy(
                 | "stats"
                 | "verbose"
                 | "progress"
-                | "progress_json"
                 | "quiet"
                 | "no_progress"
                 | "follow_src"
@@ -2454,7 +2447,6 @@ fn apply_native_operational(args: &mut Args, operational: NativeOperationalArgs)
     args.performance_tuning = operational.performance_tuning;
     args.progress = operational.progress;
     args.no_progress = operational.no_progress;
-    args.progress_json = operational.progress_json;
 }
 
 #[cfg(test)]

@@ -1033,9 +1033,6 @@ fn run_remote(
         remote.push("--rsh".into());
         remote.push(remote_shell);
     }
-    if args.progress_json && !args.quiet {
-        remote.push("--progress-json".into());
-    }
     if args.no_progress || args.quiet {
         remote.push("--no-progress".into());
     } else if args.progress {
@@ -1089,15 +1086,9 @@ fn run_remote(
     ));
 
     if args.detach {
-        // Detached: log JSON progress instead of a live display.
-        remote.retain(|a| {
-            a != "--progress"
-                && a != "--no-progress"
-                && a != "--progress-json"
-                && !a.starts_with("--width=")
-        });
+        // Detached: keep a text log without a live progress display.
+        remote.retain(|a| a != "--progress" && a != "--no-progress" && !a.starts_with("--width="));
         remote.insert(1, "--no-progress".into());
-        remote.insert(1, "--progress-json".into());
         remote.insert(1, "-v".into());
     }
     // A detached launcher returns before the background syq execs, so a

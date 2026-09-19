@@ -169,7 +169,7 @@ fn hash_policy_automation_digest_schema_checks_algorithm_and_width() {
 }
 
 #[test]
-fn progress_bar_does_not_mix_with_json_progress() {
+fn progress_bar_does_not_mix_with_results() {
     let t = Tmp::new();
     write(&t.path("src"), &prng(1024 * 1024, 452));
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
@@ -179,20 +179,29 @@ fn progress_bar_does_not_mix_with_json_progress() {
             "--as",
             &t.s("dst"),
             "--progress",
-            "--progress-json",
+            "--results",
+            &t.s("results.ndjson"),
             "--resource-limits",
             "bandwidth=1M",
         ])
         .run()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(!stderr.is_empty());
-    for line in stderr.lines() {
-        let value: serde_json::Value =
-            serde_json::from_str(line).expect("JSON without a terminal bar");
-        assert!(value["bytes_done"].is_u64(), "{line}");
-    }
+    assert!(!out.stderr.is_empty(), "forced human progress is shown");
+    let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results.ndjson"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.last().unwrap()["status"], "success");
+    let samples: Vec<_> = records.iter().filter(|r| r["type"] == "progress").collect();
+    assert!(samples.len() >= 2, "live and final progress: {records:?}");
+    assert!(samples.iter().all(|r| r["rate_bytes_per_second"].is_u64()));
+    assert!(samples
+        .iter()
+        .any(|r| r["rate_bytes_per_second"].as_u64().unwrap() > 0));
+    assert_eq!(samples.last().unwrap()["bytes_done"], 1024 * 1024);
+    assert_eq!(read(&t.path("src")), read(&t.path("dst")));
 }
 
 #[cfg(all(target_os = "linux", debug_assertions))]
@@ -1351,4 +1360,21 @@ fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["connections"][0]["receiving"]["error"], error);
     server.join().unwrap();
+}
+
+#[test]
+fn removed_progress_json_options_are_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"keep");
+    for command in ["cp", "rm", "clean-partials", "rsync"] {
+        let flag = if command == "rsync" {
+            "--syq-progress-json"
+        } else {
+            "--progress-json"
+        };
+        let out = native_syq(&[command, flag, &t.s("src")]);
+        assert_eq!(out.status.code(), Some(2), "{command}: {}", stderr_of(&out));
+        assert!(stderr_of(&out).contains(flag));
+        assert_eq!(read(&t.path("src")), b"keep");
+    }
 }

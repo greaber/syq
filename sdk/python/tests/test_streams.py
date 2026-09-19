@@ -48,9 +48,9 @@ class StreamTests(unittest.TestCase):
                 resource_limits="bandwidth=1M", performance_tuning="request-size=8K") as out:
             out.write(payload)
         self.assertIn(b"stream complete", out.stderr)
-        with self.client.open_reader(target, progress_json=True) as source:
+        with self.client.open_reader(target, stats=True) as source:
             self.assertEqual(source.read(), payload)
-        self.assertEqual(json.loads(source.stderr.splitlines()[-1])["files_done"], 1)
+        self.assertIn(b"stream complete", source.stderr)
         async def asynchronous():
             client = syq.AsyncClient(executable=SYQ, env=self.env, timeout=10)
             async with client.open_writer(as_=target,
@@ -58,16 +58,16 @@ class StreamTests(unittest.TestCase):
                 await out.write(payload)
             self.assertIn(b"stream complete", out.stderr)
             async with client.open_reader(target,
-                    integrity_checking="transfer=md5", progress_json=True) as source:
+                    integrity_checking="transfer=md5", stats=True) as source:
                 self.assertEqual(await source.read(), payload)
-            self.assertEqual(json.loads(source.stderr.splitlines()[-1])["files_done"], 1)
+            self.assertIn(b"stream complete", source.stderr)
         asyncio.run(asynchronous())
 
     def test_removed_stream_options_are_rejected(self):
-        for option in ("expected_hash", "expected_digest", "min_size", "max_size"):
+        for option in ("expected_hash", "expected_digest", "min_size", "max_size", "progress_json"):
             with self.subTest(option=option), self.assertRaises(TypeError):
                 self.client.open_reader("missing", **{option: "1"})
-        for option in ("--expected-hash=md5:" + "0" * 32, "--min-size=1", "--max-size=1"):
+        for option in ("--expected-hash=md5:" + "0" * 32, "--min-size=1", "--max-size=1", "--progress-json"):
             inherited = syq.Client(executable=SYQ, env={**self.env, "SYQ_CP_OPTIONS": option})
             with self.subTest(option=option), self.assertRaises(syq.SyqProcessError):
                 inherited.open_writer(as_=self.root / "missing")

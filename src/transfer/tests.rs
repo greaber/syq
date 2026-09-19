@@ -262,7 +262,7 @@ fn pipeline_worker(
         src: Box::new(PipelineConn(src.clone())),
         dst: Box::new(PipelineConn(dst.clone())),
         sched: sched.clone(),
-        progress: Progress::new(false, false, None, false),
+        progress: Progress::new(false, false, None),
         opts,
         bwlimit: None,
         gate: Gate::new(1),
