@@ -72,17 +72,23 @@ fn checksum_repairs_silent_corruption() {
 #[cfg(debug_assertions)]
 fn hash_policy_verify_only_expected_mismatch_exits() {
     let t = Tmp::new();
-    write(&t.path("source"), b"abc");
+    write(&t.path("src/source"), b"abc");
     write(&t.path("destination"), b"abc");
     let child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            &t.s("source"),
-            "--as",
-            &t.s("destination"),
+            "--mapping",
+            &expected_mapping(
+                &t,
+                "source",
+                "destination",
+                Some("md5:00000000000000000000000000000000"),
+            ),
+            "-C",
+            &t.s("src"),
+            "--into",
+            &t.s(""),
             "--verify-only",
-            "--expected-hash",
-            "md5:00000000000000000000000000000000",
             "--results",
             &t.s("results.ndjson"),
         ])
@@ -110,14 +116,14 @@ fn hash_policy_independent_compare_and_payload_hashes_cross_transports() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     let data = prng(5 * 1024 * 1024 + 13, 999);
-    write(&t.path("source"), &data);
+    write(&t.path("src/source"), &data);
     for tcp in [false, true] {
         for path in ["ranges", "streaming"] {
             let destination = format!("destination-{tcp}-{path}");
             let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
             command.args([
                 "cp",
-                &t.s("source"),
+                &t.s("src/source"),
                 "--to",
                 "fake",
                 "--as",
@@ -148,7 +154,7 @@ fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
     let t = Tmp::new();
     // Three default 4 MiB hash blocks; only the last block differs.
     let contents = prng(12 << 20, 1000);
-    write(&t.path("source"), &contents);
+    write(&t.path("src/source"), &contents);
     for (compare, transfer) in [("blake3", "sha256"), ("xxh3-128", "blake3")] {
         let results = t.s(&format!("results-{compare}-{transfer}.ndjson"));
         let mut previous = contents.clone();
@@ -156,7 +162,7 @@ fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
         write(&t.path("destination"), &previous);
         let output = native_syq(&[
             "cp",
-            &t.s("source"),
+            &t.s("src/source"),
             "--as",
             &t.s("destination"),
             "--performance-tuning=workers=1,copy-path=ranges",
@@ -177,22 +183,28 @@ fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
 #[test]
 fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
     let t = Tmp::new();
-    write(&t.path("source"), b"abc");
+    write(&t.path("src/source"), b"abc");
     write(&t.path("destination"), b"abc");
-    set_mtime(&t.path("source"), 1_700_000_000);
+    set_mtime(&t.path("src/source"), 1_700_000_000);
     set_mtime(&t.path("destination"), 1_700_000_000);
-    fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o640)).unwrap();
+    fs::set_permissions(t.path("src/source"), fs::Permissions::from_mode(0o640)).unwrap();
     fs::set_permissions(t.path("destination"), fs::Permissions::from_mode(0o600)).unwrap();
     let inode = fs::metadata(t.path("destination")).unwrap().ino();
     let copy = |results: &str| {
         let output = native_syq(&[
             "cp",
-            &t.s("source"),
-            "--as",
-            &t.s("destination"),
+            "--mapping",
+            &expected_mapping(
+                &t,
+                "source",
+                "destination",
+                Some("md5:900150983cd24fb0d6963f7d28e17f72"),
+            ),
+            "-C",
+            &t.s("src"),
+            "--into",
+            &t.s(""),
             "--preserve=permissions",
-            "--expected-hash",
-            "md5:900150983cd24fb0d6963f7d28e17f72",
             "--results",
             &t.s(results),
         ]);
@@ -214,16 +226,22 @@ fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
     assert_eq!(read(&t.path("destination")), b"abc");
     // --hash must still compare source contents even when the expectation
     // matches the destination and metadata agrees.
-    write(&t.path("source"), b"bad");
-    set_mtime(&t.path("source"), 1_700_000_000);
+    write(&t.path("src/source"), b"bad");
+    set_mtime(&t.path("src/source"), 1_700_000_000);
     let output = native_syq(&[
         "cp",
         "--hash",
-        &t.s("source"),
-        "--as",
-        &t.s("destination"),
-        "--expected-hash",
-        "md5:900150983cd24fb0d6963f7d28e17f72",
+        "--mapping",
+        &expected_mapping(
+            &t,
+            "source",
+            "destination",
+            Some("md5:900150983cd24fb0d6963f7d28e17f72"),
+        ),
+        "-C",
+        &t.s("src"),
+        "--into",
+        &t.s(""),
     ]);
     assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
     assert_eq!(read(&t.path("destination")), b"abc");
@@ -238,7 +256,7 @@ fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
     }
     let t = Tmp::new();
     let contents = prng(5 << 20, 993);
-    write(&t.path("source"), &contents);
+    write(&t.path("src/source"), &contents);
     let correct = format!("blake3:{}", blake3::hash(&contents).to_hex());
     let wrong = format!("blake3:{}", "0".repeat(64));
     for (name, expected, succeeds) in [
@@ -250,14 +268,14 @@ fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command.args([
             "cp",
-            &t.s("source"),
-            "--as",
-            &t.s(name),
+            "--mapping",
+            &expected_mapping(&t, "source", name, expected),
+            "-C",
+            &t.s("src"),
+            "--into",
+            &t.s(""),
             "--integrity-checking=transfer=xxh3-128",
         ]);
-        if let Some(expected) = expected {
-            command.args(["--expected-hash", expected]);
-        }
         let output = command
             .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_FAIL_READ_RANGE", "1")
@@ -285,16 +303,21 @@ fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
 fn hash_policy_expected_mismatch_preserves_destination() {
     for size in [3, 5 * 1024 * 1024] {
         let t = Tmp::new();
-        write(&t.path("source"), &vec![b'n'; size]);
+        write(&t.path("src/source"), &vec![b'n'; size]);
         write(&t.path("destination"), b"previous contents");
         let output = native_syq(&[
             "cp",
-            "--src",
-            &t.s("source"),
-            "--as",
-            &t.s("destination"),
-            "--expected-hash",
-            "md5:00000000000000000000000000000000",
+            "--mapping",
+            &expected_mapping(
+                &t,
+                "source",
+                "destination",
+                Some("md5:00000000000000000000000000000000"),
+            ),
+            "-C",
+            &t.s("src"),
+            "--into",
+            &t.s(""),
             "--results",
             &t.s("results.ndjson"),
         ]);
@@ -319,7 +342,7 @@ fn hash_policy_expected_mismatch_preserves_destination() {
             })
             .unwrap();
         assert_eq!(
-            failed["expected_digest"],
+            failed["expected_hash"],
             serde_json::json!({"algorithm": "md5", "value": "0".repeat(32)})
         );
     }
@@ -328,15 +351,20 @@ fn hash_policy_expected_mismatch_preserves_destination() {
 #[test]
 fn hash_policy_expected_empty_file_is_checked_before_publication() {
     let t = Tmp::new();
-    write(&t.path("empty"), b"");
+    write(&t.path("src/empty"), b"");
     run_native_ok(&[
         "cp",
-        "--src",
-        &t.s("empty"),
-        "--as",
-        &t.s("good"),
-        "--expected-hash",
-        "md5:d41d8cd98f00b204e9800998ecf8427e",
+        "--mapping",
+        &expected_mapping(
+            &t,
+            "empty",
+            "good",
+            Some("md5:d41d8cd98f00b204e9800998ecf8427e"),
+        ),
+        "-C",
+        &t.s("src"),
+        "--into",
+        &t.s(""),
         "--integrity-checking",
         "compare=xxh3-128",
         "--integrity-checking=transfer=blake3",
@@ -344,12 +372,17 @@ fn hash_policy_expected_empty_file_is_checked_before_publication() {
     assert_eq!(read(&t.path("good")), b"");
     let output = native_syq(&[
         "cp",
-        "--src",
-        &t.s("empty"),
-        "--as",
-        &t.s("bad"),
-        "--expected-hash",
-        "md5:00000000000000000000000000000000",
+        "--mapping",
+        &expected_mapping(
+            &t,
+            "empty",
+            "bad",
+            Some("md5:00000000000000000000000000000000"),
+        ),
+        "-C",
+        &t.s("src"),
+        "--into",
+        &t.s(""),
     ]);
     assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
     assert!(
@@ -364,17 +397,23 @@ fn hash_policy_xxh3_compares_repairs_and_verifies() {
     let contents = prng(5 * 1024 * 1024, 992);
     let mut bad = contents.clone();
     bad[1_234_567] ^= 1;
-    write(&t.path("source"), &contents);
+    write(&t.path("src/source"), &contents);
     write(&t.path("destination"), &bad);
-    set_mtime(&t.path("source"), 1_600_000_000);
+    set_mtime(&t.path("src/source"), 1_600_000_000);
     set_mtime(&t.path("destination"), 1_600_000_000);
     // The default metadata comparison cannot detect this same-size, same-time edit.
-    run_native_ok(&["cp", "--src", &t.s("source"), "--as", &t.s("destination")]);
+    run_native_ok(&[
+        "cp",
+        "--src",
+        &t.s("src/source"),
+        "--as",
+        &t.s("destination"),
+    ]);
     assert_eq!(read(&t.path("destination")), bad);
     run_native_ok(&[
         "cp",
         "--src",
-        &t.s("source"),
+        &t.s("src/source"),
         "--as",
         &t.s("destination"),
         "--integrity-checking",
@@ -386,7 +425,7 @@ fn hash_policy_xxh3_compares_repairs_and_verifies() {
         "cp",
         "--verify-only",
         "--src",
-        &t.s("source"),
+        &t.s("src/source"),
         "--as",
         &t.s("destination"),
         "--integrity-checking",
@@ -397,7 +436,7 @@ fn hash_policy_xxh3_compares_repairs_and_verifies() {
         "cp",
         "--verify-only",
         "--src",
-        &t.s("source"),
+        &t.s("src/source"),
         "--as",
         &t.s("destination"),
         "--integrity-checking",
@@ -808,4 +847,23 @@ fn native_verify_only_compares_contents_without_mutations() {
         assert!(!out.status.success());
         assert!(!t.path("absent").exists());
     }
+}
+
+pub(super) fn expected_mapping(
+    t: &Tmp,
+    source: &str,
+    destination: &str,
+    expected: Option<&str>,
+) -> String {
+    let mut entry = serde_json::json!({
+        "src": {"encoding": "utf-8", "value": source},
+        "dst": {"encoding": "utf-8", "value": destination}, "kind": "file"
+    });
+    if let Some(expected) = expected {
+        let (algorithm, value) = expected.split_once(':').unwrap();
+        entry["expected_hash"] = serde_json::json!({"algorithm": algorithm, "value": value});
+    }
+    let path = format!("{destination}.mapping");
+    write(&t.path(&path), entry.to_string().as_bytes());
+    t.s(&path)
 }

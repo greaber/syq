@@ -22,7 +22,7 @@ pub(super) struct Source {
     pub meta: RootMetadata,
     pub key: String,
     pub label: Vec<u8>,
-    pub expected_digest: Option<crate::hashing::Digest>,
+    pub expected_hash: Option<crate::hashing::Digest>,
     // Keep a selected leaf alive so an unlink cannot recycle its inode.
     _pin: Option<Arc<File>>,
 }
@@ -200,7 +200,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                 join(&target, &key_path(&entry.dst)?),
                 SourceSelection::Named,
                 entry.kind,
-                entry.expected_digest,
+                entry.expected_hash,
             ));
         }
     } else {
@@ -227,7 +227,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
     }
     let mut out = Vec::new();
     let mut claims = BTreeMap::new();
-    for (path, destination, selection, declared_kind, expected_digest) in selectors {
+    for (path, destination, selection, declared_kind, expected_hash) in selectors {
         let resolved = crate::fsops::resolve(&path);
         let pinned = if resolved.is_absolute() {
             if args.native_source_root.is_some() {
@@ -262,7 +262,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                     meta,
                     key: destination,
                     label: path,
-                    expected_digest,
+                    expected_hash,
                     _pin: None,
                 }
             }
@@ -274,7 +274,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                     meta,
                     key: destination,
                     label: path,
-                    expected_digest,
+                    expected_hash,
                     _pin: pin.map(Arc::new),
                 }
             }
@@ -293,7 +293,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                 bail!("source type does not match mapping");
             }
         }
-        if source.expected_digest.is_some() && source.kind() != ObjectKind::File {
+        if source.expected_hash.is_some() && source.kind() != ObjectKind::File {
             bail!("an expected digest requires a regular file");
         }
         if args.delete

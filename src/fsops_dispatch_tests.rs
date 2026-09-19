@@ -330,7 +330,7 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
         flags: 0,
         condition: TargetCondition::Absent,
         guard: None,
-        expected_digest: None,
+        expected_hash: None,
     });
     assert!(matches!(reply, Response::Ok), "{reply:?}");
     assert_eq!(fs::read(dir.path().join(&name)).unwrap(), b"new data");

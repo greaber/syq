@@ -65,7 +65,7 @@ fn remote_manifest_cannot_inject_digest_protocol_framing() {
     setup_release_bootstrap(&t);
 
     let archive = read(&t.path("release.gz"));
-    let expected_digest = sha256_hex(&archive);
+    let expected_hash = sha256_hex(&archive);
     let mut alternate_archive = archive;
     alternate_archive[4] ^= 1;
     let mut decoded = Vec::new();
@@ -77,7 +77,7 @@ fn remote_manifest_cannot_inject_digest_protocol_framing() {
 
     let mut injected_manifest = read(&t.path("release-manifest.json"));
     injected_manifest.extend_from_slice(
-        format!("\nsyq-helper-manifest-end\nsyq-helper-sha256:{expected_digest}\n").as_bytes(),
+        format!("\nsyq-helper-manifest-end\nsyq-helper-sha256:{expected_hash}\n").as_bytes(),
     );
     write(&t.path("injected-manifest.json"), &injected_manifest);
 
@@ -1151,7 +1151,7 @@ const DOC_JQ_RETRY_GATE: &str = r#"if (.[-1].type? // "") != "result"
                           and .disposition == "failed"
                           and .retryable != "no")
              | {src, dst, kind}
-               + (if has("expected_digest") then {expected_digest} else {} end)
+               + (if has("expected_hash") then {expected_hash} else {} end)
         end"#;
 
 /// Assert the doc contains the complete invocation — flags included — that
@@ -1253,7 +1253,7 @@ fn mappings_md_retry_gate_example_works_verbatim() {
     });
     let mut missing: serde_json::Value =
         serde_json::from_str(&entry_line("gone.txt", "g.txt", None)).unwrap();
-    missing["expected_digest"] = expected.clone();
+    missing["expected_hash"] = expected.clone();
     let manifest = format!("{missing}\n{}", entry_line("ok.txt", "ok.txt", None));
     let cp = syq_cp_in(
         &t.path(""),
@@ -1278,7 +1278,7 @@ fn mappings_md_retry_gate_example_works_verbatim() {
     assert!(out.status.success());
     let retry: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one retry entry");
     assert_eq!(retry["dst"]["value"], "g.txt");
-    assert_eq!(retry["expected_digest"], expected);
+    assert_eq!(retry["expected_hash"], expected);
     // The emitted entry executes as a mapping after the source appears.
     write(&t.path("src/gone.txt"), b"late");
     let cp = syq_cp_in(

@@ -166,7 +166,7 @@ pub(super) fn grant_for(
         DestinationPlacement::ExactPath | DestinationPlacement::DirectoryContents => {
             vec![MutationScope {
                 path: destination_bytes.clone(),
-                descendants: args.recursive && args.expected_digest.is_none(),
+                descendants: args.recursive && args.expected_hash.is_none(),
             }]
         }
         DestinationPlacement::DirectoryAsChild => {
@@ -181,7 +181,7 @@ pub(super) fn grant_for(
                 }
                 scopes.push(MutationScope {
                     path: crate::fsops::join(&destination_bytes, &basename),
-                    descendants: args.recursive && args.expected_digest.is_none(),
+                    descendants: args.recursive && args.expected_hash.is_none(),
                 });
             }
             scopes
@@ -380,7 +380,7 @@ pub(crate) fn prepare_transfer(
     };
     let receipt_policy = crate::receipt::ReceiptPolicy {
         required: true,
-        hashed: args.receiver_receipt == Some(crate::cli::ReceiptDetail::Digests),
+        hashed: args.receiver_receipt == Some(crate::cli::ReceiptDetail::Hashes),
         max_records: crate::receipt::DEFAULT_MAX_RECORDS,
         max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
         delivery: receipt_delivery,

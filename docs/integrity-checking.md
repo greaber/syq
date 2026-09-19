@@ -17,7 +17,7 @@ syq cp data --into backup --integrity-checking compare=blake3,transfer=sha256
 
 BLAKE3 and SHA-256 are cryptographic hashes. MD5 supports existing manifests;
 XXH3-128 is a noncryptographic checksum. Use BLAKE3 or SHA-256 with an expected
-digest from a trusted source to check authenticity; see [code and transport integrity](security.md#code-and-transport-integrity).
+hash from a trusted source to check authenticity; see [code and transport integrity](security.md#code-and-transport-integrity).
 
 ## Comparison
 
@@ -50,50 +50,33 @@ SSH and encrypted TCP retain their transport authentication independently.
 `--tcp-plain` does not enable payload checks automatically, and checksums do
 not authenticate plaintext traffic.
 
-For a complete check of a local copy, use an [expected digest](#expected-digests).
+For a complete check of a local copy, use an [expected hash](#expected-hashes).
 
 For local/S3 copies, provider request checksums remain enabled. The `transfer`
-algorithm records a whole-file digest on upload and checks stored digests on
-download when present. Use an expected digest for objects without a stored
-digest. See [S3 metadata and integrity](object-storage.md#filesystem-differences).
+algorithm records a whole-file hash on upload and checks stored hashes on
+download when present. Use an expected hash for objects without a stored
+hash. See [S3 metadata and integrity](object-storage.md#filesystem-differences).
 
-Server-side S3 copies preserve stored digests without reading or verifying
+Server-side S3 copies preserve stored hashes without reading or verifying
 object bodies. They do not support content-hash comparison, extra transfer
-hashing, expected digests, or `--verify-only`.
+hashing, expected hashes, or `--verify-only`.
 
 Descriptor copies use the same optional payload checks as regular-file
 copies: `transfer=ALGORITHM` enables them and selects the hash. Raw S3 streams keep
-provider checksums but do not store syq digest metadata, so they cannot use
-that metadata for extra verification. Use a known expected hash instead.
-Neither backend rereads the object after transfer by default.
+provider checksums but do not store syq hash metadata, so they cannot use
+that metadata for extra verification. Neither backend rereads the object after transfer by default.
 
-## Expected digests
+## Expected hashes
 
-To require a particular whole-file digest, use `--expected-hash ALGORITHM:HEX`
-with one named regular file or a descriptor stream:
+Supply `expected_hash` on individual [mapping entries](mappings.md#the-format)
+to require known whole-file contents. The expectation includes its algorithm
+and hexadecimal value, independently of the comparison and transfer settings.
 
-```sh
-syq cp data.bin --as backup.bin --expected-hash md5:900150983cd24fb0d6963f7d28e17f72
-```
-
-This checks all resulting bytes, including reused data, before reporting success.
-When size and modification time match, syq validates the existing destination and skips copying if its digest matches.
-Otherwise it copies and validates the result; a mismatch fails that file. With normal
-staging, validation happens before replacing the destination. With `--inplace`,
-the file has already been modified when validation finishes. Use
-[per-file mapping expectations](mappings.md#the-format) for a batch. Selection
-filters still apply.
-The expected digest's algorithm can differ from either integrity-checking hash type. Dry runs
-preview changes without validating the expectation.
-
-For descriptor input, syq checks the digest as bytes arrive and refuses to
-publish a named destination if it differs. For descriptor output, bytes have
-already reached the consumer when a mismatch is reported. Always check the
-exit status; syq cannot retract those bytes. No second pass is needed.
-
-The algorithms are `blake3`, `sha256`, `md5`, and `xxh3-128`. Supply 64 hex
-digits for BLAKE3 or SHA-256, and 32 for MD5 or XXH3-128. In `syq rsync`, use
-`--syq-expected-hash ALGORITHM:HEX`.
+Syq checks the complete result, including reused bytes. A mismatch fails the
+file. With normal staging, checking happens before replacing the destination;
+with `--inplace`, the destination has already been modified. Matching size and
+time allow syq to check the existing destination first and skip copying if its
+hash matches. Selection filters still apply. Dry runs do not check expectations.
 
 ## Compare without copying
 

@@ -211,7 +211,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 "results" | "results_fd" | "progress" | "no_progress" | "progress_json"
                 | "stats" => "Progress and results",
                 "resource_limits_arg" => "Resource limits",
-                "integrity_checking_arg" | "hash" | "expected_digest" => "Integrity checking",
+                "integrity_checking_arg" | "hash" | "expected_hash" => "Integrity checking",
                 "performance_tuning" | "block_size" => "Performance tuning",
                 "auth_from" | "via" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp"
                 | "tcp_plain" | "tcp_ports" | "tcp_congestion" | "pscope" | "compress"
@@ -275,9 +275,7 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
             ("Updates and deletion", 2)
         }
         "preserve" | "follow" | "follow_src" | "follow_dst" => ("Metadata and symlinks", 3),
-        "verify_only" | "integrity_checking_arg" | "hash" | "expected_digest" => {
-            ("Verification", 4)
-        }
+        "verify_only" | "integrity_checking_arg" | "hash" | "expected_hash" => ("Verification", 4),
         "auth_from"
         | "via"
         | "rsh"

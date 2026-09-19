@@ -25,7 +25,7 @@ def manifest(entries, expected=None):
     for src, dst, kind in entries:
         record = {"src": {"encoding": "utf-8", "value": src}, "dst": {"encoding": "utf-8", "value": dst}, "kind": kind}
         if expected is not None:
-            record["expected_digest"] = expected
+            record["expected_hash"] = expected
         records.append(json.dumps(record) + "\n")
     return "".join(records).encode()
 
@@ -41,20 +41,20 @@ def hashing(root, source, temporary):
     for name, flags in [("encrypted", []), ("plain", ["--tcp-plain"])]:
         print(f"hash policy: ordinary {name} TCP", flush=True)
         destination = root + "/hash-" + name
-        command = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=1", str(local), "--to", "destination", "--as", destination,
+        command = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=1", "-C", str(local.parent), "--mapping", "-", "--to", "destination", "--into", root,
                    "--integrity-checking", "compare=xxh3-128", "--integrity-checking=transfer=blake3", "--performance-tuning", "copy-path=ranges"] + flags
-        run(command + ["--expected-hash", "sha256:" + sha256])
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "sha256", "value": sha256}))
         results = str(Path(temporary) / ("hash-repeat-" + name + ".ndjson"))
-        run(command + ["--expected-hash", "sha256:" + sha256, "--results", results])
+        run(command + ["--results", results], data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "sha256", "value": sha256}))
         summary = json.loads(Path(results).read_text().splitlines()[-1])
         assert summary["files_unchanged"] == 1 and summary["bytes_transferred"] == 0, summary
         # compare=xxh3-128 checks the existing file with the selected algorithm.
-        run(command + ["--expected-hash", "md5:" + md5])
-        run(command + ["--expected-hash", "md5:" + wrong_md5], expected=23)
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "md5", "value": md5}))
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "md5", "value": wrong_md5}), expected=23)
         ssh("destination", f"from pathlib import Path; import hashlib; assert hashlib.sha256(Path({destination!r}).read_bytes()).hexdigest()=={sha256!r}")
         # A changed target must remain intact when staged validation fails.
         ssh("destination", f"from pathlib import Path; Path({destination!r}).write_bytes(b'keep existing')")
-        run(command + ["--expected-hash", "md5:" + wrong_md5], expected=23)
+        run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "md5", "value": wrong_md5}), expected=23)
         ssh("destination", f"from pathlib import Path; assert Path({destination!r}).read_bytes()==b'keep existing'")
 
     print("hash policy: signed mapping with independent expected digest", flush=True)

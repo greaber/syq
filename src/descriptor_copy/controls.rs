@@ -128,7 +128,7 @@ impl Controls {
             pipeline: tuning.pipeline_depth(),
             progress,
             limit,
-            expected: args.expected_digest.clone(),
+            expected: args.expected_hash.clone(),
             stats: args.stats,
             quiet: args.quiet,
         }

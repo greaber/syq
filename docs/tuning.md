@@ -6,6 +6,10 @@ Leave performance tuning unset for everyday copies. These experimental controls
 are available in `syq cp` and `syq rsync`; `syq rm` and `syq clean-partials` accept
 only `workers` for filesystem removal.
 
+Performance-tuning keys, accepted values, and behavior may change or be removed
+between releases without deprecation. Pin the syq version when a script depends
+on these overrides.
+
 ## Transfer controls
 
 `syq cp` and `syq rsync` accept `--performance-tuning`. Supply

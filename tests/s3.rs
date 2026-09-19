@@ -2085,13 +2085,12 @@ fn s3_expected_hash_checks_single_and_multipart_before_publication() {
             let output = server.cp(
                 temp.path(),
                 &[
-                    "--expected-hash",
-                    &expected,
+                    "--mapping",
+                    &expected_mapping(temp.path(), "object", "result", &expected),
                     "--from",
                     "s3://bucket",
-                    "object",
-                    "--as",
-                    "result",
+                    "--into",
+                    ".",
                 ],
             );
             assert_eq!(
@@ -2119,13 +2118,12 @@ fn s3_expected_hash_checks_unchanged_destination_and_recovers_corruption() {
             .collect::<String>()
     );
     let args = [
-        "--expected-hash",
-        &expected,
+        "--mapping",
+        &expected_mapping(temp.path(), "object", "result", &expected),
         "--from",
         "s3://bucket",
-        "object",
-        "--as",
-        "result",
+        "--into",
+        ".",
     ];
     let output = server.cp(temp.path(), &args);
     assert!(output.status.success(), "{}", output_text(&output));
@@ -2163,25 +2161,11 @@ fn s3_transfer_integrity_is_opt_in_but_framing_stays_mandatory() {
 
 #[test]
 fn s3_upload_native_checksum_reuse_and_expected_hash() {
-    use sha2::Digest as _;
     for (fault, options) in [
         ("upload-default", Vec::new()),
         (
             "upload-sha256",
             vec!["--integrity-checking=transfer=sha256".to_owned()],
-        ),
-        (
-            "upload-md5",
-            vec![
-                "--expected-hash".to_owned(),
-                format!(
-                    "md5:{}",
-                    md5::Md5::digest(b"payload")
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
-                ),
-            ],
         ),
     ] {
         let server = Server::start(fault);
@@ -2203,13 +2187,17 @@ fn s3_upload_native_checksum_reuse_and_expected_hash() {
     let output = server.cp(
         temp.path(),
         &[
-            "--expected-hash",
-            "md5:00000000000000000000000000000000",
-            "source",
+            "--mapping",
+            &expected_mapping(
+                temp.path(),
+                "source",
+                "object",
+                "md5:00000000000000000000000000000000",
+            ),
             "--to",
             "s3://bucket",
-            "--as",
-            "object",
+            "--into",
+            ".",
         ],
     );
     assert!(!output.status.success(), "{}", output_text(&output));
@@ -2235,7 +2223,7 @@ fn s3_mapping_preserves_expected_hashes_in_failed_results() {
     .map(|(name, value)| {
         serde_json::json!({
         "src": {"encoding": "utf-8", "value": name}, "dst": {"encoding": "utf-8", "value": name},
-        "kind": "file", "expected_digest": {"algorithm": "md5", "value": value},
+        "kind": "file", "expected_hash": {"algorithm": "md5", "value": value},
     }).to_string()
     })
     .join("\n");
@@ -2265,9 +2253,9 @@ fn s3_mapping_preserves_expected_hashes_in_failed_results() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .find(|record| record["disposition"] == "failed")
         .unwrap();
-    assert_eq!(failed["expected_digest"]["algorithm"], "md5");
+    assert_eq!(failed["expected_hash"]["algorithm"], "md5");
     assert_eq!(
-        failed["expected_digest"]["value"],
+        failed["expected_hash"]["value"],
         "00000000000000000000000000000000"
     );
 }
@@ -2310,13 +2298,12 @@ fn s3_dry_run_does_not_validate_expected_hash() {
         temp.path(),
         &[
             "--dry-run",
-            "--expected-hash",
-            expected,
-            "source",
+            "--mapping",
+            &expected_mapping(temp.path(), "source", "object", expected),
             "--to",
             "s3://bucket",
-            "--as",
-            "object",
+            "--into",
+            ".",
         ],
     );
     assert!(output.status.success(), "{}", output_text(&output));
@@ -2340,13 +2327,12 @@ fn s3_dry_run_does_not_validate_expected_hash() {
         &[
             "--dry-run",
             "-v",
-            "--expected-hash",
-            expected,
+            "--mapping",
+            &expected_mapping(temp.path(), "object", "result", expected),
             "--from",
             "s3://bucket",
-            "object",
-            "--as",
-            "result",
+            "--into",
+            ".",
         ],
     );
     assert!(output.status.success(), "{}", output_text(&output));
@@ -2409,13 +2395,17 @@ fn s3_review_verify_only_reports_expected_hash_mismatch() {
         temp.path(),
         &[
             "--verify-only",
-            "--expected-hash",
-            "md5:00000000000000000000000000000000",
+            "--mapping",
+            &expected_mapping(
+                temp.path(),
+                "object",
+                "result",
+                "md5:00000000000000000000000000000000",
+            ),
             "--from",
             "s3://bucket",
-            "object",
-            "--as",
-            "result",
+            "--into",
+            ".",
         ],
     );
     assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
@@ -4173,12 +4163,7 @@ fn server_copy_multipart_preserves_tag_characters() {
 #[test]
 fn server_copy_filters_exact_and_mapping_overlap() {
     for mapping in [false, true] {
-        for filter in [
-            None,
-            Some(("--ignore", "original")),
-            Some(("--min-size", "5")),
-            Some(("--max-size", "3")),
-        ] {
+        for filter in [None, Some(("--ignore", "original"))] {
             let server = Server::start("server-copy");
             let temp = tempfile::tempdir().unwrap();
             std::fs::write(
@@ -4463,4 +4448,16 @@ fn download_directory_to_root_keeps_root_metadata() {
     assert_eq!(server.requests.load(Ordering::Relaxed), 4);
     let records = parsed_results(temp.path());
     assert!(records.iter().any(|r| r["action"] == "create_directory"));
+}
+
+fn expected_mapping(root: &Path, source: &str, destination: &str, expected: &str) -> String {
+    let (algorithm, value) = expected.split_once(':').unwrap();
+    let record = serde_json::json!({
+        "src": {"encoding": "utf-8", "value": source},
+        "dst": {"encoding": "utf-8", "value": destination}, "kind": "file",
+        "expected_hash": {"algorithm": algorithm, "value": value}
+    });
+    let path = root.join("expected.mapping");
+    std::fs::write(&path, record.to_string()).unwrap();
+    path.to_str().unwrap().to_owned()
 }

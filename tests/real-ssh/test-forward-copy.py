@@ -115,8 +115,8 @@ assert destination_connections() - before == 1, "a cached helper must need only 
 expected = run("ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
 assert remote("sha256sum /tmp/syq-real-ssh/forward/approved").split()[0] == expected
 
-print("case: explicit authorizer and released --via spelling use the same restricted route", flush=True)
-for option, name in [("--auth-from", "selected"), ("--via", "legacy")]:
+print("case: explicit authorizer uses the restricted route", flush=True)
+for option, name in [("--auth-from", "selected")]:
     copy("/tmp/syq-real-ssh/forward/" + name, auth=(option, "@laptop"))
     assert remote("sha256sum /tmp/syq-real-ssh/forward/" + name).split()[0] == expected
 

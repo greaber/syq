@@ -739,7 +739,7 @@ fn canonical_body_bytes(
         crate::cli::parse_tcp_congestion(algorithm).map_err(anyhow::Error::msg)?;
     }
     if let Some(hashing) = hashing {
-        if let Some(expected) = &hashing.expected_digest {
+        if let Some(expected) = &hashing.expected_hash {
             expected.validate()?;
         }
         if mapping.is_some() {

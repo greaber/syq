@@ -68,7 +68,7 @@ class AutomationFixtureTests(unittest.TestCase):
             decoder = AutomationDecoder(dry_run=False, mapping=True)
             decoder.feed(json.dumps(records[0]).encode())
             progress = {
-                "schema": "syq.automation", "schema_version": 1, "seq": 1, "type": "progress",
+                "schema": "syq.automation", "schema_version": 2, "seq": 1, "type": "progress",
                 **dict.fromkeys(["bytes_done", "bytes_total", "bytes_unchanged", "files_done", "files_total",
                     "files_unchanged", "files_excluded", "scanned", "elapsed_ms"], 0), "scan_done": False,
             }
@@ -124,7 +124,7 @@ class AutomationFixtureTests(unittest.TestCase):
             1,
             {
                 "schema": "syq.automation",
-                "schema_version": 1,
+                "schema_version": 2,
                 "seq": 1,
                 "type": "progress",
                 "bytes_done": 0,

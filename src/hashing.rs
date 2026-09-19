@@ -132,7 +132,9 @@ impl HashPolicy {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CopyHashing {
     pub policy: HashPolicy,
-    pub expected_digest: Option<Digest>,
+    // Preserve the spelling inside signed grants; public mappings use expected_hash.
+    #[serde(rename = "expected_digest")]
+    pub expected_hash: Option<Digest>,
 }
 
 impl CopyHashing {
@@ -143,7 +145,7 @@ impl CopyHashing {
                 transfer_integrity: args.transfer_integrity,
                 transfer_hash_type: args.transfer_hash_type,
             },
-            expected_digest: args.expected_digest.clone(),
+            expected_hash: args.expected_hash.clone(),
         }
     }
 }
@@ -181,7 +183,7 @@ impl Digest {
             || !value.bytes().all(|b| b.is_ascii_hexdigit())
         {
             bail!(
-                "{algorithm} digest must contain exactly {} hexadecimal characters",
+                "{algorithm} hash must contain exactly {} hexadecimal characters",
                 algorithm.output_len() * 2
             );
         }
