@@ -4,18 +4,12 @@
 </h1>
 
 Copy, reorganize, and remove files across local filesystems, remote machines,
-and [S3-compatible storage](object-storage.md). Choose which files to copy and
+and S3-compatible storage. Choose which files to copy and
 where they should land, preview the changes, and rerun interrupted copies to resume.
 
 <nav class="landing-actions" aria-label="Explore syq">
 <a class="landing-primary" href="install.html">Install syq</a>
 <a href="https://greaber.github.io/syq-bench/">Benchmarks ↗</a>
-<a href="receive.html">Send files to your laptop</a>
-<a href="exec.html">Run commands on your laptop</a>
-<a href="remote-to-remote.html">Copy directly between servers without forwarding your SSH agent</a>
-<a href="mappings.html">Rename and reorganize files during a copy</a>
-<a href="automation.html">Structured results</a>
-<a href="python.html">Python SDK</a>
 </nav>
 
 ## Try a copy
@@ -58,7 +52,7 @@ unless you request `--prune`.
 ## Put syq in your workflow
 
 Scripts can [choose files and destination names](mappings.md), preview a copy
-with `--dry-run`, and read [structured results](automation.md).
+with `--dry-run`, and read structured results.
 The [Python SDK](python.md) provides copy and removal calls with typed results.
 
 Working in a server shell? [Send files to your laptop](receive.md) or

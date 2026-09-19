@@ -104,7 +104,7 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to s3://backups --into project</code></pre></div>
 </div>
 <p>Uploads project/index.html to the key project/index.html in bucket backups.</p>
-<p class="tool-example-note">s3 is an rclone S3 remote. Syq uses <a href="object-storage.html#s3-options">AWS credentials and endpoint settings</a>.</p>
+<p class="tool-example-note">s3 is an rclone S3 remote. Syq uses AWS credentials and endpoint settings.</p>
 </section>
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
@@ -187,7 +187,7 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
 {"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --into archive</code></pre></div>
 </div>
-<p class="tool-example-note">Rclone also supports <a href="https://rclone.org/docs/#name-transform">name transforms</a>.</p>
+<p class="tool-example-note">Rclone also supports name transforms.</p>
 <p><a href="mappings.html">Generate a mapping with a script</a>.</p>
 </section>
 <!-- References: https://rclone.org/commands/rclone_copy/ https://rclone.org/commands/rclone_sync/ https://rclone.org/commands/rclone_copyto/ https://rclone.org/commands/rclone_deletefile/ https://rclone.org/sftp/ https://rclone.org/docs/#name-transform --></details>
