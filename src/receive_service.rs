@@ -20,8 +20,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const VERSION: u16 = 2; // Preserve the old daemon stop/status protocol.
-const SETTINGS_VERSION: u16 = 3;
-const PREFERENCES_VERSION: u16 = 4;
+const SETTINGS_VERSION: u16 = 5;
+const PREFERENCES_VERSION: u16 = 5;
 const MAX_PROFILES: usize = 32;
 const SOCKET: &[u8] = b".recv";
 const LOCK: &[u8] = b".recv-lock";
@@ -38,11 +38,18 @@ pub(crate) struct Settings {
     pub enabled: bool,
     pub name: String,
     pub cwd: PathBuf,
+    #[serde(default)]
+    pub cwd_explicit: bool,
     pub root: Option<PathBuf>,
+    #[serde(default)]
+    pub auto_approve_root: Option<PathBuf>,
+    #[serde(default)]
+    pub servers: Vec<String>,
     pub max_bytes: u64,
     pub max_entries: u64,
     pub max_delete: u64,
-    #[serde(default)]
+    // Accept legacy daemon status without persisting its blanket grant.
+    #[serde(default, skip_serializing)]
     pub approval: crate::receive_approval::Mode,
     #[serde(default)]
     pub notifications: crate::receive_approval::Notifications,
@@ -50,6 +57,39 @@ pub(crate) struct Settings {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+impl Settings {
+    fn allows_server(&self, endpoint: &str) -> bool {
+        self.enabled && (self.servers.is_empty() || self.servers.iter().any(|s| s == endpoint))
+    }
+    fn print_paths(&self) {
+        crate::output::human_stdout!(
+            "cwd: {} ({})",
+            self.cwd.display(),
+            if self.cwd_explicit {
+                "explicit"
+            } else {
+                "automatic"
+            }
+        );
+        if let Some(root) = &self.root {
+            crate::output::human_stdout!("root: {}", root.display());
+        }
+        match &self.auto_approve_root {
+            Some(root) => crate::output::human_stdout!("auto-approve-root: {}", root.display()),
+            None => {
+                crate::output::human_stdout!("auto-approve-root: none (ask for every download)")
+            }
+        }
+        crate::output::human_stdout!(
+            "servers: {}",
+            if self.servers.is_empty() {
+                "all".into()
+            } else {
+                self.servers.join(", ")
+            }
+        );
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,9 +171,18 @@ enum Action {
 }
 #[derive(Args, Default, Debug)]
 struct Configure {
-    /// Require local approval for each copy, or explicitly trust connected servers
-    #[arg(long = "approve", value_enum)]
-    approval: Option<crate::receive_approval::Mode>,
+    /// Automatically approve downloads confined to this directory
+    #[arg(long, conflicts_with = "no_auto_approve_root")]
+    auto_approve_root: Option<PathBuf>,
+    /// Require approval for every download again
+    #[arg(long)]
+    no_auto_approve_root: bool,
+    /// Limit this profile to these SSH destinations (repeat to allow several)
+    #[arg(long = "server", conflicts_with = "all_servers")]
+    servers: Vec<String>,
+    /// Make this profile available through every connected server
+    #[arg(long)]
+    all_servers: bool,
     /// Show desktop prompts, or use only local pending/approve/deny commands
     #[arg(long = "notify", value_enum)]
     notifications: Option<crate::receive_approval::Notifications>,
@@ -141,11 +190,17 @@ struct Configure {
     #[arg(long)]
     name: Option<String>,
     /// Default destination directory; absolute paths and .. may select elsewhere
-    #[arg(short = 'C', long, conflicts_with = "root")]
+    #[arg(short = 'C', long, conflicts_with = "auto_cwd")]
     cwd: Option<PathBuf>,
-    /// Default directory and confinement boundary; refuse paths escaping it
+    /// Choose cwd from root, auto-approve-root, then HOME
     #[arg(long)]
+    auto_cwd: bool,
+    /// Confinement boundary for every download, even with approval
+    #[arg(long, conflicts_with = "no_root")]
     root: Option<PathBuf>,
+    /// Remove the hard download boundary
+    #[arg(long)]
+    no_root: bool,
     /// Maximum bytes one transfer may reserve/write (default: 100G)
     #[arg(long)]
     max_bytes: Option<String>,
@@ -188,7 +243,10 @@ fn default_settings() -> Result<Settings> {
         enabled: true,
         name,
         cwd,
+        cwd_explicit: false,
         root: None,
+        auto_approve_root: None,
+        servers: Vec::new(),
         max_bytes: 100 * 1024 * 1024 * 1024,
         max_entries: 1_000_000,
         max_delete: 0,
@@ -218,7 +276,8 @@ fn preferences() -> Result<Preferences> {
 }
 fn decode_preferences(bytes: &[u8]) -> Result<Preferences> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
-    let preferences = match value["version"].as_u64() {
+    let legacy = matches!(value["version"].as_u64(), Some(2..=4));
+    let mut preferences = match value["version"].as_u64() {
         Some(2 | 3) => {
             let mut settings: Settings = serde_json::from_value(value)?;
             if settings.version == 2 {
@@ -231,9 +290,22 @@ fn decode_preferences(bytes: &[u8]) -> Result<Preferences> {
                 profiles: vec![settings],
             }
         }
-        Some(4) => serde_json::from_value(value)?,
+        Some(4 | 5) => serde_json::from_value(value)?,
         _ => bail!("unsupported receive preferences version; use a matching syq build"),
     };
+    if legacy {
+        preferences.version = PREFERENCES_VERSION;
+        for profile in &mut preferences.profiles {
+            if !matches!(profile.version, 2 | 3 | SETTINGS_VERSION) {
+                bail!("unsupported receive profile version; use a matching syq build");
+            }
+            profile.version = SETTINGS_VERSION;
+            profile.cwd_explicit = true;
+            profile.approval = crate::receive_approval::Mode::Ask;
+            profile.auto_approve_root = None;
+            profile.servers.clear();
+        }
+    }
     validate_preferences(&preferences)?;
     Ok(preferences)
 }
@@ -253,8 +325,13 @@ fn validate_preferences(preferences: &Preferences) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn enabled() -> Result<bool> {
-    Ok(preferences()?.enabled())
+pub(crate) fn enabled_servers() -> Result<Vec<Vec<String>>> {
+    Ok(preferences()?
+        .profiles
+        .into_iter()
+        .filter(|p| p.enabled)
+        .map(|p| p.servers)
+        .collect())
 }
 fn validate_settings(settings: &Settings) -> Result<()> {
     if settings.version != SETTINGS_VERSION {
@@ -264,12 +341,32 @@ fn validate_settings(settings: &Settings) -> Result<()> {
     if !settings.cwd.is_absolute() || settings.cwd.to_str().is_none() {
         bail!("receiving working directory must be an existing absolute UTF-8 directory");
     }
+    for root in [&settings.root, &settings.auto_approve_root]
+        .into_iter()
+        .flatten()
+    {
+        if !root.is_absolute() || root.to_str().is_none() {
+            bail!("receiving roots must be absolute UTF-8 directories");
+        }
+    }
+    if settings
+        .auto_approve_root
+        .as_ref()
+        .is_some_and(|root| root.parent().is_none())
+    {
+        bail!("automatic approval root must be below filesystem root");
+    }
     if settings
         .root
         .as_ref()
-        .is_some_and(|root| root != &settings.cwd)
+        .is_some_and(|root| !settings.cwd.starts_with(root))
     {
-        bail!("receiving root must also be the working directory");
+        bail!("receiving working directory must be inside --root; use --auto-cwd or choose --cwd inside it");
+    }
+    for server in &settings.servers {
+        if server.is_empty() || server.starts_with('-') || server.chars().any(char::is_whitespace) {
+            bail!("--server must name an SSH connection destination");
+        }
     }
     if settings.max_bytes == 0
         || settings.max_bytes > crate::delegation::MAX_COPY_BYTES
@@ -386,7 +483,7 @@ struct Status {
     endpoint: String,
     name: String,
     connection: ConnectionState,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     approval: Option<crate::receive_approval::Mode>,
     #[serde(default)]
     pending: Vec<crate::receive_approval::Summary>,
@@ -603,9 +700,13 @@ fn ensure_inner(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<bool
     if scope.join(CLOSING).exists() {
         bail!("persistence scope is closing");
     }
-    // Persist v4 before reuse so older binaries cannot overwrite multiple profiles.
+    // Persist current preferences before reuse so older binaries cannot weaken policy.
     let config = ensure_current_settings()?;
-    if !config.enabled() {
+    if !config
+        .profiles
+        .iter()
+        .any(|p| p.allows_server(&remote.label()))
+    {
         return Ok(false);
     }
     if is_running(control) {
@@ -789,10 +890,14 @@ fn reconcile(
         config
             .profiles
             .iter()
-            .any(|p| p.enabled && p == &worker.config)
+            .any(|p| p.allows_server(&spec.endpoint.label()) && p == &worker.config)
             && !(retry && worker.state.lock().unwrap().phase == "failed")
     });
-    for profile in config.profiles.iter().filter(|p| p.enabled) {
+    for profile in config
+        .profiles
+        .iter()
+        .filter(|p| p.allows_server(&spec.endpoint.label()))
+    {
         if !workers.iter().any(|w| w.config.name == profile.name) {
             workers.push(ProfileWorker::new(profile.clone(), spec.clone()));
         }
@@ -841,7 +946,12 @@ fn apply_preferences(config: &Preferences) -> Result<()> {
         let mut progress = Instant::now();
         while is_running(&control) {
             let state = status(&control, false);
-            let enabled: Vec<_> = config.profiles.iter().filter(|p| p.enabled).collect();
+            let endpoint = read_spec(&control)?.endpoint.label();
+            let enabled: Vec<_> = config
+                .profiles
+                .iter()
+                .filter(|p| p.allows_server(&endpoint))
+                .collect();
             if state.as_ref().is_ok_and(|state| {
                 state.profiles.len() == enabled.len()
                     && enabled
@@ -1032,9 +1142,6 @@ fn configure(options: Configure) -> Result<()> {
         .revision
         .checked_add(1)
         .context("receiving profile revision exhausted")?;
-    if let Some(mode) = options.approval {
-        config.approval = mode;
-    }
     if let Some(notifications) = options.notifications {
         config.notifications = notifications;
     }
@@ -1044,12 +1151,42 @@ fn configure(options: Configure) -> Result<()> {
     if let Some(cwd) = options.cwd {
         config.cwd = fs::canonicalize(cwd)?;
         anyhow::ensure!(config.cwd.is_dir(), "--cwd must name a directory");
-        config.root = None;
+        config.cwd_explicit = true;
+    }
+    if options.auto_cwd {
+        config.cwd_explicit = false;
     }
     if let Some(root) = options.root {
-        config.cwd = fs::canonicalize(root)?;
-        anyhow::ensure!(config.cwd.is_dir(), "--root must name a directory");
-        config.root = Some(config.cwd.clone());
+        let root = fs::canonicalize(root)?;
+        anyhow::ensure!(root.is_dir(), "--root must name a directory");
+        anyhow::ensure!(
+            root.parent().is_some(),
+            "--root must be below filesystem root"
+        );
+        config.root = Some(root);
+    }
+    if options.no_root {
+        config.root = None;
+    }
+    if let Some(root) = options.auto_approve_root {
+        let root = fs::canonicalize(root)?;
+        anyhow::ensure!(root.is_dir(), "--auto-approve-root must name a directory");
+        config.auto_approve_root = Some(root);
+    }
+    if options.no_auto_approve_root {
+        config.auto_approve_root = None;
+    }
+    if !options.servers.is_empty() {
+        config.servers = options.servers;
+    }
+    if options.all_servers {
+        config.servers.clear();
+    }
+    if !config.cwd_explicit {
+        config.cwd = match config.root.as_ref().or(config.auto_approve_root.as_ref()) {
+            Some(root) => root.clone(),
+            None => fs::canonicalize(std::env::var_os("HOME").context("HOME is unset")?)?,
+        };
     }
     if let Some(bytes) = options.max_bytes {
         config.max_bytes = crate::cli::parse_size(&bytes)?;
@@ -1063,11 +1200,8 @@ fn configure(options: Configure) -> Result<()> {
     let config = config.clone();
     save_settings(&preferences)?;
     apply_preferences(&preferences)?;
-    crate::output::human_stdout!("Receiving is on: {} ({})", config.name, config.approval);
-    crate::output::human_stdout!("cwd: {}", config.cwd.display());
-    if let Some(root) = config.root {
-        crate::output::human_stdout!("root: {}", root.display());
-    }
+    crate::output::human_stdout!("Receiving is on: {}", config.name);
+    config.print_paths();
     crate::output::human_stdout!(
         "Applies to persistent syq SSH connections; use syq persist on to enable persistence."
     );
@@ -1229,15 +1363,11 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
             } else {
                 for config in selected {
                     crate::output::human_stdout!(
-                        "Receiving is {}: {} ({})",
+                        "Receiving is {}: {}",
                         if config.enabled { "on" } else { "off" },
-                        config.name,
-                        config.approval
+                        config.name
                     );
-                    crate::output::human_stdout!("cwd: {}", config.cwd.display());
-                    if let Some(root) = &config.root {
-                        crate::output::human_stdout!("root: {}", root.display());
-                    }
+                    config.print_paths();
                 }
                 for state in connections {
                     if state.profiles.is_empty() {
@@ -1259,11 +1389,10 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
                         .filter(|p| name.as_ref().is_none_or(|n| n == &p.settings.name))
                     {
                         crate::output::human_stdout!(
-                            "  {} @{}: {} ({}, {} pending){}",
+                            "  {} @{}: {} ({} pending){}",
                             state.endpoint,
                             profile.settings.name,
                             profile.connection.phase,
-                            profile.settings.approval,
                             profile.pending.len(),
                             profile
                                 .connection
@@ -1288,11 +1417,11 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
             let names: Vec<_> = config
                 .profiles
                 .iter()
-                .filter(|p| p.enabled && name.as_ref().is_none_or(|n| n == &p.name))
+                .filter(|p| p.allows_server(&host) && name.as_ref().is_none_or(|n| n == &p.name))
                 .map(|p| p.name.clone())
                 .collect();
             if names.is_empty() {
-                bail!("no selected receiving profiles are enabled");
+                bail!("no selected receiving profiles are enabled for {host}");
             }
             if timeout == 0 || timeout > 3600 {
                 bail!("timeout must be between 1 and 3600 seconds");
@@ -1346,6 +1475,20 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_server_scope_matches_only_the_locally_selected_endpoint() {
+        let mut settings = default_settings().unwrap();
+        assert!(settings.allows_server("work"));
+        settings.servers = vec!["work".into(), "alice@lab:2222".into()];
+        assert!(settings.allows_server("work"));
+        assert!(settings.allows_server("alice@lab:2222"));
+        for endpoint in ["other", "bob@lab:2222", "alice@lab", "work:22"] {
+            assert!(!settings.allows_server(endpoint));
+        }
+        settings.enabled = false;
+        assert!(!settings.allows_server("work"));
+    }
 
     #[test]
     fn multiple_profile_status_exceeds_remote_envelope_but_stays_bounded() {

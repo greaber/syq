@@ -68,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     root = Path(directory)
     project = root / "project"
     project.mkdir()
-    receive("on", "--name", "laptop", "--approve", "ask", "--notify", "off")
+    receive("on", "--name", "laptop", "--no-auto-approve-root", "--notify", "off")
     receive("wait", "source", "--name", "laptop", "--timeout", "30")
     original = profile("laptop")["connection"]["ssh_pid"]
     first = start_copy("laptop", "profiles-kept-pending")
@@ -98,6 +98,57 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     finish(escaped, success=False)
     assert not (root / "escape").exists()
 
+    print("case: scoped automatic downloads and server restrictions", flush=True)
+    inbox = root / "inbox"
+    inbox.mkdir()
+    receive("on", "--name", "inbox", "--auto-approve-root", str(inbox),
+            "--server", "source", "--notify", "off")
+    receive("wait", "source", "--name", "inbox", "--timeout", "30")
+    automatic = start_copy("inbox", "automatic")
+    processes.append(automatic)
+    finish(automatic)
+    assert (inbox / "automatic").read_bytes() == b"return\n"
+    assert json.loads(receive("pending", "--json").stdout) == []
+    outside = start_copy("inbox", str(root / "approved-outside"))
+    processes.append(outside)
+    request = pending(1)[0]
+    assert not (root / "approved-outside").exists()
+    receive("approve", request["id"])
+    finish(outside)
+    assert (root / "approved-outside").read_bytes() == b"return\n"
+    (inbox / "escape").symlink_to(root, target_is_directory=True)
+    escaped = start_copy("inbox", "escape/must-ask")
+    processes.append(escaped)
+    receive("deny", pending(1)[0]["id"])
+    finish(escaped, success=False)
+    assert not (root / "must-ask").exists()
+    # A hard root still rejects an outside destination before any prompt.
+    receive("on", "--name", "inbox", "--root", str(root))
+    receive("wait", "source", "--name", "inbox", "--timeout", "30")
+    refused = start_copy("inbox", "../outside-hard-root")
+    processes.append(refused)
+    finish(refused, success=False)
+    assert json.loads(receive("pending", "--json").stdout) == []
+    # Withdrawing a server cancels its pending request and stops advertising.
+    waiting = start_copy("inbox", "requires-approval")
+    processes.append(waiting)
+    pending(1)
+    receive("on", "--name", "inbox", "--server", "another-server")
+    finish(waiting, success=False)
+    assert not any(p["settings"]["name"] == "inbox"
+                   for c in state()["connections"] for p in c["profiles"])
+    assert receive("wait", "source", "--name", "inbox", "--timeout", "1", ok=False).returncode != 0
+    unavailable = start_copy("inbox", "unavailable")
+    processes.append(unavailable)
+    finish(unavailable, success=False)
+    receive("on", "--name", "inbox", "--all-servers")
+    receive("wait", "source", "--name", "inbox", "--timeout", "30")
+    restored = start_copy("inbox", "inbox/restored")
+    processes.append(restored)
+    finish(restored)
+    assert (inbox / "restored").read_bytes() == b"return\n"
+    receive("remove", "inbox")
+
     print("case: live command survives changes to another profile", flush=True)
     script = "from pathlib import Path; import time; p=Path(" + repr(str(root)) + "); (p/'ready').touch(); deadline=time.monotonic()+30\nwhile not (p/'release').exists():\n assert time.monotonic()<deadline\n time.sleep(.1)\nprint('survived')"
     command = subprocess.Popen(["ssh", "source", shlex.join(["syq", "exec", "--on", "@laptop", "--", "python3", "-c", script])], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -119,7 +170,7 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     other_root.mkdir()
     try:
         receive("on", "--name", "laptop", "--root", str(other_root), "--notify", "off", env=other_env)
-        receive("on", "--name", "other-client", "--root", str(other_root), "--notify", "off", "--approve", "always", env=other_env)
+        receive("on", "--name", "other-client", "--root", str(other_root), "--notify", "off", "--auto-approve-root", str(other_root), env=other_env)
         conflict = run("syq", "persist", "connect", "source", "--timeout", "30", env=other_env, ok=False)
         assert conflict.returncode != 0 and "already connected" in conflict.stderr, conflict
         receive("wait", "source", "--name", "other-client", "--timeout", "30", env=other_env)
@@ -135,6 +186,15 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
         assert profile("other-client", other_env)["connection"]["ssh_pid"] == other_pid
         receive("remove", "laptop", env=other_env)
         run("syq", "persist", "connect", "source", env=other_env)
+        # An SSH connection with no allowed receiving profiles is still usable.
+        receive("on", "--name", "other-client", "--server", "another-server", env=other_env)
+        run("syq", "persist", "connect", "source", "--timeout", "2", env=other_env)
+        connection = next(c for c in json.loads(run("syq", "persist", "status", "--json", env=other_env).stdout)["connections"]
+                          if c["endpoint"] == "source")
+        assert connection["receiving_enabled"] is False, connection
+        assert connection["state"] == "ready", connection
+        receive("on", "--name", "other-client", "--server", "source", env=other_env)
+        receive("wait", "source", "--name", "other-client", "--timeout", "30", env=other_env)
     finally:
         run("syq", "persist", "off", env=other_env)
         for process in processes:
@@ -142,6 +202,6 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=5)
     receive("remove", "project")
-    receive("on", "--name", "laptop", "--approve", "always", "--notify", "off")
+    receive("on", "--name", "laptop", "--auto-approve-root", "/tmp/syq-real-ssh-receive", "--notify", "off")
     receive("wait", "source", "--timeout", "30")
 print("Multiple receiving profiles passed", flush=True)

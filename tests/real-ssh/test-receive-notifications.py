@@ -91,7 +91,7 @@ def tests():
     try:
         # This fixture enters a new DBus session: restart its supervisor too.
         run("syq", "persist", "receive", "off")
-        run("syq", "persist", "receive", "on", "--approve", "ask", "--notify", "desktop")
+        run("syq", "persist", "receive", "on", "--no-auto-approve-root", "--notify", "desktop")
         run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
         for choice in ["allow", "deny", "dismiss", "unexpected", "unavailable"]:
             destination = Path("/tmp/syq-real-ssh-receive") / f"desktop-{choice}-<b>&\nFrom: fake"

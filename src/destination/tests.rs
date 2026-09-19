@@ -189,7 +189,7 @@ pub(super) fn broker(
         name: "laptop".into(),
         identity_key: identity::generate_key().unwrap(),
         requester: "test-server".into(),
-        approval_mode: crate::receive_approval::Mode::Always,
+        auto_approve_root: Some(root.into()),
         notifications: crate::receive_approval::Notifications::Off,
         approvals: Arc::new(crate::receive_approval::Queue::default()),
         generation: AtomicU64::new(0),

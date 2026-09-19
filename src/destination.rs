@@ -571,6 +571,10 @@ fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(
     }
     if let Some(root) = root {
         let destination = PathBuf::from(OsString::from_vec(rebase(&request_path(path)?, cwd)?));
+        anyhow::ensure!(
+            destination.starts_with(root),
+            "receiving destination is outside --root"
+        );
         let container = root
             .parent()
             .context("receiving root must not be filesystem root")?
@@ -882,7 +886,7 @@ struct Receiver {
     name: String,
     identity_key: ssh_key::PrivateKey,
     requester: String,
-    approval_mode: crate::receive_approval::Mode,
+    auto_approve_root: Option<PathBuf>,
     notifications: crate::receive_approval::Notifications,
     approvals: Arc<crate::receive_approval::Queue>,
     generation: AtomicU64,
@@ -911,6 +915,7 @@ impl Receiver {
         request: &CopyRequest,
         socket: &UnixStream,
         generation: u64,
+        automatic: bool,
     ) -> Result<()> {
         #[cfg(test)]
         if matches!(self.approval, Approval::Ask) {
@@ -931,7 +936,7 @@ impl Receiver {
         if cancelled() {
             bail!("receiving stopped or request disconnected");
         }
-        if self.approval_mode == crate::receive_approval::Mode::Ask {
+        if !automatic {
             self.approvals
                 .request(&self.requester, request, self.notifications, cancelled)?;
         }
@@ -981,7 +986,7 @@ impl Receiver {
                         "another transfer is awaiting approval; retry after it is decided"
                     )
                 })?;
-                let (destination, container) =
+                let (destination, mut container) =
                     resolve_destination(&self.cwd, self.root.as_deref(), &request.destination)?;
                 if self.root.as_ref() == Some(&destination)
                     && request.copy.policy.placement == DestinationPlacement::ExactPath
@@ -1003,17 +1008,33 @@ impl Receiver {
                     }
                 }
                 let generation = self.generation.load(Ordering::Acquire);
+                let automatic = self.auto_approve_root.as_ref().is_some_and(|root| {
+                    destination.starts_with(root)
+                        && !(destination == *root
+                            && request.copy.policy.placement == DestinationPlacement::ExactPath)
+                });
+                if automatic {
+                    // Anchor the filesystem executor above the automatic root. Its
+                    // no-follow traversal and signed scopes keep every operation
+                    // inside the selected destination, including during races.
+                    container = self
+                        .auto_approve_root
+                        .as_ref()
+                        .unwrap()
+                        .parent()
+                        .context("automatic approval root must not be filesystem root")?
+                        .to_path_buf();
+                }
                 // Validate the complete operation before the local policy decision.
                 let (authority, approved) =
                     crate::restricted::named_authority(&container, request.clone())?;
-                self.authorize_request(&request, &stream.try_clone()?, generation)?;
+                self.authorize_request(&request, &stream.try_clone()?, generation, automatic)?;
                 // Start the grant clock at approval, including after a long prompt.
-                let (authority, mut approved) =
-                    if self.approval_mode == crate::receive_approval::Mode::Ask {
-                        crate::restricted::named_authority(&container, request)?
-                    } else {
-                        (authority, approved)
-                    };
+                let (authority, mut approved) = if !automatic {
+                    crate::restricted::named_authority(&container, request)?
+                } else {
+                    (authority, approved)
+                };
                 let mut sessions = self.sessions.lock().unwrap();
                 if self.stop.load(Ordering::Acquire)
                     || self.generation.load(Ordering::Acquire) != generation
@@ -1168,7 +1189,7 @@ pub(crate) fn serve_background(
             spec.endpoint.label(),
             config.name
         ),
-        approval_mode: config.approval,
+        auto_approve_root: config.auto_approve_root.clone(),
         notifications: config.notifications,
         approvals,
         generation: AtomicU64::new(0),

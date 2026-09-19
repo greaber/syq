@@ -15,7 +15,7 @@ print("case: discovery and return copies work from a different server PATH build
 identity = run("syq", "--build-identity")
 other = run("ssh", "source", "syq-other-build --build-identity")
 assert identity != other, (identity, other)
-run("syq", "persist", "receive", "on", "--approve", "always", "--notify", "off")
+run("syq", "persist", "receive", "on", "--auto-approve-root", "/tmp/syq-real-ssh-receive", "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 run("ssh", "source", "syq-other-build persist destinations wait laptop --timeout 5")
 root = Path("/tmp/syq-real-ssh-receive")

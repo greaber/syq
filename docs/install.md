@@ -124,5 +124,5 @@ This enables persistence and connects without copying files. It also lets you
 Connections stay open until you close them with `syq persist off`.
 Use `syq persist status` to see them.
 
-See [background connections](receive.md#background-connections) for reconnecting,
+See [connection lifetime](persistence-reference.md#connection-lifetime-and-waits) for reconnecting,
 turning receiving off, and using persistence in scripts.

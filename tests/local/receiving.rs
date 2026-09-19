@@ -691,7 +691,8 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
     };
     let defaults = status();
     assert_eq!(defaults["settings"]["enabled"], true);
-    assert_eq!(defaults["settings"]["approval"], "ask");
+    assert!(defaults["settings"]["auto_approve_root"].is_null());
+    assert_eq!(defaults["settings"]["cwd_explicit"], false);
     assert_eq!(defaults["settings"]["notifications"], "desktop");
     assert_eq!(
         defaults["settings"]["cwd"],
@@ -713,24 +714,36 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
         "downloads",
     ]));
     assert_eq!(status()["settings"]["root"], t.s("downloads"));
-    assert_output_ok(&run(&["persist", "receive", "on", "--cwd", "."]));
+    assert_output_ok(&run(&[
+        "persist",
+        "receive",
+        "on",
+        "--cwd",
+        ".",
+        "--no-root",
+    ]));
     assert!(status()["settings"]["root"].is_null());
     assert_eq!(status()["settings"]["name"], "laptop");
     assert_output_ok(&run(&[
         "persist",
         "receive",
         "on",
-        "--approve",
-        "always",
+        "--auto-approve-root",
+        "downloads",
         "--notify",
         "off",
     ]));
-    assert_eq!(status()["settings"]["approval"], "always");
+    assert_eq!(status()["settings"]["auto_approve_root"], t.s("downloads"));
     assert_eq!(status()["settings"]["notifications"], "off");
     assert_output_ok(&run(&["persist", "receive", "on", "--max-entries", "500"]));
-    assert_eq!(status()["settings"]["approval"], "always");
-    assert_output_ok(&run(&["persist", "receive", "on", "--approve", "ask"]));
-    assert_eq!(status()["settings"]["approval"], "ask");
+    assert_eq!(status()["settings"]["auto_approve_root"], t.s("downloads"));
+    assert_output_ok(&run(&[
+        "persist",
+        "receive",
+        "on",
+        "--no-auto-approve-root",
+    ]));
+    assert!(status()["settings"]["auto_approve_root"].is_null());
     assert_output_ok(&run(&["persist", "receive", "off"]));
     assert_eq!(status()["settings"]["enabled"], false);
     assert!(!t.path("config/syq/persistence.json").exists());
@@ -752,6 +765,78 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
     ])
     .status
     .success());
+}
+
+#[test]
+fn receiving_automatic_cwd_and_server_scope_are_independent() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("root/inbox")).unwrap();
+    fs::create_dir_all(t.path("root/explicit")).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["persist", "receive"])
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .output()
+            .unwrap()
+    };
+    let state = || {
+        let output = run(&["status", "--json"]);
+        assert_output_ok(&output);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["settings"].clone()
+    };
+    assert_output_ok(&run(&[
+        "on",
+        "--auto-approve-root",
+        "root/inbox",
+        "--server",
+        "work",
+        "--server",
+        "alice@lab:2222",
+    ]));
+    assert_eq!(state()["cwd"], t.s("root/inbox"));
+    assert_eq!(state()["cwd_explicit"], false);
+    assert_eq!(
+        state()["servers"],
+        serde_json::json!(["work", "alice@lab:2222"])
+    );
+    assert!(!run(&["wait", "other", "--timeout", "1"]).status.success());
+    assert_output_ok(&run(&["on", "--root", "root"]));
+    assert_eq!(state()["cwd"], t.s("root"));
+    assert_output_ok(&run(&["on", "--cwd", "root/explicit"]));
+    assert_eq!(state()["root"], t.s("root"));
+    assert_output_ok(&run(&["on", "--no-auto-approve-root"]));
+    assert_eq!(state()["cwd"], t.s("root/explicit"));
+    assert_output_ok(&run(&[
+        "on",
+        "--auto-cwd",
+        "--auto-approve-root",
+        "root/inbox",
+    ]));
+    assert_eq!(state()["cwd"], t.s("root"));
+    assert_output_ok(&run(&["on", "--no-root"]));
+    assert_eq!(state()["cwd"], t.s("root/inbox"));
+    assert_output_ok(&run(&["on", "--no-auto-approve-root", "--all-servers"]));
+    assert_eq!(
+        state()["cwd"],
+        fs::canonicalize(t.path("")).unwrap().to_str().unwrap()
+    );
+    assert_eq!(state()["servers"], serde_json::json!([]));
+    let before = fs::read(t.path("config/syq/receive.json")).unwrap();
+    for args in [
+        vec!["on", "--auto-approve-root", "missing"],
+        vec!["on", "--server", ""],
+        vec!["on", "--cwd", ".", "--root", "root"],
+        vec!["on", "--auto-approve-root", "/"],
+        vec!["on", "--approve", "always"],
+    ] {
+        assert!(!run(&args).status.success(), "{args:?}");
+        assert_eq!(fs::read(t.path("config/syq/receive.json")).unwrap(), before);
+    }
 }
 
 #[test]
@@ -921,7 +1006,7 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
     let output = run(&["persist", "receive", "status", "--json"]);
     assert_output_ok(&output);
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(status["settings"]["approval"], "ask");
+    assert!(status["settings"]["auto_approve_root"].is_null());
     assert_eq!(
         fs::read(&path).unwrap(),
         old,
@@ -941,8 +1026,8 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
     ] {
         assert_eq!(migrated["profiles"][0][field], original[field], "{field}");
     }
-    assert_eq!(migrated["version"], 4);
-    assert_eq!(migrated["profiles"][0]["approval"], "ask");
+    assert_eq!(migrated["version"], 5);
+    assert!(migrated["profiles"][0]["auto_approve_root"].is_null());
     assert_eq!(migrated["profiles"][0]["notifications"], "desktop");
     assert!(!t.path("config/syq/persistence.json").exists());
     assert_output_ok(&run(&["persist", "receive", "off"]));
@@ -1010,7 +1095,19 @@ fn remote_copy_addition_preserves_approval_preferences_from_f752ee8() {
     assert_output_ok(&output);
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let previous: serde_json::Value = serde_json::from_slice(old).unwrap();
-    assert_eq!(status["settings"], previous);
+    for key in [
+        "name",
+        "cwd",
+        "root",
+        "max_bytes",
+        "max_entries",
+        "max_delete",
+        "notifications",
+    ] {
+        assert_eq!(status["settings"][key], previous[key]);
+    }
+    assert!(status["settings"]["auto_approve_root"].is_null());
+    assert_eq!(status["settings"]["cwd_explicit"], true);
     assert_eq!(fs::read(path).unwrap(), old);
 }
 
@@ -1221,8 +1318,8 @@ fn receiving_profiles_preserve_independent_settings_and_select_names() {
         "on",
         "--name",
         "laptop",
-        "--approve",
-        "always",
+        "--auto-approve-root",
+        "project",
     ]));
     let first = status()["profiles"][0].clone();
     assert_output_ok(&run(&[
@@ -1231,7 +1328,7 @@ fn receiving_profiles_preserve_independent_settings_and_select_names() {
     let state = status();
     assert_eq!(state["profiles"].as_array().unwrap().len(), 2);
     assert_eq!(state["profiles"][0], first);
-    assert_eq!(state["profiles"][1]["approval"], "ask");
+    assert!(state["profiles"][1]["auto_approve_root"].is_null());
     assert_eq!(state["profiles"][1]["root"], t.s("project"));
     assert_output_ok(&run(&["persist", "receive", "off", "--name", "project"]));
     assert_eq!(status()["profiles"][0], first);
@@ -1335,9 +1432,20 @@ fn receiving_profiles_migrate_unchanged_v051_preferences_and_reject_duplicates()
     assert_output_ok(&run(&["persist", "receive", "on", "--name", "new-profile"]));
     let mut saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let original: serde_json::Value = serde_json::from_slice(old).unwrap();
-    assert_eq!(saved["version"], 4);
-    assert_eq!(saved["profiles"][0], original);
-    assert_eq!(saved["profiles"][1]["approval"], "ask");
+    assert_eq!(saved["version"], 5);
+    for key in [
+        "name",
+        "cwd",
+        "root",
+        "max_bytes",
+        "max_entries",
+        "max_delete",
+        "notifications",
+    ] {
+        assert_eq!(saved["profiles"][0][key], original[key]);
+    }
+    assert!(saved["profiles"][0]["auto_approve_root"].is_null());
+    assert!(saved["profiles"][1]["auto_approve_root"].is_null());
     saved["profiles"][1]["name"] = saved["profiles"][0]["name"].clone();
     write(&path, &serde_json::to_vec(&saved).unwrap());
     let failed = run(&["persist", "receive", "status", "--json"]);

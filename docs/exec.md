@@ -36,7 +36,7 @@ syq persist receive deny REQUEST_ID
 ```
 
 Command requests are available whenever receiving is enabled. Every command
-requires its own decision, even with `syq persist receive on --approve always` for copies.
+requires its own decision, even with an automatic approval root for downloads.
 Approving a copy does not approve commands. A missing or dismissed desktop
 prompt never grants permission; use the local terminal commands. Pending
 requests expire after five minutes and are cancelled when the requester

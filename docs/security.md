@@ -129,8 +129,12 @@ It does not authenticate what you typed on a remote server or attest to source
 contents. The receiving user and desktop session remain trusted. Request IDs
 are local, expire after five minutes, and cannot be reused. Disconnecting or
 stopping receiving cancels pending decisions. Desktop failure never approves a
-copy. `syq persist receive on --approve always` explicitly removes the per-copy decision
-and trusts connected server accounts for repeated copies.
+copy. `syq persist receive on --auto-approve-root DIRECTORY` removes the per-copy
+decision for downloads confined inside that directory, including overwrites.
+Other downloads still ask. A profile's optional `--server` list limits which
+locally selected SSH connections may use it. Within each allowed server account,
+all processes share this authority. Choose an inbox whose downloaded contents
+are not automatically executed or loaded as trusted configuration.
 
 The default starting directory is your home directory, with no containment.
 `syq persist receive on --root DIRECTORY` contains copies; `syq persist receive off` disables receiving

@@ -44,7 +44,7 @@ name rules and route restrictions.
 
 The selected laptop asks for approval before contacting hostB. Approve with the desktop
 prompt or `syq persist receive pending` and `syq persist receive approve REQUEST_ID` on the laptop.
-These requests require a decision even when `persist receive on --approve always` permits
+These requests require a decision even when an automatic approval root permits
 automatic copies onto the laptop itself. Once an approval request is sent,
 a refusal, interrupted connection, setup failure, or copy failure ends that
 attempt; syq does not try another authorizer or SSH. `--auth-from @NAME` and

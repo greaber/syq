@@ -404,7 +404,7 @@ python3 /usr/local/libexec/syq-test-forward-copy.py
 python3 /usr/local/libexec/syq-test-return-exec.py
 
 printf 'case: explicit automatic approval supports unattended copies\n'
-syq persist receive on --approve always
+syq persist receive on --auto-approve-root "$receive_root"
 syq persist receive wait source --timeout 30
 ssh source 'test -z "${SSH_AUTH_SOCK:-}"; syq cp --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
 remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.manifest
@@ -532,7 +532,7 @@ PYTEST
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-heartbeat-timeout'
 printf 'return\n' | cmp - "$receive_root/after-heartbeat-timeout"
 printf 'case: cwd permits destinations outside its starting directory\n'
-syq persist receive on --cwd "$receive_root"
+syq persist receive on --cwd "$receive_root" --no-root --auto-approve-root /tmp
 syq persist receive wait source --timeout 30
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as ../syq-return-outside'
 printf 'return\n' | cmp - /tmp/syq-return-outside
