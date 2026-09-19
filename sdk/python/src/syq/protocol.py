@@ -27,6 +27,7 @@ from .models import (
     FinalStateEvent,
     ObjectMetadata,
     MappingEntry,
+    DestinationMetadata,
     OperationAction,
     OperationResult,
     OperationStatus,
@@ -170,9 +171,21 @@ def _expected_hash(record: dict[str, Any]) -> Hash | None:
         raise SyqProtocolError(f"invalid expected_hash: {error}") from error
 
 
+def _destination_metadata(record: dict[str, Any]) -> DestinationMetadata | None:
+    if "metadata" not in record:
+        return None
+    metadata = record["metadata"]
+    if not isinstance(metadata, dict):
+        raise SyqProtocolError("metadata must be an object")
+    try:
+        return DestinationMetadata(**metadata)
+    except (TypeError, ValueError) as error:
+        raise SyqProtocolError(f"invalid destination metadata: {error}") from error
+
+
 def parse_mapping_line(line: bytes) -> MappingEntry:
     record = _object(line, label="mapping record")
-    unknown = set(record) - {"src", "dst", "kind", "size", "mtime", "expected_hash"}
+    unknown = set(record) - {"src", "dst", "kind", "size", "mtime", "expected_hash", "metadata"}
     if unknown:
         raise SyqProtocolError(
             f"mapping record has unknown field {sorted(unknown)[0]!r}"
@@ -188,7 +201,7 @@ def parse_mapping_line(line: bytes) -> MappingEntry:
         _integer(record, "mtime", nonnegative=False) if "mtime" in record else None
     )
     try:
-        return MappingEntry(src.raw, dst.raw, kind, size, mtime, _expected_hash(record))
+        return MappingEntry(src.raw, dst.raw, kind, size, mtime, _expected_hash(record), _destination_metadata(record))
     except (TypeError, ValueError) as error:
         raise SyqProtocolError(f"mapping path is invalid: {error}") from error
 
@@ -414,6 +427,7 @@ class AutomationDecoder:
                 scope=_optional_integer(record, "scope"),
                 code=_optional_enum(record, "code", ReceiptCode),
                 expected_hash=_expected_hash(record),
+                metadata=_destination_metadata(record),
             )
         if record_type == "selection_result":
             if self.run.mode != "rm":

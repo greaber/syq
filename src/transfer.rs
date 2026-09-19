@@ -116,6 +116,7 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
 
 pub struct Opts {
     pub hash_policy: crate::hashing::HashPolicy,
+    pub mapping_metadata: std::collections::HashMap<PathBytes, crate::mapping::Metadata>,
     pub mapping_expected_hashes: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
@@ -166,29 +167,60 @@ pub struct Opts {
 }
 
 impl Opts {
-    fn metadata_fix_flags(&self, source: &Entry, destination: &Entry) -> u8 {
+    fn metadata_for(&self, path: &[u8], source: &Entry) -> Meta {
+        let mut meta = source.meta();
+        if let Some(metadata) = self.mapping_metadata.get(path) {
+            metadata.apply(&mut meta);
+        }
+        meta
+    }
+
+    fn flags_for(&self, path: &[u8]) -> u8 {
+        self.flags
+            | self
+                .mapping_metadata
+                .get(path)
+                .map_or(0, |m| m.apply_flags())
+    }
+
+    fn metadata_fix_flags(&self, path: &[u8], source: &Entry, destination: &Entry) -> u8 {
+        let source = self.metadata_for(path, source);
+        let flags = self.flags_for(path);
         let mut changes = 0;
-        if self.flags & flags::TIMES != 0
+        if flags & flags::TIMES != 0
             && (source.mtime != destination.mtime
                 || (self.precise_mtime
                     && !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)))
         {
             changes |= flags::TIMES;
         }
-        if self.flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777 {
+        if flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777 {
             changes |= flags::MODE;
         }
-        if self.flags & flags::OWNER != 0 && source.uid != destination.uid {
-            changes |= flags::OWNER;
+        if flags & flags::OWNER != 0 && source.uid != destination.uid {
+            changes |= flags::OWNER | (flags & flags::REQUIRE_OWNER);
         }
-        if self.flags & flags::GROUP != 0 && source.gid != destination.gid {
-            changes |= flags::GROUP;
+        if flags & flags::GROUP != 0 && source.gid != destination.gid {
+            changes |= flags::GROUP | (flags & flags::REQUIRE_GROUP);
+        }
+        if self
+            .mapping_metadata
+            .get(path)
+            .is_some_and(|m| m.mtime.is_some())
+            && (source.mtime, source.mtime_nsec) != (destination.mtime, destination.mtime_nsec)
+        {
+            changes |= flags::TIMES;
         }
         changes
     }
 
-    fn metadata_matches(&self, source: &Entry, destination: &Entry) -> bool {
-        destination.kind == Kind::File
+    fn metadata_matches(&self, path: &[u8], source: &Entry, destination: &Entry) -> bool {
+        // An earlier copy may have assigned this destination timestamp. Even
+        // if the source now happens to match it, it is not content evidence.
+        self.mapping_metadata
+            .get(path)
+            .is_none_or(|m| m.mtime.is_none())
+            && destination.kind == Kind::File
             && destination.size == source.size
             && self.flags & flags::TIMES != 0
             && destination.mtime == source.mtime
@@ -1340,6 +1372,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
+    if args.restricted_grant.is_some() {
+        if let Some((entries, _)) = &mapping_entries {
+            for (_, entry) in entries {
+                if let Some(metadata) = entry.metadata {
+                    anyhow::ensure!(metadata.flags() & !args.meta_flags() == 0,
+                        "mapping metadata on a restricted receiver requires matching --preserve options in the signed grant");
+                }
+            }
+        }
+    }
+
     let mut opts = Opts {
         local_copy_fd_budget: true,
         hash_policy: crate::hashing::HashPolicy {
@@ -1347,6 +1390,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             transfer_integrity: args.transfer_integrity,
             transfer_hash_type: args.transfer_hash_type,
         },
+        mapping_metadata: mapping_entries
+            .as_ref()
+            .map(|(entries, _)| {
+                entries
+                    .iter()
+                    .filter_map(|(_, entry)| entry.metadata.map(|meta| (entry.dst.clone(), meta)))
+                    .collect()
+            })
+            .unwrap_or_default(),
         mapping_expected_hashes: mapping_entries
             .as_ref()
             .map(|(entries, _)| {
@@ -1397,6 +1449,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         max_size,
         min_size,
     };
+    if let Some(results) = progress.results_writer() {
+        results.mapping_metadata(opts.mapping_metadata.clone());
+    }
+
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
             "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
@@ -3835,7 +3891,7 @@ fn special_creation_supported(destination_supports_sockets: bool, kind: Kind) ->
     kind != Kind::Socket || destination_supports_sockets
 }
 
-fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
+fn metadata_differs(source: &Meta, destination: &Meta, flags: u8) -> bool {
     (flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777)
         || (flags & flags::OWNER != 0 && source.uid != destination.uid)
         || (flags & flags::GROUP != 0 && source.gid != destination.gid)

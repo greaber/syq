@@ -1435,9 +1435,16 @@ impl RestrictedAuthority {
         let known = proto::flags::MODE_MASK
             | proto::flags::OWNER
             | proto::flags::GROUP
-            | proto::flags::TIMES;
+            | proto::flags::TIMES
+            | proto::flags::REQUIRE_OWNER
+            | proto::flags::REQUIRE_GROUP;
         if flags & !known != 0 {
             bail!("request contains unknown metadata flags");
+        }
+        if (flags & proto::flags::REQUIRE_OWNER != 0 && flags & proto::flags::OWNER == 0)
+            || (flags & proto::flags::REQUIRE_GROUP != 0 && flags & proto::flags::GROUP == 0)
+        {
+            bail!("required ownership flags need the corresponding ownership request");
         }
         if flags & proto::flags::MODE_MASK == proto::flags::MODE_MASK {
             bail!("request cannot mix source and receiver-managed mode flags");

@@ -363,8 +363,9 @@ of these to `cp(mapping=...)`; use `dataclasses.replace` to change an entry.
 | `size` | `int` or `None` | Informational size in bytes; default `None` |
 | `mtime` | `int` or `None` | Informational modification time in Unix seconds; default `None` |
 | `expected_hash` | `Hash` or `None` | Expected whole-file hash; requires a regular file; default `None` |
+| `metadata` | `DestinationMetadata` or `None` | Explicit destination attributes; default `None` |
 
-`MappingEntry(src, dst, kind=None, size=None, mtime=None, expected_hash=None)` also accepts text or
+`MappingEntry(src, dst, kind=None, size=None, mtime=None, expected_hash=None, metadata=None)` also accepts text or
 byte paths for `src` and `dst` and converts them to `RelativePath`. `size` and
 `mtime` do not impose preconditions on the copy. `expected_hash` does: a file
 cannot succeed unless its contents match. For example, an adapter can supply
@@ -380,6 +381,26 @@ client.cp(mapping=[entry], cwd="source", into="download")
 
 Mapping files encode it as `"expected_hash": {"algorithm": "md5", "value": "..."}`.
 Older syq versions that do not support this field reject the mapping.
+
+### DestinationMetadata
+
+Set destination attributes without modifying the source:
+
+```python
+entry = syq.MappingEntry(
+    "source.bin", "payload.bin",
+    metadata=syq.DestinationMetadata(mode=0o640, mtime=1700000000),
+)
+client.cp(mapping=[entry], cwd="source", into="output")
+```
+
+The keyword-only fields are `mode`, `uid`, `gid`, `mtime`, and `mtime_nsec`,
+all optional integers. `mode` contains permission bits only; `uid` and `gid`
+are numeric IDs. Times use Unix seconds plus optional nanoseconds. Supplying
+`mtime` without `mtime_nsec` uses zero nanoseconds. Omitted attributes follow
+normal copy behavior. Explicit attributes do not require `preserve`, except
+where a restricted receiver's signed grant needs the corresponding permission.
+The [mapping reference](mappings.md#the-format) describes backend behavior.
 
 ### RelativePath and PathValue
 
@@ -540,7 +561,7 @@ It withholds the terminal record if stream validation, process completion, or
 a callback fails. Sink failures raise and abort the operation.
 
 `OperationResult.is_retryable` identifies retryable failures; `retry_entry()`
-preserves `expected_hash` and returns a `MappingEntry` when a complete mapping
+preserves `expected_hash` and `metadata` and returns a `MappingEntry` when a complete mapping
 identity is available, otherwise `None`. Only use collected entries after the call returns a validated `success`
 or `partial` result. A terminal callback alone does not establish completion.
 The client does not retry automatically.

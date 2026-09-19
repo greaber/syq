@@ -2420,7 +2420,10 @@ pub(super) fn apply_owner_if_changed(
     current_gid: u32,
     chown: impl Fn(Option<u32>, Option<u32>) -> io::Result<()>,
 ) -> Result<bool> {
-    let uid = if flags & flags::OWNER != 0 && is_superuser() && current_uid != meta.uid {
+    let uid = if flags & flags::OWNER != 0
+        && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
+        && current_uid != meta.uid
+    {
         Some(meta.uid)
     } else {
         None
@@ -2435,7 +2438,13 @@ pub(super) fn apply_owner_if_changed(
     }
     match chown(uid, gid) {
         Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && uid.is_none() => Ok(false),
+        Err(e)
+            if e.kind() == io::ErrorKind::PermissionDenied
+                && uid.is_none()
+                && flags & flags::REQUIRE_GROUP == 0 =>
+        {
+            Ok(false)
+        }
         Err(e) => Err(e.into()),
     }
 }

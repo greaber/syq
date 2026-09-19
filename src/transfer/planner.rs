@@ -848,6 +848,15 @@ impl Planner<'_> {
                         continue;
                     }
                 }
+                if let Some(metadata) = &m.metadata {
+                    if let Err(error) = metadata.validate_kind(e.kind) {
+                        let message = format!("--mapping line {line_number}: {error}");
+                        self.progress
+                            .error_classified(&message, Some("conflict"), None);
+                        self.emit_mapping_entry_failed(&m, "no", "conflict", None, &message);
+                        continue;
+                    }
+                }
                 // Destination ancestors: consistent with what earlier entries
                 // established, with missing ones synthesized parent-first.
                 let mut conflict = false;
@@ -1064,12 +1073,16 @@ impl Planner<'_> {
         self.blocked_mapping_parents = std::collections::HashSet::new();
         self.blocked_directory_paths = std::collections::HashSet::new();
         self.unusable_files = std::collections::HashSet::new();
-        // Dry-run directory traces are intentionally deferred until after
-        // planning, when a later explicit directory can have upgraded an
-        // implicit ancestor. They still need these two source-mapping sets.
-        if !self.opts.dry_run {
-            self.src_overrides = std::collections::HashMap::new();
-            self.implicit_dirs = std::collections::HashSet::new();
+        // Dry-run traces need every directory identity. Live copies only need
+        // identities for deferred metadata failures; retire the leaf mappings.
+        if self.mapping_mode && !self.opts.dry_run {
+            let deferred: std::collections::HashSet<_> =
+                self.deferred.iter().map(|(path, ..)| path).collect();
+            self.src_overrides
+                .retain(|dst, _| deferred.contains(&join(&self.dst_root, dst)));
+            self.implicit_dirs.retain(|path| deferred.contains(path));
+            self.src_overrides.shrink_to_fit();
+            self.implicit_dirs.shrink_to_fit();
         }
         if !self.opts.delete {
             self.dst_seen = std::collections::HashMap::new();
@@ -1498,7 +1511,7 @@ impl Planner<'_> {
         }
         let same = dst_entry
             .as_ref()
-            .is_some_and(|d| opts.metadata_matches(&e, d));
+            .is_some_and(|d| opts.metadata_matches(&dst_rel, &e, d));
         let dst_newer = opts.update
             && dst_entry.as_ref().is_some_and(|d| {
                 d.kind == Kind::File && (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
@@ -1512,7 +1525,7 @@ impl Planner<'_> {
             // (mode/owner/group) the way rsync does — a skipped file
             // shouldn't keep stale permissions.
             if let Some(d) = &dst_entry {
-                let ff = opts.metadata_fix_flags(&e, d);
+                let ff = opts.metadata_fix_flags(&dst_rel, &e, d);
                 if ff != 0 {
                     self.progress.files_unchanged.fetch_add(1, Relaxed);
                     self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
@@ -1533,15 +1546,19 @@ impl Planner<'_> {
                         }
                         return;
                     }
-                    leaf_ops.meta_fixes.push(Op::SetFileMetaIfSame {
-                        path: dst_path.clone(),
-                        condition: match target_condition {
-                            TargetCondition::Any => target_identity(d),
-                            condition => condition,
+                    leaf_ops.meta_fixes.push((
+                        Op::SetFileMetaIfSame {
+                            path: dst_path.clone(),
+                            condition: match target_condition {
+                                TargetCondition::Any => target_identity(d),
+                                condition => condition,
+                            },
+                            meta: opts.metadata_for(&dst_rel, &e),
+                            flags: ff,
                         },
-                        meta: e.meta(),
-                        flags: ff,
-                    });
+                        dst_rel,
+                        DeclaredKind::File,
+                    ));
                     return;
                 }
             }
@@ -1618,6 +1635,63 @@ impl Planner<'_> {
         }
     }
 
+    /// An existing link or special entry needs no content copy, but an explicit
+    /// metadata request still applies. Ordinary preservation behavior is unchanged.
+    fn plan_explicit_leaf_metadata(
+        &mut self,
+        path: &PathBytes,
+        rel: &[u8],
+        source: &Entry,
+        destination: &Entry,
+        ops: &mut LeafOps,
+    ) {
+        let Some(requested) = self.opts.mapping_metadata.get(rel) else {
+            return;
+        };
+        let meta = self.opts.metadata_for(rel, source);
+        let flags = requested.apply_flags();
+        // Explicit nanoseconds must be attempted even if preservation's quick
+        // comparison would tolerate truncation by the destination filesystem.
+        let time_differs = requested.mtime.is_some()
+            && (meta.mtime, meta.mtime_nsec) != (destination.mtime, destination.mtime_nsec);
+        if !time_differs && !metadata_differs(&meta, &destination.meta(), flags) {
+            return;
+        }
+        if self.opts.dry_run {
+            self.dry_run_changes.metadata_files += 1;
+            self.emit_trace(
+                if source.kind == Kind::Symlink {
+                    "create_symlink"
+                } else {
+                    "create_special"
+                },
+                rel,
+                if source.kind == Kind::Symlink {
+                    "symlink"
+                } else {
+                    "special"
+                },
+                None,
+                "metadata_differs",
+            );
+        } else {
+            ops.meta_fixes.push((
+                Op::SetMeta {
+                    path: path.clone(),
+                    meta,
+                    flags,
+                    condition: target_identity(destination),
+                },
+                rel.to_vec(),
+                if source.kind == Kind::Symlink {
+                    DeclaredKind::Symlink
+                } else {
+                    DeclaredKind::Special
+                },
+            ));
+        }
+    }
+
     /// Queue the creation or replacement of a mapped symlink unless the
     /// destination already matches.
     fn plan_symlink(&mut self, leaf: Planned, dst_entry: Option<Entry>, leaf_ops: &mut LeafOps) {
@@ -1642,6 +1716,13 @@ impl Planner<'_> {
             .is_some_and(|d| d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..]));
 
         if same {
+            self.plan_explicit_leaf_metadata(
+                &dst_path,
+                &dst_rel,
+                &e,
+                dst_entry.as_ref().unwrap(),
+                leaf_ops,
+            );
             return;
         }
         if opts.dry_run {
@@ -1698,8 +1779,8 @@ impl Planner<'_> {
             // this phase entirely.
             condition: TargetCondition::Any,
             path: dst_path,
-            meta: e.meta(),
-            flags: opts.flags & !flags::MODE,
+            meta: opts.metadata_for(&dst_rel, &e),
+            flags: opts.flags_for(&dst_rel) & !flags::MODE,
         });
     }
 
@@ -1724,43 +1805,50 @@ impl Planner<'_> {
         let same = dst_entry
             .as_ref()
             .is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
-
-        if same || opts.dry_run {
-            if opts.dry_run && !same {
-                self.dry_run_changes.specials += 1;
-                if dst_entry.as_ref().is_some_and(|d| d.kind != e.kind) {
-                    self.dry_run_changes.type_replacements += 1;
-                }
-                self.emit_trace(
-                    "create_special",
-                    &dst_rel,
-                    "special",
-                    None,
-                    match &dst_entry {
-                        None => "destination_missing",
-                        Some(d) if d.kind != e.kind => "type_differs",
-                        Some(_) => "content_differs",
-                    },
-                );
-                if opts.verbose > 0 {
-                    let shown = display(&dst_path);
-                    let action = match &dst_entry {
-                        None => format!(
-                            "create {} {shown} (destination missing)",
-                            kind_label(e.kind)
-                        ),
-                        Some(d) if d.kind != e.kind => format!(
-                            "replace with {} {shown} (destination is {})",
-                            kind_label(e.kind),
-                            kind_label(d.kind)
-                        ),
-                        Some(_) => format!(
-                            "update {} {shown} (device identity differs)",
-                            kind_label(e.kind)
-                        ),
-                    };
-                    self.progress.println(&action);
-                }
+        if same {
+            self.plan_explicit_leaf_metadata(
+                &dst_path,
+                &dst_rel,
+                &e,
+                dst_entry.as_ref().unwrap(),
+                leaf_ops,
+            );
+            return;
+        }
+        if opts.dry_run {
+            self.dry_run_changes.specials += 1;
+            if dst_entry.as_ref().is_some_and(|d| d.kind != e.kind) {
+                self.dry_run_changes.type_replacements += 1;
+            }
+            self.emit_trace(
+                "create_special",
+                &dst_rel,
+                "special",
+                None,
+                match &dst_entry {
+                    None => "destination_missing",
+                    Some(d) if d.kind != e.kind => "type_differs",
+                    Some(_) => "content_differs",
+                },
+            );
+            if opts.verbose > 0 {
+                let shown = display(&dst_path);
+                let action = match &dst_entry {
+                    None => format!(
+                        "create {} {shown} (destination missing)",
+                        kind_label(e.kind)
+                    ),
+                    Some(d) if d.kind != e.kind => format!(
+                        "replace with {} {shown} (destination is {})",
+                        kind_label(e.kind),
+                        kind_label(d.kind)
+                    ),
+                    Some(_) => format!(
+                        "update {} {shown} (device identity differs)",
+                        kind_label(e.kind)
+                    ),
+                };
+                self.progress.println(&action);
             }
             return;
         }
@@ -1776,8 +1864,8 @@ impl Planner<'_> {
             rdev: e.rdev,
             condition: self.exact_condition_for(&dst_path),
         });
-        let mut meta = e.meta();
-        let mut flags = opts.flags;
+        let mut meta = opts.metadata_for(&dst_rel, &e);
+        let mut flags = opts.flags_for(&dst_rel);
         if flags & flags::MODE == 0 {
             meta.mode = e.mode & 0o777 & !opts.umask;
             flags |= flags::RECEIVER_MODE;
@@ -2017,11 +2105,9 @@ impl Planner<'_> {
     /// Record what a live run would do to this batch's directories.
     fn trace_dry_run_dirs(&mut self, planned: &[PlannedDir], dst_root: &[u8]) {
         let opts = self.opts;
-        let mut meta_flags = opts.flags;
-        if !opts.perms {
-            meta_flags &= !flags::MODE;
-        }
-        for (p, _, e, destination) in planned {
+        for (p, dst_rel, e, destination) in planned {
+            let meta_flags = opts.flags_for(dst_rel);
+            let meta = opts.metadata_for(dst_rel, e);
             match destination {
                 None => {
                     // The insert doubles as a dedupe: an explicit
@@ -2045,7 +2131,8 @@ impl Planner<'_> {
                 }
                 Some(d)
                     if !opts.preserve_existing_directory_metadata
-                        && metadata_differs(e, d, meta_flags)
+                        && (metadata_differs(&meta, &d.meta(), meta_flags)
+                            || opts.metadata_fix_flags(dst_rel, e, d) != 0)
                         && !self.implicit_dirs.contains(p) =>
                 {
                     self.dry_run_changes.metadata_directories.insert(p.clone());
@@ -2079,11 +2166,7 @@ impl Planner<'_> {
         reopened_dirs: &std::collections::HashSet<PathBytes>,
     ) {
         let opts = self.opts;
-        let mut flags = opts.flags;
-        if !opts.perms {
-            flags &= !flags::MODE;
-        }
-        for (p, _, e, s) in planned {
+        for (p, dst_rel, e, s) in planned {
             // New implicit parents already have their final modes.
             // Restore only those temporarily reopened for writing.
             if self.implicit_dirs.contains(p) {
@@ -2107,8 +2190,8 @@ impl Planner<'_> {
                 continue;
             }
             let depth = p.iter().filter(|&&c| c == b'/').count();
-            let mut meta = e.meta();
-            let mut flags = flags;
+            let mut meta = opts.metadata_for(dst_rel, e);
+            let mut flags = opts.flags_for(dst_rel);
             // Without -p, existing directories retain their mode and
             // new directories receive the source mode through the
             // receiving side's umask. Only a signed receiver needs to
@@ -2138,19 +2221,44 @@ impl Planner<'_> {
     }
 
     /// Apply metadata corrections for files whose content is already current.
-    fn flush_meta_fixes(&mut self, meta_fixes: Vec<Op>) -> Result<()> {
+    fn flush_meta_fixes(&mut self, meta_fixes: Vec<(Op, PathBytes, DeclaredKind)>) -> Result<()> {
         if meta_fixes.is_empty() {
             return Ok(());
         }
-        let errors = self.apply(meta_fixes)?;
+        let (ops, entries): (Vec<_>, Vec<_>) = meta_fixes
+            .into_iter()
+            .map(|(op, dst, kind)| (op, (dst, kind)))
+            .unzip();
+        let errors = self.apply(ops)?;
         let capacity_error = first_capacity_error(&errors);
-        for err in errors.into_iter().flatten() {
-            self.progress.error(&format!("syq: {err}"));
+        for ((dst, kind), error) in entries.iter().zip(errors) {
+            if let Some(error) = error {
+                self.report_metadata_failure(Some(dst), *kind, &error);
+            }
         }
         if let Some(error) = capacity_error {
             return Err(endpoint_error(error)).context("apply destination changes");
         }
         Ok(())
+    }
+
+    fn report_metadata_failure(&self, dst: Option<&[u8]>, kind: DeclaredKind, error: &WireError) {
+        let os_kind = wire_os_kind(error);
+        self.progress
+            .error_classified(&format!("syq: {error}"), Some("io"), os_kind);
+        if let Some(dst) = dst {
+            self.emit_entry_failed(
+                FailedEntry {
+                    dst,
+                    src: self.mapping_source_rel(dst).as_deref(),
+                    kind: Some(kind),
+                },
+                "unknown",
+                "io",
+                os_kind,
+                error.as_str(),
+            );
+        }
     }
 
     /// Apply the queued symlink and special-file operations and report each
@@ -2468,6 +2576,7 @@ impl Planner<'_> {
             self.emit_mapping_entry_failed(
                 &ManifestEntry {
                     expected_hash: self.opts.expected_for(dst_rel).cloned(),
+                    metadata: self.opts.mapping_metadata.get(dst_rel).copied(),
                     src: self
                         .mapping_source_rel(dst_rel)
                         .expect("mapping parent failure"),
@@ -3150,8 +3259,13 @@ impl Planner<'_> {
                 .collect();
             let errors = self.apply(ops)?;
             let capacity_error = first_capacity_error(&errors);
-            for err in errors.into_iter().flatten() {
-                self.progress.error(&format!("syq: {err}"));
+            for ((path, ..), error) in chunk.iter().zip(errors) {
+                if let Some(error) = error {
+                    let dst = (!self.implicit_dirs.contains(path))
+                        .then(|| strip_dst_root(path, &self.dst_root))
+                        .flatten();
+                    self.report_metadata_failure(dst, DeclaredKind::Dir, &error);
+                }
             }
             if let Some(error) = capacity_error {
                 return Err(endpoint_error(error)).context("apply destination changes");
@@ -3190,7 +3304,8 @@ pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
 struct LeafOps {
     ops: Vec<Op>,
     names: Vec<QueuedLeafOp>,
-    meta_fixes: Vec<Op>,
+    // Metadata-only operations retain the same retry identity as content copies.
+    meta_fixes: Vec<(Op, PathBytes, DeclaredKind)>,
 }
 
 /// A queued symlink/special creation: the display string for -v plus the

@@ -139,6 +139,27 @@ def direct():
             if name == "fallback":
                 assert b"data over ssh" in result.stderr, result.stderr
             ssh("destination", f"from pathlib import Path; p=Path({destination!r}); assert (p/'nested'/'renamed').read_bytes()==b'mapped contents'; assert (p/'link').is_symlink(); assert (p/'nested').stat().st_mode & 0o777 == 0o755; assert (p/'directory').is_dir(); assert not (p/'directory'/'unselected').exists()")
+        print("mapping destination metadata: ordinary and signed SSH", flush=True)
+        selected = json.loads(manifest([("file", "file", "file")]))
+        owner = json.loads(ssh("destination", "import os,json; print(json.dumps([os.getuid(),os.getgid()]))").stdout)
+        selected["metadata"] = {"mode": 0o640, "mtime": 123, "mtime_nsec": 456, "uid": owner[0], "gid": owner[1]}
+        metadata_manifest = (json.dumps(selected) + "\n").encode()
+        destination = root + "/metadata"
+        command = prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--no-tcp"]
+        refused = run(command, data=metadata_manifest, expected=1)
+        assert b"matching --preserve options" in refused.stderr, refused.stderr
+        run(command + ["--preserve=permissions,ownership"], data=metadata_manifest)
+        ssh("destination", f"from pathlib import Path; p=Path({destination!r})/'file'; assert p.read_bytes()==b'mapped contents'; s=p.stat(); assert s.st_mode & 0o7777==0o640; assert s.st_mtime_ns==123000000456")
+        local_source = Path(temporary) / "metadata-source"
+        local_source.mkdir()
+        (local_source / "file").write_bytes(b'ordinary mapping')
+        run(["syq", "cp", "--no-progress", "-C", str(local_source), "--mapping", "-", "--to", "destination", "--into", destination, "--no-tcp"], data=metadata_manifest)
+        ssh("destination", f"from pathlib import Path; p=Path({destination!r})/'file'; assert p.read_bytes()==b'ordinary mapping'; s=p.stat(); assert s.st_mode & 0o7777==0o640; assert s.st_mtime_ns==123000000456")
+        if owner[0] != 0:
+            selected["metadata"]["uid"] = 4294967294
+            denied_manifest = (json.dumps(selected) + "\n").encode()
+            run(command + ["--preserve=permissions,ownership"], data=denied_manifest, expected=23)
+            ssh("destination", f"from pathlib import Path; assert (Path({destination!r})/'file').read_bytes()==b'ordinary mapping'")
         destination = root + "/tcp"
         matching_preview(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--coordinate-at", "local"], data=contents, files=1)
         # Selection uses source mtimes; --only-existing remains independently enforced.
