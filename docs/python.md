@@ -16,9 +16,9 @@ on Linux and macOS:
 python -m pip install syq
 ```
 
-Prebuilt wheels include the matching syq executable. Installation needs no Rust
-compiler, and SDK calls need no executable download or writable home directory
-for installation. The `syq` command is also available in the Python environment.
+Prebuilt wheels include the matching syq executable, so no Rust compiler or
+separate syq installation is needed. The `syq` command is also available in
+the Python environment.
 
 ## Try a copy
 
@@ -36,8 +36,7 @@ for filtering, mappings, removal, and error handling.
 ## Building from source
 
 Installing from a source distribution builds the executable and requires Rust
-and a C compiler. Its remote behavior follows the native source version bundled
-in that distribution: source builds upload themselves to compatible SSH hosts
-by default. See [source builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for helper selection and symbols
-when building from a checkout with those options. Older distributions retain
-their bundled native version's build options.
+and a C compiler. Source builds upload themselves to compatible SSH hosts by
+default. See
+[source builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for
+compiler requirements and SSH helper selection.
