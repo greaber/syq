@@ -124,7 +124,7 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
 pub struct Opts {
     pub hash_policy: crate::hashing::HashPolicy,
     pub expected_hash: Option<crate::hashing::Digest>,
-    pub mapping_expected_hashs: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
+    pub mapping_expected_hashes: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
@@ -198,7 +198,7 @@ impl Opts {
     }
 
     fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
-        self.mapping_expected_hashs
+        self.mapping_expected_hashes
             .get(path)
             .or(self.expected_hash.as_ref())
     }
@@ -1368,7 +1368,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             transfer_hash_type: args.transfer_hash_type,
         },
         expected_hash: args.expected_hash.clone(),
-        mapping_expected_hashs: mapping_entries
+        mapping_expected_hashes: mapping_entries
             .as_ref()
             .map(|(entries, _)| {
                 entries

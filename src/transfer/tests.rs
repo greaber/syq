@@ -208,7 +208,7 @@ fn pipeline_worker(
         local_copy_fd_budget: true,
         hash_policy: Default::default(),
         expected_hash: None,
-        mapping_expected_hashs: Default::default(),
+        mapping_expected_hashes: Default::default(),
         block: 512,
         tuning: crate::transfer_tuning::TransferTuning {
             copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
