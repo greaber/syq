@@ -5,7 +5,12 @@
   border: 1px solid var(--table-border-color);
   border-radius: 8px;
 }
-.tool-examples-controls:not([hidden]), .tool-example-commands {
+.tool-examples-controls:not([hidden]) {
+  display: grid;
+  grid-template-columns: 8em minmax(0, 1fr);
+  gap: 1em;
+}
+.tool-example-commands {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 1em;
