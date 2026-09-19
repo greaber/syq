@@ -2494,7 +2494,7 @@ impl Planner<'_> {
                 .error_classified(&message, Some("conflict"), None);
             self.emit_mapping_entry_failed(
                 &ManifestEntry {
-                    expected_digest: self.opts.expected_for(dst_rel).cloned(),
+                    expected_hash: self.opts.expected_for(dst_rel).cloned(),
                     src: self
                         .mapping_source_rel(dst_rel)
                         .expect("mapping parent failure"),

@@ -37,8 +37,7 @@ it uses hostA's SSH access. `--to @laptop` instead sends the files to the
 receiving machine itself.
 
 Use `--auth-from @laptop` to choose your laptop explicitly, or `--auth-from ssh`
-to use hostA's SSH access. The default is `--auth-from auto`. `--via @NAME` is
-an alias for choosing a receiving machine. See
+to use hostA's SSH access. The default is `--auth-from auto`. See
 [authorization selection](remote-reference.md#authorization-selection) for
 name rules and route restrictions.
 
@@ -47,8 +46,7 @@ prompt or `syq persist receive pending` and `syq persist receive approve REQUEST
 These requests require a decision even when `persist receive on --approve always` permits
 automatic copies onto the laptop itself. Once an approval request is sent,
 a refusal, interrupted connection, setup failure, or copy failure ends that
-attempt; syq does not try another authorizer or SSH. `--auth-from @NAME` and
-`--via @NAME` fail if that receiving machine is unavailable.
+attempt; syq does not try another authorizer or SSH. `--auth-from @NAME` fails if that receiving machine is unavailable.
 
 The laptop uses its own SSH configuration, credentials, and trusted host keys
 to connect to hostB and install the matching syq helper. Connect to hostB with

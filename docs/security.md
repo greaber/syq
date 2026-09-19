@@ -176,7 +176,7 @@ have already been compromised.
 
 Optional `--integrity-checking transfer=blake3` checks detect accidental data corruption; they
 do not authenticate plaintext traffic because an attacker can replace both
-data and checksums. An expected whole-file digest supplied through a trusted
+data and checksums. An expected whole-file hash supplied through a trusted
 channel checks the resulting file against that expectation. Use BLAKE3 or
 SHA-256 when resistance to malicious content substitution matters.
 

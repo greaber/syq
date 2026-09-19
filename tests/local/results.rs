@@ -142,7 +142,7 @@ fn followed_results_referent_stays_pinned_when_the_link_is_replaced() {
 fn hash_policy_automation_digest_schema_checks_algorithm_and_width() {
     let validator = automation_validator();
     let mut record = serde_json::json!({
-        "schema": "syq.automation", "schema_version": 1, "seq": 1,
+        "schema": "syq.automation", "schema_version": 2, "seq": 1,
         "type": "operation_result", "action": "transfer_file", "kind": "file",
         "dst": {"encoding": "utf-8", "value": "file"}, "disposition": "failed",
     });
@@ -156,16 +156,15 @@ fn hash_policy_automation_digest_schema_checks_algorithm_and_width() {
         ("md5", 32),
         ("xxh3-128", 32),
     ] {
-        record["expected_digest"] =
+        record["expected_hash"] =
             serde_json::json!({"algorithm": algorithm, "value": "a".repeat(length)});
         assert!(validator.is_valid(&record), "{record}");
-        record["expected_digest"]["value"] = "a".repeat(if length == 64 { 32 } else { 64 }).into();
+        record["expected_hash"]["value"] = "a".repeat(if length == 64 { 32 } else { 64 }).into();
         assert!(!validator.is_valid(&record), "{record}");
-        record["expected_digest"]["value"] = "g".repeat(length).into();
+        record["expected_hash"]["value"] = "g".repeat(length).into();
         assert!(!validator.is_valid(&record), "{record}");
     }
-    record["expected_digest"] =
-        serde_json::json!({"algorithm": "rolling", "value": "a".repeat(32)});
+    record["expected_hash"] = serde_json::json!({"algorithm": "rolling", "value": "a".repeat(32)});
     assert!(!validator.is_valid(&record));
 }
 
@@ -421,7 +420,7 @@ fn native_cp_results_stream_success_and_partial() {
     // Envelope: schema v1, strictly increasing seq, run first, result last.
     for (i, v) in lines.iter().enumerate() {
         assert_eq!(v["schema"], "syq.automation");
-        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["schema_version"], 2);
         assert_eq!(v["seq"], i as u64);
     }
     assert_eq!(lines[0]["type"], "run");
@@ -944,7 +943,7 @@ fn automation_fixtures_validate_against_schema() {
     assert!(
         validator
             .validate(&serde_json::json!({
-                "schema": "syq.automation", "schema_version": 1, "seq": 0, "type": "run"
+                "schema": "syq.automation", "schema_version": 2, "seq": 0, "type": "run"
             }))
             .is_err(),
         "missing required fields must fail validation"

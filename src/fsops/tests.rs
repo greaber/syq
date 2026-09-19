@@ -176,7 +176,7 @@ fn payload_integrity_checks_are_explicit() {
 }
 
 #[test]
-fn expected_digest_failure_preserves_existing_destination() {
+fn expected_hash_failure_preserves_existing_destination() {
     use crate::hashing::{Digest, HashAlgorithm, HashPolicy};
     let directory = tempfile::tempdir().unwrap();
     let target = directory.path().join("target");

@@ -24,7 +24,7 @@ def ready_stub() -> str:
     fixture = Path(__file__).resolve().parents[3] / "tests/fixtures/automation/success.ndjson"
     run = json.loads(fixture.read_text().splitlines()[0])
     run["mapping"] = False
-    ready = dict(schema="syq.automation", schema_version=1, seq=1, type="stream_ready")
+    ready = dict(schema="syq.automation", schema_version=2, seq=1, type="stream_ready")
     data = (json.dumps(run) + "\n" + json.dumps(ready) + "\n").encode()
     return (f'#!{sys.executable}\nimport os, sys, time\n'
             f'os.write(int(sys.argv[sys.argv.index("--results-fd") + 1]), {data!r})\n'
@@ -42,69 +42,36 @@ class StreamTests(unittest.TestCase):
 
     def test_stream_controls_and_diagnostics(self):
         payload = b"checksummed stream" * 5000
-        expected = syq.Digest("sha256", hashlib.sha256(payload).hexdigest())
         target = self.root / "checked"
-        with self.client.open_writer(as_=target, expected_digest=expected,
+        with self.client.open_writer(as_=target,
                 integrity_checking="transfer=sha256", stats=True,
                 resource_limits="bandwidth=1M", performance_tuning="request-size=8K") as out:
             out.write(payload)
         self.assertIn(b"stream complete", out.stderr)
-        with self.client.open_reader(target, expected_digest=expected, progress_json=True) as source:
+        with self.client.open_reader(target, progress_json=True) as source:
             self.assertEqual(source.read(), payload)
         self.assertEqual(json.loads(source.stderr.splitlines()[-1])["files_done"], 1)
-        wrong = syq.Digest("sha256", "0" * 64)
-        with self.assertRaises(syq.SyqProcessError):
-            with self.client.open_writer(as_=target, expected_digest=wrong) as out:
-                out.write(b"incorrect")
-        self.assertEqual(target.read_bytes(), payload)
-        with self.assertRaises(syq.SyqProcessError):
-            with self.client.open_reader(target, expected_digest=wrong) as source:
-                source.read()
-
         async def asynchronous():
             client = syq.AsyncClient(executable=SYQ, env=self.env, timeout=10)
-            async with client.open_writer(as_=target, expected_digest=expected,
+            async with client.open_writer(as_=target,
                     stats=True, resource_limits="workers=1") as out:
                 await out.write(payload)
             self.assertIn(b"stream complete", out.stderr)
-            async with client.open_reader(target, expected_digest=expected,
+            async with client.open_reader(target,
                     integrity_checking="transfer=md5", progress_json=True) as source:
                 self.assertEqual(await source.read(), payload)
             self.assertEqual(json.loads(source.stderr.splitlines()[-1])["files_done"], 1)
         asyncio.run(asynchronous())
 
-    def test_reader_size_filters(self):
-        target = self.root / "sized"
-        target.write_bytes(b"bytes")
-        for options in ({"max_size": "4"}, {"min_size": "6", "dry_run": True}):
-            with self.client.open_reader(target, **options) as source:
-                self.assertEqual(source.read(), b"")
-            self.assertTrue(source.skipped)
-            self.assertEqual(source.result.files_excluded, 1)
-            self.assertEqual(source.result.bytes_transferred, 0)
-        with self.client.open_reader(target, min_size="5", max_size="5") as source:
-            self.assertEqual(source.read(), b"bytes")
-        self.assertFalse(source.skipped)
-        inherited = syq.Client(executable=SYQ, env={**self.env, "SYQ_CP_OPTIONS": "--max-size 4"})
-        with inherited.open_reader(target) as source:
-            self.assertEqual(source.read(), b"")
-        self.assertTrue(source.skipped)
-        # Writers produce through a pipe: an inherited size filter must fail
-        # at open, before the caller starts generating bytes.
-        with self.assertRaises(syq.SyqProcessError) as error:
-            inherited.open_writer(as_=target)
-        self.assertIn(b"require a known source length", error.exception.result.stderr)
-        self.assertEqual(target.read_bytes(), b"bytes")
-
-        async def asynchronous():
-            client = syq.AsyncClient(executable=SYQ, env=self.env, timeout=10)
-            async with client.open_reader(target, max_size="4") as source:
-                self.assertEqual(await source.read(), b"")
-            self.assertTrue(source.skipped)
-            self.assertEqual(source.result.files_excluded, 1)
-            async with client.open_reader(target, min_size="5", max_size="5") as source:
-                self.assertEqual(await source.read(), b"bytes")
-        asyncio.run(asynchronous())
+    def test_removed_stream_options_are_rejected(self):
+        for option in ("expected_hash", "expected_digest", "min_size", "max_size"):
+            with self.subTest(option=option), self.assertRaises(TypeError):
+                self.client.open_reader("missing", **{option: "1"})
+        for option in ("--expected-hash=md5:" + "0" * 32, "--min-size=1", "--max-size=1"):
+            inherited = syq.Client(executable=SYQ, env={**self.env, "SYQ_CP_OPTIONS": option})
+            with self.subTest(option=option), self.assertRaises(syq.SyqProcessError):
+                inherited.open_writer(as_=self.root / "missing")
+        self.assertFalse((self.root / "missing").exists())
 
     def test_stream_results_and_previews(self):
         target = self.root / "result-object"

@@ -218,17 +218,22 @@ def check():
         # Only explicitly selected mappings are copied, including empty directories.
         mapping = root / 'mapping.jsonl'
         script_md5 = hashlib.md5((src / 'script').read_bytes()).hexdigest()
-        entries = [{'src': {'encoding': 'utf-8', 'value': 'script'}, 'dst': {'encoding': 'utf-8', 'value': 'renamed'}, 'kind': 'file', 'expected_digest': {'algorithm': 'md5', 'value': script_md5}}]
+        entries = [{'src': {'encoding': 'utf-8', 'value': 'script'}, 'dst': {'encoding': 'utf-8', 'value': 'renamed'}, 'kind': 'file', 'expected_hash': {'algorithm': 'md5', 'value': script_md5}}]
         mapping.write_text(''.join(json.dumps(e) + '\n' for e in entries))
         run(['-C', src, '--mapping', mapping, '--to', remote, '--into', PREFIX + '/mapping'])
         _, body = request('GET', PREFIX + '/mapping/renamed')
         assert body == (src / 'script').read_bytes()
-        run(['--from', remote, PREFIX + '/mapping/renamed', '--as', root / 'expected',
-             '--expected-hash', 'md5:' + script_md5, '--integrity-checking=transfer=blake3'])
+        entry = {'src': {'encoding': 'utf-8', 'value': PREFIX + '/mapping/renamed'},
+                 'dst': {'encoding': 'utf-8', 'value': 'expected'}, 'kind': 'file',
+                 'expected_hash': {'algorithm': 'md5', 'value': script_md5}}
+        mapping.write_text(json.dumps(entry) + '\n')
+        run(['--from', remote, '--mapping', mapping, '--into', root,
+             '--integrity-checking=transfer=blake3'])
         assert (root / 'expected').read_bytes() == body
         (root / 'expected').write_bytes(b'keep on mismatch')
-        run(['--from', remote, PREFIX + '/mapping/renamed', '--as', root / 'expected',
-             '--expected-hash', 'md5:' + '0' * 32], ok=False)
+        entry['expected_hash']['value'] = '0' * 32
+        mapping.write_text(json.dumps(entry) + '\n')
+        run(['--from', remote, '--mapping', mapping, '--into', root], ok=False)
         assert (root / 'expected').read_bytes() == b'keep on mismatch'
         # Directory entries in a mapping are explicit, not recursive selectors.
         manifest = root / 'tree-map.jsonl'

@@ -220,7 +220,7 @@ and the command exits 25.
 
 Pruning stays inside the copied directories. Copying named directories `a`
 and `b` into `backup` prunes `backup/a` and `backup/b`, leaving `backup/c` alone.
-Ignored paths and files skipped by size limits are protected.
+Ignored paths are protected.
 
 Scan or copy errors prevent deletion. An interruption after deletion starts
 can leave some extras removed. Do not prune while another copy is writing into
@@ -344,11 +344,8 @@ metadata does not prove that contents match; use `--hash` to compare contents:
 syq cp --hash --srcs-in project --into backup
 ```
 
-To require a known whole-file digest, use `--expected-hash ALGORITHM:HEX` with
-one named regular file or descriptor stream. Syq checks the complete result, including reused bytes.
-A mismatch fails the file; with normal staging it does not replace the destination.
-Selection filters still exclude files from checking. For batch copies, use
-[expected digests in mappings](mappings.md#the-format).
+Use [per-file expected hashes in mappings](mappings.md#the-format) to require
+known contents, including when reusing destination bytes.
 
 To compare without copying:
 
@@ -361,7 +358,7 @@ symlink targets, and entry types, without comparing metadata or looking for
 extra destination files.
 
 The [Integrity checking reference](integrity-checking.md) covers timestamp
-precision, every comparison and payload-check algorithm, expected digests,
+precision, every comparison and payload-check algorithm, expected hashes,
 and verification restrictions. For consistent source data, stop concurrent
 writers or copy a snapshot.
 
@@ -546,7 +543,6 @@ installed helper or pass `--no-bootstrap` when one is already on the server's
 ## More options
 
 `--src-non-dir` and `--src-dir` require a non-directory or directory respectively.
-Use `--min-size` and `--max-size` to select regular files by size.
 
 For parallelism and bandwidth controls, see [Speed](speed.md). For scripts,
 see [Automation results](automation.md).

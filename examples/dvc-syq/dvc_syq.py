@@ -44,7 +44,7 @@ import yaml
 import syq
 
 try:
-    from syq import Digest, MappingEntry
+    from syq import Hash, MappingEntry
 except ImportError:
     sys.exit("error: this script needs a syq package newer than 0.6.0")
 
@@ -79,8 +79,8 @@ class CacheObject:
         return self.is_listing or not self.legacy
 
     @property
-    def digest(self) -> Digest:
-        return Digest("md5", self.md5.removesuffix(".dir"))
+    def digest(self) -> Hash:
+        return Hash("md5", self.md5.removesuffix(".dir"))
 
 
 @dataclass(frozen=True)
@@ -272,7 +272,7 @@ def download(
         MappingEntry(
             src=prefix + obj.path, dst=obj.path, kind="file",
             # syq checks the digest as the bytes arrive and keeps a mismatched file out of the cache.
-            expected_digest=obj.digest if verify and obj.named_after_its_bytes else None,
+            expected_hash=obj.digest if verify and obj.named_after_its_bytes else None,
         )
         for obj in objects
     ]

@@ -954,9 +954,6 @@ fn run_remote(
         remote.push(format!("--resource-limits={limits}"));
     }
 
-    if let Some(expected) = &args.expected_digest {
-        remote.push(format!("--expected-hash={expected}"));
-    }
     for (enabled, option) in [
         (args.verify_only, "--verify-only"),
         (args.ignore_existing, "--only-new"),
@@ -994,12 +991,6 @@ fn run_remote(
     }
     if args.devices {
         remote.push("--preserve=specials".into());
-    }
-    if let Some(maximum) = &args.max_size {
-        remote.push(format!("--max-size={maximum}"));
-    }
-    if let Some(minimum) = &args.min_size {
-        remote.push(format!("--min-size={minimum}"));
     }
     if let Some(tuning) = args.tuning_options {
         remote.push(format!("--performance-tuning={tuning}"));

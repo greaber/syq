@@ -80,7 +80,7 @@ Unix filename bytes.
 Copies support directories, symlinks, modification times, filters, hashing,
 resume, mappings, `--preserve=permissions`, `--verify-only`, and the
 [overwrite policies](reference.md#choose-which-existing-files-to-update).
-Ownership and special-file preservation, `--inplace`, and `--min-size` are
+Ownership preservation, special-file preservation, and `--inplace` are
 unsupported. Timestamp comparisons trust the source's reported modification
 times.
 

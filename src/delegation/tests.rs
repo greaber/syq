@@ -485,7 +485,7 @@ fn hashing_constraints_are_signed_and_preserve_legacy_encoding() {
             transfer_integrity: false,
             transfer_hash_type: None,
         },
-        expected_digest: Some(Digest::hash_bytes(HashAlgorithm::Sha256, b"expected file")),
+        expected_hash: Some(Digest::hash_bytes(HashAlgorithm::Sha256, b"expected file")),
     };
     let encoded = sign_grant(
         fixture_grant(45),
@@ -504,7 +504,7 @@ fn hashing_constraints_are_signed_and_preserve_legacy_encoding() {
     let mut other_payload = hashing.clone();
     other_payload.policy.transfer_hash_type = Some(HashAlgorithm::Sha256);
     let mut omitted = hashing.clone();
-    omitted.expected_digest = None;
+    omitted.expected_hash = None;
     for policy in [None, Some(changed), Some(other_payload), Some(omitted)] {
         let mut tampered = decoded.clone();
         tampered.hashing = policy;
@@ -783,7 +783,7 @@ fn in_process_enrollment_key_signature_is_accepted_by_openssh() {
     .unwrap();
     let decoded = SignedGrantEnvelope::decode(&receipted).unwrap();
     assert_eq!(decoded.receipt_policy, expected_receipt_policy.clone());
-    let expected_digest = signed_grant_digest(&receipted).unwrap();
+    let expected_hash = signed_grant_digest(&receipted).unwrap();
     let verified = verify_and_redeem(
         &receipted,
         &context(SIGNER, TARGET, NOW, 0),
@@ -793,7 +793,7 @@ fn in_process_enrollment_key_signature_is_accepted_by_openssh() {
     .expect("OpenSSH must accept the signed receipt policy");
     let (_, extensions, digest, _) = verified.into_parts();
     assert_eq!(extensions.receipt_policy, expected_receipt_policy);
-    assert_eq!(digest, expected_digest);
+    assert_eq!(digest, expected_hash);
 }
 
 #[test]

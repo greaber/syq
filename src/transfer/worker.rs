@@ -827,7 +827,7 @@ impl Worker {
                     meta.mode = self.create_mode(&job);
                     ok(
                         self.dst.call(Request::FinishBasis {
-                            expected_digest: self.opts.expected_for(&job.rel_bytes).cloned(),
+                            expected_hash: self.opts.expected_for(&job.rel_bytes).cloned(),
                             path: job.dst.clone(),
                             copy_id: self.copy_id(),
                             meta,
@@ -1603,7 +1603,7 @@ impl Worker {
         let flags = publication_metadata_flags(self.opts.flags);
         let finalized = ok(
             self.dst.call(Request::Finalize {
-                expected_digest: self.opts.expected_for(&job.rel_bytes).cloned(),
+                expected_hash: self.opts.expected_for(&job.rel_bytes).cloned(),
                 path: job.dst.clone(),
                 inplace: job.inplace,
                 copy_id: self.copy_id(),
