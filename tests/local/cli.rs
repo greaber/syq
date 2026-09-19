@@ -1173,8 +1173,8 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
     assert_eq!(out.stdout, payload);
     assert_eq!(
         stderr_of(&out).matches(" ready (local)").count(),
-        1,
-        "one-range download opened idle workers: {}",
+        2,
+        "two-range paced download opened idle workers: {}",
         stderr_of(&out)
     );
     assert!(
