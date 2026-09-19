@@ -1850,6 +1850,23 @@ fn local_source_recycles_after_write_without_consuming_pending_replies() {
     std::fs::write(&output, []).unwrap();
     let mut source = LocalConn::new(&ConnectionRole::Control, Default::default());
     let mut destination = LocalConn::new(&ConnectionRole::Control, Default::default());
+    use std::os::unix::fs::MetadataExt;
+    let metadata = temporary.path().metadata().unwrap();
+    destination
+        .call(Request::CheckOperatorDirectory {
+            path: temporary.path().as_os_str().as_bytes().to_vec(),
+            allow_missing: false,
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+        })
+        .unwrap();
+    let anchored = destination
+        .call(Request::AnchorDestination {
+            expected_dev: metadata.dev(),
+            expected_ino: metadata.ino(),
+            request_prefix: temporary.path().as_os_str().as_bytes().to_vec(),
+        })
+        .unwrap();
+    assert!(!matches!(anchored, Response::Err(_)), "{anchored:?}");
     let request = |off| Request::ReadRange {
         path: input.as_os_str().as_bytes().to_vec(),
         source: None,
@@ -1890,6 +1907,7 @@ fn local_source_recycles_after_write_without_consuming_pending_replies() {
     assert_eq!(second, contents[block..2 * block]);
     assert_eq!(third, contents[2 * block..]);
     assert_eq!(third.as_ptr(), first_pointer);
-    assert!(matches!(destination.recv().unwrap(), Response::Ok));
+    let acknowledgment = destination.recv().unwrap();
+    assert!(matches!(acknowledgment, Response::Ok), "{acknowledgment:?}");
     assert_eq!(std::fs::read(&output).unwrap(), contents[..block]);
 }

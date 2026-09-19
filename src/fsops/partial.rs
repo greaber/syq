@@ -1366,6 +1366,11 @@ impl FsOps {
             };
             // Every visible byte is replaced by read_exact_at before publishing
             // the response. Reused initialized bytes need no zeroing first.
+            // Growing a reused allocation must not double the capacity kept
+            // by each worker when block sizes change.
+            if data.capacity() < len as usize {
+                data.reserve_exact(len as usize - data.len());
+            }
             data.resize(len as usize, 0);
             #[cfg(target_os = "linux")]
             let read = preparation.read_exact_at(f, &mut data, off);
