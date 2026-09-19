@@ -157,8 +157,10 @@ See [Resource limits](resource-limits.md) for all units and supported routes.
 
 ## Compression and in-place writes
 
-`--no-compress` can help when compression costs more CPU time than it saves in
-network traffic. `--inplace` saves temporary disk space, but exposes incomplete
+Syq compresses remote traffic by default. It samples large blocks that appear
+incompressible to reduce wasted compression work, and keeps checking as the
+contents change. `--no-compress` disables compression entirely; it can help
+when compression costs more CPU time than it saves in network traffic. `--inplace` saves temporary disk space, but exposes incomplete
 updates to readers. Read [in-place writes](reference.md#in-place-writes) before
 using it.
 

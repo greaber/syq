@@ -1677,10 +1677,11 @@ impl<W: Write> FrameWriter<W> {
         } else {
             self.w.write_all(&payload)?;
         }
-        // Common data frames reuse their output allocation. A one-off maximum
-        // frame must not retain tens of MiB on each idle connection.
+        // Leave room for the default 4 MiB block plus serialization/compression
+        // overhead. A one-off maximum frame must not retain tens of MiB on
+        // each idle connection.
         if let Some(compression) = &mut self.compression {
-            if compression.output.capacity() > 4 * 1024 * 1024 {
+            if compression.output.capacity() > 8 * 1024 * 1024 {
                 compression.output = Vec::new();
             }
         }
