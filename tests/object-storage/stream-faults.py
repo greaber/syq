@@ -268,11 +268,14 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 output.seek(0)
                 os.utime(output.fileno(), ns=(stamp, stamp + 2_000_000_000))
                 before = dict(STATE['gets'])
+                requests = STATE['requests']
                 response = run(get + ['--as-fd', str(output.fileno()), '--skip-newer'],
                                pass_fds=(output.fileno(),), env=env)
-                success(response)
-                assert b'Skipped' in response.stderr
+                assert response.returncode == 2, response.stderr
+                assert b'--skip-newer cannot be used with --as-fd' in response.stderr
+                assert b'use --as PATH' in response.stderr
                 assert output.tell() == 0 and STATE['gets'] == before
+                assert STATE['requests'] == requests and output_path.read_bytes() == DATA
             STATE['metadata']['x-amz-meta-syq-mtime'] = '1600000002'
             for preview in ([], ['--dry-run']):
                 with source.open('rb') as stream:

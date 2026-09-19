@@ -182,6 +182,8 @@ placement path, rather than every copied entry.
 regular-file pairs; replacements between non-directory entry types still
 occur, but replacing a directory with a non-directory or the reverse is
 refused. Combine it with `--only-existing` to avoid creating missing entries too.
+It cannot combine with `--as-fd`; use a named destination so syq can check its
+timestamp before opening it.
 
 `--only-new` cannot combine with either policy. Neither `--only-new` nor
 `--skip-newer` can combine with `--inplace`: an interrupted write could leave

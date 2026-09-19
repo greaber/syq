@@ -1098,6 +1098,19 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
             .wait_with_output()
             .unwrap()
     };
+    // Inherited policies follow the same validation as explicit arguments,
+    // including when the output descriptor is a pipe.
+    for inherited in ["", "--skip-newer"] {
+        let mut args = vec!["--src-fd", "0", "--as-fd", "1"];
+        if inherited.is_empty() {
+            args.push("--skip-newer");
+        }
+        let result = cp(&args, inherited);
+        assert_eq!(result.status.code(), Some(2), "{}", stderr_of(&result));
+        assert!(stderr_of(&result).contains("--skip-newer cannot be used with --as-fd"));
+        assert!(stderr_of(&result).contains("use --as PATH"));
+        assert!(result.stdout.is_empty());
+    }
     let start = std::time::Instant::now();
     let out = cp(
         &[
@@ -1373,9 +1386,15 @@ fn stream_file_metadata_and_newer_selection() {
         input.try_clone().unwrap().rewind().unwrap();
         output.rewind().unwrap();
         args.push("--skip-newer");
+        let before = read(&t.path("output"));
+        let connections = read(&t.path("rsh.log"));
         let result = cp(&args, Some(&output));
-        assert!(result.status.success(), "{}", stderr_of(&result));
-        assert!(stderr_of(&result).contains("Skipped"));
+        assert_eq!(result.status.code(), Some(2), "{}", stderr_of(&result));
+        assert!(stderr_of(&result).contains("--skip-newer cannot be used with --as-fd"));
+        assert!(stderr_of(&result).contains("use --as PATH"));
+        assert!(!stderr_of(&result).contains("Skipped"));
+        assert_eq!(read(&t.path("output")), before);
+        assert_eq!(read(&t.path("rsh.log")), connections);
         assert_eq!(output.stream_position().unwrap(), 0);
         assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 0);
     }
@@ -1610,6 +1629,9 @@ fn stream_previews_and_results_do_not_consume_payload() {
         );
         assert!(!t.path("missing").exists());
     }
+    let output = cp(&["pipe", "--as-fd", "1", "--skip-newer"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
+    assert!(stderr_of(&output).contains("--skip-newer cannot be used with --as-fd"));
     assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 0);
     let failed = cp(&[
         "pipe",

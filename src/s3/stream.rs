@@ -420,10 +420,7 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
         return Ok(());
     }
     // Raw output needs no object attributes, even when the FD is a file.
-    let source_meta = if let Some(destination) = output
-        .metadata()
-        .filter(|_| controls.metadata.preserve != 0 || controls.metadata.skip_newer)
-    {
+    let source_meta = if controls.metadata.preserve != 0 {
         let stored = client::Metadata::decode(head.metadata())?;
         let meta = stored
             .filter(|m| m.kind == client::ObjectKind::File)
@@ -443,10 +440,6 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
                     mtime_nsec: m.nsec,
                 },
             );
-        if controls.metadata.skip_newer && destination.mtime > meta.mtime {
-            controls.report.skip();
-            return Ok(());
-        }
         Some(meta)
     } else {
         None

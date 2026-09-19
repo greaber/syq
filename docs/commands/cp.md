@@ -240,12 +240,14 @@ attributes without changing timestamps. S3 downloads interpret object metadata
 when attributes are requested; time preservation uses S3's modification time if
 no syq attributes are stored.
 
-`--skip-newer` leaves input unread when the destination file is newer. Output
-pipes have no timestamp to compare. Input pipes, sockets, and devices have no
-payload metadata, so they reject `--skip-newer` and `--preserve`. Their new
-named destinations use `0666` limited by the umask and the time of the write;
-existing files keep their permissions. Output pipes likewise cannot preserve
-times, permissions, or ownership. Parent directories are created as needed. The usual
+`--skip-newer` leaves input unread when the named destination file is newer.
+It cannot be used with `--as-fd`: shell redirection such as `> out` empties and
+updates the file before syq can check it. Use `--as out` instead.
+Input pipes, sockets, and devices have no payload metadata, so they reject
+`--skip-newer` and `--preserve`. Their new named destinations use `0666` limited
+by the umask and the time of the write; existing files keep their permissions.
+Output pipes likewise cannot preserve times, permissions, or ownership. Parent
+directories are created as needed. The usual
 [symlink rules](../reference.md#symlinks) and source `--cwd` / `--root` options
 apply, but `--root` cannot confine a descriptor that is already open. Named remote
 sources must be regular files.

@@ -49,7 +49,6 @@ fn prepare(
     plan: &Plan,
     controls: &Controls,
     input_meta: Option<crate::proto::Meta>,
-    output_meta: Option<crate::proto::Meta>,
 ) -> Result<Option<Prepared>> {
     let location = plan.location.as_ref().unwrap();
     let local_session = location
@@ -99,9 +98,6 @@ fn prepare(
             if plan.source.is_none() {
                 controls.skip_size(size)?;
                 controls.metadata.source(metadata)?;
-                if controls.metadata.newer(metadata, output_meta) {
-                    controls.report.skip();
-                }
             }
             if skipped {
                 controls.report.skip();
@@ -116,8 +112,7 @@ fn prepare(
     );
     if plan.source.is_none() {
         controls.metadata.source(source_meta)?;
-        if controls.skip_size(size)? || controls.metadata.newer(source_meta, output_meta) {
-            controls.report.skip();
+        if controls.skip_size(size)? {
             return Ok(None);
         }
     }
@@ -393,7 +388,6 @@ pub(super) async fn run(
         .map(|fd| fd::Descriptor::open(fd, false, cancelled.clone()))
         .transpose()?;
     let input_meta = input.as_ref().and_then(fd::Descriptor::metadata);
-    let output_meta = output.as_ref().and_then(fd::Descriptor::metadata);
     if let Some(output) = &output {
         controls.metadata.output(output.metadata().is_some())?;
     }
@@ -408,10 +402,7 @@ pub(super) async fn run(
         )?;
     }
     if plan.location.is_none() {
-        if args.ignore_existing
-            || controls.report.skipped()
-            || controls.metadata.newer(input_meta, output_meta)
-        {
+        if args.ignore_existing || controls.report.skipped() {
             controls.report.skip();
             return Ok(());
         }
@@ -439,10 +430,10 @@ pub(super) async fn run(
         // Keep local staging owned by this future from the instant it exists.
         // A detached blocking task could create it just as cancellation drops
         // the receiver, then lose its cleanup when the CLI exits.
-        prepare(&args, &plan, &controls, input_meta, output_meta)?
+        prepare(&args, &plan, &controls, input_meta)?
     } else {
         let (a, p, c) = (args.clone(), plan.clone(), controls.clone());
-        tokio::task::spawn_blocking(move || prepare(&a, &p, &c, input_meta, output_meta)).await??
+        tokio::task::spawn_blocking(move || prepare(&a, &p, &c, input_meta)).await??
     };
     let Some(prepared) = prepared else {
         return Ok(());
