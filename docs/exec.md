@@ -89,5 +89,5 @@ print(result.stdout.decode())
 ```
 
 This captures output and raises on a nonzero exit. For live terminal output,
-run the CLI directly. See the [command reference](commands/exec.md#execution-details)
+run the CLI directly. See the [Execution details](commands/exec.md#execution-details)
 for execution limits and cancellation details.

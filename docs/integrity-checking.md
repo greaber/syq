@@ -52,12 +52,12 @@ SSH and encrypted TCP retain their transport authentication independently.
 `--tcp-plain` does not enable payload checks automatically, and checksums do
 not authenticate plaintext traffic.
 
-For a complete check of a local copy, use an [expected digest](#expected-digests).
+For a complete check of a local copy, use a known hash; see [Expected digests](#expected-digests).
 
 For local/S3 copies, provider request checksums remain enabled. The `transfer`
 algorithm records a whole-file digest on upload and checks stored digests on
 download when present. Use an expected digest for objects without a stored
-digest. See [S3 metadata and integrity](object-storage.md#filesystem-differences).
+digest. See [Filesystem differences](object-storage.md#filesystem-differences).
 
 Server-side S3 copies preserve stored digests without reading or verifying
 object bodies. They do not support content-hash comparison, extra transfer
@@ -81,8 +81,8 @@ This checks all resulting bytes, including reused data, before reporting success
 When size and modification time match, syq validates the existing destination and skips copying if its digest matches.
 Otherwise it copies and validates the result; a mismatch fails that file. With normal
 staging, validation happens before replacing the destination. With `--inplace`,
-the file has already been modified when validation finishes. Use
-[per-file mapping expectations](mappings.md#the-format) for a batch. Selection
+the file has already been modified when validation finishes. For a batch, put a
+digest in each mapping entry; see [The format](mappings.md#the-format). Selection
 filters still apply.
 The expected digest's algorithm can differ from either integrity-checking hash type. Dry runs
 preview changes without validating the expectation.
@@ -105,12 +105,19 @@ syq cp --verify-only --srcs-in project --into backup
 ```
 
 This compares file contents, symlink targets, and entry types without writing.
-Missing or different entries make the command fail. It does not compare metadata
-or look for extra destination files.
+It reads both files even when their sizes and modification times match. It
+does not compare metadata or look for extra destination files.
+
+The summary counts matching files and differences or errors. Diagnostics on
+stderr identify missing or different entries and inspection failures. Exit
+status is `0` when all selected entries match, `23` for differences or
+inspection failures, and `1` for setup failures. `-v` also lists matching
+regular files as `ok`. Use [Automation results](automation.md) for structured
+output.
 
 For two servers, add `--coordinate-at local` to compare through your machine
 using ordinary SSH access, with no restricted receiver enrollment. This also
-supports `--results`. See [remote verification](remote-reference.md#verification).
+supports `--results`. See [Verification](remote-reference.md#verification).
 
 `--verify-only` cannot combine with `--dry-run`, `--prune`, `--inplace`, or
 an overwrite policy. Filters and size limits still select what is compared;

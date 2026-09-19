@@ -1,7 +1,7 @@
 # Environment and local files
 
 Syq has no general configuration file. It uses your SSH configuration for SSH
-connections and [AWS configuration](object-storage.md#s3-options) for S3.
+connections and AWS configuration for S3; see [S3 options](object-storage.md#s3-options).
 
 ## Add options through the environment
 
@@ -22,8 +22,8 @@ helpers, or other programs; the rest of the environment is passed through.
 
 | Variable | Purpose |
 |---|---|
-| `SYQ_NO_UPDATE_CHECK`, `DO_NOT_TRACK` | Disable [update reminders](install.md#updates) |
-| `SYQ_TUNING_CACHE` | Select the [connection-count cache](tuning.md#remembered-connection-counts); an empty value disables it |
+| `SYQ_NO_UPDATE_CHECK`, `DO_NOT_TRACK` | Disable update reminders; see [Updates](install.md#updates) |
+| `SYQ_TUNING_CACHE` | Select the connection-count cache; an empty value disables it. See [Remembered connection counts](tuning.md#remembered-connection-counts) |
 | `SYQ_DEBUG` | Add internal diagnostics to stderr |
 | `SYQ_S3_DIAGNOSTICS=1` | Add S3 request diagnostics to stderr |
 | `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Relocate cache, preference, and runtime files |
@@ -49,9 +49,9 @@ Default locations include:
 | `~/.local/share/syq/restricted/` | Receiver enrollment state |
 
 Copies can proceed when optional caches cannot be written. Persistent
-connections need a writable runtime directory, and receivers need writable
-[enrollment state](remote-reference.md#enrollment). Receiving identities have
-[separate backup and replacement rules](persistence-reference.md#names-and-profiles).
+connections need a writable runtime directory. See [Enrollment](remote-reference.md#enrollment)
+for receiver state and [Names and profiles](persistence-reference.md#names-and-profiles)
+for backing up or replacing a receiving identity.
 
 SSH helpers are installed under `~/.cache/syq/helpers/` on the server too.
 If that directory cannot be created, select an installed helper with

@@ -157,4 +157,4 @@ Linux with procfs.
 Add `--results r.ndjson` to record outcomes in a fresh file outside the copy
 trees. After fixing a failure, rerun the original mapping to finish the copy.
 For scripts that select only failed entries to retry, see
-[retrying mapping entries](automation.md#retry-failed-mapping-entries).
+[Retry failed mapping entries](automation.md#retry-failed-mapping-entries).

@@ -166,9 +166,13 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 ## Update policies
 
+`--into-existing` requires the destination directory to exist but allows new
+files inside it. `--only-existing` skips missing destination entries and
+subdirectories instead of adding them.
+
 `--only-new` can add children to an existing directory, but does not change
-that directory's permissions to make it writable. `--only-existing` skips
-missing destination subtrees. `--skip-newer` compares timestamps only for
+that directory's permissions to make it writable. `--skip-newer` compares
+timestamps only for
 regular-file pairs; it does not prevent other entry-type replacements.
 
 `--only-new` cannot combine with `--only-existing` or `--skip-newer`.
@@ -178,8 +182,8 @@ the destination to be absent.
 `--only-new` and `--skip-newer` cannot combine with `--inplace`: an interrupted
 write could leave a file that a retry skips. Restricted receivers also reject
 `--only-existing --inplace` and `--as-new --inplace`, because direct writes do
-not enforce those destination conditions. [Named receiving destinations](../persistence-reference.md#copy-limits)
-and S3 do not support `--inplace`.
+not enforce those destination conditions. S3 and named receiving destinations
+do not support `--inplace`; see [Copy limits](../persistence-reference.md#copy-limits).
 
 These policies do not disable requested pruning. Descriptor-specific
 restrictions are listed under [file descriptors](#file-descriptors).
@@ -194,7 +198,9 @@ already removed.
 
 Keep the source outside the destination. Syq detects overlap locally and for
 remote paths using the same host name, user, and port. Different SSH aliases
-or shared storage can hide overlap from this check.
+or shared storage can hide overlap from this check. Wait for other copies
+into the destination to finish before pruning, so their new files are not
+deleted as extras.
 
 ## Filename and type conflicts
 
@@ -231,7 +237,8 @@ descriptors require explicit `--preserve=times`; see below.
 ## File descriptors
 
 `--src-fd 0` reads stdin; `--as-fd 1` writes stdout. Use them to connect local,
-SSH, or S3 copies to [shell pipelines](../reference.md#shell-pipelines-and-file-descriptors).
+SSH, or S3 copies to other programs; see
+[Shell pipelines and file descriptors](../reference.md#shell-pipelines-and-file-descriptors).
 Bash process substitution also works with ordinary source syntax:
 
 ```sh
@@ -272,8 +279,8 @@ destination.
 Progress, `--stats`, and `-v` go to stderr, leaving stdout for payload.
 Statistics report bytes, elapsed time, and average rate; pipe lengths are
 unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput
-or an [expected hash](../integrity-checking.md#expected-digests) to check bytes
-during transfer without a second read.
+or a known hash to check bytes during transfer without a second read; see
+[Expected digests](../integrity-checking.md#expected-digests).
 
 ### Selection and previews
 
@@ -293,7 +300,7 @@ opening a named FIFO. A shell producer can therefore receive SIGPIPE; in Python,
 Use `--dry-run` to check source and destination placement without reading input,
 opening a named pipe, or changing the destination. It cannot check a payload
 hash or predict the length of a pipe. `--results` and `--results-fd` report
-[stream outcomes](../automation.md#stream_result) separately from payload;
+[`stream_result`](../automation.md#stream_result) records separately from payload;
 results and payload/completion descriptors must differ.
 
 ### Transport and limits
@@ -302,7 +309,7 @@ Filesystem streams use parallel data workers over SSH or encrypted TCP, with
 automatic worker tuning as in regular-file copies. They accept `workers`,
 `request-size`, `pipeline-depth`, and `bw-pacing` tuning; `workers=N` fixes the
 worker count, and `--no-tcp` keeps data on SSH. S3 transfers one object using
-its [multipart controls](../object-storage.md#descriptor-copies).
+multipart controls; see [Descriptor copies](../object-storage.md#descriptor-copies).
 
 Restart recovery, named receiving destinations, detached execution,
 directory selection, and content comparison are unsupported.
@@ -334,7 +341,7 @@ Input pipes, sockets, and devices have no payload metadata, so they reject
 `--skip-newer` and `--preserve`. Their new named destinations use `0666` limited
 by the umask and the time of the write; existing files keep their permissions.
 Output pipes likewise cannot preserve times, permissions, or ownership. Parent
-directories are created as needed. The usual
-[symlink rules](../reference.md#symlinks) and source `--cwd` / `--root` options
-apply, but `--root` cannot confine a descriptor that is already open. Named remote
+directories are created as needed. The source `--cwd` / `--root` options
+apply, but `--root` cannot confine a descriptor that is already open. Symlink
+handling is unchanged; see [Symlinks](../reference.md#symlinks). Named remote
 sources must be regular files.

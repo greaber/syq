@@ -17,7 +17,7 @@ syq cp --from hostA --srcs-in big --to hostB --into big
 </figure>
 
 HostA gets permission for this transfer only. HostB checks that permission
-and reports what it changed. See [Security](security.md#a-compromised-source-server)
+and reports what it changed. See [A compromised source server](security.md#a-compromised-source-server)
 for what this protects against.
 
 ## Start a copy from the source server
@@ -36,9 +36,9 @@ destination paths start in the hostB account's home directory; your laptop's
 receiving root does not contain this copy, but its transfer limits still apply.
 
 Files go directly from hostA to hostB over encrypted TCP. HostB needs a
-[reachable data port](server-tuning.md#make-tcp-reachable); this route cannot
-use SSH for file data. Keep the laptop connection and source command running
-until completion.
+reachable data port; see [Make TCP reachable](server-tuning.md#make-tcp-reachable).
+This route cannot use SSH for file data. Keep the laptop connection and source
+command running until completion.
 
 Without `--auth-from`, syq tries an available receiving machine, then hostA's
 own SSH access if none is eligible. Once it requests approval, refusal or
@@ -52,8 +52,9 @@ for supported options.
   trusted. Connect with ordinary SSH once if either server is new to you.
 - An SSH agent on your machine, and OpenSSH 8.9 or newer on your machine,
   hostA's SSH client, and hostB's SSH server.
-- SSH connectivity from hostA to hostB. A [reachable TCP data port](server-tuning.md#make-tcp-reachable)
-  on hostB, normally in `47600–47699`, enables encrypted TCP workers. Otherwise
+- SSH connectivity from hostA to hostB. A reachable TCP data port
+  on hostB, normally in `47600–47699`, enables encrypted TCP workers; see
+  [Make TCP reachable](server-tuning.md#make-tcp-reachable). Otherwise
   the copy uses SSH workers on the same hostA-to-hostB route. `--no-tcp` selects
   SSH directly.
 - An existing parent directory for the destination.
@@ -83,7 +84,7 @@ syq receiver revoke ID
 
 Use the ID from `list`. Revocation stops active copies for that enrollment
 and removes its access; completed writes remain. If cleanup fails, retry
-`receiver revoke`. See [enrollment details](remote-reference.md#enrollment)
+`receiver revoke`. See [Enrollment](remote-reference.md#enrollment)
 for upgrades and sharing between installations.
 
 If your machine reaches hostB through hostA, add `--via hostA` to `enroll` or
@@ -115,5 +116,5 @@ This uses your machine's bandwidth and ordinary SSH access to each endpoint.
 
 Other authentication modes can use server-held credentials, a destination-
 restricted SSH agent, or full agent forwarding. They grant different authority;
-see the [advanced reference](remote-reference.md) before choosing one.
+see the [Remote copy reference](remote-reference.md) before choosing one.
 That page also covers detached copies, signed results, and direct-mode limits.

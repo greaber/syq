@@ -161,11 +161,7 @@ syq cp --only-new --srcs-in incoming --into archive
 syq cp --only-existing --srcs-in project --into deployed
 ```
 
-These policies apply throughout the copied tree. By contrast, `--into-existing`
-only requires the destination directory itself to exist.
-You can combine `--only-existing` with `--skip-newer`; `--only-new` is an
-alternative to both. See [update-policy restrictions](commands/cp.md#update-policies)
-for interactions with in-place writes and pruning.
+See [Update policies](commands/cp.md#update-policies) for supported combinations.
 
 ## Preview changes
 
@@ -175,8 +171,8 @@ Add `--dry-run -v` to list planned changes without copying or deleting files:
 syq cp --dry-run -v --srcs-in project --into backup
 ```
 
-Remote setup may still [install syq](install.md#automatic-installation-on-ssh-servers),
-and a requested results file is still written.
+A dry run can still install syq on the server; see
+[Automatic installation on SSH servers](install.md#automatic-installation-on-ssh-servers).
 
 ## Mirror a directory
 
@@ -201,9 +197,7 @@ syq cp --prune build --into backup
 syq cp --prune --srcs-in build --into backup
 ```
 
-Keep the source outside the destination, and avoid pruning a tree another
-copy is writing into. See [pruning details](commands/cp.md#pruning) for overlap
-checks and files kept for recovery.
+See [Pruning](commands/cp.md#pruning) for restrictions and files kept for recovery.
 
 ## Ignoring paths
 
@@ -241,16 +235,14 @@ Rerun the same command. Syq skips completed files and can reuse matching parts
 of interrupted files. It assembles each updated file beside the destination
 and replaces the destination when complete.
 
-Resuming can need space for another full copy of the interrupted file. Previous
-partial files may remain after a successful retry. To remove them, stop copies
-writing into the tree, then preview and run:
+Partial files may remain after a successful retry. To remove them:
 
 ```sh
 syq clean-partials --dry-run -v backup
 syq clean-partials backup
 ```
 
-See [partial-file cleanup](commands/clean-partials.md) for remote cleanup and
+See [`syq clean-partials`](commands/clean-partials.md) for remote cleanup and
 recovery entries that need inspection before removal.
 
 ## Check file contents
@@ -269,10 +261,16 @@ matches, without changing it, use `--verify-only`:
 syq cp --verify-only --srcs-in project --into backup
 ```
 
-Verification reads and compares file contents even when sizes and timestamps
-match. A missing or different file makes the command fail instead of being
-copied. Symlinks must have matching targets, and entry types must match.
-Permissions, timestamps, and extra destination files are not checked.
+This checks each selected source entry against its destination without copying
+or deleting anything. It reads and compares file contents even when sizes and
+timestamps match. It also compares entry types and symlink targets, but ignores
+permissions, timestamps, and extra destination files.
+
+The final summary reports the number of matching files and differences or
+errors. Missing or different paths are listed on stderr as `MISSING path` or
+`DIFFERS path`. The command exits with status `0` if everything selected matches,
+or `23` if any entry differs, is missing, or cannot be checked. Setup failures
+return `1`. For scripts, use the exit status and [Automation results](automation.md).
 
 See [Integrity checking](integrity-checking.md) for comparison options and
 checking against known hashes.
@@ -289,7 +287,7 @@ syq cp --inplace large-file --to server --into /backup
 This avoids the disk space for a second full copy and can reduce disk I/O.
 However, readers can see a mixture of old and new contents during the copy or
 after an interruption. Writes through a hard link also affect its other names.
-See [supported combinations](commands/cp.md#update-policies) before combining
+See [Update policies](commands/cp.md#update-policies) before combining
 in-place writes with other copy policies.
 
 ## Preserve metadata
@@ -335,7 +333,7 @@ parent directories. For example, `syq cp report.txt --as latest --follow-dst`
 replaces a symlink named `latest`, leaving its target unchanged.
 
 Links discovered inside a copied directory remain links; these options do not
-follow them. See [symlink safety](security.md#filesystem-attacks).
+follow them. See [Filesystem attacks](security.md#filesystem-attacks) for the security details.
 
 <a id="keep-sources-inside-a-directory"></a>
 

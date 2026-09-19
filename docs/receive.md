@@ -52,12 +52,12 @@ syq persist connect server
 Then run `syq cp results --to @project` on the server. The directory must already
 exist. Each name has its own settings and approval policy, so you can keep a
 project separate from your general `laptop` destination. See
-[replacing a receiver](persistence-reference.md#names-and-profiles) when moving
+[Names and profiles](persistence-reference.md#names-and-profiles) when moving
 a name to another laptop.
 
 Use `syq persist receive status` to list profiles and
 `syq persist receive off --name project` to stop one. See
-[profile management](persistence-reference.md#names-and-profiles) for more options.
+[Names and profiles](persistence-reference.md#names-and-profiles) for more options.
 
 ## Approving copies
 
@@ -82,9 +82,8 @@ syq persist receive on --approve ask   # require approval again
 ```
 
 Automatic approval trusts all processes running as the connected server accounts,
-including for overwrites. [Commands](exec.md) and
-[copies to another server](remote-to-remote.md#start-a-copy-from-the-source-server)
-still require separate approval. See [persistence security](security.md#persistent-connections)
+including for overwrites. Commands and copies to another server still require
+separate approval. See [Persistent connections](security.md#persistent-connections)
 for the trust boundary.
 
 ## Names and paths
@@ -108,7 +107,7 @@ even when following symlinks. Switching back to `--cwd` allows copies elsewhere.
 Changing a profile's settings stops its active copies so the new settings can
 take effect. Other profiles keep working.
 
-See [directory requirements](persistence-reference.md#directories) if a
+See [Directories](persistence-reference.md#directories) if a
 receiving location cannot be opened.
 
 ## Copy permissions and limits
@@ -136,5 +135,5 @@ An interrupted copy still needs to be rerun so it can resume. After rebooting
 your laptop, run `syq persist connect server` again.
 
 If a connection fails to start, `syq persist receive status` shows the error.
-The [persistence reference](persistence-reference.md) covers troubleshooting,
+The [Persistence details](persistence-reference.md) covers troubleshooting,
 upgrading, and using connections in scripts.

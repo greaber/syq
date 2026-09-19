@@ -31,8 +31,8 @@ rolled back.
 syq rm --on server --src-dir /scratch/old-output
 ```
 
-Keep the connection open until removal finishes. A dry run may still
-[install syq](install.md#automatic-installation-on-ssh-servers) on the server.
+Keep the connection open until removal finishes. A dry run can still install syq
+on the server; see [Automatic installation on SSH servers](install.md#automatic-installation-on-ssh-servers).
 
 For object storage, use `--on s3://BUCKET`:
 
@@ -42,7 +42,7 @@ syq rm --on s3://backups --src-dir old-backup --dry-run -v
 
 Ordinary removal respects bucket
 versioning; explicit version deletion is available with `--s3-all-versions` or
-`--s3-version-id`. See [S3 removal](object-storage.md#versions-and-deletion).
+`--s3-version-id`. See [Versions and deletion](object-storage.md#versions-and-deletion).
 
 ## Limit the selection
 

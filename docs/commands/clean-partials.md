@@ -1,15 +1,15 @@
 # syq clean-partials
 
-Remove syq partial files below local or SSH directory trees. Stop copies writing
-into those trees before deleting partials:
+Remove syq partial files below local or SSH directories. Wait for active copies
+into those directories to finish before running cleanup:
 
 ```sh
 syq clean-partials --dry-run -v backup
 syq clean-partials backup
 ```
 
-Add `--on server` to clean a remote tree. Results use the
-[`rm` record format](../automation.md#removal-records).
+Add `--on server` to clean a remote tree. For results output, see
+[Removal records](../automation.md#removal-records).
 
 ## Which files are removed
 
