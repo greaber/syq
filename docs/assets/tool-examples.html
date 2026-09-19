@@ -9,7 +9,6 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to server --into /backup</code></pre></div>
 </div>
 <p>Copies report.csv to /backup/report.csv on server.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>Rsync uses the destination’s trailing slash to treat /backup as a directory. Syq uses --into, which creates the directory if needed.</p></details>
 </section>
 <section class="tool-example" data-title="Send a folder to a server">
 <h3>Send a folder to a server</h3>
@@ -27,7 +26,6 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project/index.html to /backup/index.html. Destination-only files stay.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>Rsync uses the trailing slash to select contents. Syq uses --srcs-in; trailing slashes do not change its native placement rules.</p></details>
 </section>
 <section class="tool-example" data-title="Match a folder, deleting extra files">
 <h3>Match a folder, deleting extra files</h3>
@@ -53,7 +51,7 @@
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --to server --into /backup --dry-run -v</code></pre></div>
 </div>
 <p>Lists planned changes without copying file data.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>Syq may still install or cache its remote helper during setup. Remove --dry-run to perform the copy.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>Syq may still install or cache its remote helper during setup.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -73,7 +71,7 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
 {"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --to server --into /archive</code></pre></div>
 </div>
-<details class="tool-example-differences"><summary>Differences</summary><p>For rsync, /archive must already exist on server.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>For rsync, /archive must already exist on server. Syq creates missing destination directories.</p></details>
 <p><a href="mappings.html">Generate a mapping with a script</a>.</p>
 </section>
 <!-- References: https://download.samba.org/pub/rsync/rsync.1 --></details>
@@ -94,7 +92,6 @@ rsync -t photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp --srcs-in project --into backup</code></pre></div>
 </div>
 <p>Copies project/index.html to backup/index.html. Destination-only files stay.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>Rclone copies directory contents. Syq expresses that with --srcs-in.</p></details>
 </section>
 <section class="tool-example" data-title="Upload a folder’s contents to S3">
 <h3>Upload a folder’s contents to S3</h3>
@@ -220,7 +217,6 @@ rclone copyto photos/b.jpg archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><pre><code>syq cp report.csv --to s3://backups --as report.csv --dry-run -v</code></pre></div>
 </div>
 <p>Previews uploading report.csv without writing the object.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>The global --dry-run flag goes before cp in s5cmd. Syq accepts it after cp and uses -v to list planned paths.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -303,7 +299,7 @@ cp photos/b.jpg s3://backups/archive/summit.jpg</code></pre><pre><code>s5cmd run
 <div><p><strong>syq</strong></p><pre><code>syq cp project --to server --into /backup</code></pre></div>
 </div>
 <p>Copies project to /backup/project; /backup must already exist for the scp command.</p>
-<details class="tool-example-differences"><summary>Differences</summary><p>Syq copies folders without -r. Scp follows symlinks; syq normally copies links as links.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>Scp follows symlinks and copies their targets; syq copies the links themselves.</p></details>
 </section>
 <section class="tool-example" data-title="Rename a file while copying">
 <h3>Rename a file while copying</h3>
@@ -332,7 +328,7 @@ scp photos/b.jpg server:/archive/summit.jpg</code></pre></div>
 <div><p><strong>syq</strong></p><p>files.ndjson</p><pre><code>{"src":{"encoding":"utf-8","value":"a.jpg"},"dst":{"encoding":"utf-8","value":"beach.jpg"}}
 {"src":{"encoding":"utf-8","value":"b.jpg"},"dst":{"encoding":"utf-8","value":"summit.jpg"}}</code></pre><pre><code>syq cp --mapping files.ndjson -C photos --to server --into /archive</code></pre></div>
 </div>
-<details class="tool-example-differences"><summary>Differences</summary><p>For scp, /archive must already exist on server.</p></details>
+<details class="tool-example-differences"><summary>Differences</summary><p>For scp, /archive must already exist on server. Syq creates missing destination directories.</p></details>
 <p><a href="mappings.html">Generate a mapping with a script</a>.</p>
 </section>
 <!-- References: https://man.openbsd.org/scp --></details>
