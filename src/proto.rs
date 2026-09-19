@@ -1607,17 +1607,15 @@ impl<W: Write> FrameWriter<W> {
     pub fn write_msg<T: Serialize + SizeHint>(&mut self, msg: &T) -> io::Result<()> {
         self.write_preamble()?;
         let mut compress = self.compress;
-        if compress {
-            if let Some(data) = msg
-                .compression_data()
-                .filter(|data| data.len() >= FrameCompression::PROBE_MIN)
-            {
-                if self.compression.is_none() {
-                    self.compression = FrameCompression::new().ok();
-                }
-                if let Some(compression) = &mut self.compression {
-                    compress = compression.worth_compressing(data);
-                }
+        let compression_data = msg
+            .compression_data()
+            .filter(|data| data.len() >= FrameCompression::PROBE_MIN);
+        if let Some(data) = compression_data.filter(|_| compress) {
+            if self.compression.is_none() {
+                self.compression = FrameCompression::new().ok();
+            }
+            if let Some(compression) = &mut self.compression {
+                compress = compression.worth_compressing(data);
             }
         }
         if !compress && msg.direct_payload() {
@@ -1646,32 +1644,39 @@ impl<W: Write> FrameWriter<W> {
         let payload = postcard::to_extend(msg, Vec::with_capacity(msg.size_hint()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Self::check_message_size(payload.len(), msg.frame_limit())?;
-        let compressed = if compress && payload.len() > COMPRESS_MIN {
-            if self.compression.is_none() {
-                self.compression = FrameCompression::new().ok();
-            }
-            self.compression
-                .as_mut()
-                .is_some_and(|compression| compression.compress(&payload))
-        } else {
-            false
-        };
-        if compress
-            && msg
-                .compression_data()
-                .is_some_and(|data| data.len() >= FrameCompression::PROBE_MIN)
-        {
+        // Keep metadata and small-file batches on their existing path. Benchmarks
+        // found no win from retaining a compressor for small-file batches.
+        let standalone_compressed =
+            if compress && compression_data.is_none() && payload.len() > COMPRESS_MIN {
+                zstd::bulk::compress(&payload, COMPRESS_LEVEL)
+                    .ok()
+                    .filter(|encoded| encoded.len() < payload.len())
+            } else {
+                None
+            };
+        let compressed = standalone_compressed.is_some()
+            || (compress
+                && compression_data.is_some()
+                && self
+                    .compression
+                    .as_mut()
+                    .is_some_and(|compression| compression.compress(&payload)));
+        if compress && compression_data.is_some() {
             if let Some(compression) = &mut self.compression {
                 compression.remaining_probes = if compressed { 0 } else { 7 };
             }
         }
-        let size = if compressed {
+        let size = if let Some(encoded) = &standalone_compressed {
+            encoded.len()
+        } else if compressed {
             self.compression.as_ref().unwrap().output.len()
         } else {
             payload.len()
         };
         self.write_frame_header(size, u8::from(compressed))?;
-        if compressed {
+        if let Some(encoded) = &standalone_compressed {
+            self.w.write_all(encoded)?;
+        } else if compressed {
             self.w
                 .write_all(&self.compression.as_ref().unwrap().output)?;
         } else {
