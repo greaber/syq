@@ -7,7 +7,7 @@ use crate::proto::{Request, Response};
 #[test]
 fn full_listen_queue_reports_busy_without_reconnect_advice() {
     use socket2::{Domain, SockAddr, Socket, Type};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let path = dir.path().join("busy.sock");
     let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
     listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
@@ -46,7 +46,7 @@ fn full_listen_queue_reports_busy_without_reconnect_advice() {
 #[test]
 fn registration_retries_socket_timeout_but_not_peer_rejection() {
     for reject in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("return.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -315,7 +315,7 @@ fn named_paths_reject_traversal_and_ambiguous_names() {
 fn named_parser_rejects_oversize_truncated_and_wrong_generation() {
     assert!(read_message::<Envelope>(&mut &u32::MAX.to_be_bytes()[..]).is_err());
     assert!(read_message::<Envelope>(&mut &b"\0\0\0\x10{}"[..]).is_err());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_support::tempdir().unwrap();
     let (_broker, _receiver, mut registration, _) = broker(root.path(), Approval::Always);
     registration.secret = "wrong".into();
     assert!(exchange(&registration, Message::Ping, Duration::from_secs(2)).is_err());
@@ -338,7 +338,7 @@ fn named_parser_rejects_oversize_truncated_and_wrong_generation() {
 
 #[test]
 fn named_denial_does_not_issue_authority_or_touch_destination() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, prompts) = broker(&root, Approval::Ask);
@@ -361,7 +361,7 @@ fn named_denial_does_not_issue_authority_or_touch_destination() {
 
 #[test]
 fn named_control_cannot_be_replayed_and_cannot_listen_on_tcp() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
@@ -439,7 +439,7 @@ fn worker_stream(registration: &Registration, approved: &Approved) -> UnixStream
 
 #[test]
 fn named_control_closure_revokes_connected_workers() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
@@ -490,7 +490,7 @@ fn named_control_closure_revokes_connected_workers() {
 
 #[test]
 fn named_pending_hello_is_bounded_and_does_not_block_readiness() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
@@ -549,7 +549,7 @@ fn named_pending_hello_is_bounded_and_does_not_block_readiness() {
 
 #[test]
 fn named_abandoned_open_releases_its_session() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
@@ -579,7 +579,7 @@ fn named_abandoned_open_releases_its_session() {
 #[cfg(target_os = "linux")]
 #[test]
 fn named_failed_open_reply_releases_its_session() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
@@ -611,7 +611,7 @@ fn named_failed_open_reply_releases_its_session() {
 
 #[test]
 fn named_copy_uses_confined_workers_and_verifies_receipt() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let source = fs::canonicalize(temp.path()).unwrap().join("source");
@@ -650,7 +650,7 @@ fn named_copy_uses_confined_workers_and_verifies_receipt() {
 
 #[test]
 fn named_authorization_expires_before_control_opens() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
@@ -677,7 +677,7 @@ fn named_authorization_expires_before_control_opens() {
 
 #[test]
 fn named_limits_and_scope_validation_precede_approval() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
@@ -693,7 +693,7 @@ fn named_limits_and_scope_validation_precede_approval() {
 }
 #[test]
 fn receiving_cwd_allows_other_paths_but_root_confines_them() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let temp = fs::canonicalize(temp.path()).unwrap();
     let cwd = temp.join("downloads");
     fs::create_dir(&cwd).unwrap();

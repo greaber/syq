@@ -452,98 +452,12 @@ fn advanced_groups_separate_limits_tuning_and_integrity() {
 }
 
 #[test]
-fn expected_hash_accepts_native_named_and_file_selectors() {
-    for selectors in [
-        vec!["source"],
-        vec!["--src", "source"],
-        vec!["--src-non-dir", "source"],
-    ] {
-        let mut argv = vec!["--expected-hash", "md5:900150983cd24fb0d6963f7d28e17f72"];
-        argv.extend(selectors);
-        argv.extend(["--into", "destination"]);
-        let argv = argv
-            .into_iter()
-            .map(std::ffi::OsString::from)
-            .collect::<Vec<_>>();
-        assert!(parse_native_copy(&argv).unwrap().expected_digest.is_some());
-    }
-}
-
-#[test]
-fn expected_hash_rejects_native_batch_and_directory_selectors() {
-    for selectors in [
-        vec!["first", "second"],
-        vec!["--srcs-in", "source"],
-        vec!["--src-dir", "source"],
-    ] {
-        let mut argv = vec!["--expected-hash", "md5:900150983cd24fb0d6963f7d28e17f72"];
-        argv.extend(selectors);
-        argv.extend(["--into", "destination"]);
-        let argv = argv
-            .into_iter()
-            .map(std::ffi::OsString::from)
-            .collect::<Vec<_>>();
-        let error = parse_native_copy(&argv).unwrap_err().to_string();
-        assert!(
-            error.contains("--expected-hash requires one named regular file"),
-            "{error}"
-        );
-    }
-}
-
-#[test]
-fn expected_hash_rejects_rsync_batch_and_contents_before_reading_inputs() {
-    for operands in [
-        vec!["first", "second", "destination"],
-        vec!["source/", "destination"],
-        vec!["host:source/", "destination"],
-        vec![".", "destination"],
-        vec!["source/..", "destination"],
-        vec!["--files-from", "-", "source", "destination"],
-        vec!["--files-from", "/missing/list", "source", "destination"],
-    ] {
-        let mut argv = vec![
-            "--syq-expected-hash",
-            "md5:900150983cd24fb0d6963f7d28e17f72",
-        ];
-        argv.extend(operands);
-        let argv = argv
-            .into_iter()
-            .map(std::ffi::OsString::from)
-            .collect::<Vec<_>>();
-        let error = Args::parse_rsync(&argv).unwrap_err().to_string();
-        assert!(
-            error.contains("--syq-expected-hash requires one named regular file"),
-            "{error}"
-        );
-    }
-    for operands in [
-        ["source", "destination"],
-        ["host:source", "destination"],
-        ["source", "host:destination"],
-    ] {
-        let mut argv = vec![
-            "--syq-expected-hash",
-            "md5:900150983cd24fb0d6963f7d28e17f72",
-        ];
-        argv.extend(operands);
-        let argv = argv
-            .into_iter()
-            .map(std::ffi::OsString::from)
-            .collect::<Vec<_>>();
-        assert!(Args::parse_rsync(&argv).unwrap().expected_digest.is_some());
-    }
-}
-
-#[test]
 fn rsync_hash_controls_use_syq_prefix() {
     let mut parsed = Args::try_parse_from([
         "syq",
         "--integrity-checking",
         "compare=xxh3-128",
         "--integrity-checking=transfer=blake3",
-        "--syq-expected-hash",
-        "md5:900150983cd24fb0d6963f7d28e17f72",
         "source",
         "destination",
     ])
@@ -551,7 +465,6 @@ fn rsync_hash_controls_use_syq_prefix() {
     parsed.apply_advanced().unwrap();
     assert_eq!(parsed.hash_algorithm, crate::hashing::HashAlgorithm::Xxh3);
     assert!(parsed.transfer_integrity);
-    assert!(parsed.expected_digest.is_some());
     for option in [
         "--hash-algorithm=md5",
         "--transfer-integrity",
@@ -609,8 +522,6 @@ fn native_copy_policies_lower_to_the_shared_engine() {
         "!keep.tmp",
         "--preserve=permissions,ownership,specials",
         "--inplace",
-        "--min-size=1K",
-        "--max-size=1M",
         "source",
         "--into",
         "destination",
@@ -625,8 +536,8 @@ fn native_copy_policies_lower_to_the_shared_engine() {
     assert!(args.group);
     assert!(args.devices);
     assert!(args.inplace);
-    assert_eq!(args.min_size.as_deref(), Some("1K"));
-    assert_eq!(args.max_size.as_deref(), Some("1M"));
+    assert!(args.min_size.is_none());
+    assert!(args.max_size.is_none());
 }
 
 #[test]
@@ -905,4 +816,30 @@ fn native_operational_options_may_follow_destination_arguments() {
     assert_eq!(args.locations[1].path, b"dest");
     assert!(args.dry_run);
     assert!(args.native_follow_src);
+}
+
+#[test]
+fn removed_native_options_fail_before_reading_sources() {
+    for option in [
+        "--via=@laptop",
+        "--min-size=1",
+        "--max-size=1",
+        "--expected-hash=md5:900150983cd24fb0d6963f7d28e17f72",
+    ] {
+        let error =
+            NativeCopyCommand::try_parse_from(["cp", option, "missing", "--into", "destination"])
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("unexpected argument"), "{option}: {error}");
+    }
+    assert!(Args::try_parse_from([
+        "syq",
+        "--syq-expected-hash=md5:900150983cd24fb0d6963f7d28e17f72",
+        "a",
+        "b"
+    ])
+    .is_err());
+    let args = Args::try_parse_from(["syq", "--min-size=1", "--max-size=2", "a", "b"]).unwrap();
+    assert_eq!(args.min_size.as_deref(), Some("1"));
+    assert_eq!(args.max_size.as_deref(), Some("2"));
 }

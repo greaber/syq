@@ -1,15 +1,28 @@
 # syq clean-partials
 
-Remove syq partial files below local or SSH directory trees. Stop copies writing
-into those trees before deleting partials:
+Remove syq partial files below local or SSH directories. Wait for active copies
+into those directories to finish before running cleanup:
 
 ```sh
 syq clean-partials --dry-run -v backup
 syq clean-partials backup
 ```
 
-See [interrupted-copy recovery](../reference.md#resume-an-interrupted-copy) for
-which files this removes. Results use the [`rm` record format](../automation.md#removal-records).
+Add `--on server` to clean a remote tree. For results output, see
+[Removal records](../automation.md#removal-records).
+
+## Which files are removed
+
+`clean-partials` removes regular files named `.FILENAME.syq-tmp.RANDOM`, with
+16 random characters at the end. The filename portion may be shortened or
+omitted. It does not follow symlinks or remove old partial-name formats.
+A regular file deliberately named like a partial is also selected, so preview
+before deleting.
+
+Interrupted replacements and macOS clones can leave `.syq-swap-...` entries
+containing displaced originals or temporary clone data. Neither this command
+nor pruning removes them. Stop copies using the destination, inspect these
+entries, and recover anything you need before removing them manually.
 
 <!-- CLI: clean-partials -->
 ```text
@@ -45,7 +58,6 @@ syq clean-partials [OPTIONS] <TREE>...
 |---|---|
 | `--progress` | Show progress even when stderr is not a terminal |
 | `--no-progress` | Never show the human progress display |
-| `--progress-json` | Emit machine-readable progress lines (JSON) on stderr |
 | `--results <FILE>` | Write the machine-readable NDJSON result stream to FILE (created fresh; an existing file is refused) |
 | `--results-fd <FD>` | Write the result stream to an inherited file descriptor the caller opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2 |
 

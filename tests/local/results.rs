@@ -142,7 +142,7 @@ fn followed_results_referent_stays_pinned_when_the_link_is_replaced() {
 fn hash_policy_automation_digest_schema_checks_algorithm_and_width() {
     let validator = automation_validator();
     let mut record = serde_json::json!({
-        "schema": "syq.automation", "schema_version": 1, "seq": 1,
+        "schema": "syq.automation", "schema_version": 2, "seq": 1,
         "type": "operation_result", "action": "transfer_file", "kind": "file",
         "dst": {"encoding": "utf-8", "value": "file"}, "disposition": "failed",
     });
@@ -156,21 +156,20 @@ fn hash_policy_automation_digest_schema_checks_algorithm_and_width() {
         ("md5", 32),
         ("xxh3-128", 32),
     ] {
-        record["expected_digest"] =
+        record["expected_hash"] =
             serde_json::json!({"algorithm": algorithm, "value": "a".repeat(length)});
         assert!(validator.is_valid(&record), "{record}");
-        record["expected_digest"]["value"] = "a".repeat(if length == 64 { 32 } else { 64 }).into();
+        record["expected_hash"]["value"] = "a".repeat(if length == 64 { 32 } else { 64 }).into();
         assert!(!validator.is_valid(&record), "{record}");
-        record["expected_digest"]["value"] = "g".repeat(length).into();
+        record["expected_hash"]["value"] = "g".repeat(length).into();
         assert!(!validator.is_valid(&record), "{record}");
     }
-    record["expected_digest"] =
-        serde_json::json!({"algorithm": "rolling", "value": "a".repeat(32)});
+    record["expected_hash"] = serde_json::json!({"algorithm": "rolling", "value": "a".repeat(32)});
     assert!(!validator.is_valid(&record));
 }
 
 #[test]
-fn progress_bar_does_not_mix_with_json_progress() {
+fn progress_bar_does_not_mix_with_results() {
     let t = Tmp::new();
     write(&t.path("src"), &prng(1024 * 1024, 452));
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
@@ -180,20 +179,29 @@ fn progress_bar_does_not_mix_with_json_progress() {
             "--as",
             &t.s("dst"),
             "--progress",
-            "--progress-json",
+            "--results",
+            &t.s("results.ndjson"),
             "--resource-limits",
             "bandwidth=1M",
         ])
         .run()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(!stderr.is_empty());
-    for line in stderr.lines() {
-        let value: serde_json::Value =
-            serde_json::from_str(line).expect("JSON without a terminal bar");
-        assert!(value["bytes_done"].is_u64(), "{line}");
-    }
+    assert!(!out.stderr.is_empty(), "forced human progress is shown");
+    let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results.ndjson"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.last().unwrap()["status"], "success");
+    let samples: Vec<_> = records.iter().filter(|r| r["type"] == "progress").collect();
+    assert!(samples.len() >= 2, "live and final progress: {records:?}");
+    assert!(samples.iter().all(|r| r["rate_bytes_per_second"].is_u64()));
+    assert!(samples
+        .iter()
+        .any(|r| r["rate_bytes_per_second"].as_u64().unwrap() > 0));
+    assert_eq!(samples.last().unwrap()["bytes_done"], 1024 * 1024);
+    assert_eq!(read(&t.path("src")), read(&t.path("dst")));
 }
 
 #[cfg(all(target_os = "linux", debug_assertions))]
@@ -421,7 +429,7 @@ fn native_cp_results_stream_success_and_partial() {
     // Envelope: schema v1, strictly increasing seq, run first, result last.
     for (i, v) in lines.iter().enumerate() {
         assert_eq!(v["schema"], "syq.automation");
-        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["schema_version"], 2);
         assert_eq!(v["seq"], i as u64);
     }
     assert_eq!(lines[0]["type"], "run");
@@ -944,7 +952,7 @@ fn automation_fixtures_validate_against_schema() {
     assert!(
         validator
             .validate(&serde_json::json!({
-                "schema": "syq.automation", "schema_version": 1, "seq": 0, "type": "run"
+                "schema": "syq.automation", "schema_version": 2, "seq": 0, "type": "run"
             }))
             .is_err(),
         "missing required fields must fail validation"
@@ -1259,28 +1267,6 @@ fn native_remote_dry_run_results_need_a_local_coordinator() {
 }
 
 #[test]
-fn native_verify_only_remote_results_require_local_coordination() {
-    let t = Tmp::new();
-    let out = native_syq(&[
-        "cp",
-        "--verify-only",
-        "--from",
-        "source.invalid",
-        "--srcs-in",
-        "data",
-        "--to",
-        "destination.invalid",
-        "--into",
-        "data",
-        "--results",
-        &t.s("results"),
-    ]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
-    assert!(stderr_of(&out).contains("--coordinate-at local"));
-    assert!(!t.path("results").exists());
-}
-
-#[test]
 fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
@@ -1374,4 +1360,21 @@ fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["connections"][0]["receiving"]["error"], error);
     server.join().unwrap();
+}
+
+#[test]
+fn removed_progress_json_options_are_rejected() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"keep");
+    for command in ["cp", "rm", "clean-partials", "rsync"] {
+        let flag = if command == "rsync" {
+            "--syq-progress-json"
+        } else {
+            "--progress-json"
+        };
+        let out = native_syq(&[command, flag, &t.s("src")]);
+        assert_eq!(out.status.code(), Some(2), "{command}: {}", stderr_of(&out));
+        assert!(stderr_of(&out).contains(flag));
+        assert_eq!(read(&t.path("src")), b"keep");
+    }
 }

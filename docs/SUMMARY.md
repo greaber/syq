@@ -7,10 +7,11 @@
 - [Install and setup](install.md)
 - [Copy files](reference.md)
 - [Remove files](remove.md)
-- [Send files home from a server](receive.md)
-- [Run commands on your receiving machine](exec.md)
 - [Copy between servers](remote-to-remote.md)
+- [Keep connections open](persistence.md)
+- [Use your laptop from a server](receive.md)
 - [Rename and reorganize](mappings.md)
+- [Use rsync-style commands](rsync.md)
 # Performance
 
 - [Speed](speed.md)
@@ -39,6 +40,7 @@
 - [Remote copy details](remote-reference.md)
 - [Persistence details](persistence-reference.md)
 - [Automation results](automation.md)
+- [Environment and local files](environment.md)
 - [Rsync compatibility](rsync-compat.md)
 
 # SDKs

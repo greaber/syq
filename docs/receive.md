@@ -1,72 +1,73 @@
-# Send files home from a server
+<a id="send-files-home-from-a-server"></a>
 
-Inspect files on your server, then copy them to your laptop from the same shell.
-The laptop opens and maintains the connection. It needs no SSH server, public
-address, or incoming network port.
+# Use your laptop from a server
+
+Receiving lets you do three things from a connected server:
+
+- [Copy files to your laptop](#copy-files-to-your-laptop).
+- [Run commands on your laptop](#run-commands-on-your-laptop).
+- [Authorize copies between servers](#authorize-copies-between-servers)
+  using your laptop's SSH credentials.
+
+All three use a [persistent connection](persistence.md) opened by your laptop.
+It needs no SSH server, public address, or incoming network port.
+
+## Set up receiving
 
 <a id="ssh-setup"></a>
 <a id="persistence-in-scripts"></a>
 <a id="updating-receiving-connections"></a>
 <a id="background-connections"></a>
 
-With syq installed on both machines, connect from your laptop:
+Receiving starts automatically when syq opens a persistent SSH connection,
+unless you have turned receiving off. To enable persistence and connect to a
+server now, run this on your laptop with syq installed on both machines:
 
 ```sh
 syq persist connect server
 ```
 
-This keeps a connection open so the server can send files back to your laptop.
-Once the command finishes, you can close the terminal and continue working on
-the server. By default, your laptop is available under its short hostname, and
-received files go into your home directory.
+This opens the connection and waits until receiving is ready. An ordinary
+`ssh server` session does not enable receiving. If you already have a persistent
+connection to this server, you do not need to connect again. For example, after
+`syq persist on`, a syq copy or remote path completion can open that connection.
+If you previously turned receiving off, run `syq persist receive on` first.
 
-To give it the name `laptop` and choose a different starting directory:
+By default, your receiving name is your laptop's short hostname, and downloads
+and commands start in your home directory. `connect` prints the receiving name.
+The examples below use `@laptop`; replace it with your own name.
+
+Once `connect` finishes, you can close that terminal and make requests from any
+shell on the server, including an existing tmux session.
+
+### Optional name and directory
+
+To create a receiving profile named `laptop` with a different starting
+directory, run these commands on your laptop:
 
 ```sh
 mkdir -p ~/Downloads/server
 syq persist receive on --name laptop --cwd ~/Downloads/server
-syq persist connect server
 ```
 
-On the server, use the name from any shell, including an existing tmux session:
+Here, `receive on` configures the profile; it is not required to use the default
+settings. `--cwd` sets the starting directory for downloads and commands.
+
+## Copy files to your laptop
+
+On the server, send files to your receiving directory:
 
 ```sh
-ls -lh results
 syq cp results --to @laptop
 syq cp report.pdf --to @laptop --as reports/latest.pdf
 ```
 
-Each incoming copy waits for approval **on your laptop** before it can inspect
-or change destination entries. Review the destination and permissions, then
-choose **Allow once** or **Deny**. Use **Details** on macOS or
-`syq persist receive pending` in a local terminal to see the complete request.
-Approving a copy trusts the server to supply its contents.
+### Approving copies
 
-You can also [run commands on the receiving machine](exec.md), with separate
-local approval, to build a project there or open a copied artifact.
-
-## Multiple receiving profiles
-
-Give a project its own receiving name and directory:
-
-```sh
-syq persist receive on --name project --root ~/work/project
-syq persist connect server
-```
-
-Then run `syq cp results --to @project` on the server. The directory must already
-exist. Each name has its own settings and approval policy, so you can keep a
-project separate from your general `laptop` destination. Names stay assigned to
-their receiving machine while it is offline; see [replacing a receiver](persistence-reference.md#names-and-profiles)
-when moving a name to another laptop.
-
-Use `syq persist receive status` to list profiles and
-`syq persist receive off --name project` to stop one. See
-[profile management](persistence-reference.md#names-and-profiles) for more options.
-
-## Approving copies
-
-Approve or deny from the desktop prompt, or from a terminal on your laptop:
+By default, each incoming copy waits for approval **on your laptop**. Review the destination
+and permissions, then choose **Allow once** or **Deny**. To see the complete
+request, use **Details** on macOS or `syq persist receive pending` in a local
+terminal. You can also approve or deny there:
 
 ```sh
 syq persist receive pending
@@ -74,32 +75,14 @@ syq persist receive approve REQUEST_ID
 syq persist receive deny REQUEST_ID
 ```
 
-Requests expire after five minutes. If a prompt is missing or dismissed, the
-request stays pending; it is never approved automatically. To use only terminal
-approval, run `syq persist receive on --notify off`.
+Approving a copy trusts the server to supply its contents. Requests expire after
+five minutes. If a prompt is missing or dismissed, the request stays pending;
+it is never approved automatically. To use only terminal approval, run `syq persist receive on --name laptop --notify off`.
 
-For unattended downloads into a dedicated directory, choose an automatic approval
-root:
+### Names and paths
 
-```sh
-syq persist receive on --auto-approve-root ~/Downloads/server
-syq persist receive on --no-auto-approve-root   # ask for every download again
-```
-
-Downloads confined to that directory need no approval; downloads elsewhere ask.
-Automatic approval trusts all processes running as the connected server accounts,
-including for overwrites inside that directory. Limit a profile to particular
-connections with `--server` (see below). [Commands](exec.md) and
-[copies to another server](remote-to-remote.md#start-a-copy-from-the-source-server)
-still require separate approval. See [persistence security](security.md#persistent-connections)
-for the trust boundary.
-
-## Names and paths
-
-Use `--to @laptop` to select a receiving machine. The command fails if that
-receiver is offline or fails its identity check. Without `@`, `--to laptop`
-always names an SSH destination, resolved through SSH configuration or DNS.
-Once a copy starts, it keeps the same destination even if the connection fails.
+Use `--to @laptop` for your connected receiving machine. Without `@`,
+`--to laptop` names an SSH destination instead.
 
 The starting directory is your explicit `--cwd`, otherwise `--root`, otherwise
 `--auto-approve-root`, otherwise your home directory. You can
@@ -112,9 +95,8 @@ To contain copies within a directory instead:
 syq persist receive on --name laptop --root ~/Downloads/server
 ```
 
-With `--root`, all incoming copies must stay inside that directory. Absolute
-paths and `..` are rejected, and symlinks cannot lead outside it. A copy cannot
-replace the root itself with `--as .`. Use `--no-root` to remove this restriction;
+With `--root`, incoming paths must be relative and stay inside that directory,
+even when following symlinks. Use `--no-root` to remove this restriction;
 changing `--cwd` does not remove it. An explicit cwd must be inside the hard root.
 
 `--cwd` pins the starting directory. Use `--auto-cwd` to return to automatic
@@ -125,11 +107,110 @@ was selected.
 Changing a profile's settings stops its active copies so the new settings can
 take effect. Other profiles keep working.
 
-Syq also protects its own receiving files, executable, and SSH authority files
-from incoming copies. See [directory requirements](persistence-reference.md#directories)
-if a receiving location cannot be opened.
+See [Directories](persistence-reference.md#directories) if a
+receiving location cannot be opened.
 
-## Different settings for different servers
+<a id="unattended-copies"></a>
+
+### Skip approval for downloads
+
+Choose a directory for downloads that do not need approval:
+
+```sh
+syq persist receive on --name laptop --auto-approve-root ~/Downloads/server
+```
+
+Downloads confined to that directory need no approval; downloads elsewhere ask.
+`--root`, if configured, remains a hard boundary even with approval.
+Automatic approval trusts all processes running as the connected server accounts,
+including for overwrites inside that directory. Limit a profile to particular
+connections with `--server` (see below).
+
+Commands on your laptop and authorization for copies between servers still
+require approval every time. See [Receivers](security.md#receivers) for the
+trust boundary.
+
+To require approval for every download again:
+
+```sh
+syq persist receive on --name laptop --no-auto-approve-root
+```
+
+### Copy permissions and limits
+
+By default, each copy is limited to 100 GiB and one million entries. Pruning
+requires a positive deletion limit on both machines. Change limits with
+`syq persist receive on --name laptop --max-bytes SIZE --max-entries N --max-delete N`.
+
+Most copy options work here; ownership preservation, special-file preservation,
+and `--inplace` are unsupported. See
+[copy limits](persistence-reference.md#copy-limits) for details.
+
+## Run commands on your laptop
+
+From the server, request a command in a project directory on your laptop:
+
+```sh
+syq exec --on @laptop --cwd /path/to/project -- make
+syq exec --on @laptop --cwd /path/to/project -- open report.html
+```
+
+The second command uses macOS's `open` program to display a report. Replace
+it with any program installed on your laptop.
+
+Every command requires approval on your laptop and runs with your local user's
+permissions, including access to files and credentials. **The download root
+and copy limits do not restrict commands.** Build tools and scripts can execute
+code from their input files, so consider those files when approving a command.
+
+Output streams back to the server terminal, and syq returns the command's exit
+code. Interrupting the request or stopping receiving stops the command;
+completed changes are not rolled back. See [`syq exec`](commands/exec.md)
+for arguments, working directories, and cancellation details.
+
+## Authorize copies between servers
+
+Use your laptop's SSH access to [copy directly between servers](remote-to-remote.md),
+while running the command in your source server's shell:
+
+```sh
+# Run on hostA, including in an existing tmux shell.
+syq cp results --to hostB --into /archive --auth-from @laptop
+```
+
+Your laptop asks for approval for each copy, then uses its SSH access to hostB
+to authorize it without giving the source server your private SSH keys.
+Trust hostB's SSH host key on the laptop beforehand. Relative destination paths
+start in the hostB account's home directory; your laptop's receiving root does
+not contain this copy, but its transfer limits still apply.
+
+Files go directly from hostA to hostB over encrypted TCP. HostB needs a
+reachable data port; see [Make TCP reachable](server-tuning.md#make-tcp-reachable).
+This route cannot use SSH for file data. Keep the laptop connection and source
+command running until completion. See
+[Authorization selection](remote-reference.md#authorization-selection) for
+automatic selection, other authorizers, and supported options.
+
+## Multiple receiving profiles
+
+Give a project its own receiving name and directory:
+
+```sh
+syq persist receive on --name project --root ~/work/project
+syq persist connect server
+```
+
+Then run `syq cp results --to @project` on the server. The directory must already
+exist. Each name has its own settings and approval policy, so you can keep a
+project separate from your general `laptop` destination. See
+[Names and profiles](persistence-reference.md#names-and-profiles) when moving
+a name to another laptop.
+
+Use `syq persist receive status` to list profiles and
+`syq persist receive off --name project` to stop one. See
+[Names and profiles](persistence-reference.md#names-and-profiles) for more options.
+
+### Different settings for different servers
 
 By default, each enabled profile is available through every connected server.
 To give a particular server its own inbox:
@@ -146,13 +227,3 @@ every download. Repeat `--server` to allow several connections; a new list
 replaces the previous list. `--all-servers` removes the restriction. See the
 [profile reference](persistence-reference.md#names-and-profiles) for how SSH
 destination names match.
-
-## Copy permissions and limits
-
-By default, each copy is limited to 100 GiB and one million entries. Pruning
-requires a positive deletion limit on both machines. Change limits with
-`syq persist receive on --max-bytes SIZE --max-entries N --max-delete N`.
-
-Most copy options work here; ownership and special-file preservation,
-`--inplace`, and `--min-size` are unsupported. See
-[copy limits](persistence-reference.md#copy-limits) for details.

@@ -1247,7 +1247,6 @@ fn value_completion(
         "cp" => match option {
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"--to" => Some(ValueCompletion::NamedOrSshDestination),
-            b"--via" => Some(ValueCompletion::ReturnName),
             b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
             b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
@@ -1481,10 +1480,9 @@ fn complete_path_for(
         ));
     };
     let authorizer = find_option_value(args, b"--auth-from");
-    if find_option_value(args, b"--via").is_some()
-        || (authorizer != Some("ssh")
-            && (authorizer.is_some_and(|value| value != "auto")
-                || (command == "cp" && !crate::destination::connection_names().is_empty())))
+    if authorizer != Some("ssh")
+        && (authorizer.is_some_and(|value| value != "auto")
+            || (command == "cp" && !crate::destination::connection_names().is_empty()))
     {
         // Completion must never request copy approval or inspect hostB through
         // an automatically selected authorizer. Explicit SSH keeps normal completion.

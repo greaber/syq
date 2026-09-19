@@ -62,6 +62,9 @@ struct PipelineState {
     requests: Vec<Request>,
     replies: std::collections::VecDeque<Response>,
     received: usize,
+    progress: Option<Arc<Progress>>,
+    progress_at_receive: Vec<(u64, u64)>,
+    tuning_at_receive: Vec<u64>,
     sent_at_receive: Vec<usize>,
     peer: Option<Arc<Mutex<PipelineState>>>,
     peer_sent_at_receive: Vec<usize>,
@@ -124,6 +127,15 @@ impl Conn for PipelineConn {
         let mut state = self.0.lock().unwrap();
         anyhow::ensure!(!state.dead, "injected dead connection");
         state.received += 1;
+        if let Some(progress) = &state.progress {
+            let snapshot = (
+                progress.bytes_done.load(Relaxed),
+                progress.files_done.load(Relaxed),
+            );
+            let tuning = crate::tune::Meter::files(&**progress);
+            state.progress_at_receive.push(snapshot);
+            state.tuning_at_receive.push(tuning);
+        }
         if let Some(sched) = state.steal_on_receive.take() {
             let Item::File(idx) = sched.next() else {
                 panic!("expected unread file group")
@@ -207,8 +219,7 @@ fn pipeline_worker(
     let opts = Arc::new(Opts {
         local_copy_fd_budget: true,
         hash_policy: Default::default(),
-        expected_digest: None,
-        mapping_expected_digests: Default::default(),
+        mapping_expected_hashes: Default::default(),
         block: 512,
         tuning: crate::transfer_tuning::TransferTuning {
             copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
@@ -223,13 +234,13 @@ fn pipeline_worker(
         devices: false,
         checksum: false,
         precise_mtime: true,
-        verify_only: false,
         inplace: false,
         same_host: false,
         allow_sequential_nfs_fallback: false,
         dst_remote: true,
         restricted_receiver: false,
         dry_run: false,
+        dry_run_metadata_files: AtomicU64::new(0),
         quiet: true,
         verbose: 0,
         umask: 0,
@@ -251,7 +262,7 @@ fn pipeline_worker(
         src: Box::new(PipelineConn(src.clone())),
         dst: Box::new(PipelineConn(dst.clone())),
         sched: sched.clone(),
-        progress: Progress::new(false, false, None, false),
+        progress: Progress::new(false, false, None),
         opts,
         bwlimit: None,
         gate: Gate::new(1),
@@ -333,7 +344,7 @@ fn prune_index_timing() {
 #[test]
 #[ignore = "manual simulated-latency timing; run with --ignored --nocapture"]
 fn prune_pipeline_timing() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let candidate = crate::fsops::lstat_entry(b"extra".to_vec(), directory.path()).unwrap();
     let seen = (0..4096)
         .map(|i| (format!("dst/file-{i}").into_bytes(), Claim::Leaf))
@@ -366,7 +377,7 @@ fn prune_pipeline_timing() {
 
 #[test]
 fn prune_walk_drops_synced_entries_and_skips_empty_candidate_lookups() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let file = directory.path().join("file");
     std::fs::write(&file, b"contents").unwrap();
     let template = crate::fsops::lstat_entry(Vec::new(), &file).unwrap();
@@ -390,7 +401,7 @@ fn prune_walk_drops_synced_entries_and_skips_empty_candidate_lookups() {
 
 #[test]
 fn prune_walk_keeps_shields_recovery_and_nested_scopes() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let mut entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
     let seen = [(b"dst/blocked".to_vec(), Claim::Weak)]
         .into_iter()
@@ -416,7 +427,7 @@ fn prune_walk_keeps_shields_recovery_and_nested_scopes() {
 
 #[test]
 fn prune_alias_lookups_are_bounded_and_keep_only_candidate_identities() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let file = directory.path().join("file");
     std::fs::write(&file, b"contents").unwrap();
     let mut candidate = crate::fsops::lstat_entry(b"stored-name".to_vec(), &file).unwrap();
@@ -706,6 +717,185 @@ fn whole_file_groups_overlap_and_drain_both_endpoint_windows() {
 }
 
 #[test]
+fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
+    for failure in [
+        "none",
+        "destination-drop",
+        "stat-drop",
+        "changed",
+        "changed-retry",
+    ] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        let jobs: Vec<_> = (0..6)
+            .map(|i| {
+                let mut job = pipeline_job(format!("file{i}").as_bytes(), 1 << 20);
+                if failure == "changed" {
+                    job.attempt = MAX_ATTEMPTS - 1;
+                }
+                job
+            })
+            .collect();
+        for job in &jobs {
+            sched.push_file(job.clone());
+        }
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        assert_eq!(sched.begin_fast_batch(1, 6), 6);
+        let mut batch = vec![0];
+        batch.extend(sched.take_small(1 << 20, 5, u64::MAX));
+        sched.mark_fast(5);
+        let src = Arc::new(Mutex::new(PipelineState {
+            fail_receive: (failure == "stat-drop").then_some(7),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            fail_receive: (failure == "destination-drop").then_some(6),
+            ..Default::default()
+        }));
+        for _ in 0..6 {
+            let data = vec![0; 1 << 20];
+            src.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
+                    hash: content_digest(&data),
+                    data,
+                })]));
+            dst.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::Applied(vec![None]));
+        }
+        let mut entries: Vec<_> = batch
+            .iter()
+            .map(|&idx| Some(jobs[idx].entry.clone()))
+            .collect();
+        if failure.starts_with("changed") {
+            entries[0].as_mut().unwrap().mtime += 1;
+        }
+        src.lock()
+            .unwrap()
+            .replies
+            .push_back(Response::Stats(entries));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        // Other workers' progress must survive rollback of this batch.
+        worker.progress.add_bytes(123);
+        worker.progress.add_files(7);
+        src.lock().unwrap().progress = Some(worker.progress.clone());
+        dst.lock().unwrap().progress = Some(worker.progress.clone());
+        let result = worker.fast_batch(&mut batch);
+        let dropped = failure.ends_with("drop");
+        assert_eq!(result.is_err(), dropped, "{failure}: {result:?}");
+        let expected_files = if dropped {
+            0
+        } else if failure.starts_with("changed") {
+            5
+        } else {
+            6
+        };
+        assert_eq!(
+            worker.progress.bytes_done.load(Relaxed),
+            123 + (expected_files << 20),
+            "{failure}"
+        );
+        assert_eq!(
+            worker.progress.files_done.load(Relaxed),
+            7 + expected_files,
+            "{failure}"
+        );
+        let acknowledged = if failure == "destination-drop" { 5 } else { 6 };
+        assert_eq!(
+            crate::tune::Meter::files(&*worker.progress),
+            7 + acknowledged
+        );
+        for (i, &files) in dst.lock().unwrap().tuning_at_receive.iter().enumerate() {
+            assert_eq!(files, 7 + i as u64, "{failure}: tuner before ack {i}");
+        }
+        // Retrying uncertain files must not produce a second burst of credit.
+        worker
+            .progress
+            .add_tuning_files(acknowledged - expected_files);
+        assert_eq!(
+            crate::tune::Meter::files(&*worker.progress),
+            7 + acknowledged
+        );
+        worker.progress.add_files(1);
+        assert_eq!(
+            crate::tune::Meter::files(&*worker.progress),
+            8 + acknowledged
+        );
+        let snapshots = &dst.lock().unwrap().progress_at_receive;
+        for (i, &(bytes, files)) in snapshots.iter().enumerate() {
+            assert_eq!(bytes, 123 + ((i as u64) << 20), "{failure}: ack {i}");
+            assert_eq!(files, 7, "no file completes before the source recheck");
+        }
+        if !dropped {
+            assert_eq!(
+                src.lock().unwrap().progress_at_receive.last(),
+                Some(&(123 + (6 << 20), 7))
+            );
+        }
+        assert_eq!(
+            jobs[0].done.load(Relaxed),
+            if expected_files == 6 { 1 << 20 } else { 0 }
+        );
+        assert_eq!(sched.is_failed(0), failure == "changed");
+        if failure == "changed-retry" {
+            assert_eq!(sched.jobs.lock().unwrap()[0].attempt, 1);
+        }
+    }
+}
+
+#[test]
+fn small_batch_tuning_counts_empty_files_but_not_failed_publications() {
+    use crate::tune::Meter;
+    let sched = Arc::new(Sched::new(512, 8192));
+    let src = Arc::new(Mutex::new(PipelineState::default()));
+    let dst = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let jobs = [0, 8, 0]
+        .into_iter()
+        .enumerate()
+        .map(|(i, size)| {
+            let job = pipeline_job(format!("file{i}").as_bytes(), size);
+            sched.push_file(job);
+            worker.job(i)
+        })
+        .collect::<Vec<_>>();
+    dst.lock()
+        .unwrap()
+        .replies
+        .push_back(Response::Applied(vec![
+            None,
+            Some(crate::fsops::wire_error(&anyhow::anyhow!(
+                "publication failed"
+            ))),
+            None,
+        ]));
+    let mut results = vec![None, None, None];
+    assert!(worker
+        .receive_small_batch(vec![0, 1, 2], &jobs, &mut results)
+        .unwrap());
+    assert_eq!(Meter::files(&*worker.progress), 2);
+    assert_eq!(Meter::bytes(&*worker.progress), 0);
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    assert!(results[1].as_ref().unwrap().is_err());
+
+    dst.lock()
+        .unwrap()
+        .replies
+        .push_back(Response::Applied(vec![]));
+    assert!(!worker
+        .receive_small_batch(vec![1], &jobs, &mut results)
+        .unwrap());
+    assert_eq!(
+        Meter::files(&*worker.progress),
+        2,
+        "malformed replies earn no credit"
+    );
+}
+
+#[test]
 fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
     let sched = Arc::new(Sched::new(512, 8192));
     let jobs: Vec<_> = (0..8)
@@ -758,6 +948,7 @@ fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
     worker.fast_batch(&mut batch).unwrap();
     assert_eq!(batch, original);
     assert_eq!(worker.progress.files_done.load(Relaxed), 4);
+    assert_eq!(worker.progress.bytes_done.load(Relaxed), 4 << 20);
     assert_eq!(worker.progress.errors.load(Relaxed), 1);
     for &idx in &original[..4] {
         assert_eq!(jobs[idx].done.load(Relaxed), 1 << 20);
@@ -852,6 +1043,10 @@ fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
         assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
         assert_eq!(src.lock().unwrap().stolen_file, Some(stolen));
         assert_eq!(batch, owned);
+        assert_eq!(
+            worker.progress.bytes_done.load(Relaxed),
+            if failure == "none" { 2 << 20 } else { 0 }
+        );
         assert_eq!(
             worker.progress.files_done.load(Relaxed),
             if failure == "none" { 8 } else { 0 }
@@ -1304,7 +1499,7 @@ impl Conn for SetupConn {
 #[test]
 fn existing_destination_setup_pipelines_and_drains_failures() {
     for fail_at in [None, Some(0), Some(1), Some(2)] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::tempdir().unwrap();
         let path = directory.path().as_os_str().as_bytes();
         let entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
         let mut conn = SetupConn {
@@ -1344,7 +1539,7 @@ fn existing_destination_setup_pipelines_and_drains_failures() {
 
 #[test]
 fn existing_destination_setup_rejects_replaced_inode_without_writes() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let destination = directory.path().join("destination");
     std::fs::create_dir(&destination).unwrap();
     let entry = crate::fsops::lstat_entry(Vec::new(), &destination).unwrap();
@@ -1384,7 +1579,7 @@ fn existing_destination_setup_replays_on_v032_receiver() {
     // This probe deliberately speaks the released client's identity. Real
     // clients retain exact build pinning; it is not a mixed-build bypass.
     let binary = std::env::var_os("SYQ_V032_BINARY").expect("SYQ_V032_BINARY");
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let path = directory.path().as_os_str().as_bytes();
     let entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
     let mut conn = SetupConn {
@@ -1545,27 +1740,6 @@ fn dry_run_location_labels_include_explicit_ssh_port() {
 }
 
 #[test]
-fn fast_batch_ceiling_grows_on_high_rtt_tcp_or_remote_ssh() {
-    assert_eq!(fast_batch_file_limit(None, None, false), FAST_BATCH_FILES);
-    assert_eq!(
-        fast_batch_file_limit(Some(99_999), None, false),
-        FAST_BATCH_FILES
-    );
-    assert_eq!(
-        fast_batch_file_limit(None, Some(HIGH_RTT_US), false),
-        HIGH_RTT_FAST_BATCH_FILES
-    );
-    assert_eq!(
-        fast_batch_file_limit(Some(262_000), Some(1_000), false),
-        HIGH_RTT_FAST_BATCH_FILES
-    );
-    assert_eq!(
-        fast_batch_file_limit(None, None, true),
-        HIGH_RTT_FAST_BATCH_FILES
-    );
-}
-
-#[test]
 fn ssh_startup_workers_are_bounded_by_files_and_splittable_ranges() {
     const MIB: u64 = 1 << 20;
     for (bytes, expected) in [(0, 1), (32, 1), (63, 1), (64, 2), (128, 4), (512, 8)] {
@@ -1585,13 +1759,13 @@ fn ssh_startup_workers_are_bounded_by_files_and_splittable_ranges() {
 }
 
 #[test]
-fn initial_fast_workers_respect_file_and_byte_batch_limits() {
+fn initial_fast_workers_preserve_startup_file_and_byte_budgets() {
     assert_eq!(
         initial_fast_workers(
             32,
             100,
             100 * (4 << 20),
-            FAST_BATCH_FILES,
+            STARTUP_BATCH_FILES,
             crate::transfer_tuning::DEFAULT_BATCH_BYTES
         ),
         25
@@ -1601,7 +1775,7 @@ fn initial_fast_workers_respect_file_and_byte_batch_limits() {
             8,
             100,
             100 * (4 << 20),
-            FAST_BATCH_FILES,
+            STARTUP_BATCH_FILES,
             crate::transfer_tuning::DEFAULT_BATCH_BYTES
         ),
         8
@@ -1611,7 +1785,7 @@ fn initial_fast_workers_respect_file_and_byte_batch_limits() {
             32,
             300,
             300,
-            FAST_BATCH_FILES,
+            STARTUP_BATCH_FILES,
             crate::transfer_tuning::DEFAULT_BATCH_BYTES
         ),
         3
@@ -1755,4 +1929,189 @@ fn tcp_stats_distinguish_unavailable_fields_from_zero() {
     assert!(output.contains("current average 1.00 ms, minimum unavailable"));
     assert!(output.contains("receive unavailable, send-buffer unavailable"));
     assert!(output.contains("tcp ECN CE deliveries: unavailable"));
+}
+
+#[test]
+fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
+    struct CheckedConn {
+        entries: Arc<std::collections::HashMap<PathBytes, Entry>>,
+        requests: Arc<Mutex<Vec<Request>>>,
+        replies: std::collections::VecDeque<Response>,
+    }
+    impl Conn for CheckedConn {
+        fn supports_request_pipelining(&self) -> bool {
+            true
+        }
+        fn send(&mut self, request: Request) -> Result<()> {
+            let mut wire = Vec::new();
+            FrameWriter::new(&mut wire, false).write_msg(&request)?;
+            let reply = match &request {
+                Request::ReadSmallBatch(reads) => Response::SmallBlocks(
+                    reads
+                        .iter()
+                        .map(|read| {
+                            let data = vec![7; read.len as usize];
+                            Ok(SmallBlock {
+                                hash: content_digest(&data),
+                                data,
+                            })
+                        })
+                        .collect(),
+                ),
+                Request::PutSmallBatch(puts) => Response::Applied(vec![None; puts.len()]),
+                Request::StatMany { paths, .. } => Response::Stats(
+                    paths
+                        .iter()
+                        .map(|path| self.entries.get(path).cloned())
+                        .collect(),
+                ),
+                other => panic!("unexpected request {other:?}"),
+            };
+            self.requests.lock().unwrap().push(request);
+            self.replies.push_back(reply);
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Response> {
+            self.replies
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("missing reply"))
+        }
+        fn scan(
+            &mut self,
+            _: &[u8],
+            _: Option<&RegisteredPath>,
+            _: bool,
+            _: &[String],
+            _: bool,
+            _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+            _: &mut dyn FnMut(String),
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn native_remove(
+            &mut self,
+            _: Option<&[u8]>,
+            _: Option<&[u8]>,
+            _: &[NativeRemoveSelection],
+            _: bool,
+            _: bool,
+            _: usize,
+            _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+    }
+    let prefix = format!("{}/", "a".repeat(250)).repeat(12);
+    let jobs: Vec<_> = (0..2048)
+        .map(|i| pipeline_job(format!("{prefix}{i:04}").as_bytes(), 1))
+        .collect();
+    // All names fit normal component/path limits, but a single request with
+    // both spellings exceeds the metadata frame boundary.
+    let oversized = Request::StatMany {
+        paths: jobs.iter().map(|job| job.src.clone()).collect(),
+        sources: Some(jobs.iter().map(|job| job.source.clone()).collect()),
+        follow: false,
+        guard: None,
+    };
+    assert!(FrameWriter::new(Vec::new(), false)
+        .write_msg(&oversized)
+        .is_err());
+    let entries = Arc::new(
+        jobs.iter()
+            .map(|job| (job.src.clone(), job.entry.clone()))
+            .collect(),
+    );
+    let sched = Arc::new(Sched::new(512, 8192));
+    for job in &jobs {
+        sched.push_file(job.clone());
+    }
+    sched.scan_done();
+    assert!(matches!(sched.next(), Item::File(0)));
+    assert_eq!(sched.begin_fast_batch(1, jobs.len()), jobs.len());
+    let mut batch = vec![0];
+    batch.extend(sched.take_small(1, jobs.len() - 1, u64::MAX));
+    sched.mark_fast(batch.len() - 1);
+    let source_requests = Arc::new(Mutex::new(Vec::new()));
+    let destination_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut worker = pipeline_worker(
+        &sched,
+        &Arc::new(Mutex::new(PipelineState::default())),
+        &Arc::new(Mutex::new(PipelineState::default())),
+        false,
+    );
+    worker.src = Box::new(CheckedConn {
+        entries: Arc::clone(&entries),
+        requests: source_requests.clone(),
+        replies: Default::default(),
+    });
+    worker.dst = Box::new(CheckedConn {
+        entries,
+        requests: destination_requests,
+        replies: Default::default(),
+    });
+    worker.fast_batch(&mut batch).unwrap();
+    sched.complete_fast_batch(batch.len());
+    assert!(sched.finished());
+    assert_eq!(worker.progress.files_done.load(Relaxed), jobs.len() as u64);
+    assert_eq!(worker.progress.errors.load(Relaxed), 0);
+    assert!(jobs.iter().all(|job| job.done.load(Relaxed) == 1));
+    let requests = source_requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .filter(|request| matches!(request, Request::ReadSmallBatch(_)))
+            .count()
+            > 1
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| matches!(request, Request::StatMany { .. }))
+            .count()
+            > 1
+    );
+}
+
+#[test]
+fn dry_run_hash_errors_drain_both_endpoints_without_writes() {
+    for source_fails in [false, true] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        let mut job = pipeline_job(b"file", 3);
+        job.dst_entry = Some(job.entry.clone());
+        sched.push_file(job);
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        let source = Arc::new(Mutex::new(PipelineState::default()));
+        let destination = Arc::new(Mutex::new(PipelineState::default()));
+        for (state, fails) in [(&source, source_fails), (&destination, !source_fails)] {
+            state.lock().unwrap().replies.push_back(if fails {
+                Response::Err("injected read error".into())
+            } else {
+                Response::FileHash {
+                    size: 3,
+                    hash: [1; 32],
+                }
+            });
+        }
+        let mut worker = pipeline_worker(&sched, &source, &destination, false);
+        Arc::get_mut(&mut worker.opts).unwrap().dry_run = true;
+        worker.progress.files_total.store(1, Relaxed);
+        worker.progress.bytes_total.store(3, Relaxed);
+        let error = worker.preview_file(0).unwrap_err();
+        worker.file_error(0, error).unwrap();
+        assert_eq!(worker.progress.errors.load(Relaxed), 1);
+        assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+        assert!(sched.finished());
+        for state in [&source, &destination] {
+            let state = state.lock().unwrap();
+            assert_eq!(state.received, 1);
+            assert!(state.replies.is_empty());
+            assert!(matches!(
+                state.requests.as_slice(),
+                [Request::FileHash { .. }]
+            ));
+        }
+    }
 }

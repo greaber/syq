@@ -15,7 +15,7 @@ This page describes stream semantics. The
 [JSON Schema](https://github.com/greaber/syq/blob/master/schemas/automation.schema.json)
 lists precise field shapes;
 [example streams](https://github.com/greaber/syq/tree/master/tests/fixtures/automation)
-show complete runs. Mapping manifests are a [different format](mappings.md#the-format).
+show complete runs. For mapping manifests, see [Mapping format](commands/map.md#mapping-format).
 
 ## The channel
 
@@ -36,8 +36,8 @@ For direct restricted remote-to-remote copies, they are derived from the
 verified destination receipt and marked `provenance: "receiver_attested"`.
 Those records arrive after receipt verification. Otherwise remote-to-remote
 results require `--coordinate-at local`, which relays data through your
-machine. Remote-to-remote `--dry-run --results` and `--verify-only --results`
-also require that local route.
+machine. Remote-to-remote `--dry-run --results`
+also requires that local route.
 
 `--results` supports native `cp` (including pruning) and `rm`. It cannot be
 combined with `--detach`. The restricted receiver supports copy changes,
@@ -56,16 +56,17 @@ can leave it missing.
 
 - Check the terminal record and process exit code; a mismatch is a protocol
   error. Use terminal totals, not progress or a count of operation records.
-- Build [mapping retries](mappings.md#machine-readable-results) only after
-  terminal `success` or `partial`. Other statuses can leave entries unresolved.
+- Retry individual mapping entries only after terminal `success` or `partial`;
+  see [Retry failed mapping entries](#retry-failed-mapping-entries). Other
+  statuses can leave entries unresolved.
 - Ignore unknown record types and optional fields within a supported schema
   version.
 - Reject unknown `schema`, `schema_version`, terminal `status`, or path
   `encoding` values.
 - Treat human `message` text as display only; parse structured fields.
 
-`--progress-json` is a separate progress display whose format may change.
-Use `--results` when you need a stable consumer contract.
+`--results` includes both progress samples and final outcomes; use it for new
+integrations, including live progress displays.
 
 ## Record envelope
 
@@ -74,7 +75,7 @@ Every record carries:
 | Field | Value |
 |---|---|
 | `schema` | `"syq.automation"` |
-| `schema_version` | `1` |
+| `schema_version` | `2` |
 | `seq` | Integer starting at 0, strictly increasing |
 | `type` | Record type |
 
@@ -94,22 +95,18 @@ credentials, headers, ports, and raw command arguments. Clients that predate S3
 must be upgraded to decode S3 endpoint kinds; local and SSH streams retain
 their existing representation.
 
-Copy runs also carry `prune` and `mapping`. Compare-only runs add optional
-`verify_only: true`; absence means false. Removal has one source endpoint
+Copy runs also carry `prune` and `mapping`. Removal has one source endpoint
 regardless of selector count and omits those copy fields.
 
-With `--verify-only`, differences and inspection failures produce `error`
-records and a nonzero terminal status. Matching regular files count as
-`files_unchanged` and `bytes_unchanged`; transfer and creation totals remain
-zero. Successful comparisons do not emit copy operations. Progress bytes
-measure comparison work, not bytes written. As with dry runs, use
-`--coordinate-at local` for JSON comparison results between two remote hosts;
-a receiver receipt cannot attest the source's comparison claims.
+For S3 downloads using `--only-new` or `--only-existing`, unchanged-file totals
+include skipped symlinks selected through a prefix, but exclude symlinks named
+directly or through a mapping.
 
 ### `progress`
 
 Sampled telemetry, approximately once per second, for displays rather than
-accounting. It includes bytes, files, exclusions, scan state, and elapsed time.
+accounting. It includes bytes, files, exclusions, scan state, elapsed time, and
+optional `rate_bytes_per_second` and `eta_ms` estimates.
 Removal has zero byte and unchanged/excluded counts; its file counts reflect
 outcomes received so far. The terminal record owns final totals.
 
@@ -194,6 +191,11 @@ for mapping entries, kind and bytes where applicable, plus a `reason`:
 `destination_missing`, `type_differs`, `content_differs`, `metadata_differs`,
 or `destination_only`.
 
+For filesystem copies of regular files, `content_differs` means sizes or compared
+hashes differ;
+`metadata_differs` also covers copies selected by the metadata quick check.
+A `transfer_file` trace omits `bytes` when only metadata would change.
+
 A trace cannot be matched by identity to a later live operation: the filesystem
 may change between runs.
 
@@ -209,7 +211,7 @@ An outcome for a completed copy change or a failed mapping entry.
 | `kind` | `file`, `dir`, `symlink`, or `special`, when known |
 | `disposition` | `succeeded`, `failed`, `blocked`; attested streams also use `incomplete` and `observed` |
 | `bytes`, `attempts` | Optional transfer information |
-| `expected_digest` | Expected whole-file digest, when supplied: an object with `algorithm` and hexadecimal `value`; preserve it in retry mappings |
+| `expected_hash` | Expected whole-file hash, when supplied: an object with `algorithm` and hexadecimal `value`; preserve it in retry mappings |
 | `retryable` | On failures: `yes`, `no`, or `unknown` |
 | `class`, `os_kind`, `message` | Error details where available |
 | `provenance`, `scope`, `code` | Attested origin, signed destination-scope index, and receiver outcome code |
@@ -226,7 +228,7 @@ is non-retryable. Do not construct a retry source from its destination name.
 
 A producer may start supplying payload. Uploads without a skip policy emit this
 before destination setup finishes, allowing several writers to connect concurrently.
-With `--only-new`, `--only-existing`, `--skip-newer`, size filters, or metadata
+With `--only-new`, `--only-existing`, `--skip-newer`, or metadata
 preservation requested, source selection and destination checks come first.
 Skipped copies and dry runs finish without this record. Setup, transfer, or
 publication can still fail; require the terminal result for completion.
@@ -294,8 +296,8 @@ the receiver's `code`.
 Attested streams only: the destination's final observation of a path the
 transfer could have changed. Includes `scope`, `dst`, and an `object`:
 absent, an observation failure, or present with kind, size, applicable
-metadata, and symlink target. With `--receiver-receipt digests`, regular
-files also have a BLAKE3 digest.
+metadata, and symlink target. With `--receiver-receipt hashes`, regular
+files also have a BLAKE3 hash.
 
 Object kinds distinguish directories, files, symlinks, FIFOs, sockets,
 character/block devices, and other objects. Metadata fields are `mode`, `uid`,
@@ -382,3 +384,39 @@ Command approvals in `syq persist receive pending --json` use `kind: "command"`
 and include `argv`, `cwd`, and `permission`. Argument and directory strings in
 this summary are escaped for display. Use an up-to-date syq binary to inspect
 and approve commands; clients that only support copy requests omit them.
+
+## Retry failed mapping entries
+
+Add `--results r.ndjson` to record outcomes in a fresh file outside the copy
+trees.
+
+Failed mapping entries contain `src`, `dst`, and `kind`, so they can form a
+retry manifest. Preserve `expected_hash` too when present. First require a terminal `result` with `success` or `partial`:
+a missing terminal or an early stop means some entries may have no results.
+In those cases, rerun the original copy instead.
+
+```bash
+set -o pipefail
+syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
+jq -cs 'if (.[-1].type? // "") != "result"
+        then "incomplete results stream (no terminal record)" | halt_error
+        elif (.[-1].status != "success" and .[-1].status != "partial")
+        then "run stopped early (status \(.[-1].status)); rerun it instead of retrying" | halt_error
+        else .[] | select(.type == "operation_result"
+                          and .disposition == "failed"
+                          and .retryable != "no")
+             | {src, dst, kind}
+               + (if has("expected_hash") then {expected_hash} else {} end)
+        end' r.ndjson \
+  | syq cp --mapping - -C src --to nas --into /data
+```
+
+The filter skips non-retryable entries, including failed implicit parent
+creation without a source path. It does not guarantee that retrying will
+succeed; fix the underlying error first. Unchanged and excluded files appear
+only in summary totals, not as individual results.
+
+For command-restricted copies between servers, `--results` contains verified
+receiver receipts; see [Signed results](remote-reference.md#signed-results). These describe
+destination changes rather than source entry failures; retry the original
+mapping instead of applying the `operation_result` filter above.

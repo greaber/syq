@@ -764,7 +764,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let (secret, public) = crate::receipt::generate_recipient()?;
     let policy = crate::receipt::ReceiptPolicy {
         required: true,
-        hashed: args.receiver_receipt == Some(crate::cli::ReceiptDetail::Digests),
+        hashed: args.receiver_receipt == Some(crate::cli::ReceiptDetail::Hashes),
         max_records: crate::receipt::DEFAULT_MAX_RECORDS,
         max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
         delivery: crate::receipt::ReceiptDelivery::AttachedEncrypted {

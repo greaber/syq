@@ -150,18 +150,23 @@ fn checksum_toggle_accepts_prior_partial_candidates() {
 fn hash_policy_inplace_mismatch_reports_changed_contents() {
     let t = Tmp::new();
     let contents = prng(5 * 1024 * 1024, 991);
-    write(&t.path("source"), &contents);
+    write(&t.path("src/source"), &contents);
     write(&t.path("destination"), &vec![b'o'; contents.len()]);
     let inode = fs::metadata(t.path("destination")).unwrap().ino();
     let output = native_syq(&[
         "cp",
         "--inplace",
-        "--src",
-        &t.s("source"),
-        "--as",
-        &t.s("destination"),
-        "--expected-hash",
-        "md5:00000000000000000000000000000000",
+        "--mapping",
+        &super::hashing::expected_mapping(
+            &t,
+            "source",
+            "destination",
+            Some("md5:00000000000000000000000000000000"),
+        ),
+        "-C",
+        &t.s("src"),
+        "--into",
+        &t.s(""),
     ]);
     assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
     assert_eq!(read(&t.path("destination")), contents);
@@ -171,10 +176,10 @@ fn hash_policy_inplace_mismatch_reports_changed_contents() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn hash_policy_expected_digest_covers_resumed_bytes_after_algorithm_change() {
+fn hash_policy_expected_hash_covers_resumed_bytes_after_algorithm_change() {
     let t = Tmp::new();
     let contents = prng(9 * 1024 * 1024 + 123, 993);
-    write(&t.path("source"), &contents);
+    write(&t.path("src/source"), &contents);
     let partial = interrupted_partial(
         &[
             "-a",
@@ -182,7 +187,7 @@ fn hash_policy_expected_digest_covers_resumed_bytes_after_algorithm_change() {
             "4M",
             "--resource-limits",
             "bandwidth=1G",
-            &t.s("source"),
+            &t.s("src/source"),
             &t.s("destination"),
         ],
         &t.0,
@@ -202,12 +207,12 @@ fn hash_policy_expected_digest_covers_resumed_bytes_after_algorithm_change() {
     );
     run_native_ok(&[
         "cp",
-        "--src",
-        &t.s("source"),
-        "--as",
-        &t.s("destination"),
-        "--expected-hash",
-        &expected,
+        "--mapping",
+        &super::hashing::expected_mapping(&t, "source", "destination", Some(&expected)),
+        "-C",
+        &t.s("src"),
+        "--into",
+        &t.s(""),
         "--integrity-checking",
         "compare=xxh3-128",
         "--resource-limits",
@@ -682,24 +687,7 @@ fn source_partials_are_copied_and_warned_about() {
         b"ordinary payload"
     );
 
-    let output = syq(&["-a", "--syq-progress-json", &t.s("src/"), &t.s("json-dst/")]);
-    assert_output_ok(&output);
-    let warning = String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|value| value["code"] == "source_partials")
-        .expect("missing structured source-partial warning");
-    assert_eq!(warning["type"], "warning");
-    assert_eq!(warning["count"], 2);
-
-    let quiet = syq(&[
-        "-q",
-        "-v",
-        "-a",
-        "--syq-progress-json",
-        &t.s("src/"),
-        &t.s("quiet-dst/"),
-    ]);
+    let quiet = syq(&["-q", "-v", "-a", &t.s("src/"), &t.s("quiet-dst/")]);
     assert_output_ok(&quiet);
     assert!(
         quiet.stdout.is_empty(),

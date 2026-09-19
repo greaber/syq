@@ -187,6 +187,7 @@ pub(crate) struct CopyOptions {
     pub preserve_devices: bool,
     pub compare_existing_by_content: bool,
     pub dry_run: bool,
+    // Legacy signed grants use this bit to forbid writes; preserve its encoding.
     pub verify_only: bool,
     pub compressed_transport: bool,
     pub tcp_port_lo: u16,
@@ -739,7 +740,7 @@ fn canonical_body_bytes(
         crate::cli::parse_tcp_congestion(algorithm).map_err(anyhow::Error::msg)?;
     }
     if let Some(hashing) = hashing {
-        if let Some(expected) = &hashing.expected_digest {
+        if let Some(expected) = &hashing.expected_hash {
             expected.validate()?;
         }
         if mapping.is_some() {

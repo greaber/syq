@@ -653,10 +653,6 @@ fn broker_connection_limit(worker_limit: Option<usize>, restricted: bool) -> Res
     }
 }
 
-fn automatic_enrollment_allowed(dry_run: bool, verify_only: bool) -> bool {
-    !(dry_run || verify_only)
-}
-
 fn append_delegated_helper_selection(
     command: &mut Vec<String>,
     syq_path: Option<&str>,
@@ -825,7 +821,7 @@ fn run_remote(
                     dst,
                     &coordinator_policy.login_user,
                     &peer_policy.login_user,
-                    automatic_enrollment_allowed(args.dry_run, args.verify_only),
+                    !args.dry_run,
                 )
             })
             .transpose()
@@ -954,11 +950,7 @@ fn run_remote(
         remote.push(format!("--resource-limits={limits}"));
     }
 
-    if let Some(expected) = &args.expected_digest {
-        remote.push(format!("--expected-hash={expected}"));
-    }
     for (enabled, option) in [
-        (args.verify_only, "--verify-only"),
         (args.ignore_existing, "--only-new"),
         (args.existing, "--only-existing"),
         (args.update, "--skip-newer"),
@@ -994,12 +986,6 @@ fn run_remote(
     }
     if args.devices {
         remote.push("--preserve=specials".into());
-    }
-    if let Some(maximum) = &args.max_size {
-        remote.push(format!("--max-size={maximum}"));
-    }
-    if let Some(minimum) = &args.min_size {
-        remote.push(format!("--min-size={minimum}"));
     }
     if let Some(tuning) = args.tuning_options {
         remote.push(format!("--performance-tuning={tuning}"));
@@ -1046,9 +1032,6 @@ fn run_remote(
     ) {
         remote.push("--rsh".into());
         remote.push(remote_shell);
-    }
-    if args.progress_json && !args.quiet {
-        remote.push("--progress-json".into());
     }
     if args.no_progress || args.quiet {
         remote.push("--no-progress".into());
@@ -1103,15 +1086,9 @@ fn run_remote(
     ));
 
     if args.detach {
-        // Detached: log JSON progress instead of a live display.
-        remote.retain(|a| {
-            a != "--progress"
-                && a != "--no-progress"
-                && a != "--progress-json"
-                && !a.starts_with("--width=")
-        });
+        // Detached: keep a text log without a live progress display.
+        remote.retain(|a| a != "--progress" && a != "--no-progress" && !a.starts_with("--width="));
         remote.insert(1, "--no-progress".into());
-        remote.insert(1, "--progress-json".into());
         remote.insert(1, "-v".into());
     }
     // A detached launcher returns before the background syq execs, so a

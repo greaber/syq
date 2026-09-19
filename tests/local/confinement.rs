@@ -1200,23 +1200,6 @@ fn partial_symlink_is_not_followed() {
 }
 
 #[test]
-fn verify_only_detects_symlink_difference() {
-    let t = Tmp::new();
-    fs::create_dir_all(t.path("s")).unwrap();
-    fs::create_dir_all(t.path("d")).unwrap();
-    std::os::unix::fs::symlink("target-a", t.path("s/l")).unwrap();
-    std::os::unix::fs::symlink("target-b", t.path("d/l")).unwrap();
-    let out = syq(&[
-        "-a",
-        "--syq-verify-only",
-        &format!("{}/", t.s("s")),
-        &format!("{}/", t.s("d")),
-    ]);
-    assert_eq!(out.status.code(), Some(23));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("DIFFERS"));
-}
-
-#[test]
 fn rsync_control_inputs_follow_links_owned_by_the_effective_user() {
     use std::os::unix::fs::symlink;
 

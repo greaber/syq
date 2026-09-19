@@ -20,8 +20,8 @@ from .models import (
     EntryKind,
     ErrorClass,
     ErrorEvent,
-    AttestedDigest,
-    Digest,
+    AttestedHash,
+    Hash,
     FinalObjectKind,
     FinalObjectState,
     FinalStateEvent,
@@ -50,7 +50,7 @@ from .models import (
 
 
 SCHEMA = "syq.automation"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _MAX_U64 = (1 << 64) - 1
 _MAX_I64 = (1 << 63) - 1
 _EnumT = TypeVar("_EnumT")
@@ -158,21 +158,21 @@ def _tagged(value: Any, *, label: str) -> PathValue:
     return PathValue(raw=raw)
 
 
-def _expected_digest(record: dict[str, Any]) -> Digest | None:
-    if "expected_digest" not in record:
+def _expected_hash(record: dict[str, Any]) -> Hash | None:
+    if "expected_hash" not in record:
         return None
-    digest = record["expected_digest"]
-    if not isinstance(digest, dict) or set(digest) != {"algorithm", "value"}:
-        raise SyqProtocolError("expected_digest must contain algorithm and value")
+    hash = record["expected_hash"]
+    if not isinstance(hash, dict) or set(hash) != {"algorithm", "value"}:
+        raise SyqProtocolError("expected_hash must contain algorithm and value")
     try:
-        return Digest(digest["algorithm"], digest["value"])
+        return Hash(hash["algorithm"], hash["value"])
     except (TypeError, ValueError) as error:
-        raise SyqProtocolError(f"invalid expected_digest: {error}") from error
+        raise SyqProtocolError(f"invalid expected_hash: {error}") from error
 
 
 def parse_mapping_line(line: bytes) -> MappingEntry:
     record = _object(line, label="mapping record")
-    unknown = set(record) - {"src", "dst", "kind", "size", "mtime", "expected_digest"}
+    unknown = set(record) - {"src", "dst", "kind", "size", "mtime", "expected_hash"}
     if unknown:
         raise SyqProtocolError(
             f"mapping record has unknown field {sorted(unknown)[0]!r}"
@@ -188,7 +188,7 @@ def parse_mapping_line(line: bytes) -> MappingEntry:
         _integer(record, "mtime", nonnegative=False) if "mtime" in record else None
     )
     try:
-        return MappingEntry(src.raw, dst.raw, kind, size, mtime, _expected_digest(record))
+        return MappingEntry(src.raw, dst.raw, kind, size, mtime, _expected_hash(record))
     except (TypeError, ValueError) as error:
         raise SyqProtocolError(f"mapping path is invalid: {error}") from error
 
@@ -318,13 +318,14 @@ class AutomationDecoder:
                     raise SyqProtocolError(
                         f"automation run {label} disagrees with the invocation"
                     )
+            if record.get("verify_only", False):
+                raise SyqProtocolError("verify-only result streams are no longer supported")
             event = RunEvent(
                 **common,
                 run_id=run_id,
                 started_at=_integer(record, "started_at"),
                 syq_version=_string(record, "syq_version"),
                 mode=mode,
-                verify_only=_boolean(record, "verify_only") if "verify_only" in record else False,
                 prune=prune,
                 mapping=mapping,
                 dry_run=dry_run,
@@ -358,6 +359,8 @@ class AutomationDecoder:
                 scan_done=_boolean(record, "scan_done"),
                 elapsed_ms=_integer(record, "elapsed_ms"),
                 activity=record.get("activity"),
+                rate_bytes_per_second=_optional_integer(record, "rate_bytes_per_second"),
+                eta_ms=_optional_integer(record, "eta_ms"),
             )
         if record_type == "trace":
             if self.run.mode != "cp":
@@ -410,7 +413,7 @@ class AutomationDecoder:
                 provenance=provenance,
                 scope=_optional_integer(record, "scope"),
                 code=_optional_enum(record, "code", ReceiptCode),
-                expected_digest=_expected_digest(record),
+                expected_hash=_expected_hash(record),
             )
         if record_type == "selection_result":
             if self.run.mode != "rm":
@@ -556,7 +559,7 @@ class AutomationDecoder:
                         "kind",
                         "size",
                         "metadata",
-                        "digest",
+                        "hash",
                         "symlink_target",
                         "observation_error",
                     },
@@ -573,7 +576,7 @@ class AutomationDecoder:
                 "kind",
                 "size",
                 "metadata",
-                "digest",
+                "hash",
                 "symlink_target",
                 "observation_error",
                 "code",
@@ -591,22 +594,22 @@ class AutomationDecoder:
                     f"final_state {variant.value!r} object is missing "
                     f"{sorted(missing)}"
                 )
-            digest_record = state.get("digest")
-            digest = None
-            if digest_record is not None:
-                if not isinstance(digest_record, dict):
-                    raise SyqProtocolError("final_state digest is not an object")
-                algorithm = _string(digest_record, "algorithm")
+            hash_record = state.get("hash")
+            hash = None
+            if hash_record is not None:
+                if not isinstance(hash_record, dict):
+                    raise SyqProtocolError("final_state hash is not an object")
+                algorithm = _string(hash_record, "algorithm")
                 if algorithm != "blake3":
                     raise SyqProtocolError(
-                        "final_state digest algorithm is not blake3"
+                        "final_state hash algorithm is not blake3"
                     )
-                value = _string(digest_record, "value")
+                value = _string(hash_record, "value")
                 if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
                     raise SyqProtocolError(
-                        "final_state digest value is not 64 lowercase hex digits"
+                        "final_state hash value is not 64 lowercase hex digits"
                     )
-                digest = AttestedDigest(algorithm=algorithm, value=value)
+                hash = AttestedHash(algorithm=algorithm, value=value)
             metadata_record = state.get("metadata")
             metadata = None
             if metadata_record is not None:
@@ -634,7 +637,7 @@ class AutomationDecoder:
                 kind=_optional_enum(state, "kind", FinalObjectKind),
                 size=_optional_integer(state, "size"),
                 metadata=metadata,
-                digest=digest,
+                hash=hash,
                 symlink_target=(
                     _tagged(state["symlink_target"], label="symlink_target")
                     if "symlink_target" in state

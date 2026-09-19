@@ -1173,7 +1173,7 @@ mod tests {
 
     #[test]
     fn deleted_command_requires_a_matching_standalone_receipt() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
         let binary = root.path().join("syq");
         let path = receipt_path_for(&binary).unwrap();
         assert!(!was_standalone_install(&binary).unwrap());

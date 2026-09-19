@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 pub const SCHEMA: &str = "syq.automation";
-pub const SCHEMA_VERSION: u64 = 1;
+pub const SCHEMA_VERSION: u64 = 2;
 
 pub struct ResultsWriter {
     out: Mutex<Box<dyn Write + Send>>,
@@ -66,7 +66,6 @@ pub struct RunRecord<'a> {
     pub run_id: &'a str,
     pub started_at: i64,
     pub mode: &'static str,
-    pub verify_only: bool,
     /// Copy-only fields. Omitting them gives rm a distinct shape instead of
     /// assigning copy semantics to false values.
     pub prune: Option<bool>,
@@ -93,6 +92,8 @@ pub struct ProgressRecord<'a> {
     pub scanned: u64,
     pub scan_done: bool,
     pub elapsed_ms: u64,
+    pub rate_bytes_per_second: u64,
+    pub eta_ms: Option<u64>,
 }
 
 pub struct TraceRecord<'a> {
@@ -241,7 +242,6 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
         run_id: &run_id,
         started_at,
         mode: name,
-        verify_only: args.verify_only,
         prune,
         mapping,
         dry_run: args.dry_run,
@@ -351,9 +351,7 @@ impl ResultsWriter {
             "endpoints": endpoints,
         });
         let object = record.as_object_mut().expect("record is an object");
-        if run.verify_only {
-            object.insert("verify_only".into(), true.into());
-        }
+
         if let Some(prune) = run.prune {
             object.insert("prune".into(), prune.into());
         }
@@ -376,7 +374,11 @@ impl ResultsWriter {
             "scanned": progress.scanned,
             "scan_done": progress.scan_done,
             "elapsed_ms": progress.elapsed_ms,
+            "rate_bytes_per_second": progress.rate_bytes_per_second,
         });
+        if let Some(eta_ms) = progress.eta_ms {
+            record["eta_ms"] = eta_ms.into();
+        }
         if let Some(activity) = progress.activity {
             record["activity"] =
                 serde_json::to_value(activity).expect("finite observation fractions");
@@ -536,7 +538,7 @@ impl ResultsWriter {
         });
         let object = record.as_object_mut().expect("record is an object");
         if let Some(expected) = expected {
-            object.insert("expected_digest".into(), serde_json::json!(expected));
+            object.insert("expected_hash".into(), serde_json::json!(expected));
         }
         if let Some(src) = op.src {
             object.insert("src".into(), tagged(src));
@@ -774,6 +776,8 @@ mod tests {
             scanned: 1,
             scan_done: true,
             elapsed_ms: 1,
+            rate_bytes_per_second: 0,
+            eta_ms: None,
         });
         writer.emit_result(&ResultRecord {
             status: "success",

@@ -187,7 +187,7 @@ async fn fragmented_downloads_release_receive_buffers_and_preserve_bytes() {
             chunks,
         },
     ));
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let path = dir.path().join("output");
     std::fs::write(&path, b"prefix!").unwrap();
     let size = 7 + expected.len() as u64;
@@ -283,7 +283,7 @@ pub(super) fn planning_engine(extra: &[&str]) -> Engine {
         options,
         tuning,
         client: Client::from_conf(config),
-        progress: Progress::new(false, false, None, false),
+        progress: Progress::new(false, false, None),
         pace: Mutex::new(tokio::time::Instant::now()),
         upload_keys: OnceLock::new(),
         copy_checksum_unsupported: Default::default(),
@@ -297,7 +297,7 @@ pub(super) fn planning_engine(extra: &[&str]) -> Engine {
 #[test]
 fn completed_download_releases_blocking_capacity_for_secondary_hash() {
     for valid in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let destination = dir.path().join("destination");
         std::fs::write(&destination, b"original").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -427,8 +427,8 @@ async fn whole_object_batches_start_conservatively_and_can_tune_higher() {
         assert_eq!(requests.preparation_limit(), 33);
         assert_eq!(requests.begin_objects(concurrency.initial), Some(32));
     }
-    for mode in ["--verify-only", "--dry-run"] {
-        let engine = planning_engine(&[mode]);
+    {
+        let engine = planning_engine(&["--dry-run"]);
         let concurrency = engine
             .object_workers(std::iter::repeat_n(1024 * 1024, 512))
             .unwrap();

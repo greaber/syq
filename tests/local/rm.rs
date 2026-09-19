@@ -405,7 +405,6 @@ fn native_rm_accepts_bulk_typed_selectors() {
         "--src-dirs",
         "dir-a",
         "dir-b",
-        "--progress-json",
         "--no-progress",
     ]);
     assert!(listing(&t.path("base")).is_empty());
@@ -455,19 +454,9 @@ fn native_rm_overlapping_dry_run_does_not_deduplicate() {
 }
 
 #[test]
-fn progress_bar_reports_incomplete_verification_and_entry_removal() {
+fn progress_bar_reports_entry_removal() {
     let t = Tmp::new();
-    write(&t.path("src"), b"source");
-    write(&t.path("dst"), b"different");
-    let out = compat_command()
-        .args(["--syq-verify-only", "--progress", &t.s("src"), &t.s("dst")])
-        .run()
-        .unwrap();
-    assert!(!out.status.success(), "{out:?}");
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(stderr.contains("incomplete"), "{stderr:?}");
-    assert!(!stderr.contains("%  done"), "{stderr:?}");
-    assert_eq!(read(&t.path("dst")), b"different");
+    write(&t.path("dst"), b"data");
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["rm", "--progress", &t.s("dst")])
         .run()

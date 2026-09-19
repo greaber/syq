@@ -1,7 +1,7 @@
 # syq persist
 
 Manage reusable SSH connections and receiving profiles. Start with
-[Send files home from a server](../receive.md) for setup, or see
+[Use your laptop from a server](../receive.md) for setup, or see
 [Persistence details](../persistence-reference.md) for profiles and limits.
 
 <!-- CLI: persist -->
@@ -28,6 +28,10 @@ syq persist <COMMAND>
 <!-- /CLI -->
 
 ## syq persist receive
+
+Configure receiving and approve its requests. See the
+[three uses of receiving](../receive.md) for file copies to your
+machine, commands on it, and authorizing copies between servers.
 
 <!-- CLI: persist receive -->
 ```text

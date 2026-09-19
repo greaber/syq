@@ -1,8 +1,8 @@
 # Speed
 
 Syq copies files in parallel and adjusts its connection count automatically.
-Start with the defaults. For repeated remote copies, [keep the connection
-open](install.md#keep-connections-open) to avoid logging in each time.
+Start with the defaults. To avoid logging in for every remote copy, see
+[Keep connections open](install.md#keep-connections-open).
 
 ## Quick comparison
 
@@ -14,66 +14,37 @@ curl --proto '=https' --tlsv1.2 -fLsS -o try-benchmark.sh \
 bash try-benchmark.sh
 ```
 
-The default pushes 1,024 files of 8 KiB to an SSH host you choose, comparing syq
-with rsync over three rounds. Use `--mode pull` for downloads or `--mode local`
-to include cp. `--workload large` selects one 64 MiB file; `--workload both`
-runs both workloads. The script checks every copy and cleans up afterward.
+By default, the script copies 1,024 files of 8 KiB to an SSH host you choose,
+comparing syq with rsync over three rounds. It creates disposable test data,
+checks every copy, and cleans up afterward. Use `--mode pull` for downloads or
+`--mode local` to include cp.
 
-Network comparisons first run an untimed syq warm-up so it can learn a useful
-connection count. This aims for 60 seconds of copying, using up to four copies
-of datasets no larger than 1 GiB each, subject to free space. Slow copies and
-preparation can take longer. Use `--warmup off` for a shorter comparison using
-the existing learned or default count. Local copies and manual tuning skip
-this warm-up.
+Network tests first warm up syq's connection tuning. This targets about a minute
+of copying, but setup and slow transfers can take longer. It uses up to four
+copies of datasets no larger than 1 GiB each, subject to free space. Use
+`--warmup off` for a shorter comparison.
 
-`--size quick` is the fixed-size default. For longer tests, `--size medium`
-uses 1 GiB or 4,096 small files; `--size large` uses 8 GiB or 16,384 files.
-`--size auto` grows the test data until a syq copy takes about five seconds or
-scratch space limits growth, with no fixed total-data or runtime limit. All
-scored tools use the same dataset. Longer tests help reveal sustained
-throughput, but neither sizing nor warm-up guarantees tuning has settled.
+Compare tools using the main table: it includes connection startup in total
+command time. Network results show average MB/s; local results show seconds,
+since filesystem cloning may avoid moving the bytes. The separate syq timing
+table helps diagnose setup costs; its copying-only rate is not comparable with
+another tool's total-time rate.
 
-To try your own syq options, put them after `--`:
+Run `bash try-benchmark.sh --help` for workload sizes, dependencies, scratch
+directories, and custom syq options. If trials are too short to measure sustained
+speed, choose a larger workload.
 
-```sh
-bash try-benchmark.sh --yes --mode pull --host server --tool syq --rounds 1 \
-  -- --no-tcp --performance-tuning workers=1 -v
-```
+### What the comparison measures
 
-These options also apply to setup and warm-up copies. Path, removal, and
-output-file options are excluded to keep the test inside its disposable
-directories. `-v` shows full commands and scratch paths. Use `--tool rsync`
-for a separate rsync comparison, omitting syq options after `--`. See
-[tuning options](tuning.md) for experiments, or run
-`bash try-benchmark.sh --help` for all script options.
+Each timed copy uses the same data and an empty destination, preserving
+permissions and modification times. Generation, helper preparation, warm-up,
+and content checks are untimed. Failed copies or content checks stop the test.
 
-The script needs Bash, rsync, OpenSSL, standard Unix utilities, and Perl's
-core JSON::PP module locally. Remote tests need SSH access and rsync on the
-other machine; pull warm-ups also need Bash, OpenSSL, dd, and split there.
-Scratch parent directories must exist. `--source-dir` selects the local
-parent; `--dest-dir` selects the remote parent for both push and pull.
-
-Each scored copy uses an empty destination and preserves permissions and
-modification times. Generation, helper preparation, warm-up, and content
-checks are untimed. Failed commands or content checks stop the comparison.
-SSH connection reuse is disabled for both tools during network tests; syq's
-[learned connection counts](tuning.md#remembered-connection-counts) remain
-active unless you override tuning. Caches are not flushed, and copies do not
-wait for durable storage.
-
-Compare tools using the main table, which includes connection startup in total
-command time. Network results show decimal MB/s averaged across trials. Local
-results show seconds, because filesystem cloning can avoid moving bytes;
-those times do not measure disk bandwidth.
-
-The separate syq timing table helps explain slow results. It divides total time
-into the copying interval and time outside it, such as setup and finishing.
-The copying interval includes waiting and per-file work, and can overlap
-planning and connection setup. Use it to diagnose syq, not to compare against
-another tool's total time. If the script flags a short copying interval or
-substantial time outside it, try a larger workload to investigate sustained
-throughput. Each verified syq trial also reports worker activity, endpoint
-operations, and CPU use; see [diagnostics](#diagnose-a-slow-copy) below.
+Network tests disable SSH connection reuse for both tools. Syq's learned
+connection counts remain active unless you override tuning; warm-up does not
+guarantee that tuning has settled. Caches are not flushed, and copies do not
+wait for durable storage. Local cloning times therefore do not measure disk
+bandwidth.
 
 ## Benchmarks
 
@@ -81,6 +52,22 @@ The separate [syq-bench project](https://greaber.github.io/syq-bench/) runs more
 extensive experiments across workloads, storage systems, and network routes.
 Browse its results, or [run its experiments](https://greaber.github.io/syq-bench/reproduce.html)
 for a more detailed comparison. The quick script above does not use syq-bench.
+
+<figure class="benchmark-example">
+<table>
+<caption>Published example: Germany → US East Coast</caption>
+<thead><tr><th scope="col">Tool</th><th scope="col">Average speed</th></tr></thead>
+<tbody>
+<tr><th scope="row">syq</th><td>159.9 MB/s</td></tr>
+<tr><th scope="row">syq over SSH</th><td>88.3 MB/s</td></tr>
+<tr><th scope="row">rsync</th><td>18.3 MB/s</td></tr>
+</tbody>
+</table>
+<figcaption>One 1.07 GB file, held in memory at both ends; three runs per tool.
+From the separate <a href="https://greaber.github.io/syq-bench/all-results.html#public-wan-forward">syq-bench project</a>,
+measured on September 13, 2026 (<a href="https://greaber.github.io/syq-bench/data/release-060-public-wan-forward.json">raw results</a>).
+Your results will depend on your machines and connection.</figcaption>
+</figure>
 
 <a id="when-rsync-or-cp-is-faster"></a>
 
@@ -96,14 +83,14 @@ and process CPU. These wait fractions
 help locate delays; they are not proof of their cause. Add `--results run.ndjson`
 to inspect how worker waits, endpoint operations, CPU and TCP backpressure change
 over time. Remote evidence includes its age. See the
-[activity record](automation.md#progress) for interpretation and limitations.
+[`progress`](automation.md#progress) record for interpretation and limitations.
 
 | Symptom | Try |
 |---|---|
-| Data falls back to SSH | Check [TCP reachability](server-tuning.md#make-tcp-reachable) |
+| Data falls back to SSH | Check [Make TCP reachable](server-tuning.md#make-tcp-reachable) |
 | Many short commands spend time logging in | `syq persist on` |
 | CPU is saturated on a fast link | Compare with `--no-compress` |
-| A long-distance path suffers loss | Investigate [congestion control](server-tuning.md#test-congestion-control) |
+| A long-distance path suffers loss | Investigate [Test congestion control](server-tuning.md#test-congestion-control) |
 
 Compare the same workload and direction using empty test destinations.
 A second copy into the same destination may just measure skipping existing files.
@@ -112,9 +99,9 @@ A second copy into the same destination may just measure skipping existing files
 
 SSH authenticates remote copies. When reachable, encrypted TCP carries file
 data on a port in `47600–47699`; otherwise copies use SSH on the same route.
-See [server setup](server-tuning.md#make-tcp-reachable) for firewall settings.
-Copies [authorized through another machine](remote-to-remote.md#start-a-copy-from-the-source-server)
-require direct encrypted TCP.
+See [Make TCP reachable](server-tuning.md#make-tcp-reachable) for firewall settings.
+To [Run the copy from a server](remote-to-remote.md#run-the-copy-from-a-server)
+with your laptop’s approval, direct encrypted TCP must be reachable.
 
 Use `--no-tcp` to select SSH data transport or `--tcp-ports LO-HI` to choose a
 port range. On Linux, `--tcp-congestion ALGO` selects an available congestion
@@ -126,20 +113,11 @@ use it only on a trusted network. Restricted receivers refuse it.
 For local copies, syq uses the filesystem's copy optimizations automatically
 when it can. On filesystems that support cloning, this can avoid physically
 copying every byte. You can also copy to or from a mounted NFS directory using
-its local path. See [storage placement](server-tuning.md#check-local-storage-placement)
+its local path. See [Check local storage placement](server-tuning.md#check-local-storage-placement)
 for how the source and destination filesystems affect performance.
 
-On macOS, eligible copies within one APFS volume share disk blocks; later writes
-to either file are independent. Reported bytes count the file's size, so the
-displayed rate can exceed physical disk throughput. Small files travel together
-in batches; see [batch size and splitting](tuning.md#batch-size-and-splitting)
-for the cloning threshold and how tuning changes it.
-
-Cloning keeps the usual overwrite and metadata rules and omits source extended
-attributes and file flags. `--inplace`, checksum comparison, bandwidth limits,
-and explicit range transfers use normal copying. Syq also falls back to normal
-copying when cloning cannot preserve those rules, such as with inheritable
-access control entries on the destination directory.
+Reported bytes count the file's size even when cloning avoids physical I/O,
+so the displayed rate can exceed disk throughput.
 
 ## Limit bandwidth
 
@@ -157,8 +135,8 @@ See [Resource limits](resource-limits.md) for all units and supported routes.
 
 ## Compression and in-place writes
 
-`--no-compress` can help when [automatic transport compression](reference.md#transport-compression)
-costs more CPU time than it saves in network traffic. `--inplace` saves temporary
+`--no-compress` can help when compression costs more CPU time than it saves
+in network traffic; see [Transport compression](reference.md#transport-compression). `--inplace` saves temporary
 disk space, but exposes incomplete updates to readers. Read
 [in-place writes](reference.md#in-place-writes) before using it.
 

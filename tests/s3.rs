@@ -1,5 +1,8 @@
 //! Network fault tests use a local independent HTTP fixture. Real S3 protocol
 //! and signature interoperability are exercised by scripts/test-s3.sh.
+#[path = "support/temp.rs"]
+mod test_support;
+
 #[path = "s3/streams.rs"]
 mod streams;
 
@@ -1593,7 +1596,7 @@ fn validate_results(temp: &Path) {
 #[test]
 fn s3_ranges_signed_headers_metadata_and_results() {
     let server = Server::start("ok");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -1618,7 +1621,7 @@ fn s3_ranges_signed_headers_metadata_and_results() {
 fn s3_prefix_discovery_overlaps_reads_and_checks_both_results() {
     for fault in ["prefix-ok", "prefix-collision", "prefix-list-error"] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let output = server.cp(
             temp.path(),
             &[
@@ -1660,7 +1663,7 @@ fn s3_prefix_discovery_overlaps_reads_and_checks_both_results() {
 #[test]
 fn s3_first_range_supplies_metadata_without_serializing_the_remaining_ranges() {
     let server = Server::start("initial-range-overlap");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &["--from", "s3://bucket", "data", "--as", "download"],
@@ -1678,7 +1681,7 @@ fn s3_first_range_supplies_metadata_without_serializing_the_remaining_ranges() {
 fn s3_invalid_initial_ranges_never_publish_a_fresh_download() {
     for fault in ["ignore-range", "etag", "corrupt", "truncated"] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let mut args = vec!["--from", "s3://bucket", "data", "--as", "download"];
         if fault == "corrupt" {
             args.push("--integrity-checking=transfer=blake3");
@@ -1699,7 +1702,7 @@ fn s3_invalid_initial_ranges_never_publish_a_fresh_download() {
 fn s3_fast_queued_ranges_preserve_bytes_and_fail_without_publication() {
     for fault in ["patterned", "ignore-range", "etag", "truncated"] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         std::fs::write(temp.path().join("download"), b"original").unwrap();
         let output = server.cp(
             temp.path(),
@@ -1730,14 +1733,23 @@ fn s3_one_request_slot_supports_multipart_and_content_verification() {
         "--performance-tuning=s3-max-concurrent-requests=1",
         "--resource-limits=s3-max-concurrent-requests=1,s3-max-concurrent-objects=1",
     ] {
-        let temp = tempfile::tempdir().unwrap();
-        for extra in [None, Some("--verify-only")] {
+        let temp = crate::test_support::tempdir().unwrap();
+        for extra in [false, true] {
             let mut args = vec!["--from", "s3://bucket", "data", "--as", "result", control];
-            if let Some(flag) = extra {
-                args.push(flag);
+            if extra {
+                args.extend(["--dry-run", "--hash", "--results", "results.jsonl"]);
             }
             let output = server.cp(temp.path(), &args);
             assert!(output.status.success(), "{}", output_text(&output));
+            if extra {
+                let records = parsed_results(temp.path());
+                let terminal = records.last().unwrap();
+                assert_eq!(terminal["status"], "success");
+                assert_eq!(terminal["files_transferred"], 0);
+                assert_eq!(terminal["files_unchanged"], 1);
+                assert_eq!(terminal["bytes_unchanged"], SIZE);
+                assert!(!records.iter().any(|r| r["type"] == "trace"), "{records:?}");
+            }
         }
         assert_eq!(
             std::fs::metadata(temp.path().join("result")).unwrap().len(),
@@ -1750,7 +1762,7 @@ fn s3_one_request_slot_supports_multipart_and_content_verification() {
 fn s3_bad_responses_preserve_existing_destination() {
     for fault in ["ignore-range", "etag", "corrupt", "truncated"] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         std::fs::write(temp.path().join("download"), b"original").unwrap();
         let output = server.cp(
             temp.path(),
@@ -1784,7 +1796,7 @@ fn s3_bad_responses_preserve_existing_destination() {
 }
 #[test]
 fn s3_wrong_region_redirects_name_the_bucket_region() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     // A named object is found with a HEAD. A prefix is found with a HEAD and
     // a listing sent together, and either may be the first to fail.
     for (fault, selector) in [
@@ -1831,7 +1843,7 @@ fn s3_wrong_region_redirects_name_the_bucket_region() {
 #[test]
 fn s3_dry_run_never_creates_destination_or_recovery() {
     let server = Server::start("ok");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -1853,7 +1865,7 @@ fn s3_dry_run_never_creates_destination_or_recovery() {
 #[test]
 fn s3_usage_errors_do_not_contact_storage() {
     let server = Server::start("ok");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     for args in [
         vec!["--from", "s3://bucket", "data", "--as", "out", "--inplace"],
         vec![
@@ -1883,7 +1895,7 @@ fn s3_single_get_validates_metadata_length_and_contents() {
         "single-length",
     ] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let output = server.cp(
             temp.path(),
             &[
@@ -1924,7 +1936,7 @@ fn s3_single_get_validates_metadata_length_and_contents() {
 fn s3_temporary_name_replacement_cannot_redirect_metadata() {
     use std::os::unix::fs::PermissionsExt;
     let server = Server::start("single-swap");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let victim = temp.path().join("victim");
     std::fs::write(&victim, b"keep this inode untouched").unwrap();
     std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1980,7 +1992,7 @@ fn s3_temporary_name_replacement_cannot_redirect_metadata() {
 
 #[test]
 fn s3_service_profile_endpoints_keep_recovery_separate() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let config = temp.path().join("config");
     for server in [Server::start("corrupt"), Server::start("corrupt")] {
         std::fs::write(
@@ -2025,7 +2037,7 @@ fn s3_service_profile_endpoints_keep_recovery_separate() {
 
 #[test]
 fn s3_unreadable_recovery_record_is_named_and_stale_temporaries_are_removed() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let server = Server::start("corrupt");
     let download = |server: &Server| {
         server.cp(
@@ -2072,7 +2084,7 @@ fn s3_expected_hash_checks_single_and_multipart_before_publication() {
     for (fault, size) in [("single-ok", 65536), ("ok", SIZE)] {
         for correct in [true, false] {
             let server = Server::start(fault);
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::test_support::tempdir().unwrap();
             std::fs::write(temp.path().join("result"), b"original").unwrap();
             let bytes = vec![if correct { b'x' } else { b'y' }; size];
             let expected = format!(
@@ -2085,13 +2097,12 @@ fn s3_expected_hash_checks_single_and_multipart_before_publication() {
             let output = server.cp(
                 temp.path(),
                 &[
-                    "--expected-hash",
-                    &expected,
+                    "--mapping",
+                    &expected_mapping(temp.path(), "object", "result", &expected),
                     "--from",
                     "s3://bucket",
-                    "object",
-                    "--as",
-                    "result",
+                    "--into",
+                    ".",
                 ],
             );
             assert_eq!(
@@ -2110,7 +2121,7 @@ fn s3_expected_hash_checks_single_and_multipart_before_publication() {
 fn s3_expected_hash_checks_unchanged_destination_and_recovers_corruption() {
     use sha2::Digest as _;
     let server = Server::start("single-ok");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let expected = format!(
         "sha256:{}",
         sha2::Sha256::digest(vec![b'x'; 65536])
@@ -2119,13 +2130,12 @@ fn s3_expected_hash_checks_unchanged_destination_and_recovers_corruption() {
             .collect::<String>()
     );
     let args = [
-        "--expected-hash",
-        &expected,
+        "--mapping",
+        &expected_mapping(temp.path(), "object", "result", &expected),
         "--from",
         "s3://bucket",
-        "object",
-        "--as",
-        "result",
+        "--into",
+        ".",
     ];
     let output = server.cp(temp.path(), &args);
     assert!(output.status.success(), "{}", output_text(&output));
@@ -2147,7 +2157,7 @@ fn s3_expected_hash_checks_unchanged_destination_and_recovers_corruption() {
 fn s3_transfer_integrity_is_opt_in_but_framing_stays_mandatory() {
     for fault in ["single-corrupt", "single-truncated"] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let output = server.cp(
             temp.path(),
             &["--from", "s3://bucket", "object", "--as", "result"],
@@ -2163,29 +2173,15 @@ fn s3_transfer_integrity_is_opt_in_but_framing_stays_mandatory() {
 
 #[test]
 fn s3_upload_native_checksum_reuse_and_expected_hash() {
-    use sha2::Digest as _;
     for (fault, options) in [
         ("upload-default", Vec::new()),
         (
             "upload-sha256",
             vec!["--integrity-checking=transfer=sha256".to_owned()],
         ),
-        (
-            "upload-md5",
-            vec![
-                "--expected-hash".to_owned(),
-                format!(
-                    "md5:{}",
-                    md5::Md5::digest(b"payload")
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
-                ),
-            ],
-        ),
     ] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         std::fs::write(temp.path().join("source"), b"payload").unwrap();
         let output = server
             .command(temp.path())
@@ -2198,18 +2194,22 @@ fn s3_upload_native_checksum_reuse_and_expected_hash() {
         assert!(server.gate.0.load(Ordering::Acquire));
     }
     let server = Server::start("upload-default");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     std::fs::write(temp.path().join("source"), b"payload").unwrap();
     let output = server.cp(
         temp.path(),
         &[
-            "--expected-hash",
-            "md5:00000000000000000000000000000000",
-            "source",
+            "--mapping",
+            &expected_mapping(
+                temp.path(),
+                "source",
+                "object",
+                "md5:00000000000000000000000000000000",
+            ),
             "--to",
             "s3://bucket",
-            "--as",
-            "object",
+            "--into",
+            ".",
         ],
     );
     assert!(!output.status.success(), "{}", output_text(&output));
@@ -2223,7 +2223,7 @@ fn s3_upload_native_checksum_reuse_and_expected_hash() {
 fn s3_mapping_preserves_expected_hashes_in_failed_results() {
     use sha2::Digest as _;
     let server = Server::start("single-ok");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let digest = md5::Md5::digest(vec![b'x'; 65536])
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -2235,7 +2235,7 @@ fn s3_mapping_preserves_expected_hashes_in_failed_results() {
     .map(|(name, value)| {
         serde_json::json!({
         "src": {"encoding": "utf-8", "value": name}, "dst": {"encoding": "utf-8", "value": name},
-        "kind": "file", "expected_digest": {"algorithm": "md5", "value": value},
+        "kind": "file", "expected_hash": {"algorithm": "md5", "value": value},
     }).to_string()
     })
     .join("\n");
@@ -2265,9 +2265,9 @@ fn s3_mapping_preserves_expected_hashes_in_failed_results() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .find(|record| record["disposition"] == "failed")
         .unwrap();
-    assert_eq!(failed["expected_digest"]["algorithm"], "md5");
+    assert_eq!(failed["expected_hash"]["algorithm"], "md5");
     assert_eq!(
-        failed["expected_digest"]["value"],
+        failed["expected_hash"]["value"],
         "00000000000000000000000000000000"
     );
 }
@@ -2275,7 +2275,7 @@ fn s3_mapping_preserves_expected_hashes_in_failed_results() {
 #[test]
 fn s3_hash_comparison_reuses_only_the_selected_algorithm() {
     let server = Server::start("single-ok");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     std::fs::write(temp.path().join("result"), vec![b'x'; 65536]).unwrap();
     let mut counts = Vec::new();
     for algorithm in ["blake3", "sha256"] {
@@ -2304,19 +2304,18 @@ fn s3_hash_comparison_reuses_only_the_selected_algorithm() {
 fn s3_dry_run_does_not_validate_expected_hash() {
     let expected = "md5:00000000000000000000000000000000";
     let server = Server::start("upload-default");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     std::fs::write(temp.path().join("source"), b"payload").unwrap();
     let output = server.cp(
         temp.path(),
         &[
             "--dry-run",
-            "--expected-hash",
-            expected,
-            "source",
+            "--mapping",
+            &expected_mapping(temp.path(), "source", "object", expected),
             "--to",
             "s3://bucket",
-            "--as",
-            "object",
+            "--into",
+            ".",
         ],
     );
     assert!(output.status.success(), "{}", output_text(&output));
@@ -2340,13 +2339,12 @@ fn s3_dry_run_does_not_validate_expected_hash() {
         &[
             "--dry-run",
             "-v",
-            "--expected-hash",
-            expected,
+            "--mapping",
+            &expected_mapping(temp.path(), "object", "result", expected),
             "--from",
             "s3://bucket",
-            "object",
-            "--as",
-            "result",
+            "--into",
+            ".",
         ],
     );
     assert!(output.status.success(), "{}", output_text(&output));
@@ -2366,7 +2364,7 @@ fn s3_review_upload_hash_compares_objects_without_matching_stored_digest() {
         ("single-upload-nohash", "blake3", true),
     ] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let source = temp.path().join("source");
         std::fs::write(&source, vec![if changed { b'y' } else { b'x' }; 65536]).unwrap();
         std::fs::File::options()
@@ -2401,37 +2399,6 @@ fn s3_review_upload_hash_compares_objects_without_matching_stored_digest() {
 }
 
 #[test]
-fn s3_review_verify_only_reports_expected_hash_mismatch() {
-    let server = Server::start("single-ok");
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("result"), vec![b'x'; 65536]).unwrap();
-    let output = server.cp(
-        temp.path(),
-        &[
-            "--verify-only",
-            "--expected-hash",
-            "md5:00000000000000000000000000000000",
-            "--from",
-            "s3://bucket",
-            "object",
-            "--as",
-            "result",
-        ],
-    );
-    assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
-    let message = output_text(&output);
-    assert!(message.contains("expected md5 hash"), "{message}");
-    assert!(
-        !message.contains("file missing, type differs, or size differs"),
-        "{message}"
-    );
-    assert_eq!(
-        std::fs::read(temp.path().join("result")).unwrap(),
-        vec![b'x'; 65536]
-    );
-}
-
-#[test]
 fn s3_prune_reports_delete_failure_and_rejects_outside_listing() {
     for (fault, code, requests, planned) in [
         ("prune-denied", 23, 2, 1),
@@ -2439,7 +2406,7 @@ fn s3_prune_reports_delete_failure_and_rejects_outside_listing() {
         ("prune-invalid", 23, 1, 0),
         ("prune-folder-content", 23, 1, 0),
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("empty")).unwrap();
         let server = Server::start(fault);
         let output = server.cp(
@@ -2473,7 +2440,7 @@ fn s3_prune_reports_delete_failure_and_rejects_outside_listing() {
 
 #[test]
 fn s3_prune_limit_refuses_without_sending_delete() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("empty")).unwrap();
     let server = Server::start("prune-denied");
     let output = server.cp(
@@ -2516,7 +2483,7 @@ fn s3_prune_batches_account_for_every_key_and_continue_after_errors() {
         ("prune-mixed", 23, 2, 1, 2),
         ("prune-request-failure", 23, 1001, 1, 3),
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("empty")).unwrap();
         let server = Server::start(fault);
         let output = server.cp(
@@ -2556,7 +2523,7 @@ fn s3_prune_batches_account_for_every_key_and_continue_after_errors() {
 
 #[test]
 fn s3_prune_can_ignore_unrepresentable_destination_keys() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("empty")).unwrap();
     let server = Server::start("prune-invalid");
     let output = server.cp(
@@ -2605,7 +2572,7 @@ fn s3_unchanged_upload_does_not_read_body_unless_content_check_requested() {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
 
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("source");
     std::fs::write(&path, vec![b'x'; 65536]).unwrap();
     std::fs::File::options()
@@ -2649,7 +2616,7 @@ fn s3_unchanged_upload_does_not_read_body_unless_content_check_requested() {
 
 #[test]
 fn s3_head_failure_reports_http_status_without_a_response_body() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     std::fs::write(temp.path().join("source"), b"source").unwrap();
     let server = Server::start("head-denied");
     let output = server.cp(
@@ -2667,7 +2634,7 @@ fn s3_head_failure_reports_http_status_without_a_response_body() {
 #[test]
 fn s3_get_throttling_without_a_body_is_retried() {
     for (retries, expected_exit, requests) in [(2, 0, 3), (0, 23, 2)] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let server = Server::start("single-get-throttle-once");
         let output = server
             .command_with_retries(temp.path(), retries)
@@ -2705,7 +2672,7 @@ fn s3_download_retries_share_one_budget_across_statuses_and_error_codes() {
         "single-get-transient-always",
         "single-get-timeout-code-always",
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         // An existing, different file takes the HEAD-then-download-loop path;
         // a fresh file would fetch its metadata with an SDK-only initial GET.
         std::fs::write(temp.path().join("result"), b"stale").unwrap();
@@ -2744,7 +2711,7 @@ fn s3_download_retries_share_one_budget_across_statuses_and_error_codes() {
 #[test]
 fn s3_upload_retries_share_one_budget_for_throttling_and_transient_errors() {
     for fault in ["upload-throttle-always", "upload-transient-always"] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         std::fs::write(temp.path().join("source"), b"small body").unwrap();
         let server = Server::start(fault);
         let output = server
@@ -2775,7 +2742,7 @@ fn s3_upload_retries_share_one_budget_for_throttling_and_transient_errors() {
 #[test]
 fn s3_upload_retries_request_timeout_error_codes_within_the_budget() {
     for (retries, expected_exit, requests) in [(1, 0, 3), (0, 23, 2)] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         std::fs::write(temp.path().join("source"), b"small body").unwrap();
         let server = Server::start("upload-timeout-code-once");
         let output = server
@@ -2815,7 +2782,7 @@ fn s3_head_throttling_uses_the_retry_budget_and_keeps_permanent_errors_final() {
         ("single-throttle-always", 2, 23, 3),
         ("head-denied", 2, 23, 1),
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().join("source");
         std::fs::write(&path, vec![b'x'; 65536]).unwrap();
         std::fs::File::options()
@@ -2863,7 +2830,7 @@ fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
         ("remove-mixed", 23, 3),
         ("remove-omitted", 23, 3),
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let server = Server::start(fault);
         let output = server
             .command_for(temp.path(), "rm")
@@ -2955,7 +2922,7 @@ fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
 
 #[test]
 fn s3_remove_dry_run_and_usage_errors_do_not_delete() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let server = Server::start("remove-ok");
     let output = server
         .command_for(temp.path(), "rm")
@@ -3010,7 +2977,7 @@ fn s3_remove_dry_run_and_usage_errors_do_not_delete() {
 
 #[test]
 fn s3_remove_retries_bodyless_head_throttling_without_decoding_copy_metadata() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let server = Server::start("remove-head-throttle");
     let output = server
         .command_for(temp.path(), "rm")
@@ -3039,7 +3006,7 @@ fn s3_listing_costs_are_bounded_without_changing_selection() {
         ),
     ] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let mut args = vec![
             "--from",
             "s3://bucket",
@@ -3104,7 +3071,7 @@ fn s3_upload_destination_discovery_is_bounded() {
         ("listing-complete", "--into", true, 1),
     ] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         std::fs::write(temp.path().join("one"), b"one").unwrap();
         std::fs::write(temp.path().join("two"), b"two").unwrap();
         let mut args = vec![
@@ -3164,7 +3131,7 @@ fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
         ),
     ] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let mut args = vec![
             "--from",
             "s3://bucket",
@@ -3194,7 +3161,7 @@ fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
 
 #[test]
 fn s3_remove_prefix_existence_is_bounded_and_usage_mentions_removal() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let server = Server::start("remove-prefix-check");
     let output = server
         .command_for(temp.path(), "rm")
@@ -3241,7 +3208,7 @@ fn s3_remove_prefix_existence_is_bounded_and_usage_mentions_removal() {
 
 #[test]
 fn s3_remove_follow_still_allows_local_results_symlinks() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let results = temp.path().join("results");
     std::os::unix::fs::symlink("actual-results", &results).unwrap();
     let server = Server::start("remove-head-throttle");
@@ -3277,7 +3244,7 @@ fn s3_remove_exact_history_and_tree_are_selected_explicitly() {
         (vec!["--srcs-in", "ghost"], vec!["child"]),
         (vec!["--src-non-dir", "ghost"], vec!["old", "hidden"]),
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let server = Server::start("remove-ghost");
         let output = server
             .command_for(temp.path(), "rm")
@@ -3313,7 +3280,7 @@ fn s3_remove_exact_history_and_tree_are_selected_explicitly() {
 
 #[test]
 fn s3_remove_exact_versions_stops_before_unrelated_prefixes() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let server = Server::start("remove-exact-bounded");
     let output = server
         .command_for(temp.path(), "rm")
@@ -3343,7 +3310,7 @@ fn s3_remove_batches_are_concurrent_and_preserve_markers_after_late_failure() {
         ("remove-bulk", 0, 5, 1002, 0),
         ("remove-bulk-failure", 23, 4, 1, 1001),
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let server = Server::start(fault);
         let output = server
             .command_for(temp.path(), "rm")
@@ -3397,7 +3364,7 @@ fn s3_remove_batches_are_concurrent_and_preserve_markers_after_late_failure() {
 #[test]
 fn s3_remove_interrupt_cancels_stalled_planning_without_deleting() {
     for signal in [libc::SIGINT, libc::SIGTERM] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let server = Server::start("remove-planning-interrupt");
         let mut child = server
             .command_for(temp.path(), "rm")
@@ -3465,7 +3432,7 @@ fn s3_remove_interrupt_cancels_stalled_planning_without_deleting() {
 
 #[test]
 fn s3_remove_interrupt_drains_in_flight_results_before_exiting() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let server = Server::start("remove-bulk-interrupt");
     let mut child = server
         .command_for(temp.path(), "rm")
@@ -3563,7 +3530,7 @@ fn serve_latency_pages(socket: &mut TcpStream, first: &str) {
 #[test]
 fn s3_paginated_download_records_control_latency() {
     let server = Server::start("latency-pages");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server
         .command(temp.path())
         .env("SYQ_S3_DIAGNOSTICS", "1")
@@ -3613,7 +3580,7 @@ fn s3_remove_explicit_types_disambiguate_live_object_and_tree_without_extra_prob
             (vec!["--src-dir", "foo"], vec!["foo/", "foo/nested/child"]),
             (vec!["--srcs-in", "foo"], vec!["foo/nested/child"]),
         ] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::test_support::tempdir().unwrap();
             let server = Server::start("rm-explicit-collision");
             let mut command = server.command_for(temp.path(), "rm");
             command
@@ -3643,7 +3610,7 @@ fn s3_remove_explicit_types_disambiguate_live_object_and_tree_without_extra_prob
             assert_eq!(server.requests.load(Ordering::Relaxed), 1);
         }
     }
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let server = Server::start("rm-explicit-collision");
     let output = server
         .command_for(temp.path(), "rm")
@@ -3664,7 +3631,7 @@ fn s3_remove_explicit_types_disambiguate_live_object_and_tree_without_extra_prob
 #[test]
 fn server_copy_rejects_metadata_headers_before_requests() {
     let server = Server::start("ok");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     for name in [
         "X-Amz-Meta-Project",
         "Content-Type",
@@ -3710,7 +3677,7 @@ fn server_copy_never_reads_or_relays_object_contents() {
         "server-copy-fails",
         "server-copy-multipart-fails",
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let server = Server::start(fault);
         let mut command = server.command(temp.path());
         command.args(["--s3-endpoint", &server.address]);
@@ -3772,7 +3739,7 @@ fn server_copy_compares_remote_checksums_etags_and_metadata_without_body_reads()
         ("server-copy-compare-bad-request", 4),
         ("server-copy-compare-unsupported", 3),
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let server = Server::start(fault);
         let output = server.cp(
             temp.path(),
@@ -3798,7 +3765,7 @@ fn server_copy_parts_overlap_and_respect_one_request_limit() {
         ("server-copy-multipart-serial", "1", true),
         ("server-copy-multipart-drain-fails", "2", false),
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let server = Server::start(fault);
         let output = server.cp(
             temp.path(),
@@ -3827,7 +3794,7 @@ fn server_copy_parts_overlap_and_respect_one_request_limit() {
 #[test]
 fn server_copy_only_new_uses_a_conditional_write() {
     let server = Server::start("server-copy-only-new");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -3853,7 +3820,7 @@ fn server_copy_reuses_destination_discovery_and_prunes_beneath_file_keys() {
         ("server-tree-denied", "--dry-run", 6),
     ] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let output = server.cp(
             temp.path(),
             &[
@@ -3883,7 +3850,7 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
         "server-copy-multipart-storage-class",
     ] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let mut args = vec![
             "--from",
             "s3://source",
@@ -3920,7 +3887,7 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
 #[test]
 fn server_copy_automatic_sizing_uses_one_copy_request() {
     let server = Server::start("server-copy-automatic");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server
         .command_with_part_size(temp.path(), 0, false)
         .args([
@@ -3947,7 +3914,7 @@ fn server_copy_prune_protects_keys_under_skip_options() {
         ("server-tree-missing", "--only-existing"),
     ] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let output = server.cp(
             temp.path(),
             &[
@@ -3978,7 +3945,7 @@ fn server_copy_tag_reads_handle_zero_denied_and_unsupported() {
         ("server-copy-multipart-known-unsupported", false, 3),
     ] {
         let server = Server::start(fault);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let output = server.cp(
             temp.path(),
             &[
@@ -4024,7 +3991,7 @@ fn server_copy_tag_reads_handle_zero_denied_and_unsupported() {
 #[test]
 fn server_copy_caches_unsupported_tag_reads() {
     let server = Server::start("server-copy-multipart-cached-unsupported");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -4053,7 +4020,7 @@ fn server_copy_caches_unsupported_tag_reads() {
 #[test]
 fn server_copy_region_error_explains_both_endpoints() {
     let server = Server::start("wrong-region");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -4082,7 +4049,7 @@ fn server_copy_region_error_explains_both_endpoints() {
 #[test]
 fn server_copy_discovery_region_failure_stops_before_copying() {
     let server = Server::start("server-tree-region");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -4110,7 +4077,7 @@ fn server_copy_discovery_region_failure_stops_before_copying() {
 #[test]
 fn server_copy_changed_source_prevents_pruning() {
     let server = Server::start("server-tree-changed");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -4134,7 +4101,7 @@ fn server_copy_changed_source_prevents_pruning() {
 #[test]
 fn server_copy_reuses_versioned_source_snapshot() {
     let server = Server::start("server-copy-versioned");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -4154,7 +4121,7 @@ fn server_copy_reuses_versioned_source_snapshot() {
 #[test]
 fn server_copy_multipart_preserves_tag_characters() {
     let server = Server::start("server-copy-multipart-tag-encoding");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -4173,14 +4140,9 @@ fn server_copy_multipart_preserves_tag_characters() {
 #[test]
 fn server_copy_filters_exact_and_mapping_overlap() {
     for mapping in [false, true] {
-        for filter in [
-            None,
-            Some(("--ignore", "original")),
-            Some(("--min-size", "5")),
-            Some(("--max-size", "3")),
-        ] {
+        for filter in [None, Some(("--ignore", "original"))] {
             let server = Server::start("server-copy");
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::test_support::tempdir().unwrap();
             std::fs::write(
                 temp.path().join("mapping"),
                 serde_json::json!({
@@ -4223,7 +4185,7 @@ fn server_copy_filters_exact_and_mapping_overlap() {
 fn upload_region_discovery_failure_stops_with_and_without_prune() {
     for prune in [false, true] {
         let server = Server::start("wrong-region");
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("source")).unwrap();
         for name in ["a", "b"] {
             std::fs::write(temp.path().join("source").join(name), b"data").unwrap();
@@ -4254,7 +4216,7 @@ fn upload_region_discovery_failure_stops_with_and_without_prune() {
 fn failed_marker_reports_directory_action_on_both_routes() {
     for server_copy in [false, true] {
         let server = Server::start("marker-head-failure");
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let mut args = vec!["--from", "s3://source", "--srcs-in", "data"];
         if server_copy {
             args.extend(["--to", "s3://destination"]);
@@ -4285,7 +4247,7 @@ fn failed_transfers_report_known_symlink_action_on_both_routes() {
     for server_copy in [false, true] {
         for mapping in [false, true] {
             let server = Server::start("symlink-transfer-denied");
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::test_support::tempdir().unwrap();
             let mut args = vec!["--from", "s3://source"];
             if mapping {
                 let entry = serde_json::json!({
@@ -4327,7 +4289,7 @@ fn failed_transfers_report_known_symlink_action_on_both_routes() {
 fn skipped_download_markers_do_not_count_as_unchanged_files() {
     let flag = "--only-existing";
     let server = Server::start("marker-head-failure");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -4362,7 +4324,7 @@ fn skipped_download_symlinks_use_the_kind_known_from_selection() {
         ("prefix", "--only-existing"),
     ] {
         let server = Server::start("symlink-transfer-denied");
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         if flag == "--only-new" {
             std::fs::create_dir(temp.path().join("out")).unwrap();
             std::os::unix::fs::symlink("target", temp.path().join("out/original")).unwrap();
@@ -4414,7 +4376,7 @@ fn skipped_download_symlinks_use_the_kind_known_from_selection() {
 #[test]
 fn server_copy_directory_to_bucket_root_skips_root_marker() {
     let server = Server::start("copy-root-marker");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -4443,7 +4405,7 @@ fn server_copy_directory_to_bucket_root_skips_root_marker() {
 fn download_directory_to_root_keeps_root_metadata() {
     use std::os::unix::fs::MetadataExt;
     let server = Server::start("copy-root-marker");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -4463,4 +4425,16 @@ fn download_directory_to_root_keeps_root_metadata() {
     assert_eq!(server.requests.load(Ordering::Relaxed), 4);
     let records = parsed_results(temp.path());
     assert!(records.iter().any(|r| r["action"] == "create_directory"));
+}
+
+fn expected_mapping(root: &Path, source: &str, destination: &str, expected: &str) -> String {
+    let (algorithm, value) = expected.split_once(':').unwrap();
+    let record = serde_json::json!({
+        "src": {"encoding": "utf-8", "value": source},
+        "dst": {"encoding": "utf-8", "value": destination}, "kind": "file",
+        "expected_hash": {"algorithm": algorithm, "value": value}
+    });
+    let path = root.join("expected.mapping");
+    std::fs::write(&path, record.to_string()).unwrap();
+    path.to_str().unwrap().to_owned()
 }

@@ -111,25 +111,41 @@ def run(args, *, ok=True, env=None, capture=False):
     return completed
 
 
+def assert_comparison(path, *, changed, unchanged):
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    terminal = records[-1]
+    assert terminal['type'] == 'result' and terminal['status'] == 'success', records
+    assert terminal['dry_run'] and terminal['errors'] == 0, terminal
+    assert terminal['files_transferred'] == changed, terminal
+    assert terminal['files_unchanged'] == unchanged, terminal
+    assert terminal['symlinks_created'] == terminal['specials_created'] == 0, terminal
+    changes = [r for r in records if r['type'] == 'trace' and r['action'] == 'transfer_file' and 'bytes' in r]
+    assert len(changes) == changed, records
+    return changes
+
+
 def interrupted(args, threshold=5*1024*1024):
-    command=[SYQ,'cp','--no-progress','--progress-json','--performance-tuning=s3-part-size=5M,s3-max-concurrent-parts-per-object=1,s3-retries=1','--resource-limits=bandwidth=1MiB']
+    reader, writer = os.pipe()
+    command=[SYQ,'cp','--no-progress','--results-fd',str(writer),'--performance-tuning=s3-part-size=5M,s3-max-concurrent-parts-per-object=1,s3-retries=1','--resource-limits=bandwidth=1MiB']
     for name,value in HEADERS.items(): command+=['--s3-header',name+': '+value]
-    process=subprocess.Popen(command+list(map(str,args)),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,start_new_session=True)
+    process=subprocess.Popen(command+list(map(str,args)),stdout=subprocess.DEVNULL,stderr=None,pass_fds=(writer,),start_new_session=True)
+    os.close(writer)
     deadline=time.monotonic()+60
     observed=0
-    selector=selectors.DefaultSelector();selector.register(process.stderr,selectors.EVENT_READ)
+    selector=selectors.DefaultSelector();selector.register(reader,selectors.EVENT_READ)
     pending=b''
     try:
         while observed<threshold and time.monotonic()<deadline:
             for _,_ in selector.select(timeout=1):
-                block=os.read(process.stderr.fileno(),65536)
+                block=os.read(reader,65536)
                 if not block: raise AssertionError('copy exited before interruption point')
                 pending+=block
                 while b'\n' in pending:
                     line,pending=pending.split(b'\n',1)
                     try: event=json.loads(line)
-                    except ValueError: continue
-                    observed=max(observed,event.get('bytes_done',0))
+                    except ValueError: raise AssertionError(f'invalid results record: {line!r}')
+                    if event['type'] == 'progress':
+                        observed=max(observed,event['bytes_done'])
             if process.poll() is not None: raise AssertionError('copy exited before interruption point')
         assert observed>=threshold, f'interruption deadline expired; last progress {observed}'
         os.killpg(process.pid,signal.SIGINT)
@@ -139,7 +155,7 @@ def interrupted(args, threshold=5*1024*1024):
         selector.close()
         if process.poll() is None:
             os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=15)
-        process.stderr.close()
+        os.close(reader)
         try: os.killpg(process.pid,0)
         except ProcessLookupError: pass
         else: raise AssertionError('copy process group survived interruption')
@@ -176,7 +192,8 @@ def check():
                 assert actual.read_bytes() == path.read_bytes(), path.name
                 assert actual.stat().st_mode & 0o7777 == path.stat().st_mode & 0o7777
                 assert actual.stat().st_mtime_ns == path.stat().st_mtime_ns
-        run(['--from', remote, placement + '/source', '--into', dst, '--verify-only'])
+        run(['--from', remote, placement + '/source', '--into', dst, '--dry-run', '--hash', '--results', root / 'matching.ndjson'])
+        assert_comparison(root / 'matching.ndjson', changed=0, unchanged=4)
         owned = root / 'owned'
         owned.mkdir()
         run(['--from', remote, placement + '/source', '--as', owned, '--preserve=ownership'])
@@ -193,7 +210,10 @@ def check():
         assert (restored / 'script').read_bytes() == b'local edits'
         run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--only-new'])
         assert (restored / 'script').read_bytes() == b'local edits'
-        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--verify-only'], ok=False)
+        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--dry-run', '--hash', '--results', root / 'different.ndjson'])
+        changes = assert_comparison(root / 'different.ndjson', changed=1, unchanged=0)
+        assert changes[0]['dst']['value'] == 'script', changes
+        assert (restored / 'script').read_bytes() == b'local edits'
         run(['--from', remote, placement + '/source/script', '--as-new', restored / 'script'], ok=False)
         run(['--from', remote, placement + '/source/script', '--as', root / 'absent', '--only-existing'])
         assert not (root / 'absent').exists()
@@ -218,17 +238,22 @@ def check():
         # Only explicitly selected mappings are copied, including empty directories.
         mapping = root / 'mapping.jsonl'
         script_md5 = hashlib.md5((src / 'script').read_bytes()).hexdigest()
-        entries = [{'src': {'encoding': 'utf-8', 'value': 'script'}, 'dst': {'encoding': 'utf-8', 'value': 'renamed'}, 'kind': 'file', 'expected_digest': {'algorithm': 'md5', 'value': script_md5}}]
+        entries = [{'src': {'encoding': 'utf-8', 'value': 'script'}, 'dst': {'encoding': 'utf-8', 'value': 'renamed'}, 'kind': 'file', 'expected_hash': {'algorithm': 'md5', 'value': script_md5}}]
         mapping.write_text(''.join(json.dumps(e) + '\n' for e in entries))
         run(['-C', src, '--mapping', mapping, '--to', remote, '--into', PREFIX + '/mapping'])
         _, body = request('GET', PREFIX + '/mapping/renamed')
         assert body == (src / 'script').read_bytes()
-        run(['--from', remote, PREFIX + '/mapping/renamed', '--as', root / 'expected',
-             '--expected-hash', 'md5:' + script_md5, '--integrity-checking=transfer=blake3'])
+        entry = {'src': {'encoding': 'utf-8', 'value': PREFIX + '/mapping/renamed'},
+                 'dst': {'encoding': 'utf-8', 'value': 'expected'}, 'kind': 'file',
+                 'expected_hash': {'algorithm': 'md5', 'value': script_md5}}
+        mapping.write_text(json.dumps(entry) + '\n')
+        run(['--from', remote, '--mapping', mapping, '--into', root,
+             '--integrity-checking=transfer=blake3'])
         assert (root / 'expected').read_bytes() == body
         (root / 'expected').write_bytes(b'keep on mismatch')
-        run(['--from', remote, PREFIX + '/mapping/renamed', '--as', root / 'expected',
-             '--expected-hash', 'md5:' + '0' * 32], ok=False)
+        entry['expected_hash']['value'] = '0' * 32
+        mapping.write_text(json.dumps(entry) + '\n')
+        run(['--from', remote, '--mapping', mapping, '--into', root], ok=False)
         assert (root / 'expected').read_bytes() == b'keep on mismatch'
         # Directory entries in a mapping are explicit, not recursive selectors.
         manifest = root / 'tree-map.jsonl'

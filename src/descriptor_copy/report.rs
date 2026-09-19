@@ -73,7 +73,6 @@ impl Report {
             && !report.dry_run
             && !report.only_new
             && !report.only_existing
-            && !plan.size_filter.active()
             && !args.update
             && !args.times
             && !args.perms

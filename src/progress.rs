@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 pub struct Progress {
     pub(crate) observations: crate::transfer_observations::Observations,
     pub enabled: bool,
-    pub json: bool,
     pub width: Option<usize>,
     /// Removal mode: header counts entries instead of bytes.
     pub rm: bool,
@@ -23,7 +22,13 @@ pub struct Progress {
     tuning_high_water: AtomicU64,
     pub bytes_unchanged: AtomicU64,
     pub files_total: AtomicU64,
+    // Confirmed completion for display/results. Tuned transfers normally use
+    // add_files; fast batches confirm directly after earlier acknowledgment credit.
     pub files_done: AtomicU64,
+    // Acknowledged batch files plus ordinary completed files. Provisional
+    // acknowledgments are rolled back on failure, independently of files_done.
+    tuning_files: AtomicU64,
+    tuning_files_high_water: AtomicU64,
     pub files_unchanged: AtomicU64,
     /// Source files deliberately not transferred (-u, size limits, --existing,
     /// symlinks without -l, ...); neither "transferred" nor "unchanged".
@@ -71,7 +76,6 @@ impl Drop for CopyingInterval<'_> {
 
 struct TermState {
     samples: VecDeque<(Instant, u64)>,
-    last_json: Option<Instant>,
     last_results: Option<Instant>,
     last_observation: Option<Instant>,
     observation: Option<crate::transfer_observations::Interval>,
@@ -107,11 +111,10 @@ impl Drop for ProgressTicker {
 }
 
 impl Progress {
-    pub fn new(enabled: bool, force: bool, width: Option<usize>, json: bool) -> Arc<Self> {
+    pub fn new(enabled: bool, force: bool, width: Option<usize>) -> Arc<Self> {
         Arc::new(Progress {
             observations: Default::default(),
-            enabled: enabled && !json && (force || std::io::stderr().is_terminal()),
-            json,
+            enabled: enabled && (force || std::io::stderr().is_terminal()),
             width,
             rm: false,
             stream: false,
@@ -121,6 +124,8 @@ impl Progress {
             bytes_unchanged: AtomicU64::new(0),
             files_total: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
+            tuning_files: AtomicU64::new(0),
+            tuning_files_high_water: AtomicU64::new(0),
             files_unchanged: AtomicU64::new(0),
             files_excluded: AtomicU64::new(0),
             paths_ignored: AtomicU64::new(0),
@@ -139,7 +144,6 @@ impl Progress {
             copy_last_ns: AtomicU64::new(0),
             term: Mutex::new(TermState {
                 samples: VecDeque::from([(Instant::now(), 0)]),
-                last_json: None,
                 last_results: None,
                 last_observation: None,
                 observation: None,
@@ -177,6 +181,24 @@ impl Progress {
         self.tuning_high_water.fetch_max(done, Relaxed);
     }
 
+    /// Complete ordinary file work that has not already received batch credit.
+    pub fn add_files(&self, n: u64) {
+        self.files_done.fetch_add(n, Relaxed);
+        self.add_tuning_files(n);
+    }
+
+    /// Give the tuner timely file activity without claiming source validation
+    /// has finished. Like bytes, retried files must catch up to the previous
+    /// high-water mark before they count as fresh throughput.
+    pub fn add_tuning_files(&self, n: u64) {
+        let done = self.tuning_files.fetch_add(n, Relaxed).saturating_add(n);
+        self.tuning_files_high_water.fetch_max(done, Relaxed);
+    }
+
+    pub fn undo_tuning_files(&self, n: u64) {
+        self.tuning_files.fetch_sub(n, Relaxed);
+    }
+
     /// Print a line to stdout, keeping the progress area intact.
     pub fn println(&self, line: &str) {
         crate::output::emit_human_stdout(format_args!("{line}"));
@@ -204,20 +226,8 @@ impl Progress {
         }
     }
 
-    pub fn warning(&self, code: &str, count: u64, message: &str) {
-        if self.json {
-            crate::output::emit_json_stderr(format_args!(
-                "{}",
-                serde_json::json!({
-                    "type": "warning",
-                    "code": code,
-                    "count": count,
-                    "message": message,
-                })
-            ));
-        } else {
-            crate::output::diagnostic!("syq: warning: {message}");
-        }
+    pub fn warning(&self, message: &str) {
+        crate::output::diagnostic!("syq: warning: {message}");
     }
 
     fn rate(&self, t: &mut TermState, now: Instant, done: u64) -> f64 {
@@ -294,26 +304,10 @@ impl Progress {
                     scanned: self.scanned.load(Relaxed),
                     scan_done,
                     elapsed_ms: self.start.elapsed().as_millis() as u64,
+                    rate_bytes_per_second: rate.round() as u64,
+                    eta_ms: eta.map(|seconds| (seconds * 1000.0).round() as u64),
                     activity: t.observation.as_ref(),
                 });
-            }
-        }
-        if self.json && (status.is_none() || self.stream) {
-            let now = Instant::now();
-            if (self.stream && status.is_some())
-                || t.last_json
-                    .is_none_or(|l| now - l >= Duration::from_secs(1))
-            {
-                t.last_json = Some(now);
-                crate::output::emit_json_stderr(format_args!(
-                    "{{\"bytes_done\":{done},\"bytes_total\":{total},\"bytes_unchanged\":{skipped},\"files_done\":{fdone},\"files_total\":{ftotal},\"files_unchanged\":{},\"files_excluded\":{},\"scanned\":{},\"scan_done\":{scan_done},\"rate\":{:.0},\"eta\":{},\"elapsed\":{:.1}}}",
-                    self.files_unchanged.load(Relaxed),
-                    self.files_excluded.load(Relaxed),
-                    self.scanned.load(Relaxed),
-                    rate,
-                    eta.map_or("null".to_string(), |e| format!("{e:.0}")),
-                    self.start.elapsed().as_secs_f64()
-                ));
             }
         }
         if !self.enabled {
@@ -397,7 +391,7 @@ impl Progress {
         if self.enabled {
             crate::output::finish_progress();
         }
-        if !self.json && self.observations.human_summary.load(Relaxed) {
+        if self.observations.human_summary.load(Relaxed) {
             if let Some(observation) = &self.term.lock().unwrap().observation {
                 crate::output::diagnostic!("{}", observation.summary());
             }
@@ -413,10 +407,7 @@ impl Progress {
     pub fn spawn_ticker(self: &Arc<Self>) -> Option<ProgressTicker> {
         // A results stream needs the ticker too: sampled progress records
         // are emitted from render() even when stderr is not a terminal.
-        if !self.enabled
-            && !self.json
-            && self.results.get().is_none()
-            && !self.observations.enabled.load(Relaxed)
+        if !self.enabled && self.results.get().is_none() && !self.observations.enabled.load(Relaxed)
         {
             return None;
         }
@@ -542,7 +533,7 @@ impl crate::tune::Meter for Progress {
         self.tuning_high_water.load(Relaxed)
     }
     fn files(&self) -> u64 {
-        self.files_done.load(Relaxed)
+        self.tuning_files_high_water.load(Relaxed)
     }
     fn set_active(&self, n: usize) {
         self.active_workers.store(n as u64, Relaxed);
@@ -551,21 +542,22 @@ impl crate::tune::Meter for Progress {
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone, Default)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn results_do_not_enable_collection_and_only_copies_emit_a_final_sample() {
-        #[derive(Clone, Default)]
-        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         for removal in [false, true] {
-            let mut progress = super::Progress::new(false, false, None, false);
+            let mut progress = super::Progress::new(false, false, None);
             std::sync::Arc::get_mut(&mut progress).unwrap().rm = removal;
             let sink = Sink::default();
             progress.set_results(std::sync::Arc::new(crate::results::ResultsWriter::new(
@@ -588,8 +580,39 @@ mod tests {
     }
 
     #[test]
+    fn results_estimates_cover_scanning_completion_and_rollback() {
+        let progress = Progress::new(false, false, None);
+        let sink = Sink::default();
+        progress.set_results(Arc::new(crate::results::ResultsWriter::new(Box::new(
+            sink.clone(),
+        ))));
+        progress.bytes_total.store(4000, Relaxed);
+        progress.bytes_done.store(2000, Relaxed);
+        progress.term.lock().unwrap().samples =
+            VecDeque::from([(Instant::now() - Duration::from_secs(10), 0)]);
+        let sample = || {
+            sink.0.lock().unwrap().clear();
+            progress.term.lock().unwrap().last_results = None;
+            progress.render();
+            serde_json::from_slice::<serde_json::Value>(&sink.0.lock().unwrap()).unwrap()
+        };
+        let scanning = sample();
+        assert!((190..=210).contains(&scanning["rate_bytes_per_second"].as_u64().unwrap()));
+        assert!(scanning.get("eta_ms").is_none());
+        progress.scan_done.store(true, Relaxed);
+        let copying = sample();
+        assert!((9500..=11000).contains(&copying["eta_ms"].as_u64().unwrap()));
+        progress.bytes_done.store(4000, Relaxed);
+        assert_eq!(sample()["eta_ms"], 0);
+        progress.bytes_done.store(1000, Relaxed);
+        let rollback = sample();
+        assert_eq!(rollback["rate_bytes_per_second"], 0);
+        assert!(rollback.get("eta_ms").is_none());
+    }
+
+    #[test]
     fn finishing_wakes_a_parked_ticker() {
-        let progress = super::Progress::new(false, false, None, false);
+        let progress = super::Progress::new(false, false, None);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             ready_tx.send(()).unwrap();
@@ -616,7 +639,7 @@ mod tests {
 
     #[test]
     fn copying_interval_excludes_initial_setup_and_counts_overlap_once() {
-        let mut progress = Progress::new(false, false, None, false);
+        let mut progress = Progress::new(false, false, None);
         // Move the origin back without sleeping: setup must not enter the span.
         Arc::get_mut(&mut progress).unwrap().start = Instant::now() - Duration::from_secs(60);
         assert_eq!(progress.copying_elapsed_ms(), None);
@@ -640,7 +663,7 @@ mod tests {
 
     #[test]
     fn rollback_resets_display_rate_and_retries_do_not_inflate_tuning_progress() {
-        let progress = Progress::new(false, false, None, false);
+        let progress = Progress::new(false, false, None);
         progress.add_bytes(1_000);
         let mut term = progress.term.lock().unwrap();
         term.samples
@@ -659,7 +682,7 @@ mod tests {
 
     #[test]
     fn slow_blocks_keep_their_full_measurement_interval() {
-        let progress = Progress::new(false, false, None, false);
+        let progress = Progress::new(false, false, None);
         let mut term = progress.term.lock().unwrap();
         let start = Instant::now();
         term.samples = VecDeque::from([(start, 0)]);
@@ -751,7 +774,7 @@ mod tests {
 
     #[test]
     fn ticker_is_joined_when_an_error_leaves_its_scope() {
-        let progress = Progress::new(false, false, None, false);
+        let progress = Progress::new(false, false, None);
         let stopped = Arc::new(AtomicBool::new(false));
         let p = progress.clone();
         let done = stopped.clone();

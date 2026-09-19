@@ -1072,29 +1072,6 @@ fn hash_errors_do_not_desynchronize_worker_connections() {
         "{copy_stderr}"
     );
     assert_eq!(read(&t.path("dst/good")), vec![b'g'; 4096]);
-
-    // Verification has the same paired-request shape and must likewise keep
-    // processing the connection after the source-side error.
-    let verify = syq(&[
-        "-a",
-        "--syq-verify-only",
-        "-v",
-        "--performance-tuning",
-        "workers=1",
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
-    assert_eq!(verify.status.code(), Some(23));
-    let verify_stderr = String::from_utf8_lossy(&verify.stderr);
-    assert!(
-        !verify_stderr.contains("unexpected response"),
-        "{verify_stderr}"
-    );
-    assert!(
-        String::from_utf8_lossy(&verify.stdout).contains("ok      good"),
-        "{}",
-        String::from_utf8_lossy(&verify.stdout)
-    );
 }
 
 #[test]
@@ -2114,13 +2091,8 @@ fn native_remote_to_remote_carries_any_path_bytes_directly() {
 }
 
 #[test]
-fn native_direct_remote_forwards_verification_and_overwrite_policies() {
-    for policy in [
-        "--verify-only",
-        "--only-new",
-        "--only-existing",
-        "--skip-newer",
-    ] {
+fn native_direct_remote_forwards_overwrite_policies() {
+    for policy in ["--only-new", "--only-existing", "--skip-newer"] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
         let helper = cached_remote_helper(&t);
@@ -2153,12 +2125,7 @@ fn native_direct_remote_forwards_verification_and_overwrite_policies() {
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
             .run()
             .unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(if policy == "--verify-only" { 23 } else { 0 }),
-            "{policy}: {}",
-            stderr_of(&out)
-        );
+        assert_eq!(out.status.code(), Some(0), "{policy}: {}", stderr_of(&out));
         assert_eq!(
             read(&t.path("dst/file")),
             if policy == "--only-existing" {

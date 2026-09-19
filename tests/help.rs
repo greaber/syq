@@ -1,4 +1,7 @@
 //! Public help must be useful without invoking filesystem or update operations.
+#[path = "support/temp.rs"]
+mod test_support;
+
 use std::process::{Command, Output};
 
 fn run(args: &[&str]) -> Output {
@@ -151,7 +154,7 @@ fn lifecycle_and_root_help_describe_the_real_commands() {
 
 #[test]
 fn help_like_operands_are_data_and_rsync_h_remains_human_readable() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
     let dir = temp.path().canonicalize().unwrap();
     for name in ["--help", "--help-all", "-h"] {
         std::fs::write(dir.join(name), b"file data").unwrap();

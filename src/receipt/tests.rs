@@ -323,7 +323,7 @@ fn encrypted_stream_round_trips_and_binds_all_frames() {
     assert_eq!(records[0]["provenance"], "receiver_attested");
     assert_eq!(records[1]["type"], "final_state");
     assert_eq!(
-        records[1]["object"]["digest"]["value"],
+        records[1]["object"]["hash"]["value"],
         "0909090909090909090909090909090909090909090909090909090909090909"
     );
     assert_eq!(records[1]["object"]["metadata"]["mode"], 0o100644);

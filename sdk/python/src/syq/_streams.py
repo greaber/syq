@@ -49,12 +49,6 @@ def arguments(*, executable: str, writing: bool, path: PathArgument | None,
         if value is None or value is False:
             continue
         option = "--" + name.replace("_", "-")
-        if name == "expected_digest":
-            from .models import Digest
-            if not isinstance(value, Digest):
-                raise SyqInvocationError("expected_digest must be a Digest")
-            argv += ["--expected-hash", f"{value.algorithm}:{value.value}"]
-            continue
         if name == "verbose":
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255:
                 raise SyqInvocationError("verbose must be an integer from 0 to 255")
@@ -65,7 +59,7 @@ def arguments(*, executable: str, writing: bool, path: PathArgument | None,
                 _append_path_option(argv, option, _text_arg(header, label=name))
             continue
         if name in {"no_bootstrap", "no_compress", "no_tcp", "tcp_plain", "follow_src", "follow_dst",
-                    "stats", "quiet", "progress", "no_progress", "progress_json", "dry_run", "only_new", "only_existing"}:
+                    "stats", "quiet", "progress", "no_progress", "dry_run", "only_new", "only_existing"}:
             if not isinstance(value, bool):
                 raise SyqInvocationError(f"{name} must be a boolean")
             argv.append(option)

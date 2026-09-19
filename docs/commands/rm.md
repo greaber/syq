@@ -2,14 +2,14 @@
 
 Remove local files, remote filesystem entries, or S3 objects.
 See [Remove files](../remove.md) for selection rules and
-[S3 removal](../object-storage.md#versions-and-deletion) for versioned objects.
+[Versions and deletion](../object-storage.md#versions-and-deletion) for versioned objects.
 
 ```sh
 syq rm --src-dir old-output --dry-run -v
 ```
 
-For scripting, see [environment variables](../reference.md#environment-variables-and-local-files)
-and [removal results](../automation.md#removal-records).
+For scripting, see [environment variables](../environment.md)
+and [Removal records](../automation.md#removal-records).
 
 <!-- CLI: rm -->
 ```text
@@ -66,7 +66,6 @@ syq rm [OPTIONS] --srcs-in DIR
 |---|---|
 | `--progress` | Show progress even when stderr is not a terminal |
 | `--no-progress` | Never show the human progress display |
-| `--progress-json` | Emit machine-readable progress lines (JSON) on stderr |
 | `--results <FILE>` | Write the machine-readable NDJSON result stream to FILE (created fresh; an existing file is refused) |
 | `--results-fd <FD>` | Write the result stream to an inherited file descriptor the caller opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2 |
 
@@ -87,3 +86,11 @@ syq rm [OPTIONS] --srcs-in DIR
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
+
+## Selection rules
+
+Named paths, `--src`, and `--src-non-dir` require non-directories. Use
+`--src-dir` to require a directory and remove it recursively, or `--srcs-in`
+to remove its contents while keeping the directory. These directory selectors
+reject a final symlink even when following is enabled. All selections are
+checked before deletion begins. Filters are not supported.

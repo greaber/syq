@@ -1,6 +1,8 @@
 //! Shared helpers for unit tests.
 
-use std::path::PathBuf;
+#[path = "../tests/support/temp.rs"]
+mod temporary;
+pub(crate) use temporary::{temp_dir, tempdir};
 
 /// Run a unit test in a separate process whose stderr reader has gone away.
 /// Keep stdout available for the test harness and assertion diagnostics.
@@ -24,21 +26,6 @@ pub(crate) fn with_broken_stderr(name: &str) -> bool {
         String::from_utf8_lossy(&result.stdout)
     );
     false
-}
-
-/// The process temporary directory with symlinks resolved.
-///
-/// macOS places `TMPDIR` under `/var`, a symlink to `/private/var`. Native
-/// operator paths refuse symlink components by default, so tests that hand a
-/// temporary path to the product must start from its resolved form.
-pub(crate) fn temp_dir() -> PathBuf {
-    let path = std::env::temp_dir();
-    std::fs::canonicalize(&path).unwrap_or(path)
-}
-
-/// A fresh temporary directory beneath the resolved [`temp_dir`].
-pub(crate) fn tempdir() -> std::io::Result<tempfile::TempDir> {
-    tempfile::tempdir_in(temp_dir())
 }
 
 /// Whether the temporary filesystem accepts file names that are not valid

@@ -12,23 +12,6 @@ Installs into `~/.local/bin` without `sudo`. Make sure that directory is on your
 `PATH`. To choose another directory, download the script and run
 `sh install.sh --bin-dir DIR`.
 
-## Automatic installation on SSH servers
-
-When an official syq release installs its helper on an SSH server, it also
-tries to install the same version at `~/.local/bin/syq` for use on that server.
-Existing files and symlinks there are left alone; shell startup files are
-never edited. Syq reports installation or failure unless `--quiet` is set.
-Shell completion and background connections can also trigger installation,
-without printing a notice. Failure to install this command does not stop the
-transfer.
-
-Use `syq --self-update` on the server to update this command. To reinstall a
-removed command, run the standalone installer above on the server.
-
-Reusing a cached helper does not repeat this installation step. Development
-builds and connections using `--syq-path` or `--no-bootstrap` do not install
-the command.
-
 ## Homebrew
 
 ```sh
@@ -40,34 +23,21 @@ brew install greaber/tap/syq
 See [source builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for Cargo builds, custom compilation options,
 and choosing between your own executable and compatible official SSH helpers.
 
+## Automatic installation on SSH servers
+
+Syq installs its SSH helper on the server when needed. Official releases also
+try to make `syq` available at `~/.local/bin/syq` for commands you run there.
+Existing commands and shell startup files are left alone.
+
+Use `syq --self-update` on the server to update that command, or the standalone
+installer above if it is missing. See [SSH helper installation](environment.md#ssh-helper-installation)
+for custom helpers and installation exceptions.
+
 ## Try a benchmark
 
-Compare syq with rsync on your own machines, or with rsync and cp locally:
-
-```sh
-curl --proto '=https' --tlsv1.2 -fLsS https://raw.githubusercontent.com/greaber/syq/master/scripts/try-benchmark.sh | bash
-```
-
-Choose an SSH host to compare syq with rsync, or a local copy to include cp.
-The script creates test data, checks the copied contents, and cleans up afterward.
-If syq is missing, it offers to install it. See [quick comparison](speed.md#quick-comparison)
-for workload sizes, warm-up time, and command-line options.
-
-<figure class="benchmark-example">
-<table>
-<caption>Published example: Germany → US East Coast</caption>
-<thead><tr><th scope="col">Tool</th><th scope="col">Average speed</th></tr></thead>
-<tbody>
-<tr><th scope="row">syq</th><td>159.9 MB/s</td></tr>
-<tr><th scope="row">syq over SSH</th><td>88.3 MB/s</td></tr>
-<tr><th scope="row">rsync</th><td>18.3 MB/s</td></tr>
-</tbody>
-</table>
-<figcaption>One 1.07 GB file, held in memory at both ends; three runs per tool.
-From the separate <a href="https://greaber.github.io/syq-bench/all-results.html#public-wan-forward">syq-bench project</a>,
-measured on September 13, 2026 (<a href="https://greaber.github.io/syq-bench/data/release-060-public-wan-forward.json">raw results</a>).
-Your results will depend on your machines and connection.</figcaption>
-</figure>
+Compare syq with rsync on your own machines, or with rsync and cp locally.
+See [Quick comparison](speed.md#quick-comparison) for the script and how to
+read its results.
 
 ## Updates
 
@@ -79,20 +49,20 @@ at most once a day after a successful command, naming the upgrade command for
 that install. Nothing updates automatically. Set `SYQ_NO_UPDATE_CHECK=1` or
 `DO_NOT_TRACK=1` to disable reminders.
 
+### Update-check data
+
 Downloads and the daily reminder check go through `dl.syq.christmas`, a host
 run by the maintainer that serves the GitHub release files from a cache. It
 records each request's time, syq version, platform, the connection's IP
 address, and the country, region, and city derived from that address, so the
 project can see how many installs exist and which versions are in use.
 Nothing identifies an install, and the check sends nothing else.
-Non-interactive use never makes the reminder check. Every download is
-verified against the signed release manifest, so the host cannot substitute
-files.
+Non-interactive use never makes the reminder check. An installed official syq
+verifies self-updates and helper downloads against a signed release manifest.
+See [Downloaded executables](security.md#downloaded-executables) for how that
+verification works and how trust is established during the first installation.
 
 ## Shell completion
-
-See the [completion command reference](commands/completion.md) for every command
-and cache-management option.
 
 Add the line for your shell to its startup file:
 
@@ -110,19 +80,9 @@ syq completion fish | source
 Completion suggests options, hosts, and paths, with file details beside path
 matches. In Bash, press Tab again to list matches. Remote paths use your usual
 SSH login. Open a new shell after adding the setup line or upgrading syq.
+See [`syq completion`](commands/completion.md) for all options.
 
 ## Keep connections open
 
-Keep an SSH connection ready for repeated copies:
-
-```sh
-syq persist connect server
-```
-
-This enables persistence and connects without copying files. It also lets you
-[send files back from the server](receive.md), with approval on your machine.
-Connections stay open until you close them with `syq persist off`.
-Use `syq persist status` to see them.
-
-See [connection lifetime](persistence-reference.md#connection-lifetime-and-waits) for reconnecting,
-turning receiving off, and using persistence in scripts.
+Use [persistence](persistence.md) to reuse SSH connections across syq commands
+and make your laptop available to connected servers.

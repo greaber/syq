@@ -66,7 +66,7 @@ struct Download {
     key: String,
     path: String,
     size: u64,
-    expected_digest: Option<Digest>,
+    expected_hash: Option<Digest>,
     copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -172,11 +172,6 @@ impl Engine {
             let (plan, prune) =
                 tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
             super::diagnostics::elapsed(scanning, "source_plan", plan.len() as u64);
-            if self.args.expected_digest.is_some()
-                && (plan.len() != 1 || plan[0].kind() != ObjectKind::File)
-            {
-                bail!("an expected digest requires exactly one regular file");
-            }
             self.check_upload_placement(plan.first().map(|s| s.kind() != ObjectKind::Dir))
                 .await?;
             self.discover_destination(plan.iter().map(|s| s.key.as_str()).collect())
@@ -198,11 +193,7 @@ impl Engine {
                     let label = source.label.clone();
                     let kind = source.kind();
                     engine.check_cancelled()?;
-                    let expected = source
-                        .expected_digest
-                        .as_ref()
-                        .or(engine.args.expected_digest.as_ref())
-                        .cloned();
+                    let expected = source.expected_hash.as_ref().cloned();
                     let result = engine.upload(source).await;
                     engine.settle(&label, &key, kind, &result, expected.as_ref());
                     Ok(result.ok().flatten())
@@ -214,9 +205,6 @@ impl Engine {
             let destination = Arc::new(Destination::open(&self.args)?);
             let (plan, prune) = self.download_plan(&destination.prefix).await?;
             let workers = self.object_workers(plan.iter().map(|s| s.size))?;
-            if self.args.expected_digest.is_some() && plan.len() != 1 {
-                bail!("an expected digest requires exactly one regular file");
-            }
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress
                 .bytes_total
@@ -237,9 +225,7 @@ impl Engine {
                         &job.path,
                         job.kind,
                         &result,
-                        job.expected_digest
-                            .as_ref()
-                            .or(engine.args.expected_digest.as_ref()),
+                        job.expected_hash.as_ref(),
                     );
                     Ok(result.ok().flatten())
                 }
@@ -258,7 +244,7 @@ impl Engine {
         destination: &Destination,
         directories: &DirectoryMetadata,
     ) -> Result<()> {
-        if !self.args.dry_run && !self.args.verify_only {
+        if !self.args.dry_run {
             let mut directories = directories.lock().await;
             directories.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
             for (path, meta, mode) in directories.iter() {
@@ -496,11 +482,7 @@ impl Engine {
     }
 
     async fn upload(self: &Arc<Self>, source: Source) -> Result<Option<u64>> {
-        let expected_digest = source
-            .expected_digest
-            .as_ref()
-            .or(self.args.expected_digest.as_ref())
-            .filter(|_| !self.args.dry_run);
+        let expected_hash = source.expected_hash.as_ref().filter(|_| !self.args.dry_run);
         let existing = if self
             .upload_keys
             .get()
@@ -528,10 +510,10 @@ impl Engine {
         } else {
             source.meta.len
         };
-        let whole_algorithm = expected_digest.map(|d| d.algorithm).or_else(|| {
+        let whole_algorithm = expected_hash.map(|d| d.algorithm).or_else(|| {
             if self.args.transfer_integrity {
                 Some(self.args.transfer_hash_type.unwrap_or_default())
-            } else if self.args.checksum || self.args.verify_only {
+            } else if self.args.checksum {
                 Some(self.args.hash_algorithm)
             } else {
                 None
@@ -695,12 +677,12 @@ impl Engine {
             Ok((whole, checksums, None))
         })
         .await??;
-        if let Some(expected) = expected_digest {
+        if let Some(expected) = expected_hash {
             if !whole_digest
                 .as_ref()
                 .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected.value))
             {
-                bail!("source does not match expected digest");
+                bail!("source does not match expected hash");
             }
         }
         let mut metadata = source.metadata(whole_digest.clone());
@@ -714,7 +696,7 @@ impl Engine {
                         || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm)
                 })
         });
-        let comparison_digest = if self.args.checksum || self.args.verify_only {
+        let comparison_digest = if self.args.checksum {
             if whole_algorithm == Some(self.args.hash_algorithm) {
                 whole_digest.clone()
             } else {
@@ -739,20 +721,10 @@ impl Engine {
                         == *comparison_digest.as_ref().unwrap();
             }
         }
-        if self.args.verify_only {
-            let object = existing.context("verification failed: destination object is missing")?;
-            self.verify_upload(
-                &source,
-                &object,
-                comparison_digest.as_deref().unwrap(),
-                self.args.hash_algorithm,
-            )
-            .await?;
-            return Ok(None);
-        }
-        if unchanged && expected_digest.is_some() {
+
+        if unchanged && expected_hash.is_some() {
             unchanged = self
-                .verify_expected_remote(existing.as_ref().unwrap(), expected_digest)
+                .verify_expected_remote(existing.as_ref().unwrap(), expected_hash)
                 .await
                 .is_ok();
         }
@@ -1095,44 +1067,7 @@ impl Engine {
         }
         Ok(Some(size))
     }
-    async fn verify_upload(
-        &self,
-        source: &Source,
-        object: &Object,
-        digest: &str,
-        algorithm: HashAlgorithm,
-    ) -> Result<()> {
-        let _slot = self.tuning.requests.acquire().await;
-        if object.kind() != source.kind()
-            || object.size != source.meta.len && source.kind() != ObjectKind::Dir
-        {
-            bail!("verification failed: object type or size differs");
-        }
-        let output = self
-            .client
-            .get_object()
-            .bucket(&self.options.bucket)
-            .key(&object.key)
-            .if_match(&object.etag)
-            .set_version_id(object.version.clone())
-            .send()
-            .await
-            .map_err(|e| e.into_service_error())?;
-        let mut reader = output.body.into_async_read();
-        let mut hasher = algorithm.hasher();
-        let mut buffer = vec![0; 1024 * 1024];
-        loop {
-            let n = reader.read(&mut buffer).await?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buffer[..n]);
-        }
-        if Digest::from_hash(algorithm, &hasher.finalize()).value != digest {
-            bail!("verification failed: contents differ");
-        }
-        Ok(())
-    }
+
     async fn download_plan(
         &self,
         destination_prefix: &str,
@@ -1178,7 +1113,7 @@ impl Engine {
                         _ => SourceSelection::Named,
                     },
                     entry.kind.map(|kind| kind.label()),
-                    entry.expected_digest,
+                    entry.expected_hash,
                 ));
             }
         } else {
@@ -1199,7 +1134,7 @@ impl Engine {
             }
         }
         if self.options.route.is_server_copy() && selectors.iter().any(|s| s.4.is_some()) {
-            bail!("S3-to-S3 copies stay server-side; mapping expected digests require reading object contents and are not supported");
+            bail!("S3-to-S3 copies stay server-side; mapping expected hashes require reading object contents and are not supported");
         }
         let matcher = crate::scan::build_ignore(&self.args.ignore_lines)?;
         let min = self
@@ -1245,8 +1180,7 @@ impl Engine {
             })
             .buffered(32);
         while let Some(selector) = selectors.next().await {
-            let ((key, path, selection, declared_kind, expected_digest), mut copy_source) =
-                selector?;
+            let ((key, path, selection, declared_kind, expected_hash), mut copy_source) = selector?;
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
                 selection,
@@ -1314,8 +1248,8 @@ impl Engine {
                 {
                     bail!("S3 source type does not match mapping");
                 }
-                if expected_digest.is_some() && object.kind() != ObjectKind::File {
-                    bail!("an expected digest requires a regular file");
+                if expected_hash.is_some() && object.kind() != ObjectKind::File {
+                    bail!("an expected hash requires a regular file");
                 }
                 let kind = object.kind();
                 let directory = client::is_directory_marker(&object.key, object.size);
@@ -1438,7 +1372,7 @@ impl Engine {
                     key,
                     path,
                     size,
-                    expected_digest: expected_digest.clone(),
+                    expected_hash: expected_hash.clone(),
                     copy_source: copy_source.take().map(Box::new),
                 });
             }
@@ -1455,12 +1389,9 @@ impl Engine {
         directories: DirectoryMetadata,
     ) -> Result<Option<u64>> {
         let part_size = self.part_size(job.size);
-        let expected_digest = job
-            .expected_digest
-            .as_ref()
-            .or(self.args.expected_digest.as_ref());
-        let requires_regular_file = expected_digest.is_some();
-        let expected_digest = expected_digest.filter(|_| !self.args.dry_run);
+        let expected_hash = job.expected_hash.as_ref();
+        let requires_regular_file = expected_hash.is_some();
+        let expected_hash = expected_hash.filter(|_| !self.args.dry_run);
         let root = &destination.root;
         let path = RelativePath::new(job.path.as_bytes())?;
         let existing = match root.metadata_optional(&path) {
@@ -1485,11 +1416,7 @@ impl Engine {
         // other ranges; the first body is consumed alongside them.
         // Existing files still use HEAD so an unchanged object is not fetched.
         let mut initial_slot = None;
-        let initial = if existing.is_none()
-            && !self.args.dry_run
-            && !self.args.verify_only
-            && !job.key.ends_with('/')
-        {
+        let initial = if existing.is_none() && !self.args.dry_run && !job.key.ends_with('/') {
             initial_slot = Some(self.tuning.requests.acquire().await);
             Some(
                 self.client
@@ -1537,15 +1464,9 @@ impl Engine {
             }
         }
         if requires_regular_file && object.kind() != ObjectKind::File {
-            bail!("an expected digest requires a regular file");
+            bail!("an expected hash requires a regular file");
         }
         if object.kind() == ObjectKind::Dir {
-            if self.args.verify_only {
-                if existing.is_none() {
-                    bail!("verification failed: directory is missing");
-                }
-                return Ok(None);
-            }
             if !self.args.dry_run {
                 if existing.is_none() {
                     root.create_missing_parents(&path, 0o777)?;
@@ -1582,12 +1503,7 @@ impl Engine {
                 }
             }
             let same = existing.is_some_and(|m| m.is_symlink()) && root.read_link(&path)? == bytes;
-            if self.args.verify_only {
-                if !same {
-                    bail!("verification failed: symlink differs");
-                }
-                return Ok(None);
-            }
+
             if !self.args.dry_run {
                 root.create_missing_parents(&path, 0o777)?;
                 if !same {
@@ -1608,11 +1524,8 @@ impl Engine {
         }
         let mut unchanged = false;
         if let Some(m) = existing.filter(|m| m.is_file() && m.len == object.size) {
-            if self.args.verify_only || self.args.checksum {
-                if self.args.verify_only
-                    || metadata.hash.is_none()
-                    || metadata.hash_algorithm != self.args.hash_algorithm
-                {
+            if self.args.checksum {
+                if metadata.hash.is_none() || metadata.hash_algorithm != self.args.hash_algorithm {
                     unchanged = self.verify_download(root, &path, &object).await?;
                 } else {
                     let file = root.open_regular_read(&path)?;
@@ -1626,20 +1539,10 @@ impl Engine {
                 unchanged = m.mtime == metadata.mtime && m.mtime_nsec == metadata.nsec;
             }
         }
-        if self.args.verify_only {
-            if !unchanged {
-                if existing.is_some_and(|m| m.is_file() && m.len == object.size) {
-                    bail!("verification failed: contents differ");
-                }
-                bail!("verification failed: file missing, type differs, or size differs");
-            }
-            self.verify_expected_local(root, &path, expected_digest)
-                .await?;
-            return Ok(None);
-        }
-        if unchanged && expected_digest.is_some() {
+
+        if unchanged && expected_hash.is_some() {
             unchanged = self
-                .verify_expected_local(root, &path, expected_digest)
+                .verify_expected_local(root, &path, expected_hash)
                 .await
                 .is_ok();
         }
@@ -1669,7 +1572,7 @@ impl Engine {
                     &object,
                     root,
                     &path,
-                    (&metadata, expected_digest),
+                    (&metadata, expected_hash),
                     existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
                     initial,
                     initial_slot,
@@ -1723,7 +1626,7 @@ impl Engine {
             file.clone(),
             object.size,
             !part_size.is_multiple_of(4096)
-                || !self.download_digests(&metadata, expected_digest).is_empty(),
+                || !self.download_digests(&metadata, expected_hash).is_empty(),
         )?;
         let parts = object.size.div_ceil(part_size);
         let _interval = self.progress.copying_interval();
@@ -1790,7 +1693,7 @@ impl Engine {
         flushed?;
         let partial = record.lock().await.partial.clone();
         let partial_path = RelativePath::new(partial.as_bytes())?;
-        for expected in self.download_digests(&metadata, expected_digest) {
+        for expected in self.download_digests(&metadata, expected_hash) {
             let f = root.open_regular_read(&partial_path)?;
             tokio::task::spawn_blocking(move || expected.verify_reader(&mut &f)).await??;
         }
@@ -1854,11 +1757,11 @@ impl Engine {
     ) -> Result<()> {
         if let Some(expected) = expected {
             if object.kind() != ObjectKind::File {
-                bail!("an expected digest requires a regular file");
+                bail!("an expected hash requires a regular file");
             }
             let actual = self.remote_hash_as(object, expected.algorithm).await?;
             if actual != expected.value {
-                bail!("remote object does not match expected digest");
+                bail!("remote object does not match expected hash");
             }
         }
         Ok(())
@@ -1874,7 +1777,7 @@ impl Engine {
         initial: Option<ByteStream>,
         initial_slot: Option<super::tuning::Permit>,
     ) -> Result<Option<u64>> {
-        let (metadata, expected_digest) = validation;
+        let (metadata, expected_hash) = validation;
         let path_buf = path.to_path_buf();
         let label = path_buf
             .to_str()
@@ -1892,7 +1795,7 @@ impl Engine {
             identity: (file.metadata()?.dev(), file.metadata()?.ino()),
         };
         let result = async {
-            let digests = self.download_digests(metadata, expected_digest);
+            let digests = self.download_digests(metadata, expected_hash);
             let algorithm = digests.first().map(|d| d.algorithm);
             let output =
                 super::writer::Writer::with_readback(file.clone(), object.size, digests.len() > 1)?;

@@ -41,31 +41,24 @@ use worker::*;
 
 const MAX_ATTEMPTS: u32 = 3;
 pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
-const FAST_BATCH_FILES: usize = 128;
-// Larger batches trade filesystem overlap for fewer request/ack turns. On the
-// measured 262 ms path, 4,096 one-byte files at eight workers improved from a
-// 9.68 s to an 8.72 s median at 512. Direct TCP exposes its RTT; remote SSH
-// does not, but needs the same amortization and remains bounded by bytes below.
-const HIGH_RTT_FAST_BATCH_FILES: usize = 512;
-const HIGH_RTT_US: u64 = 100_000;
-const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
+// Amortize metadata requests across enough files to keep their shared pool
+// busy. The scheduler still divides queued files fairly among active workers,
+// and the byte limit bounds each batch independently of this ceiling.
+const FAST_BATCH_FILES: usize = 2048;
+// Keep the startup worker budget independent of the larger batch ceiling.
+// Larger batches must not leave small trees with fewer transfer workers.
+const STARTUP_BATCH_FILES: usize = 128;
+// Source requests carry both display paths and registered references. Leave
+// room for framing within the metadata protocol's 8 MiB limit, even when a
+// large batch contains long paths rather than substantial file data.
+const SOURCE_BATCH_PATH_BYTES: usize = 4 << 20;
 
-fn fast_batch_file_limit(
-    src_rtt_us: Option<u64>,
-    dst_rtt_us: Option<u64>,
-    remote_ssh_data: bool,
-) -> usize {
-    if remote_ssh_data
-        || src_rtt_us
-            .into_iter()
-            .chain(dst_rtt_us)
-            .any(|rtt| rtt >= HIGH_RTT_US)
-    {
-        HIGH_RTT_FAST_BATCH_FILES
-    } else {
-        FAST_BATCH_FILES
-    }
+fn source_request_bytes(path: &[u8], source: Option<&RegisteredPath>) -> usize {
+    path.len()
+        .saturating_add(source.map_or(0, |source| source.relative().len()))
+        .saturating_add(64)
 }
+const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
 
 // Bound a window of small-file groups independently of the logical batch.
 const FAST_BATCH_READ_BYTES: u64 = 4 << 20;
@@ -123,8 +116,7 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
 
 pub struct Opts {
     pub hash_policy: crate::hashing::HashPolicy,
-    pub expected_digest: Option<crate::hashing::Digest>,
-    pub mapping_expected_digests: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
+    pub mapping_expected_hashes: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
@@ -137,7 +129,6 @@ pub struct Opts {
     pub devices: bool,
     pub checksum: bool,
     pub precise_mtime: bool,
-    pub verify_only: bool,
     pub inplace: bool,
     pub same_host: bool,
     /// Automatic copies and explicit -j1 may use one direct userspace writer
@@ -146,6 +137,7 @@ pub struct Opts {
     pub dst_remote: bool,
     pub restricted_receiver: bool,
     pub dry_run: bool,
+    dry_run_metadata_files: AtomicU64,
     pub quiet: bool,
     pub verbose: u8,
     pub umask: u32,
@@ -176,6 +168,13 @@ pub struct Opts {
 impl Opts {
     fn metadata_fix_flags(&self, source: &Entry, destination: &Entry) -> u8 {
         let mut changes = 0;
+        if self.flags & flags::TIMES != 0
+            && (source.mtime != destination.mtime
+                || (self.precise_mtime
+                    && !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)))
+        {
+            changes |= flags::TIMES;
+        }
         if self.flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777 {
             changes |= flags::MODE;
         }
@@ -198,9 +197,7 @@ impl Opts {
     }
 
     fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
-        self.mapping_expected_digests
-            .get(path)
-            .or(self.expected_digest.as_ref())
+        self.mapping_expected_hashes.get(path)
     }
     fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
         crate::copy_policy::CopyPolicy {
@@ -211,7 +208,6 @@ impl Opts {
             bandwidth_limited,
             receiver_copy_disabled: !cfg!(any(target_os = "linux", target_os = "macos"))
                 || !self.local_copy_fd_budget
-                || self.verify_only
                 || self.dry_run
                 || self.restricted_receiver
                 || (cfg!(target_os = "macos") && self.inplace),
@@ -444,12 +440,10 @@ fn small_copy_eligible(
         && !srcs.iter().any(Location::is_remote)
         && args.restricted_grant.is_none()
         && !args.dry_run
-        && !args.verify_only
         && !args.inplace
         && !args.delete
         && !args.update
         && !args.checksum
-        && args.expected_digest.is_none()
         && !args.ignore_existing
         && !args.existing
         && !args.stats
@@ -804,7 +798,7 @@ fn attempt_small_copy(
             continue;
         }
         progress.add_bytes(entry.size);
-        progress.files_done.fetch_add(1, Relaxed);
+        progress.add_files(1);
         if let Some(results) = progress.results_writer() {
             results.emit_operation(&crate::results::OperationRecord {
                 action: "transfer_file",
@@ -992,12 +986,7 @@ pub fn run(mut args: Args) -> Result<i32> {
     // failure in this process settles with a terminal record (spec: automation
     // results). A successful exec hands that responsibility to the helper.
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
-    let progress = Progress::new(
-        show_progress,
-        args.progress,
-        args.width,
-        !args.quiet && args.progress_json,
-    );
+    let progress = Progress::new(show_progress, args.progress, args.width);
     if args.stats || debug() {
         progress
             .observations
@@ -1018,7 +1007,6 @@ pub fn run(mut args: Args) -> Result<i32> {
         progress.set_results(writer);
     }
     let dry_run = args.dry_run;
-    let verify_only = args.verify_only;
     let prune = args.delete;
     let outcome = handoff.and_then(|()| run_transfer(args, Arc::clone(&progress)));
     if outcome.is_err() {
@@ -1034,11 +1022,7 @@ pub fn run(mut args: Args) -> Result<i32> {
                 status: "failed",
                 exit_code: 1,
                 dry_run,
-                files_transferred: if verify_only {
-                    0
-                } else {
-                    progress.files_done.load(Relaxed)
-                },
+                files_transferred: progress.files_done.load(Relaxed),
                 files_unchanged: progress.files_unchanged.load(Relaxed),
                 files_excluded: progress.files_excluded.load(Relaxed),
                 // Mutations that settled (and streamed their records)
@@ -1047,13 +1031,9 @@ pub fn run(mut args: Args) -> Result<i32> {
                 symlinks_created: progress.symlinks_created.load(Relaxed),
                 specials_created: progress.specials_created.load(Relaxed),
                 errors: progress.errors.load(Relaxed),
-                bytes_transferred: if verify_only {
-                    0
-                } else {
-                    progress.bytes_done.load(Relaxed)
-                },
+                bytes_transferred: progress.bytes_done.load(Relaxed),
                 bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-                copying_elapsed_ms: if verify_only || dry_run {
+                copying_elapsed_ms: if dry_run {
                     None
                 } else {
                     progress.copying_elapsed_ms()
@@ -1367,15 +1347,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             transfer_integrity: args.transfer_integrity,
             transfer_hash_type: args.transfer_hash_type,
         },
-        expected_digest: args.expected_digest.clone(),
-        mapping_expected_digests: mapping_entries
+        mapping_expected_hashes: mapping_entries
             .as_ref()
             .map(|(entries, _)| {
                 entries
                     .iter()
                     .filter_map(|(_, entry)| {
                         entry
-                            .expected_digest
+                            .expected_hash
                             .clone()
                             .map(|digest| (entry.dst.clone(), digest))
                     })
@@ -1395,13 +1374,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         devices: args.devices,
         checksum: args.checksum,
         precise_mtime: !matches!(args.placement, Placement::Rsync),
-        verify_only: args.verify_only,
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         allow_sequential_nfs_fallback: args.connections_default || args.connections == 1,
         dst_remote: dst_ep.is_remote(),
         restricted_receiver: args.restricted_grant.is_some(),
         dry_run: args.dry_run,
+        dry_run_metadata_files: AtomicU64::new(0),
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
         umask: crate::fsops::process_umask(),
@@ -1425,7 +1404,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),
-            opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
+            opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
             if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
         );
@@ -1675,13 +1654,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         }
                     };
                     gate.mark_ready(id);
-                    let remote_ssh_data = [&src_ep, &dst_ep]
-                        .into_iter()
-                        .filter_map(real_remote_spec)
-                        .any(|spec| spec.data_transport() == DataTransport::Ssh);
-                    let fast_batch_files = opts.tuning.batch_files.unwrap_or_else(|| {
-                        fast_batch_file_limit(src.tcp_rtt_us(), dst.tcp_rtt_us(), remote_ssh_data)
-                    });
+                    let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let mut worker = Worker {
                         id,
                         src,
@@ -1776,17 +1749,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         source_shared_workers,
         source_independent_handoff_workers,
     )?;
-    if args.expected_digest.is_some() {
-        let entry = stat_one_registered(
-            &mut *src_ctl,
-            &srcs[0].path,
-            &registered_sources[0].selection,
-            false,
-        )?;
-        if !entry.is_some_and(|entry| entry.kind == Kind::File) {
-            bail!("--expected-hash requires one regular source file");
-        }
-    }
     source_roots
         .set(registered_sources)
         .expect("source roots set once");
@@ -2008,7 +1970,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !srcs[0].is_remote()
         && dst_is_dir
         && dst_entry_is_dir
-        && !args.verify_only
         && !args.existing;
     let mut prepared_anchor = None;
     let mut prepared_filesystem = None;
@@ -2103,7 +2064,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         || operator_directory == operator_dst_root
         || exact_capacity_target.is_some();
     let initial_destination_filesystem = if use_operator_anchor
-        && !args.verify_only
         && !args.existing
         && (dst_root_entry.is_none() || (dst_entry_is_dir && can_inspect_existing_destination))
     {
@@ -2137,8 +2097,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             overflowed: false,
         })
     });
-    let defer_destination_mutations = multiple_distinct_sources
-        || (fresh_capacity.is_some() && !args.dry_run && !args.verify_only);
+    let defer_destination_mutations =
+        multiple_distinct_sources || (fresh_capacity.is_some() && !args.dry_run);
     // Native new/existing forms are intentionally only the lightweight
     // pathname checks above. Once they pass, use the ordinary engine's target
     // conditions and publication behavior; this adapter does not add an
@@ -2314,24 +2274,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // and never under --existing. With several sources, or while a fresh-target
     // capacity check is pending, this waits until the complete scan has passed
     // its namespace and capacity preflights.
-    let create_root = dst_root_entry.is_none()
-        && dst_is_dir
-        && !args.dry_run
-        && !args.verify_only
-        && !args.existing;
+    let create_root = dst_root_entry.is_none() && dst_is_dir && !args.dry_run && !args.existing;
     let dry_run_creates_root =
         args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
     let root_create_condition = TargetCondition::Any;
     let defer_operator_directory_creation = use_operator_anchor
         && directory_selection.is_none()
         && !args.dry_run
-        && !args.verify_only
         && !args.existing
         && defer_destination_mutations;
     if use_operator_anchor {
         let create_operator_directory_now = directory_selection.is_none()
             && !args.dry_run
-            && !args.verify_only
             && !args.existing
             && !defer_operator_directory_creation;
         if create_operator_directory_now {
@@ -2496,7 +2450,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && destination_tree_known_missing
         && !opts.dry_run
         && !opts.inplace
-        && !opts.verify_only
         && (!destination_anchor_required || destination_anchor.get().is_some())
     {
         // The planner signals as soon as a source batch contains regular files,
@@ -2702,7 +2655,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .as_ref()
             .is_some_and(|plan| plan.root_existed)
         && !opts.dry_run
-        && !opts.verify_only
         && !opts.inplace
         && !opts.checksum
         && !opts.update
@@ -2729,7 +2681,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 args.connections,
                 files,
                 bytes,
-                opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
+                opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
                 opts.tuning.batch_bytes(),
             ));
             workers_started = true;
@@ -2769,8 +2721,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if st.source_partials > 0 && !args.quiet && scan_err.is_none() && !st.collision {
         let count = st.source_partials;
         progress.warning(
-            "source_partials",
-            count,
             &format!(
                 "source contains {count} recognizable SYQ partial path{}; {} treated as ordinary payload",
                 if count == 1 { "" } else { "s" },
@@ -2788,7 +2738,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         sched.abort();
     } else {
         let has_file_work = !sched.jobs.lock().unwrap().is_empty();
-        if !opts.dry_run && has_file_work {
+        if has_file_work {
             if use_operator_anchor && destination_anchor.get().is_none() {
                 progress.error("syq: destination root is missing and cannot be anchored");
                 sched.abort();
@@ -2796,7 +2746,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 let (multiplex_small_files, file_jobs, file_bytes) = {
                     let jobs = sched.jobs.lock().unwrap();
                     (
-                        !opts.verify_only
+                        !opts.dry_run
                             && !opts.tuning.force_ranges()
                             && bwlimit.is_none()
                             && jobs.iter().enumerate().all(|(idx, job)| {
@@ -2838,7 +2788,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             args.connections,
                             file_jobs,
                             file_bytes,
-                            opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
+                            opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
                             opts.tuning.batch_bytes(),
                         )
                     } else {
@@ -2972,7 +2922,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     }
-    if !aborted && !opts.dry_run && !opts.verify_only {
+    if !aborted && !opts.dry_run {
         st.apply_deferred()?;
     }
     if debug() {
@@ -2983,6 +2933,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     let max_delete_hit = st.max_delete_hit;
     let mut dry_run_changes = std::mem::take(&mut st.dry_run_changes);
+    if opts.dry_run {
+        dry_run_changes.regular_files = progress.files_done.load(Relaxed);
+        dry_run_changes.metadata_files += opts.dry_run_metadata_files.load(Relaxed);
+    }
     // The destination container is created outside per-entry accounting in
     // live runs; drop it here so the terminal record and the human dry-run
     // summary count the same set (spec: summary renders from the record).
@@ -3085,11 +3039,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         status,
         exit_code,
         dry_run: opts.dry_run,
-        files_transferred: if opts.verify_only {
-            0
-        } else {
-            progress.files_done.load(Relaxed)
-        },
+        files_transferred: progress.files_done.load(Relaxed),
         files_unchanged: progress.files_unchanged.load(Relaxed),
         files_excluded: progress.files_excluded.load(Relaxed),
         // Live counters only move when mutations run; a dry run reports the
@@ -3110,13 +3060,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             created_counts.2
         },
         errors,
-        bytes_transferred: if opts.verify_only {
-            0
-        } else {
-            progress.bytes_done.load(Relaxed)
-        },
+        bytes_transferred: progress.bytes_done.load(Relaxed),
         bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-        copying_elapsed_ms: if opts.verify_only || opts.dry_run {
+        copying_elapsed_ms: if opts.dry_run {
             None
         } else {
             progress.copying_elapsed_ms()
@@ -3130,7 +3076,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if !aborted
         && errors == 0
         && !opts.dry_run
-        && !opts.verify_only
         && scan_err.is_none()
         && !collision
         // A capped run can use an unrestricted hint, but cannot replace it.
@@ -3181,14 +3126,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 &dry_run_changes,
                 fresh_capacity_assessment,
             );
-        } else if opts.verify_only {
-            crate::output::human_stdout!(
-                "syq: verified {} files match, {} differences or errors, checked {} in {}",
-                commas(terminal.files_unchanged),
-                errors,
-                human(done),
-                crate::progress::hms(elapsed)
-            );
         } else {
             print_transfer_summary(
                 &terminal,
@@ -3197,7 +3134,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
-    if args.stats && show_statistics(&args) && !args.quiet && !opts.verify_only && !opts.dry_run {
+    if args.stats && show_statistics(&args) && !args.quiet && !opts.dry_run {
         if let Some(ms) = progress.copying_elapsed_ms() {
             crate::output::human_stdout!(
                 "  copying interval: {:.3}s (may overlap planning)",
@@ -3217,14 +3154,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     "logical bytes needing content work",
                     "logical bytes with unchanged content",
                     progress.bytes_total.load(Relaxed),
-                )
-            } else if opts.verify_only {
-                (
-                    "regular files to compare",
-                    "regular files matched",
-                    "bytes checked",
-                    "bytes matched",
-                    done,
                 )
             } else {
                 (
@@ -3301,8 +3230,8 @@ fn validate_range_reply(expected_off: u64, expected_len: u64, off: u64, len: usi
 
 fn stat_many_registered(
     conn: &mut dyn Conn,
-    paths: Vec<PathBytes>,
-    sources: Option<Vec<RegisteredPath>>,
+    mut paths: Vec<PathBytes>,
+    mut sources: Option<Vec<RegisteredPath>>,
     follow: bool,
 ) -> Result<Vec<Option<Entry>>> {
     if paths.is_empty() {
@@ -3312,6 +3241,25 @@ fn stat_many_registered(
         if sources.len() != paths.len() {
             bail!("source stat capability count does not match path count");
         }
+    }
+    let path_bytes = paths.iter().enumerate().fold(0usize, |bytes, (i, path)| {
+        bytes.saturating_add(source_request_bytes(
+            path,
+            sources.as_ref().map(|sources| &sources[i]),
+        ))
+    });
+    if paths.len() > 1 && path_bytes > SOURCE_BATCH_PATH_BYTES {
+        let middle = paths.len() / 2;
+        let tail_paths = paths.split_off(middle);
+        let tail_sources = sources.as_mut().map(|sources| sources.split_off(middle));
+        let mut entries = stat_many_registered(conn, paths, sources, follow)?;
+        entries.extend(stat_many_registered(
+            conn,
+            tail_paths,
+            tail_sources,
+            follow,
+        )?);
+        return Ok(entries);
     }
     match ok(
         conn.call(Request::StatMany {
