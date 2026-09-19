@@ -166,7 +166,7 @@ impl Receiver {
         };
         let cwd = self.cwd.join(OsString::from_vec(request.cwd.clone()));
         // This is command authority, not the restricted copy executor. Root
-        // and copy --approve always do not change a command's permission.
+        // and automatic download approval do not change a command's permission.
         self.approvals.request_command(
             &self.requester,
             &request.argv,

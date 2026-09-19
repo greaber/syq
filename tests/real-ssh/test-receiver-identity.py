@@ -39,7 +39,7 @@ with tempfile.TemporaryDirectory(prefix="syq-other-receiver-") as directory:
         # test-specific HOME rather than the account's passwd home directory.
         receiver_key = Path(directory) / ".syq-receiver-identity/identity_ed25519"
         receiver_key_before = receiver_key.read_bytes()
-        run("syq", "persist", "receive", "on", "--name", "laptop", "--approve", "always", env=env)
+        run("syq", "persist", "receive", "on", "--name", "laptop", "--auto-approve-root", directory, env=env)
         run("syq", "persist", "receive", "wait", "source", "--timeout", "15", env=env)
         run("ssh", "source", "syq cp /tmp/syq-real-ssh/return-source/message.txt "
             "--to @laptop --as .syq-receiver-identity/identity_ed25519", success=False)

@@ -91,7 +91,7 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False,
 
 
 print("case: automatic authorization requires approval even with automatic local receiving", flush=True)
-run("syq", "persist", "receive", "on", "--approve", "always", "--notify", "off")
+run("syq", "persist", "receive", "on", "--auto-approve-root", "/tmp/syq-real-ssh-receive", "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 remote("mkdir -p /tmp/syq-real-ssh/forward")
 print("case: explicit SSH fails without source credentials and never requests approval", flush=True)
@@ -224,7 +224,7 @@ def deny_during_setup():
 # open long enough to exercise another request on the same return connection.
 remote("printf '%s\\n' '#!/bin/sh' 'sleep 10' 'exec /usr/local/bin/syq \"$@\"' > " + helper + ".fixture && chmod 700 " + helper + ".fixture && mv " + helper + ".fixture " + helper)
 try:
-    run("syq", "persist", "receive", "on", "--approve", "ask", "--notify", "off")
+    run("syq", "persist", "receive", "on", "--no-auto-approve-root", "--notify", "off")
     run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
     copy("/tmp/syq-real-ssh/forward/slow-setup", after_approval=deny_during_setup)
 finally:

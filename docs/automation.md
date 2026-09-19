@@ -369,10 +369,17 @@ without starting connections. Endpoint states are `starting`, `connecting`,
 `ready`, `reconnecting`, `failed`, or `inactive`. Each entry also reports whether
 SSH is connected and the receiving state and errors.
 
-With receiving enabled, `ready` means the return connection is online; SSH can
-reconnect on its next use. If receiving preferences cannot be read, SSH entries
-are still listed, `receiving_error` explains the failure, and each entry's
+With receiving enabled for an endpoint, `ready` means its allowed receiving
+profiles are online; SSH can reconnect on its next use. If receiving preferences
+cannot be read, SSH entries are still listed, `receiving_error` explains the
+failure, and each entry's
 `receiving_enabled` is `null`.
+
+`persist receive status --json` reports each profile's `cwd`, `cwd_explicit`,
+`root`, `auto_approve_root`, and `servers`. An empty server list means all
+connections. A null automatic approval root means every download asks. These
+fields replace the former blanket `approval` setting. Connection entries list
+only profiles allowed on that endpoint.
 
 Command approvals in `syq persist receive pending --json` use `kind: "command"`
 and include `argv`, `cwd`, and `permission`. Argument and directory strings in

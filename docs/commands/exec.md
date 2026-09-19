@@ -68,8 +68,8 @@ expansion on the receiving machine. To use shell syntax, request a shell:
 syq exec --on @laptop --cwd work/project -- sh -c 'cargo build && ./target/debug/demo'
 ```
 
-`--cwd DIR` (or `-C DIR`) is relative to the directory selected by `persist receive on
---cwd` or `persist receive on --root`. Its default is that directory. Absolute paths and
+`--cwd DIR` (or `-C DIR`) is relative to the profile's effective starting directory
+(shown by `persist receive status`). Its default is that directory. Absolute paths and
 `..` can select elsewhere. The directory must exist. Syq does not expand `~`
 on the receiving machine; use a relative path or an absolute path instead.
 

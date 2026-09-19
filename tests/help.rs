@@ -229,7 +229,15 @@ fn management_help_separates_everyday_options_from_manual_overrides() {
         ),
         (
             vec!["persist", "receive", "on"],
-            vec!["--approve", "--notify", "--name", "--cwd", "--root"],
+            vec![
+                "--auto-approve-root",
+                "--server",
+                "--auto-cwd",
+                "--notify",
+                "--name",
+                "--cwd",
+                "--root",
+            ],
             vec!["--max-bytes", "--max-entries", "--max-delete"],
         ),
         (

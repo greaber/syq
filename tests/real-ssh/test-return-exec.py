@@ -73,7 +73,7 @@ def execute(argv, *, cwd="exec-fixture", allow=True, status=0, cancel=None, bina
 
 
 print("case: exec always needs command approval, even with automatic copies", flush=True)
-run("syq", "persist", "receive", "on", "--approve", "always", "--notify", "off")
+run("syq", "persist", "receive", "on", "--auto-approve-root", "/tmp/syq-real-ssh-receive", "--notify", "off")
 ready()
 execute(["sh", "-c", "touch denied"], allow=False, status=1)
 assert not (root / "denied").exists()

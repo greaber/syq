@@ -272,13 +272,16 @@ Requests from a server are subject to local approval:
 
 | Request | Approval on your machine |
 |---|---|
-| Send files to your machine | Required by default; `--approve always` explicitly allows unattended copies |
+| Send files to your machine | Required by default; `--auto-approve-root` permits unattended downloads confined to that directory |
 | Use your SSH access for a copy to another server | Always required |
 | Run a command on your machine | Always required |
 
 The prompt identifies the server account and requested operation. It cannot
 prove who typed the command there. Approving a copy does not approve a later
-command.
+command. By default, every connected server can use every enabled profile.
+A profile's optional `--server` list limits which locally selected SSH
+connections may use it. Within each allowed server account, all processes
+share this authority; choosing a different profile name does not isolate them.
 
 <a id="named-receiving-destinations"></a>
 
@@ -290,7 +293,9 @@ contents, inspect destination entries during planning, and use disk space
 within those limits. The default starting directory is your home, without
 containment; `syq persist receive on --root DIRECTORY` confines copies to that
 directory. See [Use your laptop from a server](receive.md) for setup and
-approval controls.
+approval controls. Automatic approval trusts those accounts to overwrite files
+inside its root. Choose an inbox whose downloaded contents are not automatically
+executed or loaded as trusted configuration.
 
 A receiving name is tied to a public key; reconnecting requires proof of the
 matching private key. This prevents another client from claiming your name,

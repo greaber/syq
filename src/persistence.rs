@@ -822,17 +822,22 @@ struct ConnectionStatus {
 fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
     let records = scope_records(scope)?;
     let receiving_setting = if kind == "global" {
-        crate::receive_service::enabled()
+        crate::receive_service::enabled_servers()
     } else {
-        Ok(false)
+        Ok(Vec::new())
     };
     let receiving_error = receiving_setting
         .as_ref()
         .err()
         .map(|error| format!("{error:#}"));
-    let receiving_enabled = receiving_setting.ok();
+    let receiving_servers = receiving_setting.ok();
     let mut connections = Vec::new();
     for (key, record) in records {
+        let receiving_enabled = receiving_servers.as_ref().map(|profiles| {
+            profiles
+                .iter()
+                .any(|servers| servers.is_empty() || servers.contains(&record.label()))
+        });
         let control = scope.join(&key);
         let ssh_live = socket_is_live(&control);
         let receiving = crate::receive_service::connection_status(&control);
@@ -879,7 +884,7 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
         let mut line = format!("  {}  {}", connection.endpoint, connection.state);
         if kind == "ephemeral" {
             line.push_str(" (ephemeral scope; receiving not supported)");
-        } else if receiving_enabled == Some(false) {
+        } else if connection.receiving_enabled == Some(false) {
             line.push_str(" (receiving disabled)");
         } else if let Some(name) = connection
             .receiving_name

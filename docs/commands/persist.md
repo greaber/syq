@@ -121,11 +121,16 @@ syq persist receive on [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--approve <APPROVAL>` | Require local approval for each copy, or explicitly trust connected servers<br><br>[possible values: ask, always] |
+| `--auto-approve-root <AUTO_APPROVE_ROOT>` | Automatically approve downloads confined to this directory |
+| `--no-auto-approve-root` | Require approval for every download again |
+| `--server <SERVERS>` | Limit this profile to these SSH destinations (repeat to allow several) |
+| `--all-servers` | Make this profile available through every connected server |
 | `--notify <NOTIFICATIONS>` | Show desktop prompts, or use only local pending/approve/deny commands<br><br>[possible values: desktop, off] |
 | `--name <NAME>` | Create or update this named profile; omitted means the first profile |
 | `-C, --cwd <CWD>` | Default destination directory; absolute paths and .. may select elsewhere |
-| `--root <ROOT>` | Default directory and confinement boundary; refuse paths escaping it |
+| `--auto-cwd` | Choose cwd from root, auto-approve-root, then HOME |
+| `--root <ROOT>` | Confinement boundary for every download, even with approval |
+| `--no-root` | Remove the hard download boundary |
 | `--max-bytes <MAX_BYTES>` | Maximum bytes one transfer may reserve/write (default: 100G) |
 | `--max-entries <MAX_ENTRIES>` | Maximum entries one transfer may touch (default: 1000000) |
 | `--max-delete <MAX_DELETE>` | Permit pruning up to N entries per transfer (default: 0) |

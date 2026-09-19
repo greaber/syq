@@ -257,4 +257,4 @@ print(result.stdout.decode())
 
 This captures output and raises on a nonzero exit. The receiving machine asks
 for approval before running the command. See
-[Run commands on your receiving machine](https://greaber.github.io/syq/exec.html).
+[Run commands on your receiving machine](https://greaber.github.io/syq/receive.html#run-commands-on-your-laptop).
