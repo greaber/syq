@@ -2565,6 +2565,8 @@ impl RestrictedAuthority {
             | Request::CheckOperatorDirectoryAncestry { .. }
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
+            | Request::StartRecycling { .. }
+            | Request::FinishRecycling
             | Request::AnchorDestination { .. } => {
                 bail!("destination-anchor management is not valid on a root-confined receiver")
             }

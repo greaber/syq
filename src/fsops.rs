@@ -375,6 +375,8 @@ fn is_superuser() -> bool {
 }
 
 pub struct FsOps {
+    #[cfg(target_os = "linux")]
+    recycle_owner: Option<(crate::rooted::recycle::Owner, DescriptorTicket)>,
     descriptor_copy: crate::descriptor_copy::Session,
     stream_worker: Option<crate::descriptor_copy::FileWorker>,
     stream_ticket: Option<crate::descriptor_broker::DescriptorTicket>,
@@ -553,6 +555,8 @@ impl FsOps {
         let observations = Arc::new(crate::transfer_observations::Registry::default());
         let operation = observations.actor("filesystem");
         FsOps {
+            #[cfg(target_os = "linux")]
+            recycle_owner: None,
             descriptor_copy: Default::default(),
             stream_worker: None,
             stream_ticket: None,
@@ -1020,6 +1024,7 @@ impl FsOps {
                 label,
                 true,
                 staged_file_mode(meta, flags),
+                data.len() as u64,
             )
         })?;
         let (file, basis_size) = opened.context("sidecar creation was requested")?;
@@ -1066,8 +1071,82 @@ impl FsOps {
     }
 
     pub(crate) fn initialize_destination(&mut self, destination: &DestinationRoot) -> Result<()> {
+        anyhow::ensure!(
+            destination.ticket.is_directory(),
+            "destination worker requires a directory capability"
+        );
         let directory = self.descriptor_session.acquire(&destination.ticket)?;
-        self.install_destination(directory, &destination.request_prefix)
+        self.install_destination(directory, &destination.request_prefix)?;
+        if let Some(ticket) = &destination.recycle {
+            anyhow::ensure!(
+                ticket.same_session(&destination.ticket),
+                "recycling pool belongs to another endpoint session"
+            );
+            ticket.require_recycling()?;
+            self.attach_recycling(ticket)?;
+        }
+        Ok(())
+    }
+
+    fn start_recycling(&mut self, max_bytes: u64) -> Result<DescriptorTicket> {
+        #[cfg(target_os = "linux")]
+        {
+            anyhow::ensure!(
+                self.recycle_owner.is_none(),
+                "staging recycling is already active"
+            );
+            let root = self
+                .destination_root
+                .as_ref()
+                .context("recycling requires an anchored destination")?
+                .clone();
+            let owner = crate::rooted::recycle::Owner::create(root, max_bytes)?;
+            let ticket = self
+                .descriptor_session
+                .register_recycling(owner.pool.directory()?)?;
+            self.recycle_owner = Some((owner, ticket.clone()));
+            self.attach_recycling(&ticket)?;
+            Ok(ticket)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = max_bytes;
+            bail!("staging recycling requires a Linux receiver")
+        }
+    }
+
+    fn attach_recycling(&mut self, ticket: &DescriptorTicket) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            ticket.require_recycling()?;
+            let pool =
+                crate::rooted::recycle::Pool::open(self.descriptor_session.acquire(ticket)?)?;
+            let old = self
+                .destination_root
+                .as_ref()
+                .context("recycling requires an anchored destination")?;
+            let mut root = Root::from_directory(old.open_directory(&RelativePath::new(b"")?)?)?;
+            root.recycle = Some(pool);
+            self.destination_root = Some(Arc::new(root));
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = ticket;
+            bail!("staging recycling requires a Linux receiver")
+        }
+    }
+
+    fn finish_recycling(&mut self) -> Result<RecyclingStats> {
+        #[cfg(target_os = "linux")]
+        if let Some((owner, ticket)) = &mut self.recycle_owner {
+            owner.close()?;
+            let stats = owner.pool.stats()?;
+            self.descriptor_session.release_recycling(ticket);
+            self.recycle_owner.take();
+            return Ok(stats);
+        }
+        Ok(RecyclingStats::default())
     }
 
     /// Resolve a batch completely before registering any of it. Each result is
@@ -1841,6 +1920,8 @@ impl FsOps {
             | Request::CheckOperatorDirectoryAncestry { .. }
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
+            | Request::StartRecycling { .. }
+            | Request::FinishRecycling
             | Request::AnchorDestination { .. }
             | Request::DestinationFilesystemInfo { .. }
             | Request::TransportStats

@@ -46,6 +46,9 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     if args.tcp_plain {
         bail!("command-restricted transfers require encrypted data connections");
     }
+    if args.recycle_staging.is_some() {
+        bail!("--recycle-staging is not supported by command-restricted receivers");
+    }
     if args.inplace
         && (args.only_new_native_entries()
             || args.existing

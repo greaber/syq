@@ -56,6 +56,8 @@ mod macos_clone_support;
 #[cfg(any(target_os = "linux", test))]
 mod directory_gate;
 mod operator;
+#[cfg(target_os = "linux")]
+pub(crate) mod recycle;
 
 pub(crate) use operator::*;
 
@@ -177,6 +179,8 @@ impl RelativePath {
 
 /// An existing directory opened once as the authority boundary.
 pub(crate) struct Root {
+    #[cfg(target_os = "linux")]
+    pub(crate) recycle: Option<recycle::Pool>,
     directory: File,
     identity: RootIdentity,
     #[cfg(target_os = "linux")]
@@ -211,6 +215,8 @@ impl Root {
             bail!("confined root descriptor is not a directory");
         }
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            recycle: None,
             directory,
             #[cfg(target_os = "linux")]
             partial_name_limits: OnceLock::new(),
@@ -415,6 +421,26 @@ impl Root {
         clear_nonblocking(&file)
             .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
         Ok(file)
+    }
+
+    /// Reused bytes are unverified storage, never resumable contents.
+    pub(crate) fn create_partial_file(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+        size: u64,
+    ) -> Result<File> {
+        #[cfg(target_os = "linux")]
+        if let Some(pool) = &self.recycle {
+            let parent = self.resolve_parent(path)?;
+            let _permit = self.mutation_permit(path)?;
+            if let Some(file) = recycle::take(pool, &parent, size)? {
+                return Ok(file);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = size;
+        self.create_file(path, mode)
     }
 
     /// Clone data into a new private sidecar, removing copied xattrs and user
@@ -1198,6 +1224,13 @@ impl Root {
         let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
+        #[cfg(target_os = "linux")]
+        if let Some(pool) = &self.recycle {
+            let _permit = self.mutation_permit(target)?;
+            if recycle::publish(pool, &source_parent, &target_parent, staged_identity)? {
+                return Ok(());
+            }
+        }
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(target)?;
         retry_zero(|| unsafe {

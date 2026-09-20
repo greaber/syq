@@ -157,6 +157,42 @@ done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null
 
+printf 'case: opt-in staging recycling across SSH and encrypted TCP workers\n'
+mkdir /tmp/recycling-source
+python3 - <<'PYTHON'
+from pathlib import Path
+root = Path('/tmp/recycling-source')
+for i in range(20):
+    p = root / f'file-{i:02}'
+    p.write_bytes(bytes([i]) * (512 * 1024 + i * 7919))
+    p.chmod(0o644)
+PYTHON
+syq cp --srcs-in /tmp/recycling-source --to destination --into /tmp/recycling-destination --preserve=permissions
+for route in ssh tcp; do
+    python3 - <<'PYTHON'
+from pathlib import Path
+for p in Path('/tmp/recycling-source').iterdir():
+    data = p.read_bytes()
+    p.write_bytes(bytes([(data[0] + 31) % 256]) * (len(data) + 1777))
+PYTHON
+    set --
+    if [ "$route" = ssh ]; then set -- --no-tcp; fi
+    syq cp --srcs-in /tmp/recycling-source --to destination --into /tmp/recycling-destination \
+        --hash --preserve=permissions --stats --no-compress --performance-tuning=workers=2 \
+        --recycle-staging=8M "$@" 2>"/tmp/recycling-$route.log"
+    cat "/tmp/recycling-$route.log"
+    python3 - "/tmp/recycling-$route.log" <<'PYTHON'
+import re, sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+match = re.search(r'recycled staging: (\d+) files, (\d+) bytes reused', text)
+assert match and int(match[1]) > 0 and int(match[2]) > 0, text
+PYTHON
+    (cd /tmp/recycling-source && sha256sum * | LC_ALL=C sort) > /tmp/recycling-source.manifest
+    ssh destination 'cd /tmp/recycling-destination && sha256sum * | LC_ALL=C sort && test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 20' > /tmp/recycling-destination.manifest
+    diff -u /tmp/recycling-source.manifest /tmp/recycling-destination.manifest
+done
+
 printf 'case: descriptor upload and download over real SSH\n'
 python3 - <<'PY_DESCRIPTORS'
 import subprocess

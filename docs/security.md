@@ -86,6 +86,15 @@ redirecting an operation; they do not make all changes within the selected
 directory safe. The following risks require separate attention, especially
 when syq has more permissions than the people who can modify that directory.
 
+**Opt-in staging recycling.** `--recycle-staging=SIZE` permits syq to overwrite
+retired destination inodes with data for other files. Anyone retaining an old
+file handle may then observe the new data; changing permissions or moving the
+inode into a private directory does not reliably revoke that access. Use this
+option only with exclusive destination access and when these consequences
+are acceptable. It is disabled by default and unavailable to command-restricted
+receivers. See [staging storage](reference.md#reuse-staging-storage) for limits
+and cleanup behavior.
+
 **Hard links and `--inplace`.** Suppose `backup/report` and a file outside
 `backup` are hard links to the same file. Copying over `backup/report` with
 `--inplace` changes the contents visible through both names. Avoid `--inplace`

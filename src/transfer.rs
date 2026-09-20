@@ -132,6 +132,7 @@ pub struct Opts {
     pub checksum: bool,
     pub precise_mtime: bool,
     pub inplace: bool,
+    pub recycle_staging: Option<u64>,
     pub same_host: bool,
     /// Automatic copies and explicit -j1 may use one direct userspace writer
     /// for the proven local-filesystem -> asynchronous-NFS topology.
@@ -464,6 +465,7 @@ fn small_copy_eligible(
         && args.restricted_grant.is_none()
         && !args.dry_run
         && !args.inplace
+        && args.recycle_staging.is_none()
         && !args.delete
         && !args.update
         && !args.checksum
@@ -1157,6 +1159,19 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if args.interface == Interface::NativeCp {
         crate::destination::prepare(&mut args)?;
     }
+    let recycle_staging = args
+        .recycle_staging
+        .as_deref()
+        .map(parse_size)
+        .transpose()?;
+    if let Some(budget) = recycle_staging {
+        anyhow::ensure!(budget != 0, "--recycle-staging requires a nonzero size");
+        anyhow::ensure!(!args.inplace, "--recycle-staging conflicts with --inplace");
+        anyhow::ensure!(
+            args.restricted_grant.is_none(),
+            "--recycle-staging is not supported by command-restricted receivers"
+        );
+    }
     let block = args.block_size;
     args.tuning_options
         .unwrap_or_default()
@@ -1412,6 +1427,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         checksum: args.checksum,
         precise_mtime: !matches!(args.placement, Placement::Rsync),
         inplace: args.inplace,
+        recycle_staging,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         allow_sequential_nfs_fallback: args.connections_default || args.connections == 1,
         dst_remote: dst_ep.is_remote(),
@@ -2338,12 +2354,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             directory_selection = Some(create_operator_directory(&mut *dst_ctl, condition)?);
         }
         if let Some(selection) = directory_selection.take() {
-            let anchor = match prepared_anchor.take() {
+            let mut anchor = match prepared_anchor.take() {
                 Some(anchor) => anchor,
                 None => {
                     activate_control_destination(&mut *dst_ctl, selection, request_prefix.clone())?
                 }
             };
+            if !opts.dry_run {
+                start_recycling(&mut *dst_ctl, &mut anchor, opts.recycle_staging)?;
+            }
             if create_root {
                 mutation_root_condition = TargetCondition::Matches {
                     dev: anchor.dev,
@@ -2917,6 +2936,23 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "syq: file workers complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
+    }
+
+    if opts.recycle_staging.is_some() && !opts.dry_run {
+        match ok(
+            st.dst.call(Request::FinishRecycling)?,
+            "dispose staging recycling pool",
+        )? {
+            Response::RecyclingFinished(stats) => {
+                if args.stats || debug() {
+                    progress.eprintln(&format!(
+                        "syq: recycled staging: {} files, {} bytes reused",
+                        stats.files, stats.bytes
+                    ));
+                }
+            }
+            other => bail!("unexpected response {other:?}"),
+        }
     }
 
     let aborted = sched.is_aborted();
@@ -3593,6 +3629,26 @@ fn destination_filesystem_info(
     }
 }
 
+fn start_recycling(
+    conn: &mut dyn Conn,
+    anchor: &mut DestinationAnchor,
+    budget: Option<u64>,
+) -> Result<()> {
+    let Some(max_bytes) = budget else {
+        return Ok(());
+    };
+    match ok(
+        conn.call(Request::StartRecycling { max_bytes })?,
+        "start staging recycling",
+    )? {
+        Response::RecyclingStarted(ticket) => {
+            anchor.destination.recycle = Some(ticket);
+            Ok(())
+        }
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
 fn activate_control_destination(
     conn: &mut dyn Conn,
     selection: DirectoryAnchor,
@@ -3608,6 +3664,7 @@ fn activate_control_destination(
     )? {
         Response::DestinationRegistered(ticket) => Ok(DestinationAnchor {
             destination: RegisteredDestinationRoot {
+                recycle: None,
                 ticket,
                 request_prefix,
             },
@@ -3663,6 +3720,7 @@ fn prepare_existing_destination(
     let anchor = match ok(anchor?, "anchor destination root")? {
         Response::DestinationRegistered(ticket) => DestinationAnchor {
             destination: RegisteredDestinationRoot {
+                recycle: None,
                 ticket,
                 request_prefix,
             },

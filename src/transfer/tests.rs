@@ -217,6 +217,7 @@ fn pipeline_worker(
     streaming: bool,
 ) -> Worker {
     let opts = Arc::new(Opts {
+        recycle_staging: None,
         local_copy_fd_budget: true,
         hash_policy: Default::default(),
         mapping_metadata: Default::default(),

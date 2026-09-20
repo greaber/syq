@@ -1284,7 +1284,8 @@ impl Planner<'_> {
         if let Some((root, condition, is_destination_root)) = self.create_root.take() {
             if self.use_operator_anchor {
                 let selection = create_operator_directory(self.dst, condition)?;
-                let anchor = activate_control_destination(self.dst, selection, root.clone())?;
+                let mut anchor = activate_control_destination(self.dst, selection, root.clone())?;
+                start_recycling(self.dst, &mut anchor, self.opts.recycle_staging)?;
                 if is_destination_root {
                     self.mutation_root_condition = TargetCondition::Matches {
                         dev: anchor.dev,

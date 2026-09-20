@@ -34,11 +34,12 @@ impl FsOps {
         label: &Path,
         create_if_missing: bool,
         create_mode: u32,
+        size: u64,
     ) -> Result<Option<(File, Option<u64>)>> {
         self.uncache_rooted(root, relative);
         let mut repaired_permissions = false;
         if create_if_missing {
-            match root.create_file(relative, create_mode) {
+            match root.create_partial_file(relative, create_mode, size) {
                 Ok(file) => return Ok(Some((file, None))),
                 Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
                 Err(error) => return Err(error),
@@ -160,7 +161,7 @@ impl FsOps {
                 Some(_) if !create_if_missing => return Ok(None),
                 Some(_) => root.unlink(relative)?,
                 None if !create_if_missing => return Ok(None),
-                None => match root.create_file(relative, create_mode) {
+                None => match root.create_partial_file(relative, create_mode, size) {
                     Ok(file) => return Ok(Some((file, None))),
                     Err(error)
                         if error
@@ -331,6 +332,7 @@ impl FsOps {
                     label,
                     create_if_missing,
                     PRIVATE_PARTIAL_MODE,
+                    size,
                 )
             })?;
         let Some((file, basis_size)) = opened else {
@@ -524,6 +526,7 @@ impl FsOps {
                     label,
                     true,
                     PRIVATE_PARTIAL_MODE,
+                    len,
                 )
             })?;
         let (output, basis_size) = opened.context("sidecar creation was requested")?;
@@ -766,6 +769,7 @@ impl FsOps {
                         label,
                         true,
                         PRIVATE_PARTIAL_MODE,
+                        size,
                     )
                 })?;
             target_relative = relative;
@@ -1190,7 +1194,14 @@ impl FsOps {
         // writes do.
         let (relative, label, opened) =
             with_rooted_partial(&rooted, target.id, |relative, label| {
-                self.open_private_partial_rooted(&rooted.root, relative, label, true, staged_mode)
+                self.open_private_partial_rooted(
+                    &rooted.root,
+                    relative,
+                    label,
+                    true,
+                    staged_mode,
+                    data.len() as u64,
+                )
             })?;
         let (file, basis_size) = opened.context("sidecar creation was requested")?;
         if basis_size.is_some() {
@@ -1839,6 +1850,10 @@ impl FsOps {
             } => self
                 .anchor_destination(*expected_dev, *expected_ino, request_prefix)
                 .map(Response::DestinationRegistered),
+            Request::StartRecycling { max_bytes } => self
+                .start_recycling(*max_bytes)
+                .map(Response::RecyclingStarted),
+            Request::FinishRecycling => self.finish_recycling().map(Response::RecyclingFinished),
             Request::CopySmallFiles(request) => self.copy_small_files(request),
             Request::DestinationFilesystemInfo {
                 check_empty,

@@ -161,6 +161,7 @@ impl Options {
         }
         for id in [
             "inplace",
+            "recycle_staging",
             "auth_from",
             "via",
             "coordinate_at",

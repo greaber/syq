@@ -423,8 +423,15 @@ pub enum Op {
     Unlink { path: PathBytes },
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RecyclingStats {
+    pub files: u64,
+    pub bytes: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DestinationRoot {
+    pub recycle: Option<DescriptorTicket>,
     pub ticket: DescriptorTicket,
     pub request_prefix: PathBytes,
 }
@@ -954,6 +961,10 @@ pub enum WireRequest<Data> {
     /// Reuse a drained stream worker within its original endpoint session.
     /// None releases its file before the control connection publishes it.
     BindStream(Option<(DescriptorTicket, crate::descriptor_copy::Settings)>),
+    StartRecycling {
+        max_bytes: u64,
+    },
+    FinishRecycling,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1200,6 +1211,8 @@ pub enum Response {
         size: Option<u64>,
         metadata: Option<Meta>,
     },
+    RecyclingStarted(DescriptorTicket),
+    RecyclingFinished(RecyclingStats),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

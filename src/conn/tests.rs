@@ -933,6 +933,7 @@ fn hello_carries_destination_initialization_before_readiness() {
         .register(std::fs::File::open(temp.path()).unwrap())
         .unwrap();
     let destination = DestinationRoot {
+        recycle: None,
         ticket,
         request_prefix: b"destination".to_vec(),
     };

@@ -80,6 +80,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 |---|---|
 | `-B, --block-size <SIZE>` | Comparison and reuse block size (64K through 64M)<br><br>[default: 4M] |
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
+| `--recycle-staging <SIZE>` | Reuse retired destination files within this copy (Linux receiver only). Old file handles may observe new contents; use only with exclusive destination access. SIZE bounds retained spare file lengths, not total transfer storage |
 
 ## Resource limits
 
