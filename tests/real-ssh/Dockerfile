@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --locked --bin syq \
     && cp target/debug/syq /tmp/syq-other-build
 
-FROM minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e AS storage-fixture
+FROM quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e AS storage-fixture
 
 FROM debian:bookworm-slim
 
