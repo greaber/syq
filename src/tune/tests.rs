@@ -627,29 +627,33 @@ fn out_of_order_readiness_keeps_every_warming_slot() {
 
 #[test]
 fn preparation_precedes_the_first_decision_without_activating_workers() {
-    let mut policy = Policy::new(16, 1, 64);
-    let mut sampler = Sampler::default();
-    sampler.reset();
-    let lead = Duration::from_secs(12);
-    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
-    assert_eq!(plan.connect, 21);
-    assert_eq!(policy.n, 16);
-    assert_eq!(policy.active(), 16);
-    assert_eq!(policy.history, vec![16]);
-    assert_eq!(policy.peak, 16);
+    for (mut policy, candidate) in [
+        (Policy::new(16, 1, 64), 32),
+        (Policy::from_cache(16, 1, 64), 21),
+    ] {
+        let mut sampler = Sampler::default();
+        sampler.reset();
+        let lead = Duration::from_secs(12);
+        let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
+        assert_eq!(plan.connect, candidate);
+        assert_eq!(policy.n, 16);
+        assert_eq!(policy.active(), 16);
+        assert_eq!(policy.history, vec![16]);
+        assert_eq!(policy.peak, 16);
 
-    let gate = Gate::new(16);
-    gate.prepare(plan);
-    for id in gate.begin_warming(plan.connect) {
-        gate.mark_ready(id);
+        let gate = Gate::new(16);
+        gate.prepare(plan);
+        for id in gate.begin_warming(plan.connect) {
+            gate.mark_ready(id);
+        }
+        assert!(gate.ready_through(candidate));
+        assert!(!gate.allowed(16));
+        assert_eq!(policy.observe(100.0), candidate);
+        assert!(gate.begin_warming(policy.n).is_empty());
+        gate.set_active(policy.n);
+        policy.activated();
+        assert!(gate.allowed(candidate - 1));
     }
-    assert!(gate.ready_through(21));
-    assert!(!gate.allowed(16));
-    assert_eq!(policy.observe(100.0), 21);
-    assert!(gate.begin_warming(policy.n).is_empty());
-    gate.set_active(policy.n);
-    policy.activated();
-    assert!(gate.allowed(20));
 }
 
 #[test]
@@ -666,7 +670,7 @@ fn preparation_uses_earliest_sample_boundary_and_keeps_rollback_ready() {
         sampler.earliest_score_in(SAMPLE, Duration::from_secs(2)),
         Duration::from_millis(500)
     );
-    let mut policy = Policy::new(16, 1, 64);
+    let mut policy = Policy::from_cache(16, 1, 64);
     let plan = policy.connection_plan(
         &sampler,
         SAMPLE,
@@ -695,7 +699,7 @@ fn preparation_uses_earliest_sample_boundary_and_keeps_rollback_ready() {
 
 #[test]
 fn distant_probe_releases_spares_then_prepares_before_it_is_due() {
-    let mut policy = Policy::new(16, 1, 64);
+    let mut policy = Policy::from_cache(16, 1, 64);
     policy.state = State::Hold;
     policy.due = [60, 60];
     let sampler = Sampler::default();
@@ -760,26 +764,30 @@ fn retired_connection_is_not_ready_or_duplicated_before_worker_cleanup() {
 
 #[test]
 fn warming_forecast_waits_for_candidate_measurements_not_baseline_refresh() {
-    let mut policy = Policy::new(16, 1, 64);
-    assert_eq!(policy.observe(100.0), 21);
-    assert_eq!(policy.active(), 16);
-    let mut baseline = Sampler::default();
-    assert_eq!(baseline.push(100.0), None);
-    // The next baseline score is due now, but the candidate still needs a
-    // discarded sample plus two measured samples after activation.
-    let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
-    assert_eq!(plan.connect, 21);
-    assert!(plan.keep >= 21);
-    assert!(policy.refresh_warming_baseline(100.0));
-    let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
-    assert_eq!(plan.connect, 21);
-    // Truly slow setup can still justify overlapping preparation, using the
-    // earliest post-activation decision rather than a baseline refresh.
-    let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(10), true);
-    assert_eq!(plan.connect, step_up(21));
-    policy.activated();
-    let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
-    assert_eq!(plan.connect, step_up(21));
+    for (mut policy, candidate, following) in [
+        (Policy::new(16, 1, 64), 32, 64),
+        (Policy::from_cache(16, 1, 64), 21, 27),
+    ] {
+        assert_eq!(policy.observe(100.0), candidate);
+        assert_eq!(policy.active(), 16);
+        let mut baseline = Sampler::default();
+        assert_eq!(baseline.push(100.0), None);
+        // The next baseline score is due now, but the candidate still needs a
+        // discarded sample plus two measured samples after activation.
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        assert_eq!(plan.connect, candidate);
+        assert!(plan.keep >= candidate);
+        assert!(policy.refresh_warming_baseline(100.0));
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        assert_eq!(plan.connect, candidate);
+        // Truly slow setup can still justify overlapping preparation, using the
+        // earliest post-activation decision rather than a baseline refresh.
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(10), true);
+        assert_eq!(plan.connect, following);
+        policy.activated();
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        assert_eq!(plan.connect, following);
+    }
 }
 
 #[test]
@@ -822,7 +830,7 @@ fn setup_lead_includes_retries_and_does_not_shrink_after_one_fast_setup() {
 
 #[test]
 fn missed_preparation_still_waits_for_ready_connections_and_optional_failure_isolated() {
-    let mut policy = Policy::new(16, 1, 64);
+    let mut policy = Policy::from_cache(16, 1, 64);
     let gate = Gate::new(16);
     for id in gate.begin_warming(16) {
         gate.mark_ready(id);
@@ -854,7 +862,7 @@ fn missed_preparation_still_waits_for_ready_connections_and_optional_failure_iso
 
 #[test]
 fn a_preparation_pause_does_not_close_imminently_needed_spares() {
-    let mut policy = Policy::new(16, 1, 64);
+    let mut policy = Policy::from_cache(16, 1, 64);
     policy.state = State::Hold;
     policy.due = [1, 1];
     let plan = policy.connection_plan(

@@ -467,7 +467,7 @@ impl Policy {
             ))
             .next()
             .map_or_else(
-                || step_up(self.n).min(self.max),
+                || self.upward_step(),
                 |(&upper, _)| self.n + (upper - self.n).div_ceil(2),
             );
         (
@@ -632,6 +632,14 @@ impl Policy {
             });
     }
 
+    fn upward_step(&self) -> usize {
+        if self.startup_doubling {
+            self.n.saturating_mul(2).min(self.max)
+        } else {
+            step_up(self.n).min(self.max)
+        }
+    }
+
     /// Pick an unmeasured integer inside the nearest bound before taking
     /// another geometric step. This is what turns measurements at 10 and 13
     /// into a later probe at 11 rather than needlessly re-testing 10.
@@ -678,11 +686,7 @@ impl Policy {
                     }
                     return upper;
                 }
-                if self.startup_doubling {
-                    self.n.saturating_mul(2).min(self.max)
-                } else {
-                    step_up(self.n).min(self.max)
-                }
+                self.upward_step()
             }
         }
     }
