@@ -24,6 +24,15 @@ Run the suite from any syq checkout:
 scripts/test-real-ssh.sh
 ```
 
+The suite also runs a pinned MinIO fixture on the runner. Storage checks approve
+requests through the return connection and disconnect receiving before uploads
+and downloads finish. The source has no storage credentials. To run only these
+checks:
+
+```sh
+scripts/test-real-ssh.sh --suite storage
+```
+
 The host runner requires Bash 4 or newer. In particular, the Bash 3.2 shipped
 with macOS is not supported; install a current Bash and invoke the script with
 it when running the lab on macOS.

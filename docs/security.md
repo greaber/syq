@@ -265,7 +265,7 @@ persistent connections, including receiving.
 
 With receiving enabled, servers you have persistent connections to can request
 copies to or commands on your machine, or authorization for copies to another
-server. Receiving is configured separately and defaults to enabled. `syq persist receive off`
+server or object storage. Receiving is configured separately and defaults to enabled. `syq persist receive off`
 disables these requests while keeping SSH reuse.
 
 Requests from a server are subject to local approval:
@@ -275,6 +275,7 @@ Requests from a server are subject to local approval:
 | Send files to your machine | Required by default; `--auto-approve-root` permits unattended downloads confined to that directory |
 | Use your SSH access for a copy to another server | Always required |
 | Run a command on your machine | Always required |
+| Use your storage credentials for a transfer | Always required |
 
 The prompt identifies the server account and requested operation. It cannot
 prove who typed the command there. Approving a copy does not approve a later
@@ -317,3 +318,12 @@ described in [Copies between servers](#copies-between-servers).
 With [`syq exec`](receive.md#run-commands-on-your-laptop), a connected server can request a command on your
 laptop. An approved command runs with your local user's full permissions;
 it is not sandboxed or confined to a copy destination directory.
+
+### Storage authorization
+
+[Storage authorization](object-storage.md#authorize-from-your-laptop) gives the
+server signed URLs for approved paths and operations. The secret access key
+stays on your laptop. Approval trusts the server to choose uploaded contents.
+Anyone with the URLs can reuse them until expiry; stopping receiving does not
+revoke them. Filesystem receiver roots, aggregate limits, one-use grants, and
+signed receipts do not apply.

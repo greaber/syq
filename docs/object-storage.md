@@ -24,6 +24,24 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 
 See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 
+## Authorize from your laptop
+
+Add `--auth-from @NAME` to an S3 `cp` or `rm` command to use credentials on a
+connected [receiving machine](receive.md#set-up-receiving).
+`--s3-profile` selects a profile there:
+
+```sh
+syq cp results --to s3://my-bucket --into runs \
+  --auth-from @laptop --s3-profile storage
+```
+
+Approve on your laptop, then wait for **storage authorization ready** before
+disconnecting. Data travels directly between the server and storage.
+Authorization lasts up to seven days, subject to credentials and provider
+policies; restarting requires fresh approval. Both machines need the same syq
+build. See [Storage authorization](security.md#storage-authorization) for the
+security implications.
+
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>
 
@@ -84,5 +102,6 @@ markers, or `--s3-version-id ID` for one version. Deleting a marker can reveal
 an older version. Preview version deletions with `--dry-run -v`.
 
 Named removal selectors choose exact keys; `--src-dir` and `--srcs-in` choose
-prefix trees. An empty S3 source prefix is rejected by `cp`, so it cannot prune
-an entire local destination.
+prefix trees and accept a trailing `/`. When deleting an exact directory-marker
+version, keep the trailing `/` in its key. An empty S3 source prefix is rejected
+by `cp`, so it cannot prune an entire local destination.

@@ -44,6 +44,7 @@ pub(crate) enum Kind {
     #[default]
     Copy,
     Command,
+    Storage,
 }
 impl Kind {
     pub(crate) fn is_copy(&self) -> bool {
@@ -53,6 +54,7 @@ impl Kind {
         match self {
             Self::Copy => "syq: Allow this copy?",
             Self::Command => "syq: Run this command?",
+            Self::Storage => "syq: Authorize storage access?",
         }
     }
 }
@@ -74,6 +76,10 @@ pub(crate) struct Summary {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum Details {
+    Storage {
+        kind: StorageKind,
+        description: String,
+    },
     Command {
         kind: CommandKind,
         argv: Vec<String>,
@@ -93,6 +99,11 @@ pub(crate) enum Details {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CommandKind {
     Command,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StorageKind {
+    Storage,
 }
 impl Summary {
     fn new(
@@ -142,12 +153,14 @@ impl Summary {
         match self.details {
             Details::Copy { .. } => Kind::Copy,
             Details::Command { .. } => Kind::Command,
+            Details::Storage { .. } => Kind::Storage,
         }
     }
     /// Keep the decision visible; the full description remains available in
     /// the macOS Details view and in `persist receive pending` on both platforms.
     fn desktop_description(&self) -> String {
         match &self.details {
+            Details::Storage { description, .. } => format!("From: {}\n{description}", self.from),
             Details::Copy { destination, max_delete, .. } => {
                 let mut body = format!("To: {destination}\nFrom: {}", self.from);
                 if let Some(notice) = &self.desktop_copy_notice {
@@ -166,6 +179,7 @@ impl Summary {
     }
     fn details_description(&self) -> String {
         let body = match &self.details {
+            Details::Storage { description, .. } => description.clone(),
             Details::Copy { destination, permission, max_bytes, max_entries, max_delete, preserve_permissions } =>
                 format!("Destination: {destination}\n{permission}\nLimits: {max_bytes} bytes, {max_entries} entries; at most {max_delete} deletions.\nPreserve permissions: {preserve_permissions}.\nSource contents have not been inspected by this machine."),
             Details::Command { argv, cwd, permission, .. } =>
@@ -177,6 +191,7 @@ impl Summary {
         let question = match self.kind() {
             Kind::Copy => "Allow this copy once?",
             Kind::Command => "Run this command once?",
+            Kind::Storage => "Authorize this storage access?",
         };
         format!(
             "{}\n\n{question}\nLocal command: syq persist receive approve {}",
@@ -349,6 +364,100 @@ impl Queue {
                 permission: "Runs as your local user with access to your files, programs and credentials. Copy root and copy limits do not contain this command. Stdin is closed.".into(),
             },
         }, notifications, TIMEOUT, cancelled)
+    }
+    pub(crate) fn request_storage(
+        &self,
+        from: &str,
+        request: &crate::s3::authorization::Request,
+        notifications: Notifications,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<()> {
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
+        let scopes = request
+            .scopes
+            .iter()
+            .map(|scope| {
+                format!(
+                    "{:?}{}",
+                    scope.key,
+                    if scope.descendants {
+                        " and descendants"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = request
+            .source
+            .as_ref()
+            .map(|source| {
+                format!(
+                    "\nCopy source bucket: {:?}\nRead source objects and tags:\n{}",
+                    source.bucket,
+                    source
+                        .scopes
+                        .iter()
+                        .map(|scope| format!(
+                            "{:?}{}",
+                            scope.key,
+                            if scope.descendants {
+                                " and descendants"
+                            } else {
+                                ""
+                            }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })
+            .unwrap_or_default();
+        let removal = match &request.removal {
+            Some(crate::s3::authorization::Removal::AllVersions) => "\nSelection: all versions and delete markers. Version discovery may list names sharing the selected key prefix.".to_owned(),
+            Some(crate::s3::authorization::Removal::Version(id)) => format!("\nSelected version or delete marker: {id:?}. Version discovery may list names sharing the selected key prefix."),
+            _ => String::new(),
+        };
+        let permanence = if request.delete
+            && matches!(
+                request.removal,
+                Some(
+                    crate::s3::authorization::Removal::Version(_)
+                        | crate::s3::authorization::Removal::AllVersions
+                )
+            ) {
+            "\nDeleting selected versions or delete markers is permanent."
+        } else {
+            ""
+        };
+        let acl = if request.acl.is_empty() {
+            String::new()
+        } else {
+            format!("\nApproved object ACL headers: {:?}", request.acl)
+        };
+        let description = format!("Bucket: {:?}\nEndpoint: {:?}\nCredential profile on this machine: {:?}\nPaths:\n{scopes}{source}{removal}{permanence}{acl}\nPermission: {}{}{}.\nRequested lifetime: {} seconds (credentials or provider policies may shorten it).\nIssued requests can be reused until expiry, even after this machine disconnects or receiving stops. Copy roots, aggregate limits and receiver receipts do not apply. Source contents are not inspected.",
+            request.bucket, request.endpoint.as_deref().unwrap_or("configured AWS/S3 endpoint"), request.profile.as_deref().unwrap_or("default"),
+            if request.upload { "read and upload" } else { "read" },
+            if request.create_only { ", create-only writes" } else if request.upload { ", may overwrite" } else { "" },
+            if request.delete { ", may delete" } else { ", no object deletion" }, request.lifetime);
+        self.wait(
+            Summary {
+                id: id.iter().map(|b| format!("{b:02x}")).collect(),
+                from: format!("{from:?}"),
+                expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
+                    + TIMEOUT.as_secs(),
+                notification: "starting".into(),
+                desktop_copy_notice: None,
+                details: Details::Storage {
+                    kind: StorageKind::Storage,
+                    description,
+                },
+            },
+            notifications,
+            TIMEOUT,
+            cancelled,
+        )
     }
     fn wait(
         &self,
@@ -694,6 +803,29 @@ mod tests {
             },
             constraints: GrantConstraints::default(),
         }
+    }
+
+    #[test]
+    fn v0_6_0_pending_json_remains_compatible() {
+        // Unchanged released copy/command envelopes; storage does not reuse
+        // their kind or add fields to their serialized form.
+        for (raw, kind) in [
+            (
+                r#"{"id":"fixture","from":"server","expires_at":123,"notification":"off","destination":"backup","permission":"copy","max_bytes":100,"max_entries":10,"max_delete":0,"preserve_permissions":false}"#,
+                Kind::Copy,
+            ),
+            (
+                r#"{"id":"fixture","from":"server","expires_at":123,"notification":"off","kind":"command","argv":["true"],"cwd":"/tmp","permission":"run"}"#,
+                Kind::Command,
+            ),
+        ] {
+            let expected: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let summary: Summary = serde_json::from_str(raw).unwrap();
+            assert_eq!(summary.kind(), kind);
+            assert_eq!(serde_json::to_value(summary).unwrap(), expected);
+        }
+        let storage: Summary = serde_json::from_str(r#"{"id":"fixture","from":"server","expires_at":123,"notification":"off","kind":"storage","description":"read bucket/path"}"#).unwrap();
+        assert_eq!(storage.kind(), Kind::Storage);
     }
 
     #[test]

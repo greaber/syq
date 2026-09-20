@@ -43,62 +43,32 @@ registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.
    protected `release` environment. It has no access to the syq repository or
    to any other repository in the account.
 
-## Encrypted release inventory
+<a id="encrypted-release-inventory"></a>
 
-The committed `.env.release` file is the canonical release-credential
-inventory. It contains ciphertext for `SYQ_RELEASE_SIGNING_KEY_PEM_B64`,
-`HOMEBREW_TAP_DEPLOY_KEY`, and the `CLOUDFLARE_API_TOKEN` and
-`CLOUDFLARE_ACCOUNT_ID` that deploy the download host in
-[`infra/syq-dl/`](infra/syq-dl/README.md), plus the corresponding public
-`SYQ_RELEASE_PUBLIC_KEY`. Its decryption authority lives only in the
-gitignored `.env.keys`. Forks receive the ciphertext but neither the
-decryption key nor official publishing authority.
+## Release credentials
 
-Install the pinned maintainer tool, then initialize the inventory on an
-encrypted developer machine. The initializer generates independent Ed25519
-keys for manifest signing and Homebrew tap access; it needs no secret input.
-The release scripts need `bash`, `jq`, `ssh-keygen`, and OpenSSL 3 as
-`openssl` (1.1.1 cannot sign Ed25519 with `pkeyutl`); macOS ships LibreSSL
-under that name, so install `openssl@3` with Homebrew and put its `bin`
-directory first on `PATH` before signing:
+Credential storage and provisioning are managed separately from this public
+repository. No local credential manager is required to build or test syq.
 
-```sh
-npm install --global @dotenvx/dotenvx@2.21.0
-scripts/init-release-secrets.sh
-git add .env.release
-git commit -m 'Add encrypted release credential inventory'
-```
+The GitHub Actions release environment needs two secrets:
 
-Back up `.env.keys` immediately in protected storage. Do not commit it, upload
-it to GitHub, or use it in CI. Losing every copy prevents future releases from
-using the signing identity embedded in installed clients.
+- SYQ_RELEASE_SIGNING_KEY_PEM_B64: a base64-encoded Ed25519 private PEM key
+  used to sign release manifests.
+- HOMEBREW_TAP_DEPLOY_KEY: an SSH private key whose public half has write
+  access to the Homebrew tap.
 
-After the repository has been renamed and the protected `release` environment
-exists, preview and then synchronize the allowlisted values:
+The repository variable SYQ_RELEASE_PUBLIC_KEY contains the matching
+base64-encoded raw Ed25519 public key. Official builds embed this verification
+key. Provision these individual values using your credential-management tools;
+never give CI a key that decrypts a broader credential store.
 
-```sh
-scripts/sync-github-secrets.sh
-scripts/sync-github-secrets.sh --execute
-gh secret list --repo greaber/syq --env release
-gh variable list --repo greaber/syq
-```
+Automated crates.io publication uses GitHub OIDC. A local crates.io token is
+not needed for that workflow.
 
-The sync sends the two individual private keys to environment secrets, installs
-the Homebrew key's public half as a write-enabled deploy key on the tap, and
-sends the release public key to the repository variable used by every official
-build. It never sends `.env.keys`, any `DOTENV_PRIVATE_KEY_*` value, or an
-undeclared entry from the encrypted file. It derives both public keys locally
-and refuses a mismatched release signing pair or tap deploy key.
-
-The Homebrew deploy key is already restricted to one repository and should not
-need routine rotation. If it is exposed, replace its ciphertext with a newly
-generated Ed25519 private key, remove the deploy key titled `syq release
-workflow` from the tap, commit `.env.release`, and rerun the dry-run/execute
-sync. The sync will install the new public half before updating the protected
-environment secret.
-
-Do not rotate the release signing key casually: installed clients trust it, so
-a planned rotation first needs a release that trusts both old and new keys.
+Keep protected backups of release signing authority. Do not regenerate the
+signing key as a recovery shortcut: installed clients trust the existing key,
+and changing it requires a migration plan. The tap deploy key can be rotated
+by replacing the public deploy key and its matching environment secret.
 
 ## Signing releases from the Linux server
 

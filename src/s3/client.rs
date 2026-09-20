@@ -244,6 +244,15 @@ pub(super) async fn connect(
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
     uploads: std::sync::Arc<super::upload_http::Cancellation>,
 ) -> Result<(Client, Option<String>)> {
+    connect_authorized(options, control, uploads, None).await
+}
+
+pub(super) async fn connect_authorized(
+    options: &mut Options,
+    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    uploads: std::sync::Arc<super::upload_http::Cancellation>,
+    authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
+) -> Result<(Client, Option<String>)> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(profile) = &options.profile {
         loader = loader.profile_name(profile);
@@ -251,13 +260,37 @@ pub(super) async fn connect(
     if let Some(region) = &options.region {
         loader = loader.region(Region::new(region.clone()));
     }
-    let shared = loader.load().await;
+    let shared = if let Some(authorization) = &authorization {
+        options.endpoint = Some(authorization.configuration.endpoint.clone());
+        options.region = Some(authorization.configuration.region.clone());
+        aws_types::SdkConfig::builder()
+            .region(Region::new(authorization.configuration.region.clone()))
+            .credentials_provider(
+                aws_credential_types::provider::SharedCredentialsProvider::new(
+                    aws_credential_types::Credentials::new(
+                        "syq-delegated",
+                        "unused",
+                        None,
+                        None,
+                        "delegated-storage",
+                    ),
+                ),
+            )
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .build()
+    } else {
+        loader.load().await
+    };
     let transport = aws_smithy_http_client::Builder::new()
         .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
         ))
         .build_with_resolver(super::dns::CoalescingDns::default());
     let transport = super::upload_http::client(transport, uploads);
+    let transport = match authorization {
+        Some(authorization) => super::authorization::http_client(transport, authorization),
+        None => transport,
+    };
     let mut config = aws_sdk_s3::config::Builder::from(&shared)
         .http_client(transport)
         .region(

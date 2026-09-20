@@ -125,6 +125,26 @@ pub(super) fn check_overlap(sources: &[(String, bool)], targets: &[(String, bool
     Ok(())
 }
 
+enum CopyPreparation {
+    Skipped,
+    Preview(u64),
+    Ready(Box<PreparedCopy>),
+}
+struct PreparedCopy {
+    source: Object,
+    source_head: HeadObjectOutput,
+    desired_head: HeadObjectOutput,
+    key: String,
+    copy_source: String,
+    must_be_new: bool,
+    explicit: bool,
+    multipart: Option<PreparedCopyMultipart>,
+}
+struct PreparedCopyMultipart {
+    id: String,
+    part_size: u64,
+}
+
 impl Engine {
     fn copy_error(&self, error: anyhow::Error) -> anyhow::Error {
         if error
@@ -191,24 +211,73 @@ impl Engine {
             .bytes_total
             .store(plan.iter().map(|p| p.size).sum(), Relaxed);
         self.progress.scan_done.store(true, Relaxed);
-        parallel(plan, workers, |mut job| {
-            let engine = self.clone();
-            async move {
-                engine.check_cancelled()?;
-                let result = engine
-                    .copy_object(&mut job)
-                    .await
-                    .map_err(|error| engine.copy_error(error));
-                engine.settle(job.key.as_bytes(), &job.path, job.kind, &result, None);
-                Ok(result.ok().flatten())
+        if self.authorization.is_some() {
+            let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
+            parallel(plan, workers, |mut job| {
+                let engine = self.clone();
+                let prepared = prepared.clone();
+                async move {
+                    match engine.prepare_copy(&mut job).await {
+                        Ok(work) => prepared.lock().await.push((job, work)),
+                        Err(error) => engine.settle(
+                            job.key.as_bytes(),
+                            &job.path,
+                            job.kind,
+                            &Err(engine.copy_error(error)),
+                            None,
+                        ),
+                    }
+                    Ok(None)
+                }
+            })
+            .await?;
+            let prepared = std::mem::take(&mut *prepared.lock().await);
+            let finish = async {
+                self.prepare_pruning(&prune).await?;
+                self.finish_authorization().await
             }
-        })
-        .await?;
+            .await;
+            if let Err(error) = finish {
+                for (_, work) in &prepared {
+                    if let CopyPreparation::Ready(work) = work {
+                        self.abort_prepared_copy(work).await;
+                    }
+                }
+                return Err(error);
+            }
+            let workers = self.object_workers(prepared.iter().map(|(job, _)| job.size))?;
+            parallel(prepared, workers, |(job, work)| {
+                let engine = self.clone();
+                async move {
+                    let result = engine
+                        .execute_copy(work)
+                        .await
+                        .map_err(|e| engine.copy_error(e));
+                    engine.settle(job.key.as_bytes(), &job.path, job.kind, &result, None);
+                    Ok(result.ok().flatten())
+                }
+            })
+            .await?;
+        } else {
+            parallel(plan, workers, |mut job| {
+                let engine = self.clone();
+                async move {
+                    engine.check_cancelled()?;
+                    let result = engine
+                        .copy_object(&mut job)
+                        .await
+                        .map_err(|error| engine.copy_error(error));
+                    engine.settle(job.key.as_bytes(), &job.path, job.kind, &result, None);
+                    Ok(result.ok().flatten())
+                }
+            })
+            .await?;
+        }
         self.prune(prune, None).await?;
         Ok(())
     }
 
-    async fn copy_object(&self, job: &mut Download) -> Result<Option<u64>> {
+    async fn prepare_copy(&self, job: &mut Download) -> Result<CopyPreparation> {
         let source_bucket = self.options.route.source_bucket().unwrap();
         let key = copy_destination_key(job);
         local::key_path(key.trim_end_matches('/').as_bytes())?;
@@ -268,13 +337,13 @@ impl Engine {
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {
-            return Ok(None);
+            return Ok(CopyPreparation::Skipped);
         }
         let source_time = source.metadata.as_ref().map_or(source.mtime, |m| m.mtime);
         if let Some((old, old_head)) = &existing {
             let old_time = old.metadata.as_ref().map_or(old.mtime, |m| m.mtime);
             if self.args.update && old_time > source_time {
-                return Ok(None);
+                return Ok(CopyPreparation::Skipped);
             }
             let same = if explicit.flags() == 0 {
                 unchanged(&source, old, &source_head, old_head)
@@ -291,21 +360,70 @@ impl Engine {
                 self.progress
                     .bytes_unchanged
                     .fetch_add(source.size, Relaxed);
-                return Ok(None);
+                return Ok(CopyPreparation::Skipped);
             }
         }
         if self.args.dry_run {
             self.progress.bytes_done.fetch_add(source.size, Relaxed);
-            return Ok(Some(source.size));
+            return Ok(CopyPreparation::Preview(source.size));
         }
         self.check_cancelled()?;
-
-        let _interval = self.progress.copying_interval();
         let copy_source = encoded_source(source_bucket, &source);
         let must_be_new = self.args.ignore_existing || self.args.target_existence == Existence::New;
-        // Respect explicit part sizing for both performance control and exercising
-        // multipart copying with small disposable fixtures.
-        if source.size <= self.copy_request_limit(source.size) {
+        let multipart = if source.size > self.copy_request_limit(source.size) {
+            Some(
+                self.prepare_multipart_copy(&source, desired_head.clone(), &key)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let prepared = PreparedCopy {
+            source,
+            source_head,
+            desired_head,
+            key,
+            copy_source,
+            must_be_new,
+            explicit: explicit.flags() != 0,
+            multipart,
+        };
+        if let Err(error) = self.authorize_copy(&prepared).await {
+            self.abort_prepared_copy(&prepared).await;
+            return Err(error);
+        }
+        Ok(CopyPreparation::Ready(Box::new(prepared)))
+    }
+
+    async fn copy_object(&self, job: &mut Download) -> Result<Option<u64>> {
+        self.execute_copy(self.prepare_copy(job).await?).await
+    }
+
+    async fn execute_copy(&self, work: CopyPreparation) -> Result<Option<u64>> {
+        let work = match work {
+            CopyPreparation::Skipped => return Ok(None),
+            CopyPreparation::Preview(size) => return Ok(Some(size)),
+            CopyPreparation::Ready(work) => work,
+        };
+        if let Err(error) = self.check_cancelled() {
+            self.abort_prepared_copy(&work).await;
+            return Err(error);
+        }
+        let _interval = self.progress.copying_interval();
+        let PreparedCopy {
+            source,
+            source_head,
+            desired_head,
+            key,
+            copy_source,
+            must_be_new,
+            explicit,
+            multipart,
+        } = *work;
+        if let Some(multipart) = multipart {
+            self.execute_multipart_copy(&source, &key, &copy_source, must_be_new, multipart)
+                .await?;
+        } else {
             let _slot = self.tuning.requests.acquire().await;
             let request = self
                 .client
@@ -320,7 +438,7 @@ impl Engine {
                 .metadata_directive(MetadataDirective::Copy)
                 .tagging_directive(TaggingDirective::Copy)
                 .set_if_none_match(must_be_new.then(|| "*".to_owned()));
-            let request = if explicit.flags() != 0 {
+            let request = if explicit {
                 request
                     .metadata_directive(MetadataDirective::Replace)
                     .set_metadata(desired_head.metadata().cloned())
@@ -336,7 +454,7 @@ impl Engine {
             request
                 .customize()
                 .map_request(move |mut request| {
-                    if explicit.flags() != 0 {
+                    if explicit {
                         if let Some(expires) = &expires {
                             request
                                 .headers_mut()
@@ -351,21 +469,92 @@ impl Engine {
                 .context("S3 server-side copy failed")?;
             self.tuning.requests.completed(source.size);
             self.progress.add_bytes(source.size);
-        } else {
-            self.multipart_copy(&source, desired_head, &key, &copy_source, must_be_new)
-                .await?;
         }
         Ok(Some(source.size))
     }
 
-    async fn multipart_copy(
+    async fn abort_prepared_copy(&self, work: &PreparedCopy) {
+        if let Some(multipart) = &work.multipart {
+            let _slot = self.tuning.requests.acquire().await;
+            if let Err(error) = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.options.bucket)
+                .key(&work.key)
+                .upload_id(&multipart.id)
+                .send()
+                .await
+            {
+                self.progress.eprintln(&format!(
+                    "S3 multipart cleanup failed for {:?}: {}",
+                    work.key,
+                    error.into_service_error()
+                ));
+            }
+        }
+    }
+
+    async fn authorize_copy(&self, work: &PreparedCopy) -> Result<()> {
+        use crate::s3::authorization::Unsigned;
+        if self.authorization.is_none() {
+            return Ok(());
+        }
+        let mut requests = Vec::new();
+        let copy = |request: Unsigned| {
+            request
+                .header("x-amz-copy-source", &work.copy_source)
+                .header("x-amz-copy-source-if-match", &work.source.etag)
+        };
+        if let Some(multipart) = &work.multipart {
+            requests.push(Unsigned::new("DELETE", &work.key).query("uploadId", &multipart.id));
+            for index in 0..work.source.size.div_ceil(multipart.part_size) {
+                let start = index * multipart.part_size;
+                let end = (start + multipart.part_size).min(work.source.size) - 1;
+                requests.push(
+                    copy(
+                        Unsigned::new("PUT", &work.key)
+                            .query("uploadId", &multipart.id)
+                            .query("partNumber", &(index + 1).to_string()),
+                    )
+                    .header("x-amz-copy-source-range", &format!("bytes={start}-{end}")),
+                );
+            }
+            let mut complete = Unsigned::new("POST", &work.key).query("uploadId", &multipart.id);
+            if work.must_be_new {
+                complete = complete.header("if-none-match", "*");
+            }
+            requests.push(complete);
+        } else {
+            let mut request = copy(Unsigned::new("PUT", &work.key))
+                .header(
+                    "x-amz-metadata-directive",
+                    if work.explicit { "REPLACE" } else { "COPY" },
+                )
+                .header("x-amz-tagging-directive", "COPY");
+            if let Some(redirect) = work.source_head.website_redirect_location() {
+                request = request.header("x-amz-website-redirect-location", redirect);
+            }
+            if work.explicit {
+                if let Some(metadata) = work.desired_head.metadata() {
+                    for (name, value) in metadata {
+                        request = request.header(&format!("x-amz-meta-{name}"), value);
+                    }
+                }
+            }
+            if work.must_be_new {
+                request = request.header("if-none-match", "*");
+            }
+            requests.push(request);
+        }
+        self.authorize_requests(requests).await
+    }
+
+    async fn prepare_multipart_copy(
         &self,
         source: &Object,
         metadata: HeadObjectOutput,
         key: &str,
-        copy_source: &str,
-        new: bool,
-    ) -> Result<()> {
+    ) -> Result<PreparedCopyMultipart> {
         let bucket = self.options.route.source_bucket().unwrap();
         let part_size = self.part_size(source.size);
         anyhow::ensure!(
@@ -456,8 +645,22 @@ impl Engine {
             .map_err(|e| e.into_service_error())?;
         let id = created
             .upload_id()
-            .context("S3 omitted multipart upload ID")?;
+            .context("S3 omitted multipart upload ID")?
+            .to_owned();
         drop(setup_slot);
+        Ok(PreparedCopyMultipart { id, part_size })
+    }
+
+    async fn execute_multipart_copy(
+        &self,
+        source: &Object,
+        key: &str,
+        copy_source: &str,
+        new: bool,
+        prepared: PreparedCopyMultipart,
+    ) -> Result<()> {
+        let PreparedCopyMultipart { id, part_size } = prepared;
+        let id = id.as_str();
         let failed = std::sync::atomic::AtomicBool::new(false);
         let result: Result<()> = async {
             let mut parts = stream::iter(0..source.size.div_ceil(part_size))

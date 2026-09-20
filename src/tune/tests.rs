@@ -77,7 +77,15 @@ fn measure(p: &mut Policy, score: f64) {
 /// Feed the policy a model where throughput rises linearly with workers
 /// up to `cap` workers and is flat after.
 fn simulate(start: usize, cap: usize, rounds: usize, noise: impl Fn(usize) -> f64) -> Policy {
-    let mut p = Policy::new(start, MIN, MAX);
+    simulate_policy(Policy::new(start, MIN, MAX), cap, rounds, noise)
+}
+
+fn simulate_policy(
+    mut p: Policy,
+    cap: usize,
+    rounds: usize,
+    noise: impl Fn(usize) -> f64,
+) -> Policy {
     for i in 0..rounds {
         let eff = p.n.min(cap) as f64;
         measure(&mut p, eff * 10e6 * noise(i));
@@ -128,8 +136,93 @@ fn explicit_ceiling_above_64_bounds_automatic_growth() {
 }
 
 #[test]
-fn first_probe_is_modest_instead_of_doubling() {
-    let mut p = Policy::new(START_SSH, MIN, MAX);
+fn uncached_start_doubles_until_the_ceiling_then_stops_coarse_search() {
+    let mut p = Policy::new(8, MIN, 32);
+    for _ in 0..3 {
+        let rate = p.n as f64;
+        measure(&mut p, rate);
+    }
+    assert_eq!(p.history, vec![8, 16, 32]);
+    assert_eq!(p.n, 32);
+    assert!(!p.startup_doubling);
+    let mut capped = Policy::new(usize::MAX / 2 + 1, MIN, usize::MAX);
+    measure(&mut capped, 100.0);
+    assert_eq!(capped.n, usize::MAX);
+}
+
+#[test]
+fn unsuccessful_doubling_refines_immediately_then_uses_normal_backoff() {
+    let mut p = Policy::new(8, MIN, 64);
+    measure(&mut p, 80.0); // 8 -> 16
+    measure(&mut p, 160.0); // 16 -> 32
+    measure(&mut p, 150.0); // 32 hurt: try the 16..32 midpoint now
+    assert_eq!(p.n, 24);
+    assert_eq!(p.settled(), 16);
+    assert!(!p.startup_doubling);
+    measure(&mut p, 200.0); // 24 paid: refine the remaining 24..32 bracket
+    assert_eq!(p.n, 28);
+    measure(&mut p, 200.0); // 28 does not pay: return to 24 and wait
+    assert_eq!(p.n, 24);
+    assert!(matches!(p.state, State::Hold));
+    assert!(p.due[Direction::Up.index()] > p.tick);
+}
+
+#[test]
+fn cancelled_startup_doubling_does_not_change_active_workers_or_repeat_coarse_search() {
+    let mut p = Policy::new(8, MIN, 64);
+    p.observe(80.0);
+    assert_eq!(p.n, 16);
+    p.cancel_unapplied();
+    assert_eq!(p.n, 8);
+    assert_eq!(p.history, vec![8]);
+    assert!(!p.startup_doubling);
+    assert_eq!(p.target(Direction::Up), 10);
+}
+
+#[test]
+fn resume_worker_reset_preserves_cached_and_uncached_startup_modes() {
+    struct StopAfterReset(Arc<Sched>);
+    impl Meter for StopAfterReset {
+        fn bytes(&self) -> u64 {
+            0
+        }
+        fn files(&self) -> u64 {
+            0
+        }
+        fn set_active(&self, n: usize) {
+            if n == 8 {
+                self.0.abort();
+            }
+        }
+    }
+
+    let mut refined = Policy::new(2, MIN, MAX);
+    measure(&mut refined, 20.0);
+    measure(&mut refined, 20.0); // rejected doubling has entered finer search
+    for (policy, expected_next) in [
+        (Policy::from_cache(2, MIN, MAX), 10),
+        (Policy::new(2, MIN, MAX), 16),
+        (refined, 10),
+    ] {
+        let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+        // The same request made when a worker discovers a resumable basis:
+        // two size-limited initial workers restore the remembered eight.
+        sched.arm_direct_fallback(8);
+        sched.request_direct_fallback();
+        let gate = Gate::new(policy.active());
+        let meter = Arc::new(StopAfterReset(sched.clone()));
+        let mut reset = run(policy, gate.clone(), sched, meter, |id| gate.mark_ready(id));
+        assert_eq!(reset.active(), 8);
+        assert_eq!(reset.history, vec![8]);
+        assert!(gate.ready_through(8));
+        measure(&mut reset, 80.0);
+        assert_eq!(reset.n, expected_next);
+    }
+}
+
+#[test]
+fn cached_start_keeps_modest_probes() {
+    let mut p = Policy::from_cache(START_SSH, MIN, MAX);
     measure(&mut p, 80.0);
     assert_eq!(p.n, 10);
     assert_eq!(p.history, vec![8, 10]);
@@ -137,12 +230,12 @@ fn first_probe_is_modest_instead_of_doubling() {
 
 #[test]
 fn upward_acceptance_uses_the_near_best_objective() {
-    let mut worthwhile = Policy::new(10, MIN, MAX);
+    let mut worthwhile = Policy::from_cache(10, MIN, MAX);
     measure(&mut worthwhile, 100.0);
     measure(&mut worthwhile, 107.0);
     assert_eq!(worthwhile.settled(), 13);
 
-    let mut unnecessary = Policy::new(10, MIN, MAX);
+    let mut unnecessary = Policy::from_cache(10, MIN, MAX);
     measure(&mut unnecessary, 100.0);
     measure(&mut unnecessary, 104.0);
     assert_eq!(unnecessary.settled(), 10);
@@ -172,7 +265,7 @@ fn remaining_work_requirement_scales_with_rate_not_worker_count() {
 
 #[test]
 fn upward_probe_refreshes_its_baseline_while_warming() {
-    let mut policy = Policy::new(10, MIN, MAX);
+    let mut policy = Policy::from_cache(10, MIN, MAX);
     policy.observe(100.0);
     assert_eq!(policy.active(), 10);
     assert_eq!(policy.n, 13);
@@ -185,16 +278,16 @@ fn upward_probe_refreshes_its_baseline_while_warming() {
 }
 
 #[test]
-fn successful_direction_continues_to_the_plateau() {
-    let p = simulate(START_SSH, 32, 80, |_| 1.0);
+fn cached_successful_direction_continues_to_the_plateau() {
+    let p = simulate_policy(Policy::from_cache(START_SSH, MIN, MAX), 32, 80, |_| 1.0);
     assert_eq!(&p.history[..6], &[8, 10, 13, 17, 22, 29]);
     // 31 is the smallest integer within 5% of the observed best (32).
     assert_eq!(p.settled(), 31, "history {:?}", p.history);
 }
 
 #[test]
-fn a_gain_at_the_cap_holds_at_the_cap() {
-    let p = simulate(START_LOCAL, 200, 40, |_| 1.0);
+fn cached_gain_at_the_cap_holds_at_the_cap() {
+    let p = simulate_policy(Policy::from_cache(START_LOCAL, MIN, MAX), 200, 40, |_| 1.0);
     // Once the cap establishes the best score, downward refinement finds
     // the smallest integer within the 5% near-best tolerance.
     assert_eq!(p.settled(), 61, "history {:?}", p.history);
@@ -202,8 +295,29 @@ fn a_gain_at_the_cap_holds_at_the_cap() {
 }
 
 #[test]
+fn uncached_start_reaches_full_rate_early_and_then_trims_excess_workers() {
+    for (start, cap, smallest_near_best) in [(8, 32, 31), (32, 64, 61)] {
+        let mut p = simulate(start, cap, 3, |_| 1.0);
+        assert_eq!(p.settled(), cap, "history {:?}", p.history);
+        // Coarse startup leaves wider measured brackets. Existing failed-probe
+        // backoff can take longer to trim the final few workers than a cached
+        // start's finer path; it must still reach the smallest near-best count.
+        let mut reached = false;
+        for _ in 0..128 {
+            let rate = p.n.min(cap) as f64 * 10e6;
+            measure(&mut p, rate);
+            if p.settled() == smallest_near_best {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "history {:?}", p.history);
+    }
+}
+
+#[test]
 fn a_failed_up_probe_does_not_immediately_bounce_down() {
-    let mut p = Policy::new(10, MIN, MAX);
+    let mut p = Policy::from_cache(10, MIN, MAX);
     measure(&mut p, 100.0); // 10 -> 13
     measure(&mut p, 130.0); // 13 paid; try 17
     measure(&mut p, 130.0); // 17 did not; return to 13
@@ -219,7 +333,7 @@ fn a_failed_up_probe_does_not_immediately_bounce_down() {
 
 #[test]
 fn refines_to_the_smallest_near_best_integer() {
-    let mut p = Policy::new(10, MIN, MAX);
+    let mut p = Policy::from_cache(10, MIN, MAX);
     measure(&mut p, 100.0);
     measure(&mut p, 130.0);
     measure(&mut p, 130.0);

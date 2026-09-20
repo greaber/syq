@@ -219,11 +219,55 @@ impl Engine {
         }
     }
 
+    pub(super) async fn prepare_pruning(&self, plan: &Plan) -> Result<()> {
+        if self.authorization.is_none() || !self.args.delete {
+            return Ok(());
+        }
+        // Cache complete listings before disconnect. The pruning pass reuses the
+        // snapshot and still skips deletions if any copy failed.
+        if self.upload_keys.get().is_none() {
+            let mut keys = HashMap::new();
+            for (scope, _) in &plan.scopes {
+                let key = std::str::from_utf8(scope)?;
+                let prefix = if key.is_empty() {
+                    String::new()
+                } else {
+                    format!("{key}/")
+                };
+                keys.extend(
+                    client::list(
+                        &self.client,
+                        &self.options.bucket,
+                        &prefix,
+                        None,
+                        &mut HashSet::new(),
+                    )
+                    .await?
+                    .objects,
+                );
+            }
+            let _ = self.upload_keys.set(keys);
+        }
+        if self.args.dry_run {
+            return Ok(());
+        }
+        let requests = self
+            .deletion_candidates(&mut plan.clone(), None)
+            .await?
+            .iter()
+            .map(|candidate| {
+                crate::s3::authorization::Unsigned::new("DELETE", candidate.key.as_ref().unwrap())
+            })
+            .collect();
+        self.authorize_requests(requests).await
+    }
+
     async fn delete_objects(&self, candidates: &[Candidate]) -> Result<()> {
         crate::s3::delete::Deleter {
             client: &self.client,
             bucket: &self.options.bucket,
             budget: &self.tuning.requests,
+            individual: self.authorization.is_some(),
         }
         .run(
             candidates,

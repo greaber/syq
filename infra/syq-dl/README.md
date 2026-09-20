@@ -23,25 +23,21 @@ is the installer or a remote helper bootstrap, kind `binary` is Homebrew).
 
 ## Deploying
 
-The Cloudflare account ID and API token live in the encrypted `.env.release`
-inventory at the repository root. Run wrangler through dotenvx so they are
-available without leaving the shell:
+Wrangler needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN supplied
+through its environment, or authentication through Wrangler's own login.
+Use your preferred credential manager; this repository does not load a
+credential store. Run from the worktree containing the worker you intend to deploy:
 
     cd infra/syq-dl
     npm install
-    dotenvx run -f ../../.env.release -- npx wrangler deploy
-    dotenvx run -f ../../.env.release -- npx wrangler d1 migrations apply syq-dl --remote
+    npx wrangler deploy
+    npx wrangler d1 migrations apply syq-dl --remote
 
-To drop a cached asset, purge its URL; the token needs the zone's Cache Purge
-permission, which the stored one does not have yet (add it to the token in the
-Cloudflare dashboard):
+Query recorded events using the same authentication:
 
-    curl -X POST https://api.cloudflare.com/client/v4/zones/42640319e93a7dde7f09b46c5c9f69a7/purge_cache \
-      -H "Authorization: Bearer $(dotenvx get CLOUDFLARE_API_TOKEN -f ../../.env.release)" \
-      -H 'Content-Type: application/json' \
-      -d '{"files":["https://dl.syq.christmas/v0.6.0/syq-linux-x86_64.gz"]}'
-
-Query recorded events the same way:
-
-    dotenvx run -f ../../.env.release -- npx wrangler d1 execute syq-dl --remote \
+    npx wrangler d1 execute syq-dl --remote \
       --command 'select * from daily_checks order by day desc limit 20'
+
+Cache purges use Cloudflare's API and require a token with Cache Purge
+permission for the target zone. Deployment credentials do not necessarily
+include that permission.
