@@ -80,6 +80,18 @@ impl Controls {
             progress.set_results(writer.clone());
         }
         progress.files_total.store(1, Relaxed);
+        if args.s3.is_none() && !args.dry_run {
+            if let Some(history) = crate::tune::history::Recorder::start(
+                progress.start,
+                serde_json::json!({
+                    "policy_version":1,"driver":"descriptor","automatic":args.connections_default,
+                    "configured_workers":args.connections,"worker_limit":args.automatic_worker_limit(),
+                    "bandwidth_limit":args.bwlimit_bytes,"request_size":settings.request_size
+                }),
+            ) {
+                let _ = progress.tuning_history.set(history);
+            }
+        }
         if args.verbose > 0 && !args.quiet {
             if let Some(options) = &args.s3 {
                 crate::output::diagnostic!(
@@ -179,6 +191,10 @@ impl Controls {
         self.progress.errors.store(u64::from(!success), Relaxed);
         self.progress.finish(success);
         self.report.finish(self, error);
+        if let Some(history) = self.progress.tuning_history.get() {
+            history.complete(success,serde_json::json!({"elapsed_ms":self.progress.start.elapsed().as_millis(),
+                "bytes":bytes,"files":self.progress.files_done.load(Relaxed),"errors":u64::from(!success)}));
+        }
         if self.stats && !self.quiet && !self.report.dry_run && !self.report.skipped() {
             let seconds = self.progress.start.elapsed().as_secs_f64();
             crate::output::diagnostic!(

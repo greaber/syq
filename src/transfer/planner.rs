@@ -2439,6 +2439,12 @@ impl Planner<'_> {
             (self.partial_paths(partial_paths)?, Vec::new(), None)
         };
         if pre_stat {
+            self.progress.observe_destination_devices(
+                dir_stats
+                    .iter()
+                    .flatten()
+                    .chain(other_stats.iter().flatten().flatten()),
+            );
             mapped.dir_stats = Some(dir_stats);
             if let Some(stats) = other_stats {
                 mapped.other_stats = Some(other_paths.into_iter().zip(stats).collect());
@@ -3124,7 +3130,10 @@ impl Planner<'_> {
     }
 
     pub(super) fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
-        stat_many(self.dst, paths, false)
+        let entries = stat_many(self.dst, paths, false)?;
+        self.progress
+            .observe_destination_devices(entries.iter().flatten());
+        Ok(entries)
     }
 
     /// Avoid querying descendants of a directory conflict. The planner skips

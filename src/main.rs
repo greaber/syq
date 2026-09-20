@@ -279,6 +279,15 @@ fn main() {
             }
         }
     }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("tuning") {
+        match tune::history::run(&argv[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                crate::output::diagnostic!("syq tuning: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("completion") {
         match completion::run(&argv[2..]) {
             Ok(code) => std::process::exit(code),

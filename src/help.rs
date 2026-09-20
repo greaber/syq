@@ -329,6 +329,7 @@ pub(crate) fn root() -> Command {
         .subcommand(Command::new("rsync").about("Copy using rsync-compatible syntax"))
         .subcommand(Command::new("persist").about("Manage persistent connections, receiving, and return destinations"))
         .subcommand(Command::new("completion").about("Generate shell completion and manage cached endpoint suggestions"))
+        .subcommand(Command::new("tuning").about("Inspect and clear local transfer tuning history"))
         .subcommand(Command::new("receiver").about("Enroll, list, or revoke command-restricted receivers"))
         .subcommand(Command::new("help").about("Show help for a command, e.g. syq help cp")))
 }
@@ -405,6 +406,7 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
         Some("persist") => crate::persistence::command_for_help(),
         Some("completion") => crate::completion::command_for_help(),
         Some("receiver") => receiver(),
+        Some("tuning") => crate::tune::history::command_for_help(),
         Some("--self-update") => lifecycle(),
         Some(name) => crate::cli::command_for_completion(name)
             .ok_or_else(|| anyhow::anyhow!("unknown help topic {name:?}"))?,

@@ -256,6 +256,7 @@ fn tcp_server_joins_request_reader_on_shutdown() {
         .unwrap();
     let selection = RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap();
     let source = RegisteredSourceRoot {
+        filesystem: None,
         selection: selection.clone(),
         ticket,
         leaf_ticket: None,
@@ -582,6 +583,7 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
         .register(std::fs::File::open(selected.path()).unwrap())
         .unwrap();
     let source = RegisteredSourceRoot {
+        filesystem: None,
         selection: RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap(),
         ticket,
         leaf_ticket: None,

@@ -23,6 +23,9 @@
 //! the decision state machine; both are pure and unit tested. [`Gate`] is the
 //! shared switch the workers consult; [`run`] is the driver.
 
+pub(crate) mod history;
+pub(crate) mod trace;
+
 use crate::conn::{DataTransport, Endpoint};
 use crate::sched::Sched;
 use serde::{Deserialize, Serialize};
@@ -117,19 +120,10 @@ fn required_remaining_activity(rate: Option<f64>, workers: usize, sample: Durati
     }
 }
 
-fn enough_work(sched: &Sched, workers: usize, rate: Option<f64>, sample: Duration) -> bool {
-    sched.work_left_for(
-        workers,
-        required_remaining_activity(rate, workers, sample),
-        FILE_CREDIT,
-    )
-}
-
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TuningCache {
-    /// Deliberately only path+transport → last settled count. Volatile facts
-    /// such as RTT, loss, workload and filesystem are telemetry, not key
-    /// dimensions: a stale count is merely a cheap starting hint.
+    /// Legacy path+transport → last settled count. Keep the released format;
+    /// filesystem-specific evidence lives in the separate history store.
     paths: BTreeMap<String, usize>,
 }
 
@@ -153,8 +147,8 @@ fn transport_label(endpoint: &Endpoint) -> Option<&'static str> {
 }
 
 /// Stable identity for the directional data path. TCP and ssh results never
-/// seed one another. Local-only work is intentionally not persisted: its best
-/// count is primarily a property of whichever filesystems happen to be used.
+/// seed one another. This legacy cache excludes local-only work; the history
+/// store can reuse local results when both filesystems are known.
 pub fn path_key(src: &Endpoint, dst: &Endpoint) -> Option<String> {
     if !src.is_remote() && !dst.is_remote() {
         return None;
@@ -289,6 +283,7 @@ pub fn step_down(n: usize) -> usize {
 pub struct Sampler {
     samples: Vec<f64>,
     discard: bool,
+    pub(crate) last_status: &'static str,
 }
 
 impl Sampler {
@@ -296,14 +291,17 @@ impl Sampler {
     pub fn reset(&mut self) {
         self.samples.clear();
         self.discard = true;
+        self.last_status = "warmup_pending";
     }
 
     /// Feed one sample; returns a score once the rate is stable.
     pub fn push(&mut self, rate: f64) -> Option<f64> {
         if self.discard {
             self.discard = false;
+            self.last_status = "warmup_excluded";
             return None;
         }
+        self.last_status = "collecting";
         self.samples.push(rate);
         let n = self.samples.len();
         if n < 2 {
@@ -312,6 +310,7 @@ impl Sampler {
         let (a, b) = (self.samples[n - 2], self.samples[n - 1]);
         let stable = (a - b).abs() <= STABLE_WITHIN * a.max(b) || (a == 0.0 && b == 0.0);
         if stable || n >= MAX_SAMPLES {
+            self.last_status = if stable { "stable" } else { "sample_limit" };
             self.samples.clear();
             Some(0.5 * (a + b))
         } else {
@@ -320,7 +319,7 @@ impl Sampler {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 enum Direction {
     Down,
     Up,
@@ -342,7 +341,7 @@ impl Direction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 enum State {
     /// Waiting for the starting count's first useful measurement.
     Initial,
@@ -358,7 +357,7 @@ enum State {
     Hold,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 struct Point {
     score: f64,
     measured_at: usize,
@@ -705,6 +704,7 @@ pub struct Gate {
     retain: AtomicUsize,
     slots: Mutex<Vec<Slot>>,
     cv: Condvar,
+    history: std::sync::OnceLock<history::Recorder>,
 }
 
 /// Extend the slot table so `id`s below `n` exist. Slots are never dropped:
@@ -725,7 +725,36 @@ impl Gate {
             retain: AtomicUsize::new(active),
             slots: Mutex::new(Vec::new()),
             cv: Condvar::new(),
+            history: std::sync::OnceLock::new(),
         })
+    }
+
+    pub(crate) fn set_history(&self, history: history::Recorder) {
+        let _ = self.history.set(history);
+    }
+
+    fn counts(&self) -> (usize, usize, usize) {
+        let slots = self.slots.lock().unwrap();
+        (
+            slots.iter().filter(|s| s.phase == SlotPhase::Ready).count(),
+            slots
+                .iter()
+                .filter(|s| s.phase == SlotPhase::Warming)
+                .count(),
+            slots
+                .iter()
+                .filter(|s| s.phase == SlotPhase::Failed)
+                .count(),
+        )
+    }
+
+    fn record_slot(&self, id: usize, state: &str) {
+        if let Some(history) = self.history.get() {
+            history.event(
+                "worker",
+                serde_json::json!({"worker":id,"state":state,"active":self.active()}),
+            );
+        }
     }
 
     pub fn allowed(&self, id: usize) -> bool {
@@ -760,6 +789,10 @@ impl Gate {
                 ids.push(id);
             }
         }
+        drop(slots);
+        for id in &ids {
+            self.record_slot(*id, "warming");
+        }
         ids
     }
 
@@ -768,6 +801,8 @@ impl Gate {
         grow_to(&mut slots, id + 1);
         slots[id].phase = SlotPhase::Ready;
         self.cv.notify_all();
+        drop(slots);
+        self.record_slot(id, "ready");
     }
 
     pub fn mark_warming(&self, id: usize) {
@@ -775,6 +810,8 @@ impl Gate {
         grow_to(&mut slots, id + 1);
         slots[id].phase = SlotPhase::Warming;
         self.cv.notify_all();
+        drop(slots);
+        self.record_slot(id, "warming");
     }
 
     /// Mark a cleanly retired worker reusable immediately.
@@ -783,6 +820,8 @@ impl Gate {
         grow_to(&mut slots, id + 1);
         slots[id] = Slot::default();
         self.cv.notify_all();
+        drop(slots);
+        self.record_slot(id, "absent");
     }
 
     /// Mark setup or repeated connection loss after bounded retries.
@@ -791,6 +830,8 @@ impl Gate {
         grow_to(&mut slots, id + 1);
         slots[id].phase = SlotPhase::Failed;
         self.cv.notify_all();
+        drop(slots);
+        self.record_slot(id, "failed");
     }
 
     pub fn retained(&self, id: usize) -> bool {
@@ -846,6 +887,9 @@ impl Gate {
 
 /// Progress counters the tuner scores.
 pub trait Meter: Send + Sync {
+    fn history(&self) -> Option<history::Recorder> {
+        None
+    }
     fn bytes(&self) -> u64;
     fn files(&self) -> u64;
     fn set_active(&self, n: usize);
@@ -868,6 +912,7 @@ pub fn run(
     mut spawn: impl FnMut(usize),
 ) -> Policy {
     let mut policy = policy;
+    let mut trace = trace::Trace::new(meter.history(), &policy);
     let mut sampler = Sampler::default();
     sampler.reset();
     let mut last = (meter.bytes(), meter.files());
@@ -891,8 +936,18 @@ pub fn run(
         let requested = sched.take_worker_count_request().min(policy.max);
         if requested > active {
             let before = active;
+            trace.sample(
+                last,
+                (meter.bytes(), meter.files()),
+                sample_start.elapsed().as_secs_f64(),
+                &policy,
+                &gate,
+                "partial_before_reset",
+                None,
+            );
             policy = Policy::new(requested, policy.min, policy.max);
             active = requested;
+            trace.transition(&policy, "direct_copy_needs_userspace_transfer");
             gate.set_retain(requested);
             for id in gate.begin_warming(requested) {
                 spawn(id);
@@ -914,9 +969,19 @@ pub fn run(
         // active while its candidate workers connect in the background.
         if policy.n < active {
             let before = active;
+            trace.sample(
+                last,
+                (meter.bytes(), meter.files()),
+                sample_start.elapsed().as_secs_f64(),
+                &policy,
+                &gate,
+                "partial_before_activation",
+                None,
+            );
             gate.set_active(policy.n);
             active = policy.n;
             policy.activated();
+            trace.transition(&policy, "decrease_activated");
             meter.set_active(active);
             gate.set_retain(if active == 1 { 2 } else { active });
             sampler.reset();
@@ -932,8 +997,13 @@ pub fn run(
             continue;
         }
         if policy.n > active {
-            if !enough_work(&sched, policy.n, last_rate, sample) {
-                policy.cancel_unapplied();
+            if !trace.enough_work(&sched, policy.n, last_rate, sample) {
+                trace.cancel(
+                    &mut policy,
+                    "insufficient_remaining_work",
+                    last_rate,
+                    sample,
+                );
                 gate.set_retain(if active == 1 { 2 } else { active });
                 continue;
             }
@@ -948,16 +1018,26 @@ pub fn run(
                 }
                 // Failure to provision an optional upward probe is not a
                 // throughput result and must not fail the copy.
-                policy.cancel_unapplied();
+                trace.cancel(&mut policy, "candidate_setup_failed", last_rate, sample);
                 gate.set_retain(if active == 1 { 2 } else { active });
                 gate.clear_failed_from(active);
                 continue;
             }
             if gate.ready_through(policy.n) {
                 let before = active;
+                trace.sample(
+                    last,
+                    (meter.bytes(), meter.files()),
+                    sample_start.elapsed().as_secs_f64(),
+                    &policy,
+                    &gate,
+                    "partial_before_activation",
+                    None,
+                );
                 gate.set_active(policy.n);
                 active = policy.n;
                 policy.activated();
+                trace.transition(&policy, "candidate_ready");
                 meter.set_active(active);
                 sampler.reset();
                 collapse_samples = 0;
@@ -972,6 +1052,8 @@ pub fn run(
                 continue;
             }
 
+            trace.waiting("candidate_connecting", &policy);
+
             // The settled workers keep providing a fresh comparison while an
             // upward candidate connects. This prevents handshake delay from
             // turning unrelated path drift into an apparent candidate effect.
@@ -980,25 +1062,60 @@ pub fn run(
                 let secs = sample_start.elapsed().as_secs_f64();
                 sample_start = std::time::Instant::now();
                 if !gate.ready_through(active) {
+                    trace.sample(
+                        last,
+                        now,
+                        secs,
+                        &policy,
+                        &gate,
+                        "active_workers_connecting",
+                        None,
+                    );
                     last = now;
                     sampler.reset();
                     continue;
                 }
                 let Some(rate) = activity_rate(last, now, secs) else {
+                    trace.sample(last, now, secs, &policy, &gate, "counter_regressed", None);
                     last = now;
                     sampler.reset();
                     continue;
                 };
+                let sample_previous = last;
                 last = now;
                 last_rate = Some(rate);
-                if !enough_work(&sched, policy.n, last_rate, sample) {
-                    policy.cancel_unapplied();
+                if !trace.enough_work(&sched, policy.n, last_rate, sample) {
+                    trace.sample(
+                        sample_previous,
+                        now,
+                        secs,
+                        &policy,
+                        &gate,
+                        "insufficient_remaining_work",
+                        None,
+                    );
+                    trace.cancel(
+                        &mut policy,
+                        "insufficient_remaining_work",
+                        last_rate,
+                        sample,
+                    );
                     gate.set_retain(if active == 1 { 2 } else { active });
                     sampler.reset();
                     continue;
                 }
-                if let Some(score) = sampler.push(rate) {
-                    policy.refresh_warming_baseline(score);
+                let score = sampler.push(rate);
+                trace.sample(
+                    sample_previous,
+                    now,
+                    secs,
+                    &policy,
+                    &gate,
+                    sampler.last_status,
+                    score,
+                );
+                if let Some(score) = score {
+                    trace.refresh_baseline(&mut policy, score);
                     if crate::output::debug() {
                         crate::output::diagnostic!(
                             "syq: tune: refreshed {active}-worker baseline to {:.1} MB/s while {} workers warm",
@@ -1041,6 +1158,16 @@ pub fn run(
         // Only judge a configuration once every requested worker is actually
         // connected (ssh sessions can take seconds each).
         if !gate.ready_through(active) {
+            trace.sample(
+                last,
+                now,
+                secs,
+                &policy,
+                &gate,
+                "active_workers_connecting",
+                None,
+            );
+            trace.waiting("active_workers_connecting", &policy);
             last = now;
             sampler.reset();
             continue;
@@ -1048,6 +1175,7 @@ pub fn run(
         // Per second, so jitter in the sample length doesn't masquerade as a
         // throughput change.
         let Some(rate) = activity_rate(last, now, secs) else {
+            trace.sample(last, now, secs, &policy, &gate, "counter_regressed", None);
             // Progress can be retracted after uncertain acknowledgements. The
             // production meter is monotonic, but keep the generic driver safe
             // and discard any interval from a regressing implementation.
@@ -1056,12 +1184,23 @@ pub fn run(
             collapse_samples = 0;
             continue;
         };
+        let sample_previous = last;
         last = now;
         last_rate = Some(rate);
         // Estimate the time left at the rate just observed. In the tail, idle
         // workers say nothing; unlike a fixed byte threshold this remains
         // useful on both very slow and very fast paths.
-        if !enough_work(&sched, active, last_rate, sample) {
+        if !trace.enough_work(&sched, active, last_rate, sample) {
+            trace.sample(
+                sample_previous,
+                now,
+                secs,
+                &policy,
+                &gate,
+                "insufficient_remaining_work",
+                None,
+            );
+            trace.waiting("insufficient_remaining_work", &policy);
             sampler.reset();
             collapse_samples = 0;
             continue;
@@ -1075,16 +1214,35 @@ pub fn run(
             collapse_samples = 0;
         }
         if collapse_samples >= 2 {
-            policy.observe(rate);
+            trace.sample(
+                sample_previous,
+                now,
+                secs,
+                &policy,
+                &gate,
+                "collapse_guard",
+                Some(rate),
+            );
+            trace.observe(&mut policy, rate, "collapse_guard");
             sampler.reset();
             collapse_samples = 0;
             continue;
         }
-        let Some(score) = sampler.push(rate) else {
+        let score = sampler.push(rate);
+        trace.sample(
+            sample_previous,
+            now,
+            secs,
+            &policy,
+            &gate,
+            sampler.last_status,
+            score,
+        );
+        let Some(score) = score else {
             continue;
         };
         let before = policy.n;
-        policy.observe(score);
+        trace.observe(&mut policy, score, sampler.last_status);
         if policy.n != before {
             sampler.reset();
             if crate::output::debug() {
@@ -1097,6 +1255,16 @@ pub fn run(
             }
         }
     }
+    trace.sample(
+        last,
+        (meter.bytes(), meter.files()),
+        sample_start.elapsed().as_secs_f64(),
+        &policy,
+        &gate,
+        "final_partial",
+        None,
+    );
+    trace.end(&policy, sched.is_aborted());
     policy
 }
 

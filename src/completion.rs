@@ -560,7 +560,7 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let args_before = &words[2..index];
     match command {
-        "completion" | "persist" | "receiver" | "exec" => {
+        "completion" | "persist" | "receiver" | "exec" | "tuning" => {
             management_candidates(command, args_before, current)
         }
         "help" => Ok(help_candidates(args_before, current)),
@@ -733,6 +733,7 @@ fn public_command(name: &str) -> Option<clap::Command> {
         "receiver" => Some(crate::help::receiver()),
         "exec" => Some(crate::destination::exec::command_for_help()),
         "--self-update" => Some(crate::help::lifecycle()),
+        "tuning" => Some(crate::tune::history::command_for_help()),
         _ => crate::cli::command_for_completion(name),
     }
 }

@@ -33,6 +33,7 @@
   - [persist](commands/persist.md)
   - [receiver](commands/receiver.md)
   - [completion](commands/completion.md)
+  - [tuning](commands/tuning.md)
 - [S3 options and behavior](object-storage.md)
 - [Performance tuning](tuning.md)
 - [Resource limits](resource-limits.md)
