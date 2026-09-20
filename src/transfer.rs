@@ -1686,12 +1686,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                 || crate::conn::is_worker_initialization_error(&error) =>
                         {
                             gate.mark_failed(id);
+                            if !gate.allowed(id) && debug() {
+                                crate::output::diagnostic!(
+                                    "syq: worker {id}: optional connection setup failed ({error:#})"
+                                );
+                            }
                             return if gate.allowed(id) { Err(error) } else { Ok(()) };
                         }
                         Err(error) => {
                             failures += 1;
                             if failures >= CONNECTION_RECOVERY_ATTEMPTS {
                                 gate.mark_failed(id);
+                                if !gate.allowed(id) && debug() {
+                                    crate::output::diagnostic!(
+                                        "syq: worker {id}: optional connection setup failed ({error:#})"
+                                    );
+                                }
                                 return if gate.allowed(id) { Err(error) } else { Ok(()) };
                             }
                             gate.mark_warming(id);
