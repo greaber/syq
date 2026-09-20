@@ -7,6 +7,8 @@ use std::sync::{
     Arc,
 };
 
+mod ideal;
+
 const SLOTS: usize = 32;
 const STATE: &CStr = c"state";
 
@@ -15,6 +17,7 @@ pub(crate) struct Pool {
     state: File,
     max_bytes: u64,
     local: std::sync::Mutex<()>,
+    ideal: Option<ideal::Ideal>,
 }
 
 pub(crate) struct Owner {
@@ -57,7 +60,9 @@ impl Pool {
         state.read_exact_at(&mut bytes, 1)?;
         let max_bytes = u64::from_le_bytes(bytes);
         anyhow::ensure!(max_bytes != 0, "staging pool budget is zero");
+        let ideal = ideal::Ideal::open(&directory)?;
         Ok(Self {
+            ideal,
             directory,
             state,
             max_bytes,
@@ -66,6 +71,9 @@ impl Pool {
     }
 
     pub(crate) fn stats(&self) -> Result<crate::proto::RecyclingStats> {
+        if let Some(ideal) = &self.ideal {
+            return Ok(ideal.stats());
+        }
         let _lock = lock(self)?;
         let mut bytes = [0; 16];
         self.state.read_exact_at(&mut bytes, 9)?;
@@ -88,6 +96,14 @@ impl Pool {
 
 impl Owner {
     pub(crate) fn create(root: Arc<Root>, max_bytes: u64) -> Result<Self> {
+        Self::create_mode(
+            root,
+            max_bytes,
+            std::env::var_os("SYQ_EXPERIMENT_IDEAL_RECYCLE").is_some(),
+        )
+    }
+
+    fn create_mode(root: Arc<Root>, max_bytes: u64, ideal: bool) -> Result<Self> {
         anyhow::ensure!(max_bytes != 0, "staging pool budget is zero");
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce)?;
@@ -120,6 +136,9 @@ impl Owner {
             state.write_all_at(&[0], 0)?;
             state.write_all_at(&max_bytes.to_le_bytes(), 1)?;
             state.write_all_at(&[0; 16], 9)?;
+            if ideal {
+                ideal::Ideal::create(&directory)?;
+            }
             Pool::open(directory.try_clone()?)
         })();
         match result {
@@ -152,6 +171,9 @@ impl Owner {
         let _lock = lock(&self.pool)?;
         // Workers keep this descriptor: closure survives unlinking its name.
         self.pool.state.write_all_at(&[1], 0)?;
+        if let Some(ideal) = &self.pool.ideal {
+            ideal.close(&self.pool.directory)?;
+        }
         for i in 0..SLOTS {
             let name = CString::new(i.to_string())?;
             match unlink_at(self.pool.directory.as_raw_fd(), &name, 0) {
@@ -260,6 +282,9 @@ fn slots(pool: &Pool) -> Result<Vec<(CString, u64)>> {
 }
 
 pub(super) fn take(pool: &Pool, parent: &ResolvedParent<'_>, size: u64) -> Result<Option<File>> {
+    if let Some(ideal) = &pool.ideal {
+        return ideal.take(pool, parent, size);
+    }
     let _process = lock(pool)?;
     if pool.closed()? {
         return Ok(None);
@@ -361,6 +386,9 @@ pub(super) fn publish(
     target: &ResolvedParent<'_>,
     staged_identity: (u64, u64),
 ) -> Result<bool> {
+    if let Some(ideal) = &pool.ideal {
+        return ideal.publish(pool, source, target);
+    }
     let old = match open_at(
         target.directory.as_raw_fd(),
         &target.leaf,
@@ -498,6 +526,43 @@ mod tests {
         fn read(&self, name: &str) -> Vec<u8> {
             fs::read(self.directory.path().join(name)).unwrap()
         }
+    }
+
+    #[test]
+    fn ideal_pool_shares_atomic_inventory_between_worker_mappings() {
+        let fixture = Fixture::new();
+        let mut owner = Owner::create_mode(fixture.root.clone(), 128, true).unwrap();
+        let worker = Pool::open(owner.pool.directory().unwrap()).unwrap();
+        assert!(fixture.take(&worker, "first-part", 4).unwrap().is_none());
+        let old = fixture.file("target", b"old!");
+        fixture.file("part", b"new!");
+        assert!(fixture.publish(&owner.pool, "part", "target").unwrap());
+        let reused = fixture.take(&worker, "next-part", 4).unwrap().unwrap();
+        assert_eq!(reused.metadata().unwrap().ino(), old);
+        assert_eq!(fixture.read("target"), b"new!");
+        reused.write_all_at(b"next", 0).unwrap();
+        fixture.file("next-target", b"last");
+        assert!(fixture
+            .publish(&worker, "next-part", "next-target")
+            .unwrap());
+        assert_eq!(fixture.read("next-target"), b"next");
+        assert_eq!(owner.pool.stats().unwrap().files, 1);
+        owner.close().unwrap();
+        assert!(fixture.take(&worker, "after-close", 4).unwrap().is_none());
+    }
+
+    #[test]
+    fn ideal_pool_declines_retirement_when_equal_file_exceeds_budget() {
+        let fixture = Fixture::new();
+        let owner = Owner::create_mode(fixture.root.clone(), 3, true).unwrap();
+        assert!(fixture
+            .take(&owner.pool, "first-part", 4)
+            .unwrap()
+            .is_none());
+        fixture.file("target", b"old!");
+        fixture.file("part", b"new!");
+        assert!(!fixture.publish(&owner.pool, "part", "target").unwrap());
+        assert_eq!(fixture.read("target"), b"old!");
     }
 
     #[test]

@@ -1,0 +1,225 @@
+//! Unsafe experiment: exclusively controlled, equal-size, ordinary files only.
+//! No per-file eligibility/identity/reader checks. Never enable for user data.
+use super::*;
+use std::sync::atomic::AtomicU64;
+
+const NAME: &CStr = c"ideal";
+const MASK: u64 = (1 << SLOTS) - 1;
+#[repr(C, align(64))]
+struct Cell(AtomicU64);
+#[repr(C)]
+struct Header {
+    free: Cell,
+    ready: Cell,
+    size: Cell,
+    closed: Cell,
+    files: Cell,
+    bytes: Cell,
+}
+
+pub(super) struct Ideal {
+    header: std::ptr::NonNull<Header>,
+    names: [CString; SLOTS],
+}
+// The mapping is shared by processes; every mutable field is an atomic.
+unsafe impl Send for Ideal {}
+unsafe impl Sync for Ideal {}
+impl Drop for Ideal {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.header.as_ptr().cast(), std::mem::size_of::<Header>()) };
+    }
+}
+impl Ideal {
+    fn map(file: &File) -> Result<Self> {
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                std::mem::size_of::<Header>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        anyhow::ensure!(
+            p != libc::MAP_FAILED,
+            "map ideal pool: {}",
+            io::Error::last_os_error()
+        );
+        Ok(Self {
+            header: std::ptr::NonNull::new(p.cast()).unwrap(),
+            names: std::array::from_fn(|i| CString::new(i.to_string()).unwrap()),
+        })
+    }
+    fn h(&self) -> &Header {
+        unsafe { self.header.as_ref() }
+    }
+    pub(super) fn create(directory: &File) -> Result<()> {
+        let file = open_at(
+            directory.as_raw_fd(),
+            NAME,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o600,
+        )?;
+        file.set_len(std::mem::size_of::<Header>() as u64)?;
+        let map = Self::map(&file)?;
+        // Initialization precedes publishing the pool descriptor to workers.
+        unsafe {
+            map.header.as_ptr().write(Header {
+                free: Cell(AtomicU64::new(MASK)),
+                ready: Cell(AtomicU64::new(0)),
+                size: Cell(AtomicU64::new(0)),
+                closed: Cell(AtomicU64::new(0)),
+                files: Cell(AtomicU64::new(0)),
+                bytes: Cell(AtomicU64::new(0)),
+            });
+        }
+        Ok(())
+    }
+    pub(super) fn open(directory: &File) -> Result<Option<Self>> {
+        match open_at(
+            directory.as_raw_fd(),
+            NAME,
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(file) => {
+                anyhow::ensure!(
+                    file.metadata()?.len() == std::mem::size_of::<Header>() as u64,
+                    "invalid ideal pool header"
+                );
+                Self::map(&file).map(Some)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+    pub(super) fn close(&self, directory: &File) -> Result<()> {
+        self.h().closed.0.store(1, Ordering::Release);
+        unlink_at(directory.as_raw_fd(), NAME, 0)?;
+        Ok(())
+    }
+    pub(super) fn stats(&self) -> crate::proto::RecyclingStats {
+        crate::proto::RecyclingStats {
+            files: self.h().files.0.load(Ordering::Relaxed),
+            bytes: self.h().bytes.0.load(Ordering::Relaxed),
+        }
+    }
+    pub(super) fn take(
+        &self,
+        pool: &Pool,
+        parent: &ResolvedParent<'_>,
+        size: u64,
+    ) -> Result<Option<File>> {
+        let h = self.h();
+        if h.closed.0.load(Ordering::Acquire) != 0 {
+            return Ok(None);
+        }
+        let expected = h
+            .size
+            .0
+            .compare_exchange(0, size, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap_or_else(|s| s);
+        anyhow::ensure!(
+            expected == 0 || expected == size,
+            "ideal experiment requires equal file sizes"
+        );
+        let Some(slot) = claim(&h.ready.0, MASK) else {
+            return Ok(None);
+        };
+        let name = &self.names[slot];
+        // Open replaces the ordinary fresh-staging open; rename is additional.
+        let result = (|| {
+            let file = open_at(
+                pool.directory.as_raw_fd(),
+                name,
+                libc::O_RDWR | libc::O_CLOEXEC,
+                0,
+            )?;
+            retry_zero(|| unsafe {
+                libc::renameat2(
+                    pool.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            })?;
+            Ok(file)
+        })();
+        match result {
+            Ok(file) => {
+                h.free.0.fetch_or(1 << slot, Ordering::Release);
+                h.files.0.fetch_add(1, Ordering::Relaxed);
+                h.bytes.0.fetch_add(size, Ordering::Relaxed);
+                Ok(Some(file))
+            }
+            Err(e) => {
+                h.ready.0.fetch_or(1 << slot, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+    pub(super) fn publish(
+        &self,
+        pool: &Pool,
+        source: &ResolvedParent<'_>,
+        target: &ResolvedParent<'_>,
+    ) -> Result<bool> {
+        let h = self.h();
+        if h.closed.0.load(Ordering::Acquire) != 0 {
+            return Ok(false);
+        }
+        let size = h.size.0.load(Ordering::Acquire);
+        if size == 0 {
+            return Ok(false);
+        }
+        let count = (pool.max_bytes / size).min(SLOTS as u64);
+        let allowed = (1u64 << count) - 1;
+        let Some(slot) = claim(&h.free.0, allowed) else {
+            return Ok(false);
+        };
+        let name = &self.names[slot];
+        let linked = retry_zero(|| unsafe {
+            libc::linkat(
+                target.directory.as_raw_fd(),
+                target.leaf.as_ptr(),
+                pool.directory.as_raw_fd(),
+                name.as_ptr(),
+                0,
+            )
+        });
+        if let Err(e) = linked {
+            h.free.0.fetch_or(1 << slot, Ordering::Release);
+            if e.kind() == io::ErrorKind::NotFound {
+                return Ok(false);
+            }
+            return Err(e.into());
+        }
+        let result = retry_zero(|| unsafe {
+            libc::renameat(
+                source.directory.as_raw_fd(),
+                source.leaf.as_ptr(),
+                target.directory.as_raw_fd(),
+                target.leaf.as_ptr(),
+            )
+        });
+        if let Err(e) = result {
+            unlink_at(pool.directory.as_raw_fd(), name, 0)?;
+            h.free.0.fetch_or(1 << slot, Ordering::Release);
+            return Err(e.into());
+        }
+        // Publish only after the previous destination name has been replaced.
+        h.ready.0.fetch_or(1 << slot, Ordering::Release);
+        Ok(true)
+    }
+}
+
+fn claim(bits: &AtomicU64, allowed: u64) -> Option<usize> {
+    bits.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        let usable = current & allowed;
+        (usable != 0).then(|| current & !(1 << usable.trailing_zeros()))
+    })
+    .ok()
+    .map(|previous| (previous & allowed).trailing_zeros() as usize)
+}
