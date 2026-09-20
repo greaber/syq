@@ -200,8 +200,13 @@ impl Workers {
     }
     fn next(&self, id: usize) -> Result<Option<Job>> {
         anyhow::ensure!(!self.cancelled.load(Relaxed), "stream cancelled");
+        // This path pools completed connections in Session. Release surplus
+        // workers to that pool rather than parking with shared worker permits
+        // that another entry could use. The connection remains reusable.
         if !self.gate.park(id, || {
-            self.draining.load(Relaxed) || self.cancelled.load(Relaxed)
+            self.draining.load(Relaxed)
+                || self.cancelled.load(Relaxed)
+                || !self.gate.connection_needed(id)
         }) {
             return Ok(None);
         }
