@@ -59,7 +59,10 @@ def copy(arguments, *, allow=True, disconnect=True, interrupt=False, ok=None, re
     reader = threading.Thread(target=read_errors)
     reader.start()
     try:
-        pending = json.loads(run('syq', 'persist', 'receive', 'pending', '--json', '--wait', '--timeout', '15'))
+        try:
+            pending = json.loads(run('syq', 'persist', 'receive', 'pending', '--json', '--wait', '--timeout', '15'))
+        except subprocess.CalledProcessError as error:
+            raise AssertionError(f'approval unavailable; worker exit {process.poll()}: '+''.join(errors)) from error
         assert len(pending) == 1 and pending[0]['kind'] == 'storage', pending
         description = pending[0]['description']
         assert '604800 seconds' in description and 'receiver receipts do not apply' in description, description

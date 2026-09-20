@@ -30,8 +30,8 @@ manifest.write_text(''.join(json.dumps(entry)+'\n' for entry in entries))
 left, right = socket.socketpair()
 left.settimeout(60)
 with left, right:
-    process = subprocess.Popen([*sys.argv[2:], '--mapping', str(manifest),
-                                '--stream-mapping-fd', str(right.fileno())],
+    process = subprocess.Popen([*sys.argv[2:4], '--mapping', str(manifest),
+                                '--stream-mapping-fd', str(right.fileno()), *sys.argv[4:]],
                                pass_fds=(right.fileno(),), start_new_session=True)
     right.close()
     jobs = []
