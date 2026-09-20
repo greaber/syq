@@ -95,6 +95,12 @@ impl Request {
             "storage key contains a traversal component"
         );
         for (name, value) in &request.headers {
+            // SigV4 takes an explicit Host header in preference to the URL's
+            // authority. Only the approved endpoint may supply that authority.
+            anyhow::ensure!(
+                !name.eq_ignore_ascii_case("host"),
+                "storage signing does not permit a caller-supplied Host header"
+            );
             anyhow::ensure!(
                 name == &name.to_ascii_lowercase()
                     && http::HeaderName::from_bytes(name.as_bytes()).is_ok()
@@ -425,17 +431,16 @@ impl Authorization {
             .into_iter()
             .filter(|request| !state.requests.contains_key(request))
             .collect();
-        for batch in missing.chunks(128) {
-            let stream = state.connection.as_mut().with_context(|| format!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval", request = batch[0]))?;
-            let signed = crate::destination::storage::sign(stream, batch)?;
-            anyhow::ensure!(
-                signed.len() == batch.len(),
-                "incomplete storage authorization response"
-            );
-            for (request, signed) in batch.iter().cloned().zip(signed) {
-                state.requests.insert(request, signed);
-            }
+        if missing.is_empty() {
+            return Ok(());
         }
+        let stream = state.connection.as_mut().with_context(|| format!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval", request = missing[0]))?;
+        let signed = crate::destination::storage::sign(stream, &missing)?;
+        anyhow::ensure!(
+            signed.len() == missing.len(),
+            "incomplete storage authorization response"
+        );
+        state.requests.extend(missing.into_iter().zip(signed));
         Ok(())
     }
     pub(super) fn signed(&self, request: Unsigned) -> Result<String> {

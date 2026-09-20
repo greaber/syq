@@ -45,35 +45,60 @@ pub(crate) fn connect(name: &str, request: Request) -> Result<(UnixStream, Confi
     Ok((stream, configuration))
 }
 pub(crate) fn sign(stream: &mut UnixStream, requests: &[Unsigned]) -> Result<Vec<String>> {
-    let mut result = Vec::with_capacity(requests.len());
-    // Both request descriptions and returned URLs are bounded by the existing
-    // wire frame limit, including long keys and provider upload IDs.
-    for range in batches(requests, |batch| {
+    // Keep the bounded wire messages, but send them continuously while reading
+    // replies. Waiting after each message makes preparation cost one network
+    // round trip per 128 requests. Writing all messages before reading instead
+    // can deadlock when both socket buffers fill.
+    let ranges = batches(requests, |batch| {
         serde_json::to_vec(&SigningRequest::Sign(batch.to_vec()))
-    })? {
-        write_message(
-            stream,
-            &SigningRequest::Sign(requests[range.clone()].to_vec()),
-        )?;
-        let expected = result.len() + range.len();
-        while result.len() < expected {
-            match read_message(stream).context(
-                "authorizing machine disconnected during preparation; reconnect and rerun the copy",
-            )? {
-                SigningReply::Signed(urls) => {
-                    anyhow::ensure!(
-                        !urls.is_empty() && result.len() + urls.len() <= expected,
-                        "invalid storage signing response length"
-                    );
-                    result.extend(urls);
+    })?;
+    let mut writer = stream.try_clone()?;
+    std::thread::scope(|scope| {
+        let sending = scope.spawn(move || {
+            let result = (|| -> Result<()> {
+                for range in ranges {
+                    write_message(&mut writer, &SigningRequest::Sign(requests[range].to_vec()))?;
                 }
-                SigningReply::Error(error) => bail!("authorizing machine: {error}"),
-                _ => bail!("invalid storage signing response"),
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = writer.shutdown(std::net::Shutdown::Both);
             }
+            result
+        });
+        let received = (|| -> Result<Vec<String>> {
+            let mut result = Vec::with_capacity(requests.len());
+            while result.len() < requests.len() {
+                match read_message(stream).context(
+                    "authorizing machine disconnected during preparation; reconnect and rerun the copy",
+                )? {
+                    SigningReply::Signed(urls) => {
+                        anyhow::ensure!(
+                            !urls.is_empty() && result.len() + urls.len() <= requests.len(),
+                            "invalid storage signing response length"
+                        );
+                        result.extend(urls);
+                    }
+                    SigningReply::Error(error) => bail!("authorizing machine: {error}"),
+                    _ => bail!("invalid storage signing response"),
+                }
+            }
+            Ok(result)
+        })();
+        if received.is_err() {
+            // An early refusal must also release a sender blocked on later
+            // requests. This failed signing session cannot be reused.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
         }
-    }
-    Ok(result)
+        let sent = sending
+            .join()
+            .map_err(|_| anyhow::anyhow!("storage signing sender failed"));
+        let urls = received?;
+        sent??;
+        Ok(urls)
+    })
 }
+
 fn batches<T>(
     values: &[T],
     encode: impl Fn(&[T]) -> serde_json::Result<Vec<u8>>,
@@ -205,5 +230,123 @@ mod tests {
             );
         }
         assert!(batches(&["x".repeat(MAX_MESSAGE)], serde_json::to_vec).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    fn sockets() -> (UnixStream, UnixStream) {
+        let (client, server) = UnixStream::pair().unwrap();
+        for socket in [&client, &server] {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+        }
+        (client, server)
+    }
+    fn requests() -> Vec<Unsigned> {
+        (0..10_000)
+            .map(|n| {
+                serde_json::from_value(serde_json::json!({
+                    "method": "GET", "key": format!("allowed/{n}"), "query": {}, "headers": {},
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sends_later_batches_without_waiting_for_earlier_replies() {
+        let (mut client, mut server) = sockets();
+        let requests = requests();
+        let receiver = std::thread::spawn(move || {
+            let mut keys = Vec::new();
+            // Refuse to reply until every request arrived: this fails for a
+            // request/reply loop, independent of machine or network speed.
+            while keys.len() < 10_000 {
+                let SigningRequest::Sign(batch) = read_message(&mut server).unwrap() else {
+                    panic!("expected signing batch")
+                };
+                assert!(batch.len() <= 128);
+                keys.extend(batch.into_iter().map(|r| r.key));
+            }
+            for range in batches(&keys, |v| {
+                serde_json::to_vec(&SigningReply::Signed(v.to_vec()))
+            })
+            .unwrap()
+            {
+                write_message(&mut server, &SigningReply::Signed(keys[range].to_vec())).unwrap();
+            }
+            let SigningRequest::Finish = read_message(&mut server).unwrap() else {
+                panic!("expected finish")
+            };
+            write_message(&mut server, &SigningReply::Finished).unwrap();
+        });
+        assert_eq!(
+            sign(&mut client, &requests).unwrap(),
+            requests.into_iter().map(|r| r.key).collect::<Vec<_>>()
+        );
+        finish(&mut client).unwrap();
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn drains_large_replies_while_sending_requests() {
+        let (mut client, mut server) = sockets();
+        let requests = requests();
+        let receiver = std::thread::spawn(move || {
+            let mut received = 0;
+            while received < 10_000 {
+                let SigningRequest::Sign(batch) = read_message(&mut server).unwrap() else {
+                    panic!("expected signing batch")
+                };
+                received += batch.len();
+                let urls: Vec<_> = batch
+                    .into_iter()
+                    .map(|r| format!("{}?{}", r.key, "x".repeat(9000)))
+                    .collect();
+                for range in batches(&urls, |v| {
+                    serde_json::to_vec(&SigningReply::Signed(v.to_vec()))
+                })
+                .unwrap()
+                {
+                    write_message(&mut server, &SigningReply::Signed(urls[range].to_vec()))
+                        .unwrap();
+                }
+            }
+        });
+        let urls = sign(&mut client, &requests).unwrap();
+        assert_eq!(urls.len(), 10_000);
+        for (request, url) in requests.iter().zip(urls) {
+            assert_eq!(url, format!("{}?{}", request.key, "x".repeat(9000)));
+        }
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn early_rejection_stops_the_pending_sender() {
+        let (mut client, mut server) = sockets();
+        let receiver = std::thread::spawn(move || {
+            let _: SigningRequest = read_message(&mut server).unwrap();
+            write_message(
+                &mut server,
+                &SigningReply::Error("outside approved paths".into()),
+            )
+            .unwrap();
+            // Keep the peer open until the client closes the failed session.
+            let mut buffer = [0; 4096];
+            while std::io::Read::read(&mut server, &mut buffer).unwrap() != 0 {}
+        });
+        let error = sign(&mut client, &requests()).unwrap_err();
+        assert!(
+            error.to_string().contains("outside approved paths"),
+            "{error:#}"
+        );
+        receiver.join().unwrap();
     }
 }

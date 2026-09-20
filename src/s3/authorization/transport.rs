@@ -1,3 +1,5 @@
+mod redaction;
+
 use super::*;
 use aws_smithy_runtime_api::client::{
     http::{
@@ -44,9 +46,7 @@ impl HttpConnector for Connector {
                         .map_err(|_| failure("invalid authorized storage request"))?,
                 )
                 .await
-                .map_err(|_| {
-                    failure("direct storage connection failed; signed request details suppressed")
-                })
+                .map_err(redaction::connector_error)
         })
     }
 }
@@ -135,6 +135,94 @@ pub(in crate::s3) fn signed_header(name: &str, method: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Debug, Clone)]
+    struct ResetOnce {
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        include_url: bool,
+    }
+    impl HttpConnector for ResetOnce {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            use std::sync::atomic::Ordering::Relaxed;
+            let result = if self.attempts.fetch_add(1, Relaxed) == 0 {
+                let details = if self.include_url {
+                    format!("connection reset while accessing {}", request.uri())
+                } else {
+                    "connection reset".to_owned()
+                };
+                Err(ConnectorError::io(
+                    std::io::Error::new(std::io::ErrorKind::ConnectionReset, details).into(),
+                ))
+            } else {
+                let mut response = aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
+                    200.try_into().unwrap(),
+                    aws_smithy_types::body::SdkBody::empty(),
+                );
+                response.headers_mut().insert("content-length", "0");
+                Ok(response)
+            };
+            HttpConnectorFuture::ready(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_head_retries_connection_resets_like_ordinary_head() {
+        use aws_sdk_s3::config::{retry::RetryConfig, Builder, Credentials, Region};
+        for delegated in [false, true] {
+            for include_url in [false, true] {
+                let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let connector = ResetOnce {
+                    attempts: attempts.clone(),
+                    include_url,
+                };
+                let client =
+                    http_client_fn(move |_, _| SharedHttpConnector::new(connector.clone()));
+                let client = if delegated {
+                    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                    let authorization = Arc::new(Authorization::new(
+                        "fixture".into(),
+                        Configuration {
+                            endpoint: "https://storage.example".into(),
+                            region: "auto".into(),
+                            expires_at: now().unwrap() + 60,
+                            requested_lifetime: 60,
+                        },
+                        socket,
+                    ));
+                    {
+                        let mut state = authorization.state.lock().unwrap();
+                        state.connection = None;
+                        state.requests.insert(Unsigned::new("HEAD", "key"),
+                            "https://storage.example/fixture/key?X-Amz-Signature=secret&X-Amz-Security-Token=token".into());
+                    }
+                    http_client(client, authorization)
+                } else {
+                    client.into()
+                };
+                let client = aws_sdk_s3::Client::from_conf(
+                    Builder::new()
+                        .behavior_version_latest()
+                        .region(Region::new("auto"))
+                        .endpoint_url("https://storage.example")
+                        .force_path_style(true)
+                        .credentials_provider(Credentials::new(
+                            "fixture", "fixture", None, None, "test",
+                        ))
+                        .retry_config(RetryConfig::standard().with_max_attempts(2))
+                        .http_client(client)
+                        .build(),
+                );
+                client
+                    .head_object()
+                    .bucket("fixture")
+                    .key("key")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+            }
+        }
+    }
+
     #[test]
     fn sdk_telemetry_and_ranges_do_not_change_the_prepared_request() {
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
