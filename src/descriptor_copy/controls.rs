@@ -84,7 +84,7 @@ impl Controls {
             if let Some(history) = crate::tune::history::Recorder::start(
                 progress.start,
                 serde_json::json!({
-                    "policy_version":1,"driver":"descriptor","automatic":args.connections_default,
+                    "policy_version":crate::tune::POLICY_VERSION,"driver":"descriptor","automatic":args.connections_default,
                     "configured_workers":(!args.connections_default).then_some(args.connections),"worker_limit":(args.automatic_worker_limit() != usize::MAX).then(|| args.automatic_worker_limit()),
                     "bandwidth_limit":args.bwlimit_bytes,"request_size":settings.request_size
                 }),
