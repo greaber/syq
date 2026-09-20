@@ -40,14 +40,14 @@ there; the server needs no storage credentials. Endpoint and region options
 still work, including providers such as R2, Tigris, and MinIO. Both machines
 must run the same syq build; reconnect after updating them.
 
-Keep the laptop connected while syq lists objects, checks local upload files,
+Keep the laptop connected while syq lists objects, hashes local upload files,
 and prepares signed requests. Once the server prints **storage authorization
 ready**, you can disconnect the laptop. File data travels directly between
 the server and storage. Run the command in tmux if it should survive closing
 your SSH terminal; syq stays in the foreground.
 
-Authorization lasts up to seven days from approval. Temporary credentials can
-expire sooner, and provider policies or revocation can shorten access further.
+Syq requests seven days of authorization. Temporary credentials can expire
+sooner, and provider policies or revocation can shorten access further.
 Syq prints the expiry after preparation. The signed requests stay in memory.
 After a process restart or expiry, rerun the copy and approve again; ordinary
 multipart recovery can reuse completed work.
