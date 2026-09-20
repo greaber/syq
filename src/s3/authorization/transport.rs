@@ -196,7 +196,7 @@ mod tests {
                     }
                     http_client(client, authorization)
                 } else {
-                    client.into()
+                    client
                 };
                 let client = aws_sdk_s3::Client::from_conf(
                     Builder::new()
