@@ -369,3 +369,36 @@ fn literal_object_keys_keep_their_scope_through_signing_and_transport() {
     }
     assert!(signer.sign(&Unsigned::new("GET", "literal")).is_err());
 }
+
+#[test]
+fn signer_rejects_caller_supplied_host() {
+    let signer = Signer {
+        request: approval(),
+        configuration: Configuration {
+            endpoint: "https://storage.example".into(),
+            region: "auto".into(),
+            expires_at: now().unwrap() + DEFAULT_LIFETIME,
+            requested_lifetime: DEFAULT_LIFETIME,
+        },
+        credentials: aws_sdk_s3::config::Credentials::new(
+            "fixture-key",
+            "fixture-secret",
+            None,
+            None,
+            "test",
+        ),
+    };
+    for name in ["host", "Host", "HOST", "hOsT"] {
+        for host in ["other-bucket.storage.example", "storage.example"] {
+            let error = signer
+                .sign(&Unsigned::new("GET", "allowed/file").header(name, host))
+                .unwrap_err();
+            assert!(error.to_string().contains("Host"), "{error:#}");
+        }
+    }
+    let signed = signer.sign(&Unsigned::new("GET", "allowed/file")).unwrap();
+    assert_eq!(
+        url::Url::parse(&signed).unwrap().host_str(),
+        Some("storage.example")
+    );
+}
