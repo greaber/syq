@@ -44,10 +44,67 @@ impl Registry {
     }
 }
 
+// Diagnostic experiment only. No limit is selected unless explicitly requested.
+// The eventual policy depends on measured throughput, CPU and wait behavior.
+#[cfg(target_os = "linux")]
+struct DiagnosticWriteLimit {
+    slots: usize,
+    active: Mutex<usize>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(target_os = "linux")]
+impl DiagnosticWriteLimit {
+    fn acquire(&self) -> DiagnosticWritePermit<'_> {
+        let mut active = self.active.lock().unwrap();
+        while *active >= self.slots {
+            active = self.changed.wait(active).unwrap();
+        }
+        *active += 1;
+        DiagnosticWritePermit(self)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct DiagnosticWritePermit<'a>(&'a DiagnosticWriteLimit);
+
+#[cfg(target_os = "linux")]
+impl Drop for DiagnosticWritePermit<'_> {
+    fn drop(&mut self) {
+        *self.0.active.lock().unwrap() -= 1;
+        self.0.changed.notify_one();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn diagnostic_write_limit() -> Option<&'static DiagnosticWriteLimit> {
+    static LIMIT: OnceLock<Option<DiagnosticWriteLimit>> = OnceLock::new();
+    LIMIT
+        .get_or_init(|| {
+            std::env::var("SYQ_DIAG_TMPFS_WRITE_SLOTS")
+                .ok()
+                .map(|value| {
+                    let slots = value.parse::<usize>().expect("diagnostic write slot count");
+                    assert!(
+                        (1..=256).contains(&slots),
+                        "diagnostic write slots: 1..=256"
+                    );
+                    DiagnosticWriteLimit {
+                        slots,
+                        active: Mutex::new(0),
+                        changed: std::sync::Condvar::new(),
+                    }
+                })
+        })
+        .as_ref()
+}
+
 pub(crate) struct CachedFile {
     file: File,
     #[cfg(any(target_os = "linux", test))]
     gate: OnceLock<Arc<Mutex<()>>>,
+    #[cfg(target_os = "linux")]
+    diagnostic_tmpfs: OnceLock<bool>,
 }
 
 impl CachedFile {
@@ -56,6 +113,8 @@ impl CachedFile {
             file,
             #[cfg(any(target_os = "linux", test))]
             gate: OnceLock::new(),
+            #[cfg(target_os = "linux")]
+            diagnostic_tmpfs: OnceLock::new(),
         }
     }
 
@@ -92,6 +151,19 @@ impl CachedFile {
         let gate = self.write_gate()?;
         #[cfg(any(target_os = "linux", test))]
         let _writer = gate.lock().unwrap();
+        #[cfg(target_os = "linux")]
+        let _permit = diagnostic_write_limit().and_then(|limit| {
+            use std::os::fd::AsRawFd;
+            let is_tmpfs = self.diagnostic_tmpfs.get_or_init(|| {
+                let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                // fstatfs initializes the structure only on success.
+                unsafe {
+                    libc::fstatfs(self.file.as_raw_fd(), fs.as_mut_ptr()) == 0
+                        && fs.assume_init().f_type as u32 == libc::TMPFS_MAGIC as u32
+                }
+            });
+            is_tmpfs.then(|| limit.acquire())
+        });
         self.file.write_all_at(data, offset)
     }
 }
@@ -100,6 +172,47 @@ impl CachedFile {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diagnostic_limit_bounds_writers_and_releases_after_errors() {
+        let limit = DiagnosticWriteLimit {
+            slots: 2,
+            active: Mutex::new(0),
+            changed: std::sync::Condvar::new(),
+        };
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let (limit, active, peak) = (&limit, &active, &peak);
+                scope.spawn(move || {
+                    for _ in 0..32 {
+                        let _permit = limit.acquire();
+                        let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(n, Ordering::SeqCst);
+                        assert!(n <= 2);
+                        std::thread::yield_now();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert!(peak.load(Ordering::SeqCst) > 0);
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("read-only");
+        std::fs::write(&path, b"original").unwrap();
+        let file = File::open(path).unwrap();
+        let result = {
+            let _permit = limit.acquire();
+            file.write_all_at(b"replacement", 0)
+        };
+        assert!(result.is_err());
+        assert_eq!(*limit.active.lock().unwrap(), 0);
+        let _first = limit.acquire();
+        let _second = limit.acquire();
+        assert_eq!(*limit.active.lock().unwrap(), 2);
+    }
 
     #[test]
     fn registry_sweeps_leave_room_for_live_gates_and_reclaim_idle_entries() {
