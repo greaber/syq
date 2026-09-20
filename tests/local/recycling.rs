@@ -185,3 +185,22 @@ fn handled_write_failure_cleans_pool_and_resume_works_without_recycling() {
         );
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn explicit_recycling_requires_linux_destination() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    fs::create_dir_all(t.path("destination")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp"])
+        .arg(t.path("source"))
+        .arg("--into")
+        .arg(t.path("destination"))
+        .args(["--recycle-staging=1M", "--no-progress"])
+        .run()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires a Linux receiver"));
+    assert_eq!(fs::read_dir(t.path("destination")).unwrap().count(), 0);
+}
