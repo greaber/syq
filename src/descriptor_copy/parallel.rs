@@ -659,7 +659,7 @@ pub(crate) async fn execute(
                     if let Some(score) = sampler.push(rate) {
                         let target = policy.observe(score);
                         if target != gate.active() {
-                            if target < gate.active() { gate.set_active(target); gate.set_retain(target.max(2)); policy.activated(); }
+                            if target < gate.active() { gate.set_active(target); gate.set_connect_target(target.max(2)); policy.activated(); }
                             for id in gate.begin_warming(target) { spawn(&mut tasks, id); }
                             sampler.reset();
                         }
