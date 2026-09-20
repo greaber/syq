@@ -645,6 +645,52 @@ fn retired_connection_is_not_ready_or_duplicated_before_worker_cleanup() {
 }
 
 #[test]
+fn warming_forecast_waits_for_candidate_measurements_not_baseline_refresh() {
+    let mut policy = Policy::new(16, 1, 64);
+    assert_eq!(policy.observe(100.0), 21);
+    assert_eq!(policy.active(), 16);
+    let mut baseline = Sampler::default();
+    assert_eq!(baseline.push(100.0), None);
+    // The next baseline score is due now, but the candidate still needs a
+    // discarded sample plus two measured samples after activation.
+    let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+    assert_eq!(plan.connect, 21);
+    assert!(plan.keep >= 21);
+    assert!(policy.refresh_warming_baseline(100.0));
+    let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+    assert_eq!(plan.connect, 21);
+    // Truly slow setup can still justify overlapping preparation, using the
+    // earliest post-activation decision rather than a baseline refresh.
+    let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(10), true);
+    assert_eq!(plan.connect, step_up(21));
+    policy.activated();
+    let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+    assert_eq!(plan.connect, step_up(21));
+}
+
+#[test]
+fn setup_clock_starts_at_connection_not_worker_reservation() {
+    let gate = Gate::new(1);
+    assert_eq!(gate.begin_warming(1), vec![0]);
+    // An initial worker may remain here throughout a slow source listing.
+    // Reserving it must not start a clock that can include that wait.
+    assert_eq!(gate.slots.lock().unwrap()[0].phase, SlotPhase::Warming);
+    assert_eq!(gate.slots.lock().unwrap()[0].setup_started, None);
+    assert_eq!(gate.setup_lead(), Duration::from_secs(1));
+    assert!(!gate.ready_through(1));
+
+    let connecting = Instant::now();
+    gate.mark_warming(0);
+    let started = gate.slots.lock().unwrap()[0].setup_started.unwrap();
+    assert!(started >= connecting);
+    gate.mark_warming(0);
+    assert_eq!(gate.slots.lock().unwrap()[0].setup_started, Some(started));
+    gate.mark_ready(0);
+    assert!(gate.ready_through(1));
+    assert_eq!(gate.slots.lock().unwrap()[0].setup_started, None);
+}
+
+#[test]
 fn setup_lead_includes_retries_and_does_not_shrink_after_one_fast_setup() {
     let gate = Gate::new(1);
     gate.begin_warming(1);
@@ -655,6 +701,7 @@ fn setup_lead_includes_retries_and_does_not_shrink_after_one_fast_setup() {
     gate.mark_ready(0);
     assert!(gate.setup_lead() >= Duration::from_secs(21));
     gate.begin_warming(2);
+    gate.mark_warming(1);
     gate.mark_ready(1);
     assert!(gate.setup_lead() >= Duration::from_secs(21));
 }

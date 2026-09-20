@@ -492,7 +492,16 @@ impl Policy {
             plan.connect = self.max.min(2);
         }
         if let Some((candidate, ticks)) = forecast {
-            let until = sampler.earliest_score_in(sample, elapsed).saturating_add(
+            let first_score = if self.n != self.active {
+                // Samples while the candidate connects only refresh its
+                // baseline. Activation starts a fresh measurement period.
+                let mut candidate_sampler = Sampler::default();
+                candidate_sampler.reset();
+                candidate_sampler.earliest_score_in(sample, Duration::ZERO)
+            } else {
+                sampler.earliest_score_in(sample, elapsed)
+            };
+            let until = first_score.saturating_add(
                 sample
                     .saturating_mul(2)
                     .saturating_mul(u32::try_from(ticks.saturating_sub(1)).unwrap_or(u32::MAX)),
@@ -867,7 +876,7 @@ impl Gate {
         self.cv.notify_all();
     }
 
-    /// Include queued setup and retries, not just the successful handshake.
+    /// Include connection retries, not just the successful handshake.
     /// A high-water mark with 2x headroom avoids learning an optimistic lead
     /// from one fast connection. The extra second covers polling jitter.
     fn setup_lead(&self) -> Duration {
@@ -876,7 +885,8 @@ impl Gate {
             .saturating_add(Duration::from_secs(1))
     }
 
-    /// Claim absent slots through `n` for connection setup.
+    /// Reserve absent slots through `n`. Workers start timing with
+    /// `mark_warming` when they can connect, after any wait for planning.
     pub fn begin_warming(&self, n: usize) -> Vec<usize> {
         let mut slots = self.slots.lock().unwrap();
         grow_to(&mut slots, n);
@@ -884,7 +894,6 @@ impl Gate {
         for (id, slot) in slots.iter_mut().take(n).enumerate() {
             if slot.phase == SlotPhase::Absent {
                 slot.phase = SlotPhase::Warming;
-                slot.setup_started = Some(Instant::now());
                 ids.push(id);
             }
         }
@@ -904,6 +913,7 @@ impl Gate {
         self.cv.notify_all();
     }
 
+    /// Begin connection setup, preserving the start across retries/backoff.
     pub fn mark_warming(&self, id: usize) {
         let mut slots = self.slots.lock().unwrap();
         grow_to(&mut slots, id + 1);

@@ -172,6 +172,7 @@ struct Workers {
 }
 impl Workers {
     fn run(&self, id: usize, permit: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
+        self.gate.mark_warming(id);
         let mut worker = self.session.worker(
             self.ticket.clone(),
             self.controls.settings,

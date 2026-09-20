@@ -1637,6 +1637,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .get()
                     .context("source roots were not registered before workers started")?
                     .clone();
+                #[cfg(debug_assertions)]
+                if id == 0 {
+                    crate::fsops::test_race_barrier(
+                        "SYQ_TEST_WORKER_CONNECT_READY_FILE",
+                        "SYQ_TEST_WORKER_CONNECT_CONTINUE_FILE",
+                        "first worker connection",
+                    )?;
+                }
+                // Planner wait is not connection setup. Start once here so
+                // subsequent connection attempts still include retry backoff.
+                gate.mark_warming(id);
                 let mut failures = 0u32;
                 loop {
                     if !gate.connection_needed(id) {

@@ -462,12 +462,10 @@ fn one_worker_hint_prepares_spare_before_slow_connection_is_ready() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     t.expose_remote_syq();
-    let script = fs::read_to_string(&rsh).unwrap();
-    fs::write(
-        &rsh,
-        script.replace("exec /bin/sh -c", "sleep 0.7\nexec /bin/sh -c"),
-    )
-    .unwrap();
+    // Hold worker zero until another worker records a completed connection.
+    // Without the early spare this reaches the barrier's bounded timeout;
+    // scheduler delays cannot make the first connection race ahead.
+    let worker_events = t.path("worker-events");
     let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     write(&t.path("src/one"), &data);
     write(&t.path("src/two"), &data);
@@ -494,9 +492,17 @@ fn one_worker_hint_prepares_spare_before_slow_connection_is_ready() {
         .env("SYQ_TUNING_CACHE", &cache)
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_TUNE_SAMPLE_MS", "50")
+        .env(
+            "SYQ_TEST_WORKER_CONNECT_READY_FILE",
+            t.path("worker-zero-waiting"),
+        )
+        .env("SYQ_TEST_WORKER_CONNECT_CONTINUE_FILE", &worker_events)
+        .env("SYQ_TEST_WORKER_EVENTS", &worker_events)
         .run()
         .unwrap();
     assert_output_ok(&out);
+    let events = fs::read_to_string(&worker_events).unwrap();
+    assert_eq!(events.lines().next(), Some("connected 1 0"), "{events}");
     assert_eq!(read(&t.path("dst/one")), data);
     assert_eq!(read(&t.path("dst/two")), data);
     let stderr = String::from_utf8_lossy(&out.stderr);
