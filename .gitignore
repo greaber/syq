@@ -7,7 +7,7 @@ __pycache__/
 /.claude/*
 !/.claude/settings.json
 /.worktrees/
-/.env.keys
+/.env*
 
 # Agent working notes / handoff plans (not committed).
 /current-plans

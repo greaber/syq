@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Create syq's encrypted release inventory without exposing its durable signing
-# or Homebrew deploy keys to GitHub. Run once, then commit only .env.release.
+# or Homebrew deploy keys to GitHub. Both files stay outside the repository.
 set -euo pipefail
 
 DOTENVX_VERSION=2.21.0
-ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-ENV_FILE="$ROOT_DIR/.env.release"
-KEYS_FILE="$ROOT_DIR/.env.keys"
+SECRETS_DIR=${SYQ_RELEASE_SECRETS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/syq/release}
+ENV_FILE="$SECRETS_DIR/.env.release"
+KEYS_FILE="$SECRETS_DIR/.env.keys"
 DOTENVX_BIN=${DOTENVX_BIN:-dotenvx}
 
 die() {
@@ -32,6 +32,7 @@ command -v ssh-keygen >/dev/null || die "ssh-keygen is required"
 [ ! -e "$KEYS_FILE" ] || die "$KEYS_FILE already exists; refusing to replace its decryption authority"
 
 umask 077
+mkdir -p "$SECRETS_DIR"
 work=$(mktemp -d "${TMPDIR:-/tmp}/syq-init-release.XXXXXXXX")
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
@@ -70,11 +71,11 @@ dotenvx_set HOMEBREW_TAP_DEPLOY_KEY "$homebrew_deploy_key"
   || die "failed to verify the encrypted Homebrew deploy key"
 
 chmod 600 "$staged_keys"
-chmod 644 "$staged_env"
+chmod 600 "$staged_env"
 mv "$staged_keys" "$KEYS_FILE"
 mv "$staged_env" "$ENV_FILE"
 
 unset homebrew_deploy_key signing_key_b64
 printf '%s\n' \
   "Created $ENV_FILE and local $KEYS_FILE." \
-  "Back up .env.keys in protected storage, then commit only .env.release."
+  "Back up both files in protected storage. Do not commit either file."

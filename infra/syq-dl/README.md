@@ -23,25 +23,26 @@ is the installer or a remote helper bootstrap, kind `binary` is Homebrew).
 
 ## Deploying
 
-The Cloudflare account ID and API token live in the encrypted `.env.release`
-inventory at the repository root. Run wrangler through dotenvx so they are
-available without leaving the shell:
+The Cloudflare account ID and API token live in the private release inventory
+outside this repository (see [release credentials](../../RELEASING.md#encrypted-release-inventory)).
+Run wrangler through dotenvx to load them into the command environment:
 
+    secrets_dir=${SYQ_RELEASE_SECRETS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/syq/release}
     cd infra/syq-dl
     npm install
-    dotenvx run -f ../../.env.release -- npx wrangler deploy
-    dotenvx run -f ../../.env.release -- npx wrangler d1 migrations apply syq-dl --remote
+    dotenvx run -f "$secrets_dir/.env.release" -fk "$secrets_dir/.env.keys" -- npx wrangler deploy
+    dotenvx run -f "$secrets_dir/.env.release" -fk "$secrets_dir/.env.keys" -- npx wrangler d1 migrations apply syq-dl --remote
 
 To drop a cached asset, purge its URL; the token needs the zone's Cache Purge
 permission, which the stored one does not have yet (add it to the token in the
-Cloudflare dashboard):
+Cloudflare dashboard). Set `CLOUDFLARE_ZONE_ID` to the zone to purge:
 
-    curl -X POST https://api.cloudflare.com/client/v4/zones/42640319e93a7dde7f09b46c5c9f69a7/purge_cache \
-      -H "Authorization: Bearer $(dotenvx get CLOUDFLARE_API_TOKEN -f ../../.env.release)" \
+    curl -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/purge_cache" \
+      -H "Authorization: Bearer $(dotenvx get CLOUDFLARE_API_TOKEN -f "$secrets_dir/.env.release" -fk "$secrets_dir/.env.keys")" \
       -H 'Content-Type: application/json' \
       -d '{"files":["https://dl.syq.christmas/v0.6.0/syq-linux-x86_64.gz"]}'
 
 Query recorded events the same way:
 
-    dotenvx run -f ../../.env.release -- npx wrangler d1 execute syq-dl --remote \
+    dotenvx run -f "$secrets_dir/.env.release" -fk "$secrets_dir/.env.keys" -- npx wrangler d1 execute syq-dl --remote \
       --command 'select * from daily_checks order by day desc limit 20'
