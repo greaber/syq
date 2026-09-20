@@ -3030,16 +3030,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     // Join workers; the tuner may add more while we do, until it exits.
+    let mut tuner = tuner.lock().unwrap().take();
+    let mut tuned = None;
     loop {
         let batch: Vec<_> = std::mem::take(&mut *workers.lock().unwrap());
         if batch.is_empty() {
-            let tuning = tuner
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|t| !t.is_finished());
-            if !tuning {
+            let Some(thread) = tuner.as_ref() else {
                 break;
+            };
+            if thread.is_finished() || sched.finished() || sched.is_aborted() {
+                // Once work ends, join the tuner directly: flushing its final
+                // history must not add a polling interval to a short copy.
+                tuned = match tuner.take().unwrap().join() {
+                    Ok(policy) => Some(policy),
+                    Err(_) => {
+                        progress.error("syq: auto-tuning thread panicked");
+                        sched.abort();
+                        None
+                    }
+                };
+                // Drain any workers the tuner added before it observed the end.
+                continue;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
@@ -3055,17 +3066,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     }
-    let tuned = match tuner.lock().unwrap().take() {
-        Some(thread) => match thread.join() {
-            Ok(policy) => Some(policy),
-            Err(_) => {
-                progress.error("syq: auto-tuning thread panicked");
-                sched.abort();
-                None
-            }
-        },
-        None => None,
-    };
     if debug() {
         crate::output::diagnostic!(
             "syq: file workers complete at {:.2}s",
