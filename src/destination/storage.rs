@@ -142,11 +142,11 @@ impl Receiver {
             )
         };
         let socket = stream.try_clone()?;
-        let cancelled = || {
+        let receiving_stopped = || {
             self.stop.load(Ordering::Acquire)
                 || self.generation.load(Ordering::Acquire) != generation
-                || requester_closed(&socket)
         };
+        let cancelled = || receiving_stopped() || requester_closed(&socket);
         self.approvals
             .request_storage(&self.requester, &request, self.notifications, cancelled)?;
         drop(request_lock);
@@ -167,8 +167,11 @@ impl Receiver {
         // The owned receiver registry closes this stream on cancellation.
         socket.set_read_timeout(None)?;
         loop {
+            // Once approved, queued bytes are valid pipelined requests. The
+            // approval-phase probe treats those bytes as cancellation; rely on
+            // read_message for peer EOF and the registry for receiver shutdown.
             anyhow::ensure!(
-                !cancelled(),
+                !receiving_stopped(),
                 "storage authorization cancelled during preparation"
             );
             match read_message(&mut stream)? {
