@@ -26,34 +26,21 @@ See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 
 ## Authorize from your laptop
 
-Use `--auth-from @NAME` to run S3 copies or removal with credentials on a
-connected [receiving machine](receive.md#set-up-receiving):
+Add `--auth-from @NAME` to an S3 `cp` or `rm` command to use credentials on a
+connected [receiving machine](receive.md#set-up-receiving).
+`--s3-profile` selects a profile there:
 
 ```sh
-# On the server:
 syq cp results --to s3://my-bucket --into runs \
   --auth-from @laptop --s3-profile storage
 ```
 
-Approve the request on your laptop. The profile is selected there; the server
-needs no storage credentials. Both machines must run the same syq build;
-reconnect after updating. This works with uploads, downloads, streams,
-S3-to-S3 copies, and `rm`.
-
-Keep the laptop connected until the server prints **storage authorization
-ready**. Preparation lists objects and, for file uploads, hashes the source
-files. Afterward, data transfers directly between the server and storage.
-Use tmux on the server if the command should survive closing your SSH terminal.
-
-Authorization lasts up to seven days; credentials or provider policies can
-shorten it. Syq prints the expiry when ready. After a process restart or
-expiry, rerun and approve again. File uploads can reuse completed multipart
-work; streams require replaying the input.
-
-Unknown-size stream uploads prepare 10,000 part requests before reading
-input, using several MB per stream. See [Descriptor copies](#descriptor-copies)
-for size limits. See [Storage authorization](security.md#storage-authorization)
-for approval permissions and revocation.
+Approve on your laptop, then wait for **storage authorization ready** before
+disconnecting. Data travels directly between the server and storage.
+Authorization lasts up to seven days, subject to credentials and provider
+policies; restarting requires fresh approval. Both machines need the same syq
+build. See [Storage authorization](security.md#storage-authorization) for the
+security implications.
 
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>

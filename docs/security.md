@@ -319,23 +319,11 @@ With [`syq exec`](receive.md#run-commands-on-your-laptop), a connected server ca
 laptop. An approved command runs with your local user's full permissions;
 it is not sandboxed or confined to a copy destination directory.
 
-## Storage authorization
+### Storage authorization
 
 [Storage authorization](object-storage.md#authorize-from-your-laptop) gives the
-server signed URLs for approved operations and paths, never the secret access
-key. Every command requires approval on the receiving machine.
-
-Approval trusts the server account to choose contents within the displayed
-bucket and paths. Uploads also allow reads for comparison and recovery;
-create-only writes require conditional requests. Deletion needs explicit
-permission, including the selected version or all versions for permanent
-removal. Version discovery may list other names sharing the selected key's
-prefix. S3-to-S3 approval names both source and destination scopes. Approved
-ACL headers cannot be changed in signed requests. Bucket administration is
-refused.
-
-Anyone who obtains the URLs can reuse them until expiry, subject to provider
-rules. Stopping receiving prevents further signing but cannot revoke issued
-URLs; revocation depends on the provider and credentials used. Filesystem
-receiver roots, automatic approval directories, aggregate byte or entry
-limits, one-use grants, and signed receipts do not apply.
+server signed URLs for approved paths and operations. The secret access key
+stays on your laptop. Approval trusts the server to choose uploaded contents.
+Anyone with the URLs can reuse them until expiry; stopping receiving does not
+revoke them. Filesystem receiver roots, aggregate limits, one-use grants, and
+signed receipts do not apply.
