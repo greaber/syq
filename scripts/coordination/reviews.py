@@ -128,7 +128,9 @@ def launch(store, review_id, snap, allow_unchanged=False):
             review['reason'] = 'Revision has already been reviewed; no progress to review automatically'
             return view(review)
         common = (Path(review['repo']) / run('git', 'rev-parse', '--git-common-dir', cwd=review['repo'])).resolve()
-        path = common.parent / '.worktrees' / f'{review_id}-{number}'
+        previous_path = next((Path(r['worktree']) for r in reversed(review['rounds'])
+                              if Path(r['worktree']).exists()), None)
+        path = previous_path or common.parent / '.worktrees' / f'review-{snap["pr"]}-{review_id[7:]}'
         current = {**snap, 'number': number, 'worktree': str(path), 'status': 'starting'}
         review.pop('reason', None)
         review['rounds'].append(current)
@@ -137,10 +139,25 @@ def launch(store, review_id, snap, allow_unchanged=False):
     try:
         run('git', 'fetch', f"https://github.com/{snap['head_repository']}.git", snap['sha'], cwd=copy['repo'])
         run('git', 'fetch', f"https://github.com/{snap['repository']}.git", snap['base'], cwd=copy['repo'])
-        run('git', 'worktree', 'add', '--detach', str(path), snap['sha'], cwd=copy['repo'])
-        # Every review checkout shares the same short-lived state, including claims.
+        if previous_path is None:
+            run('git', 'worktree', 'add', '--detach', str(path), snap['sha'], cwd=copy['repo'])
+        else:
+            if Path(run('git', 'rev-parse', '--show-toplevel', cwd=path)).resolve() != path.resolve():
+                raise Error('Review worktree no longer identifies its recorded checkout')
+            if (path / run('git', 'rev-parse', '--git-common-dir', cwd=path)).resolve() != common:
+                raise Error('Review worktree belongs to a different repository')
+            if run('git', 'status', '--porcelain', cwd=path):
+                raise Error('Review worktree has uncommitted changes; preserve them before advancing')
+            recorded_heads = {r['sha'] for r in copy['rounds'][:-1] if r['worktree'] == str(path)}
+            if run('git', 'rev-parse', 'HEAD', cwd=path) not in recorded_heads:
+                raise Error('Review worktree has an unexpected HEAD; preserve it before advancing')
+            run('git', 'checkout', '--detach', snap['sha'], cwd=path)
+        # Verify the destination before writing its shared handoff link.
+        if Path(run('git', 'rev-parse', '--show-toplevel', cwd=path)).resolve() != path.resolve():
+            raise Error('Review worktree root does not match its recorded path')
         plans = common.parent / 'current-plans'
-        (path / 'current-plans').symlink_to(plans, target_is_directory=True)
+        if not (path / 'current-plans').is_symlink():
+            (path / 'current-plans').symlink_to(plans, target_is_directory=True)
         prompt = reviewer_prompt(store, copy, current)
         prompt_path = store.document(f'reviews/{review_id}/round-{number}/prompt.md', prompt)
         with store.locked() as state:
@@ -180,19 +197,17 @@ Name the exact reviewed SHA. Give findings stable short identifiers.
 Read earlier reports/dispositions under {store.root / 'reviews' / review['id']} after your own
 inspection so considered suggestions are not raised again without addressing the rationale.
 
-Coordinate ALL builds/tests and benchmarks, including local review validation. Before starting
-resource-intensive commands, inspect existing coordination notes and resource status with:
-{prefix} resource status
-Acquire shared local-compute for ordinary builds/tests, exclusive local-compute for quiet local
-benchmarks, and the matching resources for remote work. Wait for a held ticket before running.
-Undefined resources are not free: reconcile existing users before defining them. Release only
-after owned commands and their children have stopped. Code reading needs no claim.
+Resource reservations are optional. Follow any existing arrangements relevant to this review;
+this tool does not require claims for builds/tests or give a benchmark priority over other work.
 
 Write your full report to a Markdown file under this review worktree's ignored target/.
 Explicitly submit it (a final terminal answer alone is not publication):
 {prefix} review submit {review['id']} --round {current['number']} --sha {current['sha']} --verdict findings --body-file /absolute/path/to/report.md
 Use verdict clean when there are no findings, blocked when the review could not be completed.
-Submit once, then remain available for discussion. A report is advisory, not an instruction to fix
+Finish your commands before submitting. The same checkout may advance for the next round after
+submission. Remain available for discussion, but verify HEAD before using the checkout again;
+use git show with the reviewed SHA when discussing an earlier revision.
+A report is advisory, not an instruction to fix
 all findings. If the request has been stopped, do not resume its automatic loop.
 '''
 

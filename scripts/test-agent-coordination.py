@@ -49,7 +49,7 @@ class CoordinationTests(unittest.TestCase):
     def acquire(self, agent, *names, mode='exclusive', code=0):
         return self.cmd('resource', 'acquire', *names, '--agent', agent, '--mode', mode, code=code)['id']
 
-    def test_shared_builds_exclusive_benchmark_and_fairness(self):
+    def test_shared_claims_exclusive_waiter_and_fairness(self):
         self.define('local-compute')
         a = self.acquire('build-a', 'local-compute', mode='shared')
         b = self.acquire('review-build', 'local-compute', mode='shared')
@@ -85,11 +85,14 @@ class CoordinationTests(unittest.TestCase):
         self.assertEqual(sum(r['status'] == 'held' for r in results), 1)
         self.assertEqual(len(self.cmd('resource', 'status')['requests']), 10)
 
-    def test_wait_timeout_and_signal_withdraw_unused_claim(self):
+    def test_wait_timeout_keeps_ticket_and_signal_withdraws(self):
         self.define('server')
         owner = self.acquire('owner', 'server')
         ticket = self.acquire('waiting', 'server', code=3)
         self.cmd('resource', 'wait', ticket, '--agent', 'waiting', '--timeout', '1', code=2)
+        states = {r['id']: r['status'] for r in self.cmd('resource', 'status')['requests']}
+        self.assertEqual(states[ticket], 'queued')
+        self.cmd('resource', 'cancel', ticket, '--agent', 'waiting')
         ticket = self.acquire('waiting', 'server', code=3)
         process = subprocess.Popen([sys.executable, str(SCRIPT), '--state-dir', str(self.state),
                                    'resource', 'wait', ticket, '--agent', 'waiting'],
@@ -252,7 +255,7 @@ class CoordinationTests(unittest.TestCase):
                 launched = json.loads((self.root / 'launch.json').read_text())
                 self.assertIn('review submit', launched[-1])
                 self.assertIn(self.sha, launched[-1])
-                self.assertIn('local-compute', launched[-1])
+                self.assertNotIn('Acquire shared local-compute', launched[-1])
 
     def test_dirty_unpushed_and_wrong_repository_heads_are_rejected(self):
         self.review_setup()
@@ -339,6 +342,70 @@ subprocess.run(args,check=True)
                                       cwd=self.root / 'repo', env=self.env, text=True)
         self.assertIn('fixture', json.loads(out)['resources'])
         self.assertTrue((self.root / 'repo' / '.git' / 'agent-coordination' / 'state.json').exists())
+
+
+
+    def test_timeout_preserves_exclusive_waiters_priority(self):
+        self.define('resource')
+        first = self.acquire('first', 'resource', mode='shared')
+        queued = self.cmd('resource', 'acquire', 'resource', '--agent', 'exclusive', '--wait', '1', code=2)
+        self.assertIn('ticket retained', queued['error'])
+        requests = self.cmd('resource', 'status')['requests']
+        ticket = next(r['id'] for r in requests if r['agent'] == 'exclusive')
+        later = self.acquire('later', 'resource', mode='shared', code=3)
+        self.cmd('resource', 'wait', ticket, '--agent', 'exclusive', '--timeout', '1', code=2)
+        self.cmd('resource', 'release', first, '--agent', 'first')
+        self.assertEqual(self.cmd('resource', 'wait', ticket, '--agent', 'exclusive')['status'], 'held')
+        states = {r['id']: r['status'] for r in self.cmd('resource', 'status')['requests']}
+        self.assertEqual(states[later], 'queued')
+        self.cmd('resource', 'release', ticket, '--agent', 'exclusive')
+        self.assertEqual(self.cmd('resource', 'wait', later, '--agent', 'later')['status'], 'held')
+
+    def test_rounds_reuse_checkout_and_preserve_build_artifacts(self):
+        self.review_setup()
+        review = self.review()
+        worktree = Path(review['rounds'][0]['worktree'])
+        artifact = worktree / 'target' / 'incremental' / 'fixture'
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text('Existing build artifact')
+        first_sha = review['rounds'][0]['sha']
+        self.submit(review)
+        self.advance()
+        second = self.triage(review, 'revise')
+        self.assertEqual(second['rounds'][1]['worktree'], str(worktree))
+        self.assertEqual(artifact.read_text(), 'Existing build artifact')
+        head = subprocess.check_output(['git', '-C', str(worktree), 'rev-parse', 'HEAD'], text=True).strip()
+        self.assertEqual(head, self.sha)
+        self.assertEqual(second['rounds'][0]['sha'], first_sha)
+        self.assertTrue(Path(second['rounds'][0]['report']).is_file())
+        entries = [line for line in self.git('worktree', 'list', '--porcelain').splitlines() if line.startswith('worktree ')]
+        self.assertEqual(len(entries), 3)  # coordination checkout, implementation, review
+
+    def test_dirty_review_checkout_is_not_discarded(self):
+        self.review_setup()
+        review = self.review()
+        worktree = Path(review['rounds'][0]['worktree'])
+        (worktree / 'file').write_text('Keep this edit')
+        (worktree / 'untracked').write_text('Keep this file too')
+        self.submit(review)
+        self.advance()
+        self.triage(review, 'revise', code=2)
+        self.assertEqual((worktree / 'file').read_text(), 'Keep this edit')
+        self.assertEqual((worktree / 'untracked').read_text(), 'Keep this file too')
+
+
+    def test_review_checkout_commits_are_not_abandoned(self):
+        self.review_setup()
+        review = self.review()
+        worktree = Path(review['rounds'][0]['worktree'])
+        subprocess.run(['git', '-C', str(worktree), 'commit', '--allow-empty', '-m', 'Reviewer work'],
+                       check=True, capture_output=True)
+        head = subprocess.check_output(['git', '-C', str(worktree), 'rev-parse', 'HEAD'], text=True)
+        self.submit(review)
+        self.advance()
+        self.triage(review, 'revise', code=2)
+        self.assertEqual(subprocess.check_output(
+            ['git', '-C', str(worktree), 'rev-parse', 'HEAD'], text=True), head)
 
 
 if __name__ == '__main__':

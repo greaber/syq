@@ -27,33 +27,30 @@ deadline. There is no daemon to keep running.
 
 ## Resource access
 
-First reconcile existing use and reservations with the agents' coordination
-notes. An empty new registry is **not** evidence that machines are free. Define
-the resources and register existing owners before other agents start acquiring
-them. Once everyone using a resource has adopted this registry, use it as the
-source of current ownership instead of maintaining a second queue in prose.
+Reservations are opt-in. Ordinary builds and tests, including review validation,
+do not need a claim or a resource-status check. A benchmark request does not
+require other agents to stop work or give its owner a quiet machine. Prefer
+continuing useful work and acknowledging possible measurement interference over
+blocking unrelated tasks.
+
+When particular benchmarkers want to avoid overlapping comparisons, they can
+agree on a named resource and take turns using it. The claim coordinates those
+participants only. Check their existing arrangements before moving that queue
+into the registry; a new, empty registry is not evidence that a server is unused.
 
 ```sh
-python3 scripts/agent-coordination.py resource define local-compute \
-  --description 'Shared for builds/tests; exclusive for quiet benchmarks'
-python3 scripts/agent-coordination.py resource define test-server \
-  --description 'Exclusive use of this test server'
+python3 scripts/agent-coordination.py resource define benchmark-comparison \
+  --description 'Optional turn-taking between participating benchmark runs'
+python3 scripts/agent-coordination.py resource acquire benchmark-comparison \
+  --agent benchmark-task --wait 60
+# Once held, run the comparison agreed with the other participants.
+python3 scripts/agent-coordination.py resource release CLAIM_ID --agent benchmark-task
 ```
 
-Use a stable, distinct agent name for your task/session. Ordinary local builds
-and tests take **shared** `local-compute` claims, including builds started by
-reviewers. Quiet local benchmarks take an **exclusive** claim. Use additional
-resources for shared disks, network links, or remote machines when their use can
-interfere. Agree the resource names with the other users; the tool cannot infer
-that two different names represent the same contention. Reading code requires
-no claim.
-
-```sh
-python3 scripts/agent-coordination.py resource acquire local-compute \
-  --mode shared --agent implementation --wait 60
-# After the response says "held", run the build/tests.
-python3 scripts/agent-coordination.py resource release CLAIM_ID --agent implementation
-```
+Use a stable, distinct agent name for your task/session. Exclusive claims are
+the default; `--mode shared` also allows several participating users at once.
+These are mechanisms for an arrangement you choose, not mandatory rules for
+builds, tests, benchmarks, or remote access.
 
 Without `--wait`, acquire returns a ticket immediately (exit 3 when queued).
 You can do other work and later use `resource wait CLAIM_ID --agent NAME
@@ -64,9 +61,12 @@ requests may run together, but cannot jump ahead of an earlier exclusive waiter.
 Unrelated resources can proceed independently.
 
 `resource status` lists definitions, owners, and waiters. `resource cancel`
-withdraws a queued request; it refuses to cancel a held claim. A timeout or
-interrupt of **resource wait** withdraws its unused claim, including a grant
-racing with cancellation. Do not use wait again on a claim you are already using.
+withdraws a queued request; it refuses to cancel a held claim. A **wait timeout
+preserves the ticket and its queue position**. Call wait again with the same
+ticket; do not acquire a replacement. A claim can become held after a timeout,
+so inspect it and release it if no longer needed. Signal-based interruption
+withdraws the unused claim, including a grant racing with cancellation. Do not
+use wait again on a claim you are already using.
 Release only after your commands and their children have stopped. Claims are
 cooperative reservations, not OS-enforced access controls.
 
@@ -135,13 +135,19 @@ python3 scripts/agent-coordination.py review start --pr 123 --agent implementati
 
 Choose `--reviewer codex` for a Codex reviewer. The tool resolves the GitHub PR
 head and repository identity, checks that your clean task branch matches it,
-fetches the head/base commits, and creates a detached review worktree and a new
-tmux window. The window runs an ordinary interactive reviewer with an initial
-prompt; no keystrokes are injected. You can attach and discuss its findings.
-Its prompt reads `AGENTS.md` and includes the resource-claim requirement for
-review builds/tests.
+fetches the head/base commits, and creates one detached worktree for the review
+request plus a tmux reviewer window. Later rounds advance that same worktree
+without clearing `target/`, so builds can reuse their existing artifacts. The
+worktree name includes the PR number and request ID, and stays stable as the SHA
+changes. A dirty checkout is preserved and must be resolved before advancing.
+The window runs an ordinary interactive reviewer with an initial prompt; no
+keystrokes are injected. You can attach and discuss its findings. The reviewer
+reads the project’s existing `AGENTS.md`; no standing resource policy is added.
 
 Each review round has its own prompt, immutable report, and triage Markdown.
+Reviewers finish their commands before submitting: publication allows the next
+round to advance the shared checkout. Old reviewer conversations remain available,
+but must check HEAD and use their recorded SHA when discussing older code.
 The reviewer publishes by running the `review submit` command in its prompt,
 including the round number, reviewed SHA, and verdict (`clean`, `findings`, or
 `blocked`). A terminal answer or a process exiting successfully is not enough.
@@ -196,7 +202,7 @@ permission. These are workflow instructions, not a sandbox around the agents.
 
 `review stop-loop REVIEW_ID --agent NAME` prevents continuation without killing
 an interactive reviewer or its jobs. An outstanding reviewer may still submit
-its report, but that submission does not restart the loop. Review worktrees and
+its report, but that submission does not restart the loop. The request’s worktree and reviewer
 windows are retained for discussion; inspect cleanliness and running processes
 before removing them with normal Git/tmux commands.
 

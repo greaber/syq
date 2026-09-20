@@ -72,12 +72,13 @@ def wait(store, ticket, agent, timeout):
             if request['status'] != 'queued':
                 raise Error(f"Ticket is {request['status']}")
             if time.monotonic() >= deadline:
-                raise Error(f'Timed out waiting for {ticket}; last status: queued')
+                raise Error(f'Timed out waiting for {ticket}; ticket retained. Last observed status: queued. '
+                            'Wait again with the same ticket, or inspect status and cancel/release it.')
             if time.monotonic() >= progress:
                 print(f'Waiting for {ticket}: queued', file=sys.stderr, flush=True)
                 progress = time.monotonic() + 10
             time.sleep(min(0.25, max(0, deadline - time.monotonic())))
-    except BaseException:
+    except KeyboardInterrupt:
         # This command has not handed resources to its caller. If scheduling raced
         # with interruption, release that unused grant too. Never expire used claims.
         with store.locked() as state:
