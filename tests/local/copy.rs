@@ -455,3 +455,56 @@ fn absent_user_config_environment_keeps_ordinary_commands_nonpersistent() {
     assert_output_ok(&output);
     assert_eq!(read(&t.path("dst")), b"no home required");
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn one_worker_hint_prepares_spare_before_slow_connection_is_ready() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    t.expose_remote_syq();
+    let script = fs::read_to_string(&rsh).unwrap();
+    fs::write(
+        &rsh,
+        script.replace("exec /bin/sh -c", "sleep 0.7\nexec /bin/sh -c"),
+    )
+    .unwrap();
+    let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    write(&t.path("src/one"), &data);
+    write(&t.path("src/two"), &data);
+    let cache = t.path("tuning.json");
+    write(&cache, br#"{"paths":{"local>fake|ssh":1}}"#);
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = compat_command()
+        .arg("-e")
+        .arg(&rsh)
+        .args([
+            "--syq-no-tcp",
+            "-a",
+            "--syq-no-bootstrap",
+            "--block-size=64K",
+            "--resource-limits=bandwidth=4M",
+            "--no-progress",
+            &t.s("src/"),
+            &remote,
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("SYQ_TUNING_CACHE", &cache)
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_TUNE_SAMPLE_MS", "50")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/one")), data);
+    assert_eq!(read(&t.path("dst/two")), data);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let prepare = stderr
+        .find("preparing 2 connections ahead of probe")
+        .unwrap_or_else(|| panic!("missing startup spare: {stderr}"));
+    let first_ready = stderr
+        .find("worker 0 connected")
+        .unwrap_or_else(|| panic!("missing first connection: {stderr}"));
+    assert!(prepare < first_ready, "{stderr}");
+}
