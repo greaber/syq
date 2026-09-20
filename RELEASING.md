@@ -43,77 +43,32 @@ registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.
    protected `release` environment. It has no access to the syq repository or
    to any other repository in the account.
 
-## Encrypted release inventory
+<a id="encrypted-release-inventory"></a>
 
-Release credentials stay outside this public repository, including encrypted
-copies. Keep the encrypted inventory and setup instructions in a separate
-private operations repository. Its wrapper selects the inventory from its own
-checkout or worktree and passes its path as `SYQ_RELEASE_ENV_FILE`. No inventory
-symlinks or per-checkout registration are needed. Uncommitted inventory edits
-in that checkout take effect without redirecting another checkout.
+## Release credentials
 
-Only decryption keys live in private machine configuration. The default is
-`${XDG_CONFIG_HOME:-$HOME/.config}/syq/release/.env.keys`; use
-`SYQ_RELEASE_KEYS_FILE` to select another key file. Restore that key from a
-separately protected backup on a new machine. Never commit it, even privately.
+Credential storage and provisioning are managed separately from this public
+repository. No local credential manager is required to build or test syq.
 
-The inventory contains the manifest signing key, Homebrew deploy key, and
-Cloudflare credentials used by [`infra/syq-dl/`](infra/syq-dl/README.md).
-An optional manual crates.io token can also be kept there; automated
-publication uses GitHub OIDC instead.
+The GitHub Actions release environment needs two secrets:
 
-For an existing inventory, keep its encrypted file in the selected private
-checkout and its key in machine configuration. Verify decryption before
-removing old copies or inventory links. Preserve their values: initialization
-creates new signing authority and is not a migration step. Keep the key
-directory mode `0700` and the key file mode `0600`.
+- SYQ_RELEASE_SIGNING_KEY_PEM_B64: a base64-encoded Ed25519 private PEM key
+  used to sign release manifests.
+- HOMEBREW_TAP_DEPLOY_KEY: an SSH private key whose public half has write
+  access to the Homebrew tap.
 
-For first-time provisioning only, initialize the inventory on an encrypted
-developer machine. The private operations wrapper installs its pinned tool
-automatically. The initializer generates independent Ed25519
-keys for manifest signing and Homebrew tap access; it needs no secret input.
-The release scripts need `bash`, `jq`, `ssh-keygen`, and OpenSSL 3 as
-`openssl` (1.1.1 cannot sign Ed25519 with `pkeyutl`); macOS ships LibreSSL
-under that name, so install `openssl@3` with Homebrew and put its `bin`
-directory first on `PATH` before signing:
+The repository variable SYQ_RELEASE_PUBLIC_KEY contains the matching
+base64-encoded raw Ed25519 public key. Official builds embed this verification
+key. Provision these individual values using your credential-management tools;
+never give CI a key that decrypts a broader credential store.
 
-```sh
-DOTENVX_BIN="$OPS_CHECKOUT/scripts/dotenvx" \
-  SYQ_RELEASE_ENV_FILE="$PRIVATE_INVENTORY" scripts/init-release-secrets.sh
-```
+Automated crates.io publication uses GitHub OIDC. A local crates.io token is
+not needed for that workflow.
 
-Back up both files immediately in protected storage. Do not commit either
-file to syq. Never upload the decryption key to GitHub or use it in CI. Losing
-every copy prevents future releases from using the signing identity embedded
-in installed clients.
-
-After the repository has been renamed and the protected `release` environment
-exists, select the desired private operations checkout in `OPS_CHECKOUT`,
-then preview and synchronize the allowlisted values:
-
-```sh
-"$OPS_CHECKOUT/scripts/run" release scripts/sync-github-secrets.sh
-"$OPS_CHECKOUT/scripts/run" release scripts/sync-github-secrets.sh --execute
-gh secret list --repo greaber/syq --env release
-gh variable list --repo greaber/syq
-```
-
-The sync sends the two individual private keys to environment secrets, installs
-the Homebrew key's public half as a write-enabled deploy key on the tap, and
-sends the release public key to the repository variable used by every official
-build. It never sends `.env.keys`, any `DOTENV_PRIVATE_KEY_*` value, or an
-undeclared entry from the encrypted file. It derives both public keys locally
-and refuses a mismatched release signing pair or tap deploy key.
-
-The Homebrew deploy key is already restricted to one repository and should not
-need routine rotation. If it is exposed, replace its ciphertext with a newly
-generated Ed25519 private key, remove the deploy key titled `syq release
-workflow` from the tap, update the private inventory and its backup, and
-rerun the dry-run/execute sync. The sync will install the new public half before updating the protected
-environment secret.
-
-Do not rotate the release signing key casually: installed clients trust it, so
-a planned rotation first needs a release that trusts both old and new keys.
+Keep protected backups of release signing authority. Do not regenerate the
+signing key as a recovery shortcut: installed clients trust the existing key,
+and changing it requires a migration plan. The tap deploy key can be rotated
+by replacing the public deploy key and its matching environment secret.
 
 ## Signing releases from the Linux server
 

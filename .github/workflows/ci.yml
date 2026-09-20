@@ -162,12 +162,6 @@ jobs:
           (needs.scope.outputs.native == 'true' &&
            needs.scope.outputs.full_suite == 'true')
         run: scripts/check-workflows.sh
-      - name: Test release-secret tooling
-        if: >-
-          needs.scope.outputs.tooling == 'true' ||
-          (needs.scope.outputs.native == 'true' &&
-           needs.scope.outputs.full_suite == 'true')
-        run: scripts/test-secret-tools.sh
       - name: Lint tracked shell scripts
         if: >-
           needs.scope.outputs.tooling == 'true' ||

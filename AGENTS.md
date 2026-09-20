@@ -422,33 +422,14 @@ credential file appropriate for this repository. The user chose private
 storage outside the repository in September 2026 so that public clones do
 not receive credential material.
 
-The encrypted inventory belongs to a separate private operations repository.
-Each invocation selects an inventory with `SYQ_RELEASE_ENV_FILE`; the private
-operations wrapper supplies the file from its own checkout or worktree.
-Do not create inventory symlinks or a global pointer to one checkout. Modified
-inventories must be read from the explicitly selected checkout.
+Credential storage, decryption, backup, and account provisioning are managed
+outside this repository. Keep public tooling independent of any particular
+credential manager or local directory layout. Accept the individual credentials
+needed by the operation through the underlying tool's standard interface.
 
-Decryption keys stay outside all Git repositories. The default key file is
-`${XDG_CONFIG_HOME:-$HOME/.config}/syq/release/.env.keys`, with
-`SYQ_RELEASE_KEYS_FILE` available for an explicit key file. Back keys up
-separately in protected storage. Never upload `.env.keys` or a
-`DOTENV_PRIVATE_KEY_*` value to GitHub, CI, the Homebrew tap, or a runtime
-system. Keep actual private storage locations out of commits and PRs.
-
-When migrating credentials, verify the private copy decrypts to the same
-values before removing the old copy. Do not rewrite published history or
-rotate release signing authority as a cleanup shortcut; installed clients
-trust the existing signing identity.
-
-CI consumes only the two individual environment secrets it needs. A maintainer
-materializes those values locally with `scripts/sync-github-secrets.sh`; the
-script has a fixed inventory and refuses to target anything except
-`github.com/greaber/syq`. Do not change that boundary to let CI decrypt
-`.env.release`, and do not add a general dotenvx key to GitHub secrets.
-
-Use dotenvx 2.21.0 for this inventory. Initialize it once with
-`scripts/init-release-secrets.sh`, and run the sync without `--execute` before
-every actual update. See `RELEASING.md` for provisioning, backup, and rotation.
+CI receives only its individual release secrets, never a credential-store
+decryption key. Preserve the existing release signing authority: installed
+clients trust it. See RELEASING.md for the workflow's required inputs.
 
 ## Performance evidence
 

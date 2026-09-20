@@ -215,7 +215,6 @@ jobs:
           for suite in \
             scripts/test-release-tools.sh \
             scripts/test-release-orchestration.sh \
-            scripts/test-secret-tools.sh \
             scripts/test-installer.sh \
             scripts/test-homebrew-formula.sh
           do
