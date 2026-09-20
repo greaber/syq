@@ -20,17 +20,17 @@ use std::{
 
 /// One client/discovery context and shared part/request admission for the
 /// lifetime of a batch. Entry failures do not cancel this client's other jobs.
-struct Session {
+pub(crate) struct Session {
     client: Client,
     options: Options,
     cancellation: Arc<super::upload_http::Cancellation>,
     parts: Arc<tokio::sync::Semaphore>,
-    requests: tokio::sync::Semaphore,
-    objects: tokio::sync::Semaphore,
+    requests: Arc<tokio::sync::Semaphore>,
+    objects: Arc<tokio::sync::Semaphore>,
     bandwidth: Option<Arc<crate::bwlimit::BandwidthLimit>>,
 }
 impl Session {
-    async fn connect(
+    pub(crate) async fn connect(
         mut options: Options,
         controls: &crate::descriptor_copy::controls::Controls,
     ) -> Result<Self> {
@@ -42,14 +42,74 @@ impl Session {
             // Keep the existing single-stream window, shared across entries
             // instead of multiplying it by the number of concurrent producers.
             parts: Arc::new(tokio::sync::Semaphore::new(options.concurrency)),
-            requests: tokio::sync::Semaphore::new(
+            requests: Arc::new(tokio::sync::Semaphore::new(
                 controls.s3_requests.unwrap_or(options.concurrency),
-            ),
-            objects: tokio::sync::Semaphore::new(controls.s3_objects),
+            )),
+            objects: Arc::new(tokio::sync::Semaphore::new(controls.s3_objects)),
             options,
             cancellation,
             bandwidth: controls.bandwidth(),
         })
+    }
+    pub(crate) fn share_admission(&mut self, other: &Self) {
+        self.parts = other.parts.clone();
+        self.requests = other.requests.clone();
+        self.objects = other.objects.clone();
+    }
+    pub(crate) async fn check_container(
+        &self,
+        path: &[u8],
+        existence: crate::cli::Existence,
+    ) -> Result<()> {
+        if existence == crate::cli::Existence::Any {
+            return Ok(());
+        }
+        let key = super::local::key_path(path)?;
+        let _request = self.requests.acquire().await?;
+        let exact = !key.is_empty()
+            && client::head_output(&self.client, &self.options.bucket, &key, None)
+                .await?
+                .is_some();
+        let prefix = if key.is_empty() {
+            key
+        } else {
+            format!("{key}/")
+        };
+        let children = client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
+        anyhow::ensure!(
+            match existence {
+                crate::cli::Existence::Any => true,
+                crate::cli::Existence::New => !exact && !children,
+                crate::cli::Existence::Existing => children,
+            },
+            "S3 destination container existence condition failed"
+        );
+        Ok(())
+    }
+    pub(crate) async fn callback(
+        &self,
+        key: String,
+        upload: bool,
+        controls: Arc<crate::descriptor_copy::controls::Controls>,
+        payload: Arc<crate::stream_mapping::Payload>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let mut options = self.options.clone();
+        options.route = if upload {
+            super::Route::Upload
+        } else {
+            super::Route::Download
+        };
+        let plan = Plan {
+            session: self,
+            controls: &controls,
+            options,
+            target: key.clone(),
+            key,
+            placement: Default::default(),
+            source_meta: None,
+        };
+        execute(&plan, None, None, None, cancelled, Some(&payload)).await
     }
     async fn pace(&self, length: u64) {
         if let Some(limit) = &self.bandwidth {
@@ -147,7 +207,7 @@ pub(crate) fn run(
             value = &mut interrupt => { value?; bail!("stream cancelled"); }
         };
         let plan = Plan { session: &session, controls, options: session.options.clone(), key, placement, target, source_meta };
-        let operation = execute(&plan, source, descriptor, commit, cancelled.clone());
+        let operation = execute(&plan, source, descriptor, commit, cancelled.clone(), None);
         tokio::pin!(operation);
         tokio::select! {
             result = &mut operation => result,
@@ -170,8 +230,9 @@ async fn execute(
     plan: &Plan<'_>,
     source: Option<Source>,
     descriptor: Option<Descriptor>,
-    commit: Option<Descriptor>,
+    mut commit: Option<Descriptor>,
     cancelled: Arc<AtomicBool>,
+    callback: Option<&Arc<crate::stream_mapping::Payload>>,
 ) -> Result<()> {
     let mut retirements: Vec<_> = descriptor
         .iter()
@@ -196,8 +257,27 @@ async fn execute(
                 }
                 controls.report.ready();
             }
+            if plan.options.route == crate::s3::Route::Download {
+                return download(
+                    client,
+                    plan,
+                    descriptor,
+                    callback,
+                    cancelled.clone(),
+                    &mut retirements,
+                )
+                .await;
+            }
             let descriptor = match descriptor {
                 Some(descriptor) => descriptor,
+                None if callback.is_some() => {
+                    let (descriptor, acknowledge) =
+                        callback.unwrap().open(true, cancelled.clone())?;
+                    retirements.extend(descriptor.retirement());
+                    retirements.extend(acknowledge.retirement());
+                    commit = Some(acknowledge);
+                    descriptor
+                }
                 None => {
                     let descriptor = source
                         .context("missing stream input")?
@@ -209,11 +289,7 @@ async fn execute(
                     descriptor
                 }
             };
-            if plan.options.route == crate::s3::Route::Upload {
-                upload(client, plan, descriptor, &mut upload_id, commit).await
-            } else {
-                download(client, plan, descriptor).await
-            }
+            upload(client, plan, descriptor, &mut upload_id, commit).await
         };
         tokio::select! {
             result = operation => result,
@@ -358,25 +434,46 @@ async fn upload(
 ) -> Result<()> {
     let controls = plan.controls;
     let options = &plan.options;
-    let metadata = plan.source_meta.map(|m| {
-        client::Metadata {
-            kind: client::ObjectKind::File,
-            mode: m.mode,
-            uid: m.uid,
-            gid: m.gid,
-            mtime: m.mtime,
-            nsec: m.mtime_nsec,
-            hash: None,
-            hash_algorithm: Default::default(),
-        }
-        .encode()
-    });
+    let metadata = plan
+        .source_meta
+        .or_else(|| {
+            controls.metadata.overrides.map(|_| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                crate::proto::Meta {
+                    mode: 0o666 & !crate::fsops::process_umask(),
+                    uid: unsafe { libc::geteuid() },
+                    gid: unsafe { libc::getegid() },
+                    mtime: now.as_secs() as i64,
+                    mtime_nsec: now.subsec_nanos(),
+                }
+            })
+        })
+        .map(|mut m| {
+            if let Some(overrides) = controls.metadata.overrides {
+                overrides.apply(&mut m);
+            }
+            client::Metadata {
+                kind: client::ObjectKind::File,
+                mode: m.mode,
+                uid: m.uid,
+                gid: m.gid,
+                mtime: m.mtime,
+                nsec: m.mtime_nsec,
+                hash: None,
+                hash_algorithm: Default::default(),
+            }
+            .encode()
+        });
 
     let size = usize::try_from(options.part_size)?;
     let algorithm = Algorithm::for_endpoint(options.endpoint.as_deref());
+    let mut check = controls.expected.start();
     let (mut input, first) = plan.session.read(input).await?;
+    check.add(&first.bytes)?;
     if first.bytes.len() < size {
-        let length = first.bytes.len() as u64;
+        let length = check.finish()?;
         plan.session.pace(length).await;
         crate::descriptor_copy::fd::await_commit(commit).await?;
         let hash = digest(algorithm, &first.bytes);
@@ -398,7 +495,7 @@ async fn upload(
             .await
             .map_err(|e| e.into_service_error())
             .context("upload object")?;
-        controls.progress.add_bytes(length);
+        controls.add_bytes(length);
         return Ok(());
     }
     let request = plan.session.requests.acquire().await?;
@@ -450,6 +547,7 @@ async fn upload(
         };
         input = next.0;
         data = next.1;
+        check.add(&data.bytes)?;
         if data.bytes.is_empty() {
             drop(data);
             break;
@@ -458,6 +556,7 @@ async fn upload(
     while let Some(part) = pending.try_next().await? {
         completed.push(part);
     }
+    check.finish()?;
     completed.sort_by_key(|p| p.part_number());
     crate::descriptor_copy::fd::await_commit(commit).await?;
     let _request = plan.session.requests.acquire().await?;
@@ -512,7 +611,7 @@ async fn upload_part(
         .await
         .map_err(|e| e.into_service_error())
         .context("upload stream part")?;
-    controls.progress.add_bytes(length);
+    controls.add_bytes(length);
     Ok(CompletedPart::builder()
         .part_number(number)
         .e_tag(output.e_tag().context("S3 part omitted ETag")?)
@@ -520,7 +619,14 @@ async fn upload_part(
         .build())
 }
 
-async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> Result<()> {
+async fn download(
+    client: &Client,
+    plan: &Plan<'_>,
+    output: Option<Descriptor>,
+    callback: Option<&Arc<crate::stream_mapping::Payload>>,
+    cancelled: Arc<AtomicBool>,
+    retirements: &mut Vec<Arc<crate::descriptor_copy::fd::Retirement>>,
+) -> Result<()> {
     let controls = plan.controls;
     // Read raw objects, including objects carrying another tool's metadata.
     let request = plan.session.requests.acquire().await?;
@@ -571,6 +677,15 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
         return Ok(());
     }
     controls.report.ready();
+    let (mut output, commit) = match callback {
+        Some(callback) => {
+            let (output, commit) = callback.open(false, cancelled)?;
+            retirements.extend(output.retirement());
+            retirements.extend(commit.retirement());
+            (output, Some(commit))
+        }
+        None => (output.context("missing stream output")?, None),
+    };
     let etag = head.e_tag().context("S3 HEAD omitted ETag")?;
     let version = head.version_id();
     let part_size = plan.options.part_size;
@@ -587,12 +702,20 @@ async fn download(client: &Client, plan: &Plan<'_>, mut output: Descriptor) -> R
             )
         })
         .buffered(plan.options.concurrency);
+    let mut check = controls.expected.start();
     while let Some(bytes) = parts.try_next().await? {
+        check.add(&bytes.bytes)?;
         let length = bytes.bytes.len() as u64;
         output = output.write_chunk(bytes.bytes).await?;
-        controls.progress.add_bytes(length);
+        controls.add_bytes(length);
     }
-    output.apply_metadata(controls.metadata, source_meta)
+    check.finish()?;
+    output.apply_metadata(controls.metadata, source_meta)?;
+    drop(output); // Consumers must see EOF before their success acknowledgement.
+    if let Some(callback) = callback {
+        callback.transferred(None)?;
+    }
+    crate::descriptor_copy::fd::await_commit(commit).await
 }
 
 async fn read_part(

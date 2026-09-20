@@ -20,6 +20,8 @@ from collections.abc import (
 from pathlib import Path
 from typing import BinaryIO, TypeVar
 
+from ._callback_runtime import Callbacks
+from ._stream_endpoints import StreamSource, StreamDestination
 from ._streams import AsyncStreamReader, AsyncStreamWriter
 from ._defaults import CLIENT_DEFAULT, Timeout, resolve_timeout
 from ._mapping import AsyncMapping, _ContextMapping, _source_options
@@ -27,6 +29,7 @@ from .managed import managed_executable
 from .bundled import bundled_executable
 from .client import (
     Argument,
+    Client,
     IgnoreSelector,
     PathArgument,
     Result,
@@ -130,11 +133,16 @@ async def _read_stderr_tail(stderr: asyncio.StreamReader) -> bytes:
 
 async def _write_async_mapping_manifest(
     manifest: BinaryIO, mapping: AsyncIterable[MappingEntry]
-) -> None:
+) -> tuple[dict[int, MappingEntry], bool]:
+    callbacks = {}
+    named_destination = False
     chunk = bytearray()
     index = 0
     async for entry in mapping:
         chunk.extend(_mapping_line(entry, index=index))
+        named_destination |= not isinstance(entry.dst, StreamDestination)
+        if isinstance(entry.src, StreamSource) or isinstance(entry.dst, StreamDestination):
+            callbacks[index] = entry
         index += 1
         if len(chunk) >= 256 * 1024:
             write = asyncio.create_task(
@@ -147,13 +155,16 @@ async def _write_async_mapping_manifest(
         await _complete_task(write)
     flush = asyncio.create_task(asyncio.to_thread(manifest.flush))
     await _complete_task(flush)
+    return callbacks, named_destination
 
 
 def _write_sync_mapping_manifest(
     manifest: BinaryIO,
     mapping: Iterable[MappingEntry],
     cancelled: threading.Event,
-) -> None:
+) -> tuple[dict[int, MappingEntry], bool]:
+    callbacks = {}
+    named_destination = False
     iterator = iter(mapping)
     index = 0
     while not cancelled.is_set():
@@ -164,9 +175,13 @@ def _write_sync_mapping_manifest(
         if cancelled.is_set():
             break
         manifest.write(_mapping_line(entry, index=index))
+        named_destination |= not isinstance(entry.dst, StreamDestination)
+        if isinstance(entry.src, StreamSource) or isinstance(entry.dst, StreamDestination):
+            callbacks[index] = entry
         index += 1
     if not cancelled.is_set():
         manifest.flush()
+    return callbacks, named_destination
 
 
 async def _run(
@@ -686,7 +701,35 @@ class AsyncClient:
         results: BinaryIO | None,
         timeout: Timeout,
         check: bool,
+        callbacks: Callbacks | None = None,
     ) -> OperationSummary:
+        if callbacks is not None:
+            client = Client(executable=await self._executable_value(), process_cwd=self.process_cwd, env=self.env, timeout=self.timeout)
+            async def dispatch(event):
+                if on_event is not None:
+                    value = on_event(event)
+                    if inspect.isawaitable(value):
+                        await value
+            def event_callback(event):
+                callbacks.wait_async(dispatch(event))
+            task = asyncio.create_task(asyncio.to_thread(client._typed, argv, mode=mode, prune=prune,
+                mapping=mapping, dry_run=dry_run, selectors_total=selectors_total,
+                on_event=event_callback if on_event is not None else None, results=results,
+                timeout=timeout, check=check, callbacks=callbacks))
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), resolve_timeout(timeout, self.timeout))
+            except (asyncio.CancelledError, TimeoutError) as error:
+                callbacks.request_abort()
+                try:
+                    await asyncio.shield(task)
+                except BaseException:
+                    pass
+                if isinstance(error, TimeoutError):
+                    import subprocess
+                    raise subprocess.TimeoutExpired(argv, resolve_timeout(timeout, self.timeout)) from None
+                raise
+            finally:
+                await asyncio.to_thread(callbacks.close, abort=False)
         process = await self._start_results(argv, timeout=timeout)
         writer = _ResultsFileWriter(results)
         decoder = AutomationDecoder(
@@ -760,6 +803,7 @@ class AsyncClient:
             | AsyncIterable[MappingEntry]
             | None
         ) = None,
+        stream_concurrency: int = 4,
         results: BinaryIO | None = None,
         prune: bool = False,
         dry_run: bool = False,
@@ -855,6 +899,7 @@ class AsyncClient:
             preserve=preserve,
             inplace=inplace,
             max_delete=max_delete,
+            allow_missing_placement=mapping is not None and not isinstance(mapping, (str, bytes, os.PathLike)),
         )
         _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
         if auth_from is not None:
@@ -917,7 +962,7 @@ class AsyncClient:
             mode="wb", prefix="syq-python-mapping-", suffix=".ndjson"
         ) as manifest:
             if isinstance(mapping, AsyncIterable):
-                await _write_async_mapping_manifest(manifest, mapping)
+                entries, named_destination = await _write_async_mapping_manifest(manifest, mapping)
             else:
                 cancelled = threading.Event()
                 materialize = asyncio.create_task(
@@ -928,7 +973,12 @@ class AsyncClient:
                         cancelled,
                     )
                 )
-                await _complete_task(materialize, on_cancel=cancelled.set)
+                entries, named_destination = await _complete_task(materialize, on_cancel=cancelled.set)
+            if not any(value is not None for value in (into, into_new, into_existing)):
+                if named_destination or not entries:
+                    raise SyqInvocationError("pathname mapping destinations require --into, --into-new, or --into-existing")
+                argv.extend(["--into", "."])
+            callbacks = Callbacks(entries, stream_concurrency, loop=asyncio.get_running_loop()) if entries else None
             _insert_mapping_option(
                 argv, source_end, os.path.realpath(manifest.name)
             )
@@ -943,6 +993,7 @@ class AsyncClient:
                 results=results,
                 timeout=timeout,
                 check=check,
+                callbacks=callbacks,
             )
             assert isinstance(result, CpResult)
             return result

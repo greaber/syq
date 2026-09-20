@@ -56,6 +56,7 @@ async fn copy(
         output,
         commit,
         input_meta,
+        None,
     )
     .await
 }
@@ -179,7 +180,8 @@ async fn cancelling_quiet_owned_payload_retires_io_and_keeps_the_session_usable(
     let dir = crate::test_support::tempdir().unwrap();
     let target = dir.path().join("target");
     std::fs::write(&target, b"old").unwrap();
-    let args = arguments(&target, true);
+    let mut args = arguments(&target, true);
+    args.connections = 1;
     let session = Session::connect(
         &args,
         args.descriptor_copy
@@ -190,42 +192,64 @@ async fn cancelling_quiet_owned_payload_retires_io_and_keeps_the_session_usable(
             .unwrap(),
     )
     .unwrap();
-    let (reader, _producer) = std::os::unix::net::UnixStream::pair().unwrap();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let descriptor = fd::Descriptor::owned(
-        File::from(std::os::fd::OwnedFd::from(reader)),
-        true,
-        cancelled.clone(),
-    )
-    .unwrap();
-    let retirement = descriptor.retirement().unwrap();
-    let transfer = execute(
-        session.clone(),
-        args.descriptor_copy.clone().unwrap(),
-        controls(&args),
-        cancelled.clone(),
-        Some(descriptor),
-        None,
-        None,
-        None,
-    );
-    let cancel = async {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cancelled.store(true, Relaxed);
-    };
+    let mut producers = Vec::new();
+    let mut retirements = Vec::new();
+    let mut transfers = tokio::task::JoinSet::new();
+    // One quiet entry occupies the sole worker; the others await admission.
+    // Cancellation must retire both active and waiting entries' descriptors.
+    for i in 0..3 {
+        let (reader, producer) = std::os::unix::net::UnixStream::pair().unwrap();
+        producers.push(producer);
+        let descriptor = fd::Descriptor::owned(
+            File::from(std::os::fd::OwnedFd::from(reader)),
+            true,
+            cancelled.clone(),
+        )
+        .unwrap();
+        retirements.push(descriptor.retirement().unwrap());
+        let path = if i == 0 {
+            target.clone()
+        } else {
+            dir.path().join(format!("pending-{i}"))
+        };
+        let plan = arguments(&path, true).descriptor_copy.unwrap();
+        transfers.spawn(execute(
+            session.clone(),
+            plan,
+            controls(&args),
+            cancelled.clone(),
+            Some(descriptor),
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let (result, ()) = tokio::join!(transfer, cancel);
-        assert!(format!("{:#}", result.unwrap_err()).contains("cancelled"));
-        retirement.wait().await;
+        while session.connections_created.load(Relaxed) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        cancelled.store(true, Relaxed);
+        while let Some(result) = transfers.join_next().await {
+            assert!(format!("{:#}", result.unwrap().unwrap_err()).contains("cancelled"));
+        }
+        for retirement in retirements {
+            retirement.wait().await;
+        }
     })
     .await
-    .expect("quiet payload cancellation must retire workers");
+    .expect("quiet payload cancellation must retire active and waiting workers");
     assert_eq!(std::fs::read(&target).unwrap(), b"old");
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    for i in 0..3 {
+        assert!(!dir.path().join(format!("pending-{i}")).exists());
+    }
+    // Reusing the control connection drains any queued abort acknowledgements.
     copy(session, &target, true, &input(b"next"), None)
         .await
         .unwrap();
     assert_eq!(std::fs::read(&target).unwrap(), b"next");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -260,6 +284,7 @@ async fn cancelling_full_upload_queue_retires_input_and_releases_budget() {
         controls.clone(),
         cancelled.clone(),
         Some(descriptor),
+        None,
         None,
         None,
         None,

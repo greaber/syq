@@ -77,7 +77,7 @@ Every record carries:
 | Field | Value |
 |---|---|
 | `schema` | `"syq.automation"` |
-| `schema_version` | `2` |
+| `schema_version` | `2`; Stream mappings use `3` |
 | `seq` | Integer starting at 0, strictly increasing |
 | `type` | Record type |
 
@@ -182,6 +182,16 @@ Skipped copies consume no payload, report zero bytes, and count as one excluded
 file. The normal terminal `result` still establishes completion. Its optional
 `bytes_total_known` field is false when the source length is unknown; preview
 byte totals then count only known bytes, rather than asserting an empty input.
+
+Stream mappings use version 3 and emit one `stream_result` for each
+callback entry, with an additional zero-based `entry` index. Each endpoint is
+`{"path": <tagged path>}` or `{"entry": N, "callback": true}`. Failed entries
+include `message`. These records identify callbacks within this invocation;
+they cannot be converted to a pathname retry manifest. Ordinary entries in a
+mixed mapping still emit their usual records. The
+[Python callback reference](https://greaber.github.io/syq/python-reference.html#callback-mappings) describes
+publication and application retries. Callback admission uses the SDK's private
+channel, so these runs do not emit `stream_ready`.
 
 ### Removal records
 
@@ -410,7 +420,9 @@ In those cases, rerun the original copy instead.
 ```bash
 set -o pipefail
 syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
-jq -cs 'if (.[-1].type? // "") != "result"
+jq -cs 'if any(.[]; .schema != "syq.automation" or .schema_version != 2)
+        then "unsupported results schema for pathname retry" | halt_error
+        elif (.[-1].type? // "") != "result"
         then "incomplete results stream (no terminal record)" | halt_error
         elif (.[-1].status != "success" and .[-1].status != "partial")
         then "run stopped early (status \(.[-1].status)); rerun it instead of retrying" | halt_error

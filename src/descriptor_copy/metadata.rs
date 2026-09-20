@@ -15,6 +15,7 @@ pub(crate) struct Policy {
     pub preserve: u8,
     pub skip_newer: bool,
     pub specials: bool,
+    pub overrides: Option<crate::mapping::Metadata>,
 }
 impl Policy {
     pub fn new(args: &Args) -> Self {
@@ -25,6 +26,7 @@ impl Policy {
                 | if args.times { flags::TIMES } else { 0 },
             skip_newer: args.update,
             specials: args.devices,
+            overrides: None,
         }
     }
     pub fn source(self, meta: Option<Meta>) -> Result<()> {

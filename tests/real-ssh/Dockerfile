@@ -84,3 +84,5 @@ COPY tests/real-ssh/test-restricted-mapping.py /usr/local/libexec/syq-test-restr
 COPY tests/real-ssh/test-receiver-identity.py /usr/local/libexec/syq-test-receiver-identity.py
 
 ENTRYPOINT ["/usr/local/libexec/syq-real-ssh-entrypoint"]
+
+COPY tests/real-ssh/test-stream-mappings.py /usr/local/libexec/syq-test-stream-mappings.py

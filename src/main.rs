@@ -54,6 +54,7 @@ mod sched;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod server;
 mod session_pool;
+mod stream_mapping;
 mod streaming;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod sys;
@@ -337,7 +338,9 @@ fn main() {
         }
     }
     let quiet = args.quiet;
-    let result = if args.descriptor_copy.is_some() {
+    let result = if args.stream_mapping_fd.is_some() {
+        stream_mapping::run(args)
+    } else if args.descriptor_copy.is_some() {
         descriptor_copy::run(args)
     } else if args.s3.is_some() {
         s3::run(args)

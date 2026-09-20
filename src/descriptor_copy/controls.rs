@@ -49,11 +49,13 @@ pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
 pub(crate) struct Controls {
     pub report: super::report::Report,
     pub metadata: super::metadata::Policy,
+    pub expected: super::check::Expected,
     pub settings: Settings,
     pub pipeline: usize,
     pub s3_requests: Option<usize>,
     pub s3_objects: usize,
     pub progress: Arc<Progress>,
+    pub parent_progress: Option<Arc<Progress>>,
     limit: Option<Arc<crate::bwlimit::BandwidthLimit>>,
     stats: bool,
     quiet: bool,
@@ -74,7 +76,7 @@ impl Controls {
         };
         let mut progress = Progress::new(!args.quiet && !args.no_progress, args.progress, None);
         Arc::get_mut(&mut progress).unwrap().stream = true;
-        if let Some(writer) = report.writer() {
+        if let Some(writer) = report.writer().filter(|_| !report.is_entry()) {
             progress.set_results(writer.clone());
         }
         progress.files_total.store(1, Relaxed);
@@ -106,6 +108,7 @@ impl Controls {
         Self {
             report,
             metadata: super::metadata::Policy::new(args),
+            expected: Default::default(),
             settings,
             pipeline: tuning.pipeline_depth(),
             s3_requests: tuning
@@ -120,13 +123,30 @@ impl Controls {
                     .unwrap_or(usize::MAX),
             ),
             progress,
+            parent_progress: None,
             limit,
             stats: args.stats,
             quiet: args.quiet,
         }
     }
+    pub(crate) fn share_bandwidth(&mut self, limit: Option<Arc<crate::bwlimit::BandwidthLimit>>) {
+        self.limit = limit;
+    }
+    pub fn add_bytes(&self, bytes: u64) {
+        self.progress.add_bytes(bytes);
+        if let Some(parent) = &self.parent_progress {
+            parent.add_bytes(bytes);
+        }
+    }
     pub fn set_size(&self, size: u64) {
-        self.progress.bytes_total.store(size, Relaxed);
+        let previous = self.progress.bytes_total.swap(size, Relaxed);
+        if let Some(parent) = &self.parent_progress {
+            if size >= previous {
+                parent.bytes_total.fetch_add(size - previous, Relaxed);
+            } else {
+                parent.bytes_total.fetch_sub(previous - size, Relaxed);
+            }
+        }
         self.progress.scan_done.store(true, Relaxed);
     }
     pub(crate) fn bandwidth(&self) -> Option<Arc<crate::bwlimit::BandwidthLimit>> {

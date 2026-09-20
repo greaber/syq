@@ -23,7 +23,7 @@ class NativeApiInventoryTests(unittest.TestCase):
 
     def test_every_python_option_is_in_the_matching_signature(self) -> None:
         sdk_parameters = {
-            "cp": {"self", "sources", "on_event", "timeout", "check"},
+            "cp": {"self", "sources", "on_event", "timeout", "check", "stream_concurrency"},
             "rm": {"self", "sources", "on_event", "timeout", "check"},
             "map": {"self", "sources", "timeout"},
         }

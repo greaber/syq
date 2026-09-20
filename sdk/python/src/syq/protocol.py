@@ -27,6 +27,7 @@ from .models import (
     FinalStateEvent,
     ObjectMetadata,
     MappingEntry,
+    MappingStreamResult,
     DestinationMetadata,
     OperationAction,
     OperationResult,
@@ -245,9 +246,13 @@ class AutomationDecoder:
         prune: bool = False,
         mapping: bool = False,
         selectors_total: int | None = None,
+        stream_entries: set[int] | None = None,
     ) -> None:
         if mode not in {"cp", "rm"}:
             raise ValueError("automation decoder mode must be 'cp' or 'rm'")
+        self.stream_entries = stream_entries
+        self.stream_outcomes: set[int] = set()
+        self.schema_version = 3 if stream_entries is not None else SCHEMA_VERSION
         self.expected_mode = mode
         self.expected_prune = prune
         self.expected_mapping = mapping
@@ -283,7 +288,7 @@ class AutomationDecoder:
         record = _object(line, label="automation record")
         if record.get("schema") != SCHEMA:
             raise SyqProtocolError("unsupported automation schema")
-        if _integer(record, "schema_version") != SCHEMA_VERSION:
+        if _integer(record, "schema_version") != self.schema_version:
             raise SyqProtocolError("unsupported automation schema version")
         seq = _integer(record, "seq")
         if seq != self._next_seq:
@@ -293,7 +298,7 @@ class AutomationDecoder:
         self._next_seq += 1
         record_type = _string(record, "type")
         common = {
-            "protocol": ProtocolMetadata(SCHEMA, SCHEMA_VERSION, seq, record_type)
+            "protocol": ProtocolMetadata(SCHEMA, self.schema_version, seq, record_type)
         }
 
         if self.run is None:
@@ -389,6 +394,32 @@ class AutomationDecoder:
                 bytes=_optional_integer(record, "bytes"),
                 reason=_enum(record, "reason", TraceReason),
             )
+        if record_type == "stream_result" and self.stream_entries is not None:
+            index = _integer(record, "entry")
+            if index not in self.stream_entries or index in self.stream_outcomes:
+                raise SyqProtocolError("unexpected or duplicate callback mapping outcome")
+            disposition = _string(record, "disposition")
+            if disposition not in {"succeeded", "failed", "skipped", "planned"}:
+                raise SyqProtocolError("unknown callback mapping disposition")
+            dry_run = _boolean(record, "dry_run")
+            if dry_run != self.expected_dry_run or (disposition == "planned" and not dry_run) or (disposition == "succeeded" and dry_run):
+                raise SyqProtocolError("callback mapping outcome disagrees with dry_run")
+            message = _optional_string(record, "message")
+            if disposition == "failed" and not message:
+                raise SyqProtocolError("failed callback mapping has no error message")
+            def endpoint(name):
+                value = record.get(name)
+                if not isinstance(value, dict):
+                    raise SyqProtocolError("invalid callback mapping endpoint")
+                if value.get("callback") is True and value.get("entry") == index:
+                    return None
+                return _tagged(value.get("path"), label=name)
+            source, destination = endpoint("source"), endpoint("destination")
+            if source is not None and destination is not None:
+                raise SyqProtocolError("callback result contains no callback endpoint")
+            self.stream_outcomes.add(index)
+            return MappingStreamResult(**common, entry=index, source=source, destination=destination,
+                disposition=disposition, dry_run=dry_run, bytes=_optional_integer(record, "bytes"), message=message)
         if record_type == "operation_result":
             if self.run.mode != "cp":
                 raise SyqProtocolError(
@@ -662,6 +693,8 @@ class AutomationDecoder:
                 message=_optional_string(state, "message"),
             )
         if record_type == "result":
+            if self.stream_entries is not None and record.get("status") in {"success", "partial"} and self.stream_outcomes != self.stream_entries:
+                raise SyqProtocolError("stream mapping result omitted callback outcomes")
             status = _enum(record, "status", OperationStatus)
             exit_code = _integer(record, "exit_code")
             allowed_exit_codes = {
