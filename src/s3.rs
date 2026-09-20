@@ -1,6 +1,7 @@
 //! Native local/S3 and server-side S3 copies. The S3 client and its durable formats are independent
 //! of the filesystem helper protocol: credentials never enter an SSH request.
 mod admission;
+pub(crate) mod authorization;
 mod checksum;
 mod client;
 mod delete;
@@ -79,7 +80,7 @@ pub(crate) struct Flags {
     /// S3 signing region, used as given (otherwise syq asks AWS where the bucket is)
     #[arg(long, value_name = "REGION", help_heading = "Object storage")]
     s3_region: Option<String>,
-    /// AWS shared configuration/credentials profile
+    /// AWS profile (on the authorizing machine with --auth-from @NAME)
     #[arg(long, value_name = "NAME", help_heading = "Object storage")]
     s3_profile: Option<String>,
     /// Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused)
@@ -159,9 +160,16 @@ impl Options {
             }
             return Ok(None);
         }
+        if explicit("auth_from")
+            && !matches!(
+                matches.get_one::<crate::cli::AuthFrom>("auth_from"),
+                Some(crate::cli::AuthFrom::Return(_))
+            )
+        {
+            bail!("S3 authorization requires --auth-from @NAME; omit it to use local storage credentials");
+        }
         for id in [
             "inplace",
-            "auth_from",
             "via",
             "coordinate_at",
             "rsh",

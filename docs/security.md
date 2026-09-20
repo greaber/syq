@@ -265,7 +265,7 @@ persistent connections, including receiving.
 
 With receiving enabled, servers you have persistent connections to can request
 copies to or commands on your machine, or authorization for copies to another
-server. Receiving is configured separately and defaults to enabled. `syq persist receive off`
+server or object storage. Receiving is configured separately and defaults to enabled. `syq persist receive off`
 disables these requests while keeping SSH reuse.
 
 Requests from a server are subject to local approval:
@@ -275,6 +275,7 @@ Requests from a server are subject to local approval:
 | Send files to your machine | Required by default; `--auto-approve-root` permits unattended downloads confined to that directory |
 | Use your SSH access for a copy to another server | Always required |
 | Run a command on your machine | Always required |
+| Use your storage credentials for a transfer | Always required |
 
 The prompt identifies the server account and requested operation. It cannot
 prove who typed the command there. Approving a copy does not approve a later
@@ -317,3 +318,27 @@ described in [Copies between servers](#copies-between-servers).
 With [`syq exec`](receive.md#run-commands-on-your-laptop), a connected server can request a command on your
 laptop. An approved command runs with your local user's full permissions;
 it is not sandboxed or confined to a copy destination directory.
+
+## Storage authorization
+
+With `cp --auth-from @NAME` and an S3 endpoint, the receiving machine signs
+requests using its storage credentials. The server receives bearer URLs for
+approved operations and paths, never the underlying secret access key. Data
+travels directly between the server and storage; the authorizer need not stay
+connected after preparation finishes.
+
+Approval trusts the requesting server account to choose contents and request
+operations within the displayed bucket and paths. Upload approval also allows
+reading those paths for comparison and recovery. Create-only approval requires
+conditional writes; object deletion requires separate permission in the same
+prompt. Syq refuses bucket administration, ACL changes, and server-side copies.
+The storage provider enforces each issued request's signature and expiry.
+
+These are reusable bearer capabilities. Anyone who obtains them can repeat the
+signed operations until expiry, subject to the provider's rules. They do not
+carry filesystem receiver one-use grants, aggregate byte or entry limits, or
+signed receipts. Receiving roots and automatic approval directories do not
+apply. Stopping receiving prevents further signing but cannot revoke URLs
+already issued; revocation depends on the provider and the credentials used.
+See [Authorize from your laptop](object-storage.md#authorize-from-your-laptop)
+for setup and expiry behavior.

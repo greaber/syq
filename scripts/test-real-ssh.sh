@@ -26,11 +26,11 @@ while [ "$#" -gt 0 ]; do
       esac
       shift 2
       ;;
-    *) die 'usage: scripts/test-real-ssh.sh [--profile max-sessions-1] [--suite core|benchmark]' ;;
+    *) die 'usage: scripts/test-real-ssh.sh [--profile max-sessions-1] [--suite core|benchmark|storage]' ;;
   esac
 done
 case "$suite" in
-  core|benchmark) ;;
+  core|benchmark|storage) ;;
   *) die "unknown real-SSH test suite: $suite" ;;
 esac
 [ "$suite" != benchmark ] || [ "$profile" = default ] ||

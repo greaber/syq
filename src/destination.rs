@@ -31,6 +31,7 @@ pub(crate) mod exec;
 mod forward;
 pub(crate) mod handoff;
 mod identity;
+pub(crate) mod storage;
 
 // Discovery is independent of the build-pinned request protocol. Keep the
 // Ping/Ready and Identify/Identity JSON envelopes stable across helper wire changes.
@@ -131,6 +132,7 @@ enum Message {
         challenge: String,
     },
     Exec(exec::ExecRequest),
+    Storage(crate::s3::authorization::Request),
     Request(Box<CopyRequest>),
     Forward {
         target: String,
@@ -971,6 +973,7 @@ impl Receiver {
         }
         match envelope.message {
             Message::Exec(request) => self.execute(request, stream),
+            Message::Storage(request) => self.storage(request, stream),
             Message::Ping => write_message(&mut stream, &Reply::Ready),
             Message::Identify { name, challenge } => {
                 if name != self.name {
