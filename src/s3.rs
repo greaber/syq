@@ -80,7 +80,7 @@ pub(crate) struct Flags {
     /// S3 signing region, used as given (otherwise syq asks AWS where the bucket is)
     #[arg(long, value_name = "REGION", help_heading = "Object storage")]
     s3_region: Option<String>,
-    /// AWS profile (on the authorizing machine with --auth-from @NAME)
+    /// AWS shared configuration/credentials profile
     #[arg(long, value_name = "NAME", help_heading = "Object storage")]
     s3_profile: Option<String>,
     /// Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused)

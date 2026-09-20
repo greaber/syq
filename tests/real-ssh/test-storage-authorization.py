@@ -35,7 +35,7 @@ def copy(arguments, *, allow=True, disconnect=True, interrupt=False, ok=None):
                '--s3-endpoint', endpoint, '--s3-region', 'us-east-1', '--no-progress',
                '--performance-tuning=s3-part-size=5M,s3-max-concurrent-parts-per-object=1,s3-retries=0',
                '--resource-limits=bandwidth=2MiB', '--results', '/tmp/syq-storage-authorization/progress', *arguments]
-    remote = 'test ! -e ~/.aws/credentials && test -z "${AWS_ACCESS_KEY_ID:-}" && echo $$ > /tmp/syq-storage-authorization/copy.pid && exec ' + shlex.join(command)
+    remote = 'rm -f /tmp/syq-storage-authorization/progress && test ! -e ~/.aws/credentials && test -z "${AWS_ACCESS_KEY_ID:-}" && echo $$ > /tmp/syq-storage-authorization/copy.pid && exec ' + shlex.join(command)
     process = subprocess.Popen(['ssh', 'source', remote], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, start_new_session=True)
     messages = queue.Queue()
