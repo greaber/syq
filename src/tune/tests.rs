@@ -160,12 +160,12 @@ fn activity_rate_discards_a_regressing_sample() {
 
 #[test]
 fn remaining_work_requirement_scales_with_rate_not_worker_count() {
-    let slow = required_remaining_activity(Some(1_000_000.0), 8, SAMPLE);
-    let fast = required_remaining_activity(Some(1_000_000_000.0), 8, SAMPLE);
+    let slow = required_remaining_activity(Some(1_000_000.0), 8, SAMPLE, MEASUREMENT_SAMPLES);
+    let fast = required_remaining_activity(Some(1_000_000_000.0), 8, SAMPLE, MEASUREMENT_SAMPLES);
     assert_eq!(slow, 7_500_000);
     assert_eq!(fast, 7_500_000_000);
     assert_eq!(
-        required_remaining_activity(None, 8, SAMPLE),
+        required_remaining_activity(None, 8, SAMPLE, MEASUREMENT_SAMPLES),
         8 * TAIL_FALLBACK_BYTES_PER_WORKER
     );
 }
@@ -456,4 +456,56 @@ fn out_of_order_readiness_keeps_every_warming_slot() {
     gate.mark_ready(4);
     assert!(gate.ready_through(6));
     assert!(gate.begin_warming(6).is_empty());
+}
+
+#[test]
+fn ongoing_measurement_can_finish_without_another_full_window() {
+    let mut policy = Policy::new(16, MIN, MAX);
+    policy.observe(100.0);
+    assert_eq!(policy.n, 21);
+    policy.activated();
+    let mut sampler = Sampler::default();
+    sampler.reset();
+    // A 21-worker probe starts with ten seconds of work remaining. By the
+    // final sample only five seconds remain: enough to score it, but less
+    // than the old requirement of another full 7.5-second measurement.
+    for seconds_left in [10, 7, 5] {
+        let required =
+            required_remaining_activity(Some(130.0), 21, SAMPLE, sampler.remaining_samples());
+        assert!(seconds_left * 130 >= required);
+        if let Some(score) = sampler.push(130.0) {
+            policy.observe(score);
+        }
+    }
+    assert!(5 * 130 < required_remaining_activity(Some(130.0), 21, SAMPLE, MEASUREMENT_SAMPLES));
+    assert!(
+        policy.measured(),
+        "completed comparison can seed the next copy"
+    );
+    assert_eq!(policy.settled(), 21);
+}
+
+#[test]
+fn remaining_measurement_budget_keeps_tail_margin_and_resets() {
+    let mut sampler = Sampler::default();
+    sampler.reset();
+    assert_eq!(sampler.remaining_samples(), MEASUREMENT_SAMPLES);
+    assert_eq!(sampler.push(100.0), None);
+    assert_eq!(sampler.remaining_samples(), 2);
+    assert_eq!(sampler.push(100.0), None);
+    assert_eq!(sampler.remaining_samples(), 1);
+    assert_eq!(
+        sampler.push(200.0),
+        None,
+        "less work does not waive stability"
+    );
+    assert_eq!(sampler.remaining_samples(), 1);
+    let required =
+        required_remaining_activity(Some(200.0), 21, SAMPLE, sampler.remaining_samples());
+    assert!(
+        200 < required,
+        "one second left is still too close to the tail"
+    );
+    sampler.reset();
+    assert_eq!(sampler.remaining_samples(), MEASUREMENT_SAMPLES);
 }

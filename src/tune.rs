@@ -68,7 +68,7 @@ const EVIDENCE_MAX_AGE: usize = PROBE_EVERY * 4;
 /// How often progress is sampled.
 pub const SAMPLE: Duration = Duration::from_millis(2500);
 /// One discarded warm-up interval plus the two samples needed for stability.
-const MEASUREMENT_SAMPLES: f64 = 3.0;
+const MEASUREMENT_SAMPLES: usize = 3;
 /// Two consecutive samples this close count as a stable rate.
 const STABLE_WITHIN: f64 = 0.10;
 /// Give up waiting for stability after this many samples and use what we have.
@@ -108,19 +108,30 @@ fn sample_interval() -> Duration {
     SAMPLE
 }
 
-fn required_remaining_activity(rate: Option<f64>, workers: usize, sample: Duration) -> u64 {
+fn required_remaining_activity(
+    rate: Option<f64>,
+    workers: usize,
+    sample: Duration,
+    remaining_samples: usize,
+) -> u64 {
     match rate.filter(|rate| rate.is_finite() && *rate >= 0.0) {
-        Some(rate) => (rate * sample.as_secs_f64() * MEASUREMENT_SAMPLES)
+        Some(rate) => (rate * sample.as_secs_f64() * remaining_samples as f64)
             .ceil()
             .clamp(0.0, u64::MAX as f64) as u64,
         None => (workers as u64).saturating_mul(TAIL_FALLBACK_BYTES_PER_WORKER),
     }
 }
 
-fn enough_work(sched: &Sched, workers: usize, rate: Option<f64>, sample: Duration) -> bool {
+fn enough_work(
+    sched: &Sched,
+    workers: usize,
+    rate: Option<f64>,
+    sample: Duration,
+    remaining_samples: usize,
+) -> bool {
     sched.work_left_for(
         workers,
-        required_remaining_activity(rate, workers, sample),
+        required_remaining_activity(rate, workers, sample, remaining_samples),
         FILE_CREDIT,
     )
 }
@@ -296,6 +307,15 @@ impl Sampler {
     pub fn reset(&mut self) {
         self.samples.clear();
         self.discard = true;
+    }
+
+    /// Budget only the samples still needed, including the one about to be
+    /// submitted. Keep at least one interval of work ahead even when several
+    /// unstable samples have accumulated, so draining workers are not scored.
+    fn remaining_samples(&self) -> usize {
+        (usize::from(self.discard) + 2)
+            .saturating_sub(self.samples.len())
+            .max(1)
     }
 
     /// Feed one sample; returns a score once the rate is stable.
@@ -932,7 +952,7 @@ pub fn run(
             continue;
         }
         if policy.n > active {
-            if !enough_work(&sched, policy.n, last_rate, sample) {
+            if !enough_work(&sched, policy.n, last_rate, sample, MEASUREMENT_SAMPLES) {
                 policy.cancel_unapplied();
                 gate.set_retain(if active == 1 { 2 } else { active });
                 continue;
@@ -991,7 +1011,7 @@ pub fn run(
                 };
                 last = now;
                 last_rate = Some(rate);
-                if !enough_work(&sched, policy.n, last_rate, sample) {
+                if !enough_work(&sched, policy.n, last_rate, sample, MEASUREMENT_SAMPLES) {
                     policy.cancel_unapplied();
                     gate.set_retain(if active == 1 { 2 } else { active });
                     sampler.reset();
@@ -1060,8 +1080,17 @@ pub fn run(
         last_rate = Some(rate);
         // Estimate the time left at the rate just observed. In the tail, idle
         // workers say nothing; unlike a fixed byte threshold this remains
-        // useful on both very slow and very fast paths.
-        if !enough_work(&sched, active, last_rate, sample) {
+        // useful on both very slow and very fast paths. An ongoing measurement
+        // needs only its remaining samples, not another complete warm-up and
+        // measurement window. Admission of new upward probes still requires
+        // the full window above.
+        if !enough_work(
+            &sched,
+            active,
+            last_rate,
+            sample,
+            sampler.remaining_samples(),
+        ) {
             sampler.reset();
             collapse_samples = 0;
             continue;
