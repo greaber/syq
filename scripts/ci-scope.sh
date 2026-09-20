@@ -167,7 +167,7 @@ while IFS= read -r path; do
       ;;
     tests/real-ssh/*)
       ;;
-    scripts/*|.github/workflows/*|.env.release|deny.toml)
+    scripts/*|.github/workflows/*|deny.toml)
       tooling=true
       ;;
     *.md|docs/*|.github/ISSUE_TEMPLATE/*|.github/dependabot.yml|LICENSE|.gitignore|.claude/*)

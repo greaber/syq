@@ -129,7 +129,9 @@ chmod 755 "$fake_bin/dotenvx" "$fake_bin/gh" "$repo/scripts/"*.sh
 git -C "$repo" init -q -b master
 git -C "$repo" remote add origin https://github.com/greaber/not-syq.git
 
+secrets_dir="$work/config/syq/release"
 common_env=(
+  "SYQ_RELEASE_SECRETS_DIR=$secrets_dir"
   "PATH=$fake_bin:$PATH"
   "DOTENVX_BIN=$fake_bin/dotenvx"
   "FAKE_DOTENVX_STATE=$fake_state"
@@ -138,8 +140,10 @@ common_env=(
 
 env "${common_env[@]}" "$repo/scripts/init-release-secrets.sh" \
   > "$work/init-output" 2>&1
-[ -f "$repo/.env.release" ] || fail "initializer did not create .env.release"
-[ -f "$repo/.env.keys" ] || fail "initializer did not create .env.keys"
+[ -f "$secrets_dir/.env.release" ] || fail "initializer did not create .env.release"
+[ -f "$secrets_dir/.env.keys" ] || fail "initializer did not create .env.keys"
+[ ! -e "$repo/.env.release" ] || fail "initializer wrote credentials in the checkout"
+[ ! -e "$repo/.env.keys" ] || fail "initializer wrote a private key in the checkout"
 file_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
@@ -151,8 +155,10 @@ sha256_file() {
     shasum -a 256 "$1" | awk '{print $1}'
   fi
 }
-[ "$(file_mode "$repo/.env.keys")" = 600 ] || fail ".env.keys is not mode 0600"
-grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$repo/.env.release" \
+[ "$(file_mode "$secrets_dir")" = 700 ] || fail "secrets directory is not mode 0700"
+[ "$(file_mode "$secrets_dir/.env.release")" = 600 ] || fail "inventory is not mode 0600"
+[ "$(file_mode "$secrets_dir/.env.keys")" = 600 ] || fail ".env.keys is not mode 0600"
+grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$secrets_dir/.env.release" \
   && fail "encrypted inventory contains the plaintext Homebrew key"
 grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$work/init-output" \
   && fail "initializer printed the Homebrew key"
@@ -169,13 +175,13 @@ derived_public=$(openssl pkey -in "$work/signing.pem" -pubout -outform DER \
 [ "$derived_public" = "$(cat "$fake_state/SYQ_RELEASE_PUBLIC_KEY")" ] \
   || fail "initializer stored a mismatched signing key pair"
 
-env_hash=$(sha256_file "$repo/.env.release")
-keys_hash=$(sha256_file "$repo/.env.keys")
+env_hash=$(sha256_file "$secrets_dir/.env.release")
+keys_hash=$(sha256_file "$secrets_dir/.env.keys")
 expect_failure "$work/reinit-output" \
   env "${common_env[@]}" "$repo/scripts/init-release-secrets.sh"
-[ "$env_hash" = "$(sha256_file "$repo/.env.release")" ] \
+[ "$env_hash" = "$(sha256_file "$secrets_dir/.env.release")" ] \
   || fail "reinitialization changed .env.release"
-[ "$keys_hash" = "$(sha256_file "$repo/.env.keys")" ] \
+[ "$keys_hash" = "$(sha256_file "$secrets_dir/.env.keys")" ] \
   || fail "reinitialization changed .env.keys"
 
 : > "$fake_state/calls"
@@ -232,5 +238,22 @@ grep -q 'secret set\|variable set' "$fake_state/calls" \
 
 expect_failure "$work/unknown-argument-output" \
   env "${common_env[@]}" "$repo/scripts/sync-github-secrets.sh" --surprise
+
+# Defaults must also stay outside the checkout when no override is supplied.
+default_env=(
+  "PATH=$fake_bin:$PATH"
+  "DOTENVX_BIN=$fake_bin/dotenvx"
+  "FAKE_DOTENVX_STATE=$fake_state"
+  "FAKE_GH_STATE=$fake_state"
+)
+env -u SYQ_RELEASE_SECRETS_DIR "${default_env[@]}" \
+  XDG_CONFIG_HOME="$work/xdg" "$repo/scripts/init-release-secrets.sh" \
+  > "$work/xdg-output" 2>&1
+[ -f "$work/xdg/syq/release/.env.release" ] || fail "XDG config inventory missing"
+env -u SYQ_RELEASE_SECRETS_DIR -u XDG_CONFIG_HOME "${default_env[@]}" \
+  HOME="$work/home" "$repo/scripts/init-release-secrets.sh" \
+  > "$work/home-output" 2>&1
+[ -f "$work/home/.config/syq/release/.env.release" ] || fail "default config inventory missing"
+[ ! -e "$repo/.env.release" ] || fail "default initialization wrote credentials in the checkout"
 
 printf 'secret tooling tests passed\n'

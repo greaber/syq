@@ -10,8 +10,9 @@ HOMEBREW_TAP_REPO=greaber/homebrew-tap
 HOMEBREW_DEPLOY_KEY_TITLE='syq release workflow'
 RELEASE_ENVIRONMENT=release
 ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-ENV_FILE="$ROOT_DIR/.env.release"
-KEYS_FILE="$ROOT_DIR/.env.keys"
+SECRETS_DIR=${SYQ_RELEASE_SECRETS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/syq/release}
+ENV_FILE="$SECRETS_DIR/.env.release"
+KEYS_FILE="$SECRETS_DIR/.env.keys"
 DOTENVX_BIN=${DOTENVX_BIN:-dotenvx}
 EXECUTE=false
 

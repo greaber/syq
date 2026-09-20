@@ -45,14 +45,26 @@ registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.
 
 ## Encrypted release inventory
 
-The committed `.env.release` file is the canonical release-credential
-inventory. It contains ciphertext for `SYQ_RELEASE_SIGNING_KEY_PEM_B64`,
-`HOMEBREW_TAP_DEPLOY_KEY`, and the `CLOUDFLARE_API_TOKEN` and
-`CLOUDFLARE_ACCOUNT_ID` that deploy the download host in
-[`infra/syq-dl/`](infra/syq-dl/README.md), plus the corresponding public
-`SYQ_RELEASE_PUBLIC_KEY`. Its decryption authority lives only in the
-gitignored `.env.keys`. Forks receive the ciphertext but neither the
-decryption key nor official publishing authority.
+Release credentials stay outside this public repository, including encrypted
+copies. The tools read `.env.release` and its `.env.keys` decryption key from
+`${XDG_CONFIG_HOME:-$HOME/.config}/syq/release`. Set `SYQ_RELEASE_SECRETS_DIR`
+to use another private directory outside the checkout. Both tools use the
+same location; they do not read an old inventory from the repository root.
+
+For multi-machine operation, keep the encrypted inventory and setup instructions
+in a separate private operations repository. Local configuration can link to
+that checkout. Commit encrypted inventory updates there; keep `.env.keys` out
+of Git and restore it from a separately protected backup on each machine.
+
+The inventory contains the manifest signing key, Homebrew deploy key, and
+Cloudflare credentials used by [`infra/syq-dl/`](infra/syq-dl/README.md).
+An optional manual crates.io token can also be kept there; automated
+publication uses GitHub OIDC instead.
+
+For an existing inventory, move both files to the private directory and
+verify decryption before removing the old copies. Preserve their values:
+initialization creates new signing authority and is not a migration step.
+Keep the directory mode `0700` and both files mode `0600`.
 
 Install the pinned maintainer tool, then initialize the inventory on an
 encrypted developer machine. The initializer generates independent Ed25519
@@ -65,12 +77,10 @@ directory first on `PATH` before signing:
 ```sh
 npm install --global @dotenvx/dotenvx@2.21.0
 scripts/init-release-secrets.sh
-git add .env.release
-git commit -m 'Add encrypted release credential inventory'
 ```
 
-Back up `.env.keys` immediately in protected storage. Do not commit it, upload
-it to GitHub, or use it in CI. Losing every copy prevents future releases from
+Back up both files immediately in protected storage. Do not commit either
+file to syq. Never upload the decryption key to GitHub or use it in CI. Losing every copy prevents future releases from
 using the signing identity embedded in installed clients.
 
 After the repository has been renamed and the protected `release` environment
@@ -93,8 +103,8 @@ and refuses a mismatched release signing pair or tap deploy key.
 The Homebrew deploy key is already restricted to one repository and should not
 need routine rotation. If it is exposed, replace its ciphertext with a newly
 generated Ed25519 private key, remove the deploy key titled `syq release
-workflow` from the tap, commit `.env.release`, and rerun the dry-run/execute
-sync. The sync will install the new public half before updating the protected
+workflow` from the tap, update the private inventory and its backup, and
+rerun the dry-run/execute sync. The sync will install the new public half before updating the protected
 environment secret.
 
 Do not rotate the release signing key casually: installed clients trust it, so
