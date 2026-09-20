@@ -13,11 +13,11 @@
 //! tends to have lower throughput regret than removing a useful one.
 //!
 //! Candidate workers are connected while the current count remains active.
-//! They become active only when the whole candidate set is ready. Surplus
-//! workers are retired after a decision instead of retaining every connection
-//! ever tried (except that count one retains one ready spare for a cheap 1→2
-//! probe). Parking takes effect within one block even in a huge range: the
-//! worker hands the rest of its range back to the scheduler.
+//! They become active only when the whole candidate set is ready. Connected
+//! workers park when no longer active and remain available until the copy ends,
+//! avoiding another handshake if tuning raises the count again. Unneeded
+//! setup/recovery attempts can still stop. Parking takes effect within one block
+//! even in a huge range: the worker hands its remainder back to the scheduler.
 //!
 //! [`Sampler`] turns raw samples into stable measurements and [`Policy`] is
 //! the decision state machine; both are pure and unit tested. [`Gate`] is the
@@ -697,12 +697,12 @@ impl Default for Slot {
 }
 
 /// The worker lifecycle shared by the tuner and workers. `active` controls who
-/// may take work; `retain` controls who keeps a connection while parked. Slot
-/// state distinguishes a genuinely ready connection from one still warming or
-/// one whose setup failed.
+/// may take work; `connect_target` controls who should establish or recover a
+/// connection. Already-connected workers stay parked until needed or the copy
+/// ends. Slot state distinguishes ready connections from setup and failure.
 pub struct Gate {
     active: AtomicUsize,
-    retain: AtomicUsize,
+    connect_target: AtomicUsize,
     slots: Mutex<Vec<Slot>>,
     cv: Condvar,
 }
@@ -722,7 +722,7 @@ impl Gate {
     pub fn new(active: usize) -> Arc<Self> {
         Arc::new(Gate {
             active: AtomicUsize::new(active),
-            retain: AtomicUsize::new(active),
+            connect_target: AtomicUsize::new(active),
             slots: Mutex::new(Vec::new()),
             cv: Condvar::new(),
         })
@@ -739,13 +739,14 @@ impl Gate {
     pub fn set_active(&self, n: usize) {
         let _g = self.slots.lock().unwrap();
         self.active.store(n, Relaxed);
-        self.retain.fetch_max(n, Relaxed);
+        self.connect_target.fetch_max(n, Relaxed);
         self.cv.notify_all();
     }
 
-    pub fn set_retain(&self, n: usize) {
+    /// Limit setup/recovery without closing already-connected parked workers.
+    pub fn set_connect_target(&self, n: usize) {
         let _g = self.slots.lock().unwrap();
-        self.retain.store(n.max(self.active()), Relaxed);
+        self.connect_target.store(n.max(self.active()), Relaxed);
         self.cv.notify_all();
     }
 
@@ -793,8 +794,8 @@ impl Gate {
         self.cv.notify_all();
     }
 
-    pub fn retained(&self, id: usize) -> bool {
-        id < self.retain.load(Relaxed)
+    pub fn connection_needed(&self, id: usize) -> bool {
+        id < self.connect_target.load(Relaxed)
     }
 
     pub fn ready_through(&self, n: usize) -> bool {
@@ -825,14 +826,15 @@ impl Gate {
     }
 
     /// Block until `id` is allowed again. Returns false if the transfer is
-    /// over or this surplus connection should be retired.
+    /// over. Reducing the connection target only cancels setup/recovery; closing
+    /// a healthy parked connection here would make a later increase reconnect.
     pub fn park(&self, id: usize, done: impl Fn() -> bool) -> bool {
         let mut slots = self.slots.lock().unwrap();
         loop {
             if self.allowed(id) {
                 return true;
             }
-            if done() || id >= self.retain.load(Relaxed) {
+            if done() {
                 return false;
             }
             slots = self
@@ -893,7 +895,7 @@ pub fn run(
             let before = active;
             policy = Policy::new(requested, policy.min, policy.max);
             active = requested;
-            gate.set_retain(requested);
+            gate.set_connect_target(requested);
             for id in gate.begin_warming(requested) {
                 spawn(id);
             }
@@ -918,7 +920,7 @@ pub fn run(
             active = policy.n;
             policy.activated();
             meter.set_active(active);
-            gate.set_retain(if active == 1 { 2 } else { active });
+            gate.set_connect_target(if active == 1 { 2 } else { active });
             sampler.reset();
             collapse_samples = 0;
             last = (meter.bytes(), meter.files());
@@ -934,10 +936,10 @@ pub fn run(
         if policy.n > active {
             if !enough_work(&sched, policy.n, last_rate, sample) {
                 policy.cancel_unapplied();
-                gate.set_retain(if active == 1 { 2 } else { active });
+                gate.set_connect_target(if active == 1 { 2 } else { active });
                 continue;
             }
-            gate.set_retain(policy.n);
+            gate.set_connect_target(policy.n);
             for id in gate.begin_warming(policy.n) {
                 spawn(id);
             }
@@ -949,7 +951,7 @@ pub fn run(
                 // Failure to provision an optional upward probe is not a
                 // throughput result and must not fail the copy.
                 policy.cancel_unapplied();
-                gate.set_retain(if active == 1 { 2 } else { active });
+                gate.set_connect_target(if active == 1 { 2 } else { active });
                 gate.clear_failed_from(active);
                 continue;
             }
@@ -993,7 +995,7 @@ pub fn run(
                 last_rate = Some(rate);
                 if !enough_work(&sched, policy.n, last_rate, sample) {
                     policy.cancel_unapplied();
-                    gate.set_retain(if active == 1 { 2 } else { active });
+                    gate.set_connect_target(if active == 1 { 2 } else { active });
                     sampler.reset();
                     continue;
                 }
@@ -1018,7 +1020,7 @@ pub fn run(
         } else {
             active
         };
-        gate.set_retain(retain);
+        gate.set_connect_target(retain);
         // A pipelined whole-file batch is already owned and cannot be stolen.
         // Do not repeatedly reconnect slots that drained the queue while the
         // remaining owners finish. Queued/retried work or an ordinary

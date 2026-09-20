@@ -87,6 +87,11 @@ Supplying `--performance-tuning` bypasses the cache. With
 ceiling, whichever is lower, and leaves the cache unchanged. A bandwidth limit
 alone still reads and updates it.
 Live tuning continues unless you fix `workers`. Use `-vv` to see the starting count.
+When tuning reduces the worker count, connected workers wait without taking new
+work. Syq keeps their SSH or TCP connections until the copy ends so a later
+increase can reuse them. These idle connections and their helper processes
+continue to hold resources; the active worker count is not a count of open
+connections.
 
 ## Filesystem tuning examples
 

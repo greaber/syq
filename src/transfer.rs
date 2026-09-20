@@ -1639,7 +1639,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .clone();
                 let mut failures = 0u32;
                 loop {
-                    if !gate.retained(id) {
+                    if !gate.connection_needed(id) {
                         gate.mark_absent(id);
                         return Ok(());
                     }

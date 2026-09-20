@@ -385,7 +385,7 @@ fn gate_parks_and_releases() {
     let g = Gate::new(2);
     assert!(g.allowed(1));
     assert!(!g.allowed(2));
-    g.set_retain(3);
+    g.set_connect_target(3);
     let g2 = g.clone();
     let t = std::thread::spawn(move || g2.park(2, || false));
     std::thread::sleep(Duration::from_millis(50));
@@ -400,22 +400,75 @@ fn gate_parks_and_releases() {
 }
 
 #[test]
-fn gate_distinguishes_warming_ready_active_and_retired() {
+fn parked_connections_survive_lower_targets_and_reactivate_without_setup() {
     let gate = Gate::new(2);
     assert_eq!(gate.begin_warming(2), vec![0, 1]);
-    assert!(!gate.ready_through(2));
     gate.mark_ready(0);
     assert!(!gate.ready_through(2));
     gate.mark_ready(1);
-    assert!(gate.ready_through(2));
-
     gate.set_active(1);
-    gate.set_retain(1);
-    assert!(gate.allowed(0));
+    gate.set_connect_target(1);
     assert!(!gate.allowed(1));
-    assert!(!gate.park(1, || false), "surplus slot should retire");
-    gate.mark_absent(1);
-    assert_eq!(gate.begin_warming(2), vec![1]);
+    assert!(!gate.connection_needed(1), "unneeded recovery can stop");
+
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    let (resumed_tx, resumed_rx) = std::sync::mpsc::channel();
+    let worker_gate = gate.clone();
+    let worker = std::thread::spawn(move || {
+        let resumed = worker_gate.park(1, || {
+            parked_tx.send(()).unwrap();
+            false
+        });
+        resumed_tx.send(resumed).unwrap();
+    });
+    parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // A further policy update must not close the parked connection either.
+    gate.set_connect_target(1);
+    assert!(resumed_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    assert!(gate.ready_through(2));
+    assert!(gate.begin_warming(2).is_empty(), "reuse, not a new worker");
+    gate.set_active(2);
+    assert!(resumed_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    worker.join().unwrap();
+}
+
+#[test]
+fn parked_connections_exit_when_the_copy_finishes_or_aborts() {
+    let gate = Gate::new(2);
+    gate.mark_ready(1);
+    gate.set_active(1);
+    gate.set_connect_target(1);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+    let worker_gate = gate.clone();
+    let worker_done = done.clone();
+    let worker = std::thread::spawn(move || {
+        let resumed = worker_gate.park(1, || {
+            parked_tx.send(()).unwrap();
+            worker_done.load(Relaxed)
+        });
+        exit_tx.send(resumed).unwrap();
+    });
+    parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    done.store(true, Relaxed);
+    assert!(!exit_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    worker.join().unwrap();
+}
+
+#[test]
+fn cancelled_connection_setup_does_not_discard_a_ready_slot() {
+    let gate = Gate::new(1);
+    gate.set_connect_target(3);
+    assert_eq!(gate.begin_warming(3), vec![0, 1, 2]);
+    gate.mark_ready(0);
+    gate.mark_ready(1);
+    gate.set_connect_target(1);
+    assert!(!gate.connection_needed(2));
+    gate.mark_absent(2);
+    // Revisit the larger count: only the cancelled attempt needs setup.
+    assert_eq!(gate.begin_warming(3), vec![2]);
+    assert!(gate.ready_through(2));
 }
 
 #[test]
@@ -449,7 +502,7 @@ fn out_of_order_readiness_keeps_every_warming_slot() {
     assert!(gate.begin_warming(4).is_empty());
 
     // Shrinking the warming target must not forget higher candidates.
-    gate.set_retain(6);
+    gate.set_connect_target(6);
     assert_eq!(gate.begin_warming(6), vec![4, 5]);
     gate.mark_ready(5);
     assert!(gate.begin_warming(4).is_empty());
