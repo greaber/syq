@@ -180,6 +180,47 @@ fn cancelled_startup_doubling_does_not_change_active_workers_or_repeat_coarse_se
 }
 
 #[test]
+fn resume_worker_reset_preserves_cached_and_uncached_startup_modes() {
+    struct StopAfterReset(Arc<Sched>);
+    impl Meter for StopAfterReset {
+        fn bytes(&self) -> u64 {
+            0
+        }
+        fn files(&self) -> u64 {
+            0
+        }
+        fn set_active(&self, n: usize) {
+            if n == 8 {
+                self.0.abort();
+            }
+        }
+    }
+
+    let mut refined = Policy::new(2, MIN, MAX);
+    measure(&mut refined, 20.0);
+    measure(&mut refined, 20.0); // rejected doubling has entered finer search
+    for (policy, expected_next) in [
+        (Policy::from_cache(2, MIN, MAX), 10),
+        (Policy::new(2, MIN, MAX), 16),
+        (refined, 10),
+    ] {
+        let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+        // The same request made when a worker discovers a resumable basis:
+        // two size-limited initial workers restore the remembered eight.
+        sched.arm_direct_fallback(8);
+        sched.request_direct_fallback();
+        let gate = Gate::new(policy.active());
+        let meter = Arc::new(StopAfterReset(sched.clone()));
+        let mut reset = run(policy, gate.clone(), sched, meter, |id| gate.mark_ready(id));
+        assert_eq!(reset.active(), 8);
+        assert_eq!(reset.history, vec![8]);
+        assert!(gate.ready_through(8));
+        measure(&mut reset, 80.0);
+        assert_eq!(reset.n, expected_next);
+    }
+}
+
+#[test]
 fn cached_start_keeps_modest_probes() {
     let mut p = Policy::from_cache(START_SSH, MIN, MAX);
     measure(&mut p, 80.0);

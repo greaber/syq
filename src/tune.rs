@@ -915,7 +915,13 @@ pub fn run(
         let requested = sched.take_worker_count_request().min(policy.max);
         if requested > active {
             let before = active;
-            policy = Policy::new(requested, policy.min, policy.max);
+            policy = Policy {
+                // Resumable SSH data also requests this reset after a limited
+                // start. Keep cached/fine search fine, rather than restarting
+                // uncached doubling when the available work changes.
+                startup_doubling: policy.startup_doubling,
+                ..Policy::new(requested, policy.min, policy.max)
+            };
             active = requested;
             gate.set_retain(requested);
             for id in gate.begin_warming(requested) {
