@@ -105,10 +105,10 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
     let report = report::Report::start(&args)?;
     let plan = args.descriptor_copy.take().unwrap();
     let controls = Arc::new(Controls::new(&args, report));
-    if let Some(options) = args.s3.take() {
+    if args.s3.is_some() {
         let ticker = controls.progress.spawn_ticker();
         let result = crate::s3::stream::run(
-            options,
+            &args,
             plan.key.unwrap(),
             plan.source,
             plan.as_fd,

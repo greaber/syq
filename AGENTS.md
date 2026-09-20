@@ -416,21 +416,20 @@ or promise indefinite support.
 
 ## Release secrets
 
-Once provisioned, `.env.release` is the committed dotenvx-encrypted source of
-truth for release credentials. `.env.keys` is its gitignored decryption
-authority and must remain on developer-controlled machines and in protected
-backup storage. Never upload `.env.keys` or a `DOTENV_PRIVATE_KEY_*` value to
-GitHub, CI, the Homebrew tap, or a runtime system.
+This repository is public. Do not commit credentials, tokens, private keys,
+or encrypted credential inventories to syq. Encryption does not make a
+credential file appropriate for this repository. The user chose private
+storage outside the repository in September 2026 so that public clones do
+not receive credential material.
 
-CI consumes only the two individual environment secrets it needs. A maintainer
-materializes those values locally with `scripts/sync-github-secrets.sh`; the
-script has a fixed inventory and refuses to target anything except
-`github.com/greaber/syq`. Do not change that boundary to let CI decrypt
-`.env.release`, and do not add a general dotenvx key to GitHub secrets.
+Credential storage, decryption, backup, and account provisioning are managed
+outside this repository. Keep public tooling independent of any particular
+credential manager or local directory layout. Accept the individual credentials
+needed by the operation through the underlying tool's standard interface.
 
-Use dotenvx 2.21.0 for this inventory. Initialize it once with
-`scripts/init-release-secrets.sh`, and run the sync without `--execute` before
-every actual update. See `RELEASING.md` for provisioning, backup, and rotation.
+CI receives only its individual release secrets, never a credential-store
+decryption key. Preserve the existing release signing authority: installed
+clients trust it. See RELEASING.md for the workflow's required inputs.
 
 ## Performance evidence
 

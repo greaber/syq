@@ -17,6 +17,15 @@ syq rm [OPTIONS] PATH...
 syq rm [OPTIONS] --srcs-in DIR
 ```
 
+## SSH and transport
+
+| Argument / option | Meaning |
+|---|---|
+| `--auth-from <@NAME>` | Request storage authorization from a connected receiving machine |
+| `--syq-path <PATH>` | Use this exact syq executable on the remote removal endpoint |
+| `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
+| `--pscope <PATH>` | Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral` |
+
 ## Copy policy and filtering
 
 | Argument / option | Meaning |
@@ -68,14 +77,6 @@ syq rm [OPTIONS] --srcs-in DIR
 | `--no-progress` | Never show the human progress display |
 | `--results <FILE>` | Write the machine-readable NDJSON result stream to FILE (created fresh; an existing file is refused) |
 | `--results-fd <FD>` | Write the result stream to an inherited file descriptor the caller opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2 |
-
-## SSH and transport
-
-| Argument / option | Meaning |
-|---|---|
-| `--syq-path <PATH>` | Use this exact syq executable on the remote removal endpoint |
-| `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
-| `--pscope <PATH>` | Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral` |
 
 ## Help and version
 

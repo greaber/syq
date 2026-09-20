@@ -2,14 +2,16 @@
 
 # Use your laptop from a server
 
-Receiving lets you do three things from a connected server:
+Receiving lets you use your laptop from a connected server:
 
 - [Copy files to your laptop](#copy-files-to-your-laptop).
 - [Run commands on your laptop](#run-commands-on-your-laptop).
 - [Authorize copies between servers](#authorize-copies-between-servers)
   using your laptop's SSH credentials.
+- [Authorize object-storage transfers](object-storage.md#authorize-from-your-laptop)
+  using your laptop's storage credentials.
 
-All three use a [persistent connection](persistence.md) opened by your laptop.
+These use a [persistent connection](persistence.md) opened by your laptop.
 It needs no SSH server, public address, or incoming network port.
 
 <a id="ssh-setup"></a>
@@ -126,9 +128,9 @@ Automatic approval trusts all processes running as the connected server accounts
 including for overwrites inside that directory. You can
 [limit a profile to particular servers](#different-settings-for-different-servers).
 
-Commands on your laptop and authorization for copies between servers still
-require approval every time. See [Receivers](security.md#receivers) for the
-trust boundary.
+Commands on your laptop, authorization for copies between servers, and
+storage authorization require approval every time. See
+[Receivers](security.md#receivers) for the trust boundary.
 
 To require approval for every download again:
 

@@ -1,6 +1,7 @@
-//! Native local/S3 and server-side S3 copies. The S3 client and its durable formats are independent
-//! of the filesystem helper protocol: credentials never enter an SSH request.
+//! Native local/S3 and server-side S3 copies. Delegated request signing leaves
+//! long-lived credentials with the authorizer; file data goes directly to storage.
 mod admission;
+pub(crate) mod authorization;
 mod checksum;
 mod client;
 mod delete;
@@ -159,9 +160,16 @@ impl Options {
             }
             return Ok(None);
         }
+        if explicit("auth_from")
+            && !matches!(
+                matches.get_one::<crate::cli::AuthFrom>("auth_from"),
+                Some(crate::cli::AuthFrom::Return(_))
+            )
+        {
+            bail!("S3 authorization requires --auth-from @NAME; omit it to use local storage credentials");
+        }
         for id in [
             "inplace",
-            "auth_from",
             "via",
             "coordinate_at",
             "rsh",

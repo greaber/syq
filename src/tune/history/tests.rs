@@ -167,7 +167,7 @@ fn decisions_include_comparison_evidence_and_unapplied_candidates() {
     let mut trace = Trace::new(Some(writer.clone()), &policy, super::super::SAMPLE);
     trace.sample((0, 0), (100, 1), 2.5, &policy, &gate, "stable", Some(100.0));
     trace.observe(&mut policy, 100.0, "stable");
-    assert_eq!(policy.n, 10);
+    assert_eq!(policy.n, 16);
     assert_eq!(policy.active(), 8);
     trace.cancel(
         &mut policy,
@@ -188,10 +188,20 @@ fn decisions_include_comparison_evidence_and_unapplied_candidates() {
     writer.finish(true, false, None, json!({}));
     let db = open(&path).unwrap();
     let events = command::read_events(&db, writer.0.lock().unwrap().id).unwrap();
+    let start = events.iter().find(|e| e["kind"] == "policy_start").unwrap();
+    assert_eq!(
+        start["data"]["policy_version"],
+        super::super::POLICY_VERSION
+    );
+    assert_eq!(start["data"]["startup_step"], 2);
+    assert_eq!(start["data"]["policy"]["startup_doubling"], true);
     let decision = events.iter().find(|e| e["kind"] == "decision").unwrap();
     assert_eq!(decision["data"]["reason"], "probe_proposed");
     assert_eq!(decision["data"]["score"], 100.0);
     assert_eq!(decision["data"]["sample_ids"], json!([1]));
+    assert_eq!(decision["data"]["after"]["requested"], 16);
+    let end = events.iter().find(|e| e["kind"] == "policy_end").unwrap();
+    assert_eq!(end["data"]["policy"]["startup_doubling"], false);
     assert!(events
         .iter()
         .any(|e| e["data"]["reason"] == "insufficient_remaining_work"));
@@ -247,7 +257,7 @@ fn trace_distinguishes_acceptance_rejection_and_pending_comparison() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
     let writer = recorder(&path);
-    let mut policy = Policy::new(8, 1, 64);
+    let mut policy = Policy::from_cache(8, 1, 64);
     let gate = Gate::new(8);
     let mut trace = Trace::new(Some(writer.clone()), &policy, super::super::SAMPLE);
     trace.observe(&mut policy, 100.0, "stable");
@@ -272,6 +282,8 @@ fn trace_distinguishes_acceptance_rejection_and_pending_comparison() {
     trace.end(&policy, false);
     let events = command::read_events(&open(&path).unwrap(), writer.0.lock().unwrap().id).unwrap();
     let decisions: Vec<_> = events.iter().filter(|e| e["kind"] == "decision").collect();
+    assert_eq!(decisions[0]["data"]["before"]["startup_doubling"], false);
+    assert_eq!(decisions[0]["data"]["after"]["requested"], 10);
     assert_eq!(decisions[1]["data"]["reason"], "probe_accepted");
     assert_eq!(
         decisions[1]["data"]["before"]["state"]["Explore"]["base"],

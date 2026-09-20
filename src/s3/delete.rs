@@ -75,6 +75,7 @@ pub(super) struct Deleter<'a> {
     pub client: &'a Client,
     pub bucket: &'a str,
     pub budget: &'a std::sync::Arc<Budget>,
+    pub individual: bool,
 }
 impl Deleter<'_> {
     pub async fn run<T>(
@@ -84,17 +85,19 @@ impl Deleter<'_> {
         check: impl Fn() -> Result<()>,
         mut finished: impl FnMut(&T, std::result::Result<(), Failure>),
     ) -> Result<()> {
-        let mut batches = stream::iter(items.chunks(1000).map(|batch| {
-            let identify = &identify;
-            let check = &check;
-            async move {
-                let _slot = self.budget.acquire().await;
-                check()?;
-                let targets: Vec<_> = batch.iter().map(identify).collect();
-                let outcomes = self.batch(&targets).await;
-                Ok::<_, anyhow::Error>((batch, outcomes))
-            }
-        }))
+        let mut batches = stream::iter(items.chunks(if self.individual { 1 } else { 1000 }).map(
+            |batch| {
+                let identify = &identify;
+                let check = &check;
+                async move {
+                    let _slot = self.budget.acquire().await;
+                    check()?;
+                    let targets: Vec<_> = batch.iter().map(identify).collect();
+                    let outcomes = self.batch(&targets).await;
+                    Ok::<_, anyhow::Error>((batch, outcomes))
+                }
+            },
+        ))
         .buffer_unordered(10);
         let mut failure = None;
         // Stop starting requests when check fails, but drain all started ones.
@@ -114,6 +117,37 @@ impl Deleter<'_> {
     }
 
     async fn batch(&self, targets: &[Target]) -> Vec<std::result::Result<(), Failure>> {
+        if self.individual {
+            let target = &targets[0];
+            let result = self
+                .client
+                .delete_object()
+                .bucket(self.bucket)
+                .key(&target.key)
+                .set_version_id(target.version.clone())
+                .send()
+                .await;
+            return vec![match result {
+                Ok(output) => {
+                    if target.version.as_deref().is_some_and(|version| {
+                        output.version_id().is_some_and(|actual| actual != version)
+                    }) {
+                        Err(Failure::new(
+                            "S3 deletion acknowledged a different version".into(),
+                            None,
+                            None,
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Err(error) => Err(Failure::new(
+                    format!("{}: {error}", client::failure("S3 removal", &error)),
+                    error.as_service_error().and_then(|e| e.code()),
+                    error.raw_response().map(|r| r.status().as_u16()),
+                )),
+            }];
+        }
         let objects = targets
             .iter()
             .map(|t| {

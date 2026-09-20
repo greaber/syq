@@ -1,8 +1,10 @@
 //! Raw S3 streams with shared client/admission and entry-scoped completion.
 //! Regular-file descriptors use the same object metadata as pathname copies.
+mod authorization;
 use super::{checksum::Algorithm, client, Options};
 use crate::descriptor_copy::fd::{Descriptor, Source};
 use anyhow::{bail, Context, Result};
+pub(crate) use authorization::Prepared;
 use aws_sdk_s3::{
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart},
@@ -23,6 +25,7 @@ use std::{
 pub(crate) struct Session {
     client: Client,
     options: Options,
+    authorization: Option<Arc<super::authorization::Authorization>>,
     cancellation: Arc<super::upload_http::Cancellation>,
     parts: Arc<tokio::sync::Semaphore>,
     requests: Arc<tokio::sync::Semaphore>,
@@ -33,12 +36,19 @@ impl Session {
     pub(crate) async fn connect(
         mut options: Options,
         controls: &crate::descriptor_copy::controls::Controls,
+        authorization: Option<Arc<super::authorization::Authorization>>,
     ) -> Result<Self> {
         let cancellation = Arc::new(super::upload_http::Cancellation::default());
-        let (client, _) =
-            client::connect(&mut options, Arc::default(), cancellation.clone()).await?;
+        let (client, _) = client::connect_authorized(
+            &mut options,
+            Arc::default(),
+            cancellation.clone(),
+            authorization.clone(),
+        )
+        .await?;
         Ok(Self {
             client,
+            authorization,
             // Keep the existing single-stream window, shared across entries
             // instead of multiplying it by the number of concurrent producers.
             parts: Arc::new(tokio::sync::Semaphore::new(options.concurrency)),
@@ -93,6 +103,7 @@ impl Session {
         controls: Arc<crate::descriptor_copy::controls::Controls>,
         payload: Arc<crate::stream_mapping::Payload>,
         cancelled: Arc<AtomicBool>,
+        prepared: Option<Prepared>,
     ) -> Result<()> {
         let mut options = self.options.clone();
         options.route = if upload {
@@ -109,7 +120,7 @@ impl Session {
             placement: Default::default(),
             source_meta: None,
         };
-        execute(&plan, None, None, None, cancelled, Some(&payload)).await
+        execute(&plan, None, None, None, cancelled, Some(&payload), prepared).await
     }
     async fn pace(&self, length: u64) {
         if let Some(limit) = &self.bandwidth {
@@ -159,7 +170,7 @@ struct Plan<'a> {
     source_meta: Option<crate::proto::Meta>,
 }
 pub(crate) fn run(
-    options: Options,
+    args: &crate::cli::Args,
     key: String,
     source: Option<Source>,
     as_fd: Option<i32>,
@@ -167,6 +178,7 @@ pub(crate) fn run(
     placement: crate::descriptor_copy::StreamPlacement,
     controls: &crate::descriptor_copy::controls::Controls,
 ) -> Result<i32> {
+    let options = args.s3.clone().unwrap();
     let target = key.clone();
     let key = match &placement.name {
         Some(name) => super::local::join(
@@ -202,12 +214,24 @@ pub(crate) fn run(
         if options.route == crate::s3::Route::Download {
             controls.metadata.output(descriptor.as_ref().and_then(Descriptor::metadata).is_some())?;
         }
+        let authorization = tokio::select! {
+            value = authorization::connect(args, &options, &target, placement.existence) => value?,
+            value = &mut interrupt => { value?; bail!("stream cancelled"); }
+        };
         let session = tokio::select! {
-            value = Session::connect(options, controls) => value?,
+            value = Session::connect(options, controls, authorization.clone()) => value?,
             value = &mut interrupt => { value?; bail!("stream cancelled"); }
         };
         let plan = Plan { session: &session, controls, options: session.options.clone(), key, placement, target, source_meta };
-        let operation = execute(&plan, source, descriptor, commit, cancelled.clone(), None);
+        let size = descriptor.as_ref().map(Descriptor::remaining_len).transpose()?.flatten();
+        let prepared = session.prepare(&plan, size).await?;
+        if let Some(authorization) = authorization {
+            if let Err(error) = authorization.finish().await {
+                if let Some(Prepared::Upload { id: Some(id), .. }) = &prepared { let _ = session.abort(&plan.key, id).await; }
+                return Err(error);
+            }
+        }
+        let operation = execute(&plan, source, descriptor, commit, cancelled.clone(), None, prepared);
         tokio::pin!(operation);
         tokio::select! {
             result = &mut operation => result,
@@ -233,6 +257,7 @@ async fn execute(
     mut commit: Option<Descriptor>,
     cancelled: Arc<AtomicBool>,
     callback: Option<&Arc<crate::stream_mapping::Payload>>,
+    prepared: Option<Prepared>,
 ) -> Result<()> {
     let mut retirements: Vec<_> = descriptor
         .iter()
@@ -242,15 +267,27 @@ async fn execute(
     let _cancel = crate::descriptor_copy::fd::CancelOnDrop(cancelled.clone());
     let client = &plan.session.client;
     let controls = plan.controls;
-    let mut upload_id = None;
+    let mut upload_id = match &prepared {
+        Some(Prepared::Upload { id, .. }) => id.clone(),
+        _ => None,
+    };
     let mut _object = None;
     let result = {
         let operation = async {
             _object = Some(plan.session.objects.acquire().await?);
+            if matches!(prepared, Some(Prepared::Skipped)) {
+                controls.report.skip();
+                return Ok(());
+            }
+            if matches!(prepared, Some(Prepared::Preview)) {
+                return Ok(());
+            }
             if plan.options.route == crate::s3::Route::Upload {
                 {
                     let _request = plan.session.requests.acquire().await?;
-                    check_placement(client, plan).await?;
+                    if prepared.is_none() {
+                        check_placement(client, plan).await?;
+                    }
                 }
                 if controls.report.skipped() || controls.report.dry_run {
                     return Ok(());
@@ -265,6 +302,10 @@ async fn execute(
                     callback,
                     cancelled.clone(),
                     &mut retirements,
+                    match prepared {
+                        Some(Prepared::Download(head)) => Some(*head),
+                        _ => None,
+                    },
                 )
                 .await;
             }
@@ -289,7 +330,7 @@ async fn execute(
                     descriptor
                 }
             };
-            upload(client, plan, descriptor, &mut upload_id, commit).await
+            upload(client, plan, descriptor, &mut upload_id, commit, prepared).await
         };
         tokio::select! {
             result = operation => result,
@@ -425,17 +466,9 @@ fn digest(algorithm: Algorithm, data: &[u8]) -> String {
     hash.finish()
 }
 
-async fn upload(
-    client: &Client,
-    plan: &Plan<'_>,
-    input: Descriptor,
-    upload_id: &mut Option<String>,
-    commit: Option<Descriptor>,
-) -> Result<()> {
+fn upload_metadata(plan: &Plan<'_>) -> Option<std::collections::HashMap<String, String>> {
     let controls = plan.controls;
-    let options = &plan.options;
-    let metadata = plan
-        .source_meta
+    plan.source_meta
         .or_else(|| {
             controls.metadata.overrides.map(|_| {
                 let now = std::time::SystemTime::now()
@@ -465,15 +498,41 @@ async fn upload(
                 hash_algorithm: Default::default(),
             }
             .encode()
-        });
+        })
+}
+
+async fn upload(
+    client: &Client,
+    plan: &Plan<'_>,
+    input: Descriptor,
+    upload_id: &mut Option<String>,
+    commit: Option<Descriptor>,
+    prepared: Option<Prepared>,
+) -> Result<()> {
+    let controls = plan.controls;
+    let options = &plan.options;
+    let metadata = match prepared {
+        Some(Prepared::Upload { metadata, .. }) => metadata,
+        _ => upload_metadata(plan),
+    };
 
     let size = usize::try_from(options.part_size)?;
-    let algorithm = Algorithm::for_endpoint(options.endpoint.as_deref());
+    // An offline stream's bytes are unknown when signing. Content-MD5 can
+    // remain an unsigned request header and still checks each provider upload.
+    let algorithm = if plan.session.authorization.is_some() {
+        Algorithm::Md5
+    } else {
+        Algorithm::for_endpoint(options.endpoint.as_deref())
+    };
     let mut check = controls.expected.start();
     let (mut input, first) = plan.session.read(input).await?;
     check.add(&first.bytes)?;
     if first.bytes.len() < size {
         let length = check.finish()?;
+        if let Some(id) = upload_id.as_ref() {
+            plan.session.abort(&plan.key, id).await?;
+            *upload_id = None;
+        }
         plan.session.pace(length).await;
         crate::descriptor_copy::fd::await_commit(commit).await?;
         let hash = digest(algorithm, &first.bytes);
@@ -498,26 +557,31 @@ async fn upload(
         controls.add_bytes(length);
         return Ok(());
     }
-    let request = plan.session.requests.acquire().await?;
-    let created = client
-        .create_multipart_upload()
-        .set_metadata(metadata)
-        .bucket(&options.bucket)
-        .key(&plan.key)
-        .set_checksum_algorithm(
-            algorithm
-                .is_sha256()
-                .then_some(aws_sdk_s3::types::ChecksumAlgorithm::Sha256),
-        )
-        .send()
-        .await
-        .map_err(|e| e.into_service_error())
-        .context("create multipart upload")?;
-    drop(request);
-    let id = created
-        .upload_id()
-        .context("S3 omitted upload ID")?
-        .to_owned();
+    let id = if let Some(id) = upload_id.as_ref() {
+        id.clone()
+    } else {
+        let request = plan.session.requests.acquire().await?;
+        let created = client
+            .create_multipart_upload()
+            .set_metadata(metadata)
+            .bucket(&options.bucket)
+            .key(&plan.key)
+            .set_checksum_algorithm(
+                algorithm
+                    .is_sha256()
+                    .then_some(aws_sdk_s3::types::ChecksumAlgorithm::Sha256),
+            )
+            .send()
+            .await
+            .map_err(|e| e.into_service_error())
+            .context("create multipart upload")?;
+        drop(request);
+        let id = created
+            .upload_id()
+            .context("S3 omitted upload ID")?
+            .to_owned();
+        id
+    };
     *upload_id = Some(id.clone());
     let mut pending = futures_util::stream::FuturesUnordered::new();
     let mut completed = Vec::new();
@@ -626,18 +690,23 @@ async fn download(
     callback: Option<&Arc<crate::stream_mapping::Payload>>,
     cancelled: Arc<AtomicBool>,
     retirements: &mut Vec<Arc<crate::descriptor_copy::fd::Retirement>>,
+    prepared: Option<aws_sdk_s3::operation::head_object::HeadObjectOutput>,
 ) -> Result<()> {
     let controls = plan.controls;
     // Read raw objects, including objects carrying another tool's metadata.
     let request = plan.session.requests.acquire().await?;
-    let head = client
-        .head_object()
-        .bucket(&plan.options.bucket)
-        .key(&plan.key)
-        .send()
-        .await
-        .map_err(|e| e.into_service_error())
-        .context("inspect source object")?;
+    let head = if let Some(head) = prepared {
+        head
+    } else {
+        client
+            .head_object()
+            .bucket(&plan.options.bucket)
+            .key(&plan.key)
+            .send()
+            .await
+            .map_err(|e| e.into_service_error())
+            .context("inspect source object")?
+    };
     drop(request);
     let size = u64::try_from(
         head.content_length()

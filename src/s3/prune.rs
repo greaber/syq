@@ -1,7 +1,7 @@
 //! Destination claims and directory scopes for local/S3 pruning.
 use std::{collections::BTreeSet, ffi::OsStr, os::unix::ffi::OsStrExt};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Plan {
     pub scopes: Vec<(Vec<u8>, Vec<u8>)>,
     pub claims: BTreeSet<Vec<u8>>,

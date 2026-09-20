@@ -19,10 +19,10 @@ impl Trace {
             waiting: None,
             last_work_check: None,
         };
-        trace.event("policy_start",json!({"policy_version":1,"policy":snapshot(policy),
+        trace.event("policy_start",json!({"policy_version":POLICY_VERSION,"policy":snapshot(policy),
             "sample_ms":interval.as_millis(),"discarded_intervals_after_reset":1,"stable_within":STABLE_WITHIN,
             "maximum_samples":MAX_SAMPLES,"near_best_tolerance":NEAR_BEST_TOLERANCE,
-            "step":STEP,"file_credit":FILE_CREDIT,"probe_every":PROBE_EVERY,
+            "step":STEP,"startup_step":STARTUP_STEP,"file_credit":FILE_CREDIT,"probe_every":PROBE_EVERY,
             "probe_backoff_max":PROBE_BACKOFF_MAX,"evidence_max_age":EVIDENCE_MAX_AGE,
             "collapse_fraction":0.5,"collapse_samples":2}));
         trace
@@ -162,7 +162,7 @@ impl Trace {
 
 fn snapshot(policy: &Policy) -> Value {
     json!({"requested":policy.n,"active":policy.active,"min":policy.min,"max":(policy.max != usize::MAX).then_some(policy.max),
-        "state":policy.state,"points":policy.points,"measurement":policy.tick,
+        "startup_doubling":policy.startup_doubling,"state":policy.state,"points":policy.points,"measurement":policy.tick,
         "comparisons":policy.comparisons,"failed_probes":policy.fails,"next_probe":policy.due,
         "recent_best":policy.recent_best(),"acceptance_floor":policy.recent_best()*(1.0-NEAR_BEST_TOLERANCE)})
 }

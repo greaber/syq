@@ -198,8 +198,9 @@ class StreamTests(unittest.TestCase):
         rsh.chmod(0o700)
         for remote in (False, True):
             options = dict(rsh=str(rsh), syq_path=str(SYQ)) if remote else {}
-            to = dict(to="fixture") if remote else {}
-            from_ = dict(from_="fixture") if remote else {}
+            # The helper runs locally; TCP discovery must not resolve a fake host.
+            to = dict(to="127.0.0.1") if remote else {}
+            from_ = dict(from_="127.0.0.1") if remote else {}
             base = self.root / ("remote" if remote else "local")
             base.mkdir()
             target = base / "object"
@@ -305,7 +306,8 @@ class StreamTests(unittest.TestCase):
             rsh = self.root / 'wrapper-rsh'
             rsh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$1"\n')
             rsh.chmod(0o700)
-            options = dict(to='fixture', rsh=str(rsh), syq_path=str(SYQ)) if remote else {}
+            # Keep the TCP path without depending on external DNS.
+            options = dict(to='127.0.0.1', rsh=str(rsh), syq_path=str(SYQ)) if remote else {}
             for text in (False, True):
                 for fail in (False, True):
                     with self.subTest(remote=remote, text=text, fail=fail):
@@ -427,6 +429,20 @@ class StreamTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(target.exists())
 
+    def test_storage_streams_forward_authorizer_to_the_process(self):
+        fake = self.root / 'stream-syq'
+        fake.write_text(ready_stub())
+        fake.chmod(0o700)
+        client = syq.Client(executable=fake, timeout=5)
+        for method, args, options in [(client.open_writer, (), dict(to='s3://bucket', as_='key')),
+                                      (client.open_reader, ('key',), dict(from_='s3://bucket'))]:
+            stream = method(*args, auth_from='@laptop', **options)
+            try:
+                argv = stream._process.process.args
+                self.assertEqual(argv[argv.index('--auth-from') + 1], '@laptop')
+            finally:
+                stream.abort()
+
     def test_timeout_interrupts_blocking_write_and_reaps_child(self):
         fake = self.root / 'slow-syq'
         fake.write_text(ready_stub())
@@ -439,6 +455,22 @@ class StreamTests(unittest.TestCase):
 
 
 class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_storage_streams_forward_authorizer_to_the_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = Path(temporary) / 'stream-syq'
+            fake.write_text(ready_stub())
+            fake.chmod(0o700)
+            client = syq.AsyncClient(executable=fake, timeout=5)
+            for method, args, options in [(client.open_writer, (), dict(to='s3://bucket', as_='key')),
+                                          (client.open_reader, ('key',), dict(from_='s3://bucket'))]:
+                stream = method(*args, auth_from='@laptop', **options)
+                await stream.__aenter__()
+                try:
+                    argv = stream._stream._process.process.args
+                    self.assertEqual(argv[argv.index('--auth-from') + 1], '@laptop')
+                finally:
+                    await stream.abort()
+
     async def test_placement_and_confined_reader(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

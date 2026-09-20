@@ -54,8 +54,9 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
             directory = root / ('remote' if ssh else 'local')
             directory.mkdir()
             options = ['--rsh', str(remote), '--syq-path', SYQ] if ssh else []
-            source = ['--from', 'test-host'] if ssh else []
-            destination = ['--to', 'test-host'] if ssh else []
+            # The helper runs locally; keep TCP discovery independent of DNS.
+            source = ['--from', '127.0.0.1'] if ssh else []
+            destination = ['--to', '127.0.0.1'] if ssh else []
             target = directory / "nested/file 'with spaces'"
             for data in (b'', DATA):
                 run([*options, '--src-fd', '0', *destination, '--as', str(target)], input=data)

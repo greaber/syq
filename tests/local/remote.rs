@@ -811,16 +811,19 @@ fn automatic_ssh_restores_workers_for_a_single_file_partial() {
         resumed[block * (4 << 20)..(block + 1) * (4 << 20)].fill(0);
     }
     write(&partial, &resumed);
+    write(&t.path("tuning.json"), br#"{"paths":{"local>host|ssh":8}}"#);
     let events = t.path("events");
     let out = compat_command()
         .args(args)
         .arg("--no-progress")
         .env("SYQ_TEST_WORKER_EVENTS", &events)
+        .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_CACHE_HOME", t.path("cache"))
         .run()
         .unwrap();
     assert_output_ok(&out);
+    assert!(stderr_of(&out).contains("starting with 8 connections remembered for this path"));
     assert_eq!(read(&t.path("dest/file")), content);
     assert!(partial.exists());
     let connected = fs::read_to_string(events)

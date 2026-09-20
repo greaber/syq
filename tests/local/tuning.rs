@@ -1732,6 +1732,14 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     assert_output_ok(&copy("first", &[]));
     // Supply an old measured result; the transfer itself is deliberately short.
     let db = rusqlite::Connection::open(t.path("history.sqlite")).unwrap();
+    let startup_doubling = |run: i64| {
+        db.query_row(
+            "SELECT json_extract(data,'$.data.policy.startup_doubling') FROM events WHERE run=?1 AND json_extract(data,'$.kind')='policy_start'",
+            [run],
+            |row| row.get::<_, bool>(0),
+        ).unwrap()
+    };
+    assert!(startup_doubling(1));
     let fs: Option<String> = db
         .query_row("SELECT source_fs FROM runs LIMIT 1", [], |row| row.get(0))
         .unwrap();
@@ -1739,6 +1747,7 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     db.execute("UPDATE runs SET eligible=1,workers=3", [])
         .unwrap();
     assert_output_ok(&copy("second", &[]));
+    assert!(!startup_doubling(2));
     let event: String = db
         .query_row(
             "SELECT data FROM events WHERE run=2 AND json_extract(data,'$.kind')='starting_count'",
@@ -1750,6 +1759,7 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     assert_eq!(event["data"]["workers"], 3);
     assert_eq!(event["data"]["hint"]["matched"], "filesystems");
     assert_output_ok(&copy("capped", &["--resource-limits", "workers=2"]));
+    assert!(!startup_doubling(3));
     let event: String = db
         .query_row(
             "SELECT data FROM events WHERE run=3 AND json_extract(data,'$.kind')='starting_count'",

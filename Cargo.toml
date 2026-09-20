@@ -32,10 +32,13 @@ aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 aws-smithy-types = "1"
 aws-types = "1"
+aws-credential-types = "1"
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "sync", "time", "signal", "macros"] }
 futures-util = "0.3"
 http = "1"
 url = "2"
+percent-encoding = "2"
 socket2 = "0.6"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
