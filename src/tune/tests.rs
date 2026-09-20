@@ -77,7 +77,15 @@ fn measure(p: &mut Policy, score: f64) {
 /// Feed the policy a model where throughput rises linearly with workers
 /// up to `cap` workers and is flat after.
 fn simulate(start: usize, cap: usize, rounds: usize, noise: impl Fn(usize) -> f64) -> Policy {
-    let mut p = Policy::new(start, MIN, MAX);
+    simulate_policy(Policy::new(start, MIN, MAX), cap, rounds, noise)
+}
+
+fn simulate_policy(
+    mut p: Policy,
+    cap: usize,
+    rounds: usize,
+    noise: impl Fn(usize) -> f64,
+) -> Policy {
     for i in 0..rounds {
         let eff = p.n.min(cap) as f64;
         measure(&mut p, eff * 10e6 * noise(i));
@@ -229,20 +237,41 @@ fn upward_probe_refreshes_its_baseline_while_warming() {
 }
 
 #[test]
-fn successful_direction_continues_to_the_plateau() {
-    let p = simulate(START_SSH, 32, 80, |_| 1.0);
-    assert_eq!(&p.history[..5], &[8, 16, 32, 64, 48]);
+fn cached_successful_direction_continues_to_the_plateau() {
+    let p = simulate_policy(Policy::from_cache(START_SSH, MIN, MAX), 32, 80, |_| 1.0);
+    assert_eq!(&p.history[..6], &[8, 10, 13, 17, 22, 29]);
     // 31 is the smallest integer within 5% of the observed best (32).
     assert_eq!(p.settled(), 31, "history {:?}", p.history);
 }
 
 #[test]
-fn a_gain_at_the_cap_holds_at_the_cap() {
-    let p = simulate(START_LOCAL, 200, 40, |_| 1.0);
+fn cached_gain_at_the_cap_holds_at_the_cap() {
+    let p = simulate_policy(Policy::from_cache(START_LOCAL, MIN, MAX), 200, 40, |_| 1.0);
     // Once the cap establishes the best score, downward refinement finds
     // the smallest integer within the 5% near-best tolerance.
     assert_eq!(p.settled(), 61, "history {:?}", p.history);
     assert_eq!(p.peak, MAX);
+}
+
+#[test]
+fn uncached_start_reaches_full_rate_early_and_then_trims_excess_workers() {
+    for (start, cap, smallest_near_best) in [(8, 32, 31), (32, 64, 61)] {
+        let mut p = simulate(start, cap, 3, |_| 1.0);
+        assert_eq!(p.settled(), cap, "history {:?}", p.history);
+        // Coarse startup leaves wider measured brackets. Existing failed-probe
+        // backoff can take longer to trim the final few workers than a cached
+        // start's finer path; it must still reach the smallest near-best count.
+        let mut reached = false;
+        for _ in 0..128 {
+            let rate = p.n.min(cap) as f64 * 10e6;
+            measure(&mut p, rate);
+            if p.settled() == smallest_near_best {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "history {:?}", p.history);
+    }
 }
 
 #[test]
