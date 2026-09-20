@@ -198,8 +198,9 @@ class StreamTests(unittest.TestCase):
         rsh.chmod(0o700)
         for remote in (False, True):
             options = dict(rsh=str(rsh), syq_path=str(SYQ)) if remote else {}
-            to = dict(to="fixture") if remote else {}
-            from_ = dict(from_="fixture") if remote else {}
+            # The helper runs locally; TCP discovery must not resolve a fake host.
+            to = dict(to="127.0.0.1") if remote else {}
+            from_ = dict(from_="127.0.0.1") if remote else {}
             base = self.root / ("remote" if remote else "local")
             base.mkdir()
             target = base / "object"
@@ -305,7 +306,8 @@ class StreamTests(unittest.TestCase):
             rsh = self.root / 'wrapper-rsh'
             rsh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$1"\n')
             rsh.chmod(0o700)
-            options = dict(to='fixture', rsh=str(rsh), syq_path=str(SYQ)) if remote else {}
+            # Keep the TCP path without depending on external DNS.
+            options = dict(to='127.0.0.1', rsh=str(rsh), syq_path=str(SYQ)) if remote else {}
             for text in (False, True):
                 for fail in (False, True):
                     with self.subTest(remote=remote, text=text, fail=fail):
