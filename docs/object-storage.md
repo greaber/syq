@@ -60,7 +60,8 @@ limits, and receiver receipts do not apply to storage authorization. See
 [Storage authorization](security.md#storage-authorization) for the trust boundary.
 
 This mode supports file and tree uploads and downloads. Descriptor copies,
-S3-to-S3 copies, and `rm` use credentials on the invoking machine.
+callback stream mappings, S3-to-S3 copies, and `rm` use credentials on the
+invoking machine.
 
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>

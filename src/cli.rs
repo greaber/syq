@@ -2150,6 +2150,12 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.native_follow_dst = copy.follow_dst;
     apply_native_copy_operational(&mut args, copy.operational, &matches)?;
     apply_native_remote(&mut args, remote)?;
+    if args.s3.is_some()
+        && args.stream_mapping_fd.is_some()
+        && matches!(args.auth_from, AuthFrom::Return(_))
+    {
+        bail!("storage authorization requires file or tree operands; callback mappings do not support --auth-from");
+    }
     if args.receiver_max_entries.is_some()
         || args.receiver_max_bytes.is_some()
         || args.receiver_receipt.is_some()

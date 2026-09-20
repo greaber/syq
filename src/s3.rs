@@ -1,5 +1,5 @@
-//! Native local/S3 and server-side S3 copies. The S3 client and its durable formats are independent
-//! of the filesystem helper protocol: credentials never enter an SSH request.
+//! Native local/S3 and server-side S3 copies. Delegated request signing leaves
+//! long-lived credentials with the authorizer; file data goes directly to storage.
 mod admission;
 pub(crate) mod authorization;
 mod checksum;

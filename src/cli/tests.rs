@@ -889,3 +889,28 @@ fn storage_authorization_is_explicit_and_preserves_provider_options() {
     .unwrap_err();
     assert!(error.to_string().contains("descriptor copies"), "{error}");
 }
+
+#[test]
+fn storage_callbacks_cannot_ignore_an_explicit_authorizer() {
+    let error = parse_native_copy(&argv(&[
+        "--mapping",
+        "manifest",
+        "--stream-mapping-fd",
+        "4",
+        "--results-fd",
+        "5",
+        "--to",
+        "s3://bucket",
+        "--into",
+        "keys",
+        "--auth-from",
+        "@laptop",
+    ]))
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("callback mappings do not support --auth-from"),
+        "{error}"
+    );
+}
