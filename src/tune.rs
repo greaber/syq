@@ -484,6 +484,13 @@ impl Policy {
                 usize::MAX
             },
         };
+        // Preserve the existing 1 -> 2 startup spare even before the first
+        // connection is ready. Waiting for its setup measurement would miss
+        // the first probe when an SSH handshake takes longer than a sample.
+        // Settled single-worker copies still use the expiry schedule below.
+        if matches!(self.state, State::Initial) && self.n == 1 {
+            plan.connect = self.max.min(2);
+        }
         if let Some((candidate, ticks)) = forecast {
             let until = sampler.earliest_score_in(sample, elapsed).saturating_add(
                 sample

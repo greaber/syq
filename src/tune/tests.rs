@@ -709,3 +709,40 @@ fn a_preparation_pause_does_not_close_imminently_needed_spares() {
         "no new setup, but don't discard ready capacity"
     );
 }
+
+#[test]
+fn one_worker_start_prepares_spare_before_initial_connection_is_ready() {
+    let gate = Gate::new(1);
+    assert_eq!(gate.begin_warming(1), vec![0]);
+    assert!(!gate.ready_through(1));
+    let mut sampler = Sampler::default();
+    sampler.reset();
+    let mut policy = Policy::new(1, 1, 8);
+    let plan = policy.connection_plan(
+        &sampler,
+        SAMPLE,
+        Duration::ZERO,
+        Duration::from_secs(1),
+        false,
+    );
+    gate.prepare(plan);
+    assert_eq!(gate.begin_warming(plan.connect), vec![1]);
+    gate.mark_ready(1);
+    gate.mark_ready(0);
+    assert_eq!(policy.observe(100.0), 2);
+    assert!(gate.ready_through(2));
+    assert!(gate.begin_warming(2).is_empty());
+    let fixed = Policy::new(1, 1, 1);
+    assert_eq!(
+        fixed
+            .connection_plan(
+                &sampler,
+                SAMPLE,
+                Duration::ZERO,
+                Duration::from_secs(1),
+                false
+            )
+            .connect,
+        1
+    );
+}
