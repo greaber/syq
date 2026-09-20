@@ -1097,28 +1097,15 @@ impl Engine {
                 .unwrap_or(b"."),
         )?;
         let mut selectors = Vec::new();
-        if let Some(mapping) = &self.args.native_mapping {
-            let mapping = mapping.clone();
-            let follow = self.args.native_follow;
-            let manifest = tokio::task::spawn_blocking(move || -> Result<_> {
-                let mut contents = Vec::new();
-                if mapping == b"-" {
-                    std::io::stdin().read_to_end(&mut contents)?;
-                } else {
-                    crate::fsops::open_operator_file_read(
-                        &mapping,
-                        if follow {
-                            crate::proto::OperatorSymlinkPolicy::FollowAll
-                        } else {
-                            crate::proto::OperatorSymlinkPolicy::Refuse
-                        },
-                    )?
-                    .read_to_end(&mut contents)?;
+        if self.args.native_mapping.is_some() {
+            let manifest = match self.args.parsed_mapping.clone() {
+                Some(parsed) => parsed,
+                None => {
+                    let args = self.args.clone();
+                    tokio::task::spawn_blocking(move || crate::mapping::load(&args)).await??
                 }
-                crate::mapping::read_mapping_manifest(contents)
-            })
-            .await??;
-            for (_, entry) in manifest.entries {
+            };
+            for (_, entry) in &manifest.entries {
                 selectors.push((
                     local::join(&base, &local::key_path(&entry.src)?),
                     local::join(destination_prefix, &local::key_path(&entry.dst)?),
@@ -1128,7 +1115,7 @@ impl Engine {
                         _ => SourceSelection::Named,
                     },
                     entry.kind.map(|kind| kind.label()),
-                    entry.expected_hash,
+                    entry.expected_hash.clone(),
                     entry.metadata,
                 ));
             }

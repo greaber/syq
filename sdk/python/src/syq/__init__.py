@@ -2,6 +2,7 @@
 
 from importlib.metadata import version as distribution_version
 
+from ._stream_endpoints import StreamSource, StreamDestination
 from ._streams import StreamReader, StreamWriter, AsyncStreamReader, AsyncStreamWriter
 from ._defaults import CLIENT_DEFAULT, Timeout
 from ._mapping import Mapping, AsyncMapping
@@ -37,6 +38,7 @@ from .models import (
     ErrorEvent,
     IgnoreFrom,
     MappingEntry,
+    MappingStreamResult,
     DestinationMetadata,
     OperationAction,
     ReceiptCode,
@@ -67,6 +69,7 @@ open_reader = _default_client.open_reader
 open_writer = _default_client.open_writer
 
 __all__ = [
+    "StreamSource", "StreamDestination",
     "StreamReader", "StreamWriter", "AsyncStreamReader", "AsyncStreamWriter",
     "open_reader", "open_writer",
     "CLIENT_DEFAULT",
@@ -99,6 +102,7 @@ __all__ = [
     "AsyncMapping",
     "MapStream",
     "MappingEntry",
+    "MappingStreamResult",
     "DestinationMetadata",
     "OperationAction",
     "ReceiptCode",

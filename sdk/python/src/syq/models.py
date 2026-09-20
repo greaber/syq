@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from ._stream_endpoints import StreamSource, StreamDestination
+
 
 class _StringEnum(str, Enum):
     def __str__(self) -> str:
@@ -268,8 +270,8 @@ def _metadata_json(metadata: DestinationMetadata) -> dict[str, int]:
 
 @dataclass(frozen=True, slots=True)
 class MappingEntry:
-    src: RelativePath
-    dst: RelativePath
+    src: RelativePath | StreamSource
+    dst: RelativePath | StreamDestination
     kind: EntryKind | None = None
     size: int | None = None
     mtime: int | None = None
@@ -277,15 +279,20 @@ class MappingEntry:
     metadata: DestinationMetadata | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.src, RelativePath):
+        if not isinstance(self.src, (RelativePath, StreamSource)):
             object.__setattr__(self, "src", RelativePath(self.src))
-        if not isinstance(self.dst, RelativePath):
+        if not isinstance(self.dst, (RelativePath, StreamDestination)):
             object.__setattr__(self, "dst", RelativePath(self.dst))
         if self.kind is not None and not isinstance(self.kind, EntryKind):
             try:
                 object.__setattr__(self, "kind", EntryKind(self.kind))
             except ValueError as error:
                 raise ValueError(f"unknown mapping kind: {self.kind!r}") from error
+        if isinstance(self.src, StreamSource) or isinstance(self.dst, StreamDestination):
+            if self.kind not in {None, EntryKind.FILE}:
+                raise ValueError("stream mapping endpoints carry regular-file bytes")
+            if isinstance(self.dst, StreamDestination) and self.metadata is not None:
+                raise ValueError("destination metadata requires a named destination")
         for label, value in (("size", self.size), ("mtime", self.mtime)):
             if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
                 raise TypeError(f"{label} must be an integer or None")
@@ -562,11 +569,30 @@ class RmResult(OperationSummary):
     mode: str = "rm"
 
 
+@dataclass(frozen=True)
+class MappingStreamResult:
+    """One callback mapping outcome. Entry indices refer to this invocation only.
+
+    A ``None`` source or destination denotes the corresponding callback. The
+    application owns retrying that callback; it cannot be saved as a path.
+    """
+
+    protocol: ProtocolMetadata
+    entry: int
+    source: PathValue | None
+    destination: PathValue | None
+    disposition: str
+    dry_run: bool
+    bytes: int | None
+    message: str | None
+
+
 AutomationEvent = (
     RunEvent
     | ProgressEvent
     | TraceEvent
     | OperationResult
+    | MappingStreamResult
     | SelectionResult
     | RemovalTrace
     | RemovalResult
@@ -588,10 +614,15 @@ def _tagged_path(path: RelativePath) -> dict[str, str]:
     return {"encoding": "utf-8", "value": value}
 
 
-def _mapping_json(entry: MappingEntry) -> dict[str, Any]:
+def _mapping_json(entry: MappingEntry, *, stream_id: int | None = None) -> dict[str, Any]:
+    callback = isinstance(entry.src, StreamSource) or isinstance(entry.dst, StreamDestination)
+    if callback and stream_id is None:
+        raise ValueError("callback mappings require a live SDK copy; they cannot be saved as pathname mappings")
     record: dict[str, Any] = {
-        "src": _tagged_path(entry.src),
-        "dst": _tagged_path(entry.dst),
+        "src": ({"stream": stream_id, "size": entry.src.size}
+                if isinstance(entry.src, StreamSource) else _tagged_path(entry.src)),
+        "dst": ({"stream": stream_id}
+                if isinstance(entry.dst, StreamDestination) else _tagged_path(entry.dst)),
     }
     if entry.kind is not None:
         record["kind"] = entry.kind.value

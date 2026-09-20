@@ -164,6 +164,7 @@ async fn copy(
         Some(descriptor),
         commit,
         cancelled,
+        None,
     )
     .await
 }
@@ -237,8 +238,8 @@ async fn entries_share_s3_admission_and_failed_producer_does_not_cancel_client()
         options,
         cancellation: Arc::default(),
         parts: Arc::new(tokio::sync::Semaphore::new(2)),
-        requests: tokio::sync::Semaphore::new(controls.s3_requests.unwrap()),
-        objects: tokio::sync::Semaphore::new(3),
+        requests: tokio::sync::Semaphore::new(controls.s3_requests.unwrap()).into(),
+        objects: tokio::sync::Semaphore::new(3).into(),
         bandwidth: None,
     };
     tokio::time::timeout(Duration::from_secs(10), async {

@@ -40,6 +40,7 @@
 - [Remote copy details](remote-reference.md)
 - [Persistence details](persistence-reference.md)
 - [Automation results](automation.md)
+- [Stream-mapping protocol](stream-mappings.md)
 - [Environment and local files](environment.md)
 - [Rsync compatibility](rsync-compat.md)
 

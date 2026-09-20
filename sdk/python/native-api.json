@@ -60,6 +60,8 @@
       "internal": [
         "delegated-operands-b64",
         "stream-commit-fd",
+        "stream-mapping-fd",
+        "stream-concurrency",
         "results-fd",
         "suppress-summary"
       ],
