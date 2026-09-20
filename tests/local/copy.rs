@@ -106,6 +106,13 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         stderr.contains("2 -> 3 workers (candidate ready"),
         "{stderr}"
     );
+    let preparation = stderr
+        .find("preparing 3 connections ahead of probe")
+        .expect("prepare the upward candidate while still measuring two workers");
+    let decision = stderr
+        .find("candidate 2 -> 3 workers")
+        .expect("the later measurement should select three workers");
+    assert!(preparation < decision, "{stderr}");
     assert!(stderr.contains("3 -> 2 workers"), "{stderr}");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("connections: auto:"),

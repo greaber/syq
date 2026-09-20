@@ -14,9 +14,10 @@
 //!
 //! Candidate workers are connected while the current count remains active.
 //! They become active only when the whole candidate set is ready. Connected
-//! workers park when no longer active and remain available until the copy ends,
-//! avoiding another handshake if tuning raises the count again. Unneeded
-//! setup/recovery attempts can still stop. Parking takes effect within one block
+//! workers park when no longer active. The driver prepares likely upward
+//! candidates ahead of decisions and retains rollback capacity during probes.
+//! Between probes, surplus connections can close when there is enough time
+//! to reopen them using the measured setup time plus a margin. Parking takes effect within one block
 //! even in a huge range: the worker hands its remainder back to the scheduler.
 //!
 //! [`Sampler`] turns raw samples into stable measurements and [`Policy`] is
@@ -30,9 +31,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Workers to start with when auto-tuning over ssh: handshakes can take seconds
 /// on a long path, so start modestly and let the tuner earn more.
@@ -298,6 +299,16 @@ impl Sampler {
         self.discard = true;
     }
 
+    /// Earliest next decision, even if future samples stabilize immediately.
+    fn earliest_score_in(&self, sample: Duration, elapsed: Duration) -> Duration {
+        let remaining = if self.discard {
+            3
+        } else {
+            2usize.saturating_sub(self.samples.len()).max(1)
+        };
+        sample.saturating_sub(elapsed) + sample * (remaining - 1) as u32
+    }
+
     /// Feed one sample; returns a score once the rate is stable.
     pub fn push(&mut self, rate: f64) -> Option<f64> {
         if self.discard {
@@ -413,6 +424,81 @@ impl Policy {
             State::Explore { from, .. } => from,
             _ => self.n,
         }
+    }
+
+    /// Connections required now (including rollback), and the earliest
+    /// measurement at which a larger set could be selected. This is a
+    /// preparation forecast, not a throughput decision. Hold uses the up
+    /// deadline even when a down probe might happen first, conservatively.
+    fn connection_forecast(&self) -> (usize, Option<(usize, usize)>) {
+        let required = self.n.max(self.active).max(self.settled());
+        let ticks = match self.state {
+            State::Initial
+            | State::Explore {
+                direction: Direction::Up,
+                ..
+            } => 1,
+            State::Explore {
+                direction: Direction::Down,
+                ..
+            } => return (required, None),
+            State::Hold => self.due[Direction::Up.index()]
+                .saturating_sub(self.tick)
+                .max(1),
+        };
+        // A nearest measured bound can make the next step larger than STEP.
+        // Ignore score-based suppression: a new measurement can change it.
+        let candidate = self
+            .points
+            .range((
+                std::ops::Bound::Excluded(self.n),
+                std::ops::Bound::Included(self.max),
+            ))
+            .next()
+            .map_or_else(
+                || step_up(self.n).min(self.max),
+                |(&upper, _)| self.n + (upper - self.n).div_ceil(2),
+            );
+        (
+            required,
+            (candidate > required).then_some((candidate, ticks)),
+        )
+    }
+
+    fn connection_plan(
+        &self,
+        sampler: &Sampler,
+        sample: Duration,
+        elapsed: Duration,
+        lead: Duration,
+        speculate: bool,
+    ) -> ConnectionPlan {
+        let (required, forecast) = self.connection_forecast();
+        let mut plan = ConnectionPlan {
+            connect: required,
+            // While exploring, another decision can follow immediately.
+            // Only a settled wait gives us a useful retirement deadline.
+            keep: if matches!(self.state, State::Hold) {
+                required
+            } else {
+                usize::MAX
+            },
+        };
+        if let Some((candidate, ticks)) = forecast {
+            let until = sampler.earliest_score_in(sample, elapsed).saturating_add(
+                sample
+                    .saturating_mul(2)
+                    .saturating_mul(u32::try_from(ticks.saturating_sub(1)).unwrap_or(u32::MAX)),
+            );
+            if speculate && until <= lead {
+                plan.connect = candidate;
+            }
+            // Hysteresis avoids closing and immediately reopening connections.
+            if until <= lead.saturating_mul(2) {
+                plan.keep = usize::MAX;
+            }
+        }
+        plan
     }
 
     /// Record that the candidate count has become active. Warming a candidate
@@ -681,28 +767,40 @@ enum SlotPhase {
     Warming,
     Ready,
     Failed,
+    Retiring,
 }
 
 #[derive(Debug, Clone)]
 struct Slot {
     phase: SlotPhase,
+    setup_started: Option<Instant>,
 }
 
 impl Default for Slot {
     fn default() -> Self {
         Self {
             phase: SlotPhase::Absent,
+            setup_started: None,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionPlan {
+    connect: usize,
+    keep: usize,
+}
+
 /// The worker lifecycle shared by the tuner and workers. `active` controls who
 /// may take work; `connect_target` controls who should establish or recover a
-/// connection. Already-connected workers stay parked until needed or the copy
-/// ends. Slot state distinguishes ready connections from setup and failure.
+/// connection. The ordinary-copy driver separately controls which parked
+/// connections to keep. Slot state distinguishes ready, retiring and failed
+/// connections, so a retiring connection cannot be mistaken for a ready one.
 pub struct Gate {
     active: AtomicUsize,
     connect_target: AtomicUsize,
+    keep_target: AtomicUsize,
+    setup_micros: AtomicU64,
     slots: Mutex<Vec<Slot>>,
     cv: Condvar,
 }
@@ -723,6 +821,10 @@ impl Gate {
         Arc::new(Gate {
             active: AtomicUsize::new(active),
             connect_target: AtomicUsize::new(active),
+            // Drivers without anticipatory preparation retain their existing
+            // lifecycle; descriptor copies return connections to Session.
+            keep_target: AtomicUsize::new(usize::MAX),
+            setup_micros: AtomicU64::new(0),
             slots: Mutex::new(Vec::new()),
             cv: Condvar::new(),
         })
@@ -750,6 +852,23 @@ impl Gate {
         self.cv.notify_all();
     }
 
+    fn prepare(&self, plan: ConnectionPlan) {
+        let _slots = self.slots.lock().unwrap();
+        let connect = plan.connect.max(self.active());
+        self.connect_target.store(connect, Relaxed);
+        self.keep_target.store(plan.keep.max(connect), Relaxed);
+        self.cv.notify_all();
+    }
+
+    /// Include queued setup and retries, not just the successful handshake.
+    /// A high-water mark with 2x headroom avoids learning an optimistic lead
+    /// from one fast connection. The extra second covers polling jitter.
+    fn setup_lead(&self) -> Duration {
+        Duration::from_micros(self.setup_micros.load(Relaxed))
+            .saturating_mul(2)
+            .saturating_add(Duration::from_secs(1))
+    }
+
     /// Claim absent slots through `n` for connection setup.
     pub fn begin_warming(&self, n: usize) -> Vec<usize> {
         let mut slots = self.slots.lock().unwrap();
@@ -758,6 +877,7 @@ impl Gate {
         for (id, slot) in slots.iter_mut().take(n).enumerate() {
             if slot.phase == SlotPhase::Absent {
                 slot.phase = SlotPhase::Warming;
+                slot.setup_started = Some(Instant::now());
                 ids.push(id);
             }
         }
@@ -767,6 +887,12 @@ impl Gate {
     pub fn mark_ready(&self, id: usize) {
         let mut slots = self.slots.lock().unwrap();
         grow_to(&mut slots, id + 1);
+        if let Some(started) = slots[id].setup_started.take() {
+            self.setup_micros.fetch_max(
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Relaxed,
+            );
+        }
         slots[id].phase = SlotPhase::Ready;
         self.cv.notify_all();
     }
@@ -775,6 +901,7 @@ impl Gate {
         let mut slots = self.slots.lock().unwrap();
         grow_to(&mut slots, id + 1);
         slots[id].phase = SlotPhase::Warming;
+        slots[id].setup_started.get_or_insert_with(Instant::now);
         self.cv.notify_all();
     }
 
@@ -826,15 +953,18 @@ impl Gate {
     }
 
     /// Block until `id` is allowed again. Returns false if the transfer is
-    /// over. Reducing the connection target only cancels setup/recovery; closing
-    /// a healthy parked connection here would make a later increase reconnect.
+    /// over or the driver has released this spare outside the preparation
+    /// horizon. Mark retirement before releasing the lock so a tuner cannot
+    /// activate a connection whose worker has already decided to exit.
     pub fn park(&self, id: usize, done: impl Fn() -> bool) -> bool {
         let mut slots = self.slots.lock().unwrap();
         loop {
             if self.allowed(id) {
                 return true;
             }
-            if done() {
+            if done() || id >= self.keep_target.load(Relaxed) {
+                grow_to(&mut slots, id + 1);
+                slots[id].phase = SlotPhase::Retiring;
                 return false;
             }
             slots = self
@@ -912,6 +1042,35 @@ pub fn run(
             continue;
         }
 
+        let (_, forecast) = policy.connection_forecast();
+        let preparation_count = forecast.map_or(policy.n, |(count, _)| count);
+        let lead = gate.setup_lead();
+        let preparation_activity =
+            required_remaining_activity(last_rate, preparation_count, sample).saturating_add(
+                last_rate.map_or(0, |rate| (rate * lead.as_secs_f64()).ceil() as u64),
+            );
+        let plan = policy.connection_plan(
+            &sampler,
+            sample,
+            sample_start.elapsed(),
+            lead,
+            gate.ready_through(active)
+                && sched.work_left_for(preparation_count, preparation_activity, FILE_CREDIT),
+        );
+        gate.prepare(plan);
+        if sched.needs_worker_capacity() {
+            let warming = gate.begin_warming(plan.connect);
+            if crate::output::debug() && !warming.is_empty() && plan.connect > policy.n {
+                crate::output::diagnostic!(
+                    "syq: tune: preparing {} connections ahead of probe ({} active, {:.2}s setup lead)",
+                    plan.connect, active, gate.setup_lead().as_secs_f64()
+                );
+            }
+            for id in warming {
+                spawn(id);
+            }
+        }
+
         // Apply reductions immediately. An increase leaves the current set
         // active while its candidate workers connect in the background.
         if policy.n < active {
@@ -920,7 +1079,6 @@ pub fn run(
             active = policy.n;
             policy.activated();
             meter.set_active(active);
-            gate.set_connect_target(if active == 1 { 2 } else { active });
             sampler.reset();
             collapse_samples = 0;
             last = (meter.bytes(), meter.files());
@@ -936,10 +1094,8 @@ pub fn run(
         if policy.n > active {
             if !enough_work(&sched, policy.n, last_rate, sample) {
                 policy.cancel_unapplied();
-                gate.set_connect_target(if active == 1 { 2 } else { active });
                 continue;
             }
-            gate.set_connect_target(policy.n);
             for id in gate.begin_warming(policy.n) {
                 spawn(id);
             }
@@ -951,7 +1107,6 @@ pub fn run(
                 // Failure to provision an optional upward probe is not a
                 // throughput result and must not fail the copy.
                 policy.cancel_unapplied();
-                gate.set_connect_target(if active == 1 { 2 } else { active });
                 gate.clear_failed_from(active);
                 continue;
             }
@@ -995,7 +1150,6 @@ pub fn run(
                 last_rate = Some(rate);
                 if !enough_work(&sched, policy.n, last_rate, sample) {
                     policy.cancel_unapplied();
-                    gate.set_connect_target(if active == 1 { 2 } else { active });
                     sampler.reset();
                     continue;
                 }
@@ -1013,23 +1167,6 @@ pub fn run(
             continue;
         }
 
-        // Heal an unexpectedly missing active slot. At one active worker keep
-        // exactly one ready spare so the important 1→2 probe is instantaneous.
-        let retain = if active == 1 {
-            2.min(policy.max)
-        } else {
-            active
-        };
-        gate.set_connect_target(retain);
-        // A pipelined whole-file batch is already owned and cannot be stolen.
-        // Do not repeatedly reconnect slots that drained the queue while the
-        // remaining owners finish. Queued/retried work or an ordinary
-        // large-file probe re-enables healing on the next poll.
-        if sched.needs_worker_capacity() {
-            for id in gate.begin_warming(retain) {
-                spawn(id);
-            }
-        }
         if gate.permanent_failure_through(active) {
             sched.abort();
             break;

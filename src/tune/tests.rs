@@ -510,3 +510,202 @@ fn out_of_order_readiness_keeps_every_warming_slot() {
     assert!(gate.ready_through(6));
     assert!(gate.begin_warming(6).is_empty());
 }
+
+#[test]
+fn preparation_precedes_the_first_decision_without_activating_workers() {
+    let mut policy = Policy::new(16, 1, 64);
+    let mut sampler = Sampler::default();
+    sampler.reset();
+    let lead = Duration::from_secs(12);
+    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
+    assert_eq!(plan.connect, 21);
+    assert_eq!(policy.n, 16);
+    assert_eq!(policy.active(), 16);
+    assert_eq!(policy.history, vec![16]);
+    assert_eq!(policy.peak, 16);
+
+    let gate = Gate::new(16);
+    gate.prepare(plan);
+    for id in gate.begin_warming(plan.connect) {
+        gate.mark_ready(id);
+    }
+    assert!(gate.ready_through(21));
+    assert!(!gate.allowed(16));
+    assert_eq!(policy.observe(100.0), 21);
+    assert!(gate.begin_warming(policy.n).is_empty());
+    gate.set_active(policy.n);
+    policy.activated();
+    assert!(gate.allowed(20));
+}
+
+#[test]
+fn preparation_uses_earliest_sample_boundary_and_keeps_rollback_ready() {
+    let mut sampler = Sampler::default();
+    sampler.reset();
+    assert_eq!(
+        sampler.earliest_score_in(SAMPLE, Duration::ZERO),
+        SAMPLE * 3
+    );
+    assert_eq!(sampler.push(100.0), None);
+    assert_eq!(sampler.push(100.0), None);
+    assert_eq!(
+        sampler.earliest_score_in(SAMPLE, Duration::from_secs(2)),
+        Duration::from_millis(500)
+    );
+    let mut policy = Policy::new(16, 1, 64);
+    let plan = policy.connection_plan(
+        &sampler,
+        SAMPLE,
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        true,
+    );
+    assert_eq!(plan.connect, 21);
+    policy.observe(100.0);
+    policy.activated();
+    policy.observe(100.0); // reject 21 and settle at 16
+    policy.activated();
+    assert_eq!(policy.n, 16);
+    assert!(policy.begin(Direction::Down, 100.0));
+    policy.activated();
+    let plan = policy.connection_plan(
+        &sampler,
+        SAMPLE,
+        Duration::ZERO,
+        Duration::from_secs(1),
+        true,
+    );
+    assert_eq!(plan.connect, 16, "keep rollback despite lower active count");
+    assert!(plan.keep >= 16);
+}
+
+#[test]
+fn distant_probe_releases_spares_then_prepares_before_it_is_due() {
+    let mut policy = Policy::new(16, 1, 64);
+    policy.state = State::Hold;
+    policy.due = [60, 60];
+    let sampler = Sampler::default();
+    let lead = Duration::from_secs(21); // measured ten seconds, doubled plus margin
+    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
+    assert_eq!(
+        plan,
+        ConnectionPlan {
+            connect: 16,
+            keep: 16
+        }
+    );
+    policy.tick = 55; // 25 seconds until earliest probe: retain, not yet open
+    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
+    assert_eq!(plan.connect, 16);
+    assert!(plan.keep >= 21);
+    policy.tick = 56; // 20 seconds: open now, before the policy changes
+    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
+    assert_eq!(plan.connect, 21);
+    assert_eq!(policy.n, 16);
+    assert_eq!(policy.tick, 56);
+}
+
+#[test]
+fn preparation_respects_limits_and_skips_speculation_at_the_tail() {
+    let policy = Policy::new(16, 1, 18);
+    let sampler = Sampler::default();
+    let lead = Duration::from_secs(30);
+    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
+    assert_eq!(plan.connect, 18);
+    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, false);
+    assert_eq!(plan.connect, 16);
+    let fixed = Policy::new(16, 16, 16);
+    assert_eq!(fixed.connection_forecast(), (16, None));
+}
+
+#[test]
+fn retired_connection_is_not_ready_or_duplicated_before_worker_cleanup() {
+    let gate = Gate::new(1);
+    for id in gate.begin_warming(2) {
+        gate.mark_ready(id);
+    }
+    gate.prepare(ConnectionPlan {
+        connect: 1,
+        keep: 1,
+    });
+    assert!(!gate.park(1, || false));
+    assert!(!gate.ready_through(2));
+    gate.prepare(ConnectionPlan {
+        connect: 2,
+        keep: 2,
+    });
+    assert!(
+        gate.begin_warming(2).is_empty(),
+        "wait for old worker cleanup"
+    );
+    gate.mark_absent(1);
+    assert_eq!(gate.begin_warming(2), vec![1]);
+    gate.mark_ready(1);
+    assert!(gate.ready_through(2));
+}
+
+#[test]
+fn setup_lead_includes_retries_and_does_not_shrink_after_one_fast_setup() {
+    let gate = Gate::new(1);
+    gate.begin_warming(1);
+    let started = Instant::now() - Duration::from_secs(10);
+    gate.slots.lock().unwrap()[0].setup_started = Some(started);
+    gate.mark_warming(0);
+    assert_eq!(gate.slots.lock().unwrap()[0].setup_started, Some(started));
+    gate.mark_ready(0);
+    assert!(gate.setup_lead() >= Duration::from_secs(21));
+    gate.begin_warming(2);
+    gate.mark_ready(1);
+    assert!(gate.setup_lead() >= Duration::from_secs(21));
+}
+
+#[test]
+fn missed_preparation_still_waits_for_ready_connections_and_optional_failure_isolated() {
+    let mut policy = Policy::new(16, 1, 64);
+    let gate = Gate::new(16);
+    for id in gate.begin_warming(16) {
+        gate.mark_ready(id);
+    }
+    let plan = policy.connection_plan(
+        &Sampler::default(),
+        SAMPLE,
+        Duration::ZERO,
+        Duration::from_secs(10),
+        true,
+    );
+    gate.prepare(plan);
+    assert_eq!(
+        gate.begin_warming(plan.connect),
+        (16..21).collect::<Vec<_>>()
+    );
+    assert_eq!(policy.observe(100.0), 21);
+    assert!(!gate.ready_through(policy.n));
+    assert_eq!(gate.active(), 16);
+    assert_eq!(policy.history, vec![16]);
+    gate.mark_failed(20);
+    assert!(gate.permanent_failure_through(21));
+    assert!(!gate.permanent_failure_through(16));
+    policy.cancel_unapplied();
+    assert_eq!(policy.n, 16);
+    assert_eq!(policy.peak, 16);
+    assert!(gate.ready_through(16));
+}
+
+#[test]
+fn a_preparation_pause_does_not_close_imminently_needed_spares() {
+    let mut policy = Policy::new(16, 1, 64);
+    policy.state = State::Hold;
+    policy.due = [1, 1];
+    let plan = policy.connection_plan(
+        &Sampler::default(),
+        SAMPLE,
+        Duration::ZERO,
+        Duration::from_secs(10),
+        false,
+    );
+    assert_eq!(plan.connect, 16);
+    assert!(
+        plan.keep >= 21,
+        "no new setup, but don't discard ready capacity"
+    );
+}

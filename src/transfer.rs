@@ -1675,7 +1675,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                 || crate::conn::is_worker_initialization_error(&error) =>
                         {
                             gate.mark_failed(id);
-                            return Err(error);
+                            return if gate.allowed(id) { Err(error) } else { Ok(()) };
                         }
                         Err(error) => {
                             failures += 1;
@@ -1694,7 +1694,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             continue;
                         }
                     };
-                    gate.mark_ready(id);
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let mut worker = Worker {
                         id,
