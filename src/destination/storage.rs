@@ -204,11 +204,6 @@ mod tests {
                     <= MAX_MESSAGE
             );
         }
-        assert!(
-            batches(&["x".repeat(MAX_MESSAGE)], |values| serde_json::to_vec(
-                values
-            ))
-            .is_err()
-        );
+        assert!(batches(&["x".repeat(MAX_MESSAGE)], serde_json::to_vec).is_err());
     }
 }

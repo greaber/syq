@@ -4,7 +4,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import queue
 import shlex
 import signal
 import socket
@@ -38,12 +37,10 @@ def copy(arguments, *, allow=True, disconnect=True, interrupt=False, ok=None):
     remote = 'rm -f /tmp/syq-storage-authorization/progress && test ! -e ~/.aws/credentials && test -z "${AWS_ACCESS_KEY_ID:-}" && echo $$ > /tmp/syq-storage-authorization/copy.pid && exec ' + shlex.join(command)
     process = subprocess.Popen(['ssh', 'source', remote], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, start_new_session=True)
-    messages = queue.Queue()
     errors = []
     def read_errors():
         for line in process.stderr:
             errors.append(line)
-            messages.put(line)
     reader = threading.Thread(target=read_errors)
     reader.start()
     try:
@@ -53,17 +50,27 @@ def copy(arguments, *, allow=True, disconnect=True, interrupt=False, ok=None):
         assert '604800 seconds' in description and 'receiver receipts do not apply' in description, description
         run('syq', 'persist', 'receive', 'approve' if allow else 'deny', pending[0]['id'])
         if allow and disconnect:
+            # Data progress proves preparation has finished without parsing a
+            # human diagnostic as the readiness protocol. Check that diagnostic
+            # separately, since it tells the person when disconnection is safe.
             deadline = time.monotonic() + 45
+            next_notice = 0
+            last = 'no data transferred'
             while time.monotonic() < deadline:
-                try:
-                    line = messages.get(timeout=1)
-                    if 'storage authorization ready;' in line:
-                        break
-                except queue.Empty:
-                    if process.poll() is not None:
-                        raise AssertionError('copy ended before authorization finished: ' + ''.join(errors))
+                raw = run('ssh', 'source', 'cat /tmp/syq-storage-authorization/progress')
+                events = [json.loads(line) for line in raw.split('\n')[:-1] if line]
+                completed = max((e['bytes_done'] for e in events if e['type'] == 'progress'), default=0)
+                last = f'{completed} bytes completed; exit status {process.poll()}'
+                if completed > 0:
+                    break
+                assert process.poll() is None, (last, ''.join(errors))
+                if time.monotonic() >= next_notice:
+                    print('Waiting for data progress:', last, flush=True)
+                    next_notice = time.monotonic() + 2
+                time.sleep(.2)
             else:
-                raise AssertionError('authorization preparation deadline: ' + ''.join(errors))
+                raise AssertionError('authorization preparation deadline: ' + last + ''.join(errors))
+            assert 'storage authorization ready;' in ''.join(errors), ''.join(errors)
             run('syq', 'persist', 'receive', 'off')
             assert process.poll() is None, ('copy ended before disconnection check', process.returncode, ''.join(errors))
         if interrupt:
@@ -145,6 +152,12 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             print('case: denied storage request never uploads', flush=True)
             copy([remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/denied'], allow=False)
             assert not checks.listing()
+            print('case: a different build refuses storage authorization before requesting approval', flush=True)
+            skew = subprocess.run(['ssh', 'source', shlex.join(['syq-other-build', 'cp', remote_root+'/source',
+                                  '--to', 's3://syq-storage-test', '--as', prefix+'/skew', '--auth-from', '@laptop'])],
+                                  text=True, capture_output=True, timeout=20)
+            assert skew.returncode != 0 and 'requires matching syq builds' in skew.stderr, skew.stderr
+            assert json.loads(run('syq', 'persist', 'receive', 'pending', '--json')) == []
             print('case: multipart upload finishes after authorizer disconnects', flush=True)
             copy([remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/large'])
             assert hashlib.sha256(checks.request('GET', prefix+'/large')[1]).hexdigest() == expected
