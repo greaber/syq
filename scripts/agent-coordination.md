@@ -64,13 +64,13 @@ Unrelated resources can proceed independently.
 withdraws a queued request; it refuses to cancel a held claim. A **wait timeout
 preserves the ticket and its queue position**. Call wait again with the same
 ticket; do not acquire a replacement. A claim can become held after a timeout,
-so inspect it and release it if no longer needed. Signal-based interruption
-withdraws the unused claim, including a grant racing with cancellation. Do not
-use wait again on a claim you are already using.
+so inspect it and release it if no longer needed. Do not use wait again on a
+claim you are already using.
 Release only after your commands and their children have stopped. Claims are
 cooperative reservations, not OS-enforced access controls.
 
-Signal-based interruption (SIGINT, SIGTERM, SIGHUP) withdraws a waiting claim.
+Signal-based interruption (SIGINT, SIGTERM, SIGHUP) withdraws the unused claim,
+including a grant racing with cancellation.
 A runtime may stop its turn without signalling the waiting process; after
 Escape, inspect the ticket rather than assuming it was cancelled. The command
 still has its deadline.
@@ -85,7 +85,8 @@ looks old.
 
 Topics are useful when coordination needs an explanation rather than a lock.
 `topic list` shows existing topics and their subscribers, so an agent can
-discover which sessions are interested without messaging everyone.
+discover which sessions are interested without messaging everyone. Subscribe or
+publish to create a topic; read, ack, and unsubscribe reject unknown names.
 
 ```sh
 python3 scripts/agent-coordination.py topic subscribe transfer-experiments --agent implementation
@@ -135,11 +136,13 @@ python3 scripts/agent-coordination.py review start --pr 123 --agent implementati
 
 Choose `--reviewer codex` for a Codex reviewer. The tool resolves the GitHub PR
 head and repository identity, checks that your clean task branch matches it,
-fetches the head/base commits, and creates one detached worktree for the review
+fetches the head/base commits using matching configured repository URLs, and
+creates one detached worktree for the review
 request plus a tmux reviewer window. Later rounds advance that same worktree
 without clearing `target/`, so builds can reuse their existing artifacts. The
 worktree name includes the PR number and request ID, and stays stable as the SHA
-changes. A dirty checkout is preserved and must be resolved before advancing.
+changes. A fork base without a configured remote uses its GitHub HTTPS URL.
+A dirty checkout is preserved and must be resolved before advancing.
 The window runs an ordinary interactive reviewer with an initial prompt; no
 keystrokes are injected. You can attach and discuss its findings. The reviewer
 reads the project’s existing `AGENTS.md`; no standing resource policy is added.
@@ -189,7 +192,10 @@ Use `--unresolved FINDING_ID ...` to record persistent issues. Repeating an
 unresolved identifier stops the loop for discussion. A report marked blocked
 also requires discussion. Reviewer suggestions are not new user requirements.
 
-Auto mode is opt-in and defaults to at most three rounds (`--max-rounds N`).
+Auto mode is opt-in and defaults to at most three published review rounds
+(`--max-rounds N`). Attempts that fail without publishing a report do not count;
+attempt numbers still increase to keep their records distinct. At the completed
+round limit, start a new request if you want further review.
 An unchanged SHA stops for lack of progress. Failed attempts without a published
 report can be retried with `review next`; an explicit request to review an
 already reviewed SHA again uses `review next --allow-unchanged`. Semantic repetition still needs the

@@ -408,5 +408,41 @@ subprocess.run(args,check=True)
             ['git', '-C', str(worktree), 'rev-parse', 'HEAD'], text=True), head)
 
 
+    def test_unknown_topic_operations_do_not_create_topics(self):
+        self.cmd('topic', 'subscribe', 'known', '--agent', 'reader')
+        for action in ('read', 'ack', 'unsubscribe'):
+            args = ('1',) if action == 'ack' else ()
+            result = self.cmd('topic', action, 'typo', *args, '--agent', 'reader', code=2)
+            self.assertIn('Unknown topic', result['error'])
+        self.assertEqual(set(self.cmd('topic', 'list')), {'known'})
+
+    def test_failed_attempts_do_not_exhaust_completed_round_limit(self):
+        self.review_setup()
+        review = self.review(limit=1)
+        for number in (1, 2):
+            self.cmd('review', 'worker', review['id'], '--round', str(number))
+            review = self.cmd('review', 'next', review['id'], '--agent', 'implementer')
+            self.assertEqual(review['status'], 'waiting_review')
+        self.assertEqual(review['rounds'][-1]['number'], 3)
+        self.submit(review)
+        self.advance()
+        self.assertEqual(self.triage(review, 'revise')['status'], 'round_limit')
+        self.cmd('review', 'next', review['id'], '--agent', 'implementer', code=2)
+
+    def test_fetch_preserves_configured_transport_for_head_and_fork_base(self):
+        self.review_setup()
+        head_url = 'git@github.com:example/project.git'
+        base_url = 'ssh://git@github.com/upstream/project.git'
+        self.git('remote', 'set-url', 'origin', head_url)
+        self.git('remote', 'set-url', '--push', 'origin', 'https://github.com/example/project.git')
+        self.git('remote', 'add', 'upstream', base_url)
+        self.stub('gh', "import os,json,sys\nfrom pathlib import Path\nif sys.argv[1:3]==['repo','view']: print(json.dumps({'nameWithOwner':'upstream/project'}))\nelse: print((Path(os.environ['TEST_ROOT'])/'pr.json').read_text())\n")
+        real_git = shutil.which('git')
+        self.stub('git', f"import json,os,sys\nfrom pathlib import Path\nif sys.argv[1]=='fetch':\n with (Path(os.environ['TEST_ROOT'])/'fetches').open('a') as out: out.write(json.dumps(sys.argv[2:])+'\\n')\n sys.exit(0)\nos.execv({real_git!r},[{real_git!r},*sys.argv[1:]])\n")
+        self.review()
+        fetches = [json.loads(line) for line in (self.root / 'fetches').read_text().splitlines()]
+        self.assertEqual(fetches, [[head_url, self.sha], [base_url, self.base]])
+
+
 if __name__ == '__main__':
     unittest.main()

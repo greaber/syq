@@ -44,13 +44,30 @@ def snapshot(repo, pr, repository=None):
     if not remote:
         raise Error('Set the task branch upstream or push remote before requesting review')
     remote_url = run('git', 'remote', 'get-url', '--push', remote, cwd=repo)
-    normalized = remote_url.removesuffix('.git').removesuffix('/')
-    if normalized not in (f'https://github.com/{head_repo}', f'git@github.com:{head_repo}',
-                          f'ssh://git@github.com/{head_repo}'):
+    if not identifies_repository(remote_url, head_repo):
         raise Error('Task branch remote does not identify the PR head repository')
+    head_url = run('git', 'remote', 'get-url', remote, cwd=repo)
+    if not identifies_repository(head_url, head_repo):
+        head_url = remote_url
     return {'sha': data['headRefOid'], 'base': data['baseRefOid'], 'branch': branch,
             'head_repository': head_repo, 'repository': repository, 'pr': data['number'],
-            'url': data['url']}
+            'url': data['url'], 'head_fetch_url': head_url,
+            'base_fetch_url': head_url if head_repo == repository else fetch_url(repo, repository)}
+
+
+def identifies_repository(url, repository):
+    normalized = url.removesuffix('/').removesuffix('.git')
+    return normalized in (f'https://github.com/{repository}', f'git@github.com:{repository}',
+                          f'ssh://git@github.com/{repository}')
+
+
+def fetch_url(repo, repository):
+    for remote in run('git', 'remote', cwd=repo).splitlines():
+        url = run('git', 'remote', 'get-url', remote, cwd=repo)
+        if identifies_repository(url, repository):
+            return url
+    # Fork reviews may have no configured remote for the base repository.
+    return f'https://github.com/{repository}.git'
 
 
 def get(state, review_id):
@@ -118,9 +135,9 @@ def launch(store, review_id, snap, allow_unchanged=False):
         if review['status'] != 'starting':
             raise Error('Review is no longer ready to launch')
         number = len(review['rounds']) + 1
-        if number > review['max_rounds']:
+        if sum(bool(r.get('report')) for r in review['rounds']) >= review['max_rounds']:
             review['status'] = 'round_limit'
-            review['reason'] = 'Configured review round limit reached'
+            review['reason'] = 'Completed review round limit reached; start a new request for further review'
             return view(review)
         if not allow_unchanged and any(r['sha'] == snap['sha'] and r.get('report')
                                        for r in review['rounds']):
@@ -137,8 +154,8 @@ def launch(store, review_id, snap, allow_unchanged=False):
         review['status'] = 'starting'
         copy = json.loads(json.dumps(review))
     try:
-        run('git', 'fetch', f"https://github.com/{snap['head_repository']}.git", snap['sha'], cwd=copy['repo'])
-        run('git', 'fetch', f"https://github.com/{snap['repository']}.git", snap['base'], cwd=copy['repo'])
+        run('git', 'fetch', snap['head_fetch_url'], snap['sha'], cwd=copy['repo'])
+        run('git', 'fetch', snap['base_fetch_url'], snap['base'], cwd=copy['repo'])
         if previous_path is None:
             run('git', 'worktree', 'add', '--detach', str(path), snap['sha'], cwd=copy['repo'])
         else:

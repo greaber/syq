@@ -127,7 +127,12 @@ def dispatch(store, args):
         name(args.topic)
         name(args.agent)
         with store.locked() as state:
-            topic = state['topics'].setdefault(args.topic, {'events': [], 'subscribers': {}})
+            if args.action in ('subscribe', 'publish'):
+                topic = state['topics'].setdefault(args.topic, {'events': [], 'subscribers': {}})
+            else:
+                if args.topic not in state['topics']:
+                    raise Error(f'Unknown topic: {args.topic}')
+                topic = state['topics'][args.topic]
             if args.action == 'subscribe':
                 topic['subscribers'].setdefault(args.agent, 0)
             elif args.action == 'unsubscribe':
