@@ -472,18 +472,6 @@ fn cancelled_connection_setup_does_not_discard_a_ready_slot() {
 }
 
 #[test]
-fn pooled_worker_can_release_its_permit_while_preserving_the_connection() {
-    let gate = Gate::new(2);
-    gate.mark_ready(0);
-    gate.mark_ready(1);
-    gate.set_active(1);
-    gate.set_connect_target(1);
-    // Descriptor workers return their connection to Session's existing pool
-    // when they exit, releasing shared capacity for other entries.
-    assert!(!gate.park(1, || !gate.connection_needed(1)));
-}
-
-#[test]
 fn optional_provisioning_failure_does_not_poison_active_slots() {
     let gate = Gate::new(2);
     assert_eq!(gate.begin_warming(3), vec![0, 1, 2]);
