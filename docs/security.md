@@ -321,27 +321,21 @@ it is not sandboxed or confined to a copy destination directory.
 
 ## Storage authorization
 
-With `cp --auth-from @NAME` or `rm --auth-from @NAME` and an S3 endpoint, the receiving machine signs
-requests using its storage credentials. The server receives bearer URLs for
-approved operations and paths, never the underlying secret access key. Data
-travels directly between the server and storage; the authorizer need not stay
-connected after preparation finishes.
+[Storage authorization](object-storage.md#authorize-from-your-laptop) gives the
+server signed URLs for approved operations and paths, never the secret access
+key. Every command requires approval on the receiving machine.
 
-Approval trusts the requesting server account to choose contents and request
-operations within the displayed bucket and paths. Upload approval also allows
-reading those paths for comparison and recovery. Create-only approval requires
-conditional writes; object deletion requires separate permission in the same
-prompt. Version deletion requires approval for that version or all versions.
-S3-to-S3 approval separately identifies the source read scope and destination
-write scope. Requested ACL headers appear in the prompt and cannot be changed
-in issued requests. Bucket administration is refused. The storage provider
-enforces each issued request's signature and expiry.
+Approval trusts the server account to choose contents within the displayed
+bucket and paths. Uploads also allow reads for comparison and recovery;
+create-only writes require conditional requests. Deletion needs explicit
+permission, including the selected version or all versions for permanent
+removal. Version discovery may list other names sharing the selected key's
+prefix. S3-to-S3 approval names both source and destination scopes. Approved
+ACL headers cannot be changed in signed requests. Bucket administration is
+refused.
 
-These are reusable bearer capabilities. Anyone who obtains them can repeat the
-signed operations until expiry, subject to the provider's rules. They do not
-carry filesystem receiver one-use grants, aggregate byte or entry limits, or
-signed receipts. Receiving roots and automatic approval directories do not
-apply. Stopping receiving prevents further signing but cannot revoke URLs
-already issued; revocation depends on the provider and the credentials used.
-See [Authorize from your laptop](object-storage.md#authorize-from-your-laptop)
-for setup and expiry behavior.
+Anyone who obtains the URLs can reuse them until expiry, subject to provider
+rules. Stopping receiving prevents further signing but cannot revoke issued
+URLs; revocation depends on the provider and credentials used. Filesystem
+receiver roots, automatic approval directories, aggregate byte or entry
+limits, one-use grants, and signed receipts do not apply.

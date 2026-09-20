@@ -26,52 +26,34 @@ See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 
 ## Authorize from your laptop
 
-Run S3 copies or removal on a server using storage credentials on a connected
-[receiving machine](receive.md#set-up-receiving):
+Use `--auth-from @NAME` to run S3 copies or removal with credentials on a
+connected [receiving machine](receive.md#set-up-receiving):
 
 ```sh
-# On the server, after connecting from your laptop:
-syq cp results --to s3://my-bucket --into runs --auth-from @laptop --s3-profile storage
-syq cp datasets --from s3://my-bucket --into /scratch --auth-from @laptop --s3-profile storage
+# On the server:
+syq cp results --to s3://my-bucket --into runs \
+  --auth-from @laptop --s3-profile storage
 ```
 
-Approve the storage request on your laptop. `--s3-profile` selects a profile
-there; the server needs no storage credentials. Endpoint and region options
-still work, including providers such as R2, Tigris, and MinIO. Both machines
-must run the same syq build; reconnect after updating them.
+Approve the request on your laptop. The profile is selected there; the server
+needs no storage credentials. Both machines must run the same syq build;
+reconnect after updating. This works with uploads, downloads, streams,
+S3-to-S3 copies, and `rm`.
 
-Keep the laptop connected while syq lists objects and prepares signed requests.
-For file and tree uploads, preparation also hashes the local source files. Once the server prints **storage authorization
-ready**, you can disconnect the laptop. File data travels directly between
-the server and storage. Run the command in tmux if it should survive closing
-your SSH terminal; syq stays in the foreground.
+Keep the laptop connected until the server prints **storage authorization
+ready**. Preparation lists objects and, for file uploads, hashes the source
+files. Afterward, data transfers directly between the server and storage.
+Use tmux on the server if the command should survive closing your SSH terminal.
 
-Syq requests seven days of authorization. Temporary credentials can expire
-sooner, and provider policies or revocation can shorten access further.
-Syq prints the expiry after preparation. The signed requests stay in memory.
-After a process restart or expiry, rerun the copy and approve again; ordinary
-multipart recovery can reuse completed work.
+Authorization lasts up to seven days; credentials or provider policies can
+shorten it. Syq prints the expiry when ready. After a process restart or
+expiry, rerun and approve again. File uploads can reuse completed multipart
+work; streams require replaying the input.
 
-Each command requires approval, including when receiving has an automatic
-approval directory. Review the bucket, paths, read/write permissions, and any
-permission to delete for `--prune`. Issued requests can be reused until expiry;
-stopping receiving does not revoke them. Filesystem copy roots, aggregate
-limits, and receiver receipts do not apply to storage authorization. See
-[Storage authorization](security.md#storage-authorization) for the trust boundary.
-
-This also works with descriptor copies, callback stream mappings, S3-to-S3
-copies, and `rm --auth-from @NAME`. Mixed file/stream mappings share one approval.
-S3-to-S3 approval names both source and destination scopes. Removal approval
-identifies any permanent version deletion; discovering versions can also list
-object names sharing a selected key's prefix. Requested ACL headers are shown
-in the approval and signed with their exact values.
-
-Stream uploads begin reading after preparation. For an unknown-size stream,
-syq prepares all 10,000 possible part uploads; this can use several MB
-of authorization data per stream. Known sizes require fewer requests.
-Streams retain their ordinary checksum, publication, and recovery behavior:
-a producer must succeed before publication, and restarting requires replaying
-the input.
+Unknown-size stream uploads prepare 10,000 part requests before reading
+input, using several MB per stream. See [Descriptor copies](#descriptor-copies)
+for size limits. See [Storage authorization](security.md#storage-authorization)
+for approval permissions and revocation.
 
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>
