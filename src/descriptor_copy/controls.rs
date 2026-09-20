@@ -85,7 +85,7 @@ impl Controls {
                 progress.start,
                 serde_json::json!({
                     "policy_version":1,"driver":"descriptor","automatic":args.connections_default,
-                    "configured_workers":args.connections,"worker_limit":args.automatic_worker_limit(),
+                    "configured_workers":(!args.connections_default).then_some(args.connections),"worker_limit":(args.automatic_worker_limit() != usize::MAX).then(|| args.automatic_worker_limit()),
                     "bandwidth_limit":args.bwlimit_bytes,"request_size":settings.request_size
                 }),
             ) {

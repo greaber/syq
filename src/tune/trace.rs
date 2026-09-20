@@ -161,7 +161,7 @@ impl Trace {
 }
 
 fn snapshot(policy: &Policy) -> Value {
-    json!({"requested":policy.n,"active":policy.active,"min":policy.min,"max":policy.max,
+    json!({"requested":policy.n,"active":policy.active,"min":policy.min,"max":(policy.max != usize::MAX).then_some(policy.max),
         "state":policy.state,"points":policy.points,"measurement":policy.tick,
         "comparisons":policy.comparisons,"failed_probes":policy.fails,"next_probe":policy.due,
         "recent_best":policy.recent_best(),"acceptance_floor":policy.recent_best()*(1.0-NEAR_BEST_TOLERANCE)})

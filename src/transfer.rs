@@ -1034,7 +1034,7 @@ pub fn run(mut args: Args) -> Result<i32> {
             progress.start,
             serde_json::json!({
                 "policy_version": 1, "automatic": args.connections_default,
-                "configured_workers": args.connections, "worker_limit": args.automatic_worker_limit(),
+                "configured_workers": (!args.connections_default).then_some(args.connections), "worker_limit": (args.automatic_worker_limit() != usize::MAX).then(|| args.automatic_worker_limit()),
                 "bandwidth_limit": args.bwlimit_bytes, "compression": args.compress,
                 "inplace": args.inplace, "checksum": args.checksum,
                 "comparison_hash": args.hash_algorithm, "transfer_integrity": args.transfer_integrity,

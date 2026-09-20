@@ -172,10 +172,21 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
             "rsync",
             "persist",
             "completion",
+            "tuning",
             "clean-partials",
             "receiver",
             "--self-update",
         ],
+    );
+    assert_completion_candidates(
+        &t,
+        &["syq", "tuning", ""],
+        &["list", "show", "export", "clear", "help"],
+    );
+    assert_completion_candidates(
+        &t,
+        &["syq", "tuning", "show", "1", "--h"],
+        &["--help", "--help-all", "--html"],
     );
     assert_completion_candidates(&t, &["syq", "cp", "--as-f"], &["--as-fd"]);
     assert_completion_candidates(&t, &["syq", "cp", "--src-f"], &["--src-fd"]);

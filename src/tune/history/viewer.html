@@ -9,7 +9,7 @@ document.getElementById('summary').textContent=`Transfer ${run.id} · ${run.date
 const svg=document.getElementById('chart'), ns='http://www.w3.org/2000/svg';
 function draw(tag,attrs,text){const node=document.createElementNS(ns,tag);for(const [k,v]of Object.entries(attrs))node.setAttribute(k,String(v));if(text!==undefined)node.textContent=text;svg.append(node);return node;}
 function inspect(e){document.getElementById('detail').textContent=JSON.stringify(e,null,2);}
-const end=events.reduce((n,e)=>Math.max(n,e.elapsed_us/1e6),1), maxWorkers=events.reduce((n,e)=>Math.max(n,e.data.active||e.data.workers||0),1);
+const end=events.reduce((n,e)=>Math.max(n,e.elapsed_us/1e6),0)||1, maxWorkers=events.reduce((n,e)=>Math.max(n,e.data.active||e.data.workers||0),1);
 const samples=events.filter(e=>e.kind==='sample'&&e.data.seconds>0&&typeof e.data.bytes==='number'), maxRate=samples.reduce((n,e)=>Math.max(n,Math.max(0,e.data.bytes||0)/e.data.seconds),1);
 const x=t=>65+900*t/end, yw=n=>175-130*n/maxWorkers, yr=n=>345-120*n/maxRate;
 draw('text',{x:65,y:23},'Enabled worker slots');draw('text',{x:65,y:212},'Measured byte progress (MB/s; may include buffering, not network capacity)');
@@ -19,6 +19,7 @@ for(const e of events){const n=e.data.active??(e.kind==='workers_start'?e.data.w
 if(path)draw('path',{d:path+`H${x(end)}`,fill:'none',stroke:'#116b99','stroke-width':2});
 let rates=samples.map(e=>`${x(e.elapsed_us/1e6)},${yr(Math.max(0,e.data.bytes||0)/e.data.seconds)}`).join(' ');
 draw('polyline',{points:rates,fill:'none',stroke:'#218253','stroke-width':2});
+if(samples.length===1){const e=samples[0],dot=draw('circle',{cx:x(e.elapsed_us/1e6),cy:yr(e.data.bytes/e.data.seconds),r:4,fill:'#218253',tabindex:0,role:'button','aria-label':'Inspect the only measurement'});dot.addEventListener('click',()=>inspect(e));dot.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' ')inspect(e);});}
 for(const e of events.filter(e=>e.kind==='decision'||e.kind==='transition')){const c=draw('circle',{cx:x(e.elapsed_us/1e6),cy:yw(e.data.active||e.data.workers||0),r:5,fill:'#b76317',tabindex:0,role:'button','aria-label':`${e.kind} at ${(e.elapsed_us/1e6).toFixed(3)} seconds`});c.addEventListener('click',()=>inspect(e));c.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' ')inspect(e);});}
 let page=0;
 const pageSize=200;
