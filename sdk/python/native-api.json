@@ -86,6 +86,7 @@
       "sdk": "python",
       "python": [
         "on",
+        "auth-from",
         "cwd",
         "root",
         "follow",

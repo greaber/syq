@@ -263,26 +263,11 @@ impl Engine {
     }
 
     async fn delete_objects(&self, candidates: &[Candidate]) -> Result<()> {
-        if self.authorization.is_some() {
-            for candidate in candidates {
-                self.check_cancelled()?;
-                let result = self
-                    .client
-                    .delete_object()
-                    .bucket(&self.options.bucket)
-                    .key(candidate.key.as_ref().unwrap())
-                    .send()
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| anyhow::Error::from(e.into_service_error()));
-                self.deletion_finished(candidate, result, "storage");
-            }
-            return Ok(());
-        }
         crate::s3::delete::Deleter {
             client: &self.client,
             bucket: &self.options.bucket,
             budget: &self.tuning.requests,
+            individual: self.authorization.is_some(),
         }
         .run(
             candidates,

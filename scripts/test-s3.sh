@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 _syq_s3_binary=${1:-target/debug/syq}
 if [[ $# == 0 ]]; then cargo build --locked; fi
-_syq_s3_image=minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+_syq_s3_image=quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
 _syq_s3_container=
 _syq_s3_runner=
 cleanup() {

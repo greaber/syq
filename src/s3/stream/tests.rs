@@ -165,6 +165,7 @@ async fn copy(
         commit,
         cancelled,
         None,
+        None,
     )
     .await
 }
@@ -234,6 +235,7 @@ async fn entries_share_s3_admission_and_failed_producer_does_not_cancel_client()
     options.part_size = 8; // The independent fixture accepts tiny multipart parts.
     options.concurrency = 2;
     let session = Session {
+        authorization: None,
         client,
         options,
         cancellation: Arc::default(),

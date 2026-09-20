@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --locked --bin syq \
     && cp target/debug/syq /tmp/syq-other-build
 
-FROM minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e AS storage-fixture
+FROM quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e AS storage-fixture
 
 FROM debian:bookworm-slim
 
@@ -59,6 +59,7 @@ RUN useradd --uid 1001 --gid syq --create-home --shell /bin/sh \
 COPY --from=storage-fixture /usr/bin/minio /usr/local/libexec/syq-test-minio
 COPY tests/object-storage/check.py /usr/local/libexec/syq-storage-check.py
 COPY tests/real-ssh/test-storage-authorization.py /usr/local/libexec/syq-test-storage-authorization.py
+COPY tests/real-ssh/storage-streams.py /usr/local/libexec/syq-storage-streams.py
 
 COPY --from=builder /tmp/syq /usr/local/bin/syq
 COPY --from=builder /tmp/syq-other-build /usr/local/bin/syq-other-build

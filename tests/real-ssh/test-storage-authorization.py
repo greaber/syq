@@ -12,11 +12,21 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 
 
 def run(*argv, timeout=40):
     return subprocess.check_output(argv, text=True, timeout=timeout)
+
+
+def absent(key):
+    try:
+        checks.request('HEAD', key)
+    except urllib.error.HTTPError as error:
+        assert error.code == 404, error
+    else:
+        raise AssertionError('unexpected published object: '+key)
 
 
 def connect():
@@ -26,7 +36,7 @@ def connect():
     run('syq', 'persist', 'receive', 'wait', 'source', '--timeout', '30')
 
 
-def copy(arguments, *, allow=True, disconnect=True, interrupt=False, ok=None):
+def copy(arguments, *, allow=True, disconnect=True, interrupt=False, ok=None, redirection='', pipe_input=False, mapping=None, removal=False):
     if ok is None:
         ok = allow and not interrupt
     connect()
@@ -34,7 +44,12 @@ def copy(arguments, *, allow=True, disconnect=True, interrupt=False, ok=None):
                '--s3-endpoint', endpoint, '--s3-region', 'us-east-1', '--no-progress',
                '--performance-tuning=s3-part-size=5M,s3-max-concurrent-parts-per-object=1,s3-retries=0',
                '--resource-limits=bandwidth=2MiB', '--results', '/tmp/syq-storage-authorization/progress', *arguments]
-    remote = 'rm -f /tmp/syq-storage-authorization/progress && test ! -e ~/.aws/credentials && test -z "${AWS_ACCESS_KEY_ID:-}" && echo $$ > /tmp/syq-storage-authorization/copy.pid && exec ' + shlex.join(command)
+    if removal:
+        command[1] = 'rm'
+        command = [item for item in command if not item.startswith(('--performance-tuning=', '--resource-limits='))]
+    if mapping:
+        command = ['python3', '/usr/local/libexec/syq-storage-streams.py', mapping, *command]
+    remote = 'rm -f /tmp/syq-storage-authorization/progress && test ! -e ~/.aws/credentials && test -z "${AWS_ACCESS_KEY_ID:-}" && echo $$ > /tmp/syq-storage-authorization/copy.pid && ' + ('cat /tmp/syq-storage-authorization/source | ' if pipe_input else '') + 'exec ' + shlex.join(command) + redirection
     process = subprocess.Popen(['ssh', 'source', remote], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, start_new_session=True)
     errors = []
@@ -44,7 +59,10 @@ def copy(arguments, *, allow=True, disconnect=True, interrupt=False, ok=None):
     reader = threading.Thread(target=read_errors)
     reader.start()
     try:
-        pending = json.loads(run('syq', 'persist', 'receive', 'pending', '--json', '--wait', '--timeout', '15'))
+        try:
+            pending = json.loads(run('syq', 'persist', 'receive', 'pending', '--json', '--wait', '--timeout', '15'))
+        except subprocess.CalledProcessError as error:
+            raise AssertionError(f'approval unavailable; worker exit {process.poll()}: '+''.join(errors)) from error
         assert len(pending) == 1 and pending[0]['kind'] == 'storage', pending
         description = pending[0]['description']
         assert '604800 seconds' in description and 'receiver receipts do not apply' in description, description
@@ -161,6 +179,63 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             print('case: multipart upload finishes after authorizer disconnects', flush=True)
             copy([remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/large'])
             assert hashlib.sha256(checks.request('GET', prefix+'/large')[1]).hexdigest() == expected
+            print('case: descriptor upload and download continue without the authorizer', flush=True)
+            copy(['--src-fd', '0', '--to', 's3://syq-storage-test', '--as', prefix+'/descriptor'],
+                 redirection=' < /tmp/syq-storage-authorization/source')
+            assert hashlib.sha256(checks.request('GET', prefix+'/descriptor')[1]).hexdigest() == expected
+            copy([prefix+'/descriptor', '--from', 's3://syq-storage-test', '--as-fd', '1'],
+                 redirection=' > /tmp/syq-storage-authorization/descriptor-download')
+            assert run('ssh', 'source', 'sha256sum /tmp/syq-storage-authorization/descriptor-download').split()[0] == expected
+            print('case: unknown-length input signs parts before reading the pipe', flush=True)
+            copy(['--src-fd', '0', '--to', 's3://syq-storage-test', '--as', prefix+'/pipe'],
+                 pipe_input=True)
+            assert hashlib.sha256(checks.request('GET', prefix+'/pipe')[1]).hexdigest() == expected
+            print('case: prepared multipart server-side copy', flush=True)
+            copy([prefix+'/large', '--from', 's3://syq-storage-test', '--to', 's3://syq-storage-test',
+                  '--as', prefix+'/server-copy'], disconnect=False)
+            assert hashlib.sha256(checks.request('GET', prefix+'/server-copy')[1]).hexdigest() == expected
+            print('case: single-request copy preserves object metadata', flush=True)
+            checks.request('PUT', prefix+'/small-source', b'small copy', headers={'x-amz-meta-example': 'kept', 'content-type': 'text/plain'})
+            copy([prefix+'/small-source', '--from', 's3://syq-storage-test', '--to', 's3://syq-storage-test',
+                  '--as', prefix+'/small-copy'], disconnect=False)
+            headers, body = checks.request('GET', prefix+'/small-copy')
+            assert body == b'small copy'
+            assert {k.lower(): v for k, v in headers.items()}['x-amz-meta-example'] == 'kept'
+            print('case: mixed paths and callbacks share one offline approval', flush=True)
+            copy(['--to', 's3://syq-storage-test', '--into', prefix+'/mixed'], mapping='upload')
+            for name in ['ordinary', 'known', 'unknown']:
+                assert hashlib.sha256(checks.request('GET', prefix+'/mixed/'+name)[1]).hexdigest() == expected
+            copy(['--from', 's3://syq-storage-test', '--cwd', prefix+'/mixed',
+                  '--into', remote_root+'/mixed-download'], mapping='download')
+            assert run('ssh', 'source', 'sha256sum '+remote_root+'/mixed-download/ordinary').split()[0] == expected
+            print('case: failed producer cannot publish after authorization disconnects', flush=True)
+            copy(['--to', 's3://syq-storage-test', '--into', prefix+'/failed-mixed'], mapping='abort', ok=False)
+            absent(prefix+'/failed-mixed/known')
+            print('case: storage removal honors previews and approval', flush=True)
+            remove = ['--on', 's3://syq-storage-test', prefix+'/server-copy']
+            copy([*remove, '--dry-run'], removal=True, disconnect=False)
+            assert hashlib.sha256(checks.request('GET', prefix+'/server-copy')[1]).hexdigest() == expected
+            copy(remove, removal=True, disconnect=False)
+            absent(prefix+'/server-copy')
+            print('case: trailing-slash directory and contents removal use the approved base', flush=True)
+            for selector, name in [('--src-dir', 'slash-directory'), ('--srcs-in', 'slash-contents')]:
+                marker = prefix+'/'+name+'/'
+                child = marker+'child'
+                neighbor = prefix+'/'+name+'-neighbor'
+                checks.request('PUT', marker, b'')
+                checks.request('PUT', child, b'child')
+                checks.request('PUT', neighbor, b'keep')
+                remove = ['--on', 's3://syq-storage-test', '--cwd', prefix, selector, name+'/']
+                copy([*remove, '--dry-run'], removal=True, disconnect=False)
+                assert checks.request('GET', marker)[1] == b''
+                assert checks.request('GET', child)[1] == b'child'
+                copy(remove, removal=True, disconnect=False)
+                absent(child)
+                if selector == '--src-dir':
+                    absent(marker)
+                else:
+                    assert checks.request('GET', marker)[1] == b''
+                assert checks.request('GET', neighbor)[1] == b'keep'
             print('case: interrupted multipart work resumes after a fresh approval', flush=True)
             resumed = [remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/resumed']
             copy(resumed, interrupt=True)
@@ -204,6 +279,68 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             run('ssh', 'source', shlex.join(['python3', '-c', script]))
             copy(['--mapping', remote_root+'/mapping', '--cwd', prefix, '--from', 's3://syq-storage-test', '--into', remote_root+'/mapping-copy'], disconnect=False)
             assert run('ssh', 'source', shlex.join(['cat', remote_root+'/mapping-copy/mapped'])) == 'small'
+            if endpoint.startswith('http://'):
+                # Only the disposable MinIO fixture owns bucket configuration.
+                # Live-provider runs leave existing bucket settings untouched.
+                print('case: cross-bucket copies and permanent version removal', flush=True)
+                original_bucket = checks.BUCKET
+                other_bucket = 'syq-storage-versions'
+                checks.BUCKET = other_bucket
+                checks.request('PUT')
+                try:
+                    copy([prefix+'/large', '--from', 's3://syq-storage-test', '--to', 's3://'+other_bucket,
+                          '--as', prefix+'/copied'], disconnect=False)
+                    assert hashlib.sha256(checks.request('GET', prefix+'/copied')[1]).hexdigest() == expected
+                    checks.request('DELETE', prefix+'/copied')
+                    checks.request('PUT', data=b'<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>', query={'versioning': ''})
+                    print('case: exact directory-marker version removal preserves its trailing slash', flush=True)
+                    marker = prefix+'/marker/'
+                    # Pinned MinIO exposes directory markers as the null
+                    # version even when the bucket has versioning enabled.
+                    checks.request('PUT', marker, b'')
+                    marker_version = 'null'
+                    checks.request('PUT', marker+'child', b'keep child')
+                    checks.request('PUT', prefix+'/marker-neighbor', b'keep separate key')
+                    remove = ['--on', 's3://'+other_bucket, '--cwd', prefix,
+                              '--s3-version-id', marker_version, 'marker/']
+                    copy([*remove, '--dry-run'], removal=True, disconnect=False)
+                    assert checks.request('GET', marker, query={'versionId': marker_version})[1] == b''
+                    copy(remove, removal=True, disconnect=False)
+                    try:
+                        checks.request('HEAD', marker, query={'versionId': marker_version})
+                    except urllib.error.HTTPError as error:
+                        assert error.code == 404, error
+                    else:
+                        raise AssertionError('selected directory-marker version was not removed')
+                    absent(marker)
+                    assert checks.request('GET', marker+'child')[1] == b'keep child'
+                    assert checks.request('GET', prefix+'/marker-neighbor')[1] == b'keep separate key'
+                    key = prefix+'/versioned'
+                    headers, _ = checks.request('PUT', key, b'old')
+                    old = {k.lower(): v for k, v in headers.items()}['x-amz-version-id']
+                    checks.request('PUT', key, b'new')
+                    checks.request('PUT', key+'-neighbor', b'outside selected key')
+                    remove = ['--on', 's3://'+other_bucket, key]
+                    copy([*remove, '--s3-version-id', old], removal=True, disconnect=False)
+                    assert checks.request('GET', key)[1] == b'new'
+                    _, listing = checks.request('GET', query={'versions': '', 'prefix': key})
+                    assert old not in listing.decode(), listing
+                    copy(remove, removal=True, disconnect=False)
+                    absent(key)
+                    copy([*remove, '--s3-all-versions'], removal=True, disconnect=False)
+                    _, listing = checks.request('GET', query={'versions': '', 'prefix': key})
+                    tree = checks.ET.fromstring(listing)
+                    keys = [node.text for node in tree.iter() if node.tag.rsplit('}', 1)[-1] == 'Key']
+                    assert keys == [key+'-neighbor'], keys
+                finally:
+                    _, listing = checks.request('GET', query={'versions': '', 'prefix': prefix+'/'})
+                    tree = checks.ET.fromstring(listing)
+                    for node in tree.iter():
+                        node.tag = node.tag.rsplit('}', 1)[-1]
+                    for node in list(tree.findall('Version')) + list(tree.findall('DeleteMarker')):
+                        checks.request('DELETE', node.findtext('Key'), query={'versionId': node.findtext('VersionId')})
+                    checks.request('DELETE')
+                    checks.BUCKET = original_bucket
         finally:
             try:
                 run('syq', 'persist', 'receive', 'off')

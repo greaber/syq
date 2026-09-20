@@ -777,6 +777,7 @@ def _rm_arguments(
     s3_endpoint: str | None = None,
     s3_region: str | None = None,
     s3_profile: str | None = None,
+    auth_from: str | None = None,
     s3_header: Iterable[str] | None = None,
     s3_all_versions: bool = False,
     s3_version_id: str | None = None,
@@ -838,7 +839,7 @@ def _rm_arguments(
         )
     is_s3 = on is not None and on.startswith("s3://")
     if not is_s3 and (
-        s3_all_versions or s3_version_id is not None
+        auth_from is not None or s3_all_versions or s3_version_id is not None
         or any(v is not None for v in (s3_endpoint, s3_region, s3_profile, s3_header))
     ):
         raise SyqInvocationError("S3 removal options require on='s3://BUCKET'")
@@ -850,6 +851,8 @@ def _rm_arguments(
     ):
         raise SyqInvocationError("s3_version_id requires one exact key and a nonempty version ID")
     _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
+    if auth_from is not None:
+        argv.extend(("--auth-from", _text_arg(auth_from, label="auth_from")))
     if s3_all_versions:
         argv.append("--s3-all-versions")
     if s3_version_id is not None:
@@ -1014,6 +1017,7 @@ class Client:
         s3_endpoint: str | None = None,
         s3_region: str | None = None,
         s3_profile: str | None = None,
+        auth_from: str | None = None,
         s3_header: Iterable[str] | None = None,
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
@@ -1038,7 +1042,7 @@ class Client:
                          no_tcp=no_tcp, tcp_plain=tcp_plain,
                          tcp_ports=tcp_ports, tcp_congestion=tcp_congestion,
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
-                         s3_profile=s3_profile, s3_header=s3_header,
+                         s3_profile=s3_profile, s3_header=s3_header, auth_from=auth_from,
                          resource_limits=resource_limits, integrity_checking=integrity_checking,
                          stats=stats, verbose=verbose,
                          quiet=quiet, progress=progress, no_progress=no_progress,
@@ -1069,6 +1073,7 @@ class Client:
         s3_endpoint: str | None = None,
         s3_region: str | None = None,
         s3_profile: str | None = None,
+        auth_from: str | None = None,
         s3_header: Iterable[str] | None = None,
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
@@ -1093,7 +1098,7 @@ class Client:
                          no_tcp=no_tcp, tcp_plain=tcp_plain,
                          tcp_ports=tcp_ports, tcp_congestion=tcp_congestion,
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
-                         s3_profile=s3_profile, s3_header=s3_header,
+                         s3_profile=s3_profile, s3_header=s3_header, auth_from=auth_from,
                          resource_limits=resource_limits, integrity_checking=integrity_checking,
                          stats=stats, verbose=verbose,
                          quiet=quiet, progress=progress, no_progress=no_progress,
@@ -1389,6 +1394,7 @@ class Client:
         s3_endpoint: str | None = None,
         s3_region: str | None = None,
         s3_profile: str | None = None,
+        auth_from: str | None = None,
         s3_header: Iterable[str] | None = None,
         s3_all_versions: bool = False,
         s3_version_id: str | None = None,
@@ -1417,6 +1423,7 @@ class Client:
             s3_endpoint=s3_endpoint,
             s3_region=s3_region,
             s3_profile=s3_profile,
+            auth_from=auth_from,
             s3_header=s3_header,
             s3_all_versions=s3_all_versions,
             s3_version_id=s3_version_id,

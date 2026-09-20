@@ -8,7 +8,6 @@ Receiving lets you use your laptop from a connected server:
 - [Run commands on your laptop](#run-commands-on-your-laptop).
 - [Authorize copies between servers](#authorize-copies-between-servers)
   using your laptop's SSH credentials.
-
 - [Authorize object-storage transfers](object-storage.md#authorize-from-your-laptop)
   using your laptop's storage credentials.
 
@@ -130,8 +129,8 @@ including for overwrites inside that directory. You can
 [limit a profile to particular servers](#different-settings-for-different-servers).
 
 Commands on your laptop, authorization for copies between servers, and
-storage authorization require approval every time. See [Receivers](security.md#receivers) for the
-trust boundary.
+storage authorization require approval every time. See
+[Receivers](security.md#receivers) for the trust boundary.
 
 To require approval for every download again:
 

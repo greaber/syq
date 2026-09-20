@@ -319,26 +319,11 @@ With [`syq exec`](receive.md#run-commands-on-your-laptop), a connected server ca
 laptop. An approved command runs with your local user's full permissions;
 it is not sandboxed or confined to a copy destination directory.
 
-## Storage authorization
+### Storage authorization
 
-With `cp --auth-from @NAME` and an S3 endpoint, the receiving machine signs
-requests using its storage credentials. The server receives bearer URLs for
-approved operations and paths, never the underlying secret access key. Data
-travels directly between the server and storage; the authorizer need not stay
-connected after preparation finishes.
-
-Approval trusts the requesting server account to choose contents and request
-operations within the displayed bucket and paths. Upload approval also allows
-reading those paths for comparison and recovery. Create-only approval requires
-conditional writes; object deletion requires separate permission in the same
-prompt. Syq refuses bucket administration, ACL changes, and server-side copies.
-The storage provider enforces each issued request's signature and expiry.
-
-These are reusable bearer capabilities. Anyone who obtains them can repeat the
-signed operations until expiry, subject to the provider's rules. They do not
-carry filesystem receiver one-use grants, aggregate byte or entry limits, or
-signed receipts. Receiving roots and automatic approval directories do not
-apply. Stopping receiving prevents further signing but cannot revoke URLs
-already issued; revocation depends on the provider and the credentials used.
-See [Authorize from your laptop](object-storage.md#authorize-from-your-laptop)
-for setup and expiry behavior.
+[Storage authorization](object-storage.md#authorize-from-your-laptop) gives the
+server signed URLs for approved paths and operations. The secret access key
+stays on your laptop. Approval trusts the server to choose uploaded contents.
+Anyone with the URLs can reuse them until expiry; stopping receiving does not
+revoke them. Filesystem receiver roots, aggregate limits, one-use grants, and
+signed receipts do not apply.

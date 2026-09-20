@@ -26,42 +26,21 @@ See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 
 ## Authorize from your laptop
 
-Run a file or tree copy on a server using storage credentials on a connected
-[receiving machine](receive.md#set-up-receiving):
+Add `--auth-from @NAME` to an S3 `cp` or `rm` command to use credentials on a
+connected [receiving machine](receive.md#set-up-receiving).
+`--s3-profile` selects a profile there:
 
 ```sh
-# On the server, after connecting from your laptop:
-syq cp results --to s3://my-bucket --into runs --auth-from @laptop --s3-profile storage
-syq cp datasets --from s3://my-bucket --into /scratch --auth-from @laptop --s3-profile storage
+syq cp results --to s3://my-bucket --into runs \
+  --auth-from @laptop --s3-profile storage
 ```
 
-Approve the storage request on your laptop. `--s3-profile` selects a profile
-there; the server needs no storage credentials. Endpoint and region options
-still work, including providers such as R2, Tigris, and MinIO. Both machines
-must run the same syq build; reconnect after updating them.
-
-Keep the laptop connected while syq lists objects, hashes local upload files,
-and prepares signed requests. Once the server prints **storage authorization
-ready**, you can disconnect the laptop. File data travels directly between
-the server and storage. Run the command in tmux if it should survive closing
-your SSH terminal; syq stays in the foreground.
-
-Syq requests seven days of authorization. Temporary credentials can expire
-sooner, and provider policies or revocation can shorten access further.
-Syq prints the expiry after preparation. The signed requests stay in memory.
-After a process restart or expiry, rerun the copy and approve again; ordinary
-multipart recovery can reuse completed work.
-
-Each request requires approval, including when receiving has an automatic
-approval directory. Review the bucket, paths, read/write permissions, and any
-permission to delete for `--prune`. Issued requests can be reused until expiry;
-stopping receiving does not revoke them. Filesystem copy roots, aggregate
-limits, and receiver receipts do not apply to storage authorization. See
-[Storage authorization](security.md#storage-authorization) for the trust boundary.
-
-This mode supports file and tree uploads and downloads. Descriptor copies,
-callback stream mappings, S3-to-S3 copies, and `rm` use credentials on the
-invoking machine.
+Approve on your laptop, then wait for **storage authorization ready** before
+disconnecting. Data travels directly between the server and storage.
+Authorization lasts up to seven days, subject to credentials and provider
+policies; restarting requires fresh approval. Both machines need the same syq
+build. See [Storage authorization](security.md#storage-authorization) for the
+security implications.
 
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>
@@ -123,5 +102,6 @@ markers, or `--s3-version-id ID` for one version. Deleting a marker can reveal
 an older version. Preview version deletions with `--dry-run -v`.
 
 Named removal selectors choose exact keys; `--src-dir` and `--srcs-in` choose
-prefix trees. An empty S3 source prefix is rejected by `cp`, so it cannot prune
-an entire local destination.
+prefix trees and accept a trailing `/`. When deleting an exact directory-marker
+version, keep the trailing `/` in its key. An empty S3 source prefix is rejected
+by `cp`, so it cannot prune an entire local destination.

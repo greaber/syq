@@ -130,7 +130,7 @@ for each reply. Offline or unsupported connections are skipped. With none
 available, or with unsupported options, it uses the source machine's SSH access.
 Once approval is requested, refusal or failure ends the attempt.
 
-For object-storage uploads and downloads, explicit `--auth-from @NAME` uses
+For object-storage copies and removal, explicit `--auth-from @NAME` uses
 [storage authorization](object-storage.md#authorize-from-your-laptop).
 
 For SSH copies, `--auth-from @NAME` requires that receiving machine
