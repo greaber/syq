@@ -644,10 +644,8 @@ impl Policy {
         self.record(self.n, score);
         match self.state {
             State::Initial => {
-                if score > 0.0 {
-                    if !self.begin(Direction::Up, score) {
-                        self.begin(Direction::Down, score);
-                    }
+                if score > 0.0 && !self.begin(Direction::Up, score) {
+                    self.begin(Direction::Down, score);
                 }
             }
             State::Hold => self.begin_due_probe(score),
