@@ -282,7 +282,7 @@ class CoordinationTests(unittest.TestCase):
         tmux = shutil.which('tmux', path=os.environ['PATH'])
         self.assertIsNotNone(tmux, 'tmux is required to verify reviewer window launch')
         socket = str(self.root / 'tmux.sock')
-        subprocess.run([tmux, '-S', socket, 'new-session', '-d', '-s', 'coord-test'], check=True)
+        subprocess.run([tmux, '-f', '/dev/null', '-S', socket, 'new-session', '-d', '-s', 'coord-test', 'sleep 60'], check=True)
         self.addCleanup(subprocess.run, [tmux, '-S', socket, 'kill-server'], capture_output=True)
         self.stub('tmux', f"import os,sys\nos.execv({tmux!r}, [{tmux!r},'-S',{socket!r},*sys.argv[1:]])\n")
         agent_body = """import json,os,shlex,subprocess,sys

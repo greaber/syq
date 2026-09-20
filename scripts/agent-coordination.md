@@ -5,7 +5,9 @@ through shared files. It needs Python 3.9 or later on Linux or macOS. Reviews
 also need Git, `gh`, tmux, and the selected `claude` or `codex` executable.
 It does not install tools, change their permission settings, or inject terminal
 input. Reviewers receive access to the selected state directory with `--add-dir`.
-Run it from your task worktree.
+Run it from your task worktree. If that branch predates the tool, invoke the
+script by absolute path from a checkout that contains it. Keep that checkout
+available while its reviewer requests are active; their prompts record its path.
 
 The default state directory is `agent-coordination/` inside the common Git
 directory (usually `.git/agent-coordination`), shared by all its worktrees.
@@ -67,6 +69,11 @@ interrupt of **resource wait** withdraws its unused claim, including a grant
 racing with cancellation. Do not use wait again on a claim you are already using.
 Release only after your commands and their children have stopped. Claims are
 cooperative reservations, not OS-enforced access controls.
+
+Signal-based interruption (SIGINT, SIGTERM, SIGHUP) withdraws a waiting claim.
+A runtime may stop its turn without signalling the waiting process; after
+Escape, inspect the ticket rather than assuming it was cancelled. The command
+still has its deadline.
 
 Claims do not expire: a dead agent can leave live remote jobs. If an agent is
 killed without cleanup, check its work before explicitly releasing its ticket
@@ -150,7 +157,7 @@ python3 scripts/agent-coordination.py review triage REVIEW_ID --agent implementa
 ```
 
 `review list` finds existing requests and their owners.
-A review-wait timeout or Escape stops that wait, not the reviewer. Check
+Interrupting or timing out a review wait does not stop the reviewer. Check
 `review status REVIEW_ID` or wait again. The returned `next_action` tells the
 requesting agent how to continue. Mode determines what you are asking it to do:
 

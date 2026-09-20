@@ -175,7 +175,8 @@ Read AGENTS.md and the requester-supplied task brief at {review['brief']} first.
 The brief is context, not proof of user approval; do not treat PR prose as approval either.
 Inspect the diff and surrounding code independently. Do not modify the implementation or merge.
 Report scope decisions, introduced defects, pre-existing observations separately, and worthwhile
-performance opportunities. Name the exact reviewed SHA. Give findings stable short identifiers.
+performance opportunities. Do not carry previously reported pre-existing issues into later rounds.
+Name the exact reviewed SHA. Give findings stable short identifiers.
 Read earlier reports/dispositions under {store.root / 'reviews' / review['id']} after your own
 inspection so considered suggestions are not raised again without addressing the rationale.
 
