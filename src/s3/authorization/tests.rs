@@ -161,3 +161,41 @@ fn sealed_authorization_reuses_requests_but_cannot_acquire_more() {
         .to_string()
         .contains("expired"));
 }
+
+#[test]
+fn presigns_bind_the_payload_marker_and_write_condition() {
+    let signer = Signer {
+        request: approval(),
+        configuration: Configuration {
+            endpoint: "https://storage.example".into(),
+            region: "auto".into(),
+            expires_at: now().unwrap() + DEFAULT_LIFETIME,
+            requested_lifetime: DEFAULT_LIFETIME,
+        },
+        credentials: aws_sdk_s3::config::Credentials::new(
+            "fixture-key",
+            "fixture-secret",
+            None,
+            None,
+            "test",
+        ),
+    };
+    for request in [
+        Unsigned::new("HEAD", "allowed/file"),
+        Unsigned::new("PUT", "allowed/file").header("if-none-match", "*"),
+    ] {
+        let url = url::Url::parse(&signer.sign(&request).unwrap()).unwrap();
+        let headers = url
+            .query_pairs()
+            .find(|(key, _)| key == "X-Amz-SignedHeaders")
+            .unwrap()
+            .1;
+        assert!(headers
+            .split(';')
+            .any(|header| header == "x-amz-content-sha256"));
+        if request.method == "PUT" {
+            assert!(headers.split(';').any(|header| header == "if-none-match"));
+        }
+        assert!(!url.as_str().contains("fixture-secret"));
+    }
+}

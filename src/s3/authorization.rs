@@ -342,7 +342,11 @@ impl Signer {
             request
                 .headers
                 .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str())),
+                .filter(|(k, _)| k.as_str() != "x-amz-content-sha256")
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                // The transport sends this marker, including for HEAD/GET.
+                // R2 requires it in SignedHeaders whenever it is present.
+                .chain([("x-amz-content-sha256", "UNSIGNED-PAYLOAD")]),
             SignableBody::UnsignedPayload,
         )?;
         let (instructions, _) = sign(signable, &params)?.into_parts();
