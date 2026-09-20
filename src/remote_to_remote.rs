@@ -977,6 +977,9 @@ fn run_remote(
     if args.delete {
         remote.push("--prune".into());
     }
+    if let Some(size) = &args.recycle_staging {
+        remote.push(format!("--recycle-staging={size}"));
+    }
     if args.inplace {
         remote.push("--inplace".into());
     }

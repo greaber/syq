@@ -105,6 +105,29 @@ compression to the observed transfer speed. Blocks that do not shrink enough
 are sent uncompressed. Use `--no-compress` to disable transport compression,
 for example when comparing its effect on CPU use and copy speed.
 
+### Reuse staging storage
+
+On a Linux destination, `--recycle-staging=SIZE` opts into reusing replaced
+files as staging storage later in the same copy. For example,
+`--recycle-staging=8G` retains at most 8 GiB of spare file lengths and at most
+32 files. This bounds the spare pool, not the space occupied by active copies.
+The pool starts empty for each invocation and is removed before successful
+completion. `--stats` reports how many files and bytes reused storage.
+
+Use this only with exclusive control of the destination. Old open file
+handles can observe new contents after reuse, even after permissions or names
+change; a private pool directory does not revoke those handles. The option is
+off by default. Files with other hard links, a different owner, or extended
+attributes use ordinary staging instead. Directory attributes, special filesystem
+flags, or a different filesystem can also prevent reuse. Source contents are still verified normally.
+
+Recycling cannot be combined with `--inplace`. It is not supported for
+command-restricted or named receivers, S3 copies, or descriptor and callback
+streams. Normal completion and handled copy errors dispose of the pool.
+Abnormal termination can leave a private `.syq-recycle-*` directory. After
+confirming no copy is using it, remove that directory to reclaim its space.
+Syq does not reuse pools from earlier invocations.
+
 <a id="output-and-diagnostics"></a>
 <a id="performance-and-time-limits"></a>
 

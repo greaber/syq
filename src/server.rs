@@ -518,6 +518,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::CheckOperatorDirectoryAncestry { .. }
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
+                    | Request::StartRecycling { .. }
+                    | Request::FinishRecycling
                     | Request::AnchorDestination { .. }
                     | Request::CopySmallFiles(_)
                     | Request::PruneLookup { .. }

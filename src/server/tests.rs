@@ -560,6 +560,7 @@ fn rejected_destination_ticket_is_not_acknowledged_as_ready() {
             token: Vec::new(),
             role: ConnectionRole::DestinationWorker {
                 destination: Some(DestinationRoot {
+                    recycle: None,
                     ticket,
                     request_prefix: b"destination".to_vec(),
                 }),

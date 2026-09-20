@@ -259,6 +259,10 @@ fn validate(args: &Args, manifest: &manifest::Manifest) -> Result<()> {
         !args.delete,
         "callback mappings cannot prune a tree: byte streams do not describe its complete contents"
     );
+    ensure!(
+        args.recycle_staging.is_none(),
+        "callback mappings do not support --recycle-staging"
+    );
     ensure!(!args.inplace, "callback mappings publish only after the producer succeeds; --inplace cannot provide that behavior");
     ensure!(!args.checksum, "callback mappings cannot compare content before invoking producers; use expected_hash to check produced bytes");
     ensure!(

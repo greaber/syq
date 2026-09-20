@@ -61,6 +61,7 @@ enum RegisteredDescriptorKind {
     SourceLeaf,
     StreamRead,
     StreamWrite,
+    RecyclingPool,
 }
 
 impl RegisteredDescriptorKind {
@@ -70,6 +71,7 @@ impl RegisteredDescriptorKind {
             Self::SourceLeaf => 1,
             Self::StreamRead => 2,
             Self::StreamWrite => 3,
+            Self::RecyclingPool => 4,
         }
     }
 
@@ -79,6 +81,7 @@ impl RegisteredDescriptorKind {
             1 => Some(Self::SourceLeaf),
             2 => Some(Self::StreamRead),
             3 => Some(Self::StreamWrite),
+            4 => Some(Self::RecyclingPool),
             _ => None,
         }
     }
@@ -289,6 +292,14 @@ impl DescriptorTicket {
         self.kind == RegisteredDescriptorKind::SourceLeaf
     }
 
+    pub(crate) fn require_recycling(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.kind == RegisteredDescriptorKind::RecyclingPool,
+            "recycling requires a pool capability"
+        );
+        Ok(())
+    }
+
     pub(crate) fn stream_write(&self) -> Result<bool> {
         match self.kind {
             RegisteredDescriptorKind::StreamRead => Ok(false),
@@ -465,6 +476,51 @@ impl DescriptorSessionSlot {
             }])?
             .remove(0);
         session.ticket_for(id, kind)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn register_recycling(&self, directory: File) -> Result<DescriptorTicket> {
+        anyhow::ensure!(
+            directory.metadata()?.is_dir(),
+            "recycling capability requires a directory"
+        );
+        let mut session = self.session.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(
+            !self.closed.load(Ordering::Acquire),
+            "descriptor session is closed"
+        );
+        let session = session
+            .as_mut()
+            .context("destination session is not initialized")?;
+        let kind = RegisteredDescriptorKind::RecyclingPool;
+        let id = session
+            .registry
+            .register_entries(vec![RegisteredRoot {
+                descriptor: directory,
+                kind,
+                source_leaf: None,
+            }])?
+            .remove(0);
+        session.ticket_for(id, kind)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn release_recycling(&self, ticket: &DescriptorTicket) {
+        let session = self.session.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(session) = session.as_ref() {
+            if ticket.require_recycling().is_ok()
+                && ticket.secret == session.secret
+                && ticket.socket_path == session.broker.socket_path().as_os_str().as_bytes()
+            {
+                session
+                    .registry
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .roots
+                    .remove(&ticket.root_id);
+            }
+        }
     }
 
     /// Release a completed entry without reusing its capability identifier.
@@ -1297,5 +1353,29 @@ mod tests {
         let debug = format!("{ticket:?}");
         assert!(debug.contains("root_id"));
         assert!(!debug.contains(&hex(&ticket.secret)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recycling_capabilities_are_distinct_and_released_at_completion() {
+        let directory = tempfile::tempdir_in(crate::test_support::temp_dir()).unwrap();
+        let session = DescriptorSessionSlot::default();
+        let root = session
+            .register(File::open(directory.path()).unwrap())
+            .unwrap();
+        let pool = session
+            .register_recycling(File::open(directory.path()).unwrap())
+            .unwrap();
+        assert!(!pool.is_directory());
+        assert!(pool.require_recycling().is_ok());
+        assert!(root.require_recycling().is_err());
+        assert!(pool.same_session(&root));
+        assert!(session.acquire(&pool).unwrap().metadata().unwrap().is_dir());
+        session.release_recycling(&root);
+        assert!(session.acquire(&root).is_ok());
+        session.release_recycling(&pool);
+        assert!(session.acquire(&pool).is_err());
+        assert!(session.acquire(&root).is_ok());
+        session.close();
     }
 }

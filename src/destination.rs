@@ -754,6 +754,10 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let Some(selection) = selection else {
         return Ok(());
     };
+    anyhow::ensure!(
+        args.recycle_staging.is_none(),
+        "named receivers do not support --recycle-staging"
+    );
     handoff::check_selection(&selection)?;
     if selection.kind == handoff::Kind::Forward {
         return forward::prepare(args, selection);

@@ -71,6 +71,7 @@
         "src-dirs": "src-dir"
       },
       "raw_only": [
+        "recycle-staging",
         "verbose",
         "quiet",
         "progress",

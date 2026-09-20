@@ -977,6 +977,8 @@ mod persistence;
 mod progress;
 #[path = "local/receiving.rs"]
 mod receiving;
+#[path = "local/recycling.rs"]
+mod recycling;
 #[path = "local/remote.rs"]
 mod remote;
 #[path = "local/results.rs"]

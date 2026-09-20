@@ -308,6 +308,11 @@ pub struct Args {
     /// in-place write leaves a newer-looking final file those filters would then skip forever
     #[arg(long, conflicts_with_all = ["update", "ignore_existing"])]
     pub inplace: bool,
+    /// Reuse retired destination files within this copy (Linux receiver only).
+    /// Old file handles may observe new contents; use only with exclusive destination access.
+    /// SIZE bounds retained spare file lengths, not total transfer storage.
+    #[arg(long, value_name = "SIZE", conflicts_with = "inplace")]
+    pub recycle_staging: Option<String>,
     /// Remote shell command (default: ssh); controls agent forwarding when set
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
@@ -1089,6 +1094,14 @@ struct NativeCopyOperationalArgs {
     /// Update destination files directly, using no full-sized staging file; interruption can leave them incomplete
     #[arg(long)]
     inplace: bool,
+    /// Reuse retired destination files (Linux only); old handles may see new contents. Requires exclusive destination access
+    #[arg(
+        long,
+        value_name = "SIZE",
+        conflicts_with = "inplace",
+        help_heading = "Advanced controls"
+    )]
+    recycle_staging: Option<String>,
     /// Command-restricted receiver ceiling: refuse to touch more than N destination entries
     #[arg(long, value_name = "N", help_heading = REMOTE_TO_REMOTE_HEADING)]
     receiver_max_entries: Option<u64>,
@@ -2597,6 +2610,7 @@ fn apply_native_copy_operational(
         ignore_from,
         preserve,
         inplace,
+        recycle_staging,
         receiver_max_entries,
         receiver_max_bytes,
         receiver_receipt,
@@ -2619,6 +2633,7 @@ fn apply_native_copy_operational(
     args.ignore = ignore;
     args.ignore_from = ignore_from;
     args.inplace = inplace;
+    args.recycle_staging = recycle_staging;
     for attribute in preserve {
         match attribute {
             NativePreserve::Times => args.times = true,

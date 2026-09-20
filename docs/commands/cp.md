@@ -128,6 +128,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 |---|---|
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
 | `--resource-limits <KEY=VALUE,...>` | [Bandwidth and concurrency ceilings](../resource-limits.md) |
+| `--recycle-staging <SIZE>` | Reuse retired destination files (Linux only); old handles may see new contents. Requires exclusive destination access |
 
 <a id="progress-and-results"></a>
 

@@ -65,6 +65,9 @@ fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     {
         bail!("return authorization owns its SSH connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp, --tcp-plain, --peer-auth, or --coordinate-at");
     }
+    if args.recycle_staging.is_some() {
+        bail!("return authorization does not support --recycle-staging");
+    }
     if args.owner || args.group || args.devices || args.inplace {
         bail!("return authorization does not accept ownership, special-file preservation, or --inplace");
     }
