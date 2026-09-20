@@ -26,16 +26,11 @@ pub(crate) struct Owner {
 }
 
 impl Pool {
-    pub(crate) fn supported() -> bool {
-        std::fs::read_to_string("/proc/sys/fs/protected_hardlinks")
-            .is_ok_and(|value| value.trim() == "1")
-    }
-
     pub(crate) fn open(directory: File) -> Result<Self> {
-        anyhow::ensure!(
-            Self::supported(),
-            "private hard-link protection is unavailable"
-        );
+        // This experiment requires exclusive destination access. Reading a
+        // global hard-link sysctl does not establish that condition, and some
+        // hosts hide it from unprivileged processes. Check the actual objects
+        // below; these checks do not make concurrent hostile access supported.
         let metadata = directory.metadata()?;
         anyhow::ensure!(
             metadata.is_dir()
