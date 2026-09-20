@@ -112,6 +112,10 @@ fn open(path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     db.busy_timeout(Duration::from_millis(100))?;
+    // This history is disposable: avoid durability barriers on the copy path.
+    // Set this before schema creation or journal changes, which can also sync.
+    // A system crash can lose or corrupt history; it never authorizes file work.
+    db.pragma_update(None, "synchronous", "OFF")?;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     anyhow::ensure!(
         matches!(version, 0 | SCHEMA),
@@ -173,7 +177,6 @@ fn open(path: &Path) -> Result<Connection> {
         }
     }
     db.busy_timeout(Duration::from_millis(100))?;
-    db.pragma_update(None, "synchronous", "NORMAL")?;
     db.pragma_update(None, "foreign_keys", true)?;
     Ok(db)
 }

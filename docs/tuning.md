@@ -126,16 +126,9 @@ external scripts. `export` without an ID exports all retained transfers as
 NDJSON. These diagnostic records are versioned, but their event details may
 evolve; they are separate from the [automation results](automation.md) contract.
 
-Samples include their duration, byte and file progress, worker counts, and
-whether the tuner used them. Copies completed by a single control request
-record that copy path without a tuning timeline. Warm-up, insufficient remaining work, and partial
-final intervals are labeled explicitly. The tuning score adds a credit for
-completed files, so it is distinct from byte throughput. A requested count may
-still be connecting; activation and acceptance are separate events. Decisions
-include the baseline, scores, thresholds, and policy state used at the time.
-The remaining-work gate records its scan status, work available, and required
-measurement duration in activity units. Repeated waiting states are recorded
-when the reason changes.
+The timeline distinguishes requested workers from workers ready to copy, and
+shows which measurements informed each decision. Copies completed by a single
+control request record that copy path without a tuning timeline.
 
 Descriptor and pipe copies also record their tuning decisions, but do not use
 filesystem history to choose their starting count. S3 copies do not currently
@@ -150,17 +143,21 @@ while leaving the older cache available. New database files are private to the
 user. SQLite may create adjacent `-wal` and `-shm` files while in use.
 
 `SYQ_TUNING_HISTORY_SIZE` sets a retention target, default `1G`, minimum `16M`.
-There is no age expiry for completed transfers. When over budget, completion
-removes up to 100 oldest eligible records with their whole timelines. The
-current transfer and recently active incomplete records are preserved; disk use
-can temporarily exceed the target, and freed pages are reused or reclaimed
-incrementally. Increase the target before collecting a large investigation.
+There is no age expiry for completed transfers. Above the target, new transfers
+continue to be recorded and the oldest stored transfers and their timelines are
+removed to make room. Their startup recommendations are removed with them;
+using a recommendation does not refresh its age. The current transfer and
+recently active incomplete records are preserved, so disk use can temporarily
+exceed the target. Increase the target to keep more history.
 
 Recording is buffered and best effort. Copies still proceed when history cannot
 be written. An interrupted process can leave an incomplete timeline; prolonged
 write contention can lose events, reported in the history when it becomes
-writable again. Clearing history also removes its startup hints; it leaves the
-older connection-count cache intact.
+writable again. History writes do not force a disk sync. A system crash or power
+loss can lose or corrupt this disposable history. If it becomes unreadable,
+stop active transfers and delete the history file and any adjacent `-wal` and
+`-shm` files to start fresh. Clearing history also removes its startup hints;
+it leaves the older connection-count cache intact.
 
 ## Filesystem tuning examples
 
