@@ -155,7 +155,7 @@ fn decisions_include_comparison_evidence_and_unapplied_candidates() {
     let writer = recorder(&path);
     let mut policy = Policy::new(8, 1, 64);
     let gate = Gate::new(8);
-    let mut trace = Trace::new(Some(writer.clone()), &policy);
+    let mut trace = Trace::new(Some(writer.clone()), &policy, super::super::SAMPLE);
     trace.sample((0, 0), (100, 1), 2.5, &policy, &gate, "stable", Some(100.0));
     trace.observe(&mut policy, 100.0, "stable");
     assert_eq!(policy.n, 10);
@@ -240,7 +240,7 @@ fn trace_distinguishes_acceptance_rejection_and_pending_comparison() {
     let writer = recorder(&path);
     let mut policy = Policy::new(8, 1, 64);
     let gate = Gate::new(8);
-    let mut trace = Trace::new(Some(writer.clone()), &policy);
+    let mut trace = Trace::new(Some(writer.clone()), &policy, super::super::SAMPLE);
     trace.observe(&mut policy, 100.0, "stable");
     policy.activated();
     trace.transition(&policy, "candidate_ready");
@@ -272,4 +272,30 @@ fn trace_distinguishes_acceptance_rejection_and_pending_comparison() {
     assert_eq!(decisions[2]["data"]["reason"], "probe_rejected");
     assert_eq!(decisions[2]["data"]["sample_ids"], json!([2]));
     assert_eq!(events.last().unwrap()["data"]["pending_comparison"], false);
+}
+
+#[test]
+fn filesystem_tokens_can_be_related_across_transfer_directions() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let writer = recorder(&temp.path().join("history.sqlite"));
+    let endpoint = crate::conn::Endpoint::local();
+    let forward = context_key(
+        &writer,
+        &endpoint,
+        &endpoint,
+        Some("a"),
+        Some("b"),
+        "default".into(),
+    );
+    let reverse = context_key(
+        &writer,
+        &endpoint,
+        &endpoint,
+        Some("b"),
+        Some("a"),
+        "default".into(),
+    );
+    assert_eq!(forward.source_filesystem, reverse.destination_filesystem);
+    assert_eq!(forward.destination_filesystem, reverse.source_filesystem);
+    assert_ne!(forward.source_filesystem, forward.destination_filesystem);
 }

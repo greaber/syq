@@ -1835,6 +1835,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     source_roots
         .set(registered_sources)
         .expect("source roots set once");
+    if let Some(history) = progress.tuning_history.get() {
+        let key = tune::history::context_key(
+            history,
+            &src_ep,
+            &dst_ep,
+            source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
+            None,
+            "setup".into(),
+        );
+        history.context(&key);
+        history.event(
+            "context",
+            serde_json::json!({"stage":"source_registered", "key":key,
+            "source_type":source_filesystem.as_ref().map(|fs| &fs.kind)}),
+        );
+    }
     // A native push of a few small local files needs no data worker and no
     // separate preflight: one control-connection turn selects, anchors,
     // checks, and publishes. Source registration above was local, so nothing
@@ -1855,6 +1871,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             t0,
         )? {
             SmallCopy::Done(code) => {
+                if let Some(history) = progress.tuning_history.get() {
+                    history.event(
+                        "copy_path",
+                        serde_json::json!({"path":"fused_control_copy", "tuning":"not_started"}),
+                    );
+                }
                 if let Some(benchmark) = &opts.benchmark {
                     benchmark.lock().unwrap().native_small_copies += 1;
                 }

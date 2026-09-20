@@ -81,7 +81,10 @@ This also works for local copies. Filesystem identities are best-effort hints
 reported by the operating system; syq uses the selected roots and marks a run
 as mixed if planning observes other filesystems. Unknown or mixed filesystems
 can use a route-level hint for remote copies. SSH, encrypted TCP, and plaintext
-TCP histories are separate.
+TCP histories are separate. Destination hints come from existing filesystem
+inspection responses; some restricted routes and copies onto existing individual
+files do not provide them. Local copies without both filesystem hints use the
+normal starting count.
 
 Without a matching history result, remote copies can use the older connection
 cache, then fall back to 8 workers over SSH or 16 over TCP. Local copies start
@@ -124,7 +127,8 @@ NDJSON. These diagnostic records are versioned, but their event details may
 evolve; they are separate from the [automation results](automation.md) contract.
 
 Samples include their duration, byte and file progress, worker counts, and
-whether the tuner used them. Warm-up, insufficient remaining work, and partial
+whether the tuner used them. Copies completed by a single control request
+record that copy path without a tuning timeline. Warm-up, insufficient remaining work, and partial
 final intervals are labeled explicitly. The tuning score adds a credit for
 completed files, so it is distinct from byte throughput. A requested count may
 still be connecting; activation and acceptance are separate events. Decisions

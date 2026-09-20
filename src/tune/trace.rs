@@ -11,7 +11,7 @@ pub(crate) struct Trace {
 }
 
 impl Trace {
-    pub fn new(recorder: Option<history::Recorder>, policy: &Policy) -> Self {
+    pub fn new(recorder: Option<history::Recorder>, policy: &Policy, interval: Duration) -> Self {
         let trace = Self {
             recorder,
             sample: 0,
@@ -20,7 +20,7 @@ impl Trace {
             last_work_check: None,
         };
         trace.event("policy_start",json!({"policy_version":1,"policy":snapshot(policy),
-            "sample_ms":sample_interval().as_millis(),"discarded_intervals_after_reset":1,"stable_within":STABLE_WITHIN,
+            "sample_ms":interval.as_millis(),"discarded_intervals_after_reset":1,"stable_within":STABLE_WITHIN,
             "maximum_samples":MAX_SAMPLES,"near_best_tolerance":NEAR_BEST_TOLERANCE,
             "step":STEP,"file_credit":FILE_CREDIT,"probe_every":PROBE_EVERY,
             "probe_backoff_max":PROBE_BACKOFF_MAX,"evidence_max_age":EVIDENCE_MAX_AGE,

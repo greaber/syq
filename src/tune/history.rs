@@ -416,18 +416,10 @@ pub(crate) fn context_key(
         source_transport,
         destination_transport,
         route: recorder.token("route", &route),
-        source_filesystem: source.map(|v| {
-            recorder.token(
-                "source-filesystem",
-                &format!("{}:{v}", super::endpoint_key(src)),
-            )
-        }),
-        destination_filesystem: destination.map(|v| {
-            recorder.token(
-                "destination-filesystem",
-                &format!("{}:{v}", super::endpoint_key(dst)),
-            )
-        }),
+        source_filesystem: source
+            .map(|v| recorder.token("filesystem", &format!("{}:{v}", super::endpoint_key(src)))),
+        destination_filesystem: destination
+            .map(|v| recorder.token("filesystem", &format!("{}:{v}", super::endpoint_key(dst)))),
         mode,
     }
 }

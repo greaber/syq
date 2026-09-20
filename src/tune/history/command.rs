@@ -63,7 +63,10 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<i32> {
     let mut output = std::io::stdout().lock();
     match matches.subcommand() {
         Some(("list", args)) => {
-            writeln!(output, "ID\tDATE\tSTATUS\tSECONDS\tWORKERS\tEVENTS")?;
+            writeln!(
+                output,
+                "ID\tDATE\tSTATUS\tSECONDS\tFILES\tBYTES\tWORKERS\tEVENTS"
+            )?;
             let mut statement=db.prepare("SELECT id,day,status,summary,CASE WHEN eligible=1 THEN workers END,(SELECT count(*) FROM events WHERE run=runs.id) FROM runs ORDER BY id DESC LIMIT ?1")?;
             let rows =
                 statement.query_map([args.get_one::<u32>("limit").copied().unwrap()], |r| {
@@ -87,8 +90,16 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<i32> {
                     .unwrap_or_else(|| "?".into());
                 writeln!(
                     output,
-                    "{id}\t{}\t{status}\t{seconds}\t{}\t{events}",
+                    "{id}\t{}\t{status}\t{seconds}\t{}\t{}\t{}\t{events}",
                     date(day),
+                    summary["files"]
+                        .as_u64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "?".into()),
+                    summary["bytes"]
+                        .as_u64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "?".into()),
                     workers.map(|v| v.to_string()).unwrap_or_else(|| "?".into())
                 )?;
             }

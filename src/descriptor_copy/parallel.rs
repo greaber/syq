@@ -559,8 +559,11 @@ pub(crate) async fn execute(
         spawn(&mut tasks, id);
     }
     let mut policy = tune::Policy::new(prepared.workers, 1, prepared.worker_limit);
-    let mut trace =
-        tune::trace::Trace::new(controls.progress.tuning_history.get().cloned(), &policy);
+    let mut trace = tune::trace::Trace::new(
+        controls.progress.tuning_history.get().cloned(),
+        &policy,
+        tune::SAMPLE,
+    );
     let mut sampler = tune::Sampler::default();
     let mut interval = tokio::time::interval(tune::SAMPLE);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -743,9 +746,9 @@ pub(crate) async fn execute(
     for retired in retirements {
         retired.wait().await;
     }
-    if let Some(payload) = callback {
-        payload.transferred(result.as_ref().err())?;
-    }
+    let callback_result = callback
+        .map(|payload| payload.transferred(result.as_ref().err()))
+        .transpose();
     trace.sample(
         (last.1, 0),
         (controls.progress.bytes_done.load(Relaxed), 0),
@@ -755,7 +758,8 @@ pub(crate) async fn execute(
         "final_partial",
         None,
     );
-    trace.end(&policy, result.is_err());
+    trace.end(&policy, result.is_err() || callback_result.is_err());
+    callback_result?;
     result
 }
 pub(crate) async fn direct(

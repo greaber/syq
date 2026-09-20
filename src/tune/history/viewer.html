@@ -1,6 +1,6 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>syq tuning history</title>
 <style>body{font:16px system-ui,sans-serif;margin:2rem auto;padding:0 1rem;max-width:1100px;color:#172b3a;background:#f6f8fa}h1{font-size:1.6rem}svg{width:100%;background:white;border:1px solid #ccd5dc;border-radius:8px}text{font:12px system-ui;fill:#465966}button{font:inherit;background:white;border:1px solid #ccd5dc;border-radius:4px;padding:.25rem .5rem;cursor:pointer}tr:hover{background:#e4f0f6}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:.4rem;border-bottom:1px solid #d7e0e7}pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:1rem;background:white;border:1px solid #ccd5dc}circle{cursor:pointer}#summary{color:#465966}</style>
-<h1>Transfer tuning timeline</h1><p id="summary"></p><p>Worker limits and measured byte progress. Click a decision marker or event to inspect its evidence. An enabled worker may still be connecting or idle.</p><svg id="chart" viewBox="0 0 1000 390" role="img" aria-label="Worker count and byte progress over elapsed time"></svg><pre id="detail" aria-live="polite">Select an event.</pre><label><input id="samples" type="checkbox"> Show measurement events in the table</label><table><thead><tr><th>Elapsed</th><th>Event</th><th>Reason</th></tr></thead><tbody id="events"></tbody></table>
+<h1>Transfer tuning timeline</h1><p id="summary"></p><p>Worker limits and measured byte progress. Click a decision marker or event to inspect its evidence. An enabled worker may still be connecting or idle.</p><svg id="chart" viewBox="0 0 1000 390" role="img" aria-label="Worker count and byte progress over elapsed time"></svg><pre id="detail" aria-live="polite">Select an event.</pre><label><input id="samples" type="checkbox"> Show measurement events in the table</label><p><button id="previous">Previous</button> <span id="page"></span> <button id="next">Next</button></p><table><thead><tr><th>Elapsed</th><th>Event</th><th>Reason</th></tr></thead><tbody id="events"></tbody></table>
 <script>"use strict";
 const history=__HISTORY_DATA__;
 const events=history.events, run=history.run;
@@ -10,16 +10,33 @@ const svg=document.getElementById('chart'), ns='http://www.w3.org/2000/svg';
 function draw(tag,attrs,text){const node=document.createElementNS(ns,tag);for(const [k,v]of Object.entries(attrs))node.setAttribute(k,String(v));if(text!==undefined)node.textContent=text;svg.append(node);return node;}
 function inspect(e){document.getElementById('detail').textContent=JSON.stringify(e,null,2);}
 const end=events.reduce((n,e)=>Math.max(n,e.elapsed_us/1e6),1), maxWorkers=events.reduce((n,e)=>Math.max(n,e.data.active||e.data.workers||0),1);
-const samples=events.filter(e=>e.kind==='sample'&&e.data.seconds>0), maxRate=samples.reduce((n,e)=>Math.max(n,Math.max(0,e.data.bytes||0)/e.data.seconds),1);
+const samples=events.filter(e=>e.kind==='sample'&&e.data.seconds>0&&typeof e.data.bytes==='number'), maxRate=samples.reduce((n,e)=>Math.max(n,Math.max(0,e.data.bytes||0)/e.data.seconds),1);
 const x=t=>65+900*t/end, yw=n=>175-130*n/maxWorkers, yr=n=>345-120*n/maxRate;
 draw('text',{x:65,y:23},'Enabled worker slots');draw('text',{x:65,y:212},'Measured byte progress (MB/s; may include buffering, not network capacity)');
 for(let i=0;i<=4;i++){let t=end*i/4;draw('line',{x1:x(t),x2:x(t),y1:32,y2:350,stroke:'#e1e7ec'});draw('text',{x:x(t),y:377,'text-anchor':'middle'},`${t.toFixed(2)}s`);draw('text',{x:55,y:yw(maxWorkers*i/4),'text-anchor':'end'},Math.round(maxWorkers*i/4));draw('text',{x:55,y:yr(maxRate*i/4),'text-anchor':'end'},(maxRate*i/4/1e6).toFixed(1));}
 let path='',previous;
-for(const e of events){const n=e.data.active??(e.kind==='workers_start'?e.data.workers:undefined);if(n===undefined)continue;const t=e.elapsed_us/1e6;if(previous===undefined)path+=`M${x(t)},${yw(n)}`;else path+=`H${x(t)}V${yw(n)}`;previous=n;}
+for(const e of events){const n=e.data.active??(e.kind==='workers_start'?e.data.workers:undefined);if(n===undefined||n===previous)continue;const t=e.elapsed_us/1e6;if(previous===undefined)path+=`M${x(t)},${yw(n)}`;else path+=`H${x(t)}V${yw(n)}`;previous=n;}
 if(path)draw('path',{d:path+`H${x(end)}`,fill:'none',stroke:'#116b99','stroke-width':2});
 let rates=samples.map(e=>`${x(e.elapsed_us/1e6)},${yr(Math.max(0,e.data.bytes||0)/e.data.seconds)}`).join(' ');
 draw('polyline',{points:rates,fill:'none',stroke:'#218253','stroke-width':2});
 for(const e of events.filter(e=>e.kind==='decision'||e.kind==='transition')){const c=draw('circle',{cx:x(e.elapsed_us/1e6),cy:yw(e.data.active||e.data.workers||0),r:5,fill:'#b76317',tabindex:0,role:'button','aria-label':`${e.kind} at ${(e.elapsed_us/1e6).toFixed(3)} seconds`});c.addEventListener('click',()=>inspect(e));c.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' ')inspect(e);});}
-function render(){const body=document.getElementById('events');body.replaceChildren();for(const e of events){if(e.kind==='sample'&&!document.getElementById('samples').checked)continue;const tr=document.createElement('tr'),time=document.createElement('td'),kind=document.createElement('td'),reason=document.createElement('td'),button=document.createElement('button');time.textContent=(e.elapsed_us/1e6).toFixed(3)+'s';button.textContent=e.kind;button.addEventListener('click',()=>inspect(e));kind.append(button);reason.textContent=e.data.reason||e.data.disposition||'';tr.append(time,kind,reason);body.append(tr);}}
-document.getElementById('samples').addEventListener('change',render);render();
+let page=0;
+const pageSize=200;
+function render(){
+  const visible=events.filter(e=>e.kind!=='sample'||document.getElementById('samples').checked);
+  page=Math.max(0,Math.min(page,Math.ceil(visible.length/pageSize)-1));
+  const start=page*pageSize,end=Math.min(start+pageSize,visible.length),body=document.getElementById('events');
+  document.getElementById('page').textContent=visible.length?`${start+1}–${end} of ${visible.length} events`:'No events';
+  document.getElementById('previous').disabled=page===0;
+  document.getElementById('next').disabled=end>=visible.length;
+  body.replaceChildren();
+  for(const e of visible.slice(start,end)){
+    const tr=document.createElement('tr'),time=document.createElement('td'),kind=document.createElement('td'),reason=document.createElement('td'),button=document.createElement('button');
+    time.textContent=(e.elapsed_us/1e6).toFixed(3)+'s';button.textContent=e.kind;button.addEventListener('click',()=>inspect(e));kind.append(button);reason.textContent=e.data.reason||e.data.disposition||'';tr.append(time,kind,reason);body.append(tr);
+  }
+}
+document.getElementById('samples').addEventListener('change',()=>{page=0;render();});
+document.getElementById('previous').addEventListener('click',()=>{page--;render();});
+document.getElementById('next').addEventListener('click',()=>{page++;render();});
+render();
 </script></html>

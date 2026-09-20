@@ -912,7 +912,7 @@ pub fn run(
     mut spawn: impl FnMut(usize),
 ) -> Policy {
     let mut policy = policy;
-    let mut trace = trace::Trace::new(meter.history(), &policy);
+    let mut trace = trace::Trace::new(meter.history(), &policy, sample_interval());
     let mut sampler = Sampler::default();
     sampler.reset();
     let mut last = (meter.bytes(), meter.files());
