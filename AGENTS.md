@@ -424,8 +424,11 @@ not receive credential material.
 
 The release tools read `.env.release` and `.env.keys` from
 `${XDG_CONFIG_HOME:-$HOME/.config}/syq/release`, or from the external directory
-selected by `SYQ_RELEASE_SECRETS_DIR`. Keep both files on developer-controlled
-machines and in protected backup storage. Never upload `.env.keys` or a
+selected by `SYQ_RELEASE_SECRETS_DIR`. The operator keeps the encrypted
+inventory in a separate private operations repository; local configuration
+links to that checkout. Commit inventory updates only in that private repo.
+Keep decryption keys out of every Git repository and back them up separately
+in protected storage. Never upload `.env.keys` or a
 `DOTENV_PRIVATE_KEY_*` value to GitHub, CI, the Homebrew tap, or a runtime
 system. Keep actual private storage locations out of commits and PRs.
 

@@ -51,6 +51,11 @@ copies. The tools read `.env.release` and its `.env.keys` decryption key from
 to use another private directory outside the checkout. Both tools use the
 same location; they do not read an old inventory from the repository root.
 
+For multi-machine operation, keep the encrypted inventory and setup instructions
+in a separate private operations repository. Local configuration can link to
+that checkout. Commit encrypted inventory updates there; keep `.env.keys` out
+of Git and restore it from a separately protected backup on each machine.
+
 The inventory contains the manifest signing key, Homebrew deploy key, and
 Cloudflare credentials used by [`infra/syq-dl/`](infra/syq-dl/README.md).
 An optional manual crates.io token can also be kept there; automated
