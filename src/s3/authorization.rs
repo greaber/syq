@@ -630,7 +630,11 @@ pub(crate) async fn connect(
             .iter()
             .map(|source| {
                 Ok(Scope {
-                    key: super::local::join(&base, &super::local::key_path(&source.path)?),
+                    key: super::remove::selector_key(
+                        &base,
+                        source,
+                        args.s3_remove.s3_version_id.is_some(),
+                    )?,
                     descendants: true,
                 })
             })

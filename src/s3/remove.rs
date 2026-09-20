@@ -1,7 +1,7 @@
 //! Explicit S3 removal. Resolve every selector before issuing any DELETE.
 use super::{client, delete, local};
 use crate::{
-    cli::{Args, SourceSelection},
+    cli::{Args, Location, SourceSelection},
     progress::Progress,
     results::{RemovalRecord, RmResultRecord, RunMode, SelectionResultRecord},
 };
@@ -157,6 +157,30 @@ async fn present(client: &Client, bucket: &str, key: &str) -> Result<bool> {
     }
 }
 
+// Share selector interpretation with authorization so approved keys match the
+// removal plan, including the slash on an exact directory-marker version.
+pub(super) fn selector_key(base: &str, location: &Location, exact_version: bool) -> Result<String> {
+    let raw = std::str::from_utf8(&location.path).context("S3 keys require UTF-8")?;
+    let mut path = local::key_path(raw.strip_suffix('/').unwrap_or(raw).as_bytes())?;
+    if exact_version && raw.ends_with('/') && !path.is_empty() {
+        path.push('/');
+    }
+    let key = local::join(base, &path);
+    let directory = matches!(
+        location.selection,
+        SourceSelection::Directory | SourceSelection::Contents
+    );
+    anyhow::ensure!(
+        !key.is_empty() || location.selection == SourceSelection::Contents,
+        "select bucket contents explicitly with --srcs-in .; S3 removal does not remove buckets"
+    );
+    anyhow::ensure!(
+        directory || exact_version || !raw.ends_with('/'),
+        "S3 tree removal requires --src-dir or --srcs-in: {raw:?}"
+    );
+    Ok(key)
+}
+
 async fn plan(
     args: &Args,
     client: &Client,
@@ -173,21 +197,11 @@ async fn plan(
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
     for (index, location) in args.locations.iter().enumerate() {
-        let raw = std::str::from_utf8(&location.path).context("S3 keys require UTF-8")?;
         let exact_version = args.s3_remove.s3_version_id.as_deref();
-        let mut path = local::key_path(raw.strip_suffix('/').unwrap_or(raw).as_bytes())?;
-        if exact_version.is_some() && raw.ends_with('/') && !path.is_empty() {
-            path.push('/');
-        }
-        let key = local::join(&base, &path);
+        let key = selector_key(&base, location, exact_version.is_some())?;
         let directory = matches!(
             location.selection,
             SourceSelection::Directory | SourceSelection::Contents
-        );
-        anyhow::ensure!(!key.is_empty() || location.selection == SourceSelection::Contents, "select bucket contents explicitly with --srcs-in .; S3 removal does not remove buckets");
-        anyhow::ensure!(
-            directory || exact_version.is_some() || !raw.ends_with('/'),
-            "S3 tree removal requires --src-dir or --srcs-in: {raw:?}"
         );
         let use_versions = args.s3_remove.s3_all_versions || exact_version.is_some();
         let mut listed = if use_versions && !key.is_empty() && !directory {
@@ -550,4 +564,42 @@ pub(super) fn run(args: Args) -> Result<i32> {
         ));
     }
     Ok(summary.exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use SourceSelection::{Contents, Directory, File};
+
+    #[test]
+    fn selector_keys_distinguish_trees_from_exact_marker_versions() {
+        for (raw, selection, version, key) in [
+            ("tree/", Directory, false, "tree"),
+            ("tree/", Contents, false, "tree"),
+            ("tree/", File, true, "tree/"),
+            ("tree", File, true, "tree"),
+            (".", Contents, false, ""),
+            ("./", Contents, false, ""),
+        ] {
+            let mut location = Location::parse(raw).unwrap();
+            location.selection = selection;
+            for base in ["", "parent"] {
+                assert_eq!(
+                    selector_key(base, &location, version).unwrap(),
+                    local::join(base, key),
+                    "{raw:?}, {selection:?}, version={version}, base={base:?}"
+                );
+            }
+        }
+        for (raw, selection, version) in [
+            ("tree/", File, false),
+            ("tree//", Directory, false),
+            ("../tree/", Directory, false),
+            (".", File, true),
+        ] {
+            let mut location = Location::parse(raw).unwrap();
+            location.selection = selection;
+            assert!(selector_key("", &location, version).is_err(), "{raw:?}");
+        }
+    }
 }

@@ -133,5 +133,6 @@ markers, or `--s3-version-id ID` for one version. Deleting a marker can reveal
 an older version. Preview version deletions with `--dry-run -v`.
 
 Named removal selectors choose exact keys; `--src-dir` and `--srcs-in` choose
-prefix trees. An empty S3 source prefix is rejected by `cp`, so it cannot prune
-an entire local destination.
+prefix trees and accept a trailing `/`. When deleting an exact directory-marker
+version, keep the trailing `/` in its key. An empty S3 source prefix is rejected
+by `cp`, so it cannot prune an entire local destination.

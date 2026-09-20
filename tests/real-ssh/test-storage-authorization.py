@@ -217,6 +217,25 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             assert hashlib.sha256(checks.request('GET', prefix+'/server-copy')[1]).hexdigest() == expected
             copy(remove, removal=True, disconnect=False)
             absent(prefix+'/server-copy')
+            print('case: trailing-slash directory and contents removal use the approved base', flush=True)
+            for selector, name in [('--src-dir', 'slash-directory'), ('--srcs-in', 'slash-contents')]:
+                marker = prefix+'/'+name+'/'
+                child = marker+'child'
+                neighbor = prefix+'/'+name+'-neighbor'
+                checks.request('PUT', marker, b'')
+                checks.request('PUT', child, b'child')
+                checks.request('PUT', neighbor, b'keep')
+                remove = ['--on', 's3://syq-storage-test', '--cwd', prefix, selector, name+'/']
+                copy([*remove, '--dry-run'], removal=True, disconnect=False)
+                assert checks.request('GET', marker)[1] == b''
+                assert checks.request('GET', child)[1] == b'child'
+                copy(remove, removal=True, disconnect=False)
+                absent(child)
+                if selector == '--src-dir':
+                    absent(marker)
+                else:
+                    assert checks.request('GET', marker)[1] == b''
+                assert checks.request('GET', neighbor)[1] == b'keep'
             print('case: interrupted multipart work resumes after a fresh approval', flush=True)
             resumed = [remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/resumed']
             copy(resumed, interrupt=True)
@@ -274,6 +293,27 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
                     assert hashlib.sha256(checks.request('GET', prefix+'/copied')[1]).hexdigest() == expected
                     checks.request('DELETE', prefix+'/copied')
                     checks.request('PUT', data=b'<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>', query={'versioning': ''})
+                    print('case: exact directory-marker version removal preserves its trailing slash', flush=True)
+                    marker = prefix+'/marker/'
+                    headers, _ = checks.request('PUT', marker, b'')
+                    marker_version = {k.lower(): v for k, v in headers.items()}['x-amz-version-id']
+                    checks.request('PUT', marker, b'')
+                    checks.request('PUT', marker+'child', b'keep child')
+                    checks.request('PUT', marker.rstrip('/'), b'keep separate key')
+                    remove = ['--on', 's3://'+other_bucket, '--cwd', prefix,
+                              '--s3-version-id', marker_version, 'marker/']
+                    copy([*remove, '--dry-run'], removal=True, disconnect=False)
+                    assert checks.request('GET', marker, query={'versionId': marker_version})[1] == b''
+                    copy(remove, removal=True, disconnect=False)
+                    try:
+                        checks.request('HEAD', marker, query={'versionId': marker_version})
+                    except urllib.error.HTTPError as error:
+                        assert error.code == 404, error
+                    else:
+                        raise AssertionError('selected directory-marker version was not removed')
+                    assert checks.request('GET', marker)[1] == b''
+                    assert checks.request('GET', marker+'child')[1] == b'keep child'
+                    assert checks.request('GET', marker.rstrip('/'))[1] == b'keep separate key'
                     key = prefix+'/versioned'
                     headers, _ = checks.request('PUT', key, b'old')
                     old = {k.lower(): v for k, v in headers.items()}['x-amz-version-id']
