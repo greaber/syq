@@ -4,7 +4,8 @@
 //! count and measures. Progress (bytes, plus a small credit per completed
 //! file so small-file transfers count too) is sampled every few seconds; a
 //! worker count has been *measured* once the rate has stopped changing. A
-//! successful move keeps exploring in the same direction. A failed move
+//! fresh start doubles while upward moves pay, then refines the measured
+//! bounds. A cached start uses smaller steps. A failed move
 //! returns to the last good count and leaves a measured bound that later
 //! probes can refine one integer at a time. Independent per-direction aging
 //! and backoff decide when evidence is stale enough to probe again; when both
@@ -50,7 +51,7 @@ pub const START_LOCAL: usize = 32;
 pub const START_LOCAL_LOW_CPU: usize = 16;
 /// Never auto-tune below this many.
 pub const MIN: usize = 1;
-/// Multiplicative step between worker counts, up or down.
+/// Multiplicative step after startup, or when starting from a cached count.
 pub const STEP: f64 = 1.3;
 /// Prefer the smallest measured count whose throughput is this close to the
 /// recent best. Probe scheduling handles noise independently from this
@@ -375,6 +376,8 @@ pub struct Policy {
     /// Highest count that was actually activated, not merely requested.
     pub peak: usize,
     active: usize,
+    /// Only the initial search without a learned starting count doubles.
+    startup_doubling: bool,
     state: State,
     points: BTreeMap<usize, Point>,
     /// Consecutive failed probes up / down.
@@ -396,6 +399,7 @@ impl Policy {
             max,
             peak: n,
             active: n,
+            startup_doubling: true,
             state: State::Initial,
             points: BTreeMap::new(),
             fails: [0, 0],
@@ -403,6 +407,13 @@ impl Policy {
             tick: 0,
             comparisons: 0,
             history: vec![n],
+        }
+    }
+
+    pub fn from_cache(start: usize, min: usize, max: usize) -> Self {
+        Self {
+            startup_doubling: false,
+            ..Self::new(start, min, max)
         }
     }
 
@@ -484,6 +495,7 @@ impl Policy {
         {
             self.n = from;
             self.state = State::Hold;
+            self.startup_doubling = false;
             // Provisioning is not throughput evidence, but retrying the same
             // unavailable candidate on the very next measurement is wasteful.
             self.due[direction.index()] = self.tick + PROBE_EVERY;
@@ -564,15 +576,23 @@ impl Policy {
                     }
                     return upper;
                 }
-                step_up(self.n).min(self.max)
+                if self.startup_doubling {
+                    self.n.saturating_mul(2).min(self.max)
+                } else {
+                    step_up(self.n).min(self.max)
+                }
             }
         }
     }
 
     fn begin(&mut self, direction: Direction, base: f64) -> bool {
+        if direction == Direction::Down {
+            self.startup_doubling = false;
+        }
         let from = self.n;
         let target = self.target(direction);
         if !self.set_candidate(target) {
+            self.startup_doubling = false;
             self.due[direction.index()] = if (direction == Direction::Down && self.n == self.min)
                 || (direction == Direction::Up && self.n == self.max)
             {
@@ -624,12 +644,8 @@ impl Policy {
         self.record(self.n, score);
         match self.state {
             State::Initial => {
-                if score > 0.0 {
-                    // A first 1.3× upward step discovers paths that can use
-                    // more workers without greedily opening twice the start.
-                    if !self.begin(Direction::Up, score) {
-                        self.begin(Direction::Down, score);
-                    }
+                if score > 0.0 && !self.begin(Direction::Up, score) {
+                    self.begin(Direction::Down, score);
                 }
             }
             State::Hold => self.begin_due_probe(score),
@@ -661,6 +677,8 @@ impl Policy {
                     // in the same direction, so continue immediately.
                     self.begin(direction, score);
                 } else {
+                    let refine_startup = self.startup_doubling;
+                    self.startup_doubling = false;
                     self.fails[idx] += 1;
                     self.due[idx] = self.tick + self.retry_after(direction);
                     // Do not mechanically bounce to the opposite side after
@@ -668,6 +686,12 @@ impl Policy {
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
                     self.set_candidate(from);
                     self.state = State::Hold;
+                    if refine_startup {
+                        // The failed doubling bounds the useful range. Try
+                        // its midpoint now rather than waiting out backoff
+                        // at a potentially much slower starting count.
+                        self.begin(Direction::Up, base);
+                    }
                 }
             }
         }
@@ -891,7 +915,13 @@ pub fn run(
         let requested = sched.take_worker_count_request().min(policy.max);
         if requested > active {
             let before = active;
-            policy = Policy::new(requested, policy.min, policy.max);
+            policy = Policy {
+                // Resumable SSH data also requests this reset after a limited
+                // start. Keep cached/fine search fine, rather than restarting
+                // uncached doubling when the available work changes.
+                startup_doubling: policy.startup_doubling,
+                ..Policy::new(requested, policy.min, policy.max)
+            };
             active = requested;
             gate.set_retain(requested);
             for id in gate.begin_warming(requested) {
