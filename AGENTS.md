@@ -422,13 +422,16 @@ credential file appropriate for this repository. The user chose private
 storage outside the repository in September 2026 so that public clones do
 not receive credential material.
 
-The release tools read `.env.release` and `.env.keys` from
-`${XDG_CONFIG_HOME:-$HOME/.config}/syq/release`, or from the external directory
-selected by `SYQ_RELEASE_SECRETS_DIR`. The operator keeps the encrypted
-inventory in a separate private operations repository; local configuration
-links to that checkout. Commit inventory updates only in that private repo.
-Keep decryption keys out of every Git repository and back them up separately
-in protected storage. Never upload `.env.keys` or a
+The encrypted inventory belongs to a separate private operations repository.
+Each invocation selects an inventory with `SYQ_RELEASE_ENV_FILE`; the private
+operations wrapper supplies the file from its own checkout or worktree.
+Do not create inventory symlinks or a global pointer to one checkout. Modified
+inventories must be read from the explicitly selected checkout.
+
+Decryption keys stay outside all Git repositories. The default key file is
+`${XDG_CONFIG_HOME:-$HOME/.config}/syq/release/.env.keys`, with
+`SYQ_RELEASE_KEYS_FILE` available for an explicit key file. Back keys up
+separately in protected storage. Never upload `.env.keys` or a
 `DOTENV_PRIVATE_KEY_*` value to GitHub, CI, the Homebrew tap, or a runtime
 system. Keep actual private storage locations out of commits and PRs.
 

@@ -46,28 +46,31 @@ registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.
 ## Encrypted release inventory
 
 Release credentials stay outside this public repository, including encrypted
-copies. The tools read `.env.release` and its `.env.keys` decryption key from
-`${XDG_CONFIG_HOME:-$HOME/.config}/syq/release`. Set `SYQ_RELEASE_SECRETS_DIR`
-to use another private directory outside the checkout. Both tools use the
-same location; they do not read an old inventory from the repository root.
+copies. Keep the encrypted inventory and setup instructions in a separate
+private operations repository. Its wrapper selects the inventory from its own
+checkout or worktree and passes its path as `SYQ_RELEASE_ENV_FILE`. No inventory
+symlinks or per-checkout registration are needed. Uncommitted inventory edits
+in that checkout take effect without redirecting another checkout.
 
-For multi-machine operation, keep the encrypted inventory and setup instructions
-in a separate private operations repository. Local configuration can link to
-that checkout. Commit encrypted inventory updates there; keep `.env.keys` out
-of Git and restore it from a separately protected backup on each machine.
+Only decryption keys live in private machine configuration. The default is
+`${XDG_CONFIG_HOME:-$HOME/.config}/syq/release/.env.keys`; use
+`SYQ_RELEASE_KEYS_FILE` to select another key file. Restore that key from a
+separately protected backup on a new machine. Never commit it, even privately.
 
 The inventory contains the manifest signing key, Homebrew deploy key, and
 Cloudflare credentials used by [`infra/syq-dl/`](infra/syq-dl/README.md).
 An optional manual crates.io token can also be kept there; automated
 publication uses GitHub OIDC instead.
 
-For an existing inventory, move both files to the private directory and
-verify decryption before removing the old copies. Preserve their values:
-initialization creates new signing authority and is not a migration step.
-Keep the directory mode `0700` and both files mode `0600`.
+For an existing inventory, keep its encrypted file in the selected private
+checkout and its key in machine configuration. Verify decryption before
+removing old copies or inventory links. Preserve their values: initialization
+creates new signing authority and is not a migration step. Keep the key
+directory mode `0700` and the key file mode `0600`.
 
-Install the pinned maintainer tool, then initialize the inventory on an
-encrypted developer machine. The initializer generates independent Ed25519
+For first-time provisioning only, initialize the inventory on an encrypted
+developer machine. The private operations wrapper installs its pinned tool
+automatically. The initializer generates independent Ed25519
 keys for manifest signing and Homebrew tap access; it needs no secret input.
 The release scripts need `bash`, `jq`, `ssh-keygen`, and OpenSSL 3 as
 `openssl` (1.1.1 cannot sign Ed25519 with `pkeyutl`); macOS ships LibreSSL
@@ -75,20 +78,22 @@ under that name, so install `openssl@3` with Homebrew and put its `bin`
 directory first on `PATH` before signing:
 
 ```sh
-npm install --global @dotenvx/dotenvx@2.21.0
-scripts/init-release-secrets.sh
+DOTENVX_BIN="$OPS_CHECKOUT/scripts/dotenvx" \
+  SYQ_RELEASE_ENV_FILE="$PRIVATE_INVENTORY" scripts/init-release-secrets.sh
 ```
 
 Back up both files immediately in protected storage. Do not commit either
-file to syq. Never upload the decryption key to GitHub or use it in CI. Losing every copy prevents future releases from
-using the signing identity embedded in installed clients.
+file to syq. Never upload the decryption key to GitHub or use it in CI. Losing
+every copy prevents future releases from using the signing identity embedded
+in installed clients.
 
 After the repository has been renamed and the protected `release` environment
-exists, preview and then synchronize the allowlisted values:
+exists, select the desired private operations checkout in `OPS_CHECKOUT`,
+then preview and synchronize the allowlisted values:
 
 ```sh
-scripts/sync-github-secrets.sh
-scripts/sync-github-secrets.sh --execute
+"$OPS_CHECKOUT/scripts/run" release scripts/sync-github-secrets.sh
+"$OPS_CHECKOUT/scripts/run" release scripts/sync-github-secrets.sh --execute
 gh secret list --repo greaber/syq --env release
 gh variable list --repo greaber/syq
 ```

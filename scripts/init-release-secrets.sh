@@ -4,9 +4,8 @@
 set -euo pipefail
 
 DOTENVX_VERSION=2.21.0
-SECRETS_DIR=${SYQ_RELEASE_SECRETS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/syq/release}
-ENV_FILE="$SECRETS_DIR/.env.release"
-KEYS_FILE="$SECRETS_DIR/.env.keys"
+ENV_FILE=${SYQ_RELEASE_ENV_FILE:-}
+KEYS_FILE=${SYQ_RELEASE_KEYS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/syq/release/.env.keys}
 DOTENVX_BIN=${DOTENVX_BIN:-dotenvx}
 
 die() {
@@ -17,6 +16,8 @@ die() {
 if [ "$#" -ne 0 ]; then
   die "usage: $0"
 fi
+
+[ -n "$ENV_FILE" ] || die "set SYQ_RELEASE_ENV_FILE to the private inventory, or invoke through the operations wrapper"
 
 if [[ "$DOTENVX_BIN" == */* ]]; then
   [ -x "$DOTENVX_BIN" ] || die "dotenvx is not executable: $DOTENVX_BIN"
@@ -32,7 +33,7 @@ command -v ssh-keygen >/dev/null || die "ssh-keygen is required"
 [ ! -e "$KEYS_FILE" ] || die "$KEYS_FILE already exists; refusing to replace its decryption authority"
 
 umask 077
-mkdir -p "$SECRETS_DIR"
+mkdir -p "$(dirname -- "$ENV_FILE")" "$(dirname -- "$KEYS_FILE")"
 work=$(mktemp -d "${TMPDIR:-/tmp}/syq-init-release.XXXXXXXX")
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
