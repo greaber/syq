@@ -843,3 +843,74 @@ fn removed_native_options_fail_before_reading_sources() {
     assert_eq!(args.min_size.as_deref(), Some("1"));
     assert_eq!(args.max_size.as_deref(), Some("2"));
 }
+
+#[test]
+fn storage_authorization_is_explicit_and_preserves_provider_options() {
+    let args = parse_native_copy(&argv(&[
+        "source",
+        "--to",
+        "s3://bucket",
+        "--as",
+        "key",
+        "--auth-from",
+        "@laptop",
+        "--s3-profile",
+        "storage",
+    ]))
+    .unwrap();
+    assert!(matches!(args.auth_from, super::AuthFrom::Return(ref name) if name == "laptop"));
+    assert_eq!(args.s3.unwrap().profile.as_deref(), Some("storage"));
+    for mode in ["auto", "ssh"] {
+        let error = parse_native_copy(&argv(&[
+            "source",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "key",
+            "--auth-from",
+            mode,
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("requires --auth-from @NAME"),
+            "{error}"
+        );
+    }
+    let error = parse_native_copy(&argv(&[
+        "--src-fd",
+        "0",
+        "--to",
+        "s3://bucket",
+        "--as",
+        "key",
+        "--auth-from",
+        "@laptop",
+    ]))
+    .unwrap_err();
+    assert!(error.to_string().contains("descriptor copies"), "{error}");
+}
+
+#[test]
+fn storage_callbacks_cannot_ignore_an_explicit_authorizer() {
+    let error = parse_native_copy(&argv(&[
+        "--mapping",
+        "manifest",
+        "--stream-mapping-fd",
+        "4",
+        "--results-fd",
+        "5",
+        "--to",
+        "s3://bucket",
+        "--into",
+        "keys",
+        "--auth-from",
+        "@laptop",
+    ]))
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("callback mappings do not support --auth-from"),
+        "{error}"
+    );
+}

@@ -24,6 +24,45 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 
 See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 
+## Authorize from your laptop
+
+Run a file or tree copy on a server using storage credentials on a connected
+[receiving machine](receive.md#set-up-receiving):
+
+```sh
+# On the server, after connecting from your laptop:
+syq cp results --to s3://my-bucket --into runs --auth-from @laptop --s3-profile storage
+syq cp datasets --from s3://my-bucket --into /scratch --auth-from @laptop --s3-profile storage
+```
+
+Approve the storage request on your laptop. `--s3-profile` selects a profile
+there; the server needs no storage credentials. Endpoint and region options
+still work, including providers such as R2, Tigris, and MinIO. Both machines
+must run the same syq build; reconnect after updating them.
+
+Keep the laptop connected while syq lists objects, hashes local upload files,
+and prepares signed requests. Once the server prints **storage authorization
+ready**, you can disconnect the laptop. File data travels directly between
+the server and storage. Run the command in tmux if it should survive closing
+your SSH terminal; syq stays in the foreground.
+
+Syq requests seven days of authorization. Temporary credentials can expire
+sooner, and provider policies or revocation can shorten access further.
+Syq prints the expiry after preparation. The signed requests stay in memory.
+After a process restart or expiry, rerun the copy and approve again; ordinary
+multipart recovery can reuse completed work.
+
+Each request requires approval, including when receiving has an automatic
+approval directory. Review the bucket, paths, read/write permissions, and any
+permission to delete for `--prune`. Issued requests can be reused until expiry;
+stopping receiving does not revoke them. Filesystem copy roots, aggregate
+limits, and receiver receipts do not apply to storage authorization. See
+[Storage authorization](security.md#storage-authorization) for the trust boundary.
+
+This mode supports file and tree uploads and downloads. Descriptor copies,
+callback stream mappings, S3-to-S3 copies, and `rm` use credentials on the
+invoking machine.
+
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>
 

@@ -130,12 +130,15 @@ for each reply. Offline or unsupported connections are skipped. With none
 available, or with unsupported options, it uses the source machine's SSH access.
 Once approval is requested, refusal or failure ends the attempt.
 
-`--auth-from @NAME` requires that receiving machine
+For object-storage uploads and downloads, explicit `--auth-from @NAME` uses
+[storage authorization](object-storage.md#authorize-from-your-laptop).
+
+For SSH copies, `--auth-from @NAME` requires that receiving machine
 to authorize the copy. `--auth-from ssh` uses the source machine's SSH access.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
 
-Authorization through a receiving machine does not support `--detach`, custom
+SSH authorization through a receiving machine does not support `--detach`, custom
 `--rsh` or `--syq-path`, `--no-bootstrap`, `--pscope`, alternative `--peer-auth`
 or `--coordinate-at`, `--no-tcp`, or `--tcp-plain`. It requires direct encrypted
 TCP from source to destination. Destination completion does not request

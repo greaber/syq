@@ -1165,7 +1165,7 @@ fn parse_auth_from(value: &str) -> Result<AuthFrom> {
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Authorize with a live receiving machine, or use SSH from this machine (default: auto)
+    /// Authorize through @NAME (also S3 uploads/downloads), or use local SSH access (default: auto)
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Choose the endpoint that runs the coordinator
@@ -1972,6 +1972,9 @@ fn parse_descriptor_copy(
     apply_native_copy_operational(&mut args, copy.operational, matches)?;
     crate::descriptor_copy::validate_controls(&mut args)?;
     apply_native_remote(&mut args, parsed.remote)?;
+    if args.s3.is_some() && matches!(args.auth_from, AuthFrom::Return(_)) {
+        bail!("storage authorization requires file or tree operands; descriptor copies do not support --auth-from");
+    }
     Ok(args)
 }
 
@@ -2147,6 +2150,12 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.native_follow_dst = copy.follow_dst;
     apply_native_copy_operational(&mut args, copy.operational, &matches)?;
     apply_native_remote(&mut args, remote)?;
+    if args.s3.is_some()
+        && args.stream_mapping_fd.is_some()
+        && matches!(args.auth_from, AuthFrom::Return(_))
+    {
+        bail!("storage authorization requires file or tree operands; callback mappings do not support --auth-from");
+    }
     if args.receiver_max_entries.is_some()
         || args.receiver_max_bytes.is_some()
         || args.receiver_receipt.is_some()

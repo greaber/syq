@@ -60,6 +60,10 @@ ssh destination 'install -d -m 0755 /tmp/syq-real-ssh'
 
 case "${SYQ_REAL_SSH_SUITE:-core}" in
     core) ;;
+    storage)
+        python3 /usr/local/libexec/syq-test-storage-authorization.py
+        exit 0
+        ;;
     benchmark)
         sh /usr/local/libexec/syq-real-ssh-benchmark
         exit 0
@@ -422,6 +426,7 @@ dbus-run-session -- python3 /usr/local/libexec/syq-test-receive-notifications.py
 python3 /usr/local/libexec/syq-test-return-handoff.py
 python3 /usr/local/libexec/syq-test-forward-copy.py
 python3 /usr/local/libexec/syq-test-return-exec.py
+python3 /usr/local/libexec/syq-test-storage-authorization.py
 
 printf 'case: explicit automatic approval supports unattended copies\n'
 syq persist receive on --auto-approve-root "$receive_root"

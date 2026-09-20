@@ -1,4 +1,5 @@
 use super::Route;
+mod authorization;
 mod fast;
 mod pruning;
 mod server_copy;
@@ -53,6 +54,7 @@ pub(super) struct Engine {
     cancelled: std::sync::atomic::AtomicBool,
     cancel_wake: tokio::sync::Notify,
     uploads: Arc<super::upload_http::Cancellation>,
+    authorization: Option<Arc<super::authorization::Authorization>>,
 }
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -69,6 +71,7 @@ struct Download {
     expected_hash: Option<Digest>,
     metadata: Option<crate::mapping::Metadata>,
     copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
+    authorized_object: Option<Object>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
@@ -95,6 +98,26 @@ impl UploadState {
             .is_some_and(|p| p.etag == etag && p.checksum == checksum && p.length == length)
     }
 }
+enum UploadPreparation {
+    Skipped,
+    Preview(u64),
+    Ready(Box<PreparedUpload>),
+}
+struct PreparedUpload {
+    source: Source,
+    size: u64,
+    part_size: u64,
+    algorithm: Algorithm,
+    checksums: Vec<String>,
+    small: Option<bytes::Bytes>,
+    metadata: Metadata,
+    must_be_new: bool,
+    multipart: Option<PreparedMultipart>,
+}
+struct PreparedMultipart {
+    upload: UploadState,
+    uploaded: HashMap<i32, (String, Option<String>, Option<u64>)>,
+}
 #[derive(Serialize, Deserialize)]
 struct DownloadState {
     schema: u32,
@@ -120,8 +143,14 @@ impl Engine {
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
         let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let uploads = Arc::new(super::upload_http::Cancellation::default());
-        let (client, note) =
-            client::connect(&mut options, control.clone(), uploads.clone()).await?;
+        let authorization = super::authorization::connect(&args, &options).await?;
+        let (client, note) = client::connect_authorized(
+            &mut options,
+            control.clone(),
+            uploads.clone(),
+            authorization.clone(),
+        )
+        .await?;
         if let Some(note) = note.filter(|_| args.verbose > 0) {
             progress.println(&note);
         }
@@ -131,6 +160,7 @@ impl Engine {
             cancelled: std::sync::atomic::AtomicBool::new(false),
             cancel_wake: tokio::sync::Notify::new(),
             uploads,
+            authorization,
             args,
             options,
             client,
@@ -193,24 +223,70 @@ impl Engine {
                 Relaxed,
             );
             self.progress.scan_done.store(true, Relaxed);
-            parallel(plan, workers, |source| {
-                let engine = self.clone();
-                async move {
-                    let key = source.key.clone();
-                    let label = source.label.clone();
-                    let kind = source.kind();
-                    engine.check_cancelled()?;
-                    let expected = source.expected_hash.as_ref().cloned();
-                    let result = engine.upload(source).await;
-                    engine.settle(&label, &key, kind, &result, expected.as_ref());
-                    Ok(result.ok().flatten())
-                }
-            })
-            .await?;
+            if self.authorization.is_some() {
+                let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
+                parallel(plan, workers, |source| {
+                    let engine = self.clone();
+                    let prepared = prepared.clone();
+                    async move {
+                        let key = source.key.clone();
+                        let label = source.label.clone();
+                        let kind = source.kind();
+                        let expected = source.expected_hash.clone();
+                        match engine.prepare_upload(source).await {
+                            Ok(work) => prepared
+                                .lock()
+                                .await
+                                .push((key, label, kind, expected, work)),
+                            Err(error) => {
+                                engine.settle(&label, &key, kind, &Err(error), expected.as_ref())
+                            }
+                        }
+                        Ok(None)
+                    }
+                })
+                .await?;
+                self.prepare_pruning(&prune).await?;
+                self.finish_authorization().await?;
+                let prepared = std::mem::take(&mut *prepared.lock().await);
+                let workers =
+                    self.object_workers(prepared.iter().map(|(_, _, _, _, work)| match work {
+                        UploadPreparation::Ready(work) => work.size,
+                        UploadPreparation::Preview(n) => *n,
+                        UploadPreparation::Skipped => 0,
+                    }))?;
+                parallel(prepared, workers, |(key, label, kind, expected, work)| {
+                    let engine = self.clone();
+                    async move {
+                        engine.check_cancelled()?;
+                        let result = engine.execute_upload(work).await;
+                        engine.settle(&label, &key, kind, &result, expected.as_ref());
+                        Ok(result.ok().flatten())
+                    }
+                })
+                .await?;
+            } else {
+                parallel(plan, workers, |source| {
+                    let engine = self.clone();
+                    async move {
+                        let key = source.key.clone();
+                        let label = source.label.clone();
+                        let kind = source.kind();
+                        engine.check_cancelled()?;
+                        let expected = source.expected_hash.as_ref().cloned();
+                        let result = engine.upload(source).await;
+                        engine.settle(&label, &key, kind, &result, expected.as_ref());
+                        Ok(result.ok().flatten())
+                    }
+                })
+                .await?;
+            }
             self.prune(prune, None).await?;
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
-            let (plan, prune) = self.download_plan(&destination.prefix).await?;
+            let (mut plan, prune) = self.download_plan(&destination.prefix).await?;
+            self.authorize_downloads(&mut plan).await?;
+            self.finish_authorization().await?;
             let workers = self.object_workers(plan.iter().map(|s| s.size))?;
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress
@@ -492,7 +568,7 @@ impl Engine {
             })
     }
 
-    async fn upload(self: &Arc<Self>, source: Source) -> Result<Option<u64>> {
+    async fn prepare_upload(self: &Arc<Self>, source: Source) -> Result<UploadPreparation> {
         let expected_hash = source.expected_hash.as_ref().filter(|_| !self.args.dry_run);
         let existing = if self
             .upload_keys
@@ -507,14 +583,14 @@ impl Engine {
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {
-            return Ok(None);
+            return Ok(UploadPreparation::Skipped);
         }
         if self.args.update
             && existing.as_ref().is_some_and(|o| {
                 o.metadata.as_ref().map_or(o.mtime, |m| m.mtime) > source.meta.mtime
             })
         {
-            return Ok(None);
+            return Ok(UploadPreparation::Skipped);
         }
         let size = if source.kind() == ObjectKind::Dir {
             0
@@ -545,7 +621,7 @@ impl Engine {
                 source.bytes()?;
             }
             self.progress.bytes_unchanged.fetch_add(size, Relaxed);
-            return Ok(None);
+            return Ok(UploadPreparation::Skipped);
         }
         let part_size = self.part_size(size);
         if part_size > 5 * 1024 * 1024 * 1024 {
@@ -556,18 +632,21 @@ impl Engine {
         } else {
             1 << 20
         };
-        let reservation =
-            if source.kind() == ObjectKind::File && size <= part_size && size <= buffer_limit {
-                Some(
-                    self.tuning
-                        .upload_buffers
-                        .clone()
-                        .acquire_many_owned(size.max(1) as u32)
-                        .await?,
-                )
-            } else {
-                None
-            };
+        let reservation = if self.authorization.is_none()
+            && source.kind() == ObjectKind::File
+            && size <= part_size
+            && size <= buffer_limit
+        {
+            Some(
+                self.tuning
+                    .upload_buffers
+                    .clone()
+                    .acquire_many_owned(size.max(1) as u32)
+                    .await?,
+            )
+        } else {
+            None
+        };
         self.check_cancelled()?;
         let source_clone = source.clone();
         let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
@@ -745,14 +824,59 @@ impl Engine {
         }
         if unchanged {
             self.progress.bytes_unchanged.fetch_add(size, Relaxed);
-            return Ok(None);
+            return Ok(UploadPreparation::Skipped);
         }
         if self.args.dry_run {
             self.progress.add_bytes(size);
-            return Ok(Some(size));
+            return Ok(UploadPreparation::Preview(size));
         }
-        let _interval = self.progress.copying_interval();
         let must_be_new = self.args.ignore_existing || self.args.target_existence == Existence::New;
+        let multipart = if size > part_size && small.is_none() {
+            Some(
+                self.prepare_multipart(&source, digest, part_size, &metadata, algorithm)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let prepared = PreparedUpload {
+            source,
+            size,
+            part_size,
+            algorithm,
+            checksums,
+            small,
+            metadata,
+            must_be_new,
+            multipart,
+        };
+        self.authorize_upload(&prepared).await?;
+        Ok(UploadPreparation::Ready(Box::new(prepared)))
+    }
+
+    async fn upload(self: &Arc<Self>, source: Source) -> Result<Option<u64>> {
+        self.execute_upload(self.prepare_upload(source).await?)
+            .await
+    }
+
+    async fn execute_upload(self: &Arc<Self>, prepared: UploadPreparation) -> Result<Option<u64>> {
+        let prepared = match prepared {
+            UploadPreparation::Skipped => return Ok(None),
+            UploadPreparation::Preview(size) => return Ok(Some(size)),
+            UploadPreparation::Ready(prepared) => *prepared,
+        };
+        let PreparedUpload {
+            source,
+            size,
+            part_size,
+            algorithm,
+            checksums,
+            small,
+            metadata,
+            must_be_new,
+            multipart,
+        } = prepared;
+        let _interval = self.progress.copying_interval();
         if size <= part_size || small.is_some() {
             let _slot = self.tuning.requests.acquire().await;
             let synchronous =
@@ -805,133 +929,17 @@ impl Engine {
             self.tuning.requests.completed(size);
             self.progress.add_bytes(size);
         } else {
+            let PreparedMultipart { upload, uploaded } =
+                multipart.context("multipart preparation missing")?;
             let state = State::open(&self.identity(&source.key, "upload"))?;
-            let mut previous: Option<UploadState> = state.load()?;
-            if let Some(old) = &previous {
-                if old.schema != old.algorithm.schema() {
-                    bail!("unsupported S3 upload recovery schema");
-                }
-                if old.digest != digest
-                    || old.part_size != part_size
-                    || old.metadata != metadata
-                    || old.algorithm != algorithm
-                {
-                    match self
-                        .client
-                        .abort_multipart_upload()
-                        .bucket(&self.options.bucket)
-                        .key(&source.key)
-                        .upload_id(&old.upload_id)
-                        .send()
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(error)
-                            if error
-                                .raw_response()
-                                .is_some_and(|r| r.status().as_u16() == 404) => {}
-                        Err(error) => {
-                            return Err(error.into_service_error())
-                                .context("abort obsolete multipart upload")
-                        }
-                    }
-                    state.clear()?;
-                    previous = None;
-                }
-            }
-            let mut uploaded = HashMap::new();
-            if let Some(old) = &previous {
-                let mut marker = None;
-                loop {
-                    let result = self
-                        .client
-                        .list_parts()
-                        .bucket(&self.options.bucket)
-                        .key(&source.key)
-                        .upload_id(&old.upload_id)
-                        .set_part_number_marker(marker.clone())
-                        .send()
-                        .await;
-                    match result {
-                        Ok(output) => {
-                            for p in output.parts() {
-                                if let (Some(number), Some(etag)) = (p.part_number(), p.e_tag()) {
-                                    uploaded.insert(
-                                        number,
-                                        (
-                                            etag.to_owned(),
-                                            p.checksum_sha256().map(str::to_owned),
-                                            p.size().and_then(|n| u64::try_from(n).ok()),
-                                        ),
-                                    );
-                                }
-                            }
-                            if output.is_truncated() != Some(true) {
-                                break;
-                            }
-                            let next = output
-                                .next_part_number_marker()
-                                .context("S3 parts listing omitted continuation")?
-                                .to_owned();
-                            if marker.as_ref() == Some(&next) {
-                                bail!("S3 parts listing repeated its continuation marker");
-                            }
-                            marker = Some(next);
-                        }
-                        Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => {
-                            previous = None;
-                            state.clear()?;
-                            break;
-                        }
-                        Err(e) => {
-                            return Err(e.into_service_error()).context("list uploaded parts")
-                        }
-                    }
-                }
-            }
-            let upload = if let Some(old) = previous {
-                old
-            } else {
-                let output = self
-                    .client
-                    .create_multipart_upload()
-                    .bucket(&self.options.bucket)
-                    .key(&source.key)
-                    .set_metadata(Some(metadata.encode()))
-                    .set_checksum_algorithm(
-                        algorithm
-                            .is_sha256()
-                            .then_some(aws_sdk_s3::types::ChecksumAlgorithm::Sha256),
-                    )
-                    .send()
-                    .await
-                    .map_err(|e| e.into_service_error())
-                    .context("create multipart upload")?;
-                let record = UploadState {
-                    schema: algorithm.schema(),
-                    digest,
-                    part_size,
-                    metadata: metadata.clone(),
-                    upload_id: output.upload_id().context("S3 omitted upload ID")?.into(),
-                    algorithm,
-                    completed: BTreeMap::new(),
-                };
-                if let Err(error) = state.save(&record) {
-                    self.client
-                        .abort_multipart_upload()
-                        .bucket(&self.options.bucket)
-                        .key(&source.key)
-                        .upload_id(&record.upload_id)
-                        .send()
-                        .await
-                        .map_err(|e| e.into_service_error())
-                        .context(
-                            "recovery record could not be saved and aborting the upload failed",
-                        )?;
-                    return Err(error);
-                }
-                record
-            };
+            let saved: Option<UploadState> = state.load()?;
+            anyhow::ensure!(
+                saved
+                    .as_ref()
+                    .is_some_and(|saved| saved.upload_id == upload.upload_id
+                        && saved.digest == upload.digest),
+                "upload recovery changed during preparation; rerun the copy"
+            );
             let saved_parts = Mutex::new(upload.completed.clone());
             // Stop admitting parts on failure, but drain requests already in flight.
             let failed = std::sync::atomic::AtomicBool::new(false);
@@ -1081,6 +1089,140 @@ impl Engine {
             source.check(&source.open()?)?;
         }
         Ok(Some(size))
+    }
+    async fn prepare_multipart(
+        &self,
+        source: &Source,
+        digest: String,
+        part_size: u64,
+        metadata: &Metadata,
+        algorithm: Algorithm,
+    ) -> Result<PreparedMultipart> {
+        let state = State::open(&self.identity(&source.key, "upload"))?;
+        let mut previous: Option<UploadState> = state.load()?;
+        if let Some(old) = &previous {
+            if old.schema != old.algorithm.schema() {
+                bail!("unsupported S3 upload recovery schema");
+            }
+            if old.digest != digest
+                || old.part_size != part_size
+                || old.metadata != *metadata
+                || old.algorithm != algorithm
+            {
+                match self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.options.bucket)
+                    .key(&source.key)
+                    .upload_id(&old.upload_id)
+                    .send()
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error)
+                        if error
+                            .raw_response()
+                            .is_some_and(|r| r.status().as_u16() == 404) => {}
+                    Err(error) => {
+                        return Err(error.into_service_error())
+                            .context("abort obsolete multipart upload")
+                    }
+                }
+                state.clear()?;
+                previous = None;
+            }
+        }
+        let mut uploaded = HashMap::new();
+        if let Some(old) = &previous {
+            let mut marker = None;
+            loop {
+                let result = self
+                    .client
+                    .list_parts()
+                    .bucket(&self.options.bucket)
+                    .key(&source.key)
+                    .upload_id(&old.upload_id)
+                    .set_part_number_marker(marker.clone())
+                    .send()
+                    .await;
+                match result {
+                    Ok(output) => {
+                        for p in output.parts() {
+                            if let (Some(number), Some(etag)) = (p.part_number(), p.e_tag()) {
+                                uploaded.insert(
+                                    number,
+                                    (
+                                        etag.to_owned(),
+                                        p.checksum_sha256().map(str::to_owned),
+                                        p.size().and_then(|n| u64::try_from(n).ok()),
+                                    ),
+                                );
+                            }
+                        }
+                        if output.is_truncated() != Some(true) {
+                            break;
+                        }
+                        let next = output
+                            .next_part_number_marker()
+                            .context("S3 parts listing omitted continuation")?
+                            .to_owned();
+                        if marker.as_ref() == Some(&next) {
+                            bail!("S3 parts listing repeated its continuation marker");
+                        }
+                        marker = Some(next);
+                    }
+                    Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => {
+                        previous = None;
+                        state.clear()?;
+                        break;
+                    }
+                    Err(e) => return Err(e.into_service_error()).context("list uploaded parts"),
+                }
+            }
+        }
+        let upload = if let Some(old) = previous {
+            old
+        } else {
+            let output = self
+                .client
+                .create_multipart_upload()
+                .bucket(&self.options.bucket)
+                .key(&source.key)
+                .set_metadata(Some(metadata.encode()))
+                .set_checksum_algorithm(
+                    algorithm
+                        .is_sha256()
+                        .then_some(aws_sdk_s3::types::ChecksumAlgorithm::Sha256),
+                )
+                .send()
+                .await
+                .map_err(|e| e.into_service_error())
+                .context("create multipart upload")?;
+            let record = UploadState {
+                schema: algorithm.schema(),
+                digest,
+                part_size,
+                metadata: metadata.clone(),
+                upload_id: output.upload_id().context("S3 omitted upload ID")?.into(),
+                algorithm,
+                completed: BTreeMap::new(),
+            };
+            if let Err(error) = state.save(&record) {
+                self.client
+                    .abort_multipart_upload()
+                    .bucket(&self.options.bucket)
+                    .key(&source.key)
+                    .upload_id(&record.upload_id)
+                    .send()
+                    .await
+                    .map_err(|e| e.into_service_error())
+                    .context("recovery record could not be saved and aborting the upload failed")?;
+                return Err(error);
+            }
+            record
+        };
+        drop(state);
+        Ok(PreparedMultipart { upload, uploaded })
     }
 
     async fn download_plan(
@@ -1379,6 +1521,7 @@ impl Engine {
                     expected_hash: expected_hash.clone(),
                     metadata,
                     copy_source: copy_source.take().map(Box::new),
+                    authorized_object: None,
                 });
             }
         }
@@ -1434,6 +1577,16 @@ impl Engine {
                     .get_object()
                     .bucket(&self.options.bucket)
                     .key(&job.key)
+                    .set_if_match(
+                        job.authorized_object
+                            .as_ref()
+                            .map(|object| object.etag.clone()),
+                    )
+                    .set_version_id(
+                        job.authorized_object
+                            .as_ref()
+                            .and_then(|object| object.version.clone()),
+                    )
                     .set_range((job.size > part_size).then(|| format!("bytes=0-{}", part_size - 1)))
                     .send()
                     .await
@@ -1445,6 +1598,8 @@ impl Engine {
         };
         let object = if let Some(output) = &initial {
             client::from_get(&job.key, job.size, part_size, output)?
+        } else if let Some(object) = &job.authorized_object {
+            object.clone()
         } else {
             client::head(&self.client, &self.options.bucket, &job.key)
                 .await?
