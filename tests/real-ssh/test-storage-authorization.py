@@ -164,8 +164,17 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             print('case: interrupted multipart work resumes after a fresh approval', flush=True)
             resumed = [remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/resumed']
             copy(resumed, interrupt=True)
-            assert checks.listing(uploads=True), 'interrupted upload lost its recoverable parts'
+            # Inspect the known recovery upload directly. Bucket-wide unfinished
+            # upload listings are not consistent across S3-compatible providers.
+            script = "from pathlib import Path; import json; records=[json.loads(p.read_text()) for p in (Path.home()/'.cache/syq/s3').glob('*.json')]; print(json.dumps([r['upload_id'] for r in records if 'upload_id' in r]))"
+            uploads = json.loads(run('ssh', 'source', shlex.join(['python3', '-c', script])))
+            assert len(uploads) == 1, uploads
+            checks.OWNED_UPLOADS.add((prefix+'/resumed', uploads[0]))
+            _, parts = checks.request('GET', prefix+'/resumed', query={'uploadId': uploads[0]})
+            assert any(node.tag.rsplit('}', 1)[-1] == 'Part' for node in checks.ET.fromstring(parts).iter()), 'no completed parts to resume'
             copy(resumed)
+            events = [json.loads(line) for line in run('ssh', 'source', 'cat /tmp/syq-storage-authorization/progress').splitlines()]
+            assert events[-1]['bytes_unchanged'] > 0, events[-1]
             assert hashlib.sha256(checks.request('GET', prefix+'/resumed')[1]).hexdigest() == expected
             assert not checks.listing(uploads=True)
             print('case: multipart download finishes after authorizer disconnects', flush=True)
