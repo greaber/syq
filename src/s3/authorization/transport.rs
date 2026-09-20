@@ -66,7 +66,10 @@ pub(in crate::s3) fn http_client(
     })
 }
 
-fn describe<B>(request: &mut http::Request<B>, authorization: &Authorization) -> Result<Unsigned> {
+pub(super) fn describe<B>(
+    request: &mut http::Request<B>,
+    authorization: &Authorization,
+) -> Result<Unsigned> {
     let url = url::Url::parse(&request.uri().to_string()).context("invalid storage request URL")?;
     let endpoint = url::Url::parse(&authorization.configuration.endpoint)?;
     anyhow::ensure!(
@@ -75,20 +78,18 @@ fn describe<B>(request: &mut http::Request<B>, authorization: &Authorization) ->
             && url.port_or_known_default() == endpoint.port_or_known_default(),
         "storage request endpoint differs from authorization"
     );
-    let prefix = format!(
-        "{}/{}/",
-        endpoint.path().trim_end_matches('/'),
-        authorization.bucket
-    );
-    let key = url
+    let prefix = format!("{}/", endpoint.path().trim_end_matches('/'));
+    let resource = request
+        .uri()
         .path()
         .strip_prefix(&prefix)
-        .or_else(|| (url.path() == prefix.trim_end_matches('/')).then_some(""))
-        .context("storage request bucket differs from authorization")?;
+        .context("storage request path differs from authorization")?;
+    let (bucket, key) = resource.split_once('/').unwrap_or((resource, ""));
     let key = percent_encoding::percent_decode_str(key)
         .decode_utf8()
         .context("storage key is not UTF-8")?;
-    let mut result = Unsigned::new(request.method().as_str(), &key);
+    let mut result =
+        Unsigned::new(request.method().as_str(), &key).bucket(bucket, &authorization.bucket);
     for (name, value) in url.query_pairs() {
         if name == "x-id" {
             continue;
@@ -107,7 +108,9 @@ fn describe<B>(request: &mut http::Request<B>, authorization: &Authorization) ->
     request.headers_mut().remove("x-amz-checksum-mode");
     request.headers_mut().remove("x-amz-user-agent");
     for (name, value) in request.headers() {
-        if signed_header(name.as_str(), request.method().as_str()) {
+        if signed_header(name.as_str(), request.method().as_str())
+            && !(name == "content-length" && request.headers().contains_key("x-amz-copy-source"))
+        {
             result.headers.insert(
                 name.as_str().into(),
                 value.to_str().context("invalid storage header")?.into(),

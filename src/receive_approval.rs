@@ -390,7 +390,53 @@ impl Queue {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let description = format!("Bucket: {:?}\nEndpoint: {:?}\nCredential profile on this machine: {:?}\nPaths:\n{scopes}\nPermission: {}{}{}.\nRequested lifetime: {} seconds (credentials or provider policies may shorten it).\nIssued requests can be reused until expiry, even after this machine disconnects or receiving stops. Copy roots, aggregate limits and receiver receipts do not apply. Source contents are not inspected.",
+        let source = request
+            .source
+            .as_ref()
+            .map(|source| {
+                format!(
+                    "\nCopy source bucket: {:?}\nRead source objects and tags:\n{}",
+                    source.bucket,
+                    source
+                        .scopes
+                        .iter()
+                        .map(|scope| format!(
+                            "{:?}{}",
+                            scope.key,
+                            if scope.descendants {
+                                " and descendants"
+                            } else {
+                                ""
+                            }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })
+            .unwrap_or_default();
+        let removal = match &request.removal {
+            Some(crate::s3::authorization::Removal::AllVersions) => "\nSelection: all versions and delete markers. Version discovery may list names sharing the selected key prefix.".to_owned(),
+            Some(crate::s3::authorization::Removal::Version(id)) => format!("\nSelected version or delete marker: {id:?}. Version discovery may list names sharing the selected key prefix."),
+            _ => String::new(),
+        };
+        let permanence = if request.delete
+            && matches!(
+                request.removal,
+                Some(
+                    crate::s3::authorization::Removal::Version(_)
+                        | crate::s3::authorization::Removal::AllVersions
+                )
+            ) {
+            "\nDeleting selected versions or delete markers is permanent."
+        } else {
+            ""
+        };
+        let acl = if request.acl.is_empty() {
+            String::new()
+        } else {
+            format!("\nApproved object ACL headers: {:?}", request.acl)
+        };
+        let description = format!("Bucket: {:?}\nEndpoint: {:?}\nCredential profile on this machine: {:?}\nPaths:\n{scopes}{source}{removal}{permanence}{acl}\nPermission: {}{}{}.\nRequested lifetime: {} seconds (credentials or provider policies may shorten it).\nIssued requests can be reused until expiry, even after this machine disconnects or receiving stops. Copy roots, aggregate limits and receiver receipts do not apply. Source contents are not inspected.",
             request.bucket, request.endpoint.as_deref().unwrap_or("configured AWS/S3 endpoint"), request.profile.as_deref().unwrap_or("default"),
             if request.upload { "read and upload" } else { "read" },
             if request.create_only { ", create-only writes" } else if request.upload { ", may overwrite" } else { "" },

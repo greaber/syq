@@ -136,7 +136,7 @@ returns a `StreamReader`. `cwd` resolves relative sources; `root` also confines
 them. Choose at most one, as with `cp`. These bases belong to the source
 endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
 `syq_path`, `pscope`, `no_bootstrap`, `no_compress`, `no_tcp`, `tcp_plain`,
-`tcp_ports`, `tcp_congestion`, `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
+`tcp_ports`, `tcp_congestion`, `auth_from` (S3), `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
 `performance_tuning`, `resource_limits`, `integrity_checking`, `only_new`,
 `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
 and `timeout` with the same meanings as `cp`.
@@ -261,7 +261,7 @@ It supports local, ordinary SSH, and S3 endpoints. Command-restricted receivers
 reject removal. See [Remove files](https://greaber.github.io/syq/remove.html).
 
 S3 removal uses `rm(..., on="s3://bucket")` with optional `s3_endpoint`,
-`s3_region`, `s3_profile`, and `s3_header`. `s3_all_versions=True` permanently
+`s3_region`, `s3_profile`, `s3_header`, and `auth_from="@NAME"`. `s3_all_versions=True` permanently
 removes all selected versions and delete markers; `s3_version_id="ID"` selects
 one version of one exact key. These options are mutually exclusive.
 `RemovalTrace` and `RemovalResult` expose optional `s3_version_id` and

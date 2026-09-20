@@ -9,6 +9,9 @@ fn approval() -> Request {
             key: "allowed".into(),
             descendants: true,
         }],
+        source: None,
+        removal: None,
+        acl: BTreeMap::new(),
         upload: true,
         delete: false,
         create_only: true,
@@ -91,7 +94,6 @@ fn read_only_and_create_only_authority_cannot_be_widened() {
         Unsigned::new("POST", "allowed/a").query("uploads", ""),
         Unsigned::new("POST", "allowed/a").query("uploadId", "opaque"),
         Unsigned::new("DELETE", "allowed/a").query("uploadId", "opaque"),
-        Unsigned::new("GET", "allowed/../outside"),
         Unsigned::new("GET", "allowed/a").query("tagging", ""),
     ] {
         assert!(permission.permits(&request).is_err(), "{request:?}");
@@ -198,4 +200,172 @@ fn presigns_bind_the_payload_marker_and_write_condition() {
         }
         assert!(!url.as_str().contains("fixture-secret"));
     }
+}
+
+#[test]
+fn server_copy_binds_both_buckets_and_preserves_read_only_source() {
+    let mut permission = approval();
+    permission.source = Some(ReadAccess {
+        bucket: "source".into(),
+        scopes: vec![Scope {
+            key: "input".into(),
+            descendants: true,
+        }],
+    });
+    let read = Unsigned::new("GET", "input/a").bucket("source", "fixture");
+    permission.permits(&read).unwrap();
+    permission
+        .permits(&read.clone().query("tagging", ""))
+        .unwrap();
+    let copy = Unsigned::new("PUT", "allowed/a")
+        .header("if-none-match", "*")
+        .header("x-amz-copy-source", "source/input/a%20b?versionId=v1");
+    permission.permits(&copy).unwrap();
+    for request in [
+        Unsigned::new("PUT", "input/a")
+            .bucket("source", "fixture")
+            .header("if-none-match", "*"),
+        Unsigned::new("DELETE", "input/a").bucket("source", "fixture"),
+        read.bucket("another", "fixture"),
+        copy.clone()
+            .header("x-amz-copy-source", "source/input-sibling/a"),
+        copy.clone()
+            .header("x-amz-copy-source", "unapproved/input/a"),
+        copy.header("x-amz-copy-source", "source/input/a?acl="),
+    ] {
+        assert!(permission.permits(&request).is_err(), "{request:?}");
+    }
+}
+
+#[test]
+fn deletion_distinguishes_current_objects_exact_versions_and_purges() {
+    let mut permission = approval();
+    permission.upload = false;
+    permission.create_only = false;
+    permission.delete = true;
+    permission.removal = Some(Removal::Current);
+    permission.validate().unwrap();
+    let remove = Unsigned::new("DELETE", "allowed/key");
+    permission.permits(&remove).unwrap();
+    assert!(permission
+        .permits(&remove.clone().query("versionId", "v1"))
+        .is_err());
+    let listing = Unsigned::new("GET", "")
+        .query("versions", "")
+        .query("prefix", "allowed");
+    assert!(permission.permits(&listing).is_err());
+    permission.removal = Some(Removal::Version("v1".into()));
+    permission.permits(&listing).unwrap();
+    permission
+        .permits(&remove.clone().query("versionId", "v1"))
+        .unwrap();
+    assert!(permission
+        .permits(&remove.clone().query("versionId", "v2"))
+        .is_err());
+    assert!(permission.permits(&remove).is_err());
+    permission.removal = Some(Removal::AllVersions);
+    permission
+        .permits(&remove.clone().query("versionId", "v2"))
+        .unwrap();
+    assert!(permission.permits(&remove).is_err());
+    assert!(permission
+        .permits(&listing.query("prefix", "outside"))
+        .is_err());
+}
+
+#[test]
+fn explicitly_approved_acl_headers_cannot_be_replaced() {
+    let mut permission = approval();
+    permission.acl.insert("x-amz-acl".into(), "private".into());
+    let request = Unsigned::new("PUT", "allowed/key").header("if-none-match", "*");
+    permission
+        .permits(&request.clone().header("x-amz-acl", "private"))
+        .unwrap();
+    assert!(permission
+        .permits(&request.clone().header("x-amz-acl", "public-read"))
+        .is_err());
+    assert!(permission
+        .permits(&request.header("x-amz-grant-read", "uri=anyone"))
+        .is_err());
+}
+
+#[test]
+fn stream_capabilities_accept_late_checksums_but_preserve_part_and_condition() {
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let authorization = Authorization::new(
+        "fixture".into(),
+        Configuration {
+            endpoint: "https://storage.example".into(),
+            region: "auto".into(),
+            expires_at: now().unwrap() + 60,
+            requested_lifetime: 60,
+        },
+        socket,
+    );
+    let request = Unsigned::new("PUT", "allowed/key")
+        .query("uploadId", "owned")
+        .query("partNumber", "1");
+    let mut state = authorization.state.lock().unwrap();
+    state.connection = None;
+    state
+        .requests
+        .insert(request.clone(), "fixture-stream-url".into());
+    drop(state);
+    assert_eq!(
+        authorization
+            .signed(
+                request
+                    .clone()
+                    .header("content-length", "17")
+                    .header("content-md5", "checksum-known-after-producing")
+            )
+            .unwrap(),
+        "fixture-stream-url"
+    );
+    assert!(authorization
+        .signed(request.clone().query("partNumber", "2"))
+        .is_err());
+    assert!(authorization
+        .signed(request.query("uploadId", "unapproved"))
+        .is_err());
+}
+
+#[test]
+fn literal_object_keys_keep_their_scope_through_signing_and_transport() {
+    let signer = Signer {
+        request: approval(),
+        configuration: Configuration {
+            endpoint: "https://storage.example/base".into(),
+            region: "auto".into(),
+            expires_at: now().unwrap() + 60,
+            requested_lifetime: 60,
+        },
+        credentials: aws_sdk_s3::config::Credentials::new("key", "secret", None, None, "test"),
+    };
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let authorization = Authorization::new("fixture".into(), signer.configuration.clone(), socket);
+    for key in [
+        "allowed/../literal",
+        "allowed/./literal",
+        "allowed//literal",
+        "allowed/%2e%2e/literal",
+    ] {
+        let unsigned = Unsigned::new("GET", key);
+        let signed = signer.sign(&unsigned).unwrap();
+        let mut request = http::Request::builder().uri(&signed).body(()).unwrap();
+        let path = percent_encoding::percent_decode_str(request.uri().path())
+            .decode_utf8()
+            .unwrap();
+        assert_eq!(path, format!("/base/fixture/{key}"));
+        // Strip the signing query as the transport receives SDK requests.
+        *request.uri_mut() = request_url(&signer.configuration.endpoint, "fixture", &unsigned)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            transport::describe(&mut request, &authorization).unwrap(),
+            unsigned
+        );
+    }
+    assert!(signer.sign(&Unsigned::new("GET", "literal")).is_err());
 }

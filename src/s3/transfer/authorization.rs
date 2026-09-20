@@ -20,13 +20,7 @@ impl Engine {
         let Some(authorization) = &self.authorization else {
             return Ok(());
         };
-        let deadline =
-            aws_smithy_types::DateTime::from_secs(authorization.configuration.expires_at as i64)
-                .fmt(aws_smithy_types::date_time::Format::DateTime)?;
-        let authorization = authorization.clone();
-        tokio::task::spawn_blocking(move || authorization.finish_preparation()).await??;
-        self.progress.eprintln(&format!("syq: storage authorization ready; the authorizing machine may disconnect. Authorization expires at {deadline}; provider policies or credential revocation may shorten it."));
-        Ok(())
+        authorization.finish().await
     }
     pub(super) async fn authorize_upload(&self, prepared: &PreparedUpload) -> Result<()> {
         if self.authorization.is_none() {

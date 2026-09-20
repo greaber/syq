@@ -539,14 +539,15 @@ class NativeClientTests(unittest.TestCase):
         self.assertNotIn("--coordinate-at", argv)
 
     def test_s3_removal_arguments_and_validation(self) -> None:
-        self.client.rm("key", on="s3://bucket", s3_all_versions=True, s3_endpoint="http://localhost:9000", s3_header=["X-Test: yes"])
+        self.client.rm("key", on="s3://bucket", auth_from="@laptop", s3_all_versions=True, s3_endpoint="http://localhost:9000", s3_header=["X-Test: yes"])
         argv = self.argv()
+        self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
         self.assertIn("--s3-all-versions", argv)
         self.assertIn("--s3-endpoint=http://localhost:9000", argv)
         self.assertIn("--s3-header=X-Test: yes", argv)
         self.client.rm("key", on="s3://bucket", s3_version_id="id/+=")
         self.assertIn("--s3-version-id=id/+=", self.argv())
-        for kwargs in [dict(s3_all_versions=True), dict(on="s3://bucket", s3_all_versions=True, s3_version_id="id"), dict(on="s3://bucket", s3_version_id="")]:
+        for kwargs in [dict(auth_from="@laptop"), dict(s3_all_versions=True), dict(on="s3://bucket", s3_all_versions=True, s3_version_id="id"), dict(on="s3://bucket", s3_version_id="")]:
             with self.assertRaises(syq.SyqInvocationError):
                 self.client.rm("key", **kwargs)
 

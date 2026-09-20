@@ -846,20 +846,22 @@ fn removed_native_options_fail_before_reading_sources() {
 
 #[test]
 fn storage_authorization_is_explicit_and_preserves_provider_options() {
-    let args = parse_native_copy(&argv(&[
-        "source",
-        "--to",
-        "s3://bucket",
-        "--as",
-        "key",
-        "--auth-from",
-        "@laptop",
-        "--s3-profile",
-        "storage",
-    ]))
-    .unwrap();
-    assert!(matches!(args.auth_from, super::AuthFrom::Return(ref name) if name == "laptop"));
-    assert_eq!(args.s3.unwrap().profile.as_deref(), Some("storage"));
+    for source in [vec!["source"], vec!["--src-fd", "0"]] {
+        let mut command = source;
+        command.extend([
+            "--to",
+            "s3://bucket",
+            "--as",
+            "key",
+            "--auth-from",
+            "@laptop",
+            "--s3-profile",
+            "storage",
+        ]);
+        let args = parse_native_copy(&argv(&command)).unwrap();
+        assert!(matches!(args.auth_from, super::AuthFrom::Return(ref name) if name == "laptop"));
+        assert_eq!(args.s3.unwrap().profile.as_deref(), Some("storage"));
+    }
     for mode in ["auto", "ssh"] {
         let error = parse_native_copy(&argv(&[
             "source",
@@ -876,23 +878,11 @@ fn storage_authorization_is_explicit_and_preserves_provider_options() {
             "{error}"
         );
     }
-    let error = parse_native_copy(&argv(&[
-        "--src-fd",
-        "0",
-        "--to",
-        "s3://bucket",
-        "--as",
-        "key",
-        "--auth-from",
-        "@laptop",
-    ]))
-    .unwrap_err();
-    assert!(error.to_string().contains("descriptor copies"), "{error}");
 }
 
 #[test]
-fn storage_callbacks_cannot_ignore_an_explicit_authorizer() {
-    let error = parse_native_copy(&argv(&[
+fn storage_callbacks_preserve_an_explicit_authorizer() {
+    let args = parse_native_copy(&argv(&[
         "--mapping",
         "manifest",
         "--stream-mapping-fd",
@@ -906,11 +896,7 @@ fn storage_callbacks_cannot_ignore_an_explicit_authorizer() {
         "--auth-from",
         "@laptop",
     ]))
-    .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("callback mappings do not support --auth-from"),
-        "{error}"
-    );
+    .unwrap();
+    assert_eq!(args.stream_mapping_fd, Some(4));
+    assert!(matches!(args.auth_from, super::AuthFrom::Return(ref name) if name == "laptop"));
 }

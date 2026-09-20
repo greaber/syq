@@ -394,11 +394,28 @@ pub(super) fn run(args: Args) -> Result<i32> {
             let mut options = args.s3.clone().unwrap();
             let control = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
             let uploads = std::sync::Arc::new(super::upload_http::Cancellation::default());
-            let (client, note) = client::connect(&mut options, control.clone(), uploads).await?;
+            let authorization = super::authorization::connect(&args, &options).await?;
+            let (client, note) = client::connect_authorized(&mut options, control.clone(), uploads, authorization.clone()).await?;
             if let Some(note) = note.filter(|_| args.verbose > 0 && !args.quiet) {
                 progress.println(&note);
             }
             let entries = plan(&args, &client, &progress, &mut summary).await?;
+            if let Some(authorization) = &authorization {
+                if !args.dry_run {
+                    let mut requests = Vec::with_capacity(entries.len());
+                    for entry in &entries {
+                        let mut request = super::authorization::Unsigned::new("DELETE", &entry.key);
+                        if let Some(version) = &entry.version { request = request.query("versionId", version); }
+                        for super::Header(name, value) in &options.headers {
+                            if super::authorization::signed_header(name, "DELETE") { request.headers.insert(name.clone(), value.clone()); }
+                        }
+                        requests.push(request);
+                    }
+                    let authorization = authorization.clone();
+                    tokio::task::spawn_blocking(move || authorization.authorize(requests)).await??;
+                }
+                authorization.finish().await?;
+            }
             progress.files_total.store(entries.len() as u64, Relaxed);
             progress.scan_done.store(true, Relaxed);
             let check = || {
@@ -410,7 +427,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
                 Ok(())
             };
             let tuning = super::tuning::Tuning::new(&options, &args, control);
-            if tuning.tigris()
+            if tuning.tigris() && authorization.is_none()
                 && (args.s3_remove.s3_all_versions || args.s3_remove.s3_version_id.is_some())
             {
                 progress.warning(
@@ -421,6 +438,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
                 client: &client,
                 bucket: &options.bucket,
                 budget: &tuning.requests,
+                individual: authorization.is_some(),
             };
             let identify = |entry: &Entry| delete::Target {
                 key: entry.key.clone(),

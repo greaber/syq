@@ -114,63 +114,79 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
             .worker_threads(4)
             .enable_all()
             .build()?;
+        let mut shared = args.clone();
+        if let Some(options) = &args.s3 {
+            shared.storage_authorization =
+                runtime.block_on(crate::s3::authorization::connect(args, options))?;
+        }
+        let args = &shared;
         let resources = copy::session::Resources::new(args);
         let mut sessions = Sessions::default();
-        // Containers are checked before either phase. Per-entry placement then
-        // addresses its final path, without repeating a container's -new test.
-        runtime.block_on(sessions.prepare(args, &manifest, resources.clone()))?;
-        if !manifest.paths.entries.is_empty() {
-            let mut ordinary = args.clone();
-            ordinary.stream_mapping_fd = None;
-            if manifest.callbacks.iter().any(|e| e.dst.path().is_some()) {
-                ordinary.target_existence = Existence::Any;
+        let result = (|| {
+            // Containers are checked before either phase. Per-entry placement then
+            // addresses its final path, without repeating a container's -new test.
+            runtime.block_on(sessions.prepare(args, &manifest, resources.clone()))?;
+            runtime.block_on(sessions.prepare_storage(args, &manifest.callbacks))?;
+            if manifest.paths.entries.is_empty() {
+                if let Some(authorization) = &args.storage_authorization {
+                    runtime.block_on(authorization.finish())?;
+                }
             }
-            ordinary.parsed_mapping = Some(Arc::new(manifest.paths));
-            let phase = ResultsWriter::phase(writer.clone());
-            ordinary.results_override = Some(phase.clone());
-            ordinary.suppress_summary = true;
-            let result = if ordinary.s3.is_some() {
-                crate::s3::run(ordinary)
-            } else {
-                crate::transfer::run(ordinary)
-            };
-            if let Some(record) = phase.take_phase_result() {
-                totals.phase(&record);
+            if !manifest.paths.entries.is_empty() {
+                let mut ordinary = args.clone();
+                ordinary.stream_mapping_fd = None;
+                if manifest.callbacks.iter().any(|e| e.dst.path().is_some()) {
+                    ordinary.target_existence = Existence::Any;
+                }
+                ordinary.parsed_mapping = Some(Arc::new(manifest.paths));
+                let phase = ResultsWriter::phase(writer.clone());
+                ordinary.results_override = Some(phase.clone());
+                ordinary.suppress_summary = true;
+                let result = if ordinary.s3.is_some() {
+                    crate::s3::run(ordinary)
+                } else {
+                    crate::transfer::run(ordinary)
+                };
+                if let Some(record) = phase.take_phase_result() {
+                    totals.phase(&record);
+                }
+                let code = result?;
+                ensure!(
+                    code == 0 || code == 23,
+                    "pathname phase failed with exit status {code}"
+                );
             }
-            let code = result?;
-            ensure!(
-                code == 0 || code == 23,
-                "pathname phase failed with exit status {code}"
+            let mut progress = crate::progress::Progress::new(
+                !args.quiet && !args.no_progress,
+                args.progress,
+                None,
             );
-        }
-        let mut progress =
-            crate::progress::Progress::new(!args.quiet && !args.no_progress, args.progress, None);
-        Arc::get_mut(&mut progress).unwrap().stream = true;
-        progress.set_results(writer.clone());
-        progress
-            .bytes_done
-            .store(totals.0["bytes_transferred"].as_u64().unwrap(), Relaxed);
-        progress
-            .files_total
-            .store(manifest.callbacks.len() as u64, Relaxed);
-        let ordinary_done = totals.0["files_transferred"].as_u64().unwrap();
-        let ordinary_unchanged = totals.0["files_unchanged"].as_u64().unwrap();
-        let ordinary_excluded = totals.0["files_excluded"].as_u64().unwrap();
-        progress.files_total.fetch_add(
-            ordinary_done + ordinary_unchanged + ordinary_excluded,
-            Relaxed,
-        );
-        progress.files_done.store(ordinary_done, Relaxed);
-        progress.files_unchanged.store(ordinary_unchanged, Relaxed);
-        progress.files_excluded.store(ordinary_excluded, Relaxed);
-        progress
-            .bytes_total
-            .store(totals.0["bytes_transferred"].as_u64().unwrap(), Relaxed);
-        progress
-            .bytes_unchanged
-            .store(totals.0["bytes_unchanged"].as_u64().unwrap(), Relaxed);
-        let ticker = progress.spawn_ticker();
-        let result = runtime.block_on(async {
+            Arc::get_mut(&mut progress).unwrap().stream = true;
+            progress.set_results(writer.clone());
+            progress
+                .bytes_done
+                .store(totals.0["bytes_transferred"].as_u64().unwrap(), Relaxed);
+            progress
+                .files_total
+                .store(manifest.callbacks.len() as u64, Relaxed);
+            let ordinary_done = totals.0["files_transferred"].as_u64().unwrap();
+            let ordinary_unchanged = totals.0["files_unchanged"].as_u64().unwrap();
+            let ordinary_excluded = totals.0["files_excluded"].as_u64().unwrap();
+            progress.files_total.fetch_add(
+                ordinary_done + ordinary_unchanged + ordinary_excluded,
+                Relaxed,
+            );
+            progress.files_done.store(ordinary_done, Relaxed);
+            progress.files_unchanged.store(ordinary_unchanged, Relaxed);
+            progress.files_excluded.store(ordinary_excluded, Relaxed);
+            progress
+                .bytes_total
+                .store(totals.0["bytes_transferred"].as_u64().unwrap(), Relaxed);
+            progress
+                .bytes_unchanged
+                .store(totals.0["bytes_unchanged"].as_u64().unwrap(), Relaxed);
+            let ticker = progress.spawn_ticker();
+            let result = runtime.block_on(async {
             let cancelled = Arc::new(AtomicBool::new(false));
             let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             let entries = stream::iter(manifest.callbacks).map(|entry| {
@@ -181,15 +197,9 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
                 let resources = resources.clone();
                 let sessions = &sessions;
                 async move {
-                    let mut per_entry = entry_args(args);
-                    per_entry.stats = false;
-                    let report = copy::report::Report::entry(&per_entry, entry.id, Some(writer), entry.src.json(entry.id), entry.dst.json(entry.id));
-                    let mut controls = Controls::new(&per_entry, report);
+                    let mut controls = entry_controls(args, &entry, Some(writer));
                     controls.parent_progress = Some(progress);
                     controls.share_bandwidth(resources.bandwidth());
-                    controls.metadata.overrides = entry.metadata;
-                    controls.expected = copy::check::Expected { size: match entry.src { Endpoint::Callback { size } => size, _ => None }, hash: entry.expected_hash.clone() };
-                    if let Some(size) = controls.expected.size { controls.set_size(size); }
                     let controls = Arc::new(controls);
                     let payload = Arc::new(Payload::new(channel, entry.id));
                     let local_cancel = Arc::new(AtomicBool::new(false));
@@ -230,17 +240,45 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
             }
             Ok::<_, anyhow::Error>(())
         });
-        progress.stop();
-        if let Some(ticker) = ticker {
-            let _ = ticker.join();
-        }
-        if args.stats && !args.quiet {
-            crate::output::diagnostic!("mapping complete: {} bytes transferred, {} unchanged files, {} excluded files, {} errors", totals.0["bytes_transferred"], totals.0["files_unchanged"], totals.0["files_excluded"], totals.0["errors"]);
-        }
+            progress.stop();
+            if let Some(ticker) = ticker {
+                let _ = ticker.join();
+            }
+            if args.stats && !args.quiet {
+                crate::output::diagnostic!("mapping complete: {} bytes transferred, {} unchanged files, {} excluded files, {} errors", totals.0["bytes_transferred"], totals.0["files_unchanged"], totals.0["files_excluded"], totals.0["errors"]);
+            }
+            result
+        })();
+        runtime.block_on(sessions.cleanup_storage(args));
         result
     })();
     let ended = channel.send(channel::Message::End, &[]);
     outcome.and(ended)
+}
+
+fn entry_controls(args: &Args, entry: &Entry, writer: Option<Arc<ResultsWriter>>) -> Controls {
+    let mut per_entry = entry_args(args);
+    per_entry.stats = false;
+    let report = copy::report::Report::entry(
+        &per_entry,
+        entry.id,
+        writer,
+        entry.src.json(entry.id),
+        entry.dst.json(entry.id),
+    );
+    let mut controls = Controls::new(&per_entry, report);
+    controls.metadata.overrides = entry.metadata;
+    controls.expected = copy::check::Expected {
+        size: match entry.src {
+            Endpoint::Callback { size } => size,
+            _ => None,
+        },
+        hash: entry.expected_hash.clone(),
+    };
+    if let Some(size) = controls.expected.size {
+        controls.set_size(size);
+    }
+    controls
 }
 
 fn entry_args(args: &Args) -> Args {
@@ -316,6 +354,9 @@ fn validate(args: &Args, manifest: &manifest::Manifest) -> Result<()> {
 
 #[derive(Default)]
 struct Sessions {
+    prepared: std::sync::Mutex<
+        std::collections::HashMap<u64, Result<crate::s3::stream::Prepared, String>>,
+    >,
     files: std::collections::HashMap<String, Arc<copy::session::Session>>,
     objects: std::collections::HashMap<String, Arc<crate::s3::stream::Session>>,
 }
@@ -367,7 +408,12 @@ impl Sessions {
                     copy::report::Report::entry(&entry_args, 0, None, Value::Null, Value::Null);
                 let mut controls = Controls::new(&entry_args, report);
                 controls.share_bandwidth(resources.bandwidth());
-                let mut session = crate::s3::stream::Session::connect(options, &controls).await?;
+                let mut session = crate::s3::stream::Session::connect(
+                    options,
+                    &controls,
+                    args.storage_authorization.clone(),
+                )
+                .await?;
                 if let Some(other) = self.objects.values().next() {
                     session.share_admission(other);
                 }
@@ -419,6 +465,66 @@ impl Sessions {
         }
         Ok(())
     }
+    async fn prepare_storage(&self, args: &Args, entries: &[Entry]) -> Result<()> {
+        if args.storage_authorization.is_none() {
+            return Ok(());
+        }
+        for entry in entries {
+            if entry.src.callback() && entry.dst.callback() {
+                continue;
+            }
+            let upload = entry.src.callback();
+            let location = if upload {
+                args.locations.last().unwrap()
+            } else {
+                &args.locations[0]
+            };
+            let Some(session) = self.objects.get(&identity(location)) else {
+                continue;
+            };
+            let path = if upload {
+                entry.dst.path().unwrap()
+            } else {
+                entry.src.path().unwrap()
+            };
+            let base = if upload {
+                Some(location.path.as_slice())
+            } else {
+                args.native_source_root
+                    .as_deref()
+                    .or(args.native_source_cwd.as_deref())
+            };
+            let key = crate::s3::stream::source_key(path, base)?;
+            let controls = entry_controls(args, entry, None);
+            let prepared = session
+                .prepare_callback(key, upload, &controls)
+                .await
+                .and_then(|p| p.context("missing stream authorization preparation"))
+                .map_err(|e| format!("{e:#}"));
+            self.prepared.lock().unwrap().insert(entry.id, prepared);
+        }
+        Ok(())
+    }
+
+    async fn cleanup_storage(&self, args: &Args) {
+        let prepared = std::mem::take(&mut *self.prepared.lock().unwrap());
+        let Some(session) = self.objects.get(&identity(args.locations.last().unwrap())) else {
+            return;
+        };
+        for (_, prepared) in prepared {
+            if let Ok(crate::s3::stream::Prepared::Upload {
+                key, id: Some(id), ..
+            }) = prepared
+            {
+                if let Err(error) = session.abort(&key, &id).await {
+                    crate::output::diagnostic!(
+                        "syq: unused stream upload cleanup failed for {key:?}: {error}"
+                    );
+                }
+            }
+        }
+    }
+
     async fn execute(
         &self,
         args: &Args,
@@ -468,8 +574,15 @@ impl Sessions {
         };
         if let Some(session) = self.objects.get(&identity(&location)) {
             let key = crate::s3::stream::source_key(path, base)?;
+            let prepared = self
+                .prepared
+                .lock()
+                .unwrap()
+                .remove(&entry.id)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
             return session
-                .callback(key, upload, controls, payload, cancelled)
+                .callback(key, upload, controls, payload, cancelled, prepared)
                 .await;
         }
         let session = self.files[&identity(&location)].clone();

@@ -80,6 +80,10 @@ pub struct Args {
     /// Process-local S3 transfer settings; never serialized into helper requests.
     #[arg(skip)]
     pub(crate) s3: Option<crate::s3::Options>,
+    /// Shared only within one invoking process, including mixed stream mappings.
+    #[arg(skip)]
+    pub(crate) storage_authorization:
+        Option<std::sync::Arc<crate::s3::authorization::Authorization>>,
     #[arg(skip)]
     pub(crate) s3_remove: crate::s3::RemoveFlags,
     #[arg(skip)]
@@ -1165,7 +1169,7 @@ fn parse_auth_from(value: &str) -> Result<AuthFrom> {
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Authorize through @NAME (also S3 uploads/downloads), or use local SSH access (default: auto)
+    /// Authorize through @NAME (also S3 copies), or use local SSH access (default: auto)
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Choose the endpoint that runs the coordinator
@@ -1392,6 +1396,9 @@ struct NativeMapCommand {
     override_usage = "syq rm [OPTIONS] PATH...\n       syq rm [OPTIONS] --srcs-in DIR"
 )]
 struct NativeRmCommand {
+    /// Request storage authorization from a connected receiving machine
+    #[arg(long, value_name = "@NAME", value_parser = parse_auth_from)]
+    auth_from: Option<AuthFrom>,
     #[command(flatten)]
     s3: crate::s3::Flags,
     #[command(flatten)]
@@ -1732,6 +1739,7 @@ fn parse_descriptor_copy(
                 | "s3_region"
                 | "s3_profile"
                 | "s3_header"
+                | "auth_from"
                 | "performance_tuning"
                 | "rsh"
                 | "syq_path"
@@ -1972,8 +1980,10 @@ fn parse_descriptor_copy(
     apply_native_copy_operational(&mut args, copy.operational, matches)?;
     crate::descriptor_copy::validate_controls(&mut args)?;
     apply_native_remote(&mut args, parsed.remote)?;
-    if args.s3.is_some() && matches!(args.auth_from, AuthFrom::Return(_)) {
-        bail!("storage authorization requires file or tree operands; descriptor copies do not support --auth-from");
+    if args.s3.is_none()
+        && matches.value_source("auth_from") == Some(clap::parser::ValueSource::CommandLine)
+    {
+        bail!("--auth-from with descriptor copies requires an S3 endpoint");
     }
     Ok(args)
 }
@@ -2150,12 +2160,6 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.native_follow_dst = copy.follow_dst;
     apply_native_copy_operational(&mut args, copy.operational, &matches)?;
     apply_native_remote(&mut args, remote)?;
-    if args.s3.is_some()
-        && args.stream_mapping_fd.is_some()
-        && matches!(args.auth_from, AuthFrom::Return(_))
-    {
-        bail!("storage authorization requires file or tree operands; callback mappings do not support --auth-from");
-    }
     if args.receiver_max_entries.is_some()
         || args.receiver_max_bytes.is_some()
         || args.receiver_receipt.is_some()
@@ -2350,6 +2354,9 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         .as_deref()
         .filter(|s| s.starts_with("s3://"));
     let s3 = crate::s3::Options::parse(parsed.s3, s3_endpoint, None, &matches)?;
+    if parsed.auth_from.is_some() && s3.is_none() {
+        bail!("--auth-from for rm requires --on s3://BUCKET");
+    }
     if s3.is_some() && parsed.selection.follow_src {
         bail!("--follow-src is not supported for S3 removal; object keys have no parent symlinks");
     }
@@ -2405,6 +2412,7 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     }
     args.s3 = s3;
     args.s3_remove = parsed.s3_remove;
+    args.auth_from = parsed.auth_from.unwrap_or_default();
     args.native_follow = parsed.selection.follow;
     args.native_follow_src = parsed.selection.follow_src;
     args.pscope = parsed.pscope;

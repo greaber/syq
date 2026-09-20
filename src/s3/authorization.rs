@@ -36,12 +36,29 @@ impl Scope {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ReadAccess {
+    pub bucket: String,
+    pub scopes: Vec<Scope>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum Removal {
+    Current,
+    Version(String),
+    AllVersions,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Request {
     pub bucket: String,
     pub endpoint: Option<String>,
     pub region: Option<String>,
     pub profile: Option<String>,
     pub scopes: Vec<Scope>,
+    pub source: Option<ReadAccess>,
+    pub removal: Option<Removal>,
+    pub acl: BTreeMap<String, String>,
     pub upload: bool,
     pub delete: bool,
     pub create_only: bool,
@@ -65,34 +82,65 @@ impl Request {
             (1..=DEFAULT_LIFETIME).contains(&self.lifetime),
             "storage authorization lifetime must be between 1 second and 7 days"
         );
-        for scope in &self.scopes {
+        if let Some(source) = &self.source {
+            anyhow::ensure!(
+                !source.bucket.is_empty()
+                    && source
+                        .bucket
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b)),
+                "invalid storage source bucket"
+            );
+            anyhow::ensure!(
+                !source.scopes.is_empty() && source.scopes.len() <= 1024,
+                "storage authorization requires 1 to 1024 source scopes"
+            );
+        }
+        for scope in self
+            .scopes
+            .iter()
+            .chain(self.source.iter().flat_map(|s| &s.scopes))
+        {
             anyhow::ensure!(
                 scope.key.len() <= 1024 && !scope.key.contains('\0'),
                 "invalid storage authorization key"
+            );
+        }
+        if let Some(Removal::Version(version)) = &self.removal {
+            anyhow::ensure!(!version.is_empty(), "storage version ID cannot be empty");
+        }
+        for (name, value) in &self.acl {
+            anyhow::ensure!(
+                (name == "x-amz-acl" || name.starts_with("x-amz-grant-"))
+                    && http::HeaderName::from_bytes(name.as_bytes()).is_ok()
+                    && http::HeaderValue::from_str(value).is_ok(),
+                "invalid approved storage ACL header"
             );
         }
         if let Some(endpoint) = &self.endpoint {
             super::validate_endpoint(endpoint)?;
         }
         anyhow::ensure!(
-            !self.delete || self.upload,
+            !self.delete || self.upload || self.removal.is_some(),
             "download authorization cannot delete storage objects"
         );
         Ok(())
     }
 
     fn permits(&self, request: &Unsigned) -> Result<()> {
+        let bucket = request.bucket.as_deref().unwrap_or(&self.bucket);
+        let destination =
+            bucket == self.bucket && self.scopes.iter().any(|s| s.contains(&request.key));
+        let source = self.source.as_ref().is_some_and(|s| {
+            s.bucket == bucket && s.scopes.iter().any(|s| s.contains(&request.key))
+        });
+        let reading = matches!(request.method.as_str(), "GET" | "HEAD");
         anyhow::ensure!(
-            self.scopes.iter().any(|s| s.contains(&request.key))
-                || request.query.contains_key("list-type"),
+            destination
+                || (reading && source)
+                || request.query.contains_key("list-type")
+                || request.query.contains_key("versions"),
             "storage request is outside the approved paths"
-        );
-        anyhow::ensure!(
-            !request
-                .key
-                .split('/')
-                .any(|part| matches!(part, "." | "..")),
-            "storage key contains a traversal component"
         );
         for (name, value) in &request.headers {
             anyhow::ensure!(
@@ -118,9 +166,43 @@ impl Request {
                             | "start-after"
                     )
                 })
+                && query.get("prefix").is_some_and(|p| {
+                    (bucket == self.bucket && self.scopes.iter().any(|s| s.contains_prefix(p)))
+                        || self.source.as_ref().is_some_and(|source| {
+                            source.bucket == bucket
+                                && source.scopes.iter().any(|s| s.contains_prefix(p))
+                        })
+                })
+        } else if query.contains_key("versions") {
+            matches!(
+                self.removal,
+                Some(Removal::Version(_) | Removal::AllVersions)
+            ) && request.method == "GET"
+                && request.key.is_empty()
+                && bucket == self.bucket
+                && query.keys().all(|k| {
+                    matches!(
+                        k.as_str(),
+                        "versions"
+                            | "prefix"
+                            | "delimiter"
+                            | "key-marker"
+                            | "version-id-marker"
+                            | "max-keys"
+                            | "encoding-type"
+                    )
+                })
+                && query.get("prefix").is_some_and(|prefix| {
+                    self.scopes
+                        .iter()
+                        .any(|scope| prefix == &scope.key || scope.contains_prefix(prefix))
+                })
+        } else if query.contains_key("tagging") {
+            source
+                && request.method == "GET"
                 && query
-                    .get("prefix")
-                    .is_some_and(|p| self.scopes.iter().any(|s| s.contains_prefix(p)))
+                    .keys()
+                    .all(|k| matches!(k.as_str(), "tagging" | "versionId"))
         } else if query.contains_key("uploads") {
             self.upload && request.method == "POST" && query.len() == 1
         } else if query.contains_key("uploadId") {
@@ -147,7 +229,17 @@ impl Request {
                 && match request.method.as_str() {
                     "GET" | "HEAD" => true,
                     "PUT" => self.upload && query.is_empty(),
-                    "DELETE" => self.delete && query.is_empty(),
+                    "DELETE" => {
+                        self.delete
+                            && match (&self.removal, query.get("versionId")) {
+                                (Some(Removal::Version(approved)), Some(version)) => {
+                                    approved == version
+                                }
+                                (Some(Removal::AllVersions), Some(_)) => true,
+                                (None | Some(Removal::Current), None) => true,
+                                _ => false,
+                            }
+                    }
                     _ => false,
                 }
         };
@@ -159,11 +251,36 @@ impl Request {
             !request
                 .headers
                 .keys()
-                .any(|h| h.starts_with("x-amz-copy-source")
-                    || h.starts_with("x-amz-grant-")
-                    || h == "x-amz-acl"),
-            "storage authorization does not permit ACL changes or server-side copies"
+                .any(
+                    |h| (h.starts_with("x-amz-copy-source") && self.source.is_none())
+                        || ((h.starts_with("x-amz-grant-") || h == "x-amz-acl")
+                            && self.acl.get(h) != request.headers.get(h))
+                ),
+            "storage ACL or copy headers are outside the approved permissions"
         );
+        if let Some(encoded) = request.headers.get("x-amz-copy-source") {
+            let (path, query) = encoded.split_once('?').unwrap_or((encoded, ""));
+            let path =
+                percent_encoding::percent_decode_str(path.trim_start_matches('/')).decode_utf8()?;
+            let (bucket, key) = path
+                .split_once('/')
+                .context("invalid storage copy source")?;
+            anyhow::ensure!(
+                self.source
+                    .as_ref()
+                    .is_some_and(|source| source.bucket == bucket
+                        && source.scopes.iter().any(|scope| scope.contains(key))),
+                "storage copy source is outside the approved paths"
+            );
+            anyhow::ensure!(
+                url::form_urlencoded::parse(query.as_bytes()).all(|(name, _)| name == "versionId"),
+                "invalid storage copy source query"
+            );
+            anyhow::ensure!(
+                request.method == "PUT" && self.upload && destination,
+                "storage copy destination is outside the approved permissions"
+            );
+        }
         let publishes = request.method == "PUT" && !query.contains_key("uploadId")
             || request.method == "POST" && query.contains_key("uploadId");
         if self.create_only && publishes {
@@ -183,6 +300,7 @@ impl Request {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Unsigned {
+    pub bucket: Option<String>,
     pub method: String,
     pub key: String,
     pub query: BTreeMap<String, String>,
@@ -191,11 +309,16 @@ pub(crate) struct Unsigned {
 impl Unsigned {
     pub(super) fn new(method: &str, key: &str) -> Self {
         Self {
+            bucket: None,
             method: method.into(),
             key: key.into(),
             query: BTreeMap::new(),
             headers: BTreeMap::new(),
         }
+    }
+    pub(super) fn bucket(mut self, bucket: &str, default: &str) -> Self {
+        self.bucket = (bucket != default).then(|| bucket.to_owned());
+        self
     }
     pub(super) fn query(mut self, key: &str, value: &str) -> Self {
         self.query.insert(key.into(), value.into());
@@ -209,6 +332,7 @@ impl Unsigned {
 impl std::fmt::Debug for Unsigned {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StorageRequest")
+            .field("bucket", &self.bucket)
             .field("method", &self.method)
             .field("key", &self.key)
             .field("query_fields", &self.query.keys().collect::<Vec<_>>())
@@ -360,7 +484,7 @@ impl Signer {
 }
 
 fn request_url(endpoint: &str, bucket: &str, request: &Unsigned) -> Result<String> {
-    let mut url = url::Url::parse(endpoint)?;
+    let url = url::Url::parse(endpoint)?;
     // SigV4 Single encoding expects an already canonical RFC 3986 path.
     // URL path-segment encoding alone leaves characters such as '+' literal.
     const PATH: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
@@ -372,17 +496,21 @@ fn request_url(endpoint: &str, bucket: &str, request: &Unsigned) -> Result<Strin
     let path = format!(
         "{}/{}/{}",
         url.path().trim_end_matches('/'),
-        bucket,
+        request.bucket.as_deref().unwrap_or(bucket),
         percent_encoding::utf8_percent_encode(&request.key, PATH)
     );
-    url.set_path(&path);
+    // Object keys are literal, including repeated slashes and dot segments.
+    // Feeding the assembled path back through Url would normalize those keys.
+    let mut result = format!("{}{path}", &url[..url::Position::BeforePath]);
     if !request.query.is_empty() {
-        let mut query = url.query_pairs_mut();
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
         for (key, value) in &request.query {
             query.append_pair(key, value);
         }
+        result.push('?');
+        result.push_str(&query.finish());
     }
-    Ok(url.to_string())
+    Ok(result)
 }
 fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
@@ -392,7 +520,7 @@ struct State {
     connection: Option<std::os::unix::net::UnixStream>,
     requests: BTreeMap<Unsigned, String>,
 }
-pub(super) struct Authorization {
+pub(crate) struct Authorization {
     pub configuration: Configuration,
     pub bucket: String,
     state: Mutex<State>,
@@ -443,8 +571,24 @@ impl Authorization {
             now()? < self.configuration.expires_at,
             "storage authorization expired; rerun the copy for fresh approval"
         );
+        if request.method == "PUT" {
+            let mut streaming = request.clone();
+            streaming.headers.remove("content-md5");
+            streaming.headers.remove("content-length");
+            if let Some(url) = self.state.lock().unwrap().requests.get(&streaming) {
+                return Ok(url.clone());
+            }
+        }
         self.authorize(vec![request.clone()])?;
         Ok(self.state.lock().unwrap().requests[&request].clone())
+    }
+    pub(crate) async fn finish(self: &Arc<Self>) -> Result<()> {
+        let deadline = aws_smithy_types::DateTime::from_secs(self.configuration.expires_at as i64)
+            .fmt(aws_smithy_types::date_time::Format::DateTime)?;
+        let authorization = self.clone();
+        tokio::task::spawn_blocking(move || authorization.finish_preparation()).await??;
+        crate::output::diagnostic!("syq: storage authorization ready; the authorizing machine may disconnect. Authorization expires at {deadline}; provider policies or credential revocation may shorten it.");
+        Ok(())
     }
     pub(super) fn finish_preparation(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
@@ -455,19 +599,38 @@ impl Authorization {
     }
 }
 
-pub(super) async fn connect(
+pub(crate) async fn connect(
     args: &crate::cli::Args,
     options: &super::Options,
 ) -> Result<Option<Arc<Authorization>>> {
+    if let Some(authorization) = &args.storage_authorization {
+        return Ok(Some(authorization.clone()));
+    }
     let crate::cli::AuthFrom::Return(name) = &args.auth_from else {
         return Ok(None);
     };
     anyhow::ensure!(
-        !options.route.is_server_copy() && args.descriptor_copy.is_none(),
+        args.descriptor_copy.is_none(),
         "storage authorization currently requires a file or tree upload/download"
     );
-    let upload = options.route == super::Route::Upload;
-    let scopes = if upload {
+    let upload = options.route == super::Route::Upload || options.route.is_server_copy();
+    let scopes = if args.rm {
+        let base = super::local::key_path(
+            args.native_rm_root
+                .as_deref()
+                .or(args.native_rm_cwd.as_deref())
+                .unwrap_or(b"."),
+        )?;
+        args.locations
+            .iter()
+            .map(|source| {
+                Ok(Scope {
+                    key: super::local::join(&base, &super::local::key_path(&source.path)?),
+                    descendants: true,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else if upload {
         vec![Scope {
             key: super::local::key_path(
                 &args
@@ -495,28 +658,77 @@ pub(super) async fn connect(
             })
             .collect::<Result<Vec<_>>>()?
     };
+    let source = options
+        .route
+        .source_bucket()
+        .map(|bucket| -> Result<_> {
+            let base = super::local::key_path(
+                args.native_source_root
+                    .as_deref()
+                    .or(args.native_source_cwd.as_deref())
+                    .unwrap_or(b"."),
+            )?;
+            let scopes = args.locations[..args.locations.len() - 1]
+                .iter()
+                .map(|source| {
+                    Ok(Scope {
+                        key: super::local::join(&base, &super::local::key_path(&source.path)?),
+                        descendants: true,
+                    })
+                })
+                .collect::<Result<_>>()?;
+            Ok(ReadAccess {
+                bucket: bucket.into(),
+                scopes,
+            })
+        })
+        .transpose()?;
     let request = Request {
         bucket: options.bucket.clone(),
         endpoint: options.endpoint.clone(),
         region: options.region.clone(),
         profile: options.profile.clone(),
         scopes,
+        source,
+        acl: acl_headers(options),
+        removal: args.rm.then(|| {
+            if args.s3_remove.s3_all_versions {
+                Removal::AllVersions
+            } else if let Some(id) = &args.s3_remove.s3_version_id {
+                Removal::Version(id.clone())
+            } else {
+                Removal::Current
+            }
+        }),
         upload: upload && !args.dry_run,
-        delete: upload && args.delete && !args.dry_run,
+        delete: (args.rm || (upload && args.delete)) && !args.dry_run,
         create_only: args.ignore_existing || args.target_existence == crate::cli::Existence::New,
         lifetime: DEFAULT_LIFETIME,
     };
+    connect_request(name, request).await.map(Some)
+}
+
+pub(super) fn acl_headers(options: &super::Options) -> BTreeMap<String, String> {
+    options
+        .headers
+        .iter()
+        .filter(|super::Header(name, _)| name == "x-amz-acl" || name.starts_with("x-amz-grant-"))
+        .map(|super::Header(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+pub(super) async fn connect_request(name: &str, request: Request) -> Result<Arc<Authorization>> {
     let bucket = request.bucket.clone();
-    let name = name.clone();
+    let name = name.to_owned();
     let (connection, configuration) =
         tokio::task::spawn_blocking(move || crate::destination::storage::connect(&name, request))
             .await??;
     crate::output::diagnostic!("syq: preparing storage authorization; keep the authorizing machine connected until preparation finishes");
-    Ok(Some(Arc::new(Authorization::new(
+    Ok(Arc::new(Authorization::new(
         bucket,
         configuration,
         connection,
-    ))))
+    )))
 }
 
 #[cfg(test)]

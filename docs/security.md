@@ -321,7 +321,7 @@ it is not sandboxed or confined to a copy destination directory.
 
 ## Storage authorization
 
-With `cp --auth-from @NAME` and an S3 endpoint, the receiving machine signs
+With `cp --auth-from @NAME` or `rm --auth-from @NAME` and an S3 endpoint, the receiving machine signs
 requests using its storage credentials. The server receives bearer URLs for
 approved operations and paths, never the underlying secret access key. Data
 travels directly between the server and storage; the authorizer need not stay
@@ -331,8 +331,11 @@ Approval trusts the requesting server account to choose contents and request
 operations within the displayed bucket and paths. Upload approval also allows
 reading those paths for comparison and recovery. Create-only approval requires
 conditional writes; object deletion requires separate permission in the same
-prompt. Syq refuses bucket administration, ACL changes, and server-side copies.
-The storage provider enforces each issued request's signature and expiry.
+prompt. Version deletion requires approval for that version or all versions.
+S3-to-S3 approval separately identifies the source read scope and destination
+write scope. Requested ACL headers appear in the prompt and cannot be changed
+in issued requests. Bucket administration is refused. The storage provider
+enforces each issued request's signature and expiry.
 
 These are reusable bearer capabilities. Anyone who obtains them can repeat the
 signed operations until expiry, subject to the provider's rules. They do not

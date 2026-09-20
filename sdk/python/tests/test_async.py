@@ -101,8 +101,9 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prune.deletions_completed, 1)
 
     async def test_s3_rm_options_match_the_sync_api(self) -> None:
-        result = await self.client.rm("key", on="s3://bucket", s3_version_id="version", s3_endpoint="http://localhost:9000")
+        result = await self.client.rm("key", on="s3://bucket", auth_from="@laptop", s3_version_id="version", s3_endpoint="http://localhost:9000")
         self.assertIsInstance(result, syq.RmResult)
+        self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
         self.assertIn("--s3-version-id=version", self.argv())
         self.assertIn("--s3-endpoint=http://localhost:9000", self.argv())
         with self.assertRaises(syq.SyqInvocationError):
