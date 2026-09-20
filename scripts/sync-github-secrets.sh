@@ -10,9 +10,8 @@ HOMEBREW_TAP_REPO=greaber/homebrew-tap
 HOMEBREW_DEPLOY_KEY_TITLE='syq release workflow'
 RELEASE_ENVIRONMENT=release
 ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-SECRETS_DIR=${SYQ_RELEASE_SECRETS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/syq/release}
-ENV_FILE="$SECRETS_DIR/.env.release"
-KEYS_FILE="$SECRETS_DIR/.env.keys"
+ENV_FILE=${SYQ_RELEASE_ENV_FILE:-}
+KEYS_FILE=${SYQ_RELEASE_KEYS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/syq/release/.env.keys}
 DOTENVX_BIN=${DOTENVX_BIN:-dotenvx}
 EXECUTE=false
 
@@ -67,6 +66,8 @@ target_repo=$(github_slug_from_remote_url "$origin_url") \
   || die "GH_HOST must be $CANONICAL_HOST"
 
 command -v gh >/dev/null || die "the gh CLI is required"
+[ -n "$ENV_FILE" ] || die "set SYQ_RELEASE_ENV_FILE to the private inventory, or invoke through the operations wrapper"
+
 if [[ "$DOTENVX_BIN" == */* ]]; then
   [ -x "$DOTENVX_BIN" ] || die "dotenvx is not executable: $DOTENVX_BIN"
 else

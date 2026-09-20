@@ -130,8 +130,10 @@ git -C "$repo" init -q -b master
 git -C "$repo" remote add origin https://github.com/greaber/not-syq.git
 
 secrets_dir="$work/config/syq/release"
+inventory_file="$work/ops-release/.env.release"
 common_env=(
-  "SYQ_RELEASE_SECRETS_DIR=$secrets_dir"
+  "SYQ_RELEASE_ENV_FILE=$inventory_file"
+  "SYQ_RELEASE_KEYS_FILE=$secrets_dir/.env.keys"
   "PATH=$fake_bin:$PATH"
   "DOTENVX_BIN=$fake_bin/dotenvx"
   "FAKE_DOTENVX_STATE=$fake_state"
@@ -140,7 +142,7 @@ common_env=(
 
 env "${common_env[@]}" "$repo/scripts/init-release-secrets.sh" \
   > "$work/init-output" 2>&1
-[ -f "$secrets_dir/.env.release" ] || fail "initializer did not create .env.release"
+[ -f "$inventory_file" ] || fail "initializer did not create .env.release"
 [ -f "$secrets_dir/.env.keys" ] || fail "initializer did not create .env.keys"
 [ ! -e "$repo/.env.release" ] || fail "initializer wrote credentials in the checkout"
 [ ! -e "$repo/.env.keys" ] || fail "initializer wrote a private key in the checkout"
@@ -156,9 +158,9 @@ sha256_file() {
   fi
 }
 [ "$(file_mode "$secrets_dir")" = 700 ] || fail "secrets directory is not mode 0700"
-[ "$(file_mode "$secrets_dir/.env.release")" = 600 ] || fail "inventory is not mode 0600"
+[ "$(file_mode "$inventory_file")" = 600 ] || fail "inventory is not mode 0600"
 [ "$(file_mode "$secrets_dir/.env.keys")" = 600 ] || fail ".env.keys is not mode 0600"
-grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$secrets_dir/.env.release" \
+grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$inventory_file" \
   && fail "encrypted inventory contains the plaintext Homebrew key"
 grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$work/init-output" \
   && fail "initializer printed the Homebrew key"
@@ -175,11 +177,11 @@ derived_public=$(openssl pkey -in "$work/signing.pem" -pubout -outform DER \
 [ "$derived_public" = "$(cat "$fake_state/SYQ_RELEASE_PUBLIC_KEY")" ] \
   || fail "initializer stored a mismatched signing key pair"
 
-env_hash=$(sha256_file "$secrets_dir/.env.release")
+env_hash=$(sha256_file "$inventory_file")
 keys_hash=$(sha256_file "$secrets_dir/.env.keys")
 expect_failure "$work/reinit-output" \
   env "${common_env[@]}" "$repo/scripts/init-release-secrets.sh"
-[ "$env_hash" = "$(sha256_file "$secrets_dir/.env.release")" ] \
+[ "$env_hash" = "$(sha256_file "$inventory_file")" ] \
   || fail "reinitialization changed .env.release"
 [ "$keys_hash" = "$(sha256_file "$secrets_dir/.env.keys")" ] \
   || fail "reinitialization changed .env.keys"
@@ -239,21 +241,29 @@ grep -q 'secret set\|variable set' "$fake_state/calls" \
 expect_failure "$work/unknown-argument-output" \
   env "${common_env[@]}" "$repo/scripts/sync-github-secrets.sh" --surprise
 
-# Defaults must also stay outside the checkout when no override is supplied.
+# The inventory is explicit; only private-key discovery has a machine default.
 default_env=(
   "PATH=$fake_bin:$PATH"
   "DOTENVX_BIN=$fake_bin/dotenvx"
   "FAKE_DOTENVX_STATE=$fake_state"
   "FAKE_GH_STATE=$fake_state"
 )
-env -u SYQ_RELEASE_SECRETS_DIR "${default_env[@]}" \
+expect_failure "$work/no-inventory-output" \
+  env -u SYQ_RELEASE_ENV_FILE -u SYQ_RELEASE_KEYS_FILE "${default_env[@]}" \
+  XDG_CONFIG_HOME="$work/xdg" "$repo/scripts/init-release-secrets.sh"
+[ ! -e "$work/xdg" ] || fail "missing inventory path created default state"
+env -u SYQ_RELEASE_KEYS_FILE "${default_env[@]}" \
+  SYQ_RELEASE_ENV_FILE="$work/xdg-inventory/.env.release" \
   XDG_CONFIG_HOME="$work/xdg" "$repo/scripts/init-release-secrets.sh" \
   > "$work/xdg-output" 2>&1
-[ -f "$work/xdg/syq/release/.env.release" ] || fail "XDG config inventory missing"
-env -u SYQ_RELEASE_SECRETS_DIR -u XDG_CONFIG_HOME "${default_env[@]}" \
+[ -f "$work/xdg-inventory/.env.release" ] || fail "explicit inventory missing"
+[ -f "$work/xdg/syq/release/.env.keys" ] || fail "XDG config key missing"
+[ ! -e "$work/xdg/syq/release/.env.release" ] || fail "inventory leaked into key directory"
+env -u SYQ_RELEASE_KEYS_FILE -u XDG_CONFIG_HOME "${default_env[@]}" \
+  SYQ_RELEASE_ENV_FILE="$work/home-inventory/.env.release" \
   HOME="$work/home" "$repo/scripts/init-release-secrets.sh" \
   > "$work/home-output" 2>&1
-[ -f "$work/home/.config/syq/release/.env.release" ] || fail "default config inventory missing"
-[ ! -e "$repo/.env.release" ] || fail "default initialization wrote credentials in the checkout"
+[ -f "$work/home/.config/syq/release/.env.keys" ] || fail "default config key missing"
+[ ! -e "$repo/.env.release" ] || fail "initialization wrote credentials in the checkout"
 
 printf 'secret tooling tests passed\n'

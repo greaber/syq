@@ -25,24 +25,24 @@ is the installer or a remote helper bootstrap, kind `binary` is Homebrew).
 
 The Cloudflare account ID and API token live in the private release inventory
 outside this repository (see [release credentials](../../RELEASING.md#encrypted-release-inventory)).
-Run wrangler through dotenvx to load them into the command environment:
+Set `OPS_CHECKOUT` to the private operations checkout to use. Its wrapper
+loads that checkout’s inventory into the command environment:
 
-    secrets_dir=${SYQ_RELEASE_SECRETS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/syq/release}
     cd infra/syq-dl
     npm install
-    dotenvx run -f "$secrets_dir/.env.release" -fk "$secrets_dir/.env.keys" -- npx wrangler deploy
-    dotenvx run -f "$secrets_dir/.env.release" -fk "$secrets_dir/.env.keys" -- npx wrangler d1 migrations apply syq-dl --remote
+    "$OPS_CHECKOUT/scripts/run" release npx wrangler deploy
+    "$OPS_CHECKOUT/scripts/run" release npx wrangler d1 migrations apply syq-dl --remote
 
 To drop a cached asset, purge its URL; the token needs the zone's Cache Purge
 permission, which the stored one does not have yet (add it to the token in the
 Cloudflare dashboard). Set `CLOUDFLARE_ZONE_ID` to the zone to purge:
 
     curl -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/purge_cache" \
-      -H "Authorization: Bearer $(dotenvx get CLOUDFLARE_API_TOKEN -f "$secrets_dir/.env.release" -fk "$secrets_dir/.env.keys")" \
+      -H "Authorization: Bearer $("$OPS_CHECKOUT/scripts/dotenvx" get CLOUDFLARE_API_TOKEN -f "$OPS_CHECKOUT/release/.env.release" -fk "${XDG_CONFIG_HOME:-$HOME/.config}/syq/release/.env.keys")" \
       -H 'Content-Type: application/json' \
       -d '{"files":["https://dl.syq.christmas/v0.6.0/syq-linux-x86_64.gz"]}'
 
 Query recorded events the same way:
 
-    dotenvx run -f "$secrets_dir/.env.release" -fk "$secrets_dir/.env.keys" -- npx wrangler d1 execute syq-dl --remote \
+    "$OPS_CHECKOUT/scripts/run" release npx wrangler d1 execute syq-dl --remote \
       --command 'select * from daily_checks order by day desc limit 20'
