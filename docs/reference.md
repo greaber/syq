@@ -112,7 +112,8 @@ for example when comparing its effect on CPU use and copy speed.
 
 Syq shows a progress bar in a terminal, with elapsed time, speed, and an
 estimated finish time. The final summary reports copied and skipped files
-and any errors. Add `-v` to list copied paths.
+and any errors. During SSH and TCP file copies, byte progress advances when
+the destination confirms writing the data. Add `-v` to list copied paths.
 
 Use `--progress` to show the bar when output is redirected, or `--no-progress`
 to hide it. For connection details and ways to investigate performance, see

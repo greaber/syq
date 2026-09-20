@@ -263,7 +263,6 @@ fn pipeline_worker(
     });
     Worker {
         id: 0,
-        activity: Arc::new(AtomicU64::new(0)),
         src: Box::new(PipelineConn(src.clone())),
         dst: Box::new(PipelineConn(dst.clone())),
         sched: sched.clone(),

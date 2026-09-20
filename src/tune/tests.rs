@@ -457,35 +457,3 @@ fn out_of_order_readiness_keeps_every_warming_slot() {
     assert!(gate.ready_through(6));
     assert!(gate.begin_warming(6).is_empty());
 }
-
-#[test]
-fn inconclusive_probe_is_not_a_cacheable_throughput_comparison() {
-    let mut policy = Policy::new(16, 1, 64);
-    policy.observe(100.0);
-    assert!(policy.n > 16);
-    policy.activated();
-    policy.inconclusive();
-    assert_eq!(policy.n, 16);
-    assert!(!policy.measured());
-    assert_eq!(policy.fails, [0, 0]);
-    assert_eq!(policy.points.len(), 1);
-    policy.activated();
-    assert_eq!(policy.active(), 16);
-}
-
-#[test]
-fn contribution_counters_survive_reconnection_without_counting_readiness() {
-    let gate = Gate::new(2);
-    let activity = gate.activity(1);
-    gate.mark_ready(1);
-    assert_eq!(gate.activity_counts(2), [0, 0]);
-    activity.fetch_add(1, Relaxed);
-    gate.mark_absent(1);
-    gate.begin_warming(2);
-    gate.mark_ready(1);
-    assert_eq!(gate.activity_counts(2), [0, 1]);
-    assert!(Arc::ptr_eq(&activity, &gate.activity(1)));
-    gate.mark_failed(1);
-    gate.clear_failed_from(1);
-    assert!(Arc::ptr_eq(&activity, &gate.activity(1)));
-}

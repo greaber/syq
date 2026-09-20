@@ -325,7 +325,6 @@ fn test_credit(block: u64, count: u64) -> Arc<WriteCredit> {
         crate::progress::Progress::new(false, false, None),
         Arc::new(AtomicU64::new(0)),
         block,
-        Arc::new(AtomicU64::new(0)),
     );
     for _ in 0..count {
         credit.submit(block).unwrap();
@@ -337,17 +336,11 @@ fn test_credit(block: u64, count: u64) -> Arc<WriteCredit> {
 fn streaming_credit_waits_for_acknowledgments_and_counts_short_tail_exactly() {
     let progress = crate::progress::Progress::new(false, false, None);
     let done = Arc::new(AtomicU64::new(0));
-    let credit = WriteCredit::new(
-        progress.clone(),
-        done.clone(),
-        4096,
-        Arc::new(AtomicU64::new(0)),
-    );
+    let credit = WriteCredit::new(progress.clone(), done.clone(), 4096);
     for n in [4096, 4096, 13] {
         credit.submit(n).unwrap();
     }
     assert_eq!(progress.bytes_done.load(Ordering::Relaxed), 0);
-    assert_eq!(progress.outstanding_bytes.load(Ordering::Relaxed), 8205);
     let (tx, rx) = mpsc::channel();
     let replies = WriteReplies::spawn(rx, Some(credit.clone()));
     for _ in 0..3 {
@@ -359,7 +352,6 @@ fn streaming_credit_waits_for_acknowledgments_and_counts_short_tail_exactly() {
     assert_eq!(credit.acknowledged(), 8205);
     assert_eq!(progress.bytes_done.load(Ordering::Relaxed), 8205);
     assert_eq!(done.load(Ordering::Relaxed), 8205);
-    assert_eq!(progress.outstanding_bytes.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -367,12 +359,7 @@ fn failed_stream_credit_retracts_before_retry_and_never_scores_failed_writes() {
     use crate::tune::Meter;
     let progress = crate::progress::Progress::new(false, false, None);
     let done = Arc::new(AtomicU64::new(0));
-    let credit = WriteCredit::new(
-        progress.clone(),
-        done.clone(),
-        4096,
-        Arc::new(AtomicU64::new(0)),
-    );
+    let credit = WriteCredit::new(progress.clone(), done.clone(), 4096);
     for n in [4096, 4096, 7] {
         credit.submit(n).unwrap();
     }
@@ -386,19 +373,12 @@ fn failed_stream_credit_retracts_before_retry_and_never_scores_failed_writes() {
     assert!(matches!(state.error, Some(Failure::Rejected(_))));
     assert_eq!(credit.acknowledged(), 4096);
     assert_eq!(progress.bytes_done.load(Ordering::Relaxed), 4096);
-    assert_eq!(progress.outstanding_bytes.load(Ordering::Relaxed), 4103);
     drop(state);
     drop(credit);
-    assert_eq!(progress.outstanding_bytes.load(Ordering::Relaxed), 0);
     progress.bytes_done.fetch_sub(4096, Ordering::Relaxed);
     done.fetch_sub(4096, Ordering::Relaxed);
     assert_eq!(progress.bytes(), 4096);
-    let credit = WriteCredit::new(
-        progress.clone(),
-        done.clone(),
-        4096,
-        Arc::new(AtomicU64::new(0)),
-    );
+    let credit = WriteCredit::new(progress.clone(), done.clone(), 4096);
     credit.submit(4096).unwrap();
     let mut completed = Completions::new(Some(credit.clone()));
     completed.record(Response::Ok);
@@ -416,12 +396,7 @@ fn failed_stream_credit_retracts_before_retry_and_never_scores_failed_writes() {
 #[test]
 fn cancelled_collector_cannot_credit_after_caller_recovers() {
     let progress = crate::progress::Progress::new(false, false, None);
-    let credit = WriteCredit::new(
-        progress.clone(),
-        Arc::new(AtomicU64::new(0)),
-        4096,
-        Arc::new(AtomicU64::new(0)),
-    );
+    let credit = WriteCredit::new(progress.clone(), Arc::new(AtomicU64::new(0)), 4096);
     credit.submit(4096).unwrap();
     let (tx, rx) = mpsc::channel();
     let replies = WriteReplies::spawn(rx, Some(credit.clone()));
@@ -432,7 +407,6 @@ fn cancelled_collector_cannot_credit_after_caller_recovers() {
     drop(state);
     drop(credit);
     assert_eq!(progress.bytes_done.load(Ordering::Relaxed), 0);
-    assert_eq!(progress.outstanding_bytes.load(Ordering::Relaxed), 0);
 }
 
 #[test]

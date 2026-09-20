@@ -21,7 +21,6 @@ impl RangeFlight {
 
 pub(super) struct Worker {
     pub(super) id: usize,
-    pub(super) activity: Arc<AtomicU64>,
     pub(super) src: Box<dyn Conn>,
     pub(super) dst: Box<dyn Conn>,
     pub(super) sched: Arc<Sched>,
@@ -294,7 +293,6 @@ impl Worker {
         if files > 0 {
             self.progress.add_bytes(bytes);
             self.progress.add_tuning_files(files);
-            self.activity.fetch_add(1, Relaxed);
         }
         Ok(valid)
     }
@@ -982,7 +980,6 @@ impl Worker {
             Response::Ok => {
                 self.benchmark.local_whole_files += 1;
                 self.progress.add_bytes(job.entry.size);
-                self.activity.fetch_add(1, Relaxed);
                 job.done.store(job.entry.size, Relaxed);
                 if let Err(e) = self.finish_file(idx) {
                     if self.transport_dead() {
@@ -1288,7 +1285,6 @@ impl Worker {
     pub(super) fn acknowledge_range_write(
         sched: &Sched,
         progress: &Progress,
-        activity: &AtomicU64,
         job: &WorkerJob,
         flights: &mut [Option<RangeFlight>],
         slot: usize,
@@ -1298,7 +1294,6 @@ impl Worker {
         flight.pending -= 1;
         flight.credited += n;
         progress.add_bytes(n);
-        activity.fetch_add(1, Relaxed);
         job.done.fetch_add(n, Relaxed);
         if slot != 0 && flight.pending == 0 && {
             let range = flight.handle.lock().unwrap();
@@ -1430,7 +1425,6 @@ impl Worker {
                     Self::acknowledge_range_write(
                         &self.sched,
                         &self.progress,
-                        &self.activity,
                         job,
                         &mut flights,
                         slot,
@@ -1458,7 +1452,6 @@ impl Worker {
                     Self::acknowledge_range_write(
                         &self.sched,
                         &self.progress,
-                        &self.activity,
                         job,
                         &mut flights,
                         slot,
@@ -1521,12 +1514,8 @@ impl Worker {
             _ => bail!("unexpected response starting read stream"),
         }
         self.benchmark.streaming_ranges += 1;
-        let credit = crate::streaming::WriteCredit::new(
-            self.progress.clone(),
-            job.done.clone(),
-            block,
-            self.activity.clone(),
-        );
+        let credit =
+            crate::streaming::WriteCredit::new(self.progress.clone(), job.done.clone(), block);
         let begin = self.dst.begin_streaming_writes(Some(credit.clone()));
         if let Err(error) = begin {
             let _ = self.src.stop_read_stream();
@@ -1811,7 +1800,6 @@ impl Worker {
             self.progress.files_unchanged.fetch_add(1, Relaxed);
         } else {
             self.progress.add_files(1);
-            self.activity.fetch_add(1, Relaxed);
             if let Some(results) = self.progress.results_writer() {
                 results.emit_operation_expected(
                     &crate::results::OperationRecord {
@@ -1943,7 +1931,6 @@ impl Worker {
             (None, "metadata_differs")
         } else {
             self.progress.add_files(1);
-            self.activity.fetch_add(1, Relaxed);
             self.progress.bytes_done.fetch_add(job.entry.size, Relaxed);
             (Some(job.entry.size), "content_differs")
         };

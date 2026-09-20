@@ -1713,7 +1713,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let mut worker = Worker {
                         id,
-                        activity: gate.activity(id),
                         src,
                         dst,
                         sched: sched.clone(),

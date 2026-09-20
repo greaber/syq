@@ -142,7 +142,6 @@ pub(crate) struct WriteCredit {
     progress: Arc<crate::progress::Progress>,
     done: Arc<AtomicU64>,
     block: u64,
-    activity: Arc<AtomicU64>,
     submitted: AtomicU64,
     acknowledged: AtomicU64,
 }
@@ -152,14 +151,12 @@ impl WriteCredit {
         progress: Arc<crate::progress::Progress>,
         done: Arc<AtomicU64>,
         block: u64,
-        activity: Arc<AtomicU64>,
     ) -> Arc<Self> {
         assert!(block > 0);
         Arc::new(Self {
             progress,
             done,
             block,
-            activity,
             submitted: AtomicU64::new(0),
             acknowledged: AtomicU64::new(0),
         })
@@ -176,9 +173,6 @@ impl WriteCredit {
             previous.checked_add(bytes).is_some(),
             "streaming byte count overflow"
         );
-        self.progress
-            .outstanding_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
         self.submitted.store(previous + bytes, Ordering::Release);
         Ok(())
     }
@@ -191,27 +185,14 @@ impl WriteCredit {
         }
         let total = count.saturating_mul(self.block).min(submitted);
         let bytes = total - self.acknowledged.swap(total, Ordering::Relaxed);
-        self.progress
-            .outstanding_bytes
-            .fetch_sub(bytes, Ordering::Relaxed);
         self.progress.add_bytes(bytes);
         self.done.fetch_add(bytes, Ordering::Relaxed);
-        self.activity.fetch_add(1, Ordering::Relaxed);
         true
     }
 
     /// Read after the collector has joined, before the caller can retry.
     pub(crate) fn acknowledged(&self) -> u64 {
         self.acknowledged.load(Ordering::Relaxed)
-    }
-}
-
-impl Drop for WriteCredit {
-    fn drop(&mut self) {
-        let uncertain = *self.submitted.get_mut() - *self.acknowledged.get_mut();
-        self.progress
-            .outstanding_bytes
-            .fetch_sub(uncertain, Ordering::Relaxed);
     }
 }
 
