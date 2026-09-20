@@ -27,6 +27,7 @@ struct Writer {
     last_flush: Instant,
     sequence: u64,
     pending: Vec<Value>,
+    pending_context: Option<ContextKey>,
     lost: i64,
     budget: u64,
     finished: bool,
@@ -117,8 +118,11 @@ fn open(path: &Path) -> Result<Connection> {
         "unsupported tuning history version {version}"
     );
     if version == 0 {
-        db.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-        let transaction = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        db.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .context("configure history page reclamation")?;
+        let transaction = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("lock history for initialization")?;
         // Another process may have initialized the database while we waited.
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         anyhow::ensure!(
@@ -147,7 +151,28 @@ fn open(path: &Path) -> Result<Connection> {
         }
         transaction.commit()?;
     }
-    db.pragma_update(None, "journal_mode", "WAL")?;
+    // Concurrent first opens can race while changing journal mode. SQLite
+    // returns BUSY immediately for this lock upgrade, without the busy handler.
+    // Retry only this operation, within the same small startup wait budget.
+    db.busy_timeout(Duration::ZERO)?;
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match db.pragma_update(None, "journal_mode", "WAL") {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy && Instant::now() < deadline =>
+            {
+                std::thread::sleep(
+                    Duration::from_millis(2)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            result => {
+                result.context("enable history WAL")?;
+                break;
+            }
+        }
+    }
+    db.busy_timeout(Duration::from_millis(100))?;
     db.pragma_update(None, "synchronous", "NORMAL")?;
     db.pragma_update(None, "foreign_keys", true)?;
     Ok(db)
@@ -194,6 +219,7 @@ impl Recorder {
             last_flush: Instant::now(),
             sequence: 0,
             pending: Vec::new(),
+            pending_context: None,
             lost: 0,
             budget,
             finished: false,
@@ -243,10 +269,10 @@ impl Recorder {
     }
 
     pub(crate) fn context(&self, key: &ContextKey) {
-        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if let Err(error) = state.db.execute("UPDATE runs SET context=?1,route=?2,source_fs=?3,destination_fs=?4,mode=?5 WHERE id=?6",
-            params![serde_json::to_string(key).unwrap(), key.route, key.source_filesystem, key.destination_filesystem, key.mode, state.id]) {
-            diagnostic(&error.into());
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.pending_context = Some(key.clone());
+        if let Err(error) = state.flush() {
+            diagnostic(&error);
         }
     }
 
@@ -307,10 +333,17 @@ fn select_hint(db: &Connection, key: &ContextKey, allow_route: bool) -> Result<O
 
 impl Writer {
     fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.pending_context.is_none() {
             return Ok(());
         }
         let transaction = self.db.unchecked_transaction()?;
+        // Context revisions (for example, discovering a mixed-filesystem tree)
+        // must survive contention just like samples. Finish flushes this before
+        // publishing any recommendation under the context.
+        if let Some(key) = &self.pending_context {
+            transaction.execute("UPDATE runs SET context=?1,route=?2,source_fs=?3,destination_fs=?4,mode=?5 WHERE id=?6",
+                params![serde_json::to_string(key)?, key.route, key.source_filesystem, key.destination_filesystem, key.mode, self.id])?;
+        }
         {
             let mut insert = transaction.prepare("INSERT INTO events VALUES (?1,?2,?3,?4)")?;
             for event in &self.pending {
@@ -328,6 +361,7 @@ impl Writer {
         )?;
         transaction.commit()?;
         self.pending.clear();
+        self.pending_context = None;
         self.last_flush = Instant::now();
         Ok(())
     }

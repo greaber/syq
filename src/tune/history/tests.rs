@@ -127,23 +127,32 @@ fn retention_removes_whole_old_runs_and_keeps_current_and_active() {
 }
 
 #[test]
-fn lock_contention_keeps_samples_for_later_flush() {
+fn lock_contention_keeps_samples_and_context_for_later_flush() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
     let writer = recorder(&path);
+    writer.context(&key("a"));
     let other = open(&path).unwrap();
     other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let mut mixed = key("a");
+    mixed.destination_filesystem = None;
+    writer.context(&mixed);
     writer.event("sample", json!({"bytes":123}));
     writer.flush();
     assert_eq!(writer.0.lock().unwrap().pending.len(), 1);
     other.execute_batch("COMMIT").unwrap();
-    writer.flush();
+    writer.finish(true, true, Some(8), json!({}));
     assert!(writer.0.lock().unwrap().pending.is_empty());
+    assert!(writer.0.lock().unwrap().pending_context.is_none());
+    assert!(writer.hint(&key("a"), false).is_none());
+    let run = command::read_run(&other, writer.0.lock().unwrap().id).unwrap();
+    assert_eq!(run["context"]["destination_filesystem"], Value::Null);
+    assert_eq!(run["recommendation_eligible"], true);
     assert_eq!(
         command::read_events(&other, writer.0.lock().unwrap().id)
             .unwrap()
             .len(),
-        2
+        3
     );
 }
 
