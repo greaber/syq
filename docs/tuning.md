@@ -142,22 +142,13 @@ independent history file; an empty value disables history and its startup hints
 while leaving the older cache available. New database files are private to the
 user. SQLite may create adjacent `-wal` and `-shm` files while in use.
 
-`SYQ_TUNING_HISTORY_SIZE` sets a retention target, default `1G`, minimum `16M`.
-There is no age expiry for completed transfers. Above the target, new transfers
-continue to be recorded and the oldest stored transfers and their timelines are
-removed to make room. Their startup recommendations are removed with them;
-using a recommendation does not refresh its age. The current transfer and
-recently active incomplete records are preserved, so disk use can temporarily
-exceed the target. Increase the target to keep more history.
+`SYQ_TUNING_HISTORY_SIZE` sets how much history to keep, default `1G`, minimum
+`16M`. History may be removed when this size target is exceeded.
 
-Recording is buffered and best effort. Copies still proceed when history cannot
-be written. An interrupted process can leave an incomplete timeline; prolonged
-write contention can lose events, reported in the history when it becomes
-writable again. History writes do not force a disk sync. A system crash or power
-loss can lose or corrupt this disposable history. If it becomes unreadable,
-stop active transfers and delete the history file and any adjacent `-wal` and
-`-shm` files to start fresh. Clearing history also removes its startup hints;
-it leaves the older connection-count cache intact.
+Recording is best effort: an interrupted transfer or a storage error can leave
+gaps in the history. Copies still proceed when history cannot be saved.
+Clearing history also removes its startup hints; it leaves the older
+connection-count cache intact.
 
 ## Filesystem tuning examples
 
