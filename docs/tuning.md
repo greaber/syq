@@ -78,7 +78,10 @@ for buffering and upload-size limits. S3 tuning is not saved between runs.
 Remote copies start from the last learned count for the same route, direction,
 and transport, or from 8 workers over SSH and 16 over TCP. Successful copies
 update the cache after comparing enough worker counts. Short copies may finish
-before syq learns a better count.
+before syq learns a better count. Without a learned starting count, automatic
+filesystem copies initially double the worker count while throughput improves,
+then refine between measured counts. Copies starting from a cached count keep
+smaller probes. Worker limits still apply.
 
 The cache is `~/.cache/syq/tuning.json`; `XDG_CACHE_HOME` changes its parent.
 `SYQ_TUNING_CACHE` names another file, or disables the cache when empty.

@@ -128,8 +128,52 @@ fn explicit_ceiling_above_64_bounds_automatic_growth() {
 }
 
 #[test]
-fn first_probe_is_modest_instead_of_doubling() {
-    let mut p = Policy::new(START_SSH, MIN, MAX);
+fn uncached_start_doubles_until_the_ceiling_then_stops_coarse_search() {
+    let mut p = Policy::new(8, MIN, 32);
+    for _ in 0..3 {
+        let rate = p.n as f64;
+        measure(&mut p, rate);
+    }
+    assert_eq!(p.history, vec![8, 16, 32]);
+    assert_eq!(p.n, 32);
+    assert!(!p.startup_doubling);
+    let mut capped = Policy::new(usize::MAX / 2 + 1, MIN, usize::MAX);
+    measure(&mut capped, 100.0);
+    assert_eq!(capped.n, usize::MAX);
+}
+
+#[test]
+fn unsuccessful_doubling_refines_immediately_then_uses_normal_backoff() {
+    let mut p = Policy::new(8, MIN, 64);
+    measure(&mut p, 80.0); // 8 -> 16
+    measure(&mut p, 160.0); // 16 -> 32
+    measure(&mut p, 150.0); // 32 hurt: try the 16..32 midpoint now
+    assert_eq!(p.n, 24);
+    assert_eq!(p.settled(), 16);
+    assert!(!p.startup_doubling);
+    measure(&mut p, 200.0); // 24 paid: refine the remaining 24..32 bracket
+    assert_eq!(p.n, 28);
+    measure(&mut p, 200.0); // 28 does not pay: return to 24 and wait
+    assert_eq!(p.n, 24);
+    assert!(matches!(p.state, State::Hold));
+    assert!(p.due[Direction::Up.index()] > p.tick);
+}
+
+#[test]
+fn cancelled_startup_doubling_does_not_change_active_workers_or_repeat_coarse_search() {
+    let mut p = Policy::new(8, MIN, 64);
+    p.observe(80.0);
+    assert_eq!(p.n, 16);
+    p.cancel_unapplied();
+    assert_eq!(p.n, 8);
+    assert_eq!(p.history, vec![8]);
+    assert!(!p.startup_doubling);
+    assert_eq!(p.target(Direction::Up), 10);
+}
+
+#[test]
+fn cached_start_keeps_modest_probes() {
+    let mut p = Policy::from_cache(START_SSH, MIN, MAX);
     measure(&mut p, 80.0);
     assert_eq!(p.n, 10);
     assert_eq!(p.history, vec![8, 10]);
@@ -137,12 +181,12 @@ fn first_probe_is_modest_instead_of_doubling() {
 
 #[test]
 fn upward_acceptance_uses_the_near_best_objective() {
-    let mut worthwhile = Policy::new(10, MIN, MAX);
+    let mut worthwhile = Policy::from_cache(10, MIN, MAX);
     measure(&mut worthwhile, 100.0);
     measure(&mut worthwhile, 107.0);
     assert_eq!(worthwhile.settled(), 13);
 
-    let mut unnecessary = Policy::new(10, MIN, MAX);
+    let mut unnecessary = Policy::from_cache(10, MIN, MAX);
     measure(&mut unnecessary, 100.0);
     measure(&mut unnecessary, 104.0);
     assert_eq!(unnecessary.settled(), 10);
@@ -172,7 +216,7 @@ fn remaining_work_requirement_scales_with_rate_not_worker_count() {
 
 #[test]
 fn upward_probe_refreshes_its_baseline_while_warming() {
-    let mut policy = Policy::new(10, MIN, MAX);
+    let mut policy = Policy::from_cache(10, MIN, MAX);
     policy.observe(100.0);
     assert_eq!(policy.active(), 10);
     assert_eq!(policy.n, 13);
@@ -187,7 +231,7 @@ fn upward_probe_refreshes_its_baseline_while_warming() {
 #[test]
 fn successful_direction_continues_to_the_plateau() {
     let p = simulate(START_SSH, 32, 80, |_| 1.0);
-    assert_eq!(&p.history[..6], &[8, 10, 13, 17, 22, 29]);
+    assert_eq!(&p.history[..5], &[8, 16, 32, 64, 48]);
     // 31 is the smallest integer within 5% of the observed best (32).
     assert_eq!(p.settled(), 31, "history {:?}", p.history);
 }
@@ -203,7 +247,7 @@ fn a_gain_at_the_cap_holds_at_the_cap() {
 
 #[test]
 fn a_failed_up_probe_does_not_immediately_bounce_down() {
-    let mut p = Policy::new(10, MIN, MAX);
+    let mut p = Policy::from_cache(10, MIN, MAX);
     measure(&mut p, 100.0); // 10 -> 13
     measure(&mut p, 130.0); // 13 paid; try 17
     measure(&mut p, 130.0); // 17 did not; return to 13
@@ -219,7 +263,7 @@ fn a_failed_up_probe_does_not_immediately_bounce_down() {
 
 #[test]
 fn refines_to_the_smallest_near_best_integer() {
-    let mut p = Policy::new(10, MIN, MAX);
+    let mut p = Policy::from_cache(10, MIN, MAX);
     measure(&mut p, 100.0);
     measure(&mut p, 130.0);
     measure(&mut p, 130.0);

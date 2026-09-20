@@ -1764,7 +1764,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         })
     };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
-    let spawn_workers = |initial: usize| {
+    let spawn_workers = |initial: usize, cached_start: bool| {
         gate.set_active(initial);
         for id in gate.begin_warming(initial) {
             spawn_worker(id);
@@ -1777,7 +1777,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 spawn_worker.clone(),
             );
             let n0 = initial;
-            let policy = tune::Policy::new(n0, tune::MIN, maximum_workers);
+            let policy = if cached_start {
+                tune::Policy::from_cache(n0, tune::MIN, maximum_workers)
+            } else {
+                tune::Policy::new(n0, tune::MIN, maximum_workers)
+            };
             *tuner.lock().unwrap() = Some(std::thread::spawn(move || {
                 tune::run(policy, gate, sched, progress, |id| spawn_worker(id))
             }));
@@ -2395,7 +2399,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !destination_tree_known_missing
         && std::env::var_os("SYQ_INTERNAL_DETACH_READY").is_none()
         && !pending_tcp_setups.is_empty();
-    let mut finish_transport_setup = |args: &mut Args| -> Result<(bool, Option<String>)> {
+    let mut finish_transport_setup = |args: &mut Args| -> Result<(bool, Option<String>, bool)> {
         for (spec, pending) in std::mem::take(&mut pending_tcp_setups) {
             if let Err(error) = spec.finish_tcp_setup(pending) {
                 handle_tcp_setup_error(
@@ -2479,7 +2483,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 );
             }
         }
-        Ok((all_remote_endpoints_use_tcp, tuning_key))
+        Ok((
+            all_remote_endpoints_use_tcp,
+            tuning_key,
+            remembered_start.is_some(),
+        ))
     };
     let mut transport_setup = if defer_transport_setup {
         None
@@ -2487,7 +2495,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Some(finish_transport_setup(&mut args)?)
     };
     let mut workers_started = false;
-    if transport_setup.as_ref().is_some_and(|(tcp, _)| *tcp)
+    if transport_setup.as_ref().is_some_and(|(tcp, _, _)| *tcp)
         && destination_tree_known_missing
         && !opts.dry_run
         && !opts.inplace
@@ -2498,7 +2506,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // therefore open no data connections, while fresh file trees cover TCP
         // authentication with work the control connection must do anyway.
         connect_after_file_plan.store(true, Relaxed);
-        spawn_workers(args.connections);
+        spawn_workers(
+            args.connections,
+            transport_setup
+                .as_ref()
+                .is_some_and(|(_, _, cached)| *cached),
+        );
         workers_started = true;
     }
 
@@ -2677,7 +2690,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if transport_setup.is_none() {
         transport_setup = Some(finish_transport_setup(&mut args)?);
     }
-    let (all_remote_endpoints_use_tcp, tuning_key) =
+    let (all_remote_endpoints_use_tcp, tuning_key, cached_start) =
         transport_setup.expect("transport setup completed before releasing planned work");
     // The complete buffered scan lets small trees keep the same bounded
     // starting count as normal scheduling. Open TCP workers while the control
@@ -2718,13 +2731,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
         if files > 0 && all_small {
-            spawn_workers(initial_fast_workers(
-                args.connections,
-                files,
-                bytes,
-                opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
-                opts.tuning.batch_bytes(),
-            ));
+            spawn_workers(
+                initial_fast_workers(
+                    args.connections,
+                    files,
+                    bytes,
+                    opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
+                    opts.tuning.batch_bytes(),
+                ),
+                cached_start,
+            );
             workers_started = true;
         }
     }
@@ -2866,7 +2882,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         sched.arm_direct_fallback(args.connections);
                         initial = 1;
                     }
-                    spawn_workers(initial);
+                    spawn_workers(initial, cached_start);
                 }
             }
         }
