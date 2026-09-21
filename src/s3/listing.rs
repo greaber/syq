@@ -113,7 +113,13 @@ impl Store for S3<'_> {
         !self.bucket.ends_with("--x-s3")
     }
 
-    async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+    async fn page(
+        &self,
+        prefix: &str,
+        delimiter: bool,
+        token: Option<&str>,
+        start_after: Option<&str>,
+    ) -> Result<Page> {
         let response = self
             .client
             .list_objects_v2()
@@ -123,6 +129,7 @@ impl Store for S3<'_> {
             .encoding_type(aws_sdk_s3::types::EncodingType::Url)
             .set_delimiter(delimiter.then(|| "/".into()))
             .set_continuation_token(token.map(str::to_owned))
+            .set_start_after(start_after.map(str::to_owned))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("{}", super::client::failure("listing S3 objects", &e)))?;

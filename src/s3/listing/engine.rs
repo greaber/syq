@@ -40,6 +40,7 @@ pub(in crate::s3) trait Store {
         prefix: &str,
         delimiter: bool,
         token: Option<&str>,
+        start_after: Option<&str>,
     ) -> impl Future<Output = Result<Page>>;
 }
 
@@ -53,9 +54,15 @@ impl<S: Store> Store for LimitedStore<'_, S> {
     fn ordered(&self) -> bool {
         self.inner.ordered()
     }
-    async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+    async fn page(
+        &self,
+        prefix: &str,
+        delimiter: bool,
+        token: Option<&str>,
+        start_after: Option<&str>,
+    ) -> Result<Page> {
         let _permit = self.slots.acquire().await?;
-        self.inner.page(prefix, delimiter, token).await
+        self.inner.page(prefix, delimiter, token, start_after).await
     }
 }
 
@@ -69,6 +76,7 @@ enum Job {
     Recursive {
         prefix: String,
         depth: usize,
+        start_after: Option<String>,
     },
     Scan {
         prefix: String,
@@ -103,7 +111,17 @@ async fn read(
     delimiter: bool,
     token: Option<&str>,
 ) -> Result<Page> {
-    let page = store.page(prefix, delimiter, token).await?;
+    read_after(store, prefix, delimiter, token, None).await
+}
+
+async fn read_after(
+    store: &impl Store,
+    prefix: &str,
+    delimiter: bool,
+    token: Option<&str>,
+    start_after: Option<&str>,
+) -> Result<Page> {
+    let page = store.page(prefix, delimiter, token, start_after).await?;
     ensure!(
         page.entries.len() + page.prefixes.len() <= 1000,
         "S3 listing exceeded the requested page size"
@@ -115,6 +133,10 @@ async fn read(
         "S3 listing returned an invalid continuation token"
     );
     for entry in &page.entries {
+        ensure!(
+            start_after.is_none_or(|after| entry.key.as_str() > after),
+            "S3 listing returned a key at or before StartAfter"
+        );
         ensure!(
             entry.key.starts_with(prefix),
             "S3 listing returned a key outside the requested prefix"
@@ -139,7 +161,11 @@ async fn execute(
     split: bool,
 ) -> Result<Batch> {
     let (mut prefix, mut component, depth) = match job {
-        Job::Recursive { prefix, depth } => return recursive(store, prefix, depth, split).await,
+        Job::Recursive {
+            prefix,
+            depth,
+            start_after,
+        } => return recursive(store, prefix, depth, split, start_after.as_deref()).await,
         Job::Scan {
             prefix,
             delimiter,
@@ -168,7 +194,7 @@ async fn execute(
     let part = &pattern.components[component];
     let query = format!("{prefix}{}", part.literal_prefix());
     if part.recursive() {
-        return recursive(store, query, depth, split).await;
+        return recursive(store, query, depth, split, None).await;
     }
     if !split && component + 1 < pattern.components.len() {
         let page = read(store, &query, false, None).await?;
@@ -222,8 +248,14 @@ fn dense_children(query: &str, page: &Page) -> usize {
     counts.values().filter(|count| **count >= 256).count()
 }
 
-async fn recursive(store: &impl Store, query: String, depth: usize, split: bool) -> Result<Batch> {
-    let mut flat = read(store, &query, false, None).await?;
+async fn recursive(
+    store: &impl Store,
+    query: String,
+    depth: usize,
+    split: bool,
+    start_after: Option<&str>,
+) -> Result<Batch> {
+    let mut flat = read_after(store, &query, false, None, start_after).await?;
     if flat.next.is_none()
         || !split
         || !store.ordered()
@@ -266,25 +298,29 @@ async fn recursive(store: &impl Store, query: String, depth: usize, split: bool)
     {
         return Ok(scan_batch(query, false, flat));
     }
-    // S3 general-purpose buckets order keys lexically. Entire children before
-    // the last sampled child are complete already: emit those objects and do
-    // not list them again. Only the partial last child is fetched again.
-    let last = &flat.entries.last().unwrap().key;
-    let (complete, pending): (Vec<_>, Vec<_>) = branches
-        .prefixes
+    // Retain every sampled child entry, then resume the partial last child
+    // strictly after the last sampled key. Continuation tokens stay with their
+    // original request; StartAfter establishes a new child-prefix listing.
+    let last = flat.entries.last().unwrap().key.clone();
+    let mut entries: Vec<_> = branches
+        .entries
         .into_iter()
-        .partition(|prefix| prefix < last && !last.starts_with(prefix));
-    let mut entries = branches.entries;
-    entries.extend(
-        flat.entries
-            .into_iter()
-            .filter(|entry| complete.iter().any(|prefix| entry.key.starts_with(prefix))),
-    );
+        .filter(|entry| start_after.is_none_or(|start| entry.key.as_str() > start))
+        .collect();
+    entries.extend(flat.entries.into_iter().filter(|entry| {
+        branches
+            .prefixes
+            .iter()
+            .any(|prefix| entry.key.starts_with(prefix))
+    }));
     Ok(Batch {
         entries,
-        jobs: pending
+        jobs: branches
+            .prefixes
             .into_iter()
+            .filter(|prefix| prefix >= &last || last.starts_with(prefix))
             .map(|prefix| Job::Recursive {
+                start_after: last.starts_with(&prefix).then(|| last.clone()),
                 prefix,
                 depth: depth + 1,
             })
@@ -349,6 +385,7 @@ pub(in crate::s3) async fn enumerate_prefix(
         Job::Recursive {
             prefix: prefix.to_owned(),
             depth: 0,
+            start_after: None,
         },
         &mut emit,
     )

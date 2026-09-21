@@ -25,9 +25,9 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 Large unfiltered prefix copies, current-object removals, and destination scans
 for pruning can list subtrees concurrently. Discovery may use extra LIST
-requests; selectors still name literal keys and prefixes. For copies, an explicit S3
-concurrency limit also caps unfiltered discovery; a limit of one keeps flat
-pagination. If a policy denies discovery, these operations retry with flat
+requests; selectors still name literal keys and prefixes. For copies,
+`--performance-tuning s3-max-concurrent-parts-per-object=N` also caps unfiltered
+discovery; setting `N=1` keeps flat pagination. If a policy denies discovery, these operations retry with flat
 pagination at the original prefix.
 
 ## Authorize from your laptop

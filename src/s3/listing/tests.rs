@@ -8,6 +8,7 @@ use std::{
 struct Memory {
     keys: BTreeSet<String>,
     calls: RefCell<Vec<(String, bool)>>,
+    resumes: RefCell<Vec<(String, String)>>,
     active: Cell<usize>,
     peak: Cell<usize>,
 }
@@ -16,27 +17,38 @@ impl Memory {
         Self {
             keys: keys.into_iter().collect(),
             calls: RefCell::default(),
+            resumes: RefCell::default(),
             active: Cell::new(0),
             peak: Cell::new(0),
         }
     }
 }
 impl Store for Memory {
-    async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+    async fn page(
+        &self,
+        prefix: &str,
+        delimiter: bool,
+        token: Option<&str>,
+        start_after: Option<&str>,
+    ) -> Result<Page> {
         self.calls.borrow_mut().push((prefix.into(), delimiter));
+        if let Some(after) = start_after {
+            assert!(!delimiter && token.is_none());
+            self.resumes
+                .borrow_mut()
+                .push((prefix.into(), after.into()));
+        }
         self.active.set(self.active.get() + 1);
         self.peak.set(self.peak.get().max(self.active.get()));
         tokio::time::sleep(Duration::from_millis(1)).await;
         self.active.set(self.active.get() - 1);
-        let start = token
-            .map(|t| {
-                let marker = format!("{}:{prefix}:", u8::from(delimiter));
-                t.strip_prefix(&marker)
-                    .expect("token must stay with its original query")
-                    .parse::<usize>()
-                    .unwrap()
-            })
-            .unwrap_or(0);
+        let token_start = token.map(|t| {
+            let marker = format!("{}:{prefix}:", u8::from(delimiter));
+            t.strip_prefix(&marker)
+                .expect("token must stay with its original query")
+                .parse::<usize>()
+                .unwrap()
+        });
         let mut items = BTreeMap::new();
         for key in &self.keys {
             let Some(suffix) = key.strip_prefix(prefix) else {
@@ -48,6 +60,12 @@ impl Store for Memory {
                 items.insert(key.clone(), false);
             }
         }
+        let start = token_start.unwrap_or_else(|| {
+            items
+                .keys()
+                .take_while(|key| start_after.is_some_and(|after| key.as_str() <= after))
+                .count()
+        });
         let next = (items.len() > start + 1000)
             .then(|| format!("{}:{prefix}:{}", u8::from(delimiter), start + 1000));
         let mut page = Page {
@@ -186,7 +204,13 @@ async fn flat_wide_and_deep_fallbacks_preserve_pagination() {
 async fn partial_listing_and_output_failures_propagate() {
     struct Fault;
     impl Store for Fault {
-        async fn page(&self, _: &str, _: bool, token: Option<&str>) -> Result<Page> {
+        async fn page(
+            &self,
+            _: &str,
+            _: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
             anyhow::ensure!(token.is_none(), "injected page failure");
             Ok(Page {
                 entries: vec![Entry {
@@ -222,7 +246,7 @@ async fn partial_listing_and_output_failures_propagate() {
 async fn malformed_pages_fail() {
     struct Bad(bool);
     impl Store for Bad {
-        async fn page(&self, _: &str, _: bool, _: Option<&str>) -> Result<Page> {
+        async fn page(&self, _: &str, _: bool, _: Option<&str>, _: Option<&str>) -> Result<Page> {
             Ok(if self.0 {
                 Page {
                     next: Some(String::new()),
@@ -318,7 +342,7 @@ async fn two_page_dense_tree_finishes_flat_and_dense_branches_overlap() {
         (0..8).flat_map(|d| (0..2000).map(move |i| format!("tree/dir{d:02}/file{i:04}"))),
     );
     assert_eq!(listed(&store, "tree/**", 32).await.len(), 16000);
-    assert_eq!(store.calls.borrow().len(), 18);
+    assert_eq!(store.calls.borrow().len(), 17);
     assert!(store.peak.get() > 1);
     assert!(store.peak.get() <= 8);
 }
@@ -355,7 +379,13 @@ async fn unordered_stores_do_not_apply_exact_key_shortcut() {
         fn ordered(&self) -> bool {
             false
         }
-        async fn page(&self, _: &str, _: bool, token: Option<&str>) -> Result<Page> {
+        async fn page(
+            &self,
+            _: &str,
+            _: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
             Ok(Page {
                 entries: vec![Entry {
                     key: if token.is_none() {
@@ -410,8 +440,14 @@ async fn medium_density_keeps_latency_parallelism_and_reuses_complete_children()
 async fn incomplete_directory_probe_cannot_discard_observed_objects() {
     struct Incomplete(Memory);
     impl Store for Incomplete {
-        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
-            let mut page = self.0.page(prefix, delimiter, token).await?;
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            start_after: Option<&str>,
+        ) -> Result<Page> {
+            let mut page = self.0.page(prefix, delimiter, token, start_after).await?;
             if delimiter {
                 page.prefixes.retain(|prefix| prefix != "tree/dir01/");
             }
@@ -437,4 +473,26 @@ async fn incomplete_directory_probe_cannot_discard_observed_objects() {
         .borrow()
         .iter()
         .all(|(prefix, _)| prefix == "tree/"));
+}
+
+#[tokio::test]
+async fn resumed_child_can_split_again_without_losing_or_duplicating_keys() {
+    let store = Memory::new(
+        (0..1200)
+            .map(|i| format!("tree/a/{i:04}"))
+            .chain((0..8).flat_map(|d| (0..1200).map(move |i| format!("tree/b/{d}/sp +%é{i:04}"))))
+            .chain([
+                "tree/b/".into(),
+                "tree/b/0/".into(),
+                "tree/b/8-direct".into(),
+                "tree/z".into(),
+            ]),
+    );
+    let expected: Vec<_> = store.keys.iter().cloned().collect();
+    assert_eq!(listed(&store, "tree/**", 8).await, expected);
+    let resumes = store.resumes.borrow();
+    assert!(resumes.iter().any(|(prefix, _)| prefix == "tree/b/"));
+    assert!(resumes
+        .iter()
+        .any(|(prefix, _)| prefix.starts_with("tree/b/") && prefix != "tree/b/"));
 }

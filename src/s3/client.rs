@@ -769,7 +769,13 @@ async fn parallel_listing(
             !self.bucket.ends_with("--x-s3")
         }
 
-        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            start_after: Option<&str>,
+        ) -> Result<Page> {
             let response = self
                 .client
                 .list_objects_v2()
@@ -778,6 +784,7 @@ async fn parallel_listing(
                 .max_keys(1000)
                 .set_delimiter(delimiter.then(|| "/".into()))
                 .set_continuation_token(token.map(str::to_owned))
+                .set_start_after(start_after.map(str::to_owned))
                 .send()
                 .await
                 .map_err(|error| {

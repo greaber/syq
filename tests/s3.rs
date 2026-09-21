@@ -1085,6 +1085,11 @@ fn serve(
                 ("tree/" | "tree/a/", None) => (0..1000, Some("next")),
                 ("tree/", Some("next")) => (1000..2000, Some("last")),
                 ("tree/a/", Some("next")) => (1000..2000, None),
+                ("tree/b/", None)
+                    if query.get("start-after").map(|s| s.as_ref()) == Some("tree/b/2999") =>
+                {
+                    (3000..4000, None)
+                }
                 ("tree/", Some("last")) | ("tree/b/", None) => (2000..3000, Some("tail")),
                 ("tree/" | "tree/b/", Some("tail")) => (3000..4000, None),
                 other => panic!("unexpected listing {other:?}"),

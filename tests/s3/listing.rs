@@ -143,7 +143,7 @@ fn experimental_listing_help_and_invalid_arguments() {
     for (args, visible) in [
         (vec!["help"], false),
         (vec!["--help"], false),
-        (vec!["help", "--all"], true),
+        (vec!["help", "--help-all"], true),
         (vec!["--help-all"], true),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_syq"))

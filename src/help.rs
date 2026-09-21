@@ -405,7 +405,7 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("help topic is not UTF-8"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let full = matches!(topics.last(), Some(&"--help-all" | &"--all"));
+    let full = matches!(topics.last(), Some(&"--help-all"));
     if full || matches!(topics.last(), Some(&"--help" | &"-h")) {
         topics.pop();
     }
