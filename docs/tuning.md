@@ -91,15 +91,24 @@ cache, then fall back to 8 workers over SSH or 16 over TCP. Local copies start
 with 32 workers, or 16 when at most two CPUs are available. Startup can reduce
 these counts when there is little parallel work. A remembered count is a starting
 guess; syq keeps exploring quickly unless a successful transfer closely matches
-the current filesystems and settings and measured a throughput plateau. Live
+the current filesystems, settings, and known network context and measured a throughput plateau. Live
 tuning continues unless you fix `workers`.
+
+On macOS and Linux, remote-copy hints also distinguish local networks using
+available default-router hardware addresses, without requesting Wi-Fi location
+permission. These are hints about the network around the machine running syq;
+they cannot detect changes upstream of a phone hotspot. Linux currently reads
+IPv4 routers; macOS also reads IPv6 routers. If the network cannot be identified,
+syq can reuse a starting guess from another unidentified-network run but keeps
+initial discovery enabled. Older remote hints without network context are not
+reused by this version; local-copy hints are unchanged.
 
 Supplying `--performance-tuning` bypasses remembered counts and does not publish
 a new recommendation. With `--resource-limits workers=N`, syq clamps the starting
 count and leaves recommendations unchanged. Bandwidth-limited runs have separate
 history matches. Only successful runs with a completed worker-count comparison
 can supply a recommendation; a short run's ending count is not treated as an
-optimum. A change of data transport during the copy also prevents publication.
+optimum. A change of data transport or observed network context during the copy also prevents publication.
 
 The older cache remains at `~/.cache/syq/tuning.json`, in its existing format.
 `SYQ_TUNING_CACHE` names another file; an empty value disables both this cache

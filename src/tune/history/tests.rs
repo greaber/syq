@@ -582,3 +582,52 @@ fn repeated_inconclusive_copies_preserve_history_and_legacy_start() {
         }
     }
 }
+
+#[test]
+fn network_scoped_hints_do_not_cross_networks_or_trust_unknown_context() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let network_key = |network: Option<&str>| {
+        let mut key = key("a");
+        key.source_transport = "Local".into();
+        key.destination_transport = "Ssh".into();
+        key.route = super::super::network_key(&key.route, network);
+        key.network = network.map(str::to_owned);
+        key
+    };
+    // An unchanged pre-fingerprint context remains readable, but does not seed
+    // network-specific or explicitly unknown-network contexts.
+    let old = recorder(&path);
+    old.context(&key("a"));
+    old.recommend(64, true);
+    old.complete(true, json!({}));
+    let home = recorder(&path);
+    assert!(home.hint(&network_key(Some("home")), true).is_none());
+    home.context(&network_key(Some("home")));
+    home.recommend(8, true);
+    home.complete(true, json!({}));
+    let office = recorder(&path);
+    assert!(office.hint(&network_key(Some("office")), true).is_none());
+    office.context(&network_key(Some("office")));
+    office.recommend(32, true);
+    office.complete(true, json!({}));
+    let next = recorder(&path);
+    let hint = next.hint(&network_key(Some("home")), true).unwrap();
+    assert_eq!(hint.workers, 8);
+    assert!(hint.refine);
+    assert_eq!(
+        next.hint(&network_key(Some("office")), true)
+            .unwrap()
+            .workers,
+        32
+    );
+    assert!(next.hint(&network_key(None), true).is_none());
+    next.context(&network_key(None));
+    next.recommend(16, true);
+    next.complete(true, json!({}));
+    let hint = next.hint(&network_key(None), true).unwrap();
+    assert_eq!(hint.workers, 16);
+    assert!(!hint.refine);
+    // An old selector can still read its unchanged route after new writes.
+    assert_eq!(next.hint(&key("a"), true).unwrap().workers, 64);
+}

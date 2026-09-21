@@ -1145,3 +1145,25 @@ fn aging_evidence_does_not_make_a_slower_reduction_acceptable() {
         assert_eq!(p.recommended(), 32);
     }
 }
+
+#[test]
+fn network_keys_preserve_the_v060_legacy_map() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let path = dir.path().join("tuning.json");
+    let fixture = br#"{"paths":{"local>user@host|tcp":128,"user@host>local|ssh":4}}"#;
+    std::fs::write(&path, fixture).unwrap();
+    let old = "local>user@host|tcp";
+    let home = network_key(old, Some("home"));
+    let office = network_key(old, Some("office"));
+    let unknown = network_key(old, None);
+    assert_eq!(cached_at(&path, &home), None);
+    assert_eq!(cached_at(&path, &unknown), None);
+    remember_at(&path, &home, 8).unwrap();
+    remember_at(&path, &office, 32).unwrap();
+    assert_eq!(cached_at(&path, old), Some(128));
+    assert_eq!(cached_at(&path, &home), Some(8));
+    assert_eq!(cached_at(&path, &office), Some(32));
+    remember_at(&path, old, 64).unwrap();
+    assert_eq!(cached_at(&path, &home), Some(8));
+    assert_eq!(cached_at(&path, &office), Some(32));
+}

@@ -46,6 +46,8 @@ pub(crate) struct ContextKey {
     pub source_filesystem: Option<String>,
     pub destination_filesystem: Option<String>,
     pub mode: String,
+    #[serde(default)]
+    pub network: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +365,9 @@ impl Recorder {
 }
 
 fn select_hint(db: &Connection, key: &ContextKey, allow_route: bool) -> Result<Option<Hint>> {
+    let remote = [&key.source_transport, &key.destination_transport]
+        .into_iter()
+        .any(|t| matches!(t.as_str(), "Ssh" | "EncryptedTcp" | "PlaintextTcp"));
     if let (Some(src), Some(dst)) = (&key.source_filesystem, &key.destination_filesystem) {
         let hint = db.query_row("SELECT id,workers,summary FROM runs WHERE route=?1 AND mode=?2 AND source_fs=?3 AND destination_fs=?4 AND status='success' AND eligible=1 AND workers>0 ORDER BY id DESC LIMIT 1",
             params![key.route,key.mode,src,dst], |r| {
@@ -371,7 +376,8 @@ fn select_hint(db: &Connection, key: &ContextKey, allow_route: bool) -> Result<O
                 let summary: Option<String> = r.get(2)?;
                 let refine = summary.as_deref()
                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                    .is_some_and(|s| s["discovery_complete"] == true);
+                    .is_some_and(|s| s["discovery_complete"] == true)
+                    && (!remote || key.network.is_some());
                 Ok(Hint {run:r.get(0)?,workers:r.get::<_,u32>(1)? as usize,matched:"filesystems".into(),refine})
             }).optional()?;
         if hint.is_some() {
@@ -520,7 +526,15 @@ pub(crate) fn context_key(
         source_transport,
         destination_transport
     );
+    let remote = source_transport != "Local" || destination_transport != "Local";
+    let network = remote.then(super::network::fingerprint).flatten();
+    let route = if remote {
+        super::network_key(&route, network.as_deref())
+    } else {
+        route
+    };
     ContextKey {
+        network: network.as_deref().map(|n| recorder.token("network", n)),
         source_endpoint: recorder.token("endpoint", &super::endpoint_key(src)),
         destination_endpoint: recorder.token("endpoint", &super::endpoint_key(dst)),
         source_transport,

@@ -27,6 +27,7 @@
 //! shared switch the workers consult; [`run`] is the driver.
 
 pub(crate) mod history;
+mod network;
 pub(crate) mod trace;
 
 use crate::conn::{DataTransport, Endpoint};
@@ -170,6 +171,20 @@ pub fn path_key(src: &Endpoint, dst: &Endpoint) -> Option<String> {
         endpoint_key(src),
         endpoint_key(dst)
     ))
+}
+
+/// Network-aware keys are additive: released binaries keep reading/writing
+/// their own unscoped entries in the unchanged legacy paths map.
+pub fn network_path_key(src: &Endpoint, dst: &Endpoint) -> Option<String> {
+    let key = path_key(src, dst)?;
+    if transport_label(src).is_none() && transport_label(dst).is_none() {
+        return Some(key);
+    }
+    Some(network_key(&key, network::fingerprint().as_deref()))
+}
+
+fn network_key(key: &str, network: Option<&str>) -> String {
+    format!("{key}|network-v1={}", network.unwrap_or("unknown"))
 }
 
 fn cache_path() -> Option<PathBuf> {
