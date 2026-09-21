@@ -2599,6 +2599,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             selected_history = hint;
             *history_context.borrow_mut() = Some(key);
         }
+        if let Some(history) = progress.tuning_history.get() {
+            for (role, endpoint) in [("source", &src_ep), ("destination", &dst_ep)] {
+                if let Some(spec) = real_remote_spec(endpoint) {
+                    if let Some(probe) = spec.diagnostics().tcp_probe {
+                        history.tcp_probe(role, &spec.label(), &probe);
+                    }
+                }
+            }
+        }
         print_transport_diagnostics(args, &src_ep, &dst_ep);
         if args.verbose >= 2 {
             if let Some(hint) = &selected_history {
