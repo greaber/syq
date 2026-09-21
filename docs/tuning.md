@@ -39,13 +39,14 @@ coordinator too and are not saved.
 
 ## S3 copies
 
-Use these keys for `syq cp` with S3 endpoints.
+Use these keys for `syq cp` with S3 endpoints. `workers` applies only to
+filesystem copies; use `s3-requests` for the shared S3 data-request count.
 
 | Key | Default | Accepted values / meaning |
 |---|---|---|
-| `s3-max-concurrent-requests` | Automatic | 1–65536 simultaneous data requests across objects; excludes metadata requests and idle sockets |
-| `s3-max-concurrent-objects` | Automatic | 1–65536 objects in progress, including preparation and finalization |
-| `s3-max-concurrent-parts-per-object` | Automatic | 1–1024 simultaneous parts or ranges per object |
+| `s3-requests` | Automatic | 1–65536 simultaneous data requests across objects; excludes metadata requests and idle sockets |
+| `s3-objects` | Automatic | 1–65536 objects in progress, including preparation and finalization |
+| `s3-parts-per-object` | Automatic | 1–1024 simultaneous parts or ranges per object |
 | `s3-part-size` | Automatic | 5 MiB–5 GiB per upload part or download range |
 | `s3-retries` | `10` | 0–100 retries for transient failures and throttling; 0 disables retries |
 
@@ -53,7 +54,7 @@ The concurrency limits are nested. For example:
 
 ```sh
 syq cp data --to s3://backups --into archive \
-  --performance-tuning s3-max-concurrent-objects=4,s3-max-concurrent-parts-per-object=8,s3-max-concurrent-requests=16
+  --performance-tuning s3-objects=4,s3-parts-per-object=8,s3-requests=16
 ```
 
 This allows four objects in progress and up to eight parts per object, with at
@@ -74,7 +75,7 @@ for buffering and upload-size limits. S3 tuning is not saved between runs.
 Large unfiltered prefix copies, current-object removals, and destination scans
 for pruning can list subtrees concurrently. Discovery may use extra LIST
 requests; selectors still name literal keys and prefixes. For copies,
-`--performance-tuning s3-max-concurrent-parts-per-object=N` also caps unfiltered
+`--performance-tuning s3-parts-per-object=N` also caps unfiltered
 discovery; setting `N=1` keeps flat pagination. If a policy denies discovery, these operations retry with flat
 pagination at the original prefix.
 

@@ -3,7 +3,7 @@ use crate::hashing::HashAlgorithm;
 use anyhow::{bail, Result};
 use std::str::FromStr;
 
-pub(crate) const RESOURCE_HELP: &str = "Set resource ceilings with comma-separated KEY=VALUE pairs. bandwidth=RATE caps aggregate logical file-data bytes per second; plain numbers use KiB/s, K/M/G use powers of 1024, and 0 disables the rate cap. Limits are not saved. workers=N caps automatically chosen filesystem copy-worker slots, 1..65536. s3-max-concurrent-requests=N caps automatic S3 data-request concurrency, 1..65536. s3-max-concurrent-objects=N caps automatic S3 object concurrency, 1..65536. s3-max-concurrent-parts-per-object=N caps automatically chosen parts or ranges per S3 object, 1..1024. A ceiling does not raise automatic defaults. Each count conflicts with the same key in --performance-tuning, which fixes that count. Counts do not bound total threads, sockets, CPU or memory.";
+pub(crate) const RESOURCE_HELP: &str = "Set resource ceilings with comma-separated KEY=VALUE pairs. bandwidth=RATE caps aggregate logical file-data bytes per second; plain numbers use KiB/s, K/M/G use powers of 1024, and 0 disables the rate cap. Limits are not saved. workers=N caps automatically chosen filesystem copy-worker slots, 1..65536. s3-requests=N caps automatic S3 data-request concurrency, 1..65536. s3-objects=N caps automatic S3 object concurrency, 1..65536. s3-parts-per-object=N caps automatically chosen parts or ranges per S3 object, 1..1024. A ceiling does not raise automatic defaults. Each count conflicts with the same key in --performance-tuning, which fixes that count. Counts do not bound total threads, sockets, CPU or memory.";
 pub(crate) const INTEGRITY_HELP: &str = "Add extra payload checks with transfer=blake3, sha256, md5, or xxh3-128; transfer=off is the default. Transport authentication, S3 provider checksums and recovery checks remain enabled. Same-host copies keep kernel-copy shortcuts; use expected_hash in a mapping to validate a complete result.";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -25,15 +25,13 @@ impl FromStr for ResourceLimits {
                     once(&mut result.bandwidth, value.to_owned(), key)?;
                 }
                 "workers" => once(&mut result.workers, count(value, key, 65536)?, key)?,
-                "s3-max-concurrent-requests" => {
-                    once(&mut result.s3_requests, count(value, key, 65536)?, key)?
-                }
-                "s3-max-concurrent-objects" => once(
+                "s3-requests" => once(&mut result.s3_requests, count(value, key, 65536)?, key)?,
+                "s3-objects" => once(
                     &mut result.s3_object_workers,
                     count(value, key, 65536)?,
                     key,
                 )?,
-                "s3-max-concurrent-parts-per-object" => {
+                "s3-parts-per-object" => {
                     once(&mut result.s3_part_workers, count(value, key, 1024)?, key)?
                 }
                 _ => bail!("unknown resource limit {key:?}"),
@@ -50,9 +48,9 @@ impl std::fmt::Display for ResourceLimits {
         }
         for (key, value) in [
             ("workers", self.workers),
-            ("s3-max-concurrent-requests", self.s3_requests),
-            ("s3-max-concurrent-objects", self.s3_object_workers),
-            ("s3-max-concurrent-parts-per-object", self.s3_part_workers),
+            ("s3-requests", self.s3_requests),
+            ("s3-objects", self.s3_object_workers),
+            ("s3-parts-per-object", self.s3_part_workers),
         ] {
             if let Some(value) = value {
                 fields.push(format!("{key}={value}"));
@@ -80,18 +78,14 @@ impl ResourceLimits {
         }
         for (key, limit, fixed) in [
             ("workers", self.workers, tuning.workers),
+            ("s3-requests", self.s3_requests, tuning.s3_requests),
             (
-                "s3-max-concurrent-requests",
-                self.s3_requests,
-                tuning.s3_requests,
-            ),
-            (
-                "s3-max-concurrent-objects",
+                "s3-objects",
                 self.s3_object_workers,
                 tuning.s3_object_workers,
             ),
             (
-                "s3-max-concurrent-parts-per-object",
+                "s3-parts-per-object",
                 self.s3_part_workers,
                 tuning.s3_part_workers,
             ),
@@ -170,16 +164,19 @@ mod tests {
 
     #[test]
     fn resource_counts_validate_and_round_trip() {
-        let limits: ResourceLimits = "bandwidth=10M,workers=4,s3-max-concurrent-requests=8,s3-max-concurrent-objects=3,s3-max-concurrent-parts-per-object=2".parse().unwrap();
+        let limits: ResourceLimits =
+            "bandwidth=10M,workers=4,s3-requests=8,s3-objects=3,s3-parts-per-object=2"
+                .parse()
+                .unwrap();
         assert_eq!(
             limits.to_string().parse::<ResourceLimits>().unwrap(),
             limits
         );
         for (key, max) in [
             ("workers", 65536),
-            ("s3-max-concurrent-requests", 65536),
-            ("s3-max-concurrent-objects", 65536),
-            ("s3-max-concurrent-parts-per-object", 1024),
+            ("s3-requests", 65536),
+            ("s3-objects", 65536),
+            ("s3-parts-per-object", 1024),
         ] {
             for bad in [
                 "0".to_string(),

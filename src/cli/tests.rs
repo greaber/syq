@@ -345,7 +345,7 @@ fn resource_limits_keep_automatic_workers_and_reject_conflicts() {
     for extra in [
         "--performance-tuning=workers=3",
         "--resource-limits=workers=2",
-        "--resource-limits=s3-max-concurrent-objects=2",
+        "--resource-limits=s3-objects=2",
     ] {
         assert!(parse_native_copy(
             &[
@@ -359,11 +359,7 @@ fn resource_limits_keep_automatic_workers_and_reject_conflicts() {
         )
         .is_err());
     }
-    for key in [
-        "s3-max-concurrent-requests",
-        "s3-max-concurrent-objects",
-        "s3-max-concurrent-parts-per-object",
-    ] {
+    for key in ["s3-requests", "s3-objects", "s3-parts-per-object"] {
         let limit = format!("--resource-limits={key}=3");
         let fixed = format!("--performance-tuning={key}=3");
         let mut flags = vec!["source", "--to", "s3://bucket", "--as", "object", &limit];
@@ -388,19 +384,19 @@ fn resource_limits_keep_automatic_workers_and_reject_conflicts() {
 #[test]
 fn advanced_groups_separate_limits_tuning_and_integrity() {
     let args = parse_native_copy(
-            &[
-                "source",
-                "--to",
-                "s3://bucket",
-                "--as",
-                "object",
-                "--resource-limits=bandwidth=1M",
-                "--performance-tuning=s3-max-concurrent-objects=3,s3-max-concurrent-requests=4,s3-max-concurrent-parts-per-object=2,s3-part-size=8M",
-                "--integrity-checking=compare=blake3,transfer=sha256",
-            ]
-            .map(OsString::from),
-        )
-        .unwrap();
+        &[
+            "source",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "object",
+            "--resource-limits=bandwidth=1M",
+            "--performance-tuning=s3-objects=3,s3-requests=4,s3-parts-per-object=2,s3-part-size=8M",
+            "--integrity-checking=compare=blake3,transfer=sha256",
+        ]
+        .map(OsString::from),
+    )
+    .unwrap();
     let tuning = args.tuning_options.unwrap();
     assert_eq!(tuning.s3_requests, Some(4));
     assert_eq!(tuning.s3_object_workers, Some(3));

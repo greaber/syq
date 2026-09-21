@@ -57,7 +57,7 @@ impl Engine {
             32
         };
         if small_upload && fixed_workers.is_some_and(|n| n > capacity) {
-            bail!("s3-max-concurrent-objects exceeds the available small-upload capacity ({capacity}); lower it or increase the open-file limit");
+            bail!("s3-objects exceeds the available small-upload capacity ({capacity}); lower it or increase the open-file limit");
         }
         // Automatic small-upload admission leaves room for source opens,
         // payload buffers, and descriptors pinned during discovery.

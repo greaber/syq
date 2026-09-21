@@ -10,9 +10,9 @@ Supply comma-separated `KEY=VALUE` pairs:
 |---|---|---|
 | `bandwidth` | `0` (unlimited) | Aggregate logical file-data bytes per second across the copy's workers |
 | `workers` | Automatic | Ceiling of 1–65536 filesystem copy-worker slots |
-| `s3-max-concurrent-requests` | Automatic | Ceiling of 1–65536 simultaneous S3 data requests across objects; excludes metadata requests and idle sockets |
-| `s3-max-concurrent-objects` | Automatic | Ceiling of 1–65536 S3 objects in progress, including preparation and finalization |
-| `s3-max-concurrent-parts-per-object` | Automatic | Ceiling of 1–1024 simultaneous parts or ranges per S3 object |
+| `s3-requests` | Automatic | Ceiling of 1–65536 simultaneous S3 data requests across objects; excludes metadata requests and idle sockets |
+| `s3-objects` | Automatic | Ceiling of 1–65536 S3 objects in progress, including preparation and finalization |
+| `s3-parts-per-object` | Automatic | Ceiling of 1–1024 simultaneous parts or ranges per S3 object |
 
 ```sh
 syq cp data --to server --into backup --resource-limits bandwidth=10M

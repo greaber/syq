@@ -10,7 +10,10 @@ fn resource_ceilings_bound_initial_and_adaptive_s3_concurrency() {
         },
     ] {
         for size in [1024, 8 << 20, 32u64 << 30] {
-            let mut engine = planning_engine(&["--resource-limits", "s3-max-concurrent-objects=3,s3-max-concurrent-requests=2,s3-max-concurrent-parts-per-object=1"]);
+            let mut engine = planning_engine(&[
+                "--resource-limits",
+                "s3-objects=3,s3-requests=2,s3-parts-per-object=1",
+            ]);
             engine.options.route = route.clone();
             engine.tuning.observe_control(Duration::from_millis(100));
             let workers = engine
@@ -26,7 +29,10 @@ fn resource_ceilings_bound_initial_and_adaptive_s3_concurrency() {
             }
         }
     }
-    let fixed = planning_engine(&["--performance-tuning", "s3-max-concurrent-objects=7,s3-max-concurrent-requests=6,s3-max-concurrent-parts-per-object=5"]);
+    let fixed = planning_engine(&[
+        "--performance-tuning",
+        "s3-objects=7,s3-requests=6,s3-parts-per-object=5",
+    ]);
     let workers = fixed
         .object_workers(std::iter::repeat_n(1024, 1024))
         .unwrap();
@@ -75,9 +81,9 @@ fn server_copy_tuning_is_provider_neutral_and_respects_explicit_limits() {
     for endpoint in ["https://t3.storage.dev", "https://storage.example"] {
         for extra in [
             "",
-            "s3-max-concurrent-requests=1",
-            "s3-max-concurrent-requests=128",
-            "s3-max-concurrent-parts-per-object=7",
+            "s3-requests=1",
+            "s3-requests=128",
+            "s3-parts-per-object=7",
         ] {
             let mut flags = vec!["--to", "s3://destination", "--s3-endpoint", endpoint];
             if !extra.is_empty() {
@@ -88,9 +94,9 @@ fn server_copy_tuning_is_provider_neutral_and_respects_explicit_limits() {
             engine.tuning.observe_control(Duration::from_millis(100));
             let workers = engine.object_workers([32u64 << 30].into_iter()).unwrap();
             let expected = match extra {
-                "s3-max-concurrent-requests=1" => 1,
-                "s3-max-concurrent-requests=128" => 128,
-                "s3-max-concurrent-parts-per-object=7" => 7,
+                "s3-requests=1" => 1,
+                "s3-requests=128" => 128,
+                "s3-parts-per-object=7" => 7,
                 _ => 256,
             };
             // A per-object queue follows the global exploration range,
@@ -106,8 +112,8 @@ fn server_copy_tuning_is_provider_neutral_and_respects_explicit_limits() {
             assert_eq!(
                 engine.tuning.request_limit(),
                 match extra {
-                    "s3-max-concurrent-requests=1" => 1,
-                    "s3-max-concurrent-requests=128" => 128,
+                    "s3-requests=1" => 1,
+                    "s3-requests=128" => 128,
                     _ => 256,
                 }
             );
@@ -385,10 +391,7 @@ async fn small_download_search_preserves_seeds_mixed_batches_and_overrides() {
     assert_eq!(mixed.initial, 256);
     assert_eq!(mixed.maximum, Some(256));
 
-    let fixed = planning_engine(&[
-        "--performance-tuning",
-        "s3-max-concurrent-objects=1024,s3-max-concurrent-requests=128",
-    ]);
+    let fixed = planning_engine(&["--performance-tuning", "s3-objects=1024,s3-requests=128"]);
     let concurrency = fixed
         .object_workers(std::iter::repeat_n(64 * 1024, 8192))
         .unwrap();
@@ -437,13 +440,13 @@ async fn whole_object_batches_start_conservatively_and_can_tune_higher() {
         assert_eq!(engine.tuning.request_limit(), 32);
         assert!(concurrency.maximum.is_none());
     }
-    let engine = planning_engine(&["--performance-tuning", "s3-max-concurrent-requests=64"]);
+    let engine = planning_engine(&["--performance-tuning", "s3-requests=64"]);
     let concurrency = engine
         .object_workers(std::iter::repeat_n(1024 * 1024, 512))
         .unwrap();
     assert_eq!(concurrency.initial, 64);
     assert_eq!(engine.tuning.request_limit(), 64);
-    let engine = planning_engine(&["--performance-tuning", "s3-max-concurrent-objects=8"]);
+    let engine = planning_engine(&["--performance-tuning", "s3-objects=8"]);
     let concurrency = engine
         .object_workers(std::iter::repeat_n(1024 * 1024, 128))
         .unwrap();

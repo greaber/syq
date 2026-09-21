@@ -216,7 +216,7 @@ async fn entries_share_s3_admission_and_failed_producer_does_not_cancel_client()
             "s3://fixture",
             "--as",
             "object",
-            "--performance-tuning=s3-max-concurrent-requests=8",
+            "--performance-tuning=s3-requests=8",
         ]
         .into_iter()
         .map(Into::into)

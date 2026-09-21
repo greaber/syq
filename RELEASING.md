@@ -121,16 +121,6 @@ activate publication. Validation and repository protections still apply.
 
 ## Cutting a release
 
-**Review before the next release**
-
-- [ ] Review the S3 concurrency controls introduced in PR #367 with the maintainer
-  before publishing them. The current names make the maximum and scope explicit
-  (`s3-max-concurrent-objects`, `s3-max-concurrent-parts-per-object`, and
-  `s3-max-concurrent-requests`), but their relationship to filesystem `workers`
-  still needs a usability review. Confirm or revise the names, per-object versus
-  shared scope, and help examples together with the Python SDK documentation.
-  This question was deliberately left open to allow the implementation to merge.
-
 Start with `scripts/release-readiness.py v<version>` (add `--json` for automation).
 Exit 0 means the candidate is ready for preflight, 1 means work is missing, and
 2 means inspection failed. The report includes the candidate SHA, remote master,
