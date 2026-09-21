@@ -23,6 +23,9 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
 
 See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
+Large unfiltered prefix copies, current-object removals, and destination scans
+for pruning can list subtrees concurrently. Discovery may use extra LIST
+requests; selectors still name literal keys and prefixes.
 
 ## Authorize from your laptop
 

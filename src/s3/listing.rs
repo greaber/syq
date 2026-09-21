@@ -1,5 +1,5 @@
 //! Experimental S3 object listing, separate from copy selection and state.
-mod engine;
+pub(super) mod engine;
 mod pattern;
 #[cfg(test)]
 mod tests;

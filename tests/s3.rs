@@ -1029,6 +1029,39 @@ fn serve(
         }
         return;
     }
+    if fault == "parallel-listing-failure" {
+        if method == "HEAD" {
+            reply(&mut socket, 404, &[], b"", true);
+            return;
+        }
+        assert_eq!(method, "GET", "failed enumeration must not mutate storage");
+        assert!(
+            first.contains("list-type=2"),
+            "failed enumeration must not download bodies"
+        );
+        let target = first.split_whitespace().nth(1).unwrap();
+        let url = url::Url::parse(&format!("http://fixture{target}")).unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        let body = match query["prefix"].as_ref() {
+            "tree/" if query.contains_key("delimiter") =>
+                "<IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>tree/a/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>tree/b/</Prefix></CommonPrefixes>",
+            "tree/" => "<IsTruncated>true</IsTruncated><NextContinuationToken>unused</NextContinuationToken><Contents><Key>tree/a/file</Key><Size>1</Size></Contents>",
+            "tree/a/" => "<IsTruncated>false</IsTruncated><Contents><Key>tree/a/file</Key><Size>1</Size></Contents>",
+            "tree/b/" => {
+                reply(&mut socket, 403, &[], b"<Error><Code>AccessDenied</Code></Error>", false);
+                return;
+            }
+            other => panic!("unexpected prefix {other}"),
+        };
+        reply(
+            &mut socket,
+            200,
+            &[],
+            format!("<ListBucketResult>{body}</ListBucketResult>").as_bytes(),
+            false,
+        );
+        return;
+    }
     if fault == "latency-pages" {
         serve_latency_pages(&mut socket, first);
         return;
@@ -1060,12 +1093,26 @@ fn serve(
                 "prune-mixed" => vec!["mirror/extra".into(), "mirror/good".into()],
                 _ => vec!["mirror/extra".into()],
             };
+            // Respect S3's 1000-item page limit, including delimiter probes.
+            let start = if first.contains("continuation-token=next") {
+                1000
+            } else {
+                0
+            };
+            let truncated = keys.len() > start + 1000;
+            let next = if truncated {
+                "<NextContinuationToken>next</NextContinuationToken>"
+            } else {
+                ""
+            };
             let contents = keys
                 .iter()
+                .skip(start)
+                .take(1000)
                 .map(|key| format!("<Contents><Key>{key}</Key><Size>1</Size></Contents>"))
                 .collect::<String>();
             let body = format!(
-                "<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+                "<ListBucketResult><IsTruncated>{truncated}</IsTruncated>{next}{contents}</ListBucketResult>"
             );
             reply(&mut socket, 200, &[], body.as_bytes(), false);
         } else {
@@ -2540,10 +2587,10 @@ fn s3_prune_limit_refuses_without_sending_delete() {
 #[test]
 fn s3_prune_batches_account_for_every_key_and_continue_after_errors() {
     for (fault, code, planned, completed, requests) in [
-        ("prune-batch", 0, 1001, 1001, 3),
-        ("prune-concurrent", 0, 1001, 1001, 3),
+        ("prune-batch", 0, 1001, 1001, 5),
+        ("prune-concurrent", 0, 1001, 1001, 5),
         ("prune-mixed", 23, 2, 1, 2),
-        ("prune-request-failure", 23, 1001, 1, 3),
+        ("prune-request-failure", 23, 1001, 1, 5),
     ] {
         let temp = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("empty")).unwrap();
@@ -4721,5 +4768,35 @@ fn s3_mapping_metadata_dry_run_reports_repairs_on_unchanged_download() {
         );
         assert_eq!((meta.mtime(), meta.mtime_nsec()), (1700000000, 0));
         std::fs::remove_file(temp.path().join("results.jsonl")).unwrap();
+    }
+}
+
+#[test]
+fn parallel_listing_failure_stops_copy_and_removal_before_mutation() {
+    for command in ["cp", "rm"] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let server = Server::start("parallel-listing-failure");
+        let mut process = server.command_for(temp.path(), command);
+        process.args(["--s3-endpoint", &server.address]);
+        if command == "cp" {
+            process.args([
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "tree",
+                "--into",
+                "out",
+            ]);
+        } else {
+            process.args(["--on", "s3://bucket", "--srcs-in", "tree"]);
+        }
+        let output = process.output().unwrap();
+        assert!(!output.status.success(), "{}", output_text(&output));
+        assert!(
+            output_text(&output).contains("403"),
+            "{}",
+            output_text(&output)
+        );
+        assert!(!temp.path().join("out/a/file").exists());
     }
 }

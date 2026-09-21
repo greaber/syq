@@ -13,7 +13,7 @@ const SPLIT_QUEUE_LIMIT: usize = 4096;
 const MAX_RECURSIVE_PROBES: usize = 4;
 
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct Entry {
+pub(in crate::s3) struct Entry {
     pub key: String,
     pub size: u64,
     pub last_modified: Option<String>,
@@ -21,13 +21,13 @@ pub(super) struct Entry {
 }
 
 #[derive(Default)]
-pub(super) struct Page {
+pub(in crate::s3) struct Page {
     pub entries: Vec<Entry>,
     pub prefixes: Vec<String>,
     pub next: Option<String>,
 }
 
-pub(super) trait Store {
+pub(in crate::s3) trait Store {
     fn page(
         &self,
         prefix: &str,
@@ -109,7 +109,12 @@ async fn read(
     Ok(page)
 }
 
-async fn execute(store: &impl Store, pattern: &Pattern, job: Job, split: bool) -> Result<Batch> {
+async fn execute(
+    store: &impl Store,
+    pattern: Option<&Pattern>,
+    job: Job,
+    split: bool,
+) -> Result<Batch> {
     let (mut prefix, mut component, depth) = match job {
         Job::Recursive { prefix, depth } => return recursive(store, prefix, depth, split).await,
         Job::Scan {
@@ -126,6 +131,7 @@ async fn execute(store: &impl Store, pattern: &Pattern, job: Job, split: bool) -
             depth,
         } => (prefix, component, depth),
     };
+    let pattern = pattern.expect("discovery jobs require a pattern");
     // Literal intermediate components need no existence probes: the eventual
     // LIST establishes whether the narrowed prefix exists.
     while component + 1 < pattern.components.len() {
@@ -212,11 +218,54 @@ pub(super) async fn enumerate(
         (1..=256).contains(&concurrency),
         "concurrency must be between 1 and 256"
     );
-    let mut pending = VecDeque::from([Job::Discover {
-        prefix: String::new(),
-        component: 0,
-        depth: 0,
-    }]);
+    enumerate_jobs(
+        store,
+        Some(pattern),
+        concurrency,
+        Job::Discover {
+            prefix: String::new(),
+            component: 0,
+            depth: 0,
+        },
+        &mut emit,
+    )
+    .await
+}
+
+/// Literal prefixes from copy/removal selectors must never be parsed as globs.
+/// This only changes request scheduling; callers still validate and interpret
+/// object metadata, source types and destination mappings.
+pub(in crate::s3) async fn enumerate_prefix(
+    store: &impl Store,
+    prefix: &str,
+    concurrency: usize,
+    mut emit: impl FnMut(Entry) -> Result<()>,
+) -> Result<()> {
+    enumerate_jobs(
+        store,
+        None,
+        concurrency,
+        Job::Recursive {
+            prefix: prefix.to_owned(),
+            depth: 0,
+        },
+        &mut emit,
+    )
+    .await
+}
+
+async fn enumerate_jobs(
+    store: &impl Store,
+    pattern: Option<&Pattern>,
+    concurrency: usize,
+    first: Job,
+    emit: &mut impl FnMut(Entry) -> Result<()>,
+) -> Result<()> {
+    ensure!(
+        (1..=256).contains(&concurrency),
+        "concurrency must be between 1 and 256"
+    );
+    let mut pending = VecDeque::from([first]);
     let mut active = FuturesUnordered::new();
     loop {
         while active.len() < concurrency {
@@ -231,7 +280,7 @@ pub(super) async fn enumerate(
         };
         let batch = batch?;
         for entry in batch.entries {
-            if pattern.matches(&entry.key) {
+            if pattern.is_none_or(|pattern| pattern.matches(&entry.key)) {
                 emit(entry)?;
             }
         }

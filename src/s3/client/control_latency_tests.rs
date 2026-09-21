@@ -79,7 +79,8 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
             .len(),
         8
     );
-    assert_eq!(start.elapsed(), Duration::from_millis(200));
+    // Eight flat pages plus one unsuccessful delimiter probe, after the HEAD.
+    assert_eq!(start.elapsed(), Duration::from_millis(215));
     assert_eq!(control.load(Ordering::Relaxed), 15_000_000);
     for status in [301, 429, 503] {
         assert!(client

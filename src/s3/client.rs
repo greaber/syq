@@ -747,6 +747,85 @@ pub(super) struct Listing {
     pub excluded: u64,
 }
 
+/// Reuse the bounded recursive planner for existing literal-prefix operations.
+/// Filtered copies retain the exclusion-directed lookahead below: it can prune
+/// an ignored subtree without enumerating or interpreting its descendants.
+async fn parallel_listing(client: &Client, bucket: &str, prefix: &str) -> Result<Listing> {
+    use super::listing::engine::{self, Entry, Page, Store};
+    struct S3<'a> {
+        client: &'a Client,
+        bucket: &'a str,
+    }
+    impl Store for S3<'_> {
+        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+            let response = self
+                .client
+                .list_objects_v2()
+                .bucket(self.bucket)
+                .prefix(prefix)
+                .max_keys(1000)
+                .set_delimiter(delimiter.then(|| "/".into()))
+                .set_continuation_token(token.map(str::to_owned))
+                .send()
+                .await
+                .map_err(listing_failure)?;
+            // Preserve this path's existing SDK decoding and failure context.
+            // Transfer metadata still comes from HEAD/GET, not LIST.
+            let entries = response
+                .contents()
+                .iter()
+                .map(|object| {
+                    Ok(Entry {
+                        key: object.key().context("S3 listing omitted key")?.to_owned(),
+                        size: u64::try_from(object.size().context("S3 listing omitted size")?)?,
+                        last_modified: None,
+                        etag: None,
+                    })
+                })
+                .collect::<Result<_>>()?;
+            let prefixes = response
+                .common_prefixes()
+                .iter()
+                .map(|child| {
+                    Ok(child
+                        .prefix()
+                        .context("S3 listing omitted common prefix")?
+                        .to_owned())
+                })
+                .collect::<Result<_>>()?;
+            let next = if response.is_truncated() == Some(true) {
+                Some(
+                    response
+                        .next_continuation_token()
+                        .context("truncated S3 listing omitted continuation token")?
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
+            Ok(Page {
+                entries,
+                prefixes,
+                next,
+            })
+        }
+    }
+    let mut objects = Vec::new();
+    engine::enumerate_prefix(&S3 { client, bucket }, prefix, 32, |entry| {
+        objects.push((entry.key, entry.size));
+        Ok(())
+    })
+    .await?;
+    // Previously LIST delivered keys in order. Preserve planning/claim order
+    // for callers despite concurrent subtree completion.
+    objects.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    Ok(Listing {
+        found: !objects.is_empty(),
+        objects,
+        excluded: 0,
+    })
+}
+
 /// Keep flat listings for small trees and filename filters. Only switch to
 /// directory discovery when the first full page contains only excluded descendants.
 /// A complete directory probe can prune children or descend through a single
@@ -760,6 +839,9 @@ pub(super) async fn list(
     matcher: Option<&ignore::gitignore::Gitignore>,
     excluded_subtrees: &mut std::collections::HashSet<String>,
 ) -> Result<Listing> {
+    if matcher.is_none() {
+        return parallel_listing(client, bucket, prefix).await;
+    }
     let mut result = Listing {
         objects: Vec::new(),
         found: false,

@@ -248,3 +248,38 @@ async fn malformed_pages_fail() {
             .is_err());
     }
 }
+
+#[tokio::test]
+async fn literal_prefix_enumeration_preserves_metacharacters_and_overlap() {
+    let prefix = "literal*?**[x]/";
+    let mut keys: Vec<_> = (0..8)
+        .flat_map(|d| (0..180).map(move |i| format!("{prefix}day{d}/file{i:03}")))
+        .collect();
+    keys.extend([
+        prefix.to_owned(),
+        format!("{prefix}day0"),
+        format!("{prefix}day0/"),
+        "literal-other/file".into(),
+        "literal*?**[x]-other/file".into(),
+    ]);
+    let store = Memory::new(keys);
+    let expected: Vec<_> = store
+        .keys
+        .iter()
+        .filter(|key| key.starts_with(prefix))
+        .cloned()
+        .collect();
+    for concurrency in [1, 4] {
+        let mut actual = Vec::new();
+        engine::enumerate_prefix(&store, prefix, concurrency, |entry| {
+            actual.push(entry.key);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+    assert!(store.peak.get() > 1);
+    assert!(store.peak.get() <= 4);
+}
