@@ -1729,10 +1729,13 @@ fn disabling_tuning_cache_also_disables_history() {
 #[test]
 fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     let t = Tmp::new();
-    // Keep files above the tiny-file batching threshold so the three-worker
-    // hint is also the actual starting count in the uncapped cases.
-    for n in 0..32 {
-        write(&t.path(&format!("source/file-{n}")), &prng(128 * 1024, n));
+    // Exceed both Linux's 64 KiB and macOS's default 4 MiB batching
+    // thresholds so the three-worker hint is also the actual starting count.
+    for n in 0..4 {
+        write(
+            &t.path(&format!("source/file-{n}")),
+            &prng((4 << 20) + 1, n),
+        );
     }
     let copy = |name: &str, controls: &[&str]| {
         history_command(&t)
@@ -1819,6 +1822,17 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     )
     .unwrap();
     assert_output_ok(&copy_with_hint("confirmed", &[]));
+    let workers: usize = db
+        .query_row(
+            "SELECT json_extract(data,'$.data.workers') FROM events WHERE run=5 AND json_extract(data,'$.kind')='workers_start'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        workers, 3,
+        "the plateau hint must be the actual starting count"
+    );
     assert!(!startup_doubling(5));
     // Clamping a strong count changes the starting point; don't transfer its
     // confidence to a lower count that was not measured as the plateau.
