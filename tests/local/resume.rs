@@ -35,6 +35,8 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
             .env("SYQ_TUNING_CACHE", &cache)
+            // Match the unscoped legacy cache fixture regardless of the host network.
+            .env("SYQ_TEST_TUNING_NETWORK", "")
             .run()
             .unwrap()
     };

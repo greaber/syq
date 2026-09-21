@@ -83,6 +83,8 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("SYQ_TUNING_CACHE", &cache)
+        // Match the unscoped legacy cache fixture regardless of the host network.
+        .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_TUNE_SAMPLE_MS", "50")
         .env("SYQ_TEST_DROP_AFTER_REQUEST", "write")
@@ -493,6 +495,8 @@ fn one_worker_hint_prepares_spare_before_slow_connection_is_ready() {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("SYQ_TUNING_CACHE", &cache)
+        // Match the unscoped legacy cache fixture regardless of the host network.
+        .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_TUNE_SAMPLE_MS", "50")
         .env(

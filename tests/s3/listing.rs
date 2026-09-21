@@ -22,6 +22,8 @@ impl ListingServer {
                     }
                     Err(e) => panic!("{e}"),
                 };
+                // BSD can inherit the listener's nonblocking mode.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -36,7 +38,7 @@ impl ListingServer {
                 let request = String::from_utf8(request).unwrap();
                 assert!(
                     request.starts_with("GET "),
-                    "listing must not HEAD or download objects"
+                    "listing must not HEAD or download objects: {request:?}"
                 );
                 assert!(request.contains("list-type=2"));
                 assert!(request.contains("encoding-type=url"));
