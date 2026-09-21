@@ -9,9 +9,10 @@
 //! collapsed samples short-circuit a probe. It does not model handshakes
 //! competing with the transfer or connections warming up after activation.
 //! Initial connections are ready at time zero; elapsed time excludes their
-//! setup. Driver polling latency, file credit, connection failures, and
-//! scheduler limits are not modeled. `prepare=true` is a hypothetical policy,
-//! not current production behavior. The oracle can select the instantaneous
+//! setup. Connection planning is checked every 250ms; activation and retirement
+//! are instantaneous. File credit, connection failures, and scheduler limits
+//! are not modeled. `prepare=true` uses the production connection planner;
+//! `false` is a counterfactual that closes spare connections immediately. The oracle can select the instantaneous
 //! best count in 1..=LIMIT without setup cost and sees the same wall-clock noise.
 //! Results are only as good as the curves and noise fed in; check those
 //! against real transfers before trusting a small difference.
@@ -95,7 +96,16 @@ impl Curve {
     }
 
     fn best(self, t: f64) -> f64 {
-        (1..=LIMIT).map(|n| self.rate(n, t)).fold(0.0, f64::max)
+        match self {
+            Curve::Decline {
+                per_worker, cap, ..
+            } => {
+                let knee = cap / per_worker;
+                self.rate((knee.floor() as usize).clamp(1, LIMIT), t)
+                    .max(self.rate((knee.ceil() as usize).clamp(1, LIMIT), t))
+            }
+            _ => self.rate(LIMIT, t),
+        }
     }
 
     /// Smallest count within the policy's own tolerance of the best rate.
@@ -126,8 +136,8 @@ struct Scenario {
     sigma: f64,
     rho: f64,
     setup_secs: f64,
-    /// Open the likely next increase during a measurement and keep rollback
-    /// connections through a probe, as connection preparation does.
+    /// Use the production preparation/retirement plan. False is a comparison
+    /// that opens only requested workers and immediately retires spare ones.
     prepare: bool,
 }
 
@@ -140,30 +150,6 @@ struct Outcome {
     connection_secs: f64,
     handshakes: usize,
     policy: Policy,
-}
-
-fn connections_wanted(policy: &Policy, active: usize, open: usize, prepare: bool) -> usize {
-    let needed = policy.n.max(active);
-    if !prepare {
-        return if needed == 1 {
-            2.min(policy.max)
-        } else {
-            needed
-        };
-    }
-    let needed = needed.max(policy.settled());
-    match policy.state {
-        State::Initial
-        | State::Explore {
-            direction: Direction::Up,
-            ..
-        } => open.max(needed).max(policy.target(Direction::Up)),
-        State::Explore { .. } => open.max(needed),
-        State::Hold if policy.due[Direction::Up.index()] <= policy.tick + 1 => {
-            needed.max(policy.target(Direction::Up))
-        }
-        State::Hold => needed,
-    }
 }
 
 fn copy(s: &Scenario, policy: Policy, rng: &mut Rng) -> Outcome {
@@ -187,7 +173,6 @@ fn copy_observing(
     let mut sampler = Sampler::default();
     sampler.reset();
     let (mut sample_start, mut sample_bytes) = (0.0f64, 0.0f64);
-    let mut ready_at: Option<f64>;
     let mut noise_end = SAMPLE_SECS;
     let (mut ideal_done, mut ideal_elapsed, mut near_secs) = (0.0, None, 0.0);
     let mut collapsed = 0;
@@ -200,6 +185,32 @@ fn copy_observing(
     for _ in 0..1_000_000 {
         assert!(t < 1_000_000.0, "simulation deadline: {}", s.name);
         observe(t, &policy);
+        let needs = last_rate.map_or(0.0, |rate| rate * SAMPLE_SECS * MEASUREMENT_SAMPLES);
+        // All initial connections have already completed the same deterministic
+        // setup, so the driver's measured high-water setup lead is known.
+        let lead = Duration::from_secs_f64(s.setup_secs * 2.0 + 1.0);
+        let wanted = if s.prepare {
+            let plan = policy.connection_plan(
+                &sampler,
+                SAMPLE,
+                Duration::from_secs_f64(t - sample_start),
+                lead,
+                total - done >= needs + last_rate.unwrap_or(0.0) * lead.as_secs_f64(),
+            );
+            open.min(plan.keep.max(plan.connect).max(active))
+                .max(plan.connect)
+                .max(active)
+        } else {
+            let needed = policy.n.max(active);
+            if needed == 1 {
+                2.min(policy.max)
+            } else {
+                needed
+            }
+        };
+        handshakes += wanted.saturating_sub(open);
+        connections.resize(wanted, t + s.setup_secs);
+        open = wanted;
         if policy.n < active {
             active = policy.n;
             policy.activated();
@@ -207,7 +218,6 @@ fn copy_observing(
             (sample_start, sample_bytes, collapsed) = (t, 0.0, 0);
             continue;
         }
-        let needs = last_rate.map_or(0.0, |rate| rate * SAMPLE_SECS * MEASUREMENT_SAMPLES);
         let tail_blocks_increase = policy.n > active && total - done < needs;
         if tail_blocks_increase {
             policy.cancel_unapplied();
@@ -219,19 +229,7 @@ fn copy_observing(
             // cancel_unapplied does not change it. Production keeps copying
             // at the lower active count while polling the tail guard.
         }
-        let wanted = if tail_blocks_increase {
-            if active == 1 {
-                2.min(policy.max)
-            } else {
-                active
-            }
-        } else {
-            connections_wanted(&policy, active, open, s.prepare)
-        };
-        handshakes += wanted.saturating_sub(open);
-        connections.resize(wanted, t + s.setup_secs);
-        open = wanted;
-        ready_at = (policy.n > active && !tail_blocks_increase)
+        let ready_at = (policy.n > active && !tail_blocks_increase)
             .then(|| connections[..policy.n].iter().copied().fold(t, f64::max));
         if reached.is_none()
             && s.curve.rate(active, t) >= s.curve.best(t) * (1.0 - NEAR_BEST_TOLERANCE)
@@ -242,7 +240,7 @@ fn copy_observing(
         let rate = s.curve.rate(active, t) * noise;
         let sample_end = sample_start + SAMPLE_SECS;
         let mut until = ready_at.map_or(sample_end, |ready| ready.min(sample_end));
-        until = until.min(noise_end);
+        until = until.min(noise_end).min(((t / 0.25).floor() + 1.0) * 0.25);
         if let Curve::Shift { at, .. } = s.curve {
             if t < at {
                 until = until.min(at);
@@ -489,7 +487,7 @@ fn report() {
             sigma: 0.05,
             rho: 0.5,
             setup_secs: 0.3,
-            prepare: false,
+            prepare: true,
         };
         let mut remembered = vec![Vec::new(); 6];
         for seed in 0..SEEDS {
@@ -499,7 +497,7 @@ fn report() {
                 let start = next.active();
                 let policy = copy(&s, next, &mut rng).policy;
                 let count = if policy.measured() {
-                    policy.settled()
+                    policy.recommended()
                 } else {
                     start
                 };
@@ -538,12 +536,9 @@ fn noiseless_knee_is_found_and_the_copy_completes() {
         prepare: false,
     };
     let out = copy(&s, Policy::new(start, 1, LIMIT), &mut Rng(1));
-    let best = curve.smallest_near_best(0.0);
-    assert!(
-        (best..=best + 2).contains(&out.policy.settled()),
-        "settled {} for smallest near-best {best}",
-        out.policy.settled()
-    );
+    // This checks discovery, not the final live count: the policy may be in
+    // a probe or have aged out its earlier best by the end of a long copy.
+    assert!(out.reached_near_best.is_some_and(|t| t < 20.0));
     assert!(out.elapsed < 600.0 * 1.25, "{}", out.elapsed);
     assert!(out.reached_near_best.is_some());
 }
@@ -592,7 +587,7 @@ fn sweep() {
                                 sigma,
                                 rho,
                                 setup_secs,
-                                prepare: false,
+                                prepare: true,
                             };
                             let mut slow = Vec::new();
                             let (mut near, mut settled_rate, mut misses) = (0.0, 0.0, 0);
@@ -627,7 +622,7 @@ fn fixture(curve: Curve) -> Scenario {
         sigma: 0.0,
         rho: 0.0,
         setup_secs: 0.3,
-        prepare: false,
+        prepare: true,
     }
 }
 
@@ -680,6 +675,7 @@ fn preparation_waits_for_actual_connection_readiness() {
         cap: 16.0,
     });
     s.prepare = true;
+    s.ideal_secs = 600.0;
     s.setup_secs = 30.0;
     let out = copy(&s, Policy::new(8, 1, LIMIT), &mut Rng(1));
     assert_eq!(out.reached_near_best, Some(30.0));
@@ -727,6 +723,15 @@ fn diagnostics() {
     for (name, curve, start, ideal_secs) in cases.into_iter().chain([
         ("capacity rises, long run", cases[0].1, 8, 6000.0),
         ("below ceiling", cases[1].1, 63, 600.0),
+        (
+            "steady path, long run",
+            Curve::Knee {
+                per_worker: 100.0 / 32.0,
+                cap: 100.0,
+            },
+            8,
+            1800.0,
+        ),
     ]) {
         let s = Scenario {
             name,
@@ -767,6 +772,7 @@ fn tail_blocked_rollback_keeps_copying_instead_of_spinning() {
         per_worker: 1.0,
         cap: 2.0,
     });
+    s.prepare = false;
     s.ideal_secs = 2.0;
     s.setup_secs = 30.0;
     // The driver has just rejected a one-worker downward probe and asked to
@@ -779,4 +785,31 @@ fn tail_blocked_rollback_keeps_copying_instead_of_spinning() {
     assert_eq!(out.policy.active(), 1);
     assert_eq!(out.elapsed, 4.0);
     assert_eq!(out.ideal_elapsed, 2.0);
+}
+
+#[test]
+fn analytic_optimum_matches_exhaustive_worker_search() {
+    let extra = [
+        Curve::Decline {
+            per_worker: 7.0,
+            cap: 100.0,
+            loss: 0.5,
+        },
+        Curve::Decline {
+            per_worker: 100.0,
+            cap: 1.0,
+            loss: 0.5,
+        },
+        Curve::Decline {
+            per_worker: 1.0,
+            cap: 1000.0,
+            loss: 0.5,
+        },
+    ];
+    for curve in curves().into_iter().map(|(_, curve, _)| curve).chain(extra) {
+        for t in [0.0, 37.0, 60.0, 600.0] {
+            let exhaustive = (1..=LIMIT).map(|n| curve.rate(n, t)).fold(0.0, f64::max);
+            assert!((curve.best(t) - exhaustive).abs() < 1e-9);
+        }
+    }
 }
