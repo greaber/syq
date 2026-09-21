@@ -113,11 +113,11 @@ Wi-Fi names, and nothing is uploaded. Timing and sizes still reveal activity;
 this is performance history, not anonymous data or a complete audit trail.
 
 ```sh
-syq tuning list
-syq tuning show 42
-syq tuning show 42 --html > tuning-42.html
-syq tuning export 42 > tuning-42.ndjson
-syq tuning clear
+syq tuning-cache list
+syq tuning-cache show 42
+syq tuning-cache show 42 --html > tuning-42.html
+syq tuning-cache export 42 > tuning-42.ndjson
+syq tuning-cache clear
 ```
 
 Open the HTML file in a browser to plot worker counts and byte progress, then

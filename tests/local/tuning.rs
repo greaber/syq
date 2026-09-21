@@ -1620,7 +1620,7 @@ fn tuning_history_records_short_copy_and_exports_interactive_timeline() {
         .unwrap();
     assert_output_ok(&output);
     let output = history_command(&t)
-        .args(["tuning", "export"])
+        .args(["tuning-cache", "export"])
         .run()
         .unwrap();
     assert_output_ok(&output);
@@ -1646,7 +1646,7 @@ fn tuning_history_records_short_copy_and_exports_interactive_timeline() {
     );
     let id = records[0]["run"]["id"].as_i64().unwrap().to_string();
     let html = history_command(&t)
-        .args(["tuning", "show", &id, "--html"])
+        .args(["tuning-cache", "show", &id, "--html"])
         .run()
         .unwrap();
     assert_output_ok(&html);
@@ -1654,10 +1654,13 @@ fn tuning_history_records_short_copy_and_exports_interactive_timeline() {
     assert!(html.contains("<svg"));
     assert!(html.contains("final_partial"));
     assert!(!html.contains("__HISTORY_DATA__"));
-    let cleared = history_command(&t).args(["tuning", "clear"]).run().unwrap();
+    let cleared = history_command(&t)
+        .args(["tuning-cache", "clear"])
+        .run()
+        .unwrap();
     assert_output_ok(&cleared);
     let empty = history_command(&t)
-        .args(["tuning", "export"])
+        .args(["tuning-cache", "export"])
         .run()
         .unwrap();
     assert_output_ok(&empty);
@@ -1679,7 +1682,7 @@ fn tuning_history_records_failed_copy_without_recommending_it() {
         .unwrap();
     assert!(!output.status.success());
     let output = history_command(&t)
-        .args(["tuning", "export"])
+        .args(["tuning-cache", "export"])
         .run()
         .unwrap();
     assert_output_ok(&output);

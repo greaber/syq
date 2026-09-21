@@ -1,20 +1,20 @@
-# syq tuning
+# syq tuning-cache
 
 Inspect the measurements and decisions recorded by filesystem transfers.
 See [tuning history](../tuning.md#inspect-tuning-history) for privacy,
 retention, and startup behavior.
 
-<!-- CLI: tuning -->
+<!-- CLI: tuning-cache -->
 ```text
-syq tuning <COMMAND>
+syq tuning-cache <COMMAND>
 ```
 
 | Command | Purpose |
 |---|---|
-| [`tuning list`](#syq-tuning-list) | List recent transfers |
-| [`tuning show`](#syq-tuning-show) | Show a transfer's measurements and decisions |
-| [`tuning export`](#syq-tuning-export) | Export history as NDJSON; omit ID for every transfer |
-| [`tuning clear`](#syq-tuning-clear) | Delete recorded history and filesystem startup hints |
+| [`tuning-cache list`](#syq-tuning-cache-list) | List recent transfers |
+| [`tuning-cache show`](#syq-tuning-cache-show) | Show a transfer's measurements and decisions |
+| [`tuning-cache export`](#syq-tuning-cache-export) | Export history as NDJSON; omit ID for every transfer |
+| [`tuning-cache clear`](#syq-tuning-cache-clear) | Delete recorded history and filesystem startup hints |
 
 **Help (also available on subcommands)**
 
@@ -25,14 +25,14 @@ syq tuning <COMMAND>
 
 <!-- /CLI -->
 
-## syq tuning list
+## syq tuning-cache list
 
 List recent transfers, newest first. The worker column shows the count saved
 as a startup hint; `?` means the transfer did not supply a recommendation.
 
-<!-- CLI: tuning list -->
+<!-- CLI: tuning-cache list -->
 ```text
-syq tuning list [OPTIONS]
+syq tuning-cache list [OPTIONS]
 ```
 
 **Options**
@@ -43,14 +43,14 @@ syq tuning list [OPTIONS]
 
 <!-- /CLI -->
 
-## syq tuning show
+## syq tuning-cache show
 
 Print one transfer's context and timestamped events. With `--html`, redirect
 stdout to a file and open it in a browser for an interactive timeline.
 
-<!-- CLI: tuning show -->
+<!-- CLI: tuning-cache show -->
 ```text
-syq tuning show [OPTIONS] <id>
+syq tuning-cache show [OPTIONS] <id>
 ```
 
 **Arguments**
@@ -67,14 +67,14 @@ syq tuning show [OPTIONS] <id>
 
 <!-- /CLI -->
 
-## syq tuning export
+## syq tuning-cache export
 
 Export one transfer, or all retained transfers when the ID is omitted, as
 NDJSON. Each transfer record is followed by its event records.
 
-<!-- CLI: tuning export -->
+<!-- CLI: tuning-cache export -->
 ```text
-syq tuning export [id]
+syq tuning-cache export [id]
 ```
 
 **Arguments**
@@ -85,14 +85,14 @@ syq tuning export [id]
 
 <!-- /CLI -->
 
-## syq tuning clear
+## syq tuning-cache clear
 
 Delete the local history and its filesystem startup hints. The older
 connection-count cache remains unchanged.
 
-<!-- CLI: tuning clear -->
+<!-- CLI: tuning-cache clear -->
 ```text
-syq tuning clear
+syq tuning-cache clear
 ```
 
 <!-- /CLI -->

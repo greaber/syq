@@ -279,11 +279,11 @@ fn main() {
             }
         }
     }
-    if argv.get(1).and_then(|arg| arg.to_str()) == Some("tuning") {
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("tuning-cache") {
         match tune::history::run(&argv[2..]) {
             Ok(code) => std::process::exit(code),
             Err(error) => {
-                crate::output::diagnostic!("syq tuning: {error:#}");
+                crate::output::diagnostic!("syq tuning-cache: {error:#}");
                 std::process::exit(1);
             }
         }

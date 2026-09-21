@@ -4,7 +4,7 @@ use std::io::Write;
 
 pub(crate) fn command_for_help() -> Command {
     crate::help::configure(
-        Command::new("syq tuning")
+        Command::new("syq tuning-cache")
             .about("Inspect and clear local transfer tuning history")
             .subcommand_required(true)
             .subcommand(
@@ -43,7 +43,7 @@ pub(crate) fn command_for_help() -> Command {
 
 pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<i32> {
     let matches = match command_for_help().try_get_matches_from(
-        std::iter::once(std::ffi::OsString::from("syq tuning")).chain(args.iter().cloned()),
+        std::iter::once(std::ffi::OsString::from("syq tuning-cache")).chain(args.iter().cloned()),
     ) {
         Ok(matches) => matches,
         Err(error) => {

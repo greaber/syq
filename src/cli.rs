@@ -891,7 +891,7 @@ fn read_ignore_inputs(
 }
 
 fn print_root_help(full: bool) {
-    let mut command = crate::help::root();
+    let mut command = crate::help::root_for_help(full);
     let result = if full {
         command.print_long_help()
     } else {

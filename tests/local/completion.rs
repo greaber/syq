@@ -172,7 +172,7 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
             "rsync",
             "persist",
             "completion",
-            "tuning",
+            "tuning-cache",
             "clean-partials",
             "receiver",
             "--self-update",
@@ -180,14 +180,35 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
     );
     assert_completion_candidates(
         &t,
-        &["syq", "tuning", ""],
+        &["syq", "tuning-cache", ""],
         &["list", "show", "export", "clear", "help"],
     );
     assert_completion_candidates(
         &t,
-        &["syq", "tuning", "show", "1", "--h"],
+        &["syq", "tuning-cache", "show", "1", "--h"],
         &["--help", "--help-all", "--html"],
     );
+    for args in [&[][..], &["--help"], &["-h"], &["help"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("tuning-cache"));
+    }
+    for args in [
+        &["--help-all"][..],
+        &["help", "--help-all"],
+        &["help", "tuning-cache"],
+        &["tuning-cache", "--help"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("tuning-cache"));
+    }
     assert_completion_candidates(&t, &["syq", "cp", "--as-f"], &["--as-fd"]);
     assert_completion_candidates(&t, &["syq", "cp", "--src-f"], &["--src-fd"]);
     assert_completion_candidates(&t, &["syq", "help", "receiver", "e"], &["enroll"]);
