@@ -116,11 +116,7 @@ fn automatic_growth_can_explore_above_64() {
         let rate = policy.n.min(128) as f64 * 10e6;
         measure(&mut policy, rate);
     }
-    assert!(
-        (65..=128).contains(&policy.settled()),
-        "{:?}",
-        policy.history
-    );
+    assert!(policy.settled() >= 128, "{:?}", policy.history);
     assert!(policy.history.iter().any(|&count| count > 64));
 }
 
@@ -340,45 +336,35 @@ fn upward_probe_refreshes_its_baseline_while_warming() {
 #[test]
 fn cached_successful_direction_continues_to_the_plateau() {
     let mut p = Policy::refine(START_SSH, MIN, MAX);
-    let mut refined = false;
+    let mut reached_full_rate = false;
     for _ in 0..80 {
         let rate = p.n.min(32) as f64 * 10e6;
         measure(&mut p, rate);
-        // Later exploration can hold a larger inconclusive candidate; check
-        // that downward refinement still reaches the smallest near-best count.
-        refined |= p.settled() == 31;
+        reached_full_rate |= p.settled() >= 32;
     }
     assert_eq!(&p.history[..6], &[8, 10, 13, 17, 22, 29]);
-    assert!(refined, "history {:?}", p.history);
+    assert!(reached_full_rate, "history {:?}", p.history);
 }
 
 #[test]
 fn cached_gain_at_the_cap_holds_at_the_cap() {
     let p = simulate_policy(Policy::refine(START_LOCAL, MIN, MAX), 200, 40, |_| 1.0);
-    // Once the cap establishes the best score, downward refinement finds
-    // the smallest integer within the 5% near-best tolerance.
-    assert_eq!(p.settled(), 61, "history {:?}", p.history);
+    // Even a one-worker reduction is slower on this linear curve.
+    assert_eq!(p.settled(), MAX, "history {:?}", p.history);
     assert_eq!(p.peak, MAX);
 }
 
 #[test]
-fn uncached_start_reaches_full_rate_early_and_then_trims_excess_workers() {
-    for (start, cap, smallest_near_best) in [(8, 32, 31), (32, 64, 61)] {
+fn uncached_start_reaches_full_rate_without_accepting_slower_reductions() {
+    for (start, cap) in [(8, 32), (32, 64)] {
         let mut p = simulate(start, cap, 3, |_| 1.0);
         assert_eq!(p.settled(), cap, "history {:?}", p.history);
-        // Coarse startup leaves wider measured brackets. Existing failed-probe
-        // backoff can take longer to trim the final few workers than a cached
-        // start's finer path; it must still reach the smallest near-best count.
-        let mut reached = false;
         for _ in 0..128 {
             let rate = p.n.min(cap) as f64 * 10e6;
             measure(&mut p, rate);
-            if p.settled() == smallest_near_best {
-                reached = true;
-                break;
-            }
+            assert!(p.settled() >= cap, "history {:?}", p.history);
+            assert_eq!(p.recommended(), cap);
         }
-        assert!(reached, "history {:?}", p.history);
     }
 }
 
@@ -399,7 +385,7 @@ fn a_failed_up_probe_does_not_immediately_bounce_down() {
 }
 
 #[test]
-fn refines_to_the_smallest_near_best_integer() {
+fn rejects_a_slightly_slower_downward_probe() {
     let mut p = Policy::refine(10, MIN, MAX);
     measure(&mut p, 100.0);
     measure(&mut p, 130.0);
@@ -409,19 +395,18 @@ fn refines_to_the_smallest_near_best_integer() {
     }
     assert_eq!(p.n, 11);
     measure(&mut p, 129.0);
-    // 10 is a fresh lower bound and was materially slower; do not retest
-    // it immediately just because the probe at 11 succeeded.
-    assert_eq!(p.settled(), 11);
-    assert_eq!(p.n, 11);
+    assert_eq!(p.settled(), 13);
+    assert_eq!(p.n, 13);
 }
 
 #[test]
-fn descends_all_the_way_to_one_when_one_saturates_the_link() {
-    let p = simulate(START_SSH, 1, 80, |_| 1.0);
-    assert!(p.history.contains(&1), "history {:?}", p.history);
-    // Flat upward probes can be retained later, but must not repeatedly
-    // double and grow beyond the initial inconclusive increase.
-    assert_eq!(p.peak, START_SSH * STARTUP_STEP);
+fn flat_throughput_does_not_justify_a_reduction() {
+    let mut p = Policy::new(START_SSH, MIN, MAX);
+    for _ in 0..200 {
+        measure(&mut p, 100.0);
+        assert!(p.settled() >= START_SSH, "history {:?}", p.history);
+        assert_eq!(p.recommended(), START_SSH);
+    }
 }
 
 #[test]
@@ -1010,12 +995,12 @@ fn inconclusive_doubling_keeps_capacity_without_another_increase() {
 }
 
 #[test]
-fn ambiguous_probe_does_not_change_downward_acceptance_or_clear_loss_rollback() {
+fn downward_gain_requirement_preserves_clear_upward_loss_rollback() {
     let mut policy = Policy::refine(8, 1, 64);
     measure(&mut policy, 100.0);
     measure(&mut policy, 94.0);
     assert_eq!(policy.n, 8);
-    for (score, keep_smaller) in [(95.0, true), (94.0, false)] {
+    for (score, keep_smaller) in [(101.0, true), (100.0, false), (95.0, false)] {
         let mut policy = Policy::refine(16, 1, 64);
         policy.record(16, 100.0);
         assert!(policy.begin(Direction::Down, 100.0));
@@ -1071,14 +1056,15 @@ fn recommendation_changes_only_with_justified_growth_or_reduction() {
     assert!(policy.begin(Direction::Down, 200.0));
     policy.activated();
     assert_eq!(policy.n, 24);
-    measure(&mut policy, 200.0);
+    measure(&mut policy, 201.0);
     assert_eq!(policy.settled(), 24);
     assert_eq!(policy.recommended(), 16); // Partial rollback must not save 24.
     for _ in 0..16 {
         if policy.settled() < 16 {
             break;
         }
-        measure(&mut policy, 200.0);
+        let score = 300.0 - policy.n as f64;
+        measure(&mut policy, score);
     }
     assert!(policy.recommended() < 16);
     assert_eq!(policy.recommended(), policy.settled());
@@ -1126,4 +1112,33 @@ fn floor_does_not_prevent_downward_recovery_after_growing() {
         "never resumed downward probing: {:?}",
         p.history
     );
+}
+
+#[test]
+fn downward_probe_requires_a_measured_speed_increase() {
+    for score in [94.0, 95.0, 99.0, 100.0, 100.001, 101.0] {
+        let mut policy = Policy::refine(32, MIN, MAX);
+        policy.record(32, 100.0);
+        assert!(policy.begin(Direction::Down, 100.0));
+        policy.activated();
+        let lower = policy.n;
+        measure(&mut policy, score);
+        assert_eq!(
+            policy.settled(),
+            if score > 100.0 { lower } else { 32 },
+            "score={score}"
+        );
+        assert_eq!(policy.recommended(), policy.settled());
+    }
+}
+
+#[test]
+fn aging_evidence_does_not_make_a_slower_reduction_acceptable() {
+    let mut p = Policy::refine(32, MIN, MAX);
+    for _ in 0..1000 {
+        let score = p.n.min(32) as f64 * 100.0 / 32.0;
+        measure(&mut p, score);
+        assert!(p.settled() >= 32, "settled below full speed: {p:?}");
+        assert_eq!(p.recommended(), 32);
+    }
 }

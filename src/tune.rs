@@ -57,14 +57,14 @@ pub const START_LOCAL_LOW_CPU: usize = 16;
 /// Never auto-tune below this many.
 pub const MIN: usize = 1;
 /// Policy mechanics version recorded in transfer history.
-pub const POLICY_VERSION: u32 = 5;
+pub const POLICY_VERSION: u32 = 6;
 const STARTUP_STEP: usize = 2;
 
 /// Multiplicative step after discovery, or with a closely matched plateau hint.
 pub const STEP: f64 = 1.3;
-/// Throughput tolerance for comparisons. Reductions must stay near the recent
-/// best; an inconclusive increase within this tolerance of its own baseline
-/// keeps the larger count without continuing growth.
+/// Throughput tolerance for upward comparisons and plateau evidence. An
+/// inconclusive increase within this tolerance of its own baseline keeps the
+/// larger count without continuing growth. Reductions require a measured gain.
 const NEAR_BEST_TOLERANCE: f64 = 0.05;
 /// Measurements in the hold phase between probes. Each failed probe in a
 /// direction doubles only that direction's wait (up to
@@ -814,7 +814,7 @@ impl Policy {
                     // and its smaller baseline is not. An inconclusive result
                     // is handled separately below.
                     Direction::Up => score >= floor && base < floor,
-                    Direction::Down => score >= floor,
+                    Direction::Down => score > base,
                 };
                 self.comparisons += 1;
                 let idx = direction.index();
