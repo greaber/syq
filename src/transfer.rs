@@ -108,6 +108,15 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
         .tuning
         .request_size(opts.block, bwlimit, opts.restricted_receiver);
     let limit = opts.tuning.batch_bytes().min(request);
+    // Experiment-only control on the audit branch; never intended for release.
+    static AUDIT_LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    if let Some(audit) = AUDIT_LIMIT.get_or_init(|| {
+        std::env::var("SYQ_AUDIT_BATCH_THRESHOLD")
+            .ok()
+            .map(|value| value.parse().unwrap())
+    }) {
+        return limit.min(*audit);
+    }
     if opts.copy_policy(bwlimit.is_some()).prefer_whole_files() {
         limit.min(LOCAL_FAST_FILE_BYTES)
     } else {
