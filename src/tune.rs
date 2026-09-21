@@ -58,7 +58,7 @@ pub const START_LOCAL_LOW_CPU: usize = 16;
 /// Never auto-tune below this many.
 pub const MIN: usize = 1;
 /// Policy mechanics version recorded in transfer history.
-pub const POLICY_VERSION: u32 = 6;
+pub const POLICY_VERSION: u32 = 7;
 const STARTUP_STEP: usize = 2;
 
 /// Multiplicative step after discovery, or with a closely matched plateau hint.
@@ -825,13 +825,11 @@ impl Policy {
                 if base <= 0.0 && score <= 0.0 {
                     return self.n;
                 }
-                let best = self.recent_best();
-                let floor = best * (1.0 - NEAR_BEST_TOLERANCE);
                 let keep = match direction {
-                    // Continue upward only when the larger count is near-best
-                    // and its smaller baseline is not. An inconclusive result
-                    // is handled separately below.
-                    Direction::Up => score >= floor && base < floor,
+                    // Judge a gain against this probe's recent baseline. Older
+                    // high-water scores can describe conditions that no longer
+                    // apply, even when revisiting them refreshes their age.
+                    Direction::Up => base < score * (1.0 - NEAR_BEST_TOLERANCE),
                     Direction::Down => score > base,
                 };
                 self.comparisons += 1;

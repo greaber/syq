@@ -405,7 +405,10 @@ fn trace_distinguishes_acceptance_rejection_and_pending_comparison() {
         decisions[1]["data"]["before"]["state"]["Explore"]["base"],
         100.0
     );
-    assert_eq!(decisions[1]["data"]["after"]["acceptance_floor"], 114.0);
+    assert_eq!(
+        decisions[1]["data"]["after"]["historical_near_best_floor"],
+        114.0
+    );
     assert_eq!(decisions[2]["data"]["reason"], "probe_rejected");
     assert_eq!(decisions[2]["data"]["sample_ids"], json!([2]));
     assert_eq!(events.last().unwrap()["data"]["pending_comparison"], false);
