@@ -130,11 +130,16 @@ pub(super) fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
             );
         }
         let remote = probe.congestion_control.as_deref().unwrap_or("unavailable");
+        let (listener, connector) = if crate::destination::is_named(&spec.restricted_grant) {
+            ("sending server listener", "receiving machine")
+        } else {
+            ("remote listener", "local")
+        };
         match &args.tcp_congestion {
             Some(requested) => crate::output::diagnostic!(
-                "  congestion control: remote listener {remote}; local data sockets request {requested}"
+                "  congestion control: {listener} {remote}; {connector} data sockets request {requested}"
             ),
-            None => crate::output::diagnostic!("  congestion control: remote listener {remote} (host default)"),
+            None => crate::output::diagnostic!("  congestion control: {listener} {remote} (host default)"),
         }
     }
 

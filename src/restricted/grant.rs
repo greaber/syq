@@ -427,7 +427,7 @@ pub(crate) fn named_request(
         .split_last()
         .context("copy endpoints missing")?;
     let mut checked = args.clone();
-    // These channels are encrypted by the laptop-initiated SSH connection.
+    // Named channels are encrypted by SSH or laptop-initiated TCP workers.
     checked.no_tcp = false;
     let path = crate::destination::request_path(b".")?;
     let grant = grant_for(

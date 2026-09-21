@@ -4152,10 +4152,10 @@ fn display_plan_target(loc: &Location, path: &[u8], args: &Args) -> String {
 }
 
 fn remote_data_transport(spec: &RemoteSpec) -> &'static str {
-    match spec.tcp.lock().unwrap().as_ref() {
-        Some(info) if info.key.is_some() => "encrypted TCP",
-        Some(_) => "plaintext TCP",
-        None => "ssh",
+    match spec.data_transport() {
+        DataTransport::EncryptedTcp => "encrypted TCP",
+        DataTransport::PlaintextTcp => "plaintext TCP",
+        DataTransport::Ssh => "ssh",
     }
 }
 
