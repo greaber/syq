@@ -108,6 +108,15 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
         .tuning
         .request_size(opts.block, bwlimit, opts.restricted_receiver);
     let limit = opts.tuning.batch_bytes().min(request);
+    // Experiment-only control on the audit branch; never intended for release.
+    static AUDIT_LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    if let Some(audit) = AUDIT_LIMIT.get_or_init(|| {
+        std::env::var("SYQ_AUDIT_BATCH_THRESHOLD")
+            .ok()
+            .map(|value| value.parse().unwrap())
+    }) {
+        return limit.min(*audit);
+    }
     if opts.copy_policy(bwlimit.is_some()).prefer_whole_files() {
         limit.min(LOCAL_FAST_FILE_BYTES)
     } else {
@@ -233,13 +242,18 @@ impl Opts {
         self.mapping_expected_hashes.get(path)
     }
     fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
+        // Audit-only intervention: isolate batching from native whole-file copy.
+        static NO_WHOLE_COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let no_whole_copy =
+            *NO_WHOLE_COPY.get_or_init(|| std::env::var_os("SYQ_AUDIT_NO_WHOLE_COPY").is_some());
         crate::copy_policy::CopyPolicy {
             same_host: self.same_host,
             // Payload checks do not disable same-host copy shortcuts.
             checksum: self.checksum,
             force_ranges: self.tuning.force_ranges(),
             bandwidth_limited,
-            receiver_copy_disabled: !cfg!(any(target_os = "linux", target_os = "macos"))
+            receiver_copy_disabled: no_whole_copy
+                || !cfg!(any(target_os = "linux", target_os = "macos"))
                 || !self.local_copy_fd_budget
                 || self.dry_run
                 || self.restricted_receiver
