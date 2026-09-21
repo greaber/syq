@@ -161,7 +161,7 @@ fn unsuccessful_doubling_refines_immediately_then_uses_normal_backoff() {
     assert!(!p.startup_doubling);
     measure(&mut p, 200.0); // 24 paid: refine the remaining 24..32 bracket
     assert_eq!(p.n, 28);
-    measure(&mut p, 200.0); // 28 does not pay: return to 24 and wait
+    measure(&mut p, 180.0); // 28 clearly hurts: return to 24 and wait
     assert_eq!(p.n, 24);
     assert!(matches!(p.state, State::Hold));
     assert!(p.due[Direction::Up.index()] > p.tick);
@@ -198,7 +198,7 @@ fn resume_worker_reset_preserves_cached_and_uncached_startup_modes() {
 
     let mut refined = Policy::new(2, MIN, MAX);
     measure(&mut refined, 20.0);
-    measure(&mut refined, 20.0); // rejected doubling has entered finer search
+    measure(&mut refined, 20.0); // inconclusive doubling has stopped coarse search
     for (policy, expected_next) in [
         (Policy::refine(2, MIN, MAX), 10),
         (Policy::new(2, MIN, MAX), 16),
@@ -254,7 +254,7 @@ fn plateau_evidence_requires_a_nearby_recent_upper_measurement() {
 
     let mut close = Policy::refine(8, MIN, MAX);
     measure(&mut close, 80.0);
-    measure(&mut close, 80.0); // 10 did not help: a nearby completed comparison.
+    measure(&mut close, 60.0); // 10 clearly hurt: a nearby completed comparison.
     assert_eq!(close.settled(), 8);
     assert!(close.discovery_complete());
     let mut slower = close.clone();
@@ -287,7 +287,7 @@ fn doubling_a_weak_start_reaches_the_plateau_before_premature_refinement() {
 }
 
 #[test]
-fn upward_acceptance_uses_the_near_best_objective() {
+fn upward_gain_continues_but_inconclusive_result_holds() {
     let mut worthwhile = Policy::refine(10, MIN, MAX);
     measure(&mut worthwhile, 100.0);
     measure(&mut worthwhile, 107.0);
@@ -296,7 +296,9 @@ fn upward_acceptance_uses_the_near_best_objective() {
     let mut unnecessary = Policy::refine(10, MIN, MAX);
     measure(&mut unnecessary, 100.0);
     measure(&mut unnecessary, 104.0);
-    assert_eq!(unnecessary.settled(), 10);
+    assert_eq!(unnecessary.settled(), 13);
+    assert_eq!(unnecessary.state, State::Hold);
+    assert!(!unnecessary.discovery_complete());
 }
 
 #[test]
@@ -337,10 +339,17 @@ fn upward_probe_refreshes_its_baseline_while_warming() {
 
 #[test]
 fn cached_successful_direction_continues_to_the_plateau() {
-    let p = simulate_policy(Policy::refine(START_SSH, MIN, MAX), 32, 80, |_| 1.0);
+    let mut p = Policy::refine(START_SSH, MIN, MAX);
+    let mut refined = false;
+    for _ in 0..80 {
+        let rate = p.n.min(32) as f64 * 10e6;
+        measure(&mut p, rate);
+        // Later exploration can hold a larger inconclusive candidate; check
+        // that downward refinement still reaches the smallest near-best count.
+        refined |= p.settled() == 31;
+    }
     assert_eq!(&p.history[..6], &[8, 10, 13, 17, 22, 29]);
-    // 31 is the smallest integer within 5% of the observed best (32).
-    assert_eq!(p.settled(), 31, "history {:?}", p.history);
+    assert!(refined, "history {:?}", p.history);
 }
 
 #[test]
@@ -378,7 +387,7 @@ fn a_failed_up_probe_does_not_immediately_bounce_down() {
     let mut p = Policy::refine(10, MIN, MAX);
     measure(&mut p, 100.0); // 10 -> 13
     measure(&mut p, 130.0); // 13 paid; try 17
-    measure(&mut p, 130.0); // 17 did not; return to 13
+    measure(&mut p, 90.0); // 17 clearly hurt; return to 13
     assert_eq!(p.n, 13);
     for _ in 0..PROBE_EVERY - 1 {
         measure(&mut p, 130.0);
@@ -394,7 +403,7 @@ fn refines_to_the_smallest_near_best_integer() {
     let mut p = Policy::refine(10, MIN, MAX);
     measure(&mut p, 100.0);
     measure(&mut p, 130.0);
-    measure(&mut p, 130.0);
+    measure(&mut p, 90.0); // clear loss at 17 leaves the 10..13 bracket
     for _ in 0..PROBE_EVERY {
         measure(&mut p, 130.0);
     }
@@ -409,7 +418,10 @@ fn refines_to_the_smallest_near_best_integer() {
 #[test]
 fn descends_all_the_way_to_one_when_one_saturates_the_link() {
     let p = simulate(START_SSH, 1, 80, |_| 1.0);
-    assert_eq!(p.settled(), 1, "history {:?}", p.history);
+    assert!(p.history.contains(&1), "history {:?}", p.history);
+    // Flat upward probes can be retained later, but must not repeatedly
+    // double and grow beyond the initial inconclusive increase.
+    assert_eq!(p.peak, START_SSH * STARTUP_STEP);
 }
 
 #[test]
@@ -557,7 +569,7 @@ fn gate_parks_and_releases() {
     let g = Gate::new(2);
     assert!(g.allowed(1));
     assert!(!g.allowed(2));
-    g.set_retain(3);
+    g.set_connect_target(3);
     let g2 = g.clone();
     let t = std::thread::spawn(move || g2.park(2, || false));
     std::thread::sleep(Duration::from_millis(50));
@@ -572,22 +584,75 @@ fn gate_parks_and_releases() {
 }
 
 #[test]
-fn gate_distinguishes_warming_ready_active_and_retired() {
+fn parked_connections_survive_lower_targets_and_reactivate_without_setup() {
     let gate = Gate::new(2);
     assert_eq!(gate.begin_warming(2), vec![0, 1]);
-    assert!(!gate.ready_through(2));
     gate.mark_ready(0);
     assert!(!gate.ready_through(2));
     gate.mark_ready(1);
-    assert!(gate.ready_through(2));
-
     gate.set_active(1);
-    gate.set_retain(1);
-    assert!(gate.allowed(0));
+    gate.set_connect_target(1);
     assert!(!gate.allowed(1));
-    assert!(!gate.park(1, || false), "surplus slot should retire");
-    gate.mark_absent(1);
-    assert_eq!(gate.begin_warming(2), vec![1]);
+    assert!(!gate.connection_needed(1), "unneeded recovery can stop");
+
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    let (resumed_tx, resumed_rx) = std::sync::mpsc::channel();
+    let worker_gate = gate.clone();
+    let worker = std::thread::spawn(move || {
+        let resumed = worker_gate.park(1, || {
+            parked_tx.send(()).unwrap();
+            false
+        });
+        resumed_tx.send(resumed).unwrap();
+    });
+    parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // A further policy update must not close the parked connection either.
+    gate.set_connect_target(1);
+    assert!(resumed_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    assert!(gate.ready_through(2));
+    assert!(gate.begin_warming(2).is_empty(), "reuse, not a new worker");
+    gate.set_active(2);
+    assert!(resumed_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    worker.join().unwrap();
+}
+
+#[test]
+fn parked_connections_exit_when_the_copy_finishes_or_aborts() {
+    let gate = Gate::new(2);
+    gate.mark_ready(1);
+    gate.set_active(1);
+    gate.set_connect_target(1);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+    let worker_gate = gate.clone();
+    let worker_done = done.clone();
+    let worker = std::thread::spawn(move || {
+        let resumed = worker_gate.park(1, || {
+            parked_tx.send(()).unwrap();
+            worker_done.load(Relaxed)
+        });
+        exit_tx.send(resumed).unwrap();
+    });
+    parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    done.store(true, Relaxed);
+    assert!(!exit_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    worker.join().unwrap();
+}
+
+#[test]
+fn cancelled_connection_setup_does_not_discard_a_ready_slot() {
+    let gate = Gate::new(1);
+    gate.set_connect_target(3);
+    assert_eq!(gate.begin_warming(3), vec![0, 1, 2]);
+    gate.mark_ready(0);
+    gate.mark_ready(1);
+    gate.set_connect_target(1);
+    assert!(!gate.connection_needed(2));
+    gate.mark_absent(2);
+    // Revisit the larger count: only the cancelled attempt needs setup.
+    assert_eq!(gate.begin_warming(3), vec![2]);
+    assert!(gate.ready_through(2));
 }
 
 #[test]
@@ -621,11 +686,403 @@ fn out_of_order_readiness_keeps_every_warming_slot() {
     assert!(gate.begin_warming(4).is_empty());
 
     // Shrinking the warming target must not forget higher candidates.
-    gate.set_retain(6);
+    gate.set_connect_target(6);
     assert_eq!(gate.begin_warming(6), vec![4, 5]);
     gate.mark_ready(5);
     assert!(gate.begin_warming(4).is_empty());
     gate.mark_ready(4);
     assert!(gate.ready_through(6));
     assert!(gate.begin_warming(6).is_empty());
+}
+
+#[test]
+fn preparation_precedes_the_first_decision_without_activating_workers() {
+    for (mut policy, candidate) in [
+        (Policy::new(16, 1, 64), 32),
+        (Policy::refine(16, 1, 64), 21),
+    ] {
+        let mut sampler = Sampler::default();
+        sampler.reset();
+        let lead = Duration::from_secs(12);
+        let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
+        assert_eq!(plan.connect, candidate);
+        assert_eq!(policy.n, 16);
+        assert_eq!(policy.active(), 16);
+        assert_eq!(policy.history, vec![16]);
+        assert_eq!(policy.peak, 16);
+
+        let gate = Gate::new(16);
+        gate.prepare(plan);
+        for id in gate.begin_warming(plan.connect) {
+            gate.mark_ready(id);
+        }
+        assert!(gate.ready_through(candidate));
+        assert!(!gate.allowed(16));
+        assert_eq!(policy.observe(100.0), candidate);
+        assert!(gate.begin_warming(policy.n).is_empty());
+        gate.set_active(policy.n);
+        policy.activated();
+        assert!(gate.allowed(candidate - 1));
+    }
+}
+
+#[test]
+fn preparation_uses_earliest_sample_boundary_and_keeps_rollback_ready() {
+    let mut sampler = Sampler::default();
+    sampler.reset();
+    assert_eq!(
+        sampler.earliest_score_in(SAMPLE, Duration::ZERO),
+        SAMPLE * 3
+    );
+    assert_eq!(sampler.push(100.0), None);
+    assert_eq!(sampler.push(100.0), None);
+    assert_eq!(
+        sampler.earliest_score_in(SAMPLE, Duration::from_secs(2)),
+        Duration::from_millis(500)
+    );
+    let mut policy = Policy::refine(16, 1, 64);
+    let plan = policy.connection_plan(
+        &sampler,
+        SAMPLE,
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        true,
+    );
+    assert_eq!(plan.connect, 21);
+    policy.observe(100.0);
+    policy.activated();
+    policy.observe(70.0); // reject a clearly slower 21 and settle at 16
+    policy.activated();
+    assert_eq!(policy.n, 16);
+    assert!(policy.begin(Direction::Down, 100.0));
+    policy.activated();
+    let plan = policy.connection_plan(
+        &sampler,
+        SAMPLE,
+        Duration::ZERO,
+        Duration::from_secs(1),
+        true,
+    );
+    assert_eq!(plan.connect, 16, "keep rollback despite lower active count");
+    assert!(plan.keep >= 16);
+}
+
+#[test]
+fn distant_probe_releases_spares_then_prepares_before_it_is_due() {
+    let mut policy = Policy::refine(16, 1, 64);
+    policy.state = State::Hold;
+    policy.due = [60, 60];
+    let sampler = Sampler::default();
+    let lead = Duration::from_secs(21); // measured ten seconds, doubled plus margin
+    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
+    assert_eq!(
+        plan,
+        ConnectionPlan {
+            connect: 16,
+            keep: 16
+        }
+    );
+    policy.tick = 55; // 25 seconds until earliest probe: retain, not yet open
+    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
+    assert_eq!(plan.connect, 16);
+    assert!(plan.keep >= 21);
+    policy.tick = 56; // 20 seconds: open now, before the policy changes
+    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
+    assert_eq!(plan.connect, 21);
+    assert_eq!(policy.n, 16);
+    assert_eq!(policy.tick, 56);
+}
+
+#[test]
+fn preparation_respects_limits_and_skips_speculation_at_the_tail() {
+    let policy = Policy::new(16, 1, 18);
+    let sampler = Sampler::default();
+    let lead = Duration::from_secs(30);
+    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
+    assert_eq!(plan.connect, 18);
+    let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, false);
+    assert_eq!(plan.connect, 16);
+    let fixed = Policy::new(16, 16, 16);
+    assert_eq!(fixed.connection_forecast(), (16, None));
+}
+
+#[test]
+fn retired_connection_is_not_ready_or_duplicated_before_worker_cleanup() {
+    let gate = Gate::new(1);
+    for id in gate.begin_warming(2) {
+        gate.mark_ready(id);
+    }
+    gate.prepare(ConnectionPlan {
+        connect: 1,
+        keep: 1,
+    });
+    assert!(!gate.park(1, || false));
+    assert!(!gate.ready_through(2));
+    gate.prepare(ConnectionPlan {
+        connect: 2,
+        keep: 2,
+    });
+    assert!(
+        gate.begin_warming(2).is_empty(),
+        "wait for old worker cleanup"
+    );
+    gate.mark_absent(1);
+    assert_eq!(gate.begin_warming(2), vec![1]);
+    gate.mark_ready(1);
+    assert!(gate.ready_through(2));
+}
+
+#[test]
+fn warming_forecast_waits_for_candidate_measurements_not_baseline_refresh() {
+    for (mut policy, candidate, following) in [
+        (Policy::new(16, 1, 64), 32, 64),
+        (Policy::refine(16, 1, 64), 21, 27),
+    ] {
+        assert_eq!(policy.observe(100.0), candidate);
+        assert_eq!(policy.active(), 16);
+        let mut baseline = Sampler::default();
+        assert_eq!(baseline.push(100.0), None);
+        // The next baseline score is due now, but the candidate still needs a
+        // discarded sample plus two measured samples after activation.
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        assert_eq!(plan.connect, candidate);
+        assert!(plan.keep >= candidate);
+        assert!(policy.refresh_warming_baseline(100.0));
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        assert_eq!(plan.connect, candidate);
+        // Truly slow setup can still justify overlapping preparation, using the
+        // earliest post-activation decision rather than a baseline refresh.
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(10), true);
+        assert_eq!(plan.connect, following);
+        policy.activated();
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        assert_eq!(plan.connect, following);
+    }
+}
+
+#[test]
+fn setup_clock_starts_at_connection_not_worker_reservation() {
+    let gate = Gate::new(1);
+    assert_eq!(gate.begin_warming(1), vec![0]);
+    // An initial worker may remain here throughout a slow source listing.
+    // Reserving it must not start a clock that can include that wait.
+    assert_eq!(gate.slots.lock().unwrap()[0].phase, SlotPhase::Warming);
+    assert_eq!(gate.slots.lock().unwrap()[0].setup_started, None);
+    assert_eq!(gate.setup_lead(), Duration::from_secs(1));
+    assert!(!gate.ready_through(1));
+
+    let connecting = Instant::now();
+    gate.mark_warming(0);
+    let started = gate.slots.lock().unwrap()[0].setup_started.unwrap();
+    assert!(started >= connecting);
+    gate.mark_warming(0);
+    assert_eq!(gate.slots.lock().unwrap()[0].setup_started, Some(started));
+    gate.mark_ready(0);
+    assert!(gate.ready_through(1));
+    assert_eq!(gate.slots.lock().unwrap()[0].setup_started, None);
+}
+
+#[test]
+fn setup_lead_includes_retries_and_does_not_shrink_after_one_fast_setup() {
+    let gate = Gate::new(1);
+    gate.begin_warming(1);
+    let started = Instant::now() - Duration::from_secs(10);
+    gate.slots.lock().unwrap()[0].setup_started = Some(started);
+    gate.mark_warming(0);
+    assert_eq!(gate.slots.lock().unwrap()[0].setup_started, Some(started));
+    gate.mark_ready(0);
+    assert!(gate.setup_lead() >= Duration::from_secs(21));
+    gate.begin_warming(2);
+    gate.mark_warming(1);
+    gate.mark_ready(1);
+    assert!(gate.setup_lead() >= Duration::from_secs(21));
+}
+
+#[test]
+fn missed_preparation_still_waits_for_ready_connections_and_optional_failure_isolated() {
+    let mut policy = Policy::refine(16, 1, 64);
+    let gate = Gate::new(16);
+    for id in gate.begin_warming(16) {
+        gate.mark_ready(id);
+    }
+    let plan = policy.connection_plan(
+        &Sampler::default(),
+        SAMPLE,
+        Duration::ZERO,
+        Duration::from_secs(10),
+        true,
+    );
+    gate.prepare(plan);
+    assert_eq!(
+        gate.begin_warming(plan.connect),
+        (16..21).collect::<Vec<_>>()
+    );
+    assert_eq!(policy.observe(100.0), 21);
+    assert!(!gate.ready_through(policy.n));
+    assert_eq!(gate.active(), 16);
+    assert_eq!(policy.history, vec![16]);
+    gate.mark_failed(20);
+    assert!(gate.permanent_failure_through(21));
+    assert!(!gate.permanent_failure_through(16));
+    policy.cancel_unapplied();
+    assert_eq!(policy.n, 16);
+    assert_eq!(policy.peak, 16);
+    assert!(gate.ready_through(16));
+}
+
+#[test]
+fn a_preparation_pause_does_not_close_imminently_needed_spares() {
+    let mut policy = Policy::refine(16, 1, 64);
+    policy.state = State::Hold;
+    policy.due = [1, 1];
+    let plan = policy.connection_plan(
+        &Sampler::default(),
+        SAMPLE,
+        Duration::ZERO,
+        Duration::from_secs(10),
+        false,
+    );
+    assert_eq!(plan.connect, 16);
+    assert!(
+        plan.keep >= 21,
+        "no new setup, but don't discard ready capacity"
+    );
+}
+
+#[test]
+fn one_worker_start_prepares_spare_before_initial_connection_is_ready() {
+    let gate = Gate::new(1);
+    assert_eq!(gate.begin_warming(1), vec![0]);
+    assert!(!gate.ready_through(1));
+    let mut sampler = Sampler::default();
+    sampler.reset();
+    let mut policy = Policy::new(1, 1, 8);
+    let plan = policy.connection_plan(
+        &sampler,
+        SAMPLE,
+        Duration::ZERO,
+        Duration::from_secs(1),
+        false,
+    );
+    gate.prepare(plan);
+    assert_eq!(gate.begin_warming(plan.connect), vec![1]);
+    gate.mark_ready(1);
+    gate.mark_ready(0);
+    assert_eq!(policy.observe(100.0), 2);
+    assert!(gate.ready_through(2));
+    assert!(gate.begin_warming(2).is_empty());
+    let fixed = Policy::new(1, 1, 1);
+    assert_eq!(
+        fixed
+            .connection_plan(
+                &sampler,
+                SAMPLE,
+                Duration::ZERO,
+                Duration::from_secs(1),
+                false
+            )
+            .connect,
+        1
+    );
+}
+
+#[test]
+fn inconclusive_doubling_keeps_capacity_without_another_increase() {
+    for score in [95.0, 100.0, 104.0] {
+        let mut policy = Policy::new(8, 1, 64);
+        measure(&mut policy, 100.0);
+        assert_eq!(policy.n, 16);
+        measure(&mut policy, score);
+        assert_eq!(policy.n, 16);
+        assert_eq!(policy.state, State::Hold);
+        assert!(!policy.startup_doubling);
+        assert!(policy.measured());
+        assert!(!policy.discovery_complete());
+        assert_eq!(
+            policy.due[Direction::Up.index()],
+            policy.tick + 2 * PROBE_EVERY
+        );
+        for _ in 0..PROBE_EVERY - 1 {
+            measure(&mut policy, score);
+            assert_eq!(policy.n, 16);
+        }
+    }
+}
+
+#[test]
+fn ambiguous_probe_does_not_change_downward_acceptance_or_clear_loss_rollback() {
+    let mut policy = Policy::refine(8, 1, 64);
+    measure(&mut policy, 100.0);
+    measure(&mut policy, 94.0);
+    assert_eq!(policy.n, 8);
+    for (score, keep_smaller) in [(95.0, true), (94.0, false)] {
+        let mut policy = Policy::refine(16, 1, 64);
+        policy.record(16, 100.0);
+        assert!(policy.begin(Direction::Down, 100.0));
+        policy.activated();
+        let lower = policy.n;
+        measure(&mut policy, score);
+        assert_eq!(policy.settled(), if keep_smaller { lower } else { 16 });
+    }
+}
+
+#[test]
+fn repeated_inconclusive_copies_do_not_raise_the_recommended_start() {
+    // End copies before or after downward probes. Neither keeping a larger
+    // count nor partially reducing it should ratchet the next start upward.
+    for refine in [false, true] {
+        for loss_per_doubling in [1.0_f64, 0.97] {
+            for measurements in 2..=60 {
+                let mut start = 8;
+                for _ in 0..6 {
+                    let mut policy = if refine {
+                        Policy::refine(start, 1, 256)
+                    } else {
+                        Policy::new(start, 1, 256)
+                    };
+                    for _ in 0..measurements {
+                        let score = 100.0 * loss_per_doubling.powf((policy.n as f64 / 8.0).log2());
+                        measure(&mut policy, score);
+                    }
+                    assert!(policy.measured());
+                    assert!(
+                        policy.recommended() <= start,
+                        "start={start}, samples={measurements}, refine={refine}, \
+                         loss={loss_per_doubling}, policy={policy:?}"
+                    );
+                    start = policy.recommended();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn recommendation_changes_only_with_justified_growth_or_reduction() {
+    let mut policy = Policy::new(8, 1, 64);
+    measure(&mut policy, 100.0); // Proposed 16 is not a recommendation yet.
+    assert_eq!(policy.recommended(), 8);
+    measure(&mut policy, 200.0); // Clear gain at 16; propose 32.
+    assert_eq!(policy.recommended(), 16);
+    measure(&mut policy, 200.0); // Keep 32 live, but not for the next copy.
+    assert_eq!(policy.settled(), 32);
+    assert_eq!(policy.recommended(), 16);
+
+    assert!(policy.begin(Direction::Down, 200.0));
+    policy.activated();
+    assert_eq!(policy.n, 24);
+    measure(&mut policy, 200.0);
+    assert_eq!(policy.settled(), 24);
+    assert_eq!(policy.recommended(), 16); // Partial rollback must not save 24.
+    for _ in 0..16 {
+        if policy.settled() < 16 {
+            break;
+        }
+        measure(&mut policy, 200.0);
+    }
+    assert!(policy.recommended() < 16);
+    assert_eq!(policy.recommended(), policy.settled());
+    let lower = policy.recommended();
+    policy.cancel_unapplied();
+    assert_eq!(policy.recommended(), lower);
 }

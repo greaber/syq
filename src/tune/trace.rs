@@ -88,7 +88,11 @@ impl Trace {
         let reason = if comparisons != policy.comparisons {
             if policy.fails != fails && policy.fails.iter().sum::<u32>() > fails.iter().sum::<u32>()
             {
-                "probe_rejected"
+                if policy.n == old_n {
+                    "probe_inconclusive"
+                } else {
+                    "probe_rejected"
+                }
             } else {
                 "probe_accepted"
             }
@@ -152,7 +156,7 @@ impl Trace {
 
     pub fn end(&self, policy: &Policy, aborted: bool) {
         self.event("policy_end",json!({"active":policy.active(),"requested":policy.n,
-            "last_accepted":policy.settled(),"completed_comparison":policy.measured(),"discovery_complete":policy.discovery_complete(),
+            "last_accepted":policy.settled(),"recommended":policy.recommended(),"completed_comparison":policy.measured(),"discovery_complete":policy.discovery_complete(),
             "pending_comparison":matches!(policy.state,State::Explore{..}),"aborted":aborted,"policy":snapshot(policy)}));
         if let Some(recorder) = &self.recorder {
             recorder.flush();
@@ -162,7 +166,7 @@ impl Trace {
 
 fn snapshot(policy: &Policy) -> Value {
     json!({"requested":policy.n,"active":policy.active,"min":policy.min,"max":(policy.max != usize::MAX).then_some(policy.max),
-        "startup_doubling":policy.startup_doubling,"state":policy.state,"points":policy.points,"measurement":policy.tick,
+        "recommended":policy.recommended(),"startup_doubling":policy.startup_doubling,"state":policy.state,"points":policy.points,"measurement":policy.tick,
         "comparisons":policy.comparisons,"failed_probes":policy.fails,"next_probe":policy.due,
         "recent_best":policy.recent_best(),"acceptance_floor":policy.recent_best()*(1.0-NEAR_BEST_TOLERANCE)})
 }

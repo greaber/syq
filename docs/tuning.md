@@ -105,6 +105,18 @@ The older cache remains at `~/.cache/syq/tuning.json`, in its existing format.
 `SYQ_TUNING_CACHE` names another file; an empty value disables both this cache
 and the history below. `XDG_CACHE_HOME` changes their parent directory.
 
+When an increase gives similar throughput, syq keeps the extra workers and
+pauses growth; later experiments can reduce the count. That inconclusive
+increase does not raise the starting count remembered for future copies.
+When tuning reduces the worker count, connected workers wait without taking new
+work. Syq keeps connections available during an experiment so it can promptly
+restore the previous count. It also prepares likely increases ahead of time,
+using observed connection setup times to allow a margin. During longer waits
+between experiments, surplus connections can close and reopen nearer the next
+probe. Setup can still delay an increase if it takes longer than expected.
+Idle connections and their helper processes hold resources; the active worker
+count is not a count of open connections.
+
 ## Inspect tuning history
 
 Filesystem copies record a local timeline by default, including short and failed
