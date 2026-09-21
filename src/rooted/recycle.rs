@@ -26,6 +26,7 @@ pub(crate) struct Owner {
     identity: RootIdentity,
     pub(crate) pool: Pool,
     cleaned: bool,
+    drainers: Vec<std::thread::JoinHandle<Result<()>>>,
 }
 
 impl Pool {
@@ -142,13 +143,38 @@ impl Owner {
             Pool::open(directory.try_clone()?)
         })();
         match result {
-            Ok(pool) => Ok(Self {
-                root,
-                name,
-                identity,
-                pool,
-                cleaned: false,
-            }),
+            Ok(pool) => {
+                let mut owner = Self {
+                    root,
+                    name,
+                    identity,
+                    pool,
+                    cleaned: false,
+                    drainers: Vec::new(),
+                };
+                if owner
+                    .pool
+                    .ideal
+                    .as_ref()
+                    .is_some_and(|i| i.draining_enabled())
+                {
+                    let workers = std::env::var("SYQ_EXPERIMENT_DRAIN_WORKERS")
+                        .unwrap_or_else(|_| "1".into())
+                        .parse::<usize>()?;
+                    anyhow::ensure!(
+                        (1..=8).contains(&workers),
+                        "drain experiment requires 1..8 workers"
+                    );
+                    for _ in 0..workers {
+                        let directory = owner.pool.directory.try_clone()?;
+                        let mapping = ideal::Ideal::open(&directory)?.unwrap();
+                        owner
+                            .drainers
+                            .push(std::thread::spawn(move || mapping.drain(directory)));
+                    }
+                }
+                Ok(owner)
+            }
             Err(error) => {
                 // Use the retained directory, never reopen a raced pathname
                 // before removing the state file this attempt created.
@@ -173,6 +199,23 @@ impl Owner {
         self.pool.state.write_all_at(&[1], 0)?;
         if let Some(ideal) = &self.pool.ideal {
             ideal.close(&self.pool.directory)?;
+        }
+        let mut drain_error = None;
+        for thread in self.drainers.drain(..) {
+            let result = thread
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("experimental drain worker panicked")));
+            if let Err(error) = result {
+                drain_error = Some(error);
+            }
+        }
+        if let Some(error) = drain_error {
+            return Err(error);
+        }
+        if let Some(ideal) = &self.pool.ideal {
+            if ideal.draining_enabled() {
+                ideal.report_drain();
+            }
         }
         for i in 0..SLOTS {
             let name = CString::new(i.to_string())?;
