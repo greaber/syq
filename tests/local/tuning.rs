@@ -117,6 +117,10 @@ fn automatic_workers_can_start_above_64_from_the_cache() {
         }
         let output = command
             .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
+            .env(
+                "SYQ_TUNING_HISTORY",
+                t.path(&format!("history-{label}.sqlite")),
+            )
             .env("SYQ_TEST_WORKER_EVENTS", &events)
             .env("SYQ_TEST_REQUIRE_TCP", "1")
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
@@ -133,6 +137,16 @@ fn automatic_workers_can_start_above_64_from_the_cache() {
                 "starting with {expected} connections remembered for this path"
             )),
             "{output:?}"
+        );
+        let history =
+            rusqlite::Connection::open(t.path(&format!("history-{label}.sqlite"))).unwrap();
+        let doubling: bool = history.query_row(
+            "SELECT json_extract(data,'$.data.policy.startup_doubling') FROM events WHERE json_extract(data,'$.kind')='policy_start' ORDER BY sequence LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            doubling,
+            "legacy count has no plateau or filesystem evidence"
         );
         for file in ["one", "two"] {
             assert_eq!(read(&t.path(&format!("{label}/{file}"))), data);
@@ -1715,8 +1729,10 @@ fn disabling_tuning_cache_also_disables_history() {
 #[test]
 fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     let t = Tmp::new();
+    // Keep files above the tiny-file batching threshold so the three-worker
+    // hint is also the actual starting count in the uncapped cases.
     for n in 0..32 {
-        write(&t.path(&format!("source/file-{n}")), &prng(8192, n));
+        write(&t.path(&format!("source/file-{n}")), &prng(128 * 1024, n));
     }
     let copy = |name: &str, controls: &[&str]| {
         history_command(&t)
@@ -1750,7 +1766,7 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     db.execute("UPDATE runs SET eligible=1,workers=3", [])
         .unwrap();
     assert_output_ok(&copy("second", &[]));
-    assert!(!startup_doubling(2));
+    assert!(startup_doubling(2));
     let event: String = db
         .query_row(
             "SELECT data FROM events WHERE run=2 AND json_extract(data,'$.kind')='starting_count'",
@@ -1762,7 +1778,7 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     assert_eq!(event["data"]["workers"], 3);
     assert_eq!(event["data"]["hint"]["matched"], "filesystems");
     assert_output_ok(&copy("capped", &["--resource-limits", "workers=2"]));
-    assert!(!startup_doubling(3));
+    assert!(startup_doubling(3));
     let event: String = db
         .query_row(
             "SELECT data FROM events WHERE run=3 AND json_extract(data,'$.kind')='starting_count'",
@@ -1783,4 +1799,19 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     let event: serde_json::Value = serde_json::from_str(&event).unwrap();
     assert_eq!(event["data"]["workers"], 1);
     assert_eq!(event["data"]["reason"], "explicit");
+    // The same count becomes suitable for fine probes only with plateau evidence.
+    db.execute(
+        "UPDATE runs SET summary=json_set(summary,'$.discovery_complete',json('true')) WHERE id=1",
+        [],
+    )
+    .unwrap();
+    assert_output_ok(&copy("confirmed", &[]));
+    assert!(!startup_doubling(5));
+    // Clamping a strong count changes the starting point; don't transfer its
+    // confidence to a lower count that was not measured as the plateau.
+    assert_output_ok(&copy(
+        "confirmed-capped",
+        &["--resource-limits", "workers=2"],
+    ));
+    assert!(startup_doubling(6));
 }

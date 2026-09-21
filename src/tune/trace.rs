@@ -152,7 +152,7 @@ impl Trace {
 
     pub fn end(&self, policy: &Policy, aborted: bool) {
         self.event("policy_end",json!({"active":policy.active(),"requested":policy.n,
-            "last_accepted":policy.settled(),"completed_comparison":policy.measured(),
+            "last_accepted":policy.settled(),"completed_comparison":policy.measured(),"discovery_complete":policy.discovery_complete(),
             "pending_comparison":matches!(policy.state,State::Explore{..}),"aborted":aborted,"policy":snapshot(policy)}));
         if let Some(recorder) = &self.recorder {
             recorder.flush();

@@ -89,8 +89,10 @@ normal starting count.
 Without a matching history result, remote copies can use the older connection
 cache, then fall back to 8 workers over SSH or 16 over TCP. Local copies start
 with 32 workers, or 16 when at most two CPUs are available. Startup can reduce
-these counts when there is little parallel work. Live tuning continues unless
-you fix `workers`.
+these counts when there is little parallel work. A remembered count is a starting
+guess; syq keeps exploring quickly unless a successful transfer closely matches
+the current filesystems and settings and measured a throughput plateau. Live
+tuning continues unless you fix `workers`.
 
 Supplying `--performance-tuning` bypasses remembered counts and does not publish
 a new recommendation. With `--resource-limits workers=N`, syq clamps the starting
@@ -142,7 +144,7 @@ independent history file; an empty value disables history and its startup hints
 while leaving the older cache available. New database files are private to the
 user. SQLite may create adjacent `-wal` and `-shm` files while in use.
 
-`SYQ_TUNING_HISTORY_SIZE` sets how much history to keep, default `1G`, minimum
+`SYQ_TUNING_HISTORY_SIZE` sets how much history to keep, default `128M`, minimum
 `16M`. History may be removed when this size target is exceeded.
 
 Recording is best effort: an interrupted transfer or a storage error can leave

@@ -55,10 +55,10 @@ pub const START_LOCAL_LOW_CPU: usize = 16;
 /// Never auto-tune below this many.
 pub const MIN: usize = 1;
 /// Policy mechanics version recorded in transfer history.
-pub const POLICY_VERSION: u32 = 2;
+pub const POLICY_VERSION: u32 = 3;
 const STARTUP_STEP: usize = 2;
 
-/// Multiplicative step after startup, or when starting from a cached count.
+/// Multiplicative step after discovery, or with a closely matched plateau hint.
 pub const STEP: f64 = 1.3;
 /// Prefer the smallest measured count whose throughput is this close to the
 /// recent best. Probe scheduling handles noise independently from this
@@ -379,7 +379,7 @@ pub struct Policy {
     /// Highest count that was actually activated, not merely requested.
     pub peak: usize,
     active: usize,
-    /// Only the initial search without a learned starting count doubles.
+    /// Initial discovery doubles unless closely matched evidence supports refinement.
     startup_doubling: bool,
     state: State,
     points: BTreeMap<usize, Point>,
@@ -413,7 +413,7 @@ impl Policy {
         }
     }
 
-    pub fn from_cache(start: usize, min: usize, max: usize) -> Self {
+    pub fn refine(start: usize, min: usize, max: usize) -> Self {
         Self {
             startup_doubling: false,
             ..Self::new(start, min, max)
@@ -448,6 +448,35 @@ impl Policy {
     /// This is the minimum evidence worth persisting as a future start hint.
     pub fn measured(&self) -> bool {
         self.comparisons > 0
+    }
+
+    /// A starting guess is useful before discovery finishes. Smaller startup
+    /// probes need more: the settled count must be near the recent best and a
+    /// nearby higher count must have failed to improve it. A rejected doubling
+    /// alone leaves too wide a bracket; cancelled warmups and hitting a ceiling
+    /// are not plateau measurements either.
+    pub fn discovery_complete(&self) -> bool {
+        let settled = self.settled();
+        let Some(current) = self.points.get(&settled) else {
+            return false;
+        };
+        let recent =
+            |point: &Point| self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE;
+        current.score > 0.0
+            && recent(current)
+            && current.score >= self.recent_best() * (1.0 - NEAR_BEST_TOLERANCE)
+            && self
+                .points
+                .range((
+                    std::ops::Bound::Excluded(settled),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .is_some_and(|(&higher, point)| {
+                    higher <= step_up(settled)
+                        && recent(point)
+                        && current.score >= point.score * (1.0 - NEAR_BEST_TOLERANCE)
+                })
     }
 
     fn probe_base(&self) -> Option<f64> {

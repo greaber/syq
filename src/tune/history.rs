@@ -14,7 +14,7 @@ mod command;
 mod tests;
 pub(crate) use command::{command_for_help, run};
 const SCHEMA: i64 = 1;
-const DEFAULT_BUDGET: u64 = 1 << 30;
+const DEFAULT_BUDGET: u64 = 128 << 20;
 const MAX_PENDING: usize = 4096;
 const FINISH_LOCK_WAIT: Duration = Duration::from_millis(100);
 
@@ -32,7 +32,7 @@ struct Writer {
     lost: i64,
     budget: u64,
     finished: bool,
-    recommendation: Option<usize>,
+    recommendation: Option<(usize, bool)>,
     salt: [u8; 32],
 }
 
@@ -53,6 +53,7 @@ pub(crate) struct Hint {
     pub run: i64,
     pub workers: usize,
     pub matched: String,
+    pub refine: bool,
 }
 
 fn day() -> i64 {
@@ -285,20 +286,28 @@ impl Recorder {
         select_hint(&state.db, key, allow_route).ok().flatten()
     }
 
-    pub(crate) fn recommend(&self, workers: usize) {
+    pub(crate) fn recommend(&self, workers: usize, discovery_complete: bool) {
         self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .recommendation = Some(workers);
+            .recommendation = Some((workers, discovery_complete));
     }
 
-    pub(crate) fn complete(&self, success: bool, summary: Value) {
-        let workers = self
+    pub(crate) fn complete(&self, success: bool, mut summary: Value) {
+        let recommendation = self
             .0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .recommendation;
-        self.finish(success, workers.is_some(), workers, summary);
+        if let Some((_, discovery_complete)) = recommendation {
+            summary["discovery_complete"] = json!(discovery_complete);
+        }
+        self.finish(
+            success,
+            recommendation.is_some(),
+            recommendation.map(|(workers, _)| workers),
+            summary,
+        );
     }
 
     pub(crate) fn finish(
@@ -322,8 +331,16 @@ impl Recorder {
 
 fn select_hint(db: &Connection, key: &ContextKey, allow_route: bool) -> Result<Option<Hint>> {
     if let (Some(src), Some(dst)) = (&key.source_filesystem, &key.destination_filesystem) {
-        let hint = db.query_row("SELECT id,workers FROM runs WHERE route=?1 AND mode=?2 AND source_fs=?3 AND destination_fs=?4 AND eligible=1 AND workers>0 ORDER BY id DESC LIMIT 1",
-            params![key.route,key.mode,src,dst], |r| Ok(Hint {run:r.get(0)?,workers:r.get::<_,u32>(1)? as usize,matched:"filesystems".into()})).optional()?;
+        let hint = db.query_row("SELECT id,workers,summary FROM runs WHERE route=?1 AND mode=?2 AND source_fs=?3 AND destination_fs=?4 AND status='success' AND eligible=1 AND workers>0 ORDER BY id DESC LIMIT 1",
+            params![key.route,key.mode,src,dst], |r| {
+                // The additive summary field leaves old histories usable as
+                // starting guesses, without mistaking them for completed search.
+                let summary: Option<String> = r.get(2)?;
+                let refine = summary.as_deref()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .is_some_and(|s| s["discovery_complete"] == true);
+                Ok(Hint {run:r.get(0)?,workers:r.get::<_,u32>(1)? as usize,matched:"filesystems".into(),refine})
+            }).optional()?;
         if hint.is_some() {
             return Ok(hint);
         }
@@ -331,8 +348,8 @@ fn select_hint(db: &Connection, key: &ContextKey, allow_route: bool) -> Result<O
     if !allow_route {
         return Ok(None);
     }
-    Ok(db.query_row("SELECT id,workers FROM runs WHERE route=?1 AND mode=?2 AND eligible=1 AND workers>0 ORDER BY id DESC LIMIT 1",
-        params![key.route,key.mode], |r| Ok(Hint {run:r.get(0)?,workers:r.get::<_,u32>(1)? as usize,matched:"route".into()})).optional()?)
+    Ok(db.query_row("SELECT id,workers FROM runs WHERE route=?1 AND mode=?2 AND status='success' AND eligible=1 AND workers>0 ORDER BY id DESC LIMIT 1",
+        params![key.route,key.mode], |r| Ok(Hint {run:r.get(0)?,workers:r.get::<_,u32>(1)? as usize,matched:"route".into(),refine:false})).optional()?)
 }
 
 impl Writer {

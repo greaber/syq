@@ -1792,7 +1792,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         })
     };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
-    let spawn_workers = |initial: usize, cached_start: bool| {
+    let spawn_workers = |initial: usize, refine_start: Option<usize>| {
         if let Some(history) = progress.tuning_history.get() {
             history.event(
                 "workers_start",
@@ -1811,8 +1811,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 spawn_worker.clone(),
             );
             let n0 = initial;
-            let policy = if cached_start {
-                tune::Policy::from_cache(n0, tune::MIN, maximum_workers)
+            let policy = if refine_start == Some(n0) {
+                tune::Policy::refine(n0, tune::MIN, maximum_workers)
             } else {
                 tune::Policy::new(n0, tune::MIN, maximum_workers)
             };
@@ -2467,7 +2467,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && std::env::var_os("SYQ_INTERNAL_DETACH_READY").is_none()
         && !pending_tcp_setups.is_empty();
     let history_context = std::cell::RefCell::new(None);
-    let mut finish_transport_setup = |args: &mut Args| -> Result<(bool, Option<String>, bool)> {
+    let mut finish_transport_setup = |args: &mut Args| -> Result<_> {
         for (spec, pending) in std::mem::take(&mut pending_tcp_setups) {
             if let Err(error) = spec.finish_tcp_setup(pending) {
                 handle_tcp_setup_error(
@@ -2597,7 +2597,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Ok((
             all_remote_endpoints_use_tcp,
             tuning_key,
-            remembered_start.is_some() || selected_history.is_some(),
+            selected_history
+                .as_ref()
+                .filter(|hint| hint.refine)
+                .map(|hint| hint.workers),
         ))
     };
     let mut transport_setup = if defer_transport_setup {
@@ -2619,9 +2622,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         connect_after_file_plan.store(true, Relaxed);
         spawn_workers(
             args.connections,
-            transport_setup
-                .as_ref()
-                .is_some_and(|(_, _, cached)| *cached),
+            transport_setup.as_ref().and_then(|(_, _, refine)| *refine),
         );
         workers_started = true;
     }
@@ -2801,7 +2802,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if transport_setup.is_none() {
         transport_setup = Some(finish_transport_setup(&mut args)?);
     }
-    let (all_remote_endpoints_use_tcp, tuning_key, cached_start) =
+    let (all_remote_endpoints_use_tcp, tuning_key, refine_start) =
         transport_setup.expect("transport setup completed before releasing planned work");
     // The complete buffered scan lets small trees keep the same bounded
     // starting count as normal scheduling. Open TCP workers while the control
@@ -2850,7 +2851,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
                     opts.tuning.batch_bytes(),
                 ),
-                cached_start,
+                refine_start,
             );
             workers_started = true;
         }
@@ -3036,7 +3037,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         sched.arm_direct_fallback(args.connections);
                         initial = 1;
                     }
-                    spawn_workers(initial, cached_start);
+                    spawn_workers(initial, refine_start);
                 }
             }
         }
@@ -3312,7 +3313,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         initial.mode.clone(),
                     );
                     if initial.route == final_key.route {
-                        history.recommend(policy.settled());
+                        history.recommend(policy.settled(), policy.discovery_complete());
                     }
                 }
             }

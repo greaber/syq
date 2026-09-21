@@ -46,6 +46,49 @@ fn filesystem_hint_survives_other_destination_and_incomplete_runs() {
 }
 
 #[test]
+fn only_completed_plateau_with_exact_filesystems_allows_refinement() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let old = recorder(&path);
+    old.context(&key("a"));
+    // Unchanged old summary: still a useful hint, with no discovery evidence.
+    old.finish(true, true, Some(8), json!({"elapsed_ms":1000,"bytes":123}));
+    let hint = old.hint(&key("a"), false).unwrap();
+    assert_eq!(hint.workers, 8);
+    assert!(!hint.refine);
+
+    let weak = recorder(&path);
+    weak.context(&key("a"));
+    weak.recommend(16, false);
+    weak.complete(true, json!({}));
+    let hint = weak.hint(&key("a"), false).unwrap();
+    assert_eq!(hint.workers, 16);
+    assert!(!hint.refine);
+
+    let strong = recorder(&path);
+    strong.context(&key("a"));
+    strong.recommend(24, true);
+    // A recommendation has no effect until the whole transfer succeeds.
+    assert_eq!(strong.hint(&key("a"), false).unwrap().workers, 16);
+    strong.complete(true, json!({}));
+    let hint = strong.hint(&key("a"), false).unwrap();
+    assert_eq!(hint.workers, 24);
+    assert!(hint.refine);
+    let broad = strong.hint(&key("different-filesystem"), true).unwrap();
+    assert_eq!(broad.workers, 24);
+    assert!(!broad.refine);
+    let mut other_mode = key("a");
+    other_mode.mode = "other settings".into();
+    assert!(strong.hint(&other_mode, true).is_none());
+
+    let failed = recorder(&path);
+    failed.context(&key("a"));
+    failed.recommend(32, true);
+    failed.complete(false, json!({}));
+    assert_eq!(failed.hint(&key("a"), false).unwrap().workers, 24);
+}
+
+#[test]
 fn partial_history_is_durable_without_a_successful_finish() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
@@ -330,7 +373,7 @@ fn trace_distinguishes_acceptance_rejection_and_pending_comparison() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
     let writer = recorder(&path);
-    let mut policy = Policy::from_cache(8, 1, 64);
+    let mut policy = Policy::refine(8, 1, 64);
     let gate = Gate::new(8);
     let mut trace = Trace::new(Some(writer.clone()), &policy, super::super::SAMPLE);
     trace.observe(&mut policy, 100.0, "stable");
