@@ -88,6 +88,16 @@ filesystems, transport, and copy settings when that information is available.
 A remembered count is a starting point, not a fixed limit or a promise of the
 best speed for a different workload.
 
+On macOS and Linux, remote-copy hints also distinguish local networks using
+available default-router hardware addresses, without requesting Wi-Fi location
+permission. These are hints about the network around the machine running syq;
+they cannot detect changes upstream of a phone hotspot. Linux currently reads
+IPv4 routers; macOS also reads IPv6 routers. If the network cannot be identified,
+syq uses its existing route and filesystem matches. Hints without network
+context remain available for that fallback; a known network starts its own
+history. Local-copy hints are unchanged. A change of transport or observed
+network context during a copy prevents saving a new hint for its initial path.
+
 `--performance-tuning` bypasses remembered counts and does not save a new
 recommendation. `--resource-limits workers=N` caps the starting count while
 leaving recommendations unchanged.

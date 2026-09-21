@@ -1324,13 +1324,20 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
     let data = prng(9 * 1024 * 1024 + 123, 905);
     write(&t.path("source"), &data);
     for route in ["local", "tcp", "ssh"] {
-        for (remembered, limit) in [(64, 1), (64, 3), (2, 3)] {
-            // Keep the old cache format; cover hints above and below the cap.
+        for (remembered, limit, network) in [
+            (64, 1, "test-network"),
+            (64, 3, "test-network"),
+            (2, 3, "test-network"),
+            (2, 3, "other-network"),
+            (2, 3, ""),
+        ] {
+            // Keep the cache format, with network-scoped keys; cover hints
+            // above and below the cap without depending on the host network.
             let cache = format!(
-                r#"{{"paths":{{"local>host|tcp":{remembered},"local>host|ssh":{remembered}}}}}"#
+                r#"{{"paths":{{"local>host|tcp|network-v1=test-network":{remembered},"local>host|ssh|network-v1=test-network":{remembered},"local>host|tcp":96,"local>host|ssh":96}}}}"#
             );
             write(&t.path("tuning.json"), cache.as_bytes());
-            let label = format!("{route}-{remembered}-{limit}");
+            let label = format!("{route}-{remembered}-{limit}-{network}");
             let events = t.path(&format!("events-{label}"));
             let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
             command.args([
@@ -1364,6 +1371,7 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
                 .env("SYQ_TEST_WORKER_EVENTS", &events)
                 .env("SYQ_TEST_TUNE_SAMPLE_MS", "20")
                 .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
+                .env("SYQ_TEST_TUNING_NETWORK", network)
                 .env("FAKE_REMOTE_HOME", t.path("remote-home"))
                 .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                 .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -1373,8 +1381,14 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
             let out = command.run().unwrap();
             assert_output_ok(&out);
             assert!(stderr_of(&out).contains("auto-tuned"), "{out:?}");
-            if route != "local" {
-                let start = remembered.min(limit);
+            if route != "local" && network == "other-network" {
+                assert!(
+                    !stderr_of(&out).contains("connections remembered for this path"),
+                    "{out:?}"
+                );
+            }
+            if route != "local" && network != "other-network" {
+                let start = if network.is_empty() { 96 } else { remembered }.min(limit);
                 assert!(
                     stderr_of(&out).contains(&format!(
                         "starting with {start} connections remembered for this path"

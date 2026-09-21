@@ -2553,7 +2553,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             gate.set_active(args.connections);
         }
         let tuning_key = (autotune && args.tuning_options.is_none())
-            .then(|| tune::path_key(&src_ep, &dst_ep))
+            .then(|| tune::network_path_key(&src_ep, &dst_ep))
             .flatten();
         let remembered_start = tuning_key
             .as_deref()
@@ -3349,14 +3349,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             // A TCP failure affects later connections but leaves earlier TCP
             // workers alive, so a changed key means the measurements may mix
             // transports. Such a run is useful live evidence but not a safe
-            // hint for either future pure path.
+            // hint for either future pure path. A changed network context also
+            // invalidates the starting key.
             if let Some(initial_key) = tuning_key.as_deref() {
-                let final_key = tune::path_key(&src_ep, &dst_ep);
+                let final_key = tune::network_path_key(&src_ep, &dst_ep);
                 if final_key.as_deref() == Some(initial_key) {
                     tune::remember(initial_key, policy.recommended());
                 } else if debug() {
                     crate::output::diagnostic!(
-                        "syq: auto-tuning: transport changed during transfer; not updating cache"
+                        "syq: auto-tuning: transport or network context changed during transfer; not updating cache"
                     );
                 }
             }

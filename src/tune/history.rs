@@ -46,6 +46,8 @@ pub(crate) struct ContextKey {
     pub source_filesystem: Option<String>,
     pub destination_filesystem: Option<String>,
     pub mode: String,
+    #[serde(default)]
+    pub network: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,7 +522,15 @@ pub(crate) fn context_key(
         source_transport,
         destination_transport
     );
+    let remote = source_transport != "Local" || destination_transport != "Local";
+    let network = remote.then(super::network::fingerprint).flatten();
+    let route = if remote {
+        super::network_key(&route, network.as_deref())
+    } else {
+        route
+    };
     ContextKey {
+        network: network.as_deref().map(|n| recorder.token("network", n)),
         source_endpoint: recorder.token("endpoint", &super::endpoint_key(src)),
         destination_endpoint: recorder.token("endpoint", &super::endpoint_key(dst)),
         source_transport,
