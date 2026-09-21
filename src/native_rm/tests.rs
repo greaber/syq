@@ -469,3 +469,40 @@ fn directory_renamed_away_after_pinning_is_reported_as_a_failure() {
     assert!(base.join("moved").is_dir());
     assert_still_linked_failure(&outcomes, b"tree");
 }
+
+#[test]
+fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
+    for cancelled in [false, true] {
+        let (task_tx, _task_rx) = mpsc::sync_channel(1);
+        let (event_tx, event_rx) = mpsc::channel();
+        let pool = Pool {
+            sender: Mutex::new(Some(task_tx)),
+            pending: Mutex::new(2),
+            events: event_tx,
+            dry_run: false,
+            cancelled: AtomicBool::new(false),
+        };
+        pool.task_done();
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        pool.outcome(removal_outcome(
+            0,
+            b"file".to_vec(),
+            Kind::File,
+            NativeRemoveDisposition::Removed,
+            Some(1),
+        ));
+        assert!(matches!(event_rx.try_recv(), Ok(Some(_))));
+        assert!(!pool.is_done());
+        // Force the problematic ordering: the coordinator already consumed
+        // the last outcome while its worker still counted as pending.
+        if cancelled {
+            pool.cancel();
+        }
+        pool.task_done();
+        assert!(pool.is_done());
+        assert!(matches!(event_rx.try_recv(), Ok(None)));
+    }
+}
