@@ -496,3 +496,74 @@ async fn resumed_child_can_split_again_without_losing_or_duplicating_keys() {
         .iter()
         .any(|(prefix, _)| prefix.starts_with("tree/b/") && prefix != "tree/b/"));
 }
+
+#[tokio::test]
+async fn ignored_start_after_filters_every_continuation_page() {
+    struct IgnoresStartAfter {
+        inner: Memory,
+        resumes: Cell<usize>,
+    }
+    impl Store for IgnoresStartAfter {
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            start_after: Option<&str>,
+        ) -> Result<Page> {
+            if start_after.is_some() {
+                assert!(token.is_none());
+                self.resumes.set(self.resumes.get() + 1);
+            }
+            self.inner.page(prefix, delimiter, token, None).await
+        }
+    }
+    // Exercise a completely filtered first page followed by a partially
+    // filtered page, as well as a cursor exactly on a page boundary.
+    for leading in [256, 600, 1000, 1200] {
+        for glob in [false, true] {
+            let store = IgnoresStartAfter {
+                inner: Memory::new(
+                    (0..leading)
+                        .map(|i| format!("tree/a/{i:04}"))
+                        .chain((0..6200).map(|i| format!("tree/b/sp +%é{i:04}"))),
+                ),
+                resumes: Cell::new(0),
+            };
+            let mut actual = Vec::new();
+            if glob {
+                engine::enumerate(
+                    &store,
+                    &Pattern::parse("s3://bucket/tree/**").unwrap(),
+                    8,
+                    |entry| {
+                        actual.push(entry.key);
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+            } else {
+                engine::enumerate_prefix(&store, "tree/", 8, |entry| {
+                    actual.push(entry.key);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            }
+            actual.sort();
+            assert_eq!(actual, store.inner.keys.iter().cloned().collect::<Vec<_>>());
+            assert_eq!(store.resumes.get(), 1);
+            assert_eq!(
+                store
+                    .inner
+                    .calls
+                    .borrow()
+                    .iter()
+                    .filter(|(prefix, delimiter)| prefix == "tree/b/" && !delimiter)
+                    .count(),
+                7
+            );
+        }
+    }
+}

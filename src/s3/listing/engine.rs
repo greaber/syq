@@ -82,6 +82,7 @@ enum Job {
         prefix: String,
         delimiter: bool,
         token: Option<String>,
+        start_after: Option<String>,
     },
 }
 
@@ -90,7 +91,7 @@ struct Batch {
     jobs: Vec<Job>,
 }
 
-fn scan_batch(prefix: String, delimiter: bool, page: Page) -> Batch {
+fn scan_batch(prefix: String, delimiter: bool, page: Page, start_after: Option<&str>) -> Batch {
     Batch {
         entries: page.entries,
         jobs: page
@@ -99,6 +100,7 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page) -> Batch {
                 prefix,
                 delimiter,
                 token: Some(token),
+                start_after: start_after.map(str::to_owned),
             })
             .into_iter()
             .collect(),
@@ -121,7 +123,17 @@ async fn read_after(
     token: Option<&str>,
     start_after: Option<&str>,
 ) -> Result<Page> {
-    let page = store.page(prefix, delimiter, token, start_after).await?;
+    // Keep the wire request unchanged for continuation pages. The token carries
+    // the service position; StartAfter remains a local lower bound even when a
+    // provider silently ignores it on the initial request.
+    let mut page = store
+        .page(
+            prefix,
+            delimiter,
+            token,
+            start_after.filter(|_| token.is_none()),
+        )
+        .await?;
     ensure!(
         page.entries.len() + page.prefixes.len() <= 1000,
         "S3 listing exceeded the requested page size"
@@ -133,10 +145,6 @@ async fn read_after(
         "S3 listing returned an invalid continuation token"
     );
     for entry in &page.entries {
-        ensure!(
-            start_after.is_none_or(|after| entry.key.as_str() > after),
-            "S3 listing returned a key at or before StartAfter"
-        );
         ensure!(
             entry.key.starts_with(prefix),
             "S3 listing returned a key outside the requested prefix"
@@ -150,6 +158,9 @@ async fn read_after(
                 && child.ends_with('/'),
             "S3 listing returned an invalid common prefix"
         );
+    }
+    if let Some(after) = start_after {
+        page.entries.retain(|entry| entry.key.as_str() > after);
     }
     Ok(page)
 }
@@ -170,9 +181,17 @@ async fn execute(
             prefix,
             delimiter,
             token,
+            start_after,
         } => {
-            let page = read(store, &prefix, delimiter, token.as_deref()).await?;
-            return Ok(scan_batch(prefix, delimiter, page));
+            let page = read_after(
+                store,
+                &prefix,
+                delimiter,
+                token.as_deref(),
+                start_after.as_deref(),
+            )
+            .await?;
+            return Ok(scan_batch(prefix, delimiter, page, start_after.as_deref()));
         }
         Job::Discover {
             prefix,
@@ -198,15 +217,15 @@ async fn execute(
     }
     if !split && component + 1 < pattern.components.len() {
         let page = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, page));
+        return Ok(scan_batch(query, false, page, None));
     }
     let page = read(store, &query, true, None).await?;
     if component + 1 == pattern.components.len() {
-        return Ok(scan_batch(query, true, page));
+        return Ok(scan_batch(query, true, page, None));
     }
     if page.next.is_some() || page.prefixes.len() > MAX_CHILDREN {
         let flat = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, flat));
+        return Ok(scan_batch(query, false, flat, None));
     }
     Ok(Batch {
         entries: page.entries,
@@ -263,28 +282,28 @@ async fn recursive(
         || flat.entries.len() < 1000
         || dense_children(&query, &flat) == 0
     {
-        return Ok(scan_batch(query, false, flat));
+        return Ok(scan_batch(query, false, flat, start_after));
     }
     // Continue useful enumeration while probing. Small two-page trees finish
     // here, and rejected probes add no sequential round trip to flat scans.
     let (branches, continuation) = tokio::join!(
         read(store, &query, true, None),
-        read(store, &query, false, flat.next.as_deref()),
+        read_after(store, &query, false, flat.next.as_deref(), start_after),
     );
     let continuation = continuation?;
     flat.entries.extend(continuation.entries);
     flat.next = continuation.next;
     if flat.next.is_none() {
-        return Ok(scan_batch(query, false, flat));
+        return Ok(scan_batch(query, false, flat, start_after));
     }
     let branches = branches?;
     if branches.next.is_some() || !(2..=MAX_RECURSIVE_CHILDREN).contains(&branches.prefixes.len()) {
-        return Ok(scan_batch(query, false, flat));
+        return Ok(scan_batch(query, false, flat, start_after));
     }
     // One dense leading directory says little about its siblings. Spend at
     // most one more useful flat page looking for a second substantial child.
     if dense_children(&query, &flat) < 2 {
-        let next = read(store, &query, false, flat.next.as_deref()).await?;
+        let next = read_after(store, &query, false, flat.next.as_deref(), start_after).await?;
         flat.entries.extend(next.entries);
         flat.next = next.next;
     }
@@ -296,7 +315,7 @@ async fn recursive(
                 && !branches.prefixes.iter().any(|child| entry.key.starts_with(child))
         })
     {
-        return Ok(scan_batch(query, false, flat));
+        return Ok(scan_batch(query, false, flat, start_after));
     }
     // Retain every sampled child entry, then resume the partial last child
     // strictly after the last sampled key. Continuation tokens stay with their
