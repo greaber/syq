@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 pub(crate) struct ReverseTcp {
     listeners: Vec<TcpListener>,
     pending: Mutex<std::collections::HashMap<[u8; 32], std::sync::mpsc::SyncSender<TcpStream>>>,
+    authenticating: Mutex<std::collections::VecDeque<PendingProof>>,
     grant: String,
 }
 
@@ -31,6 +32,7 @@ impl RemoteSpec {
         let reverse = Arc::new(ReverseTcp {
             listeners,
             pending: Mutex::new(std::collections::HashMap::new()),
+            authenticating: Mutex::new(std::collections::VecDeque::new()),
             grant: grant.clone(),
         });
         let congestion_control = congestion_control.map(str::to_owned);
@@ -113,49 +115,73 @@ impl ReverseTcp {
         // A new key per open also makes late arrivals and captured proofs useless.
         loop {
             if let Ok(stream) = receive.try_recv() {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .context("reverse TCP authentication deadline expired")?;
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(remaining))?;
+                stream.set_write_timeout(Some(remaining))?;
                 return Ok((stream, channel, key));
             }
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .context("timed out accepting the receiving machine's TCP worker")?;
-            for listener in &self.listeners {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false)?;
-                        stream.set_read_timeout(Some(remaining))?;
-                        stream.set_write_timeout(Some(remaining))?;
-                        let mut proof = [0; 32];
-                        let read_proof = (|| -> Result<()> {
-                            let mut offset = 0;
-                            while offset < proof.len() {
-                                let remaining = deadline
-                                    .checked_duration_since(Instant::now())
-                                    .context("reverse TCP authentication deadline expired")?;
-                                stream.set_read_timeout(Some(remaining))?;
-                                let n = stream.read(&mut proof[offset..])?;
-                                if n == 0 {
-                                    bail!("reverse TCP connection closed before authentication");
-                                }
-                                offset += n;
-                            }
-                            Ok(())
-                        })();
-                        if read_proof.is_err() {
-                            continue;
-                        }
-                        // Taking the pending slot consumes this proof once.
-                        // No listener thread is needed: an accepting caller can
-                        // deliver another caller's socket without knowing its key.
-                        if let Some(send) = self.pending.lock().unwrap().remove(&proof) {
-                            let _ = send.send(stream);
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "timed out accepting the receiving machine's TCP worker"
+            );
+            self.poll_authentication()?;
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn poll_authentication(&self) -> Result<()> {
+        // Shared by all accepting workers, so one worker finishing cannot drop
+        // another worker's partially received proof. No read holds up acceptance.
+        let mut arrivals = self.authenticating.lock().unwrap();
+        for listener in &self.listeners {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(true)?;
+                    // Evict the oldest arrival rather than letting idle sockets
+                    // reserve every authentication slot until their deadlines.
+                    if arrivals.len() == MAX_PENDING_PROOFS {
+                        arrivals.pop_front();
+                    }
+                    arrivals.push_back(PendingProof {
+                        stream,
+                        proof: [0; 32],
+                        offset: 0,
+                        deadline: Instant::now() + Duration::from_secs(10),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        for _ in 0..arrivals.len() {
+            let mut arrival = arrivals.pop_front().unwrap();
+            if Instant::now() >= arrival.deadline {
+                continue;
+            }
+            match arrival.stream.read(&mut arrival.proof[arrival.offset..]) {
+                Ok(0) => continue,
+                Ok(n) => arrival.offset += n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => continue,
+            }
+            if arrival.offset == arrival.proof.len() {
+                // Taking the pending slot consumes this proof once. A caller
+                // can deliver another caller's socket without knowing its key.
+                if let Some(send) = self.pending.lock().unwrap().remove(&arrival.proof) {
+                    let _ = send.send(arrival.stream);
+                }
+            } else {
+                arrivals.push_back(arrival);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -167,5 +193,86 @@ struct PendingWorker<'a> {
 impl Drop for PendingWorker<'_> {
     fn drop(&mut self) {
         self.owner.pending.lock().unwrap().remove(&self.proof);
+    }
+}
+
+// This bound applies to the whole listener, independently of worker count.
+const MAX_PENDING_PROOFS: usize = 64;
+
+struct PendingProof {
+    stream: TcpStream,
+    proof: [u8; 32],
+    offset: usize,
+    deadline: Instant,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_proofs_are_bounded_and_fragmented_proofs_complete() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let reverse = ReverseTcp {
+            listeners: vec![listener],
+            pending: Mutex::new(Default::default()),
+            authenticating: Mutex::new(Default::default()),
+            grant: String::new(),
+        };
+        let mut idle = Vec::new();
+        for _ in 0..MAX_PENDING_PROOFS + 1 {
+            idle.push(TcpStream::connect(addr).unwrap());
+            reverse.poll_authentication().unwrap();
+            assert!(reverse.authenticating.lock().unwrap().len() <= MAX_PENDING_PROOFS);
+        }
+        assert_eq!(
+            reverse.authenticating.lock().unwrap().len(),
+            MAX_PENDING_PROOFS
+        );
+
+        let proof = [7; 32];
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        reverse.pending.lock().unwrap().insert(proof, send);
+        let mut worker = TcpStream::connect(addr).unwrap();
+        worker.set_nodelay(true).unwrap();
+        worker.write_all(&proof[..16]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            reverse.poll_authentication().unwrap();
+            if reverse
+                .authenticating
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.offset == 16)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "partial proof was not read");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(receive.try_recv().is_err());
+        worker.write_all(&proof[16..]).unwrap();
+        loop {
+            reverse.poll_authentication().unwrap();
+            if let Ok(stream) = receive.try_recv() {
+                assert_eq!(stream.peer_addr().unwrap(), worker.local_addr().unwrap());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fragmented proof was not authenticated"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reverse.pending.lock().unwrap().is_empty());
+        // Expired idle sockets are removed even when no new connection arrives.
+        for arrival in reverse.authenticating.lock().unwrap().iter_mut() {
+            arrival.deadline = Instant::now();
+        }
+        reverse.poll_authentication().unwrap();
+        assert!(reverse.authenticating.lock().unwrap().is_empty());
     }
 }

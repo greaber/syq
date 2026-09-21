@@ -915,3 +915,41 @@ fn named_tcp_workers_connect_concurrently() {
     drop(workers);
     drop(control);
 }
+
+#[test]
+fn named_tcp_idle_and_partial_arrivals_do_not_block_worker() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir(&root).unwrap();
+    let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+    let mut args = args(Path::new("source"), ".");
+    args.compress = false;
+    let (mut request, _) = request(&args);
+    request.copy.limits.max_connections = 1;
+    let approved = approve(&registration, request);
+    let mut spec = crate::conn::RemoteSpec::local_receiver(true);
+    spec.restricted_grant = Some(route(registration, approved.token.clone()));
+    let mut control = spec.connect_with(false, false).unwrap();
+    let pending = spec
+        .begin_tcp_setup(&mut control, false, (47600, 47699), None)
+        .unwrap();
+    spec.finish_tcp_setup(pending).unwrap();
+    let port = spec.tcp.lock().unwrap().as_ref().unwrap().port;
+    let _idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut partial = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    partial.write_all(&[0; 16]).unwrap();
+    let endpoint = crate::conn::Endpoint::Remote(spec);
+    let mut worker = endpoint
+        .connect_with_copy_capabilities(false, None, Vec::new(), false)
+        .unwrap();
+    assert!(
+        worker.transport_stats().is_some(),
+        "worker fell back to SSH"
+    );
+    assert!(matches!(
+        worker.call(Request::TransportStats).unwrap(),
+        Response::TransportStats(_)
+    ));
+    drop(worker);
+    drop(control);
+}
