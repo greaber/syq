@@ -429,9 +429,10 @@ fn backs_off_when_more_workers_hurt() {
 }
 
 #[test]
-fn ignores_noise_within_tolerance() {
+fn alternating_noise_keeps_settled_throughput_at_the_plateau() {
     let p = simulate(START_SSH, 32, 60, |i| if i % 2 == 0 { 1.0 } else { 0.93 });
-    assert!((20..=42).contains(&p.settled()), "history {:?}", p.history);
+    // Equal-speed counts may stay live; judge throughput rather than trimming.
+    assert!(p.settled() >= 32, "history {:?}", p.history);
 }
 
 #[test]
@@ -1060,7 +1061,8 @@ fn recommendation_changes_only_with_justified_growth_or_reduction() {
     measure(&mut policy, 201.0);
     assert_eq!(policy.settled(), 24);
     assert_eq!(policy.recommended(), 16); // Partial rollback must not save 24.
-    for _ in 0..16 {
+                                          // Allow earlier, slower lower-count measurements to age before retrying.
+    for _ in 0..EVIDENCE_MAX_AGE * 4 {
         if policy.settled() < 16 {
             break;
         }
