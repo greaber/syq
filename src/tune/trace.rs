@@ -168,5 +168,5 @@ fn snapshot(policy: &Policy) -> Value {
     json!({"requested":policy.n,"active":policy.active,"min":policy.min,"max":(policy.max != usize::MAX).then_some(policy.max),
         "recommended":policy.recommended(),"startup_doubling":policy.startup_doubling,"state":policy.state,"points":policy.points,"measurement":policy.tick,
         "comparisons":policy.comparisons,"failed_probes":policy.fails,"next_probe":policy.due,
-        "recent_best":policy.recent_best(),"acceptance_floor":policy.recent_best()*(1.0-NEAR_BEST_TOLERANCE)})
+        "recent_best":policy.recent_best(),"historical_near_best_floor":policy.recent_best()*(1.0-NEAR_BEST_TOLERANCE)})
 }
