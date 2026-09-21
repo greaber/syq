@@ -11,6 +11,12 @@ mod linux;
 mod macos;
 
 pub(super) fn fingerprint() -> Option<String> {
+    // Integration tests simulate reconnecting on another network without
+    // modifying the host's routing table. Release builds always read the OS.
+    #[cfg(debug_assertions)]
+    if let Some(value) = std::env::var_os("SYQ_TEST_TUNING_NETWORK") {
+        return value.into_string().ok().filter(|v| !v.is_empty());
+    }
     #[cfg(target_os = "linux")]
     let routers = linux::routers()?;
     #[cfg(target_os = "macos")]

@@ -152,10 +152,11 @@ mod tests {
         ipv4_ipv6_and_interface_scoped_neighbors();
         malformed_route_messages_are_rejected();
         let routers = routers().expect("read Darwin route table");
-        assert!(
-            super::super::fingerprint_routers(routers).is_some(),
-            "no resolved default-router hardware address"
-        );
+        let fingerprint = super::super::fingerprint_routers(routers)
+            .expect("no resolved default-router hardware address");
+        // --nocapture makes this useful for a manual reconnect/network-change
+        // check without displaying router addresses. Ordinary CI hides it.
+        println!("Network fingerprint: {fingerprint}");
     }
 
     fn route(index: u16, flags: i32, destination: &[u8], gateway: &[u8]) -> Vec<u8> {
