@@ -86,7 +86,7 @@ looks old.
 Topics are useful when coordination needs an explanation rather than a lock.
 `topic list` shows existing topics and their subscribers, so an agent can
 discover which sessions are interested without messaging everyone. Subscribe or
-publish to create a topic; read, ack, and unsubscribe reject unknown names.
+publish to create a topic; read, wait, ack, and unsubscribe reject unknown names.
 
 ```sh
 python3 scripts/agent-coordination.py topic subscribe transfer-experiments --agent implementation
@@ -120,6 +120,17 @@ review agent), never every running session. No native Claude push adapter is
 included; use the shared reads/waits. Do not use `--notify` when the requester is
 already waiting for the same report: it would queue a redundant later turn.
 
+A subscribed agent can wait for an update without notification delivery:
+
+```sh
+python3 scripts/agent-coordination.py topic wait transfer-experiments --agent implementation --timeout 60
+```
+
+The wait returns unread events and leaves them unread until `topic ack`. A
+timeout or interruption preserves the subscription and cursor; wait again when
+ready. This works for general coordination with either runtime, including
+review inboxes. It does not wake an agent that has stopped checking updates.
+
 ## Review and triage
 
 Run the project’s required validation and `scripts/branch-status.sh` before each
@@ -137,9 +148,10 @@ python3 scripts/agent-coordination.py review start --pr 123 --agent implementati
 Choose `--reviewer codex` for a Codex reviewer. The tool resolves the GitHub PR
 head and repository identity, checks that your clean task branch matches it,
 fetches the head/base commits using matching configured repository URLs, and
-creates one detached worktree for the review
-request plus a tmux reviewer window. Later rounds advance that same worktree
-without clearing `target/`, so builds can reuse their existing artifacts. The
+creates one worktree, tmux window, and interactive reviewer session per request.
+Later rounds publish to that reviewer’s inbox topic; the same session receives
+the next prompt through `topic wait`. They reuse the window and advance the
+existing worktree without clearing `target/`, so builds can reuse artifacts. The
 worktree name includes the PR number and request ID, and stays stable as the SHA
 changes. A fork base without a configured remote uses its GitHub HTTPS URL.
 A dirty checkout is preserved and must be resolved before advancing.
@@ -149,12 +161,33 @@ reads the project’s existing `AGENTS.md`; no standing resource policy is added
 
 Each review round has its own prompt, immutable report, and triage Markdown.
 Reviewers finish their commands before submitting: publication allows the next
-round to advance the shared checkout. Old reviewer conversations remain available,
-but must check HEAD and use their recorded SHA when discussing older code.
+round to advance the checkout. The existing conversation keeps its context;
+check HEAD and use the recorded SHA when discussing an earlier revision.
 The reviewer publishes by running the `review submit` command in its prompt,
 including the round number, reviewed SHA, and verdict (`clean`, `findings`, or
 `blocked`). A terminal answer or a process exiting successfully is not enough.
-If the reviewer exits without submitting, status becomes `failed`.
+After submitting, the reviewer follows `reviewer_next_action` and waits on its
+inbox topic in bounded calls. Timeouts are normal; they do not acknowledge or
+discard an update. If you interrupt to discuss findings, ask the reviewer to
+resume checking its inbox afterward. No injected keystroke competes with your
+input, but an agent that stops waiting will not wake itself. Completion, an
+explicit stop, or the round limit publishes a stop-waiting update.
+
+If the reviewer exits without submitting, status becomes `failed`. Its tmux
+pane remains available. `review resume REVIEW_ID --agent NAME` resumes the
+saved Claude or Codex conversation in that same pane, without creating another
+window. It refuses to replace a live process. If the saved session ID was not
+recorded, supply its exact ID with `--session`; the tool does not guess from the
+most recent unrelated session. Requests created with the older per-round-window
+implementation cannot consume these updates; start a new request explicitly.
+Use the same tool version for all participants in a review request.
+
+To request an independent second reviewer, run another `review start` with
+`--additional-reviewer`, choosing Claude or Codex explicitly. It gets its own
+conversation, window, worktree, reports, and round limit, all reused across its
+own rounds. Each request is triaged separately; there is no automatic agreement
+rule between reviewers. Use collect or triage mode when you want to compare
+their reports before deciding on fixes.
 
 The requesting agent stays in the original conversation:
 
@@ -209,7 +242,7 @@ permission. These are workflow instructions, not a sandbox around the agents.
 `review stop-loop REVIEW_ID --agent NAME` prevents continuation without killing
 an interactive reviewer or its jobs. An outstanding reviewer may still submit
 its report, but that submission does not restart the loop. The request’s worktree and reviewer
-windows are retained for discussion; inspect cleanliness and running processes
+window are retained for discussion; inspect cleanliness and running processes
 before removing them with normal Git/tmux commands.
 
 ## Checks

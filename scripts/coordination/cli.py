@@ -5,6 +5,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
 
 from . import resources, reviews
 from .store import Error, Store, name, notify, publish
@@ -45,10 +46,12 @@ def parser():
             p.add_argument('--timeout', type=positive, default=60)
     topic = groups.add_parser('topic').add_subparsers(dest='action', required=True)
     topic.add_parser('list')
-    for action in ('subscribe', 'unsubscribe', 'read', 'ack'):
+    for action in ('subscribe', 'unsubscribe', 'read', 'ack', 'wait'):
         p = topic.add_parser(action)
         p.add_argument('topic')
         p.add_argument('--agent', required=True)
+        if action == 'wait':
+            p.add_argument('--timeout', type=positive, default=60)
         if action == 'ack':
             p.add_argument('sequence', type=int)
     p = topic.add_parser('publish')
@@ -64,20 +67,25 @@ def parser():
     p.add_argument('--agent', required=True)
     p.add_argument('--brief', required=True, help='Markdown task context, including actual requirements and open questions')
     p.add_argument('--reviewer', choices=['claude', 'codex'], required=True)
+    p.add_argument('--additional-reviewer', action='store_true',
+                   help='Explicitly start another independent reviewer for this task')
     p.add_argument('--mode', choices=['collect', 'triage', 'auto'], default='triage')
     p.add_argument('--max-rounds', type=positive, default=3)
     p.add_argument('--notify', action='store_true', help='Also queue a hint to the requesting agent’s registered Codex endpoint')
-    for action in ('status', 'wait', 'next', 'stop-loop', 'worker'):
+    for action in ('status', 'wait', 'next', 'stop-loop', 'worker', 'resume', 'bind-session'):
         p = review.add_parser(action)
         p.add_argument('id')
         if action == 'wait':
             p.add_argument('--timeout', type=positive, default=60)
-        if action in ('next', 'stop-loop'):
+        if action in ('next', 'stop-loop', 'resume'):
             p.add_argument('--agent', required=True)
         if action == 'next':
             p.add_argument('--allow-unchanged', action='store_true', help='Explicitly request re-review of an already reviewed SHA')
+        if action == 'resume':
+            p.add_argument('--session', help='Exact saved session ID, if not recorded automatically')
         if action == 'worker':
             p.add_argument('--round', type=positive, required=True)
+            p.add_argument('--resume', action='store_true')
     p = review.add_parser('submit')
     p.add_argument('id')
     p.add_argument('--round', type=positive, required=True)
@@ -119,6 +127,8 @@ def dispatch(store, args):
                 state['resources'][args.name] = args.description
             return {'resources': state['resources'], 'requests': list(state['requests'].values())}
     if args.group == 'topic':
+        if args.action == 'wait':
+            return wait_topic(store, args.topic, args.agent, args.timeout)
         if args.action == 'list':
             with store.locked() as state:
                 return {key: {'subscribers': list(value['subscribers']),
@@ -169,10 +179,14 @@ def dispatch(store, args):
     if args.action == 'triage':
         args.action = args.decision
         return reviews.triage(store, args)
+    if args.action == 'bind-session':
+        return reviews.bind_session(store, args.id)
     if args.action == 'worker':
-        return reviews.worker(store, args.id, args.round)
+        return reviews.worker(store, args.id, args.round, args.resume)
     if args.action == 'wait':
         return reviews.wait(store, args.id, args.timeout)
+    if args.action == 'resume':
+        return reviews.resume(store, args.id, args.agent, args.session)
     if args.action == 'next':
         return reviews.next_round(store, args.id, args.agent, args.allow_unchanged)
     with store.locked() as state:
@@ -182,7 +196,32 @@ def dispatch(store, args):
                 raise Error('Only the requester can stop the loop')
             review['status'] = 'stopped'
             review['reason'] = 'Automatic continuation stopped. Existing reviewer terminal was not interrupted.'
+            reviews.publish_stop(store, state, review)
         return reviews.view(review)
+
+
+def wait_topic(store, topic_name, agent, timeout):
+    name(topic_name)
+    name(agent)
+    deadline = time.monotonic() + timeout
+    progress = 0
+    while True:
+        with store.locked() as state:
+            topic = state['topics'].get(topic_name)
+            if topic is None:
+                raise Error(f'Unknown topic: {topic_name}')
+            if agent not in topic['subscribers']:
+                raise Error('Subscribe before waiting for updates')
+            cursor = topic['subscribers'][agent]
+            events = topic['events'][cursor:]
+            if events:
+                return {'topic': topic_name, 'cursor': cursor, 'events': events}
+        if time.monotonic() >= deadline:
+            raise Error(f'Timed out waiting for {topic_name}; no unread updates. Subscription and cursor unchanged.')
+        if time.monotonic() >= progress:
+            print(f'Waiting for topic {topic_name}: no unread updates', file=sys.stderr, flush=True)
+            progress = time.monotonic() + 10
+        time.sleep(min(0.25, max(0, deadline - time.monotonic())))
 
 
 def main(argv=None):

@@ -1,10 +1,12 @@
 import json
+import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 from .store import Error, identifier, name, notify, publish, run
 
@@ -81,6 +83,10 @@ def instruction(review):
     status, mode = review['status'], review['mode']
     if mode == 'collect':
         return 'Leave the report available. Use review status or review wait when needed.'
+    if status == 'waiting_review' and review.get('worker_alive') is False:
+        return (f'Reviewer exited. Resume its saved conversation in the existing pane with review resume '
+                f'{review["id"]} --agent {review["agent"]}, then continue waiting. '
+                'If no session ID is recorded, supply its exact ID with --session; do not start an independent reviewer.')
     if status in ('starting', 'waiting_review'):
         return (f"Continue in this implementing conversation with review wait {review['id']} --timeout 60. "
                 'A wait timeout is not review failure; wait again unless the user redirects you. '
@@ -120,10 +126,13 @@ def start(store, args):
               'reviewer': args.reviewer, 'mode': args.mode, 'max_rounds': args.max_rounds,
               'repository': snap['repository'], 'pr': snap['pr'], 'rounds': [],
               'status': 'starting', 'notify': args.notify, 'created': time.time()}
+    review['inbox'] = review['id'] + '.inbox'
+    if args.reviewer == 'claude':
+        review['session_id'] = str(uuid.uuid4())
     with store.locked() as state:
-        if any(r['repo'] == repo and r['status'] in ('starting', 'waiting_review', 'review_ready')
+        if not args.additional_reviewer and any(r['repo'] == repo and r['status'] in ('starting', 'waiting_review', 'review_ready')
                for r in state['reviews'].values()):
-            raise Error('A review is already active for this task worktree')
+            raise Error('A review is already active; use --additional-reviewer to request an independent reviewer')
         review['brief'] = store.document(f"reviews/{review['id']}/brief.md", brief)
         state['reviews'][review['id']] = review
     return launch(store, review['id'], snap)
@@ -134,10 +143,13 @@ def launch(store, review_id, snap, allow_unchanged=False):
         review = get(state, review_id)
         if review['status'] != 'starting':
             raise Error('Review is no longer ready to launch')
+        if not review.get('inbox'):
+            raise Error('This request predates persistent reviewers; start a new request explicitly')
         number = len(review['rounds']) + 1
         if sum(bool(r.get('report')) for r in review['rounds']) >= review['max_rounds']:
             review['status'] = 'round_limit'
             review['reason'] = 'Completed review round limit reached; start a new request for further review'
+            publish_stop(store, state, review)
             return view(review)
         if not allow_unchanged and any(r['sha'] == snap['sha'] and r.get('report')
                                        for r in review['rounds']):
@@ -182,13 +194,21 @@ def launch(store, review_id, snap, allow_unchanged=False):
             if review['status'] != 'starting':
                 raise Error('Review was stopped during launch')
             review['status'] = 'waiting_review'
-            review['rounds'][-1].update(status='running', prompt=prompt_path)
+            event = publish(store, state, review['inbox'], review['agent'], f'Review round {number}',
+                            f'Continue review {review_id}, round {number}, at {snap["sha"]}.\n'
+                            f'Read the prompt: {prompt_path}\n')
+            state['topics'][review['inbox']]['subscribers'].setdefault(review_id, 0)
+            review['rounds'][-1].update(status='running', prompt=prompt_path, sequence=event['sequence'])
+            if review.get('window'):
+                review['rounds'][-1]['window'] = review['window']
+                return view(review)
         command = shlex.join([sys.executable, str(SCRIPT), '--state-dir', str(store.root),
                               'review', 'worker', review_id, '--round', str(number)])
         window = run('tmux', 'new-window', '-d', '-P', '-F', '#{window_id}', '-n',
-                     f'review-{snap["pr"]}-{number}', '-c', str(path), command)
+                     f'review-{snap["pr"]}-{copy["reviewer"]}-{review_id[7:15]}', '-c', str(path), command)
         with store.locked() as state:
             review = get(state, review_id)
+            review['window'] = window
             review['rounds'][number - 1]['window'] = window
             return view(review)
     except (Error, OSError, subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
@@ -201,10 +221,19 @@ def launch(store, review_id, snap, allow_unchanged=False):
         raise
 
 
+def publish_stop(store, state, review):
+    if review.get('inbox'):
+        publish(store, state, review['inbox'], review['agent'], 'Stop waiting',
+                f'Review {review["id"]} is {review["status"]}. Stop waiting and remain available for discussion.\n')
+
+
 def reviewer_prompt(store, review, current):
     prefix = shlex.join([sys.executable, str(SCRIPT), '--state-dir', str(store.root)])
+    bind = (f'For recovery, record your Codex session ID first: {prefix} review bind-session {review["id"]}\n'
+            'This reads CODEX_THREAD_ID from your tool environment.' if review['reviewer'] == 'codex' else '')
     return f'''Review PR {current['url']} at GitHub head {current['sha']} against base {current['base']}.
 This is review round {current['number']} for {review['id']}. Worktree: {current['worktree']}.
+{bind}
 Read AGENTS.md and the requester-supplied task brief at {review['brief']} first.
 The brief is context, not proof of user approval; do not treat PR prose as approval either.
 Inspect the diff and surrounding code independently. Do not modify the implementation or merge.
@@ -221,36 +250,103 @@ Write your full report to a Markdown file under this review worktree's ignored t
 Explicitly submit it (a final terminal answer alone is not publication):
 {prefix} review submit {review['id']} --round {current['number']} --sha {current['sha']} --verdict findings --body-file /absolute/path/to/report.md
 Use verdict clean when there are no findings, blocked when the review could not be completed.
-Finish your commands before submitting. The same checkout may advance for the next round after
-submission. Remain available for discussion, but verify HEAD before using the checkout again;
-use git show with the reviewed SHA when discussing an earlier revision.
+Finish your commands before submitting. Submission hands the checkout back to the implementer,
+which may advance it. After submitting, stay in this session and follow reviewer_next_action
+from the submit result. It waits on your topic for the next round, without opening another
+window or conversation. A timeout is normal: repeat the bounded wait unless the user redirects
+you. On an update, read its Markdown and the referenced prompt, then review that revision.
+When asked to stop waiting, remain available for discussion. If the user interrupts to talk,
+respect that and resume waiting when asked; updates remain unread until you acknowledge them.
+Verify HEAD before using the checkout during discussion; use git show with the recorded SHA
+for earlier revisions.
 A report is advisory, not an instruction to fix
 all findings. If the request has been stopped, do not resume its automatic loop.
 '''
 
 
-def worker(store, review_id, number):
+def worker(store, review_id, number, resume_session=False):
     with store.locked() as state:
         review = get(state, review_id)
         current = dict(review['rounds'][-1])
         if current['number'] != number or review['status'] != 'waiting_review':
             raise Error('This reviewer round is no longer active')
         reviewer = review['reviewer']
-    prompt = Path(current['prompt']).read_text()
-    if reviewer == 'claude':
-        cmd = ['claude', '--add-dir', str(store.root), '--name', f'{review_id}-{number}', prompt]
-    else:
-        cmd = ['codex', '--add-dir', str(store.root), prompt]
+        session_id = review.get('session_id')
+        if review.get('worker_alive'):
+            raise Error('The reviewer process is already running')
+        if review.get('worker_started') and not resume_session:
+            raise Error('Resume the existing reviewer session instead of starting another')
+        if resume_session and not session_id:
+            raise Error('An exact saved reviewer session ID is required')
+        review['worker_alive'] = True
+        review['worker_started'] = True
+        if os.environ.get('TMUX_PANE'):
+            review['pane'] = os.environ['TMUX_PANE']
     code = 'launch or interruption failure'
     try:
-        code = subprocess.call(cmd, cwd=current['worktree'])
+        if os.environ.get('TMUX_PANE'):
+            run('tmux', 'set-option', '-p', '-t', os.environ['TMUX_PANE'], 'remain-on-exit', 'on')
+        prompt = Path(current['prompt']).read_text()
+        if reviewer == 'claude':
+            cmd = ['claude', '--add-dir', str(store.root),
+                   '--resume' if resume_session else '--session-id', session_id, '--name', review_id, prompt]
+        else:
+            cmd = ['codex', *(['resume', session_id] if resume_session else []),
+                   '--add-dir', str(store.root), prompt]
+        env = dict(os.environ, SYQ_REVIEW_ID=review_id)
+        env.pop('CODEX_THREAD_ID', None)
+        code = subprocess.call(cmd, cwd=current['worktree'], env=env)
     finally:
         with store.locked() as state:
             review = get(state, review_id)
-            if review['status'] == 'waiting_review' and review['rounds'][-1]['number'] == number:
+            review['worker_alive'] = False
+            if review['status'] == 'waiting_review':
                 review['status'] = 'failed'
                 review['reason'] = f'Reviewer exited ({code}) without publishing a report'
     return {'exit_code': code, 'review': review_id}
+
+
+def bind_session(store, review_id):
+    session_id = os.environ.get('CODEX_THREAD_ID')
+    if os.environ.get('SYQ_REVIEW_ID') != review_id or not session_id:
+        raise Error('Run this from the Codex reviewer session, with its CODEX_THREAD_ID')
+    with store.locked() as state:
+        review = get(state, review_id)
+        if review['reviewer'] != 'codex':
+            raise Error('Only Codex reviewers need to bind their runtime session ID')
+        review['session_id'] = session_id
+    return {'id': review_id, 'session_id': session_id}
+
+
+def resume(store, review_id, agent, session_id=None):
+    with store.locked() as state:
+        review = get(state, review_id)
+        if review['agent'] != agent or review['status'] not in ('failed', 'waiting_review'):
+            raise Error('Only the requester can resume a pending or failed reviewer')
+        if not review.get('pane'):
+            raise Error('No original reviewer pane is recorded; restore that pane explicitly')
+        if session_id and review.get('session_id') and session_id != review['session_id']:
+            raise Error('Session ID does not match the recorded reviewer conversation')
+        if not (session_id or review.get('session_id')):
+            raise Error('Supply the exact saved reviewer session ID with --session')
+        copy = json.loads(json.dumps(review))
+        copy['session_id'] = session_id or review['session_id']
+    # Never use -k: tmux must refuse to overwrite a live reviewer or a human shell.
+    if run('tmux', 'display-message', '-p', '-t', copy['pane'], '#{pane_dead}') != '1':
+        raise Error('The original reviewer pane is still live; resume its topic wait there')
+    with store.locked() as state:
+        review = get(state, review_id)
+        if review['status'] != copy['status'] or review['rounds'][-1]['number'] != copy['rounds'][-1]['number']:
+            raise Error('Review state changed while resuming')
+        review['session_id'] = copy['session_id']
+        review['worker_alive'] = False
+        review['status'] = 'waiting_review'
+        review.pop('reason', None)
+    command = shlex.join([sys.executable, str(SCRIPT), '--state-dir', str(store.root),
+                         'review', 'worker', review_id, '--round', str(copy['rounds'][-1]['number']), '--resume'])
+    run('tmux', 'respawn-pane', '-t', copy['pane'], '-c', copy['rounds'][-1]['worktree'], command)
+    with store.locked() as state:
+        return view(get(state, review_id))
 
 
 def submit(store, args):
@@ -259,6 +355,8 @@ def submit(store, args):
         raise Error('Report must not be empty')
     with store.locked() as state:
         review = get(state, args.id)
+        if not review.get('inbox'):
+            raise Error('This request predates persistent reviewers; start a new request explicitly')
         current = review['rounds'][-1]
         if (review['status'] not in ('waiting_review', 'stopped') or current.get('report')
                 or current['number'] != args.round
@@ -266,6 +364,10 @@ def submit(store, args):
             raise Error('Report does not match an active round and its exact SHA')
         current.update(report=store.document(f'reviews/{args.id}/round-{args.round}/report.md', body),
                        verdict=args.verdict, status='published')
+        if (review['reviewer'] == 'codex' and os.environ.get('SYQ_REVIEW_ID') == review['id']
+                and os.environ.get('CODEX_THREAD_ID')):
+            review['session_id'] = os.environ['CODEX_THREAD_ID']
+        state['topics'][review['inbox']]['subscribers'][review['id']] = current['sequence']
         stopped = review['status'] == 'stopped'
         if not stopped:
             review['status'] = 'needs_discussion' if args.verdict == 'blocked' else 'review_ready'
@@ -273,6 +375,12 @@ def submit(store, args):
                 f"Review of {args.sha}: {current['report']}\n")
         agent, push = review['agent'], review['notify'] and not stopped
         result = view(review)
+        wait_command = shlex.join([sys.executable, str(SCRIPT), '--state-dir', str(store.root),
+                                   'topic', 'wait', review['inbox'], '--agent', review['id'], '--timeout', '60'])
+        result['reviewer_next_action'] = ('Stop waiting; remain available for discussion.' if stopped else
+            f'Wait for the next update in this same reviewer session:\n{wait_command}\n'
+            'On timeout, repeat unless the user redirects you. Read returned Markdown updates; '
+            'follow the new round prompt or stop instruction. Submission acknowledges its round update.')
     if push:
         result['delivery'] = notify(store, [agent], f'[Agent coordination] Review {args.id} of '
                                     f'{args.sha} is ready. Read {current["report"]}. Triage under '
@@ -286,6 +394,8 @@ def triage(store, args):
         raise Error('Disposition must explain the assessment')
     with store.locked() as state:
         review = get(state, args.id)
+        if not review.get('inbox'):
+            raise Error('This request predates persistent reviewers; start a new request explicitly')
         if review['agent'] != args.agent or review['status'] != 'review_ready':
             raise Error('Only the requesting agent can triage a ready review')
         current = review['rounds'][-1]
@@ -314,6 +424,7 @@ def triage(store, args):
                                 else 'Implementer requests discussion')
         elif args.action == 'complete':
             review['status'] = 'complete'
+            publish_stop(store, state, review)
         elif review['mode'] != 'auto':
             review['status'] = 'needs_revision'
         else:
@@ -329,6 +440,8 @@ def next_round(store, review_id, agent, allow_unchanged=False):
         review = get(state, review_id)
         if review['agent'] != agent or review['status'] not in ('needs_revision', 'needs_discussion', 'failed'):
             raise Error('Cannot start another round in this state or as another agent')
+        if not review.get('inbox'):
+            raise Error('This request predates persistent reviewers; start a new request explicitly')
         copy = json.loads(json.dumps(review))
     snap = snapshot(copy['repo'], copy['pr'], copy['repository'])
     with store.locked() as state:

@@ -177,9 +177,10 @@ class CoordinationTests(unittest.TestCase):
             'state': 'OPEN', 'headRefName': 'task', 'headRefOid': self.sha, 'baseRefOid': self.base,
             'headRepositoryOwner': {'login': 'example'}, 'headRepository': {'name': 'project'}}))
 
-    def review(self, mode='auto', reviewer='claude', limit=3):
+    def review(self, mode='auto', reviewer='claude', limit=3, additional=False, code=0):
         return self.cmd('review', 'start', '--pr', '17', '--agent', 'implementer', '--reviewer', reviewer,
-                        '--mode', mode, '--max-rounds', str(limit), '--brief', str(self.brief))
+                        '--mode', mode, '--max-rounds', str(limit), '--brief', str(self.brief),
+                        *(['--additional-reviewer'] if additional else []), code=code)
 
     def submit(self, review, verdict='findings'):
         current = review['rounds'][-1]
@@ -280,36 +281,73 @@ class CoordinationTests(unittest.TestCase):
                 resources.wait(store, ticket, 'second', 5)
         self.acquire('third', 'server')
 
-    def test_real_tmux_handoff_with_both_stub_agents(self):
-        self.review_setup()
+    def real_tmux(self):
         tmux = shutil.which('tmux', path=os.environ['PATH'])
         self.assertIsNotNone(tmux, 'tmux is required to verify reviewer window launch')
         socket = str(self.root / 'tmux.sock')
         subprocess.run([tmux, '-f', '/dev/null', '-S', socket, 'new-session', '-d', '-s', 'coord-test', 'sleep 60'], check=True)
         self.addCleanup(subprocess.run, [tmux, '-S', socket, 'kill-server'], capture_output=True)
         self.stub('tmux', f"import os,sys\nos.execv({tmux!r}, [{tmux!r},'-S',{socket!r},*sys.argv[1:]])\n")
+        for key in ('PATH', 'TEST_ROOT'):
+            subprocess.run([tmux, '-S', socket, 'set-environment', key, self.env[key]], check=True)
+        return tmux, socket
+
+    def test_real_tmux_two_reviewers_keep_sessions_and_windows_across_rounds(self):
+        self.review_setup()
+        tmux, socket = self.real_tmux()
         agent_body = """import json,os,shlex,subprocess,sys
 from pathlib import Path
+runtime=Path(sys.argv[0]).name
+os.environ['CODEX_THREAD_ID']='fixture-codex-session'
 prompt=sys.argv[-1]
 command=next(line for line in prompt.splitlines() if ' review submit ' in line)
 args=shlex.split(command)
-report=Path.cwd()/'target'/'review.md'; report.parent.mkdir(exist_ok=True)
-report.write_text('Independent fixture review: no defects.\\n')
-args[args.index('--body-file')+1]=str(report)
-args[args.index('--verdict')+1]='clean'
-subprocess.run(args,check=True)
+index=args.index('review')
+prefix=args[:index]
+review_id=args[index+2]
+def call(*command):
+ return json.loads(subprocess.check_output([*prefix,*command],text=True))
+if runtime=='codex': call('review','bind-session',review_id)
+for attempt in range(2):
+ state=call('review','status',review_id)
+ current=state['rounds'][-1]
+ with (Path(os.environ['TEST_ROOT'])/(runtime+'-rounds')).open('a') as out:
+  out.write(json.dumps({'pid':os.getpid(),'round':current['number'],'argv':sys.argv[1:],
+   'head':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()})+'\\n')
+ report=Path.cwd()/'target'/'review.md'; report.parent.mkdir(exist_ok=True)
+ report.write_text('Fixture review.\\n')
+ call('review','submit',review_id,'--round',str(current['number']),'--sha',current['sha'],
+      '--verdict','findings','--body-file',str(report))
+ updates=call('topic','wait',state['inbox'],'--agent',review_id,'--timeout','10')
+ if any(e['title']=='Stop waiting' for e in updates['events']): break
 """
         for runtime in ('claude', 'codex'):
             self.stub(runtime, agent_body)
-            # tmux's server environment predates the per-test PATH override.
-            subprocess.run([tmux, '-S', socket, 'set-environment', 'PATH', self.env['PATH']], check=True)
-            review = self.review(reviewer=runtime)
+        first = self.review(reviewer='claude')
+        self.review(reviewer='codex', code=2)
+        second = self.review(reviewer='codex', additional=True)
+        reviewers = [self.cmd('review', 'wait', r['id'], '--timeout', '10') for r in (first, second)]
+        self.assertTrue(all(r['status'] == 'review_ready' for r in reviewers), reviewers)
+        self.assertNotEqual(reviewers[0]['window'], reviewers[1]['window'])
+        self.assertNotEqual(reviewers[0]['rounds'][0]['worktree'], reviewers[1]['rounds'][0]['worktree'])
+        self.advance()
+        for review in reviewers:
+            self.triage(review, 'revise')
+        for review in reviewers:
             ready = self.cmd('review', 'wait', review['id'], '--timeout', '10')
-            self.assertEqual(ready['status'], 'review_ready')
-            self.assertEqual(ready['rounds'][0]['verdict'], 'clean')
+            self.assertEqual(ready['status'], 'review_ready', ready)
+            self.assertEqual(ready['rounds'][1]['window'], ready['rounds'][0]['window'])
             self.assertEqual(self.triage(ready, 'complete')['status'], 'complete')
-
-
+        windows = subprocess.check_output([tmux, '-S', socket, 'list-windows', '-F', '#{window_id}'], text=True)
+        self.assertEqual(len(windows.splitlines()), 3)  # fixture + two explicitly requested reviewers
+        for runtime in ('claude', 'codex'):
+            rounds = [json.loads(line) for line in (self.root / (runtime+'-rounds')).read_text().splitlines()]
+            self.assertEqual([r['round'] for r in rounds], [1, 2])
+            self.assertEqual(rounds[0]['pid'], rounds[1]['pid'])
+            self.assertEqual(rounds[1]['head'], self.sha)
+            self.assertNotEqual(rounds[0]['head'], self.sha)
+        codex = self.cmd('review', 'status', second['id'])
+        self.assertEqual(codex['session_id'], 'fixture-codex-session')
 
     def test_notification_failure_does_not_lose_publication(self):
         self.stub('codex', "import sys\nprint('No app server',file=sys.stderr)\nsys.exit(2)\n")
@@ -373,6 +411,9 @@ subprocess.run(args,check=True)
         self.advance()
         second = self.triage(review, 'revise')
         self.assertEqual(second['rounds'][1]['worktree'], str(worktree))
+        self.assertEqual(second['rounds'][1]['window'], second['rounds'][0]['window'])
+        windows = [json.loads(line) for line in (self.root / 'windows').read_text().splitlines()]
+        self.assertEqual(sum(args[0] == 'new-window' for args in windows), 1)
         self.assertEqual(artifact.read_text(), 'Existing build artifact')
         head = subprocess.check_output(['git', '-C', str(worktree), 'rev-parse', 'HEAD'], text=True).strip()
         self.assertEqual(head, self.sha)
@@ -420,7 +461,8 @@ subprocess.run(args,check=True)
         self.review_setup()
         review = self.review(limit=1)
         for number in (1, 2):
-            self.cmd('review', 'worker', review['id'], '--round', str(number))
+            self.cmd('review', 'worker', review['id'], '--round', str(number),
+                     *(['--resume'] if number > 1 else []))
             review = self.cmd('review', 'next', review['id'], '--agent', 'implementer')
             self.assertEqual(review['status'], 'waiting_review')
         self.assertEqual(review['rounds'][-1]['number'], 3)
@@ -442,6 +484,96 @@ subprocess.run(args,check=True)
         self.review()
         fetches = [json.loads(line) for line in (self.root / 'fetches').read_text().splitlines()]
         self.assertEqual(fetches, [[head_url, self.sha], [base_url, self.base]])
+
+
+    def test_topic_wait_preserves_updates_on_timeout_and_interrupt(self):
+        self.cmd('topic', 'subscribe', 'updates', '--agent', 'reader')
+        self.cmd('topic', 'wait', 'updates', '--agent', 'reader', '--timeout', '1', code=2)
+        process = subprocess.Popen([sys.executable, str(SCRIPT), '--state-dir', str(self.state),
+            'topic', 'wait', 'updates', '--agent', 'reader', '--timeout', '10'],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertIn('Waiting for topic', process.stderr.readline())
+        process.send_signal(signal.SIGTERM)
+        process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 130)
+        body = self.root / 'update.md'; body.write_text('Relevant coordination update')
+        self.cmd('topic', 'publish', 'updates', '--agent', 'writer', '--title', 'Ready', '--body-file', str(body))
+        first = self.cmd('topic', 'wait', 'updates', '--agent', 'reader', '--timeout', '1')
+        self.assertEqual(len(first['events']), 1)
+        self.assertEqual(first, self.cmd('topic', 'wait', 'updates', '--agent', 'reader', '--timeout', '1'))
+        self.cmd('topic', 'ack', 'updates', '1', '--agent', 'reader')
+        self.cmd('topic', 'wait', 'updates', '--agent', 'reader', '--timeout', '1', code=2)
+        self.assertIn('reader', self.cmd('topic', 'list')['updates']['subscribers'])
+
+    def test_stop_wakes_reviewers_topic_wait(self):
+        self.review_setup()
+        review = self.review()
+        self.submit(review)
+        self.cmd('review', 'stop-loop', review['id'], '--agent', 'implementer')
+        update = self.cmd('topic', 'wait', review['inbox'], '--agent', review['id'], '--timeout', '1')
+        self.assertEqual([e['title'] for e in update['events']], ['Stop waiting'])
+
+
+    def test_real_tmux_recovery_resumes_exact_session_in_same_pane(self):
+        self.review_setup()
+        tmux, socket = self.real_tmux()
+        agent_body = """import json,os,shlex,subprocess,sys
+from pathlib import Path
+runtime=Path(sys.argv[0]).name
+os.environ['CODEX_THREAD_ID']='fixture-codex-session'
+args=shlex.split(next(line for line in sys.argv[-1].splitlines() if ' review submit ' in line))
+index=args.index('review'); prefix=args[:index]; review_id=args[index+2]
+with (Path(os.environ['TEST_ROOT'])/(runtime+'-launches')).open('a') as out:
+ out.write(json.dumps(sys.argv[1:])+'\\n')
+if runtime=='codex': subprocess.run([*prefix,'review','bind-session',review_id],check=True)
+if '--resume' not in sys.argv and 'resume' not in sys.argv: sys.exit(1)
+report=Path.cwd()/'target'/'report.md'; report.parent.mkdir(exist_ok=True); report.write_text('Recovered review')
+args[args.index('--body-file')+1]=str(report)
+subprocess.run(args,check=True)
+"""
+        for runtime in ('claude', 'codex'):
+            self.stub(runtime, agent_body)
+            review = self.review(reviewer=runtime)
+            failed = self.cmd('review', 'wait', review['id'], '--timeout', '10')
+            self.assertEqual(failed['status'], 'failed', failed)
+            deadline = time.monotonic() + 5
+            last = None
+            print('Waiting for exited fixture reviewer pane', flush=True)
+            while time.monotonic() < deadline:
+                last = subprocess.check_output([tmux, '-S', socket, 'display-message', '-p',
+                    '-t', failed['pane'], '#{pane_dead}'], text=True).strip()
+                if last == '1': break
+                time.sleep(0.05)
+            self.assertEqual(last, '1', 'Reviewer pane did not exit before deadline')
+            self.cmd('review', 'resume', review['id'], '--agent', 'implementer', '--session', 'wrong-session', code=2)
+            self.assertEqual(self.cmd('review', 'status', review['id'])['session_id'], failed['session_id'])
+            self.cmd('review', 'resume', review['id'], '--agent', 'implementer')
+            ready = self.cmd('review', 'wait', review['id'], '--timeout', '10')
+            self.assertEqual(ready['status'], 'review_ready', ready)
+            self.assertEqual(ready['window'], failed['window'])
+            self.assertEqual(ready['pane'], failed['pane'])
+            self.assertEqual(ready['session_id'], failed['session_id'])
+            calls = [json.loads(line) for line in (self.root / (runtime+'-launches')).read_text().splitlines()]
+            self.assertEqual(len(calls), 2)
+            flag = '--resume' if runtime == 'claude' else 'resume'
+            self.assertEqual(calls[1][calls[1].index(flag)+1], failed['session_id'])
+            self.triage(ready, 'complete')
+        windows = subprocess.check_output([tmux, '-S', socket, 'list-windows', '-F', '#{window_id}'], text=True)
+        self.assertEqual(len(windows.splitlines()), 3)
+
+
+    def test_legacy_review_is_readable_but_cannot_advance_without_inbox(self):
+        self.review_setup()
+        review = self.review()
+        self.submit(review)
+        path = self.state / 'state.json'
+        state = json.loads(path.read_text())
+        del state['reviews'][review['id']]['inbox']
+        path.write_text(json.dumps(state))
+        before = path.read_bytes()
+        self.assertEqual(self.cmd('review', 'status', review['id'])['status'], 'review_ready')
+        self.assertIn('predates', self.triage(review, 'revise', code=2)['error'])
+        self.assertEqual(before, path.read_bytes())
 
 
 if __name__ == '__main__':
