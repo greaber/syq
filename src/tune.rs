@@ -57,7 +57,7 @@ pub const START_LOCAL_LOW_CPU: usize = 16;
 /// Never auto-tune below this many.
 pub const MIN: usize = 1;
 /// Policy mechanics version recorded in transfer history.
-pub const POLICY_VERSION: u32 = 4;
+pub const POLICY_VERSION: u32 = 5;
 const STARTUP_STEP: usize = 2;
 
 /// Multiplicative step after discovery, or with a closely matched plateau hint.
@@ -746,13 +746,10 @@ impl Policy {
         let target = self.target(direction);
         if !self.set_candidate(target) {
             self.startup_doubling = false;
-            self.due[direction.index()] = if (direction == Direction::Down && self.n == self.min)
-                || (direction == Direction::Up && self.n == self.max)
-            {
-                usize::MAX
-            } else {
-                self.tick + self.retry_after(direction)
-            };
+            // Bounds suppress probes in begin_due_probe, but the count can
+            // later move away from a bound. Keep a finite retry deadline so
+            // that direction can become eligible again, with normal backoff.
+            self.due[direction.index()] = self.tick + self.retry_after(direction);
             return false;
         }
         self.state = State::Explore {
