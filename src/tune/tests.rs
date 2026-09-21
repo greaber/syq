@@ -1157,7 +1157,7 @@ fn network_keys_preserve_the_v060_legacy_map() {
     let office = network_key(old, Some("office"));
     let unknown = network_key(old, None);
     assert_eq!(cached_at(&path, &home), None);
-    assert_eq!(cached_at(&path, &unknown), None);
+    assert_eq!(cached_at(&path, &unknown), Some(128));
     remember_at(&path, &home, 8).unwrap();
     remember_at(&path, &office, 32).unwrap();
     assert_eq!(cached_at(&path, old), Some(128));

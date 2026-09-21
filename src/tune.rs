@@ -184,7 +184,10 @@ pub fn network_path_key(src: &Endpoint, dst: &Endpoint) -> Option<String> {
 }
 
 fn network_key(key: &str, network: Option<&str>) -> String {
-    format!("{key}|network-v1={}", network.unwrap_or("unknown"))
+    network.map_or_else(
+        || key.to_owned(),
+        |network| format!("{key}|network-v1={network}"),
+    )
 }
 
 fn cache_path() -> Option<PathBuf> {

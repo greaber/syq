@@ -1329,6 +1329,7 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
             (64, 3, "test-network"),
             (2, 3, "test-network"),
             (2, 3, "other-network"),
+            (2, 3, ""),
         ] {
             // Keep the cache format, with network-scoped keys; cover hints
             // above and below the cap without depending on the host network.
@@ -1386,8 +1387,8 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
                     "{out:?}"
                 );
             }
-            if route != "local" && network == "test-network" {
-                let start = remembered.min(limit);
+            if route != "local" && network != "other-network" {
+                let start = if network.is_empty() { 96 } else { remembered }.min(limit);
                 assert!(
                     stderr_of(&out).contains(&format!(
                         "starting with {start} connections remembered for this path"

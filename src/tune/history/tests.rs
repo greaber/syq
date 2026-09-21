@@ -584,7 +584,7 @@ fn repeated_inconclusive_copies_preserve_history_and_legacy_start() {
 }
 
 #[test]
-fn network_scoped_hints_do_not_cross_networks_or_trust_unknown_context() {
+fn network_scoped_hints_separate_known_networks_and_preserve_unknown_fallback() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
     let network_key = |network: Option<&str>| {
@@ -595,8 +595,8 @@ fn network_scoped_hints_do_not_cross_networks_or_trust_unknown_context() {
         key.network = network.map(str::to_owned);
         key
     };
-    // An unchanged pre-fingerprint context remains readable, but does not seed
-    // network-specific or explicitly unknown-network contexts.
+    // An unchanged pre-fingerprint context remains the fallback when the OS
+    // cannot identify a network, but does not seed known-network contexts.
     let old = recorder(&path);
     old.context(&key("a"));
     old.recommend(64, true);
@@ -621,13 +621,18 @@ fn network_scoped_hints_do_not_cross_networks_or_trust_unknown_context() {
             .workers,
         32
     );
-    assert!(next.hint(&network_key(None), true).is_none());
+    assert_eq!(next.hint(&network_key(None), true).unwrap().workers, 64);
     next.context(&network_key(None));
     next.recommend(16, true);
     next.complete(true, json!({}));
     let hint = next.hint(&network_key(None), true).unwrap();
     assert_eq!(hint.workers, 16);
-    assert!(!hint.refine);
-    // An old selector can still read its unchanged route after new writes.
-    assert_eq!(next.hint(&key("a"), true).unwrap().workers, 64);
+    assert!(hint.refine);
+    // An old selector shares the unscoped fallback, but cannot overwrite the
+    // known-network entries, even after publishing another recommendation.
+    assert_eq!(next.hint(&key("a"), true).unwrap().workers, 16);
+    assert_eq!(
+        next.hint(&network_key(Some("home")), true).unwrap().workers,
+        8
+    );
 }
