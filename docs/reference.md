@@ -92,8 +92,10 @@ These describe the local interface and do not measure throughput to the other
 machine. Unavailable rates remain unknown.
 When link speeds are unknown, syq selects the first reachable address in priority
 order without waiting for lower-priority probes. Verbose diagnostics mark any
-unfinished probes as untested. Known-speed multipath still waits for all probes
-within their timeout.
+unfinished probes as untested. With known speeds, syq uses reachable paths
+reporting at least half the fastest reachable rate. It waits for probes that
+could join or improve that set, within their timeout, and stops waiting for
+the rest.
 
 Use `--to @NAME` to send local source files to a registered receiving machine.
 The `@` is required: `--to laptop` selects an SSH destination, while
