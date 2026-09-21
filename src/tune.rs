@@ -1527,4 +1527,6 @@ pub fn run(
 }
 
 #[cfg(test)]
+mod sim;
+#[cfg(test)]
 mod tests;
