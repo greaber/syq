@@ -425,7 +425,7 @@ enum Task {
 struct Pool {
     sender: Mutex<Option<mpsc::SyncSender<Task>>>,
     pending: Mutex<usize>,
-    events: mpsc::Sender<NativeRemoveOutcome>,
+    events: mpsc::Sender<Option<NativeRemoveOutcome>>,
     dry_run: bool,
     cancelled: AtomicBool,
 }
@@ -451,8 +451,16 @@ impl Pool {
     }
 
     fn task_done(&self) {
-        let mut pending = self.pending.lock().unwrap();
-        *pending -= 1;
+        let finished = {
+            let mut pending = self.pending.lock().unwrap();
+            *pending -= 1;
+            *pending == 0
+        };
+        if finished {
+            // The coordinator can consume the last outcome before this task
+            // finishes. Wake it again so completion cannot wait for EVENT_POLL.
+            let _ = self.events.send(None);
+        }
     }
 
     fn is_done(&self) -> bool {
@@ -473,7 +481,7 @@ impl Pool {
 
     fn outcome(&self, outcome: NativeRemoveOutcome) {
         if !self.is_cancelled() {
-            let _ = self.events.send(outcome);
+            let _ = self.events.send(Some(outcome));
         }
     }
 }
@@ -663,11 +671,12 @@ pub(crate) fn remove(
     let mut last_emit = Instant::now();
     while !pool.is_done() {
         match event_rx.recv_timeout(EVENT_POLL) {
-            Ok(event) => {
+            Ok(Some(event)) => {
                 if sink_error.is_none() {
                     batch.push(event);
                 }
             }
+            Ok(None) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -683,7 +692,7 @@ pub(crate) fn remove(
             }
         }
     }
-    while let Ok(event) = event_rx.try_recv() {
+    for event in event_rx.try_iter().flatten() {
         if sink_error.is_none() {
             batch.push(event);
             if batch.len() >= EVENT_BATCH {
