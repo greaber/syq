@@ -66,6 +66,7 @@ def main():
     parser.add_argument('--mib', type=int, default=512)
     parser.add_argument('--cpus', type=int, default=8)
     parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--count', type=int)
     parser.add_argument('--topologies', default='ext4,tmpfs,ext4-to-tmpfs')
     parser.add_argument('--sizes', default='131072,1048576')
     parser.add_argument('--policies', default='auto,fixed8')
@@ -92,7 +93,7 @@ def main():
         for topology in args.topologies.split(','):
             srcbase, dstbase = topologies[topology]
             for size in map(int, args.sizes.split(',')):
-                count = 8 if args.smoke else max(8, args.mib*(1 << 20)//size)
+                count = args.count or (8 if args.smoke else max(8, args.mib*(1 << 20)//size))
                 with tempfile.TemporaryDirectory(prefix='syq-linux-batch-src-', dir=srcbase) as s, \
                      tempfile.TemporaryDirectory(prefix='syq-linux-batch-dst-', dir=dstbase) as d:
                     source, destination_root = Path(s).resolve(), Path(d).resolve()
