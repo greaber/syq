@@ -382,7 +382,7 @@ fn excessive_probe_candidates_fail_before_resolution() {
             address: "must-not-resolve.invalid".into(),
             speed_mbps: 0,
             source: DataAddressSource::RemoteInterface,
-            reachable: false,
+            reachable: None,
             selected: false,
         })
         .collect();
@@ -1813,7 +1813,7 @@ fn probe_reachable_probes_each_socket_address_once() {
         address: address.to_string(),
         speed_mbps: 0,
         source: DataAddressSource::RemoteInterface,
-        reachable: false,
+        reachable: None,
         selected: false,
     };
     let mut candidates = vec![
@@ -1822,11 +1822,107 @@ fn probe_reachable_probes_each_socket_address_once() {
         candidate("127.0.0.1"),
     ];
     probe_reachable(&mut candidates, port).unwrap();
-    assert!(candidates[0].reachable);
-    assert!(candidates[2].reachable);
-    assert_eq!(candidates[1].reachable, via_localhost);
+    assert_eq!(candidates[0].reachable, Some(true));
+    assert_eq!(candidates[2].reachable, Some(true));
+    assert_eq!(candidates[1].reachable, Some(via_localhost));
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Replay socket-probe completions in a fixed order without depending on the
+/// host firewall or scheduler to produce a slow/unreachable address.
+fn replay_probe_results(
+    speeds: &[u32],
+    owners: &[&[usize]],
+    results: &[(usize, bool)],
+) -> Vec<Option<bool>> {
+    let mut candidates: Vec<_> = speeds
+        .iter()
+        .map(|&speed_mbps| TcpCandidate {
+            address: "fixture".into(),
+            speed_mbps,
+            source: DataAddressSource::RemoteInterface,
+            reachable: None,
+            selected: false,
+        })
+        .collect();
+    let mut remaining = vec![0; candidates.len()];
+    let targets: Vec<_> = owners
+        .iter()
+        .map(|indices| {
+            for &i in *indices {
+                remaining[i] += 1;
+            }
+            ("127.0.0.1:1".parse().unwrap(), indices.to_vec())
+        })
+        .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for &result in results {
+        tx.send(result).unwrap();
+    }
+    drop(tx);
+    collect_probe_results(
+        &mut candidates,
+        &targets,
+        remaining,
+        rx,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    );
+    candidates.iter().map(|c| c.reachable).collect()
+}
+
+#[test]
+fn unknown_speed_probe_stops_after_priority_route_is_settled() {
+    assert_eq!(
+        replay_probe_results(&[0, 0], &[&[0], &[1]], &[(0, true), (1, false)]),
+        [Some(true), None],
+    );
+    // A higher-priority refusal permits the next reachable address to win.
+    assert_eq!(
+        replay_probe_results(
+            &[0, 0, 0],
+            &[&[0], &[1], &[2]],
+            &[(1, true), (0, false), (2, false)],
+        ),
+        [Some(false), Some(true), None],
+    );
+    // Failed name resolution must not hold up the next usable address.
+    assert_eq!(
+        replay_probe_results(&[0, 0, 0], &[&[1], &[2]], &[(0, true), (1, false)]),
+        [Some(false), Some(true), None],
+    );
+}
+
+#[test]
+fn unknown_speed_probe_waits_for_higher_priority_dual_stack_candidate() {
+    // The lower-priority address succeeds before the preferred candidate's
+    // second family. Its first family's failure is not a complete refusal.
+    assert_eq!(
+        replay_probe_results(
+            &[0, 0, 0],
+            &[&[0], &[0], &[1], &[2]],
+            &[(0, false), (2, true), (1, true), (3, false)],
+        ),
+        [Some(true), Some(true), None],
+    );
+}
+
+#[test]
+fn known_speed_probe_keeps_waiting_for_multipath_candidates() {
+    for speeds in [[0, 10000], [1000, 10000], [10000, 10000]] {
+        assert_eq!(
+            replay_probe_results(&speeds, &[&[0], &[1]], &[(0, true), (1, true)]),
+            [Some(true), Some(true)],
+        );
+    }
+}
+
+#[test]
+fn unsuccessful_probe_finishes_every_candidate_before_fallback() {
+    assert_eq!(
+        replay_probe_results(&[0, 0], &[&[0], &[1]], &[(1, false), (0, false)]),
+        [Some(false), Some(false)],
+    );
 }
 
 #[test]

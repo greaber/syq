@@ -845,9 +845,9 @@ pub(super) fn set_meta_handle_known_portable(
     file: &File,
     meta: &Meta,
     flags: u8,
-    _current: &fs::Metadata,
+    current: &fs::Metadata,
 ) -> Result<()> {
-    set_meta_file(file, meta, flags)
+    set_meta_file_known(file, meta, flags, current)
 }
 
 #[cfg(target_os = "linux")]

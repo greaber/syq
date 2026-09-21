@@ -81,6 +81,16 @@ SSH endpoints use `[USER@]HOST[:PORT]`, for example `alice@server:2222`.
 Enclose IPv6 addresses in brackets: `alice@[2001:db8::1]:2222`.
 A colon in a native path is simply part of the path.
 
+For TCP data connections, Linux and macOS receivers advertise usable IPv4 and
+IPv6 addresses, with the address SSH connected to first. If that data address
+is unreachable, syq can try another advertised address on the same receiver.
+Loopback and link-local addresses are excluded from discovery; an address
+already used by SSH is still included when the data listener supports its family.
+When link speeds are unknown, syq selects the first reachable address in priority
+order without waiting for lower-priority probes. Verbose diagnostics mark any
+unfinished probes as untested. Known-speed multipath still waits for all probes
+within their timeout.
+
 Use `--to @NAME` to send local source files to a registered receiving machine.
 The `@` is required: `--to laptop` selects an SSH destination, while
 `--to @laptop` selects your connected receiving machine.

@@ -11,8 +11,10 @@ pub(super) fn link_speed(speed_mbps: u32) -> String {
 }
 
 pub(super) fn candidate_status(candidate: &TcpCandidate, fastest: u32) -> String {
-    if !candidate.reachable {
-        return "not reachable".to_string();
+    match candidate.reachable {
+        None => return "untested (probe unfinished at route selection)".to_string(),
+        Some(false) => return "not reachable".to_string(),
+        Some(true) => {}
     }
     let speed = link_speed(candidate.speed_mbps);
     if candidate.selected {
@@ -111,7 +113,7 @@ pub(super) fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
         let fastest = probe
             .candidates
             .iter()
-            .filter(|candidate| candidate.reachable)
+            .filter(|candidate| candidate.reachable == Some(true))
             .map(|candidate| candidate.speed_mbps)
             .max()
             .unwrap_or(0);
@@ -336,4 +338,26 @@ pub(super) fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> St
         output.push_str("\n  ssh data connections: kernel TCP loss statistics unavailable");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfinished_probe_is_not_reported_as_unreachable() {
+        let mut candidate = TcpCandidate {
+            address: "192.0.2.1".into(),
+            speed_mbps: 0,
+            source: DataAddressSource::RemoteInterface,
+            reachable: None,
+            selected: false,
+        };
+        assert_eq!(
+            candidate_status(&candidate, 0),
+            "untested (probe unfinished at route selection)"
+        );
+        candidate.reachable = Some(false);
+        assert_eq!(candidate_status(&candidate, 0), "not reachable");
+    }
 }
