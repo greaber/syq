@@ -6,6 +6,9 @@ mod test_support;
 #[path = "s3/streams.rs"]
 mod streams;
 
+#[path = "s3/listing.rs"]
+mod listing;
+
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -1026,6 +1029,95 @@ fn serve(
         }
         return;
     }
+    if fault.starts_with("parallel-") {
+        if method == "HEAD" {
+            if first.starts_with("HEAD /bucket/tree ") {
+                reply(&mut socket, 404, &[], b"", true);
+            } else {
+                reply(
+                    &mut socket,
+                    200,
+                    &[
+                        ("Content-Length".into(), "1".into()),
+                        ("ETag".into(), "\"source\"".into()),
+                    ],
+                    b"",
+                    true,
+                );
+            }
+            return;
+        }
+        assert_eq!(method, "GET", "enumeration must not mutate storage");
+        assert!(
+            first.contains("list-type=2"),
+            "enumeration must not download bodies"
+        );
+        let target = first.split_whitespace().nth(1).unwrap();
+        let url = url::Url::parse(&format!("http://fixture{target}")).unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        let prefix = query["prefix"].as_ref();
+        let delimiter = query.contains_key("delimiter");
+        let token = query.get("continuation-token").map(|s| s.as_ref());
+        if fault == "parallel-serial" {
+            assert!(
+                !delimiter && prefix == "tree/",
+                "one request slot must stay flat"
+            );
+        }
+        let denied = (fault == "parallel-prefix-policy" && prefix != "tree/")
+            || (fault == "parallel-delimiter-policy" && delimiter)
+            || (fault == "parallel-listing-failure"
+                && (prefix == "tree/b/" || token == Some("last")));
+        if denied {
+            reply(
+                &mut socket,
+                403,
+                &[],
+                b"<Error><Code>AccessDenied</Code></Error>",
+                false,
+            );
+            return;
+        }
+        let body = if delimiter {
+            "<IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>tree/a/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>tree/b/</Prefix></CommonPrefixes>".to_owned()
+        } else {
+            let (range, next) = match (prefix, token) {
+                ("tree/" | "tree/a/", None) => (0..1000, Some("next")),
+                ("tree/", Some("next")) => (1000..2000, Some("last")),
+                ("tree/a/", Some("next")) => (1000..2000, None),
+                ("tree/b/", None)
+                    if query.get("start-after").map(|s| s.as_ref()) == Some("tree/b/2999") =>
+                {
+                    (3000..4000, None)
+                }
+                ("tree/", Some("last")) | ("tree/b/", None) => (2000..3000, Some("tail")),
+                ("tree/" | "tree/b/", Some("tail")) => (3000..4000, None),
+                other => panic!("unexpected listing {other:?}"),
+            };
+            let contents = range
+                .map(|i| {
+                    format!(
+                        "<Contents><Key>tree/{}/{i:04}</Key><Size>1</Size></Contents>",
+                        if i < 2000 { "a" } else { "b" }
+                    )
+                })
+                .collect::<String>();
+            format!(
+                "<IsTruncated>{}</IsTruncated>{}{contents}",
+                next.is_some(),
+                next.map(|token| format!("<NextContinuationToken>{token}</NextContinuationToken>"))
+                    .unwrap_or_default()
+            )
+        };
+        reply(
+            &mut socket,
+            200,
+            &[],
+            format!("<ListBucketResult>{body}</ListBucketResult>").as_bytes(),
+            false,
+        );
+        return;
+    }
     if fault == "latency-pages" {
         serve_latency_pages(&mut socket, first);
         return;
@@ -1057,12 +1149,26 @@ fn serve(
                 "prune-mixed" => vec!["mirror/extra".into(), "mirror/good".into()],
                 _ => vec!["mirror/extra".into()],
             };
+            // Respect S3's 1000-item page limit, including delimiter probes.
+            let start = if first.contains("continuation-token=next") {
+                1000
+            } else {
+                0
+            };
+            let truncated = keys.len() > start + 1000;
+            let next = if truncated {
+                "<NextContinuationToken>next</NextContinuationToken>"
+            } else {
+                ""
+            };
             let contents = keys
                 .iter()
+                .skip(start)
+                .take(1000)
                 .map(|key| format!("<Contents><Key>{key}</Key><Size>1</Size></Contents>"))
                 .collect::<String>();
             let body = format!(
-                "<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+                "<ListBucketResult><IsTruncated>{truncated}</IsTruncated>{next}{contents}</ListBucketResult>"
             );
             reply(&mut socket, 200, &[], body.as_bytes(), false);
         } else {
@@ -2537,10 +2643,10 @@ fn s3_prune_limit_refuses_without_sending_delete() {
 #[test]
 fn s3_prune_batches_account_for_every_key_and_continue_after_errors() {
     for (fault, code, planned, completed, requests) in [
-        ("prune-batch", 0, 1001, 1001, 3),
-        ("prune-concurrent", 0, 1001, 1001, 3),
+        ("prune-batch", 0, 1001, 1001, 4),
+        ("prune-concurrent", 0, 1001, 1001, 4),
         ("prune-mixed", 23, 2, 1, 2),
-        ("prune-request-failure", 23, 1001, 1, 3),
+        ("prune-request-failure", 23, 1001, 1, 4),
     ] {
         let temp = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("empty")).unwrap();
@@ -4718,5 +4824,123 @@ fn s3_mapping_metadata_dry_run_reports_repairs_on_unchanged_download() {
         );
         assert_eq!((meta.mtime(), meta.mtime_nsec()), (1700000000, 0));
         std::fs::remove_file(temp.path().join("results.jsonl")).unwrap();
+    }
+}
+
+#[test]
+fn parallel_listing_failure_stops_copy_and_removal_before_mutation() {
+    for command in ["cp", "rm"] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let server = Server::start("parallel-listing-failure");
+        let mut process = server.command_for(temp.path(), command);
+        process.args(["--s3-endpoint", &server.address]);
+        if command == "cp" {
+            process.args([
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "tree",
+                "--into",
+                "out",
+            ]);
+        } else {
+            process.args(["--on", "s3://bucket", "--srcs-in", "tree"]);
+        }
+        let output = process.output().unwrap();
+        assert!(!output.status.success(), "{}", output_text(&output));
+        assert!(
+            output_text(&output).contains("403"),
+            "{}",
+            output_text(&output)
+        );
+        assert!(!temp.path().join("out/a/file").exists());
+    }
+}
+
+#[test]
+fn parallel_listing_preserves_exact_prefix_permissions_and_explicit_concurrency() {
+    for command in ["cp", "rm"] {
+        for fault in [
+            "parallel-prefix-policy",
+            "parallel-delimiter-policy",
+            "parallel-serial",
+        ] {
+            // S3 removal has no public tuning option.
+            if command == "rm" && fault == "parallel-serial" {
+                continue;
+            }
+            let temp = crate::test_support::tempdir().unwrap();
+            let server = Server::start(fault);
+            let template = server.command_for(temp.path(), command);
+            let mut process = Command::new(template.get_program());
+            process.current_dir(temp.path());
+            for (name, value) in template.get_envs() {
+                if let Some(value) = value {
+                    process.env(name, value);
+                } else {
+                    process.env_remove(name);
+                }
+            }
+            process.args(template.get_args().map(|arg| {
+                if fault == "parallel-serial" && arg == "s3-max-concurrent-parts-per-object=3" {
+                    std::ffi::OsStr::new("s3-max-concurrent-parts-per-object=1")
+                } else {
+                    arg
+                }
+            }));
+            process.args([
+                "--s3-endpoint",
+                &server.address,
+                "--dry-run",
+                "--results",
+                "results.ndjson",
+            ]);
+            if command == "cp" {
+                process.args([
+                    "--from",
+                    "s3://bucket",
+                    "--srcs-in",
+                    "tree",
+                    "--into",
+                    "out",
+                ]);
+            } else {
+                process.args(["--on", "s3://bucket", "--srcs-in", "tree"]);
+            }
+            let output = process.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{command}/{fault}: {}",
+                output_text(&output)
+            );
+            let records: Vec<serde_json::Value> =
+                std::fs::read_to_string(temp.path().join("results.ndjson"))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            let key = if command == "cp" { "src" } else { "path" };
+            let kind = if command == "cp" {
+                "trace"
+            } else {
+                "removal_trace"
+            };
+            let actual: Vec<_> = records
+                .iter()
+                .filter(|record| record["type"] == kind)
+                .map(|record| record[key]["value"].as_str().unwrap())
+                .collect();
+            let expected: std::collections::BTreeSet<_> = (0..4000)
+                .map(|i| format!("tree/{}/{i:04}", if i < 2000 { "a" } else { "b" }))
+                .collect();
+            assert_eq!(actual.len(), 4000);
+            assert_eq!(
+                actual
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected
+            );
+        }
     }
 }

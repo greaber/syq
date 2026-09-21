@@ -144,6 +144,9 @@ def collect(binary):
     commands = {}
     def visit(command):
         usage, groups, children = parse_help(read_help(binary, command))
+        # Experimental commands appear only in full help, not the public book.
+        if not command:
+            children = [(name, about) for name, about in children if name != "_ls"]
         parsed = usage, groups, children
         commands[command] = parsed
         for name, _ in parsed[2]:

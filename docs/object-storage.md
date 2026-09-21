@@ -23,6 +23,12 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
 
 See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
+Large unfiltered prefix copies, current-object removals, and destination scans
+for pruning can list subtrees concurrently. Discovery may use extra LIST
+requests; selectors still name literal keys and prefixes. For copies,
+`--performance-tuning s3-max-concurrent-parts-per-object=N` also caps unfiltered
+discovery; setting `N=1` keeps flat pagination. If a policy denies discovery, these operations retry with flat
+pagination at the original prefix.
 
 ## Authorize from your laptop
 

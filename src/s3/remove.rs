@@ -240,17 +240,24 @@ async fn plan(
         let exists;
         if is_tree {
             if !use_versions {
-                listed = client::list(client, bucket, &prefix, None, &mut HashSet::new())
-                    .await?
-                    .objects
-                    .into_iter()
-                    .map(|(key, _)| Entry {
-                        key,
-                        version: None,
-                        marker: false,
-                        selector: 0,
-                    })
-                    .collect();
+                listed = client::list(
+                    client,
+                    bucket,
+                    &prefix,
+                    None,
+                    &mut HashSet::new(),
+                    args.s3.as_ref().unwrap().concurrency,
+                )
+                .await?
+                .objects
+                .into_iter()
+                .map(|(key, _)| Entry {
+                    key,
+                    version: None,
+                    marker: false,
+                    selector: 0,
+                })
+                .collect();
                 anyhow::ensure!(
                     listed.iter().all(|e| e.key.starts_with(&prefix)),
                     "S3 listing returned a key outside the requested prefix"

@@ -156,6 +156,7 @@ impl Engine {
                             &prefix,
                             None,
                             &mut HashSet::new(),
+                            self.options.concurrency,
                         )
                         .await?
                         .objects
@@ -241,6 +242,7 @@ impl Engine {
                         &prefix,
                         None,
                         &mut HashSet::new(),
+                        self.options.concurrency,
                     )
                     .await?
                     .objects,

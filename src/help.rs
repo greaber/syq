@@ -47,6 +47,7 @@ fn configure_at(mut command: Command, path: &str) -> Command {
                 || arg.is_required_set()
                 || matches!(arg.get_id().as_str(), "help" | "version" | "self_update")
                 || match path {
+                    "syq _ls" => true,
                     "syq exec" => matches!(arg.get_id().as_str(), "on" | "cwd"),
                     "syq persist connect" => arg.get_id() == "timeout",
                     "syq persist receive on" => matches!(
@@ -325,6 +326,7 @@ pub(crate) fn root() -> Command {
         .subcommand(Command::new("exec").about("Run a command on a named receiving machine after local approval"))
         .subcommand(Command::new("rm").about("Remove selected files and directory trees"))
         .subcommand(Command::new("clean-partials").about("Delete syq partial files in directory trees"))
+        .subcommand(Command::new("_ls").hide(true).about("List S3 objects (experimental; interface may change)"))
         .subcommand(Command::new("map").about("Print source-to-destination mappings as NDJSON"))
         .subcommand(Command::new("rsync").about("Copy using rsync-compatible syntax"))
         .subcommand(Command::new("persist").about("Manage persistent connections, receiving, and return destinations"))
@@ -336,7 +338,9 @@ pub(crate) fn root() -> Command {
 
 /// Keep inspection commands out of common help without hiding completion.
 pub(crate) fn root_for_help(full: bool) -> Command {
-    root().mut_subcommand("tuning-cache", |command| command.hide(!full))
+    root()
+        .mut_subcommand("tuning-cache", |command| command.hide(!full))
+        .mut_subcommand("_ls", |command| command.hide(!full))
 }
 
 pub(crate) fn lifecycle() -> Command {
@@ -401,7 +405,7 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("help topic is not UTF-8"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let full = topics.last() == Some(&"--help-all");
+    let full = matches!(topics.last(), Some(&"--help-all"));
     if full || matches!(topics.last(), Some(&"--help" | &"-h")) {
         topics.pop();
     }

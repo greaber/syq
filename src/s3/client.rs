@@ -747,6 +747,139 @@ pub(super) struct Listing {
     pub excluded: u64,
 }
 
+/// Reuse the bounded recursive planner for existing literal-prefix operations.
+/// Filtered copies retain the exclusion-directed lookahead below: it can prune
+/// an ignored subtree without enumerating or interpreting its descendants.
+async fn parallel_listing(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    concurrency: usize,
+) -> Result<Listing> {
+    use super::listing::engine::{self, Entry, Page, Store};
+    struct S3<'a> {
+        client: &'a Client,
+        bucket: &'a str,
+        root: &'a str,
+        discovery_denied: std::sync::atomic::AtomicBool,
+    }
+    impl Store for S3<'_> {
+        fn ordered(&self) -> bool {
+            // Directory buckets do not promise lexicographic LIST order.
+            !self.bucket.ends_with("--x-s3")
+        }
+
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            start_after: Option<&str>,
+        ) -> Result<Page> {
+            let response = self
+                .client
+                .list_objects_v2()
+                .bucket(self.bucket)
+                .prefix(prefix)
+                .max_keys(1000)
+                .set_delimiter(delimiter.then(|| "/".into()))
+                .set_continuation_token(token.map(str::to_owned))
+                .set_start_after(start_after.map(str::to_owned))
+                .send()
+                .await
+                .map_err(|error| {
+                    if (delimiter || prefix != self.root)
+                        && error
+                            .raw_response()
+                            .is_some_and(|response| response.status().as_u16() == 403)
+                    {
+                        self.discovery_denied
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    listing_failure(error)
+                })?;
+            // Preserve this path's existing SDK decoding and failure context.
+            // Transfer metadata still comes from HEAD/GET, not LIST.
+            let entries = response
+                .contents()
+                .iter()
+                .map(|object| {
+                    Ok(Entry {
+                        key: object.key().context("S3 listing omitted key")?.to_owned(),
+                        size: u64::try_from(object.size().context("S3 listing omitted size")?)?,
+                        last_modified: None,
+                        etag: None,
+                    })
+                })
+                .collect::<Result<_>>()?;
+            let prefixes = response
+                .common_prefixes()
+                .iter()
+                .map(|child| {
+                    Ok(child
+                        .prefix()
+                        .context("S3 listing omitted common prefix")?
+                        .to_owned())
+                })
+                .collect::<Result<_>>()?;
+            let next = if response.is_truncated() == Some(true) {
+                Some(
+                    response
+                        .next_continuation_token()
+                        .context("truncated S3 listing omitted continuation token")?
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
+            Ok(Page {
+                entries,
+                prefixes,
+                next,
+            })
+        }
+    }
+    let mut objects = Vec::new();
+    let store = S3 {
+        client,
+        bucket,
+        root: prefix,
+        discovery_denied: std::sync::atomic::AtomicBool::new(false),
+    };
+    let outcome = engine::enumerate_prefix(&store, prefix, concurrency.min(32), |entry| {
+        objects.push((entry.key, entry.size));
+        Ok(())
+    })
+    .await;
+    if let Err(error) = outcome {
+        if !store
+            .discovery_denied
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || error
+                .downcast_ref::<RequestFailure>()
+                .is_none_or(|failure| failure.status != Some(403))
+        {
+            return Err(error);
+        }
+        // Exact-prefix IAM policies can permit the original LIST while denying
+        // discovery or child prefixes. No caller has consumed the plan yet.
+        objects.clear();
+        engine::enumerate_prefix(&store, prefix, 1, |entry| {
+            objects.push((entry.key, entry.size));
+            Ok(())
+        })
+        .await?;
+    }
+    // Previously LIST delivered keys in order. Preserve planning/claim order
+    // for callers despite concurrent subtree completion.
+    objects.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    Ok(Listing {
+        found: !objects.is_empty(),
+        objects,
+        excluded: 0,
+    })
+}
+
 /// Keep flat listings for small trees and filename filters. Only switch to
 /// directory discovery when the first full page contains only excluded descendants.
 /// A complete directory probe can prune children or descend through a single
@@ -759,7 +892,11 @@ pub(super) async fn list(
     prefix: &str,
     matcher: Option<&ignore::gitignore::Gitignore>,
     excluded_subtrees: &mut std::collections::HashSet<String>,
+    concurrency: usize,
 ) -> Result<Listing> {
+    if matcher.is_none() {
+        return parallel_listing(client, bucket, prefix, concurrency).await;
+    }
     let mut result = Listing {
         objects: Vec::new(),
         found: false,
