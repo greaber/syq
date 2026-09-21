@@ -460,5 +460,54 @@ fn trace_records_inconclusive_upward_hold_without_claiming_a_plateau() {
     assert_eq!(decision["data"]["after"]["state"], "Hold");
     let end = events.last().unwrap();
     assert_eq!(end["data"]["completed_comparison"], true);
+    assert_eq!(end["data"]["last_accepted"], 16);
+    assert_eq!(end["data"]["recommended"], 8);
     assert_eq!(end["data"]["discovery_complete"], false);
+}
+
+#[test]
+fn repeated_inconclusive_copies_preserve_history_and_legacy_start() {
+    use super::super::{cached_at, remember_at, Policy};
+    for use_history in [false, true] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let history_path = temp.path().join("history.sqlite");
+        let cache_path = temp.path().join("tuning.json");
+        for run in 0..6 {
+            let writer = recorder(&history_path);
+            let context = key("a");
+            writer.context(&context);
+            let hint = use_history.then(|| writer.hint(&context, true)).flatten();
+            if run > 0 && use_history {
+                assert!(
+                    hint.is_some(),
+                    "exercise history precedence over legacy cache"
+                );
+            }
+            let start = hint
+                .as_ref()
+                .map(|h| h.workers)
+                .or_else(|| cached_at(&cache_path, "path"))
+                .unwrap_or(8);
+            assert_eq!(start, 8);
+            let mut policy = if hint.is_some_and(|h| h.refine) {
+                Policy::refine(start, 1, 256)
+            } else {
+                Policy::new(start, 1, 256)
+            };
+            policy.observe(100.0);
+            policy.activated();
+            policy.observe(97.0);
+            policy.activated();
+            assert_eq!(policy.active(), 16);
+            assert!(policy.measured());
+            assert_eq!(policy.recommended(), 8);
+            writer.recommend(policy.recommended(), policy.discovery_complete());
+            writer.complete(true, json!({}));
+            remember_at(&cache_path, "path", policy.recommended()).unwrap();
+            assert_eq!(cached_at(&cache_path, "path"), Some(8));
+            let saved = writer.hint(&context, true).unwrap();
+            assert_eq!(saved.workers, 8);
+            assert!(!saved.refine);
+        }
+    }
 }

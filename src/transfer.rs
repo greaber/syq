@@ -3333,7 +3333,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         initial.mode.clone(),
                     );
                     if initial.route == final_key.route {
-                        history.recommend(policy.settled(), policy.discovery_complete());
+                        history.recommend(policy.recommended(), policy.discovery_complete());
                     }
                 }
             }
@@ -3344,7 +3344,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             if let Some(initial_key) = tuning_key.as_deref() {
                 let final_key = tune::path_key(&src_ep, &dst_ep);
                 if final_key.as_deref() == Some(initial_key) {
-                    tune::remember(initial_key, policy.settled());
+                    tune::remember(initial_key, policy.recommended());
                 } else if debug() {
                     crate::output::diagnostic!(
                         "syq: auto-tuning: transport changed during transfer; not updating cache"

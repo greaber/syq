@@ -1025,3 +1025,64 @@ fn ambiguous_probe_does_not_change_downward_acceptance_or_clear_loss_rollback() 
         assert_eq!(policy.settled(), if keep_smaller { lower } else { 16 });
     }
 }
+
+#[test]
+fn repeated_inconclusive_copies_do_not_raise_the_recommended_start() {
+    // End copies before or after downward probes. Neither keeping a larger
+    // count nor partially reducing it should ratchet the next start upward.
+    for refine in [false, true] {
+        for loss_per_doubling in [1.0_f64, 0.97] {
+            for measurements in 2..=60 {
+                let mut start = 8;
+                for _ in 0..6 {
+                    let mut policy = if refine {
+                        Policy::refine(start, 1, 256)
+                    } else {
+                        Policy::new(start, 1, 256)
+                    };
+                    for _ in 0..measurements {
+                        let score = 100.0 * loss_per_doubling.powf((policy.n as f64 / 8.0).log2());
+                        measure(&mut policy, score);
+                    }
+                    assert!(policy.measured());
+                    assert!(
+                        policy.recommended() <= start,
+                        "start={start}, samples={measurements}, refine={refine}, \
+                         loss={loss_per_doubling}, policy={policy:?}"
+                    );
+                    start = policy.recommended();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn recommendation_changes_only_with_justified_growth_or_reduction() {
+    let mut policy = Policy::new(8, 1, 64);
+    measure(&mut policy, 100.0); // Proposed 16 is not a recommendation yet.
+    assert_eq!(policy.recommended(), 8);
+    measure(&mut policy, 200.0); // Clear gain at 16; propose 32.
+    assert_eq!(policy.recommended(), 16);
+    measure(&mut policy, 200.0); // Keep 32 live, but not for the next copy.
+    assert_eq!(policy.settled(), 32);
+    assert_eq!(policy.recommended(), 16);
+
+    assert!(policy.begin(Direction::Down, 200.0));
+    policy.activated();
+    assert_eq!(policy.n, 24);
+    measure(&mut policy, 200.0);
+    assert_eq!(policy.settled(), 24);
+    assert_eq!(policy.recommended(), 16); // Partial rollback must not save 24.
+    for _ in 0..16 {
+        if policy.settled() < 16 {
+            break;
+        }
+        measure(&mut policy, 200.0);
+    }
+    assert!(policy.recommended() < 16);
+    assert_eq!(policy.recommended(), policy.settled());
+    let lower = policy.recommended();
+    policy.cancel_unapplied();
+    assert_eq!(policy.recommended(), lower);
+}

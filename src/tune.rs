@@ -391,6 +391,8 @@ pub struct Policy {
     /// Highest count that was actually activated, not merely requested.
     pub peak: usize,
     active: usize,
+    /// Starting count justified for future copies, excluding inconclusive increases.
+    recommended: usize,
     /// Initial discovery doubles unless closely matched evidence supports refinement.
     startup_doubling: bool,
     state: State,
@@ -414,6 +416,7 @@ impl Policy {
             max,
             peak: n,
             active: n,
+            recommended: n,
             startup_doubling: true,
             state: State::Initial,
             points: BTreeMap::new(),
@@ -439,6 +442,12 @@ impl Policy {
             State::Explore { from, .. } => from,
             _ => self.n,
         }
+    }
+
+    /// Count to save for future copies. Keeping an inconclusive increase live
+    /// does not justify making that increase the next copy's starting point.
+    pub fn recommended(&self) -> usize {
+        self.recommended
     }
 
     /// Connections required now (including rollback), and the earliest
@@ -560,6 +569,11 @@ impl Policy {
     /// are not plateau measurements either.
     pub fn discovery_complete(&self) -> bool {
         let settled = self.settled();
+        // Plateau evidence for the live count must not be attached to a
+        // different recommendation retained after an inconclusive increase.
+        if settled != self.recommended {
+            return false;
+        }
         let Some(current) = self.points.get(&settled) else {
             return false;
         };
@@ -823,6 +837,12 @@ impl Policy {
                     return self.n;
                 }
                 if keep {
+                    self.recommended = match direction {
+                        Direction::Up => self.n,
+                        // A partial reduction of an inconclusive increase is
+                        // not evidence to raise the future starting count.
+                        Direction::Down => self.recommended.min(self.n),
+                    };
                     self.fails[idx] = 0;
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
                     self.state = State::Hold;
