@@ -1822,7 +1822,7 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     )
     .unwrap();
     assert_output_ok(&copy_with_hint("confirmed", &[]));
-    let workers: usize = db
+    let workers: i64 = db
         .query_row(
             "SELECT json_extract(data,'$.data.workers') FROM events WHERE run=5 AND json_extract(data,'$.kind')='workers_start'",
             [],
