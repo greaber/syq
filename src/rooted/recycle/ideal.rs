@@ -16,6 +16,7 @@ struct Header {
     files: Cell,
     bytes: Cell,
     expected: Cell,
+    progressive: Cell,
     started: Cell,
     drained: Cell,
     epoch: AtomicU32,
@@ -82,6 +83,9 @@ impl Ideal {
                 files: Cell(AtomicU64::new(0)),
                 bytes: Cell(AtomicU64::new(0)),
                 expected: Cell(AtomicU64::new(expected)),
+                progressive: Cell(AtomicU64::new(u64::from(
+                    std::env::var_os("SYQ_EXPERIMENT_DRAIN_PROGRESSIVE").is_some(),
+                ))),
                 started: Cell(AtomicU64::new(0)),
                 drained: Cell(AtomicU64::new(0)),
                 epoch: AtomicU32::new(0),
@@ -158,12 +162,31 @@ impl Ideal {
     }
     fn drain_one(&self, directory: &File) -> Result<bool> {
         let h = self.h();
-        if h.closed.0.load(Ordering::Acquire) == 0
-            && h.started.0.load(Ordering::Acquire) < h.expected.0.load(Ordering::Acquire)
-        {
-            return Ok(false);
-        }
-        let Some(slot) = claim(&h.ready.0, MASK) else {
+        let slot = h
+            .ready
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |ready| {
+                let closed = h.closed.0.load(Ordering::Acquire) != 0;
+                let remaining = if closed {
+                    0
+                } else {
+                    h.expected
+                        .0
+                        .load(Ordering::Acquire)
+                        .saturating_sub(h.started.0.load(Ordering::Acquire))
+                };
+                if !closed && h.progressive.0.load(Ordering::Acquire) == 0 && remaining != 0 {
+                    return None;
+                }
+                // Each future file needs at most one spare. A take removes its
+                // ready bit before lowering remaining, so a stale remaining count
+                // is conservative. Recheck it on every failed ready-mask CAS.
+                (u64::from(ready.count_ones()) > remaining)
+                    .then(|| ready & !(1 << ready.trailing_zeros()))
+            })
+            .ok()
+            .map(|ready| ready.trailing_zeros() as usize);
+        let Some(slot) = slot else {
             return Ok(false);
         };
         unlink_at(directory.as_raw_fd(), &self.names[slot], 0)?;
@@ -203,6 +226,8 @@ impl Ideal {
             );
             if started == self.h().expected.0.load(Ordering::Acquire) {
                 self.wake(i32::MAX);
+            } else if self.h().progressive.0.load(Ordering::Acquire) != 0 {
+                self.wake(1);
             }
         }
         result
@@ -314,7 +339,8 @@ impl Ideal {
         // Publish only after the previous destination name has been replaced.
         h.ready.0.fetch_or(1 << slot, Ordering::Release);
         if self.draining_enabled()
-            && h.started.0.load(Ordering::Acquire) >= h.expected.0.load(Ordering::Acquire)
+            && (h.progressive.0.load(Ordering::Acquire) != 0
+                || h.started.0.load(Ordering::Acquire) >= h.expected.0.load(Ordering::Acquire))
         {
             self.wake(1);
         }
@@ -354,6 +380,41 @@ mod drain_tests {
         assert_eq!(ideal.h().drained.0.load(Ordering::Acquire), 1);
         assert_eq!(ideal.h().free.0.load(Ordering::Acquire), MASK);
         assert!(!ideal.drain_one(&directory).unwrap());
+    }
+
+    #[test]
+    fn progressive_reclamation_reserves_a_spare_for_each_future_file() {
+        let temp = tempfile::tempdir_in(crate::test_support::temp_dir()).unwrap();
+        let directory = File::open(temp.path()).unwrap();
+        Ideal::create(&directory).unwrap();
+        let ideal = Ideal::open(&directory).unwrap().unwrap();
+        ideal.h().expected.0.store(10, Ordering::Release);
+        ideal.h().started.0.store(6, Ordering::Release);
+        ideal.h().progressive.0.store(1, Ordering::Release);
+        for slot in 0..6 {
+            std::fs::write(temp.path().join(slot.to_string()), b"spare").unwrap();
+        }
+        ideal.h().ready.0.store(0b111111, Ordering::Release);
+        ideal.h().free.0.fetch_and(!0b111111, Ordering::Release);
+        assert!(ideal.drain_one(&directory).unwrap());
+        assert!(ideal.drain_one(&directory).unwrap());
+        assert!(!ideal.drain_one(&directory).unwrap());
+        assert_eq!(ideal.h().ready.0.load(Ordering::Acquire).count_ones(), 4);
+        // A concurrent staging acquisition first consumes one ready slot.
+        let slot = claim(&ideal.h().ready.0, MASK).unwrap();
+        std::fs::rename(
+            temp.path().join(slot.to_string()),
+            temp.path().join("staging"),
+        )
+        .unwrap();
+        ideal.h().free.0.fetch_or(1 << slot, Ordering::Release);
+        ideal.h().started.0.fetch_add(1, Ordering::AcqRel);
+        assert!(!ideal.drain_one(&directory).unwrap());
+        assert_eq!(ideal.h().ready.0.load(Ordering::Acquire).count_ones(), 3);
+        assert_eq!(
+            std::fs::read(temp.path().join("staging")).unwrap(),
+            b"spare"
+        );
     }
 
     #[test]
