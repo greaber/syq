@@ -2,7 +2,7 @@
 use std::net::IpAddr;
 
 fn is_virtual_iface(name: &str) -> bool {
-    name == "lo"
+    matches!(name, "lo" | "lo0")
         || [
             "docker", "veth", "br-", "virbr", "vmnet", "cni", "flannel", "cali", "kube", "ib",
         ]
@@ -308,6 +308,34 @@ mod tests {
                 ("100.100.1.2".into(), 0),
             ]
         );
+    }
+
+    #[test]
+    fn loopback_aliases_are_excluded_unless_used_by_ssh() {
+        let entries = || {
+            [
+                ("lo", "10.0.0.1"),
+                ("lo0", "10.0.0.2"),
+                ("lo0", "fd00::2"),
+                ("en0", "10.0.0.3"),
+            ]
+            .map(|(name, ip)| InterfaceAddress {
+                name: name.into(),
+                ip: ip.parse().unwrap(),
+                speed_mbps: 0,
+            })
+        };
+        let families = BoundFamilies { v4: true, v6: true };
+        assert_eq!(
+            advertised_addrs(entries(), None, families),
+            vec![("10.0.0.3".into(), 0)],
+        );
+        for ssh in ["10.0.0.2", "fd00::2"] {
+            assert_eq!(
+                advertised_addrs(entries(), Some(ssh.parse().unwrap()), families),
+                vec![(ssh.into(), 0), ("10.0.0.3".into(), 0)],
+            );
+        }
     }
 
     #[test]
