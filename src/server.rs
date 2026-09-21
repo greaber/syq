@@ -289,6 +289,51 @@ pub(crate) fn run_named(
     result
 }
 
+/// A laptop-initiated TCP worker, admitted through its approved SSH channel.
+pub(crate) fn run_named_tcp(
+    stream: TcpStream,
+    channel: std::os::unix::net::UnixStream,
+    key: &[u8],
+    authority: Arc<crate::restricted::RestrictedAuthority>,
+) -> Result<()> {
+    let descriptor_session = DescriptorSessionSlot::default();
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let reader = TcpHandshakeReader {
+        stream: stream.try_clone()?,
+        pending: pending.clone(),
+        deadline: std::time::Instant::now() + Duration::from_secs(10),
+    };
+    let result = serve(
+        RecordReader::new(reader, Some(Cipher::new(key, 0, 1))),
+        RecordWriter::new(stream.try_clone()?, Some(Cipher::new(key, 0, 2))),
+        false,
+        Some(Vec::new()),
+        None,
+        Some(stream),
+        ServeSession {
+            handshake_pending: Some(pending),
+            ssh_worker_ticket: None,
+            allow_tcp: false,
+            named_socket: Some(channel),
+            authority: Some(authority),
+            descriptor_session: descriptor_session.clone(),
+        },
+    );
+    descriptor_session.close();
+    result
+}
+
+pub(crate) fn return_tcp_addresses(listeners: &[TcpListener]) -> Vec<(String, u32)> {
+    local_addrs(BoundFamilies {
+        v4: listeners
+            .iter()
+            .any(|l| l.local_addr().is_ok_and(|a| a.is_ipv4())),
+        v6: listeners
+            .iter()
+            .any(|l| l.local_addr().is_ok_and(|a| a.is_ipv6())),
+    })
+}
+
 /// Serve one connection. `over_ssh` connections may set up a TCP listener;
 /// TCP connections must present `expect_token` in their Hello.
 fn serve<R: Read + Send + 'static, W: Write>(
@@ -901,7 +946,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
 /// platform default. A port where either family is already taken is skipped
 /// so the two listeners always share one port number; a family the host cannot
 /// bind at all (no IPv6, say) is simply left out.
-fn bind_data_listeners(lo: u16, hi: u16) -> Result<(u16, Vec<TcpListener>)> {
+pub(crate) fn bind_data_listeners(lo: u16, hi: u16) -> Result<(u16, Vec<TcpListener>)> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     let mut last_error = None;
     // Port 0 asks the kernel for an ephemeral port: the first family's bind

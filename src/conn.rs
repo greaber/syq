@@ -17,8 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod bootstrap;
 mod local;
+mod reverse_tcp;
 mod ssh_multiplexer;
 mod tcp_socket;
+pub(crate) use reverse_tcp::ReverseTcp;
 
 #[cfg(test)]
 use bootstrap::*;
@@ -190,7 +192,7 @@ pub struct TcpPairStats {
 /// not be honored. Callers use this to distinguish a bad experiment setup
 /// from ordinary TCP reachability failures, which may fall back to SSH.
 #[derive(Debug)]
-pub(crate) struct TcpCongestionError(String);
+pub(crate) struct TcpCongestionError(pub(crate) String);
 
 impl std::fmt::Display for TcpCongestionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -944,13 +946,13 @@ pub(crate) fn is_overlay_address(address: &str) -> bool {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DataAddressSource {
     RemoteInterface,
     SshTarget,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TcpCandidate {
     pub address: String,
     pub speed_mbps: u32,
@@ -976,6 +978,7 @@ pub struct TcpProbe {
 /// the probe join handle here lets destination preflight cover the bounded
 /// reachability window without weakening route selection.
 pub(crate) struct PendingTcpSetup {
+    reverse: Option<std::sync::Arc<ReverseTcp>>,
     port: u16,
     key: Option<Vec<u8>>,
     token: Vec<u8>,
@@ -1100,7 +1103,9 @@ impl RemoteSpec {
 
     pub fn data_transport(&self) -> DataTransport {
         match self.tcp.lock().unwrap().as_ref() {
-            Some(info) if !info.failed && info.key.is_some() => DataTransport::EncryptedTcp,
+            Some(info) if !info.failed && (info.key.is_some() || info.reverse.is_some()) => {
+                DataTransport::EncryptedTcp
+            }
             Some(info) if !info.failed => DataTransport::PlaintextTcp,
             _ => DataTransport::Ssh,
         }
@@ -1655,6 +1660,10 @@ impl RemoteSpec {
         ports: (u16, u16),
         congestion_control: Option<&str>,
     ) -> Result<PendingTcpSetup> {
+        if crate::destination::is_named(&self.restricted_grant) {
+            anyhow::ensure!(!plain, "named destinations require encrypted TCP");
+            return self.begin_reverse_tcp_setup(ports, congestion_control);
+        }
         let key = if plain {
             None
         } else {
@@ -1682,6 +1691,24 @@ impl RemoteSpec {
             },
         };
         validate_advertised_tcp_port(port, ports)?;
+        let spec = self.clone();
+        let probe = std::thread::spawn(move || spec.probe_tcp_addresses(advertised, port));
+        Ok(PendingTcpSetup {
+            reverse: None,
+            port,
+            key,
+            token,
+            congestion_control: congestion_control.map(str::to_owned),
+            remote_congestion_control,
+            probe,
+        })
+    }
+
+    pub(crate) fn probe_tcp_addresses(
+        &self,
+        advertised: Vec<(String, u32)>,
+        port: u16,
+    ) -> Result<Vec<TcpCandidate>> {
         if advertised.len() > MAX_ADVERTISED_TCP_ADDRESSES {
             bail!(
                 "TCP listener advertised too many addresses (limit {MAX_ADVERTISED_TCP_ADDRESSES})"
@@ -1721,25 +1748,13 @@ impl RemoteSpec {
                 );
             }
         }
-        // Probing is independent of the authenticated control stream. Let the
-        // coordinator do destination preflight and plan payloads while route
-        // selection probes the candidates.
-        let probe = std::thread::spawn(move || {
-            probe_reachable(&mut candidates, port)?;
-            Ok(candidates)
-        });
-        Ok(PendingTcpSetup {
-            port,
-            key,
-            token,
-            congestion_control: congestion_control.map(str::to_owned),
-            remote_congestion_control,
-            probe,
-        })
+        probe_reachable(&mut candidates, port)?;
+        Ok(candidates)
     }
 
     fn finish_tcp_setup_inner(&self, pending: PendingTcpSetup) -> Result<()> {
         let PendingTcpSetup {
+            reverse,
             port,
             key,
             token,
@@ -1747,33 +1762,13 @@ impl RemoteSpec {
             remote_congestion_control,
             probe,
         } = pending;
-        let mut candidates = probe
+        let candidates = probe
             .join()
             .map_err(|_| anyhow!("TCP route probe thread panicked"))??;
-        // Multipath only across comparable-speed NICs: keep those within 2x of
-        // the fastest reachable one. Mixing a fast and a slow path (a rail and
-        // Tailscale, say) would drag the transfer down, so we don't.
-        let fastest = candidates
-            .iter()
-            .filter(|candidate| candidate.reachable == Some(true))
-            .map(|candidate| candidate.speed_mbps)
-            .max()
-            .unwrap_or(0);
-        let mut selected_unknown = false;
-        for candidate in &mut candidates {
-            candidate.selected = candidate.reachable == Some(true)
-                && if fastest > 0 {
-                    candidate.speed_mbps.saturating_mul(2) >= fastest
-                } else if selected_unknown {
-                    false
-                } else {
-                    selected_unknown = true;
-                    true
-                };
-        }
+        let candidates = select_tcp_candidates(candidates);
         self.diagnostics.lock().unwrap().tcp_probe = Some(TcpProbe {
             port,
-            encrypted: key.is_some(),
+            encrypted: key.is_some() || reverse.is_some(),
             congestion_control: remote_congestion_control,
             candidates: candidates.clone(),
         });
@@ -1794,6 +1789,7 @@ impl RemoteSpec {
             );
         }
         *self.tcp.lock().unwrap() = Some(TcpInfo {
+            reverse,
             addrs,
             port,
             key,
@@ -1840,96 +1836,64 @@ impl RemoteSpec {
         compress: bool,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
+        if let Some(reverse) = &info.reverse {
+            return self.connect_reverse_tcp(reverse, compress, role);
+        }
         // Keep network compression, but not on the local receiver's data hop.
         let compress = compress && !self.local_process;
-        let n = info.addrs.len();
-        let start = info.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
-        let mut last = anyhow!("no data address");
-        for k in 0..n {
-            let addr = &info.addrs[(start + k) % n];
-            let resolved: Vec<_> = match (addr.as_str(), info.port).to_socket_addrs() {
-                Ok(it) => it.collect(),
-                Err(_) => {
-                    last = anyhow!("cannot resolve {addr}");
-                    continue;
-                }
-            };
-            // Try each resolved address in turn (dual-stack names may list an
-            // unreachable family first).
-            let mut got = None;
-            for sa in &resolved {
-                match connect_tcp_stream(
-                    sa,
-                    std::time::Duration::from_secs(4),
-                    info.congestion_control.as_deref(),
-                ) {
-                    Ok(s) => {
-                        got = Some(s);
-                        break;
-                    }
-                    Err(error) if is_tcp_congestion_error(&error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "coordinator could not configure the connecting data socket to {}",
-                                self.label()
-                            )
-                        })
-                    }
-                    Err(e) => last = anyhow!("{}: {e}", data_address(addr, info.port)),
-                }
-            }
-            let stream = match got {
-                Some(s) => s,
-                None => continue,
-            };
-            let addr_s = stream
-                .peer_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_default();
-            if crate::output::debug() {
-                crate::output::diagnostic!(
-                    "syq: {}: data connection via tcp {addr_s}",
+        let stream = info.connect_socket().map_err(|error| {
+            if is_tcp_congestion_error(&error) {
+                error.context(format!(
+                    "coordinator could not configure the connecting data socket to {}",
                     self.label()
-                );
+                ))
+            } else {
+                error
             }
-            stream.set_nodelay(true)?;
-            let conn_id = next_tcp_connection_id(&TCP_CONN_ID)?;
-            (&stream).write_all(&conn_id.to_be_bytes())?;
-            let (wc, rc) = match &info.key {
-                Some(k) => (
-                    Some(Cipher::new(k, conn_id, 1)),
-                    Some(Cipher::new(k, conn_id, 2)),
-                ),
-                None => (None, None),
-            };
-            let writer = RecordWriter::new(stream.try_clone()?, wc);
-            let tcp_socket = stream.try_clone()?;
-            let reader = RecordReader::new(stream, rc);
-            let observation =
-                std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-            let (rx, reader) =
-                spawn_observed_reader(Box::new(reader), self.read_ahead, observation.clone());
-            let conn = RemoteConn {
-                observation,
-                child: None,
-                w: FrameWriter::new(Box::new(writer), compress),
-                rx: Some(rx),
-                reader: Some(reader),
-                label: format!("{} (tcp {addr_s})", self.label()),
-                dead: false,
-                rpc_observation: None,
-                write_stream: None,
-                peer: None,
-                tcp_socket: Some(std::sync::Arc::new(tcp_socket)),
-                named_socket: None,
-                multiplexed_ssh: false,
-                detached: false,
-            };
-            let conn = hello(conn, compress, info.token.clone(), role.clone())?;
-            self.record_peer(&conn);
-            return Ok(conn);
+        })?;
+        let addr_s = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        if crate::output::debug() {
+            crate::output::diagnostic!("syq: {}: data connection via tcp {addr_s}", self.label());
         }
-        Err(last)
+        stream.set_nodelay(true)?;
+        let conn_id = next_tcp_connection_id(&TCP_CONN_ID)?;
+        (&stream).write_all(&conn_id.to_be_bytes())?;
+        let (wc, rc) = match &info.key {
+            Some(k) => (
+                Some(Cipher::new(k, conn_id, 1)),
+                Some(Cipher::new(k, conn_id, 2)),
+            ),
+            None => (None, None),
+        };
+        let writer = RecordWriter::new(stream.try_clone()?, wc);
+        let tcp_socket = stream.try_clone()?;
+        let reader = RecordReader::new(stream, rc);
+        let observation =
+            std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
+        let (rx, reader) =
+            spawn_observed_reader(Box::new(reader), self.read_ahead, observation.clone());
+        let conn = RemoteConn {
+            observation,
+            child: None,
+            w: FrameWriter::new(Box::new(writer), compress),
+            rx: Some(rx),
+            reader: Some(reader),
+            label: format!("{} (tcp {addr_s})", self.label()),
+            dead: false,
+            rpc_observation: None,
+            write_stream: None,
+            peer: None,
+            tcp_socket: Some(std::sync::Arc::new(tcp_socket)),
+            named_socket: None,
+            multiplexed_ssh: false,
+            detached: false,
+        };
+        let conn = hello(conn, compress, info.token.clone(), role.clone())?;
+        self.record_peer(&conn);
+        Ok(conn)
     }
 }
 
@@ -1943,6 +1907,31 @@ fn helper_needs_install(e: &anyhow::Error) -> bool {
         remote_helper::HELPER_NOT_EXECUTABLE_EXIT
     )) || message.contains("build identity mismatch")
         || message.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
+}
+
+pub(crate) fn select_tcp_candidates(mut candidates: Vec<TcpCandidate>) -> Vec<TcpCandidate> {
+    // Multipath only across comparable-speed NICs: keep those within 2x of
+    // the fastest reachable one. Mixing a fast and a slow path (a rail and
+    // Tailscale, say) would drag the transfer down, so we don't.
+    let fastest = candidates
+        .iter()
+        .filter(|candidate| candidate.reachable == Some(true))
+        .map(|candidate| candidate.speed_mbps)
+        .max()
+        .unwrap_or(0);
+    let mut selected_unknown = false;
+    for candidate in &mut candidates {
+        candidate.selected = candidate.reachable == Some(true)
+            && if fastest > 0 {
+                candidate.speed_mbps.saturating_mul(2) >= fastest
+            } else if selected_unknown {
+                false
+            } else {
+                selected_unknown = true;
+                true
+            };
+    }
+    candidates
 }
 
 /// Concurrently probe which (addr, speed) entries accept a TCP connection on
@@ -2097,6 +2086,7 @@ fn next_tcp_connection_id(next: &std::sync::atomic::AtomicU32) -> Result<u32> {
 
 #[derive(Clone)]
 pub struct TcpInfo {
+    pub(crate) reverse: Option<std::sync::Arc<ReverseTcp>>,
     /// Reachable, speed-filtered data addresses to spread connections across.
     pub addrs: Vec<String>,
     pub port: u16,
@@ -2110,6 +2100,49 @@ pub struct TcpInfo {
     pub failure: Option<String>,
     /// Round-robin cursor so successive data connections use different addresses.
     pub next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl TcpInfo {
+    pub(crate) fn connect_socket(&self) -> Result<TcpStream> {
+        let n = self.addrs.len();
+        let start = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
+        let mut last = anyhow!("no data address");
+        for k in 0..n {
+            let addr = &self.addrs[(start + k) % n];
+            let resolved: Vec<_> = match (addr.as_str(), self.port).to_socket_addrs() {
+                Ok(it) => it.collect(),
+                Err(_) => {
+                    last = anyhow!("cannot resolve {addr}");
+                    continue;
+                }
+            };
+            // Try each resolved address in turn (dual-stack names may list an
+            // unreachable family first).
+            let mut got = None;
+            for sa in &resolved {
+                match connect_tcp_stream(
+                    sa,
+                    std::time::Duration::from_secs(4),
+                    self.congestion_control.as_deref(),
+                ) {
+                    Ok(s) => {
+                        got = Some(s);
+                        break;
+                    }
+                    Err(error) if is_tcp_congestion_error(&error) => {
+                        return Err(error).with_context(|| {
+                            format!("could not configure the connecting data socket to {sa}")
+                        })
+                    }
+                    Err(e) => last = anyhow!("{}: {e}", data_address(addr, self.port)),
+                }
+            }
+            if let Some(stream) = got {
+                return Ok(stream);
+            }
+        }
+        Err(last)
+    }
 }
 
 impl std::fmt::Debug for TcpInfo {

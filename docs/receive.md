@@ -70,6 +70,11 @@ syq cp results --to @laptop
 syq cp report.pdf --to @laptop --as reports/latest.pdf
 ```
 
+File data uses encrypted TCP when your laptop can reach a data port on the
+server, with SSH as a fallback. Your laptop opens both connections; it still
+needs no incoming port. Use `--no-tcp` to send all data through SSH.
+See [Make TCP reachable](server-tuning.md#make-tcp-reachable) for server setup.
+
 ### Approving copies
 
 By default, each incoming copy waits for approval **on your laptop**. Review the destination

@@ -300,7 +300,12 @@ impl ForwardChild {
             match reply {
                 Ok(Reply::Approved(approved)) => return Ok((child, approved)),
                 Ok(Reply::Error(error)) => bail!("destination refused the copy: {error}"),
-                Ok(Reply::Ready | Reply::Identity(_)) => {
+                Ok(
+                    Reply::Ready
+                    | Reply::Identity(_)
+                    | Reply::TcpProbed(_)
+                    | Reply::TcpCongestionRejected(_),
+                ) => {
                     bail!("invalid destination setup response")
                 }
                 Err(error) => {

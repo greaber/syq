@@ -67,7 +67,8 @@ before the remaining scenarios reuse those helpers.
 The source sshd permits remote Unix socket forwarding for named return transfers
 (OpenSSH 9.2 also requires remote TCP forwarding permission). The destination
 keeps forwarding disabled. The runner has no SSH server. Return scenarios cover
-copies from independent source shells without a forwarded agent, destination
+copies from independent source shells without a forwarded agent, encrypted TCP
+workers dialed by the laptop, explicit SSH data, TCP interruption and resume, destination
 background startup through persistence, `--root` traversal refusal, unconfined
 `--cwd` paths, conflicting names, offline ownership and explicit receiver replacement, reconnection after killing the owned SSH
 transport, recovery after a server heartbeat times out while the client is
