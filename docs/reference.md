@@ -108,6 +108,10 @@ See [S3 options and behavior](object-storage.md) for credentials and filesystem 
 
 For two SSH endpoints, see [Copy between servers](remote-to-remote.md).
 
+On Linux, TCP data-address discovery includes IP over InfiniBand (IPoIB)
+interfaces. Their addresses undergo the same reachability and reported-speed
+selection as other interfaces.
+
 ### Transport compression
 
 Remote filesystem copies compress data in transit by default, adjusting

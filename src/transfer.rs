@@ -2599,6 +2599,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             selected_history = hint;
             *history_context.borrow_mut() = Some(key);
         }
+        if let Some(history) = progress.tuning_history.get() {
+            for (role, endpoint) in [("source", &src_ep), ("destination", &dst_ep)] {
+                if let Some(spec) = real_remote_spec(endpoint) {
+                    if let Some(probe) = spec.diagnostics().tcp_probe {
+                        history.tcp_probe(role, &spec.label(), &probe);
+                    }
+                }
+            }
+        }
         print_transport_diagnostics(args, &src_ep, &dst_ep);
         if args.verbose >= 2 {
             if let Some(hint) = &selected_history {
@@ -4143,10 +4152,10 @@ fn display_plan_target(loc: &Location, path: &[u8], args: &Args) -> String {
 }
 
 fn remote_data_transport(spec: &RemoteSpec) -> &'static str {
-    match spec.tcp.lock().unwrap().as_ref() {
-        Some(info) if info.key.is_some() => "encrypted TCP",
-        Some(_) => "plaintext TCP",
-        None => "ssh",
+    match spec.data_transport() {
+        DataTransport::EncryptedTcp => "encrypted TCP",
+        DataTransport::PlaintextTcp => "plaintext TCP",
+        DataTransport::Ssh => "ssh",
     }
 }
 

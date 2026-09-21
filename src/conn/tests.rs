@@ -840,6 +840,7 @@ fn connecting_socket_congestion_rejection_is_attributed_to_coordinator() {
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     let info = TcpInfo {
+        reverse: None,
         addrs: vec!["127.0.0.1".into()],
         port: 9,
         key: None,
@@ -899,6 +900,7 @@ fn only_the_local_receiver_disables_requested_tcp_compression() {
             // in-process receiver and keeps the requested compression.
             spec.local_process = local_process;
             let info = TcpInfo {
+                reverse: None,
                 addrs: vec!["127.0.0.1".into()],
                 port,
                 key: None,
@@ -1501,6 +1503,7 @@ fn worker_tcp_fallback_survives_broken_stderr() {
         ssh_multiplexer: None,
         quiet: false,
         tcp: std::sync::Arc::new(std::sync::Mutex::new(Some(TcpInfo {
+            reverse: None,
             addrs: vec!["invalid address".into()], // Fail resolution without DNS or a socket.
             port: 0,
             key: None,

@@ -42,6 +42,7 @@ fn remote(host: &str, tcp: bool) -> Endpoint {
         ssh_multiplexer: None,
         quiet: true,
         tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp.then(|| crate::conn::TcpInfo {
+            reverse: None,
             addrs: vec!["127.0.0.1".into()],
             port: 1,
             key: Some(vec![0; 32]),

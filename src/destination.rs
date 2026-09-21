@@ -32,6 +32,7 @@ mod forward;
 pub(crate) mod handoff;
 mod identity;
 pub(crate) mod storage;
+pub(crate) mod tcp;
 
 // Discovery is independent of the build-pinned request protocol. Keep the
 // Ping/Ready and Identify/Identity JSON envelopes stable across helper wire changes.
@@ -126,6 +127,8 @@ struct Envelope {
 }
 #[derive(Serialize, Deserialize)]
 enum Message {
+    TcpProbe(tcp::ProbeRequest),
+    TcpOpen(tcp::OpenRequest),
     Ping,
     Identify {
         name: String,
@@ -145,6 +148,8 @@ enum Message {
 }
 #[derive(Serialize, Deserialize)]
 enum Reply {
+    TcpProbed(Vec<crate::conn::TcpCandidate>),
+    TcpCongestionRejected(String),
     Ready,
     Identity(identity::Proof),
     Approved(Approved),
@@ -799,19 +804,11 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         approved,
         policy,
     }));
-    args.no_tcp = true;
     Ok(())
 }
 
 pub(crate) fn connect(grant: &str, control: bool) -> Result<UnixStream> {
-    let encoded = grant
-        .strip_prefix(PREFIX)
-        .context("invalid named destination route")?;
-    if encoded.len() > MAX_MESSAGE {
-        bail!("named route too large");
-    }
-    let route: Route =
-        serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?)?;
+    let route = decode_route(grant)?;
     let (stream, reply) = exchange(
         &route.registration,
         Message::Open {
@@ -826,6 +823,18 @@ pub(crate) fn connect(grant: &str, control: bool) -> Result<UnixStream> {
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
     Ok(stream)
+}
+
+fn decode_route(grant: &str) -> Result<Route> {
+    let encoded = grant
+        .strip_prefix(PREFIX)
+        .context("invalid named destination route")?;
+    if encoded.len() > MAX_MESSAGE {
+        bail!("named route too large");
+    }
+    Ok(serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?,
+    )?)
 }
 
 pub(crate) fn finish_receipt(
@@ -874,6 +883,7 @@ pub(crate) fn finish_receipt(
 }
 
 struct Session {
+    tcp: Option<crate::conn::TcpInfo>,
     authority: Arc<crate::restricted::RestrictedAuthority>,
     issued: Instant,
     opened: bool,
@@ -885,6 +895,7 @@ struct Prompt {
     decision: mpsc::SyncSender<bool>,
 }
 struct Receiver {
+    tcp_peer: crate::conn::RemoteSpec,
     name: String,
     identity_key: ssh_key::PrivateKey,
     requester: String,
@@ -972,6 +983,8 @@ impl Receiver {
             bail!("named destination authentication failed");
         }
         match envelope.message {
+            Message::TcpProbe(request) => self.probe_tcp(request, stream),
+            Message::TcpOpen(request) => self.open_tcp(request, stream),
             Message::Exec(request) => self.execute(request, stream),
             Message::Storage(request) => self.storage(request, stream),
             Message::Ping => write_message(&mut stream, &Reply::Ready),
@@ -1049,6 +1062,7 @@ impl Receiver {
                 sessions.insert(
                     approved.token.clone(),
                     Session {
+                        tcp: None,
                         authority,
                         issued: Instant::now(),
                         opened: false,
@@ -1184,7 +1198,16 @@ pub(crate) fn serve_background(
 ) -> Result<()> {
     #[cfg(test)]
     let (prompts, _requests) = mpsc::sync_channel(1);
+    let mut tcp_peer = crate::conn::RemoteSpec::local_receiver(false);
+    tcp_peer.local_process = false;
+    tcp_peer.host = spec.endpoint.host.clone();
+    tcp_peer.port = spec.endpoint.port;
+    tcp_peer.rsh = vec!["ssh".into()];
+    if let Some(user) = &spec.endpoint.user {
+        tcp_peer.rsh.extend(["-l".into(), user.clone()]);
+    }
     let receiver = Arc::new(Receiver {
+        tcp_peer,
         name: config.name.clone(),
         identity_key: identity::load_key()?,
         requester: format!(

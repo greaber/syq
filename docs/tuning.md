@@ -128,6 +128,12 @@ decisions. It does not contain filenames, command lines, file contents, or
 Wi-Fi names, and nothing is uploaded. Timing and sizes still reveal activity;
 this is performance history, not anonymous data or a complete audit trail.
 
+TCP preflight events record opaque candidate-address identifiers, reported link
+speeds (`null` when unknown), reachability (`null` when the probe had not finished
+at selection time), and selection. Selected addresses are eligible for data
+connections; they may not all carry data. Reported speeds are interface hints,
+not measured throughput. These observations do not change startup-hint reuse.
+
 ```sh
 syq tuning-cache list
 syq tuning-cache show 42

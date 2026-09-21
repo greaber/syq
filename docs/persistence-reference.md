@@ -119,6 +119,11 @@ Filenames inside it may use normal Unix filename bytes.
 
 ## Copy limits
 
+Named copies use encrypted TCP workers initiated by the receiving machine,
+falling back to SSH when TCP is unreachable. `--no-tcp` forces SSH;
+`--tcp-ports` selects the listening port range on the sending server.
+The receiving connection must stay open throughout the copy.
+
 Copies support directories, symlinks, modification times, filters, hashing,
 resume, mappings, `--preserve=permissions`, and the
 [overwrite policies](reference.md#choose-which-existing-files-to-update).

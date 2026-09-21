@@ -431,7 +431,7 @@ python3 /usr/local/libexec/syq-test-storage-authorization.py
 printf 'case: explicit automatic approval supports unattended copies\n'
 syq persist receive on --auto-approve-root "$receive_root"
 syq persist receive wait source --timeout 30
-ssh source 'test -z "${SSH_AUTH_SOCK:-}"; syq cp --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
+ssh source 'test -z "${SSH_AUTH_SOCK:-}"; SYQ_TEST_REQUIRE_TCP=1 syq cp --performance-tuning workers=2 --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
 remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.manifest
 (
     cd "$receive_root/first"
@@ -441,6 +441,8 @@ remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.ma
     } | LC_ALL=C sort
 ) > /tmp/syq-return-local.manifest
 diff -u /tmp/syq-return-source.manifest /tmp/syq-return-local.manifest
+ssh source 'syq cp --no-tcp /tmp/syq-real-ssh/return-source/subdir/chunks.bin --to @laptop --as ssh-copy'
+cmp "$receive_root/first/subdir/chunks.bin" "$receive_root/ssh-copy"
 ssh source 'syq cp --dry-run --hash --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first --results-fd 3 3>&1 1>/dev/null' > /tmp/syq-return-preview.ndjson
 assert_preview_counts /tmp/syq-return-preview.ndjson 0 3
 ssh source 'syq cp --only-new /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as first/message.txt'
@@ -480,7 +482,7 @@ ssh source 'syq persist destinations wait laptop --timeout 5'
 printf 'case: interrupted named copy fails, laptop reconnects, and retry resumes\n'
 ssh source 'dd if=/dev/urandom of=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=16 status=none'
 source_prefix=$(ssh source 'dd if=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=4 status=none | sha256sum')
-timeout 45 ssh source 'syq cp --resource-limits bandwidth=512 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
+timeout 45 ssh source 'SYQ_TEST_REQUIRE_TCP=1 syq cp --resource-limits bandwidth=512 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
 return_copy_pid=$!
 deadline=$(($(date +%s) + 25))
 next_progress=$(($(date +%s) + 5))
@@ -516,7 +518,7 @@ fi
 return_copy_pid=
 test ! -e "$receive_root/interrupted"
 ssh source 'syq persist destinations wait laptop --timeout 30'
-ssh source 'syq cp /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted'
+ssh source 'SYQ_TEST_REQUIRE_TCP=1 syq cp /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted'
 ssh source 'cat /tmp/syq-real-ssh/return-source/resume.bin' | cmp - "$receive_root/interrupted"
 test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*' | wc -l)" -eq 1
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-reconnect'
