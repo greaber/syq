@@ -245,6 +245,39 @@ impl Recorder {
         h.finalize().to_hex().to_string()
     }
 
+    /// Record preflight evidence, not a measurement of path throughput or a
+    /// claim that every selected candidate carried data. Keep address identity
+    /// stable within this store without persisting hostnames or IP addresses.
+    pub(crate) fn tcp_probe(&self, role: &str, endpoint: &str, probe: &crate::conn::TcpProbe) {
+        let candidates: Vec<_> = probe
+            .candidates
+            .iter()
+            .map(|candidate| {
+                let source = match candidate.source {
+                    crate::conn::DataAddressSource::RemoteInterface => "remote_interface",
+                    crate::conn::DataAddressSource::SshTarget => "ssh_target",
+                };
+                json!({
+                    "address": self.token("tcp_address", &format!("{endpoint}\0{}", candidate.address)),
+                    "source": source,
+                    "reported_speed_mbps": (candidate.speed_mbps > 0).then_some(candidate.speed_mbps),
+                    "reachable": candidate.reachable,
+                    "selected": candidate.selected,
+                })
+            })
+            .collect();
+        self.event(
+            "tcp_preflight",
+            json!({
+                "role": role,
+                "endpoint": self.token("endpoint", endpoint),
+                "encrypted": probe.encrypted,
+                "congestion_control": probe.congestion_control,
+                "candidates": candidates,
+            }),
+        );
+    }
+
     pub(crate) fn event(&self, kind: &str, data: Value) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if state.finished {

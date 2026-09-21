@@ -436,3 +436,74 @@ fn filesystem_tokens_can_be_related_across_transfer_directions() {
     assert_eq!(forward.destination_filesystem, reverse.source_filesystem);
     assert_ne!(forward.source_filesystem, forward.destination_filesystem);
 }
+
+#[test]
+fn tcp_preflight_preserves_evidence_without_storing_addresses() {
+    use crate::conn::{DataAddressSource, TcpCandidate, TcpProbe};
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let first = recorder(&path);
+    let probe = TcpProbe {
+        port: 47600,
+        encrypted: true,
+        congestion_control: Some("cubic".into()),
+        candidates: vec![
+            TcpCandidate {
+                address: "192.0.2.10".into(),
+                speed_mbps: 100_000,
+                source: DataAddressSource::RemoteInterface,
+                reachable: Some(true),
+                selected: true,
+            },
+            TcpCandidate {
+                address: "example.invalid".into(),
+                speed_mbps: 0,
+                source: DataAddressSource::SshTarget,
+                reachable: Some(false),
+                selected: false,
+            },
+            TcpCandidate {
+                address: "2001:db8::10".into(),
+                speed_mbps: 0,
+                source: DataAddressSource::RemoteInterface,
+                reachable: None,
+                selected: false,
+            },
+        ],
+    };
+    first.context(&key("a"));
+    first.tcp_probe("destination", "user@example.invalid", &probe);
+    first.finish(true, true, Some(8), json!({}));
+    let second = recorder(&path);
+    second.tcp_probe("source", "user@example.invalid", &probe);
+    second.flush();
+    let db = open(&path).unwrap();
+    let first_events = command::read_events(&db, 1).unwrap();
+    let second_events = command::read_events(&db, 2).unwrap();
+    let data = &first_events[1]["data"];
+    assert_eq!(first_events[1]["kind"], "tcp_preflight");
+    assert_eq!(data["role"], "destination");
+    assert_eq!(data["encrypted"], true);
+    assert_eq!(data["congestion_control"], "cubic");
+    let candidates = &data["candidates"];
+    assert_eq!(candidates[0]["reported_speed_mbps"], 100_000);
+    assert_eq!(candidates[0]["selected"], true);
+    assert_eq!(candidates[0]["reachable"], true);
+    assert_eq!(candidates[1]["source"], "ssh_target");
+    assert!(candidates[1]["reported_speed_mbps"].is_null());
+    assert_eq!(candidates[1]["selected"], false);
+    assert_eq!(candidates[1]["reachable"], false);
+    assert!(candidates[2]["reachable"].is_null());
+    assert_eq!(candidates[2]["selected"], false);
+    assert_eq!(candidates, &second_events[1]["data"]["candidates"]);
+    assert_eq!(second.hint(&key("a"), true).unwrap().workers, 8);
+    let exported = serde_json::to_string(&first_events).unwrap();
+    assert!(!exported.contains("192.0.2.10"));
+    assert!(!exported.contains("example.invalid"));
+    assert!(!exported.contains("2001:db8::10"));
+    let other = recorder(&temp.path().join("other.sqlite"));
+    assert_ne!(
+        first.token("tcp_address", "same"),
+        other.token("tcp_address", "same")
+    );
+}

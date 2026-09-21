@@ -110,7 +110,12 @@ and the history below. `XDG_CACHE_HOME` changes their parent directory.
 Filesystem copies record a local timeline by default, including short and failed
 copies. The history contains opaque endpoint and filesystem identifiers, the
 UTC date, copy settings, numerical progress, worker readiness, and tuning
-decisions. It does not contain filenames, command lines, file contents, or
+decisions. TCP preflight events record opaque candidate-address identifiers,
+reported link speeds (`null` when unknown), reachability (`null` when the probe
+had not finished at selection time), and selection. Selection
+means the address was eligible for data connections, not that it carried data;
+reported speeds are interface hints, not measured throughput. These observations
+do not change which startup hints are reused. It does not contain filenames, command lines, file contents, or
 Wi-Fi names, and nothing is uploaded. Timing and sizes still reveal activity;
 this is performance history, not anonymous data or a complete audit trail.
 

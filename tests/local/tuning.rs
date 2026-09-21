@@ -1842,3 +1842,68 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     ));
     assert!(startup_doubling(6));
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn tuning_history_records_tcp_preflight_for_push_and_pull() {
+    for pull in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        let data = prng(5 * 1024 * 1024 + 123, 912);
+        write(&t.path("source"), &data);
+        let output = history_command(&t)
+            .args([
+                "cp",
+                &t.s("source"),
+                if pull { "--from" } else { "--to" },
+                "host",
+                "--as",
+                &t.s("destination"),
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+                "--no-progress",
+                "--performance-tuning",
+                "workers=1",
+            ])
+            .env("SYQ_TEST_REQUIRE_TCP", "1")
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("destination")), data);
+        let output = history_command(&t)
+            .args(["tuning-cache", "export"])
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        let records: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let probes: Vec<_> = records
+            .iter()
+            .filter(|r| r["event"]["kind"] == "tcp_preflight")
+            .collect();
+        assert_eq!(probes.len(), 1);
+        let probe = &probes[0]["event"]["data"];
+        assert_eq!(probe["role"], if pull { "source" } else { "destination" });
+        assert_eq!(probe["encrypted"], true);
+        assert!(probe["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["selected"] == true && c["reachable"] == true));
+        assert!(!probe.to_string().contains("127.0.0.1"));
+        assert_ne!(probe["endpoint"], "host");
+    }
+}
