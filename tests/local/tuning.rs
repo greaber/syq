@@ -117,6 +117,10 @@ fn automatic_workers_can_start_above_64_from_the_cache() {
         }
         let output = command
             .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
+            .env(
+                "SYQ_TUNING_HISTORY",
+                t.path(&format!("history-{label}.sqlite")),
+            )
             .env("SYQ_TEST_WORKER_EVENTS", &events)
             .env("SYQ_TEST_REQUIRE_TCP", "1")
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
@@ -133,6 +137,16 @@ fn automatic_workers_can_start_above_64_from_the_cache() {
                 "starting with {expected} connections remembered for this path"
             )),
             "{output:?}"
+        );
+        let history =
+            rusqlite::Connection::open(t.path(&format!("history-{label}.sqlite"))).unwrap();
+        let doubling: bool = history.query_row(
+            "SELECT json_extract(data,'$.data.policy.startup_doubling') FROM events WHERE json_extract(data,'$.kind')='policy_start' ORDER BY sequence LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            doubling,
+            "legacy count has no plateau or filesystem evidence"
         );
         for file in ["one", "two"] {
             assert_eq!(read(&t.path(&format!("{label}/{file}"))), data);
@@ -1589,4 +1603,215 @@ fn local_read_ahead_shrink_keeps_old_destination() {
         assert_output_ok(&out);
         assert_eq!(read(&t.path("destination")), changed);
     }
+}
+
+fn history_command(t: &Tmp) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command.env("SYQ_TUNING_CACHE", t.path("legacy.json"));
+    command.env("SYQ_TUNING_HISTORY", t.path("history.sqlite"));
+    command
+}
+
+#[test]
+fn tuning_history_records_short_copy_and_exports_interactive_timeline() {
+    let t = Tmp::new();
+    for n in 0..32 {
+        write(
+            &t.path(&format!("private-source/secret-{n}")),
+            &prng(8192, n),
+        );
+    }
+    let output = history_command(&t)
+        .args([
+            "cp",
+            "--srcs-in",
+            &t.s("private-source"),
+            "--into",
+            &t.s("private-destination"),
+            "--no-progress",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let output = history_command(&t)
+        .args(["tuning-cache", "export"])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains("private-source"));
+    assert!(!text.contains("secret-"));
+    assert!(!text.contains("private-destination"));
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records[0]["run"]["status"], "success");
+    assert!(records[0]["run"]["selected_workers"].is_null());
+    assert!(records
+        .iter()
+        .any(|r| r["event"]["data"]["disposition"] == "final_partial"));
+    assert!(records
+        .iter()
+        .any(|r| r["event"]["kind"] == "workers_start"));
+    assert_eq!(
+        fs::metadata(t.path("history.sqlite")).unwrap().mode() & 0o777,
+        0o600
+    );
+    let id = records[0]["run"]["id"].as_i64().unwrap().to_string();
+    let html = history_command(&t)
+        .args(["tuning-cache", "show", &id, "--html"])
+        .run()
+        .unwrap();
+    assert_output_ok(&html);
+    let html = String::from_utf8(html.stdout).unwrap();
+    assert!(html.contains("<svg"));
+    assert!(html.contains("final_partial"));
+    assert!(!html.contains("__HISTORY_DATA__"));
+    let cleared = history_command(&t)
+        .args(["tuning-cache", "clear"])
+        .run()
+        .unwrap();
+    assert_output_ok(&cleared);
+    let empty = history_command(&t)
+        .args(["tuning-cache", "export"])
+        .run()
+        .unwrap();
+    assert_output_ok(&empty);
+    assert!(empty.stdout.is_empty());
+}
+
+#[test]
+fn tuning_history_records_failed_copy_without_recommending_it() {
+    let t = Tmp::new();
+    let output = history_command(&t)
+        .args([
+            "cp",
+            &t.s("missing"),
+            "--as",
+            &t.s("destination"),
+            "--no-progress",
+        ])
+        .run()
+        .unwrap();
+    assert!(!output.status.success());
+    let output = history_command(&t)
+        .args(["tuning-cache", "export"])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    let record: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(record["run"]["status"], "failed");
+    assert!(record["run"]["selected_workers"].is_null());
+}
+
+#[test]
+fn disabling_tuning_cache_also_disables_history() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"copy without persistence");
+    let output = history_command(&t)
+        .env("SYQ_TUNING_CACHE", "")
+        .args([
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--no-progress",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(!t.path("history.sqlite").exists());
+    assert!(!t.path("legacy.json").exists());
+}
+
+#[test]
+fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
+    let t = Tmp::new();
+    // Keep files above the tiny-file batching threshold so the three-worker
+    // hint is also the actual starting count in the uncapped cases.
+    for n in 0..32 {
+        write(&t.path(&format!("source/file-{n}")), &prng(128 * 1024, n));
+    }
+    let copy = |name: &str, controls: &[&str]| {
+        history_command(&t)
+            .args([
+                "cp",
+                "--srcs-in",
+                &t.s("source"),
+                "--into",
+                &t.s(name),
+                "--no-progress",
+            ])
+            .args(controls)
+            .run()
+            .unwrap()
+    };
+    assert_output_ok(&copy("first", &[]));
+    // Supply an old measured result; the transfer itself is deliberately short.
+    let db = rusqlite::Connection::open(t.path("history.sqlite")).unwrap();
+    let startup_doubling = |run: i64| {
+        db.query_row(
+            "SELECT json_extract(data,'$.data.policy.startup_doubling') FROM events WHERE run=?1 AND json_extract(data,'$.kind')='policy_start'",
+            [run],
+            |row| row.get::<_, bool>(0),
+        ).unwrap()
+    };
+    assert!(startup_doubling(1));
+    let fs: Option<String> = db
+        .query_row("SELECT source_fs FROM runs LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert!(fs.is_some(), "test filesystem did not provide an identity");
+    db.execute("UPDATE runs SET eligible=1,workers=3", [])
+        .unwrap();
+    assert_output_ok(&copy("second", &[]));
+    assert!(startup_doubling(2));
+    let event: String = db
+        .query_row(
+            "SELECT data FROM events WHERE run=2 AND json_extract(data,'$.kind')='starting_count'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+    assert_eq!(event["data"]["workers"], 3);
+    assert_eq!(event["data"]["hint"]["matched"], "filesystems");
+    assert_output_ok(&copy("capped", &["--resource-limits", "workers=2"]));
+    assert!(startup_doubling(3));
+    let event: String = db
+        .query_row(
+            "SELECT data FROM events WHERE run=3 AND json_extract(data,'$.kind')='starting_count'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+    assert_eq!(event["data"]["workers"], 2);
+    assert_output_ok(&copy("fixed", &["--performance-tuning", "workers=1"]));
+    let event: String = db
+        .query_row(
+            "SELECT data FROM events WHERE run=4 AND json_extract(data,'$.kind')='starting_count'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+    assert_eq!(event["data"]["workers"], 1);
+    assert_eq!(event["data"]["reason"], "explicit");
+    // The same count becomes suitable for fine probes only with plateau evidence.
+    db.execute(
+        "UPDATE runs SET summary=json_set(summary,'$.discovery_complete',json('true')) WHERE id=1",
+        [],
+    )
+    .unwrap();
+    assert_output_ok(&copy("confirmed", &[]));
+    assert!(!startup_doubling(5));
+    // Clamping a strong count changes the starting point; don't transfer its
+    // confidence to a lower count that was not measured as the plateau.
+    assert_output_ok(&copy(
+        "confirmed-capped",
+        &["--resource-limits", "workers=2"],
+    ));
+    assert!(startup_doubling(6));
 }

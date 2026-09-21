@@ -73,6 +73,7 @@ signature = "2"
 subtle = "2.6.1"
 signal-hook = "0.4.4"
 lz4 = "1.28.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [build-dependencies]
 serde_json = "1"

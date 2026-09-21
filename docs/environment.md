@@ -24,6 +24,8 @@ helpers, or other programs; the rest of the environment is passed through.
 |---|---|
 | `SYQ_NO_UPDATE_CHECK`, `DO_NOT_TRACK` | Disable update reminders; see [Updates](install.md#updates) |
 | `SYQ_TUNING_CACHE` | Select the connection-count cache; an empty value disables it. See [Remembered connection counts](tuning.md#remembered-connection-counts) |
+| `SYQ_TUNING_HISTORY` | Select the local tuning history; empty disables it. See [Tuning history](tuning.md#inspect-tuning-history) |
+| `SYQ_TUNING_HISTORY_SIZE` | History retention target, default `1G` |
 | `SYQ_DEBUG` | Add internal diagnostics to stderr |
 | `SYQ_S3_DIAGNOSTICS=1` | Add S3 request diagnostics to stderr |
 | `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Relocate cache, preference, and runtime files |
@@ -38,7 +40,8 @@ Default locations include:
 
 | Location | Contents |
 |---|---|
-| `~/.cache/syq/tuning.json` | Learned connection counts |
+| `~/.cache/syq/tuning.json` | Learned connection counts in the legacy format |
+| `~/.cache/syq/tuning.history-v1.sqlite` | Local tuning timelines and filesystem startup hints |
 | `~/.cache/syq/completion-endpoints.json` | Hosts offered by completion |
 | `~/.cache/syq/helpers/` | Downloaded SSH helpers |
 | `~/.config/syq/persistence.json` | Whether persistence is enabled |

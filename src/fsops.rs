@@ -221,6 +221,55 @@ fn reject_copy_source_claim_for_test() -> Result<()> {
     Ok(())
 }
 
+/// No pathname re-resolution, subprocess or additional remote round trip.
+/// f_fsid is an OS/filesystem hint, not a globally unique storage identifier.
+fn filesystem_hint(file: &File) -> Option<FilesystemHint> {
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: the syscall initializes stats; zero initialization also covers padding.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    let fsid = unsafe {
+        std::slice::from_raw_parts(
+            (&stats.f_fsid as *const libc::fsid_t).cast::<u8>(),
+            std::mem::size_of_val(&stats.f_fsid),
+        )
+    };
+    if fsid.iter().all(|b| *b == 0) {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let kind = match stats.f_type as u64 {
+        0xef53 => "ext",
+        0x58465342 => "xfs",
+        0x01021994 => "tmpfs",
+        0x6969 => "nfs",
+        0x9123683e => "btrfs",
+        0x794c7630 => "overlay",
+        _ => "other",
+    }
+    .to_string();
+    #[cfg(target_os = "macos")]
+    let kind = String::from_utf8_lossy(
+        &stats
+            .f_fstypename
+            .iter()
+            .take_while(|b| **b != 0)
+            .map(|b| *b as u8)
+            .collect::<Vec<_>>(),
+    )
+    .into_owned();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(fsid);
+    Some(FilesystemHint {
+        identity: hasher.finalize().to_hex().to_string(),
+        kind,
+        device: file.metadata().ok()?.dev(),
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn inspect_file_system(file: &File) -> FileSystemTraits {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -1213,7 +1262,13 @@ impl FsOps {
 
         let registrations: Vec<_> = resolved
             .iter()
-            .map(|(_, relative, expected_leaf, _)| (relative.clone(), expected_leaf.clone()))
+            .map(|(directory, relative, expected_leaf, object)| {
+                (
+                    relative.clone(),
+                    expected_leaf.clone(),
+                    filesystem_hint(object.as_ref().unwrap_or(directory)),
+                )
+            })
             .collect();
         let tickets = self.descriptor_session.register_source_handles(
             resolved
@@ -1224,16 +1279,19 @@ impl FsOps {
         let registered: Vec<_> = tickets
             .into_iter()
             .zip(registrations)
-            .map(|((ticket, leaf_ticket), (relative, expected_leaf))| {
-                let selection = RegisteredPath::new(ticket.root_id(), relative)?;
-                Ok(RegisteredSourceRoot {
-                    ticket,
-                    leaf_ticket,
-                    selection,
-                    expected_leaf,
-                    allow_unconfined_paths,
-                })
-            })
+            .map(
+                |((ticket, leaf_ticket), (relative, expected_leaf, filesystem))| {
+                    let selection = RegisteredPath::new(ticket.root_id(), relative)?;
+                    Ok(RegisteredSourceRoot {
+                        filesystem,
+                        ticket,
+                        leaf_ticket,
+                        selection,
+                        expected_leaf,
+                        allow_unconfined_paths,
+                    })
+                },
+            )
             .collect::<Result<_>>()?;
         self.initialize_sources(&registered)?;
         #[cfg(debug_assertions)]
@@ -1619,6 +1677,7 @@ impl FsOps {
             .then(|| Self::selected_directory_empty(&directory))
             .flatten();
         Ok(DestinationFilesystemInfo {
+            filesystem: filesystem_hint(&directory),
             device: metadata.dev(),
             available_bytes,
             available_inodes,

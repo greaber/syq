@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct Progress {
+    pub(crate) tuning_destination_devices: Mutex<std::collections::BTreeSet<u64>>,
+    pub(crate) tuning_history: std::sync::OnceLock<crate::tune::history::Recorder>,
     pub(crate) observations: crate::transfer_observations::Observations,
     pub enabled: bool,
     pub width: Option<usize>,
@@ -113,6 +115,8 @@ impl Drop for ProgressTicker {
 impl Progress {
     pub fn new(enabled: bool, force: bool, width: Option<usize>) -> Arc<Self> {
         Arc::new(Progress {
+            tuning_destination_devices: Default::default(),
+            tuning_history: std::sync::OnceLock::new(),
             observations: Default::default(),
             enabled: enabled && (force || std::io::stderr().is_terminal()),
             width,
@@ -151,6 +155,18 @@ impl Progress {
             stop: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
         })
+    }
+
+    pub(crate) fn observe_destination_devices<'a>(
+        &self,
+        entries: impl Iterator<Item = &'a crate::proto::Entry>,
+    ) {
+        if self.tuning_history.get().is_some() {
+            self.tuning_destination_devices
+                .lock()
+                .unwrap()
+                .extend(entries.map(|entry| entry.dev));
+        }
     }
 
     pub fn set_results(&self, writer: Arc<crate::results::ResultsWriter>) {
@@ -529,6 +545,9 @@ pub fn commas(n: u64) -> String {
 }
 
 impl crate::tune::Meter for Progress {
+    fn history(&self) -> Option<crate::tune::history::Recorder> {
+        self.tuning_history.get().cloned()
+    }
     fn bytes(&self) -> u64 {
         self.tuning_high_water.load(Relaxed)
     }
