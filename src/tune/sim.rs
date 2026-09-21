@@ -8,15 +8,23 @@
 //! settled count refreshes its baseline, the tail stops measuring, and two
 //! collapsed samples short-circuit a probe. It does not model handshakes
 //! competing with the transfer or connections warming up after activation.
+//! Initial connections are ready at time zero; elapsed time excludes their
+//! setup. Driver polling latency, file credit, connection failures, and
+//! scheduler limits are not modeled. `prepare=true` is a hypothetical policy,
+//! not current production behavior. The oracle can select the instantaneous
+//! best count in 1..=LIMIT without setup cost and sees the same wall-clock noise.
 //! Results are only as good as the curves and noise fed in; check those
 //! against real transfers before trusting a small difference.
 //!
 //! `cargo test --bin syq tune::sim::report -- --ignored --nocapture` prints
-//! the comparison tables.
+//! the comparison tables. `tune::sim::sweep` prints a reproducible CSV grid,
+//! and `tune::sim::diagnostics` prints decision traces for selected cases.
+//! First-hit times are conditional on reaching the near-best band; time spent
+//! in that band is also reported because a path shift can invalidate a hit.
 
 use super::*;
 
-const SAMPLE_SECS: f64 = 2.5;
+const SAMPLE_SECS: f64 = SAMPLE.as_secs_f64();
 const LIMIT: usize = 64;
 
 struct Rng(u64);
@@ -110,7 +118,8 @@ impl Curve {
 struct Scenario {
     name: &'static str,
     curve: Curve,
-    /// Copy length as seconds at the best rate.
+    /// Payload size in seconds at the initial, noiseless best rate.
+    /// A capacity shift changes the oracle duration for that fixed payload.
     ideal_secs: f64,
     start: usize,
     /// Log-normal per-sample noise, with AR(1) correlation between samples.
@@ -124,6 +133,9 @@ struct Scenario {
 
 struct Outcome {
     elapsed: f64,
+    ideal_elapsed: f64,
+    near_secs: f64,
+    tail_rollback_blocked: bool,
     reached_near_best: Option<f64>,
     connection_secs: f64,
     handshakes: usize,
@@ -133,7 +145,11 @@ struct Outcome {
 fn connections_wanted(policy: &Policy, active: usize, open: usize, prepare: bool) -> usize {
     let needed = policy.n.max(active);
     if !prepare {
-        return if needed == 1 { 2 } else { needed };
+        return if needed == 1 {
+            2.min(policy.max)
+        } else {
+            needed
+        };
     }
     let needed = needed.max(policy.settled());
     match policy.state {
@@ -150,29 +166,40 @@ fn connections_wanted(policy: &Policy, active: usize, open: usize, prepare: bool
     }
 }
 
-fn copy(s: &Scenario, mut policy: Policy, rng: &mut Rng) -> Outcome {
+fn copy(s: &Scenario, policy: Policy, rng: &mut Rng) -> Outcome {
+    copy_observing(s, policy, rng, |_, _| {})
+}
+
+fn copy_observing(
+    s: &Scenario,
+    mut policy: Policy,
+    rng: &mut Rng,
+    mut observe: impl FnMut(f64, &Policy),
+) -> Outcome {
     let total = s.curve.best(0.0) * s.ideal_secs;
     let (mut t, mut done) = (0.0f64, 0.0f64);
     let mut active = policy.active();
+    // Initial connections are already ready: elapsed time starts with copying.
+    let mut connections = vec![0.0f64; active];
     let mut open = active;
     let mut handshakes = active;
     let mut connection_secs = 0.0;
     let mut sampler = Sampler::default();
     sampler.reset();
     let (mut sample_start, mut sample_bytes) = (0.0f64, 0.0f64);
-    let mut ready_at: Option<f64> = None;
+    let mut ready_at: Option<f64>;
+    let mut noise_end = SAMPLE_SECS;
+    let (mut ideal_done, mut ideal_elapsed, mut near_secs) = (0.0, None, 0.0);
     let mut collapsed = 0;
     let mut last_rate: Option<f64> = None;
     let mut reached = None;
+    let mut tail_rollback_blocked = false;
     let mut drift = rng.normal();
     let mut noise = (s.sigma * drift - 0.5 * s.sigma * s.sigma).exp();
 
-    loop {
-        let wanted = connections_wanted(&policy, active, open, s.prepare);
-        handshakes += wanted.saturating_sub(open);
-        let candidate_prepared = policy.n <= open;
-        open = wanted;
-
+    for _ in 0..1_000_000 {
+        assert!(t < 1_000_000.0, "simulation deadline: {}", s.name);
+        observe(t, &policy);
         if policy.n < active {
             active = policy.n;
             policy.activated();
@@ -180,18 +207,32 @@ fn copy(s: &Scenario, mut policy: Policy, rng: &mut Rng) -> Outcome {
             (sample_start, sample_bytes, collapsed) = (t, 0.0, 0);
             continue;
         }
-        if policy.n > active && ready_at.is_none() {
-            let needs = last_rate.map_or(0.0, |rate| rate * SAMPLE_SECS * MEASUREMENT_SAMPLES);
-            if total - done < needs {
-                policy.cancel_unapplied();
+        let needs = last_rate.map_or(0.0, |rate| rate * SAMPLE_SECS * MEASUREMENT_SAMPLES);
+        let tail_blocks_increase = policy.n > active && total - done < needs;
+        if tail_blocks_increase {
+            policy.cancel_unapplied();
+            if policy.n <= active {
                 continue;
             }
-            ready_at = Some(if candidate_prepared {
-                t
-            } else {
-                t + s.setup_secs
-            });
+            tail_rollback_blocked = true;
+            // A rollback from a failed downward probe is already Hold;
+            // cancel_unapplied does not change it. Production keeps copying
+            // at the lower active count while polling the tail guard.
         }
+        let wanted = if tail_blocks_increase {
+            if active == 1 {
+                2.min(policy.max)
+            } else {
+                active
+            }
+        } else {
+            connections_wanted(&policy, active, open, s.prepare)
+        };
+        handshakes += wanted.saturating_sub(open);
+        connections.resize(wanted, t + s.setup_secs);
+        open = wanted;
+        ready_at = (policy.n > active && !tail_blocks_increase)
+            .then(|| connections[..policy.n].iter().copied().fold(t, f64::max));
         if reached.is_none()
             && s.curve.rate(active, t) >= s.curve.best(t) * (1.0 - NEAR_BEST_TOLERANCE)
         {
@@ -200,21 +241,47 @@ fn copy(s: &Scenario, mut policy: Policy, rng: &mut Rng) -> Outcome {
 
         let rate = s.curve.rate(active, t) * noise;
         let sample_end = sample_start + SAMPLE_SECS;
-        let until = ready_at.map_or(sample_end, |ready| ready.min(sample_end));
-        let dt = (until - t).max(0.0);
-        if done + rate * dt >= total {
-            let last = (total - done) / rate;
-            connection_secs += open as f64 * last;
-            t += last;
-            break;
+        let mut until = ready_at.map_or(sample_end, |ready| ready.min(sample_end));
+        until = until.min(noise_end);
+        if let Curve::Shift { at, .. } = s.curve {
+            if t < at {
+                until = until.min(at);
+            }
+        }
+        let dt = (until - t).max(0.0).min((total - done) / rate);
+        let ideal_rate = s.curve.best(t) * noise;
+        if ideal_elapsed.is_none() && ideal_done + ideal_rate * dt >= total {
+            ideal_elapsed = Some(t + (total - ideal_done) / ideal_rate);
+        }
+        ideal_done += ideal_rate * dt;
+        if s.curve.rate(active, t) >= s.curve.best(t) * (1.0 - NEAR_BEST_TOLERANCE) {
+            near_secs += dt;
         }
         done += rate * dt;
         sample_bytes += rate * dt;
         connection_secs += open as f64 * dt;
-        t = until;
+        t += dt;
+        if done >= total {
+            return Outcome {
+                elapsed: t,
+                ideal_elapsed: ideal_elapsed.unwrap_or(t),
+                near_secs,
+                tail_rollback_blocked,
+                reached_near_best: reached,
+                connection_secs,
+                handshakes,
+                policy,
+            };
+        }
+        // Noise is an external wall-clock process, independent of activations
+        // and sample resets. The oracle sees exactly the same realization.
+        if t >= noise_end {
+            drift = s.rho * drift + (1.0 - s.rho * s.rho).sqrt() * rng.normal();
+            noise = (s.sigma * drift - 0.5 * s.sigma * s.sigma).exp();
+            noise_end += SAMPLE_SECS;
+        }
 
         if ready_at.is_some_and(|ready| ready <= t) {
-            ready_at = None;
             active = policy.n;
             policy.activated();
             sampler.reset();
@@ -222,16 +289,20 @@ fn copy(s: &Scenario, mut policy: Policy, rng: &mut Rng) -> Outcome {
             continue;
         }
 
+        if t < sample_end {
+            continue;
+        }
+        if tail_blocks_increase {
+            (sample_start, sample_bytes) = (t, 0.0);
+            continue;
+        }
         let measured = sample_bytes / SAMPLE_SECS;
         (sample_start, sample_bytes) = (t, 0.0);
-        drift = s.rho * drift + (1.0 - s.rho * s.rho).sqrt() * rng.normal();
-        noise = (s.sigma * drift - 0.5 * s.sigma * s.sigma).exp();
         last_rate = Some(measured);
         let enough = total - done >= measured * SAMPLE_SECS * MEASUREMENT_SAMPLES;
-        if ready_at.is_some() {
+        if policy.n > active {
             if !enough {
                 policy.cancel_unapplied();
-                ready_at = None;
                 sampler.reset();
             } else if let Some(score) = sampler.push(measured) {
                 policy.refresh_warming_baseline(score);
@@ -265,13 +336,7 @@ fn copy(s: &Scenario, mut policy: Policy, rng: &mut Rng) -> Outcome {
             }
         }
     }
-    Outcome {
-        elapsed: t,
-        reached_near_best: reached,
-        connection_secs,
-        handshakes,
-        policy,
-    }
+    panic!("simulation event limit: {} at {t}s", s.name);
 }
 
 fn quantile(values: &mut [f64], q: f64) -> f64 {
@@ -348,8 +413,9 @@ fn curves() -> Vec<(&'static str, Curve, usize)> {
 #[ignore = "prints comparison tables; run explicitly"]
 fn report() {
     const SEEDS: u64 = 2000;
+    println!("\nSlowdown uses a same-noise oracle; near50 is conditional on reaching; reach% is the fraction of copies reaching the band.");
     println!(
-        "\n{:<24}{:>6}{:>6}{:>5} |{:>8}{:>8}{:>8}{:>6}{:>8}{:>8}{:>7}",
+        "\n{:<24}{:>6}{:>6}{:>5} |{:>8}{:>8}{:>8}{:>6}{:>8}{:>8}{:>7}{:>8}",
         "curve",
         "noise",
         "setup",
@@ -360,7 +426,8 @@ fn report() {
         "n*",
         "settle",
         "open",
-        "shakes"
+        "shakes",
+        "reach%"
     );
     for (name, curve, start) in curves() {
         for sigma in [0.03, 0.10] {
@@ -383,25 +450,28 @@ fn report() {
                     for seed in 0..SEEDS {
                         let mut rng = Rng(seed);
                         let out = copy(&s, Policy::new(s.start, 1, LIMIT), &mut rng);
-                        slow.push(100.0 * (out.elapsed / ideal - 1.0));
-                        near.push(out.reached_near_best.unwrap_or(out.elapsed));
+                        slow.push(100.0 * (out.elapsed / out.ideal_elapsed - 1.0));
+                        if let Some(t) = out.reached_near_best {
+                            near.push(t);
+                        }
                         settled.push(out.policy.settled() as f64);
                         open += out.connection_secs / out.elapsed / SEEDS as f64;
                         shakes += out.handshakes as f64 / SEEDS as f64;
                     }
                     println!(
-                        "{:<24}{:>6.2}{:>6.1}{:>5} |{:>7.1}%{:>7.1}%{:>7.1}s{:>6}{:>8.0}{:>8.1}{:>7.1}",
+                        "{:<24}{:>6.2}{:>6.1}{:>5} |{:>7.1}%{:>7.1}%{:>7.1}s{:>6}{:>8.0}{:>8.1}{:>7.1}{:>8.1}",
                         s.name,
                         sigma,
                         setup_secs,
                         if prepare { "yes" } else { "no" },
                         quantile(&mut slow, 0.5),
                         quantile(&mut slow, 0.9),
-                        quantile(&mut near, 0.5),
+                        if near.is_empty() { f64::NAN } else { quantile(&mut near, 0.5) },
                         curve.smallest_near_best(ideal),
                         quantile(&mut settled, 0.5),
                         open,
                         shakes,
+                        100.0 * near.len() as f64 / SEEDS as f64,
                     );
                 }
             }
@@ -476,4 +546,237 @@ fn noiseless_knee_is_found_and_the_copy_completes() {
     );
     assert!(out.elapsed < 600.0 * 1.25, "{}", out.elapsed);
     assert!(out.reached_near_best.is_some());
+}
+
+/// A deterministic Cartesian sweep, including wrong remembered starting counts,
+/// steep contention, non-power-of-two knees, short copies, and changing paths.
+/// Each row is reproducible without retaining generated input files.
+#[test]
+#[ignore = "prints a scenario sweep; run explicitly"]
+fn sweep() {
+    println!("family,knee,start,seconds,noise,rho,setup,slow50,slow90,near_time_pct,settled_rate_pct,miss_pct,tail_rollback_pct");
+    for family in ["knee", "decline", "rise", "fall"] {
+        for knee in [1, 4, 12, 32] {
+            let curve = match family {
+                "knee" => Curve::Knee {
+                    per_worker: 100.0 / knee as f64,
+                    cap: 100.0,
+                },
+                "decline" => Curve::Decline {
+                    per_worker: 100.0 / knee as f64,
+                    cap: 100.0,
+                    loss: 0.5,
+                },
+                "rise" => Curve::Shift {
+                    per_worker: 100.0 / knee as f64,
+                    before: 100.0,
+                    after: 400.0,
+                    at: 37.0,
+                },
+                _ => Curve::Shift {
+                    per_worker: 100.0 / knee as f64,
+                    before: 400.0,
+                    after: 100.0,
+                    at: 37.0,
+                },
+            };
+            for start in [1, 8, 32, 64] {
+                for ideal_secs in [40.0, 180.0, 600.0] {
+                    for (sigma, rho) in [(0.0, 0.0), (0.1, 0.5), (0.3, 0.9)] {
+                        for setup_secs in [0.3, 10.0] {
+                            let s = Scenario {
+                                name: family,
+                                curve,
+                                ideal_secs,
+                                start,
+                                sigma,
+                                rho,
+                                setup_secs,
+                                prepare: false,
+                            };
+                            let mut slow = Vec::new();
+                            let (mut near, mut settled_rate, mut misses) = (0.0, 0.0, 0);
+                            let mut rollbacks = 0;
+                            let seeds = if sigma == 0.0 { 1 } else { 100 };
+                            for seed in 0..seeds {
+                                let out = copy(&s, Policy::new(start, 1, LIMIT), &mut Rng(seed));
+                                slow.push(100.0 * (out.elapsed / out.ideal_elapsed - 1.0));
+                                near += out.near_secs / out.elapsed;
+                                settled_rate += curve.rate(out.policy.settled(), out.elapsed)
+                                    / curve.best(out.elapsed);
+                                rollbacks += usize::from(out.tail_rollback_blocked);
+                                misses += usize::from(out.reached_near_best.is_none());
+                            }
+                            println!("{family},{knee},{start},{ideal_secs},{sigma},{rho},{setup_secs},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+                                quantile(&mut slow, 0.5), quantile(&mut slow, 0.9),
+                                100.0 * near / seeds as f64, 100.0 * settled_rate / seeds as f64, 100.0 * misses as f64 / seeds as f64, 100.0 * rollbacks as f64 / seeds as f64);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn fixture(curve: Curve) -> Scenario {
+    Scenario {
+        name: "fixture",
+        curve,
+        ideal_secs: 40.0,
+        start: 8,
+        sigma: 0.0,
+        rho: 0.0,
+        setup_secs: 0.3,
+        prepare: false,
+    }
+}
+
+#[test]
+fn oracle_integrates_a_shift_between_sample_boundaries() {
+    let curve = Curve::Shift {
+        per_worker: 100.0,
+        before: 100.0,
+        after: 200.0,
+        at: 3.7,
+    };
+    let s = fixture(curve);
+    let out = copy(&s, Policy::new(8, 8, 8), &mut Rng(1));
+    let expected = curve.ideal_elapsed(curve.best(0.0) * s.ideal_secs);
+    assert!((out.elapsed - expected).abs() < 1e-9);
+    assert!((out.ideal_elapsed - expected).abs() < 1e-9);
+}
+
+#[test]
+fn noisy_optimum_has_zero_regret_against_the_same_noise() {
+    let mut s = fixture(Curve::Knee {
+        per_worker: 100.0,
+        cap: 100.0,
+    });
+    s.sigma = 0.3;
+    s.rho = 0.9;
+    for seed in 0..100 {
+        let out = copy(&s, Policy::new(8, 8, 8), &mut Rng(seed));
+        assert!((out.elapsed - out.ideal_elapsed).abs() < 1e-9);
+        assert!((out.near_secs - out.elapsed).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn unreachable_optimum_is_not_reported_as_reached() {
+    let s = fixture(Curve::Knee {
+        per_worker: 1.0,
+        cap: 64.0,
+    });
+    let out = copy(&s, Policy::new(8, 8, 8), &mut Rng(1));
+    assert!(out.reached_near_best.is_none());
+    assert_eq!(out.near_secs, 0.0);
+    assert!((out.elapsed / out.ideal_elapsed - 8.0).abs() < 1e-9);
+}
+
+#[test]
+fn preparation_waits_for_actual_connection_readiness() {
+    let mut s = fixture(Curve::Knee {
+        per_worker: 1.0,
+        cap: 16.0,
+    });
+    s.prepare = true;
+    s.setup_secs = 30.0;
+    let out = copy(&s, Policy::new(8, 1, LIMIT), &mut Rng(1));
+    assert_eq!(out.reached_near_best, Some(30.0));
+    s.prepare = false;
+    let out = copy(&s, Policy::new(8, 1, LIMIT), &mut Rng(1));
+    assert_eq!(out.reached_near_best, Some(37.5));
+}
+
+#[test]
+#[ignore = "prints decision traces; run explicitly"]
+fn diagnostics() {
+    let cases = [
+        (
+            "capacity rises",
+            Curve::Shift {
+                per_worker: 100.0 / 12.0,
+                before: 100.0,
+                after: 400.0,
+                at: 37.0,
+            },
+            8,
+            600.0,
+        ),
+        (
+            "narrow optimum",
+            Curve::Decline {
+                per_worker: 100.0 / 12.0,
+                cap: 100.0,
+                loss: 0.5,
+            },
+            64,
+            600.0,
+        ),
+        (
+            "overprovisioned start",
+            Curve::Decline {
+                per_worker: 100.0,
+                cap: 100.0,
+                loss: 0.5,
+            },
+            8,
+            40.0,
+        ),
+    ];
+    for (name, curve, start, ideal_secs) in cases.into_iter().chain([
+        ("capacity rises, long run", cases[0].1, 8, 6000.0),
+        ("below ceiling", cases[1].1, 63, 600.0),
+    ]) {
+        let s = Scenario {
+            name,
+            start,
+            ideal_secs,
+            ..fixture(curve)
+        };
+        println!("\n{name}: start={start}, initial-rate seconds={ideal_secs}");
+        let mut previous = None;
+        let out = copy_observing(&s, Policy::new(start, 1, LIMIT), &mut Rng(0), |t, p| {
+            let key = (p.active(), p.n);
+            if previous != Some(key) {
+                println!(
+                    "t={t:.1} active={} candidate={} settled={} tick={} due={:?} state={:?}",
+                    p.active(),
+                    p.n,
+                    p.settled(),
+                    p.tick,
+                    p.due,
+                    p.state
+                );
+                previous = Some(key);
+            }
+        });
+        println!(
+            "elapsed={:.2} oracle={:.2} near={:.1}% settled_rate={:.1}%",
+            out.elapsed,
+            out.ideal_elapsed,
+            100.0 * out.near_secs / out.elapsed,
+            100.0 * curve.rate(out.policy.settled(), out.elapsed) / curve.best(out.elapsed)
+        );
+    }
+}
+
+#[test]
+fn tail_blocked_rollback_keeps_copying_instead_of_spinning() {
+    let mut s = fixture(Curve::Knee {
+        per_worker: 1.0,
+        cap: 2.0,
+    });
+    s.ideal_secs = 2.0;
+    s.setup_secs = 30.0;
+    // The driver has just rejected a one-worker downward probe and asked to
+    // restore two workers. Reconnecting takes longer than the remaining copy.
+    let mut policy = Policy::new(1, 1, LIMIT);
+    policy.n = 2;
+    policy.state = State::Hold;
+    let out = copy(&s, policy, &mut Rng(0));
+    assert!(out.tail_rollback_blocked);
+    assert_eq!(out.policy.active(), 1);
+    assert_eq!(out.elapsed, 4.0);
+    assert_eq!(out.ideal_elapsed, 2.0);
 }
