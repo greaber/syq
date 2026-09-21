@@ -86,6 +86,10 @@ IPv6 addresses, with the address SSH connected to first. If that data address
 is unreachable, syq can try another advertised address on the same receiver.
 Loopback and link-local addresses are excluded from discovery; an address
 already used by SSH is still included when the data listener supports its family.
+When link speeds are unknown, syq selects the first reachable address in priority
+order without waiting for lower-priority probes. Verbose diagnostics mark any
+unfinished probes as untested. Known-speed multipath still waits for all probes
+within their timeout.
 
 Use `--to @NAME` to send local source files to a registered receiving machine.
 The `@` is required: `--to laptop` selects an SSH destination, while
