@@ -28,7 +28,6 @@
   - [rm](commands/rm.md)
   - [clean-partials](commands/clean-partials.md)
   - [map](commands/map.md)
-  - [Experimental S3 listing](commands/_ls.md)
   - [exec](commands/exec.md)
   - [rsync](commands/rsync.md)
   - [persist](commands/persist.md)

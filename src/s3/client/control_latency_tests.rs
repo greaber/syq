@@ -72,15 +72,22 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
         .is_err());
     assert_eq!(control.load(Ordering::Relaxed), 80_000_000);
     assert_eq!(
-        list(&client, "bucket", "data/", None, &mut Default::default())
-            .await
-            .unwrap()
-            .objects
-            .len(),
+        list(
+            &client,
+            "bucket",
+            "data/",
+            None,
+            &mut Default::default(),
+            32
+        )
+        .await
+        .unwrap()
+        .objects
+        .len(),
         8
     );
-    // Eight flat pages plus one unsuccessful delimiter probe, after the HEAD.
-    assert_eq!(start.elapsed(), Duration::from_millis(215));
+    // Flat pages give no evidence that directory discovery would help.
+    assert_eq!(start.elapsed(), Duration::from_millis(200));
     assert_eq!(control.load(Ordering::Relaxed), 15_000_000);
     for status in [301, 429, 503] {
         assert!(client

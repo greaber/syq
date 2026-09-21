@@ -13,6 +13,8 @@ def check():
             for day in range(8) for kind in range(2) for i in range(100)}
     keys.update({prefix + '/', prefix + '/file', prefix + '/day00/',
                  prefix + '/day00/nested/file', prefix + '/line\nbreak%2F',
+                 prefix + '/a b', prefix + '/a+b', prefix + '/a%2Bb',
+                 prefix + '/sp dir/x', prefix + '/sp+dir/x', prefix + '/sp%2Bdir/x',
                  prefix + '/[literal]{braces}', prefix + '/文', prefix + '-other/file'})
     with ThreadPoolExecutor(max_workers=16) as workers:
         list(workers.map(lambda key: checks.request('PUT', key, b'' if key.endswith('/') else b'x'), keys))
@@ -27,9 +29,16 @@ def check():
         (prefix + '*', set()),
         (prefix + '/day*/type0/*', {key for key in keys if '/type0/' in key}),
         (prefix + '/**/file', {prefix + '/day00/nested/file'}),
-        (prefix + '/[literal]{braces}', {prefix + '/[literal]{braces}'}),
+        (prefix + '/a b', prefix + '/a+b', prefix + '/a%2Bb',
+                 prefix + '/sp dir/x', prefix + '/sp+dir/x', prefix + '/sp%2Bdir/x',
+                 prefix + '/[literal]{braces}', {prefix + '/[literal]{braces}'}),
         (prefix + '/?', {prefix + '/文'}),
         (prefix + '/missing/**', set()),
+        (prefix + '/a b', {prefix + '/a b'}),
+        (prefix + '/a+b', {prefix + '/a+b'}),
+        (prefix + '/a%2Bb', {prefix + '/a%2Bb'}),
+        (prefix + '/sp dir/**', {prefix + '/sp dir/x'}),
+        (prefix + '/sp*/**', {prefix + '/sp dir/x', prefix + '/sp+dir/x', prefix + '/sp%2Bdir/x'}),
     ]
     for concurrency in [1, 4]:
         for pattern, expected in cases:

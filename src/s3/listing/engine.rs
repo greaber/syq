@@ -9,6 +9,9 @@ use serde::Serialize;
 use std::{collections::VecDeque, future::Future};
 
 const MAX_CHILDREN: usize = 256;
+// Recursive discovery has no selective pattern to amortize empty/small child
+// requests. Require evidence of a page-sized child and bound speculative fanout.
+const MAX_RECURSIVE_CHILDREN: usize = 8;
 const SPLIT_QUEUE_LIMIT: usize = 4096;
 const MAX_RECURSIVE_PROBES: usize = 4;
 
@@ -28,12 +31,32 @@ pub(in crate::s3) struct Page {
 }
 
 pub(in crate::s3) trait Store {
+    fn ordered(&self) -> bool {
+        true
+    }
+
     fn page(
         &self,
         prefix: &str,
         delimiter: bool,
         token: Option<&str>,
     ) -> impl Future<Output = Result<Page>>;
+}
+
+// A task can overlap a delimiter probe and a continuation page; bound actual
+// HTTP requests as well as task count, including with an explicit limit of two.
+struct LimitedStore<'a, S> {
+    inner: &'a S,
+    slots: tokio::sync::Semaphore,
+}
+impl<S: Store> Store for LimitedStore<'_, S> {
+    fn ordered(&self) -> bool {
+        self.inner.ordered()
+    }
+    async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+        let _permit = self.slots.acquire().await?;
+        self.inner.page(prefix, delimiter, token).await
+    }
 }
 
 #[derive(Clone)]
@@ -181,24 +204,84 @@ async fn execute(
     })
 }
 
+fn dense_children(query: &str, page: &Page) -> usize {
+    let mut counts = std::collections::HashMap::new();
+    for entry in &page.entries {
+        if let Some(slash) = entry
+            .key
+            .strip_prefix(query)
+            .and_then(|suffix| suffix.find('/'))
+        {
+            *counts
+                .entry(&entry.key[..query.len() + slash + 1])
+                .or_insert(0usize) += 1;
+        }
+    }
+    // Leave room for root markers and a few direct objects in each sample.
+    counts.values().filter(|count| **count >= 900).count()
+}
+
 async fn recursive(store: &impl Store, query: String, depth: usize, split: bool) -> Result<Batch> {
-    let flat = read(store, &query, false, None).await?;
-    if flat.next.is_none() || !split || depth >= MAX_RECURSIVE_PROBES {
-        return Ok(scan_batch(query, false, flat));
-    }
-    let branches = read(store, &query, true, None).await?;
-    if branches.next.is_some()
-        || branches.prefixes.is_empty()
-        || branches.prefixes.len() > MAX_CHILDREN
+    let mut flat = read(store, &query, false, None).await?;
+    if flat.next.is_none()
+        || !split
+        || !store.ordered()
+        || depth >= MAX_RECURSIVE_PROBES
+        || flat.entries.len() < 1000
+        || dense_children(&query, &flat) == 0
     {
-        // Keep the original flat page and its token; never mix tokens from
-        // delimiter and recursive listings or re-emit a sampled page.
         return Ok(scan_batch(query, false, flat));
     }
+    // Continue useful enumeration while probing. Small two-page trees finish
+    // here, and rejected probes add no sequential round trip to flat scans.
+    let (branches, continuation) = tokio::join!(
+        read(store, &query, true, None),
+        read(store, &query, false, flat.next.as_deref()),
+    );
+    let continuation = continuation?;
+    flat.entries.extend(continuation.entries);
+    flat.next = continuation.next;
+    if flat.next.is_none() {
+        return Ok(scan_batch(query, false, flat));
+    }
+    let branches = branches?;
+    if branches.next.is_some() || !(2..=MAX_RECURSIVE_CHILDREN).contains(&branches.prefixes.len()) {
+        return Ok(scan_batch(query, false, flat));
+    }
+    // One dense leading directory says little about its siblings. Spend at
+    // most one more useful flat page looking for a second page-sized child.
+    if dense_children(&query, &flat) < 2 {
+        let next = read(store, &query, false, flat.next.as_deref()).await?;
+        flat.entries.extend(next.entries);
+        flat.next = next.next;
+    }
+    if flat.next.is_none() || dense_children(&query, &flat) < 2
+        || !flat.entries.windows(2).all(|pair| pair[0].key < pair[1].key)
+        // Do not replace an observed key with an incomplete directory view.
+        || flat.entries.iter().any(|entry| {
+            !branches.entries.iter().any(|direct| direct.key == entry.key)
+                && !branches.prefixes.iter().any(|child| entry.key.starts_with(child))
+        })
+    {
+        return Ok(scan_batch(query, false, flat));
+    }
+    // S3 general-purpose buckets order keys lexically. Entire children before
+    // the last sampled child are complete already: emit those objects and do
+    // not list them again. Only the partial last child is fetched again.
+    let last = &flat.entries.last().unwrap().key;
+    let (complete, pending): (Vec<_>, Vec<_>) = branches
+        .prefixes
+        .into_iter()
+        .partition(|prefix| prefix < last && !last.starts_with(prefix));
+    let mut entries = branches.entries;
+    entries.extend(
+        flat.entries
+            .into_iter()
+            .filter(|entry| complete.iter().any(|prefix| entry.key.starts_with(prefix))),
+    );
     Ok(Batch {
-        entries: branches.entries,
-        jobs: branches
-            .prefixes
+        entries,
+        jobs: pending
             .into_iter()
             .map(|prefix| Job::Recursive {
                 prefix,
@@ -218,6 +301,23 @@ pub(super) async fn enumerate(
         (1..=256).contains(&concurrency),
         "concurrency must be between 1 and 256"
     );
+    if store.ordered() && pattern.components.iter().all(|part| part.literal()) {
+        // General-purpose S3 listings are sorted: the exact prefix itself, if
+        // present, precedes every longer key. Keep LIST permissions (no HEAD).
+        let key = pattern
+            .components
+            .iter()
+            .map(|part| part.literal_prefix())
+            .collect::<Vec<_>>()
+            .join("/");
+        let page = read(store, &key, false, None).await?;
+        for entry in page.entries {
+            if entry.key == key {
+                emit(entry)?;
+            }
+        }
+        return Ok(());
+    }
     enumerate_jobs(
         store,
         Some(pattern),
@@ -265,6 +365,10 @@ async fn enumerate_jobs(
         (1..=256).contains(&concurrency),
         "concurrency must be between 1 and 256"
     );
+    let store = LimitedStore {
+        inner: store,
+        slots: tokio::sync::Semaphore::new(concurrency),
+    };
     let mut pending = VecDeque::from([first]);
     let mut active = FuturesUnordered::new();
     loop {
@@ -273,7 +377,7 @@ async fn enumerate_jobs(
                 break;
             };
             let split = concurrency > 1 && pending.len() + active.len() < SPLIT_QUEUE_LIMIT;
-            active.push(execute(store, pattern, job, split));
+            active.push(execute(&store, pattern, job, split));
         }
         let Some(batch) = active.next().await else {
             return Ok(());

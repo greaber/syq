@@ -253,7 +253,7 @@ async fn malformed_pages_fail() {
 async fn literal_prefix_enumeration_preserves_metacharacters_and_overlap() {
     let prefix = "literal*?**[x]/";
     let mut keys: Vec<_> = (0..8)
-        .flat_map(|d| (0..180).map(move |i| format!("{prefix}day{d}/file{i:03}")))
+        .flat_map(|d| (0..1200).map(move |i| format!("{prefix}day{d}/file{i:03}")))
         .collect();
     keys.extend([
         prefix.to_owned(),
@@ -282,4 +282,108 @@ async fn literal_prefix_enumeration_preserves_metacharacters_and_overlap() {
     }
     assert!(store.peak.get() > 1);
     assert!(store.peak.get() <= 4);
+}
+
+#[tokio::test]
+async fn sparse_trees_stay_flat_and_exact_keys_stop_after_one_page() {
+    for per_directory in [4, 40] {
+        let store =
+            Memory::new((0..256).flat_map(|d| {
+                (0..per_directory).map(move |i| format!("tree/dir{d:03}/file{i:03}"))
+            }));
+        let keys = listed(&store, "tree/**", 32).await;
+        assert_eq!(keys.len(), 256 * per_directory);
+        assert_eq!(store.calls.borrow().len(), keys.len().div_ceil(1000));
+        assert!(store.calls.borrow().iter().all(|(_, delimiter)| !delimiter));
+    }
+    let store = Memory::new(
+        std::iter::once("exact".into()).chain((0..3000).map(|i| format!("exact{i:04}"))),
+    );
+    assert_eq!(listed(&store, "exact", 32).await, ["exact"]);
+    assert_eq!(store.calls.borrow().len(), 1);
+}
+
+#[tokio::test]
+async fn two_page_dense_tree_finishes_flat_and_dense_branches_overlap() {
+    let store = Memory::new((0..1001).map(|i| format!("tree/a/file{i:04}")));
+    assert_eq!(listed(&store, "tree/**", 32).await.len(), 1001);
+    assert_eq!(store.calls.borrow().len(), 3);
+    assert!(store
+        .calls
+        .borrow()
+        .iter()
+        .all(|(prefix, _)| prefix == "tree/"));
+    assert_eq!(store.peak.get(), 2, "probe overlaps useful continuation");
+    let store = Memory::new(
+        (0..8).flat_map(|d| (0..2000).map(move |i| format!("tree/dir{d:02}/file{i:04}"))),
+    );
+    assert_eq!(listed(&store, "tree/**", 32).await.len(), 16000);
+    assert_eq!(store.calls.borrow().len(), 18);
+    assert!(store.peak.get() > 1);
+    assert!(store.peak.get() <= 8);
+}
+
+#[tokio::test]
+async fn nested_probes_respect_the_actual_request_limit() {
+    let store = Memory::new((0..4).flat_map(|a| {
+        (0..2).flat_map(move |b| (0..2000).map(move |i| format!("tree/{a}/{b}/file{i:04}")))
+    }));
+    assert_eq!(listed(&store, "tree/**", 2).await.len(), 16000);
+    assert_eq!(store.peak.get(), 2);
+}
+
+#[tokio::test]
+async fn dense_head_with_sparse_siblings_does_not_fan_out() {
+    let store = Memory::new(
+        (0..2001)
+            .map(|i| format!("tree/a/file{i:04}"))
+            .chain((1..8).map(|i| format!("tree/dir{i}/file"))),
+    );
+    assert_eq!(listed(&store, "tree/**", 32).await.len(), 2008);
+    assert_eq!(store.calls.borrow().len(), 4);
+    assert!(store
+        .calls
+        .borrow()
+        .iter()
+        .all(|(prefix, _)| prefix == "tree/"));
+}
+
+#[tokio::test]
+async fn unordered_stores_do_not_apply_exact_key_shortcut() {
+    struct Unordered;
+    impl Store for Unordered {
+        fn ordered(&self) -> bool {
+            false
+        }
+        async fn page(&self, _: &str, _: bool, token: Option<&str>) -> Result<Page> {
+            Ok(Page {
+                entries: vec![Entry {
+                    key: if token.is_none() {
+                        "exact-other"
+                    } else {
+                        "exact"
+                    }
+                    .into(),
+                    size: 1,
+                    last_modified: None,
+                    etag: None,
+                }],
+                next: token.is_none().then(|| "next".into()),
+                ..Page::default()
+            })
+        }
+    }
+    let mut keys = Vec::new();
+    engine::enumerate(
+        &Unordered,
+        &Pattern::parse("s3://bucket/exact").unwrap(),
+        32,
+        |entry| {
+            keys.push(entry.key);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(keys, ["exact"]);
 }

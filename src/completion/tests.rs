@@ -258,7 +258,7 @@ fn path_candidates_preserve_raw_names_and_mark_directories() {
 #[test]
 fn root_and_option_candidates_come_from_public_command_metadata() {
     assert!(values(root_candidates(b"c")).contains(&b"cp".to_vec()));
-    assert_eq!(values(root_candidates(b"_l")), vec![b"_ls".to_vec()]);
+    assert!(root_candidates(b"_l").is_empty());
     let listing = public_command("_ls").unwrap();
     assert_eq!(
         values(option_candidates(&listing, b"--conc")),

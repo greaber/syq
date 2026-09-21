@@ -11,7 +11,7 @@ import check as c
 def check():
     prefix = c.PREFIX + '/literal*?[x]'
     objects = {f'{prefix}/day{day:02}/file{i:03}': f'{day}:{i}'.encode()
-               for day in range(8) for i in range(180)}
+               for day in range(2) for i in range(1200)}
     objects.update({prefix + '/': b'', prefix + '/day00/': b'',
                     prefix + '/empty/': b'', prefix + '/root': b'root',
                     prefix + '/percent%2F': b'percent'})

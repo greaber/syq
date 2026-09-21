@@ -709,7 +709,6 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
         "exec",
         "rm",
         "clean-partials",
-        "_ls",
         "map",
         "rsync",
         "persist",

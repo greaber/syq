@@ -108,6 +108,11 @@ struct S3<'a> {
     bucket: &'a str,
 }
 impl Store for S3<'_> {
+    fn ordered(&self) -> bool {
+        // Directory buckets do not promise lexicographic LIST order.
+        !self.bucket.ends_with("--x-s3")
+    }
+
     async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
         let response = self
             .client
@@ -122,10 +127,12 @@ impl Store for S3<'_> {
             .await
             .map_err(|e| anyhow::anyhow!("{}", super::client::failure("listing S3 objects", &e)))?;
         let decode = |value: &str| -> Result<String> {
-            Ok(percent_encoding::percent_decode_str(value)
-                .decode_utf8()
-                .context("S3 listing returned a key that is not UTF-8")?
-                .into_owned())
+            Ok(
+                percent_encoding::percent_decode_str(&value.replace('+', " "))
+                    .decode_utf8()
+                    .context("S3 listing returned a key that is not UTF-8")?
+                    .into_owned(),
+            )
         };
         let mut entries = Vec::new();
         for object in response.contents() {

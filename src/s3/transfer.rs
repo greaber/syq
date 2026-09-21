@@ -493,6 +493,7 @@ impl Engine {
                     &prefix,
                     None,
                     &mut HashSet::new(),
+                    self.options.concurrency,
                 )
                 .await
                 .map(|listing| Some(listing.objects.into_iter().collect()))
@@ -1363,7 +1364,8 @@ impl Engine {
                         source_bucket,
                         &prefix,
                         matcher.as_ref(),
-                        &mut excluded_subtrees
+                        &mut excluded_subtrees,
+                        self.options.concurrency,
                     )
                 )?;
                 (exact, Some(listed))
@@ -1417,6 +1419,7 @@ impl Engine {
                             &prefix,
                             matcher.as_ref(),
                             &mut excluded_subtrees,
+                            self.options.concurrency,
                         )
                         .await?
                     }

@@ -59,7 +59,7 @@ impl ListingServer {
                     } else {
                         "<NextContinuationToken>next</NextContinuationToken>"
                     };
-                    let body = format!("<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>true</IsTruncated>{next}<Contents><Key>prefix%2Fline%0Abreak%252F</Key><Size>7</Size><LastModified>2026-01-01T00:00:00Z</LastModified><ETag>&quot;opaque&quot;</ETag></Contents></ListBucketResult>");
+                    let body = format!("<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>true</IsTruncated>{next}<Contents><Key>prefix%2Fline%0Abreak%252F</Key><Size>7</Size><LastModified>2026-01-01T00:00:00Z</LastModified><ETag>&quot;opaque&quot;</ETag></Contents><Contents><Key>prefix%2Fa+b</Key><Size>1</Size></Contents><Contents><Key>prefix%2Fa%2Bb</Key><Size>1</Size></Contents><Contents><Key>prefix%2Fa%252Bb</Key><Size>1</Size></Contents></ListBucketResult>");
                     reply(&mut socket, 200, &[], body.as_bytes(), false);
                 }
             }
@@ -117,8 +117,11 @@ fn experimental_listing_streams_encoded_keys_and_reports_partial_failure() {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(records.len(), if fail { 1 } else { 2 });
+        assert_eq!(records.len(), if fail { 4 } else { 5 });
         assert_eq!(records[0]["key"], "prefix/line\nbreak%2F");
+        assert_eq!(records[1]["key"], "prefix/a b");
+        assert_eq!(records[2]["key"], "prefix/a+b");
+        assert_eq!(records[3]["key"], "prefix/a%2Bb");
         assert_eq!(records[0]["bucket"], "bucket");
         assert_eq!(records[0]["size"], 7);
         assert_eq!(records[0]["etag"], "\"opaque\"");
@@ -137,6 +140,22 @@ fn experimental_listing_streams_encoded_keys_and_reports_partial_failure() {
 
 #[test]
 fn experimental_listing_help_and_invalid_arguments() {
+    for (args, visible) in [
+        (vec!["help"], false),
+        (vec!["--help"], false),
+        (vec!["help", "--all"], true),
+        (vec!["--help-all"], true),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().contains("_ls"),
+            visible
+        );
+    }
     for args in [["_ls", "--help"], ["help", "_ls"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(args)
