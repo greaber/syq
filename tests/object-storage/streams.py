@@ -22,7 +22,7 @@ def stream(args, **kwargs):
     elif '--as-fd' not in args:
         args += ['--as-fd', '1']
     result = subprocess.run([check.SYQ, 'cp', '--s3-region', check.REGION,
-                             '--performance-tuning', 's3-part-size=5M,s3-max-concurrent-parts-per-object=3',
+                             '--performance-tuning', 's3-part-size=5M,s3-parts-per-object=3',
                              *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             timeout=60, **kwargs)
     assert (result.returncode == 0) == success, result.stderr.decode(errors='replace')
@@ -36,12 +36,12 @@ def main():
                            ('multipart', bytes(range(256)) * 50000)]:
             key = check.PREFIX + '/' + name
             stream(['--to', bucket, '--as', key,
-                    '--resource-limits', 's3-max-concurrent-requests=1', '--stats'], input=data)
+                    '--resource-limits', 's3-requests=1', '--stats'], input=data)
             headers, actual = check.request('GET', key)
             assert actual == data, name
             assert not any(k.lower().startswith('x-amz-meta-syq-') for k in headers)
             actual = stream(['--from', bucket, key,
-                             '--resource-limits', 's3-max-concurrent-requests=1'])
+                             '--resource-limits', 's3-requests=1'])
             assert actual == data, name
             print('Stream round trip:', name, flush=True)
         # Placement constraints retain the raw-object upload contract.

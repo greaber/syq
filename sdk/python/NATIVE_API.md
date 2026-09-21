@@ -95,7 +95,7 @@ In addition to the shared arguments above, it accepts:
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` |
 | `resource_limits` | Comma-separated ceilings that keep automatic tuning, e.g. `"bandwidth=10M,workers=4"`; a concurrency key conflicts with the same key in `performance_tuning` |
-| `performance_tuning` | Comma-separated overrides, e.g. `"workers=4"` or `"s3-max-concurrent-objects=32,s3-max-concurrent-parts-per-object=8,s3-part-size=16M"`; omitted means automatic |
+| `performance_tuning` | Comma-separated overrides, e.g. `"workers=4"` or `"s3-objects=4,s3-parts-per-object=8,s3-requests=16"`; omitted means automatic |
 | `s3_endpoint`, `s3_region`, `s3_profile` | Endpoint URL, signing region, and AWS profile strings |
 | `s3_header` | Iterable of `"NAME: VALUE"` strings; applied before signing every request |
 | `auth_from` | Credential source string |

@@ -103,7 +103,7 @@ def clean():
 
 
 def run(args, *, ok=True, env=None, capture=False):
-    command = [SYQ, 'cp', '--no-progress', '--performance-tuning=s3-part-size=5M,s3-max-concurrent-parts-per-object=3,s3-retries=1']
+    command = [SYQ, 'cp', '--no-progress', '--performance-tuning=s3-part-size=5M,s3-parts-per-object=3,s3-retries=1']
     for name, value in HEADERS.items():
         command += ['--s3-header', name + ': ' + value]
     completed = subprocess.run(command + list(map(str, args)), env=env, text=True, capture_output=capture, timeout=180)
@@ -126,7 +126,7 @@ def assert_comparison(path, *, changed, unchanged):
 
 def interrupted(args, threshold=5*1024*1024):
     reader, writer = os.pipe()
-    command=[SYQ,'cp','--no-progress','--results-fd',str(writer),'--performance-tuning=s3-part-size=5M,s3-max-concurrent-parts-per-object=1,s3-retries=1','--resource-limits=bandwidth=1MiB']
+    command=[SYQ,'cp','--no-progress','--results-fd',str(writer),'--performance-tuning=s3-part-size=5M,s3-parts-per-object=1,s3-retries=1','--resource-limits=bandwidth=1MiB']
     for name,value in HEADERS.items(): command+=['--s3-header',name+': '+value]
     process=subprocess.Popen(command+list(map(str,args)),stdout=subprocess.DEVNULL,stderr=None,pass_fds=(writer,),start_new_session=True)
     os.close(writer)

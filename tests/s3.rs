@@ -111,7 +111,7 @@ impl Server {
                 "X-Tigris-Consistent: true",
                 "--no-progress",
                 "--performance-tuning",
-                "s3-max-concurrent-parts-per-object=3",
+                "s3-parts-per-object=3",
             ]);
         }
         command
@@ -1895,8 +1895,8 @@ fn s3_fast_queued_ranges_preserve_bytes_and_fail_without_publication() {
 fn s3_one_request_slot_supports_multipart_and_content_verification() {
     let server = Server::start("ok");
     for control in [
-        "--performance-tuning=s3-max-concurrent-requests=1",
-        "--resource-limits=s3-max-concurrent-requests=1,s3-max-concurrent-objects=1",
+        "--performance-tuning=s3-requests=1",
+        "--resource-limits=s3-requests=1,s3-objects=1",
     ] {
         let temp = crate::test_support::tempdir().unwrap();
         for extra in [false, true] {
@@ -3867,7 +3867,7 @@ fn server_copy_never_reads_or_relays_object_contents() {
                 "--from",
                 "s3://source",
                 "original",
-                "--performance-tuning=s3-max-concurrent-objects=4096,s3-max-concurrent-requests=1",
+                "--performance-tuning=s3-objects=4096,s3-requests=1",
                 "--to",
                 "s3://destination",
                 "--as",
@@ -3943,7 +3943,7 @@ fn server_copy_parts_overlap_and_respect_one_request_limit() {
                 "--as",
                 "copied",
                 "--performance-tuning",
-                &format!("s3-max-concurrent-requests={limit}"),
+                &format!("s3-requests={limit}"),
             ],
         );
         assert_eq!(
@@ -3999,7 +3999,7 @@ fn server_copy_reuses_destination_discovery_and_prunes_beneath_file_keys() {
                 "out",
                 extra,
                 "--performance-tuning",
-                "s3-max-concurrent-objects=1",
+                "s3-objects=1",
             ],
         );
         assert!(output.status.success(), "{fault}: {}", output_text(&output));
@@ -4025,7 +4025,7 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
             "--as",
             "copied",
             "--performance-tuning",
-            "s3-max-concurrent-requests=2",
+            "s3-requests=2",
         ];
         if fault == "server-copy-heads-overlap" {
             args = vec![
@@ -4169,7 +4169,7 @@ fn server_copy_caches_unsupported_tag_reads() {
             "--into",
             "copied",
             "--performance-tuning",
-            "s3-max-concurrent-objects=1",
+            "s3-objects=1",
         ],
     );
     let diagnostic = output_text(&output);
@@ -4882,8 +4882,8 @@ fn parallel_listing_preserves_exact_prefix_permissions_and_explicit_concurrency(
                 }
             }
             process.args(template.get_args().map(|arg| {
-                if fault == "parallel-serial" && arg == "s3-max-concurrent-parts-per-object=3" {
-                    std::ffi::OsStr::new("s3-max-concurrent-parts-per-object=1")
+                if fault == "parallel-serial" && arg == "s3-parts-per-object=3" {
+                    std::ffi::OsStr::new("s3-parts-per-object=1")
                 } else {
                     arg
                 }

@@ -42,7 +42,7 @@ def copy(arguments, *, allow=True, disconnect=True, interrupt=False, ok=None, re
     connect()
     command = ['syq', 'cp', '--auth-from', '@laptop', '--s3-profile', 'storage-test',
                '--s3-endpoint', endpoint, '--s3-region', 'us-east-1', '--no-progress',
-               '--performance-tuning=s3-part-size=5M,s3-max-concurrent-parts-per-object=1,s3-retries=0',
+               '--performance-tuning=s3-part-size=5M,s3-parts-per-object=1,s3-retries=0',
                '--resource-limits=bandwidth=2MiB', '--results', '/tmp/syq-storage-authorization/progress', *arguments]
     if removal:
         command[1] = 'rm'

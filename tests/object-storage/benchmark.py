@@ -53,8 +53,8 @@ def transfer_tuning_mode(args):
 
 def transfer_tuning(args):
     """No explicit settings means the binary's automatic defaults."""
-    shared = [("s3-max-concurrent-objects", args.workers),
-              ("s3-max-concurrent-parts-per-object", args.concurrency),
+    shared = [("s3-objects", args.workers),
+              ("s3-parts-per-object", args.concurrency),
               ("s3-part-size", f"{args.part_size}M" if args.part_size else None)]
     return args.syq_tuning or ','.join(f'{key}={value}' for key, value in shared if value is not None)
 

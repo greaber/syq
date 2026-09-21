@@ -28,7 +28,7 @@ class TransferSettings(unittest.TestCase):
         self.assertEqual(benchmark.s5cmd_transfer_flags(args), ['--numworkers', '512', 'cp', '-c', '8', '-p', '16'])
 
     def test_syq_override_is_used_for_transfers(self):
-        args = settings(syq_tuning='s3-max-concurrent-requests=96')
+        args = settings(syq_tuning='s3-requests=96')
         self.assertEqual(benchmark.transfer_tuning_mode(args), 'per-tool-overrides')
         self.assertEqual(benchmark.transfer_tuning(args), args.syq_tuning)
         self.assertEqual(benchmark.s5cmd_transfer_flags(args), ['cp'])
@@ -36,7 +36,7 @@ class TransferSettings(unittest.TestCase):
     def test_explicit_shared_setting_leaves_other_settings_automatic(self):
         args = settings(workers=16)
         self.assertEqual(benchmark.transfer_tuning_mode(args), 'shared-overrides')
-        self.assertEqual(benchmark.transfer_tuning(args), 's3-max-concurrent-objects=16')
+        self.assertEqual(benchmark.transfer_tuning(args), 's3-objects=16')
         self.assertEqual(benchmark.s5cmd_transfer_flags(args), ['--numworkers', '16', 'cp'])
 
 

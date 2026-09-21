@@ -191,7 +191,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                AWS_SHARED_CREDENTIALS_FILE=os.devnull, HOME=temp)
     base = [SYQ, 'cp', '--s3-endpoint', f'http://127.0.0.1:{server.server_port}',
             '--s3-region', 'us-east-1', '--performance-tuning',
-            's3-part-size=5M,s3-max-concurrent-parts-per-object=2,s3-retries=1']
+            's3-part-size=5M,s3-parts-per-object=2,s3-retries=1']
     get = base + ['--from', 's3://bucket', 'object']
     put = base + ['--to', 's3://bucket', '--as', 'object']
     try:
@@ -199,8 +199,8 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
             import syq
             sdk = syq.Client(executable=SYQ, env=env, timeout=15)
             options = dict(s3_endpoint=f'http://127.0.0.1:{server.server_port}', s3_region='us-east-1',
-                           performance_tuning='s3-part-size=5M,s3-max-concurrent-parts-per-object=2,s3-retries=0',
-                           resource_limits='s3-max-concurrent-requests=1')
+                           performance_tuning='s3-part-size=5M,s3-parts-per-object=2,s3-retries=0',
+                           resource_limits='s3-requests=1')
             def produce(out):
                 out.write(DATA)
             for payload in (b'', b'bytes', DATA):
