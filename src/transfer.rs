@@ -1665,9 +1665,20 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .get()
                     .context("source roots were not registered before workers started")?
                     .clone();
+                #[cfg(debug_assertions)]
+                if id == 0 {
+                    crate::fsops::test_race_barrier(
+                        "SYQ_TEST_WORKER_CONNECT_READY_FILE",
+                        "SYQ_TEST_WORKER_CONNECT_CONTINUE_FILE",
+                        "first worker connection",
+                    )?;
+                }
+                // Planner wait is not connection setup. Start once here so
+                // subsequent connection attempts still include retry backoff.
+                gate.mark_warming(id);
                 let mut failures = 0u32;
                 loop {
-                    if !gate.retained(id) {
+                    if !gate.connection_needed(id) {
                         gate.mark_absent(id);
                         return Ok(());
                     }
@@ -1703,12 +1714,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                 || crate::conn::is_worker_initialization_error(&error) =>
                         {
                             gate.mark_failed(id);
-                            return Err(error);
+                            if !gate.allowed(id) && debug() {
+                                crate::output::diagnostic!(
+                                    "syq: worker {id}: optional connection setup failed ({error:#})"
+                                );
+                            }
+                            return if gate.allowed(id) { Err(error) } else { Ok(()) };
                         }
                         Err(error) => {
                             failures += 1;
                             if failures >= CONNECTION_RECOVERY_ATTEMPTS {
                                 gate.mark_failed(id);
+                                if !gate.allowed(id) && debug() {
+                                    crate::output::diagnostic!(
+                                        "syq: worker {id}: optional connection setup failed ({error:#})"
+                                    );
+                                }
                                 return if gate.allowed(id) { Err(error) } else { Ok(()) };
                             }
                             gate.mark_warming(id);
@@ -1722,7 +1743,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             continue;
                         }
                     };
-                    gate.mark_ready(id);
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let mut worker = Worker {
                         id,
@@ -3322,7 +3342,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         initial.mode.clone(),
                     );
                     if initial.route == final_key.route {
-                        history.recommend(policy.settled(), policy.discovery_complete());
+                        history.recommend(policy.recommended(), policy.discovery_complete());
                     }
                 }
             }
@@ -3333,7 +3353,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             if let Some(initial_key) = tuning_key.as_deref() {
                 let final_key = tune::path_key(&src_ep, &dst_ep);
                 if final_key.as_deref() == Some(initial_key) {
-                    tune::remember(initial_key, policy.settled());
+                    tune::remember(initial_key, policy.recommended());
                 } else if debug() {
                     crate::output::diagnostic!(
                         "syq: auto-tuning: transport changed during transfer; not updating cache"

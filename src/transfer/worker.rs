@@ -59,6 +59,9 @@ impl Worker {
                     .observe(&self.progress.observations, &actor, false, self.id)?;
                 self.observation = Some(actor);
             }
+            // A prepared connection must finish helper configuration before
+            // the tuner can activate it or use its setup time as a forecast.
+            self.gate.mark_ready(self.id);
             let _working = self
                 .observation
                 .as_ref()

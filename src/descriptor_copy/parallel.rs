@@ -184,6 +184,7 @@ struct Workers {
 }
 impl Workers {
     fn run(&self, id: usize, permit: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
+        self.gate.mark_warming(id);
         let mut worker = self.session.worker(
             self.ticket.clone(),
             self.controls.settings,
@@ -212,8 +213,13 @@ impl Workers {
     }
     fn next(&self, id: usize) -> Result<Option<Job>> {
         anyhow::ensure!(!self.cancelled.load(Relaxed), "stream cancelled");
+        // This path pools completed connections in Session. Release surplus
+        // workers to that pool rather than parking with shared worker permits
+        // that another entry could use. The connection remains reusable.
         if !self.gate.park(id, || {
-            self.draining.load(Relaxed) || self.cancelled.load(Relaxed)
+            self.draining.load(Relaxed)
+                || self.cancelled.load(Relaxed)
+                || !self.gate.connection_needed(id)
         }) {
             return Ok(None);
         }
@@ -711,7 +717,7 @@ pub(crate) async fn execute(
                         let target = policy.n;
                         if target != gate.active() {
                             if target < gate.active() {
-                                gate.set_active(target); gate.set_retain(target.max(2)); policy.activated();
+                                gate.set_active(target); gate.set_connect_target(target.max(2)); policy.activated();
                                 trace.transition(&policy,"decrease_activated");
                             }
                             for id in gate.begin_warming(target) { spawn(&mut tasks, id); }

@@ -5,7 +5,8 @@
 //! file so small-file transfers count too) is sampled every few seconds; a
 //! worker count has been *measured* once the rate has stopped changing. A
 //! fresh start doubles while upward moves pay, then refines the measured
-//! bounds. A cached start uses smaller steps. A failed move
+//! bounds. Strongly matched plateau hints use smaller steps. An inconclusive
+//! increase keeps the larger count but pauses growth; a clearly worse move
 //! returns to the last good count and leaves a measured bound that later
 //! probes can refine one integer at a time. Independent per-direction aging
 //! and backoff decide when evidence is stale enough to probe again; when both
@@ -14,11 +15,12 @@
 //! tends to have lower throughput regret than removing a useful one.
 //!
 //! Candidate workers are connected while the current count remains active.
-//! They become active only when the whole candidate set is ready. Surplus
-//! workers are retired after a decision instead of retaining every connection
-//! ever tried (except that count one retains one ready spare for a cheap 1→2
-//! probe). Parking takes effect within one block even in a huge range: the
-//! worker hands the rest of its range back to the scheduler.
+//! They become active only when the whole candidate set is ready. Connected
+//! workers park when no longer active. The driver prepares likely upward
+//! candidates ahead of decisions and retains rollback capacity during probes.
+//! Between probes, surplus connections can close when there is enough time
+//! to reopen them using the measured setup time plus a margin. Parking takes effect within one block
+//! even in a huge range: the worker hands its remainder back to the scheduler.
 //!
 //! [`Sampler`] turns raw samples into stable measurements and [`Policy`] is
 //! the decision state machine; both are pure and unit tested. [`Gate`] is the
@@ -34,9 +36,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Workers to start with when auto-tuning over ssh: handshakes can take seconds
 /// on a long path, so start modestly and let the tuner earn more.
@@ -55,14 +57,14 @@ pub const START_LOCAL_LOW_CPU: usize = 16;
 /// Never auto-tune below this many.
 pub const MIN: usize = 1;
 /// Policy mechanics version recorded in transfer history.
-pub const POLICY_VERSION: u32 = 3;
+pub const POLICY_VERSION: u32 = 4;
 const STARTUP_STEP: usize = 2;
 
 /// Multiplicative step after discovery, or with a closely matched plateau hint.
 pub const STEP: f64 = 1.3;
-/// Prefer the smallest measured count whose throughput is this close to the
-/// recent best. Probe scheduling handles noise independently from this
-/// objective; acceptance must not impose a stricter, contradictory threshold.
+/// Throughput tolerance for comparisons. Reductions must stay near the recent
+/// best; an inconclusive increase within this tolerance of its own baseline
+/// keeps the larger count without continuing growth.
 const NEAR_BEST_TOLERANCE: f64 = 0.05;
 /// Measurements in the hold phase between probes. Each failed probe in a
 /// direction doubles only that direction's wait (up to
@@ -299,6 +301,16 @@ impl Sampler {
         self.last_status = "warmup_pending";
     }
 
+    /// Earliest next decision, even if future samples stabilize immediately.
+    fn earliest_score_in(&self, sample: Duration, elapsed: Duration) -> Duration {
+        let remaining = if self.discard {
+            3
+        } else {
+            2usize.saturating_sub(self.samples.len()).max(1)
+        };
+        sample.saturating_sub(elapsed) + sample * (remaining - 1) as u32
+    }
+
     /// Feed one sample; returns a score once the rate is stable.
     pub fn push(&mut self, rate: f64) -> Option<f64> {
         if self.discard {
@@ -379,6 +391,8 @@ pub struct Policy {
     /// Highest count that was actually activated, not merely requested.
     pub peak: usize,
     active: usize,
+    /// Starting count justified for future copies, excluding inconclusive increases.
+    recommended: usize,
     /// Initial discovery doubles unless closely matched evidence supports refinement.
     startup_doubling: bool,
     state: State,
@@ -402,6 +416,7 @@ impl Policy {
             max,
             peak: n,
             active: n,
+            recommended: n,
             startup_doubling: true,
             state: State::Initial,
             points: BTreeMap::new(),
@@ -427,6 +442,103 @@ impl Policy {
             State::Explore { from, .. } => from,
             _ => self.n,
         }
+    }
+
+    /// Count to save for future copies. Keeping an inconclusive increase live
+    /// does not justify making that increase the next copy's starting point.
+    pub fn recommended(&self) -> usize {
+        self.recommended
+    }
+
+    /// Connections required now (including rollback), and the earliest
+    /// measurement at which a larger set could be selected. This is a
+    /// preparation forecast, not a throughput decision. Hold uses the up
+    /// deadline even when a down probe might happen first, conservatively.
+    fn connection_forecast(&self) -> (usize, Option<(usize, usize)>) {
+        let required = self.n.max(self.active).max(self.settled());
+        let ticks = match self.state {
+            State::Initial
+            | State::Explore {
+                direction: Direction::Up,
+                ..
+            } => 1,
+            State::Explore {
+                direction: Direction::Down,
+                ..
+            } => return (required, None),
+            State::Hold => self.due[Direction::Up.index()]
+                .saturating_sub(self.tick)
+                .max(1),
+        };
+        // A nearest measured bound can make the next step larger than STEP.
+        // Ignore score-based suppression: a new measurement can change it.
+        let candidate = self
+            .points
+            .range((
+                std::ops::Bound::Excluded(self.n),
+                std::ops::Bound::Included(self.max),
+            ))
+            .next()
+            .map_or_else(
+                || self.upward_step(),
+                |(&upper, _)| self.n + (upper - self.n).div_ceil(2),
+            );
+        (
+            required,
+            (candidate > required).then_some((candidate, ticks)),
+        )
+    }
+
+    fn connection_plan(
+        &self,
+        sampler: &Sampler,
+        sample: Duration,
+        elapsed: Duration,
+        lead: Duration,
+        speculate: bool,
+    ) -> ConnectionPlan {
+        let (required, forecast) = self.connection_forecast();
+        let mut plan = ConnectionPlan {
+            connect: required,
+            // While exploring, another decision can follow immediately.
+            // Only a settled wait gives us a useful retirement deadline.
+            keep: if matches!(self.state, State::Hold) {
+                required
+            } else {
+                usize::MAX
+            },
+        };
+        // Preserve the existing 1 -> 2 startup spare even before the first
+        // connection is ready. Waiting for its setup measurement would miss
+        // the first probe when an SSH handshake takes longer than a sample.
+        // Settled single-worker copies still use the expiry schedule below.
+        if matches!(self.state, State::Initial) && self.n == 1 {
+            plan.connect = self.max.min(2);
+        }
+        if let Some((candidate, ticks)) = forecast {
+            let first_score = if self.n != self.active {
+                // Samples while the candidate connects only refresh its
+                // baseline. Activation starts a fresh measurement period.
+                let mut candidate_sampler = Sampler::default();
+                candidate_sampler.reset();
+                candidate_sampler.earliest_score_in(sample, Duration::ZERO)
+            } else {
+                sampler.earliest_score_in(sample, elapsed)
+            };
+            let until = first_score.saturating_add(
+                sample
+                    .saturating_mul(2)
+                    .saturating_mul(u32::try_from(ticks.saturating_sub(1)).unwrap_or(u32::MAX)),
+            );
+            if speculate && until <= lead {
+                plan.connect = candidate;
+            }
+            // Hysteresis avoids closing and immediately reopening connections.
+            if until <= lead.saturating_mul(2) {
+                plan.keep = usize::MAX;
+            }
+        }
+        plan
     }
 
     /// Record that the candidate count has become active. Warming a candidate
@@ -457,6 +569,11 @@ impl Policy {
     /// are not plateau measurements either.
     pub fn discovery_complete(&self) -> bool {
         let settled = self.settled();
+        // Plateau evidence for the live count must not be attached to a
+        // different recommendation retained after an inconclusive increase.
+        if settled != self.recommended {
+            return false;
+        }
         let Some(current) = self.points.get(&settled) else {
             return false;
         };
@@ -562,6 +679,14 @@ impl Policy {
             });
     }
 
+    fn upward_step(&self) -> usize {
+        if self.startup_doubling {
+            self.n.saturating_mul(STARTUP_STEP).min(self.max)
+        } else {
+            step_up(self.n).min(self.max)
+        }
+    }
+
     /// Pick an unmeasured integer inside the nearest bound before taking
     /// another geometric step. This is what turns measurements at 10 and 13
     /// into a later probe at 11 rather than needlessly re-testing 10.
@@ -608,11 +733,7 @@ impl Policy {
                     }
                     return upper;
                 }
-                if self.startup_doubling {
-                    self.n.saturating_mul(STARTUP_STEP).min(self.max)
-                } else {
-                    step_up(self.n).min(self.max)
-                }
+                self.upward_step()
             }
         }
     }
@@ -692,16 +813,36 @@ impl Policy {
                 let best = self.recent_best();
                 let floor = best * (1.0 - NEAR_BEST_TOLERANCE);
                 let keep = match direction {
-                    // Keep the larger count only when it is near-best and the
-                    // smaller baseline is not. If both qualify, the objective
-                    // explicitly prefers the smaller one.
+                    // Continue upward only when the larger count is near-best
+                    // and its smaller baseline is not. An inconclusive result
+                    // is handled separately below.
                     Direction::Up => score >= floor && base < floor,
                     Direction::Down => score >= floor,
                 };
                 self.comparisons += 1;
                 let idx = direction.index();
                 let inverse = direction.opposite().index();
+                if direction == Direction::Up
+                    && !keep
+                    && base > 0.0
+                    && score >= base * (1.0 - NEAR_BEST_TOLERANCE)
+                {
+                    // Uncertainty is not evidence to remove workers, nor to
+                    // keep growing. Stop the ramp and wait before probing.
+                    self.startup_doubling = false;
+                    self.fails[idx] += 1;
+                    self.due[idx] = self.tick + self.retry_after(direction);
+                    self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
+                    self.state = State::Hold;
+                    return self.n;
+                }
                 if keep {
+                    self.recommended = match direction {
+                        Direction::Up => self.n,
+                        // A partial reduction of an inconclusive increase is
+                        // not evidence to raise the future starting count.
+                        Direction::Down => self.recommended.min(self.n),
+                    };
                     self.fails[idx] = 0;
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
                     self.state = State::Hold;
@@ -737,28 +878,40 @@ enum SlotPhase {
     Warming,
     Ready,
     Failed,
+    Retiring,
 }
 
 #[derive(Debug, Clone)]
 struct Slot {
     phase: SlotPhase,
+    setup_started: Option<Instant>,
 }
 
 impl Default for Slot {
     fn default() -> Self {
         Self {
             phase: SlotPhase::Absent,
+            setup_started: None,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionPlan {
+    connect: usize,
+    keep: usize,
+}
+
 /// The worker lifecycle shared by the tuner and workers. `active` controls who
-/// may take work; `retain` controls who keeps a connection while parked. Slot
-/// state distinguishes a genuinely ready connection from one still warming or
-/// one whose setup failed.
+/// may take work; `connect_target` controls who should establish or recover a
+/// connection. The ordinary-copy driver separately controls which parked
+/// connections to keep. Slot state distinguishes ready, retiring and failed
+/// connections, so a retiring connection cannot be mistaken for a ready one.
 pub struct Gate {
     active: AtomicUsize,
-    retain: AtomicUsize,
+    connect_target: AtomicUsize,
+    keep_target: AtomicUsize,
+    setup_micros: AtomicU64,
     slots: Mutex<Vec<Slot>>,
     cv: Condvar,
     history: std::sync::OnceLock<history::Recorder>,
@@ -779,7 +932,11 @@ impl Gate {
     pub fn new(active: usize) -> Arc<Self> {
         Arc::new(Gate {
             active: AtomicUsize::new(active),
-            retain: AtomicUsize::new(active),
+            connect_target: AtomicUsize::new(active),
+            // Drivers without anticipatory preparation retain their existing
+            // lifecycle; descriptor copies return connections to Session.
+            keep_target: AtomicUsize::new(usize::MAX),
+            setup_micros: AtomicU64::new(0),
             slots: Mutex::new(Vec::new()),
             cv: Condvar::new(),
             history: std::sync::OnceLock::new(),
@@ -825,17 +982,36 @@ impl Gate {
     pub fn set_active(&self, n: usize) {
         let _g = self.slots.lock().unwrap();
         self.active.store(n, Relaxed);
-        self.retain.fetch_max(n, Relaxed);
+        self.connect_target.fetch_max(n, Relaxed);
         self.cv.notify_all();
     }
 
-    pub fn set_retain(&self, n: usize) {
+    /// Limit setup/recovery without closing already-connected parked workers.
+    pub fn set_connect_target(&self, n: usize) {
         let _g = self.slots.lock().unwrap();
-        self.retain.store(n.max(self.active()), Relaxed);
+        self.connect_target.store(n.max(self.active()), Relaxed);
         self.cv.notify_all();
     }
 
-    /// Claim absent slots through `n` for connection setup.
+    fn prepare(&self, plan: ConnectionPlan) {
+        let _slots = self.slots.lock().unwrap();
+        let connect = plan.connect.max(self.active());
+        self.connect_target.store(connect, Relaxed);
+        self.keep_target.store(plan.keep.max(connect), Relaxed);
+        self.cv.notify_all();
+    }
+
+    /// Include connection retries, not just the successful handshake.
+    /// A high-water mark with 2x headroom avoids learning an optimistic lead
+    /// from one fast connection. The extra second covers polling jitter.
+    fn setup_lead(&self) -> Duration {
+        Duration::from_micros(self.setup_micros.load(Relaxed))
+            .saturating_mul(2)
+            .saturating_add(Duration::from_secs(1))
+    }
+
+    /// Reserve absent slots through `n`. Workers start timing with
+    /// `mark_warming` when they can connect, after any wait for planning.
     pub fn begin_warming(&self, n: usize) -> Vec<usize> {
         let mut slots = self.slots.lock().unwrap();
         grow_to(&mut slots, n);
@@ -856,16 +1032,24 @@ impl Gate {
     pub fn mark_ready(&self, id: usize) {
         let mut slots = self.slots.lock().unwrap();
         grow_to(&mut slots, id + 1);
+        if let Some(started) = slots[id].setup_started.take() {
+            self.setup_micros.fetch_max(
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Relaxed,
+            );
+        }
         slots[id].phase = SlotPhase::Ready;
         self.cv.notify_all();
         drop(slots);
         self.record_slot(id, "ready");
     }
 
+    /// Begin connection setup, preserving the start across retries/backoff.
     pub fn mark_warming(&self, id: usize) {
         let mut slots = self.slots.lock().unwrap();
         grow_to(&mut slots, id + 1);
         slots[id].phase = SlotPhase::Warming;
+        slots[id].setup_started.get_or_insert_with(Instant::now);
         self.cv.notify_all();
         drop(slots);
         self.record_slot(id, "warming");
@@ -891,8 +1075,8 @@ impl Gate {
         self.record_slot(id, "failed");
     }
 
-    pub fn retained(&self, id: usize) -> bool {
-        id < self.retain.load(Relaxed)
+    pub fn connection_needed(&self, id: usize) -> bool {
+        id < self.connect_target.load(Relaxed)
     }
 
     pub fn ready_through(&self, n: usize) -> bool {
@@ -923,14 +1107,18 @@ impl Gate {
     }
 
     /// Block until `id` is allowed again. Returns false if the transfer is
-    /// over or this surplus connection should be retired.
+    /// over or the driver has released this spare outside the preparation
+    /// horizon. Mark retirement before releasing the lock so a tuner cannot
+    /// activate a connection whose worker has already decided to exit.
     pub fn park(&self, id: usize, done: impl Fn() -> bool) -> bool {
         let mut slots = self.slots.lock().unwrap();
         loop {
             if self.allowed(id) {
                 return true;
             }
-            if done() || id >= self.retain.load(Relaxed) {
+            if done() || id >= self.keep_target.load(Relaxed) {
+                grow_to(&mut slots, id + 1);
+                slots[id].phase = SlotPhase::Retiring;
                 return false;
             }
             slots = self
@@ -1011,7 +1199,7 @@ pub fn run(
             };
             active = requested;
             trace.transition(&policy, "direct_copy_needs_userspace_transfer");
-            gate.set_retain(requested);
+            gate.set_connect_target(requested);
             for id in gate.begin_warming(requested) {
                 spawn(id);
             }
@@ -1026,6 +1214,35 @@ pub fn run(
                 );
             }
             continue;
+        }
+
+        let (_, forecast) = policy.connection_forecast();
+        let preparation_count = forecast.map_or(policy.n, |(count, _)| count);
+        let lead = gate.setup_lead();
+        let preparation_activity =
+            required_remaining_activity(last_rate, preparation_count, sample).saturating_add(
+                last_rate.map_or(0, |rate| (rate * lead.as_secs_f64()).ceil() as u64),
+            );
+        let plan = policy.connection_plan(
+            &sampler,
+            sample,
+            sample_start.elapsed(),
+            lead,
+            gate.ready_through(active)
+                && sched.work_left_for(preparation_count, preparation_activity, FILE_CREDIT),
+        );
+        gate.prepare(plan);
+        if sched.needs_worker_capacity() {
+            let warming = gate.begin_warming(plan.connect);
+            if crate::output::debug() && !warming.is_empty() && plan.connect > policy.n {
+                crate::output::diagnostic!(
+                    "syq: tune: preparing {} connections ahead of probe ({} active, {:.2}s setup lead)",
+                    plan.connect, active, gate.setup_lead().as_secs_f64()
+                );
+            }
+            for id in warming {
+                spawn(id);
+            }
         }
 
         // Apply reductions immediately. An increase leaves the current set
@@ -1046,7 +1263,6 @@ pub fn run(
             policy.activated();
             trace.transition(&policy, "decrease_activated");
             meter.set_active(active);
-            gate.set_retain(if active == 1 { 2 } else { active });
             sampler.reset();
             collapse_samples = 0;
             last = (meter.bytes(), meter.files());
@@ -1067,10 +1283,8 @@ pub fn run(
                     last_rate,
                     sample,
                 );
-                gate.set_retain(if active == 1 { 2 } else { active });
                 continue;
             }
-            gate.set_retain(policy.n);
             for id in gate.begin_warming(policy.n) {
                 spawn(id);
             }
@@ -1082,7 +1296,6 @@ pub fn run(
                 // Failure to provision an optional upward probe is not a
                 // throughput result and must not fail the copy.
                 trace.cancel(&mut policy, "candidate_setup_failed", last_rate, sample);
-                gate.set_retain(if active == 1 { 2 } else { active });
                 gate.clear_failed_from(active);
                 continue;
             }
@@ -1163,7 +1376,6 @@ pub fn run(
                         last_rate,
                         sample,
                     );
-                    gate.set_retain(if active == 1 { 2 } else { active });
                     sampler.reset();
                     continue;
                 }
@@ -1191,23 +1403,6 @@ pub fn run(
             continue;
         }
 
-        // Heal an unexpectedly missing active slot. At one active worker keep
-        // exactly one ready spare so the important 1→2 probe is instantaneous.
-        let retain = if active == 1 {
-            2.min(policy.max)
-        } else {
-            active
-        };
-        gate.set_retain(retain);
-        // A pipelined whole-file batch is already owned and cannot be stolen.
-        // Do not repeatedly reconnect slots that drained the queue while the
-        // remaining owners finish. Queued/retried work or an ordinary
-        // large-file probe re-enables healing on the next poll.
-        if sched.needs_worker_capacity() {
-            for id in gate.begin_warming(retain) {
-                spawn(id);
-            }
-        }
         if gate.permanent_failure_through(active) {
             sched.abort();
             break;
