@@ -104,6 +104,18 @@ fn prepare(
         }
     }
     session.start_data()?;
+    if let Some(history) = controls.progress.tuning_history.get() {
+        if let Endpoint::Remote(spec) = endpoint {
+            if let Some(probe) = spec.diagnostics().tcp_probe {
+                let role = if plan.source.is_some() {
+                    "destination"
+                } else {
+                    "source"
+                };
+                history.tcp_probe(role, &spec.label(), &probe);
+            }
+        }
+    }
     let start = match endpoint {
         Endpoint::Remote(spec) if spec.data_transport() != conn::DataTransport::Ssh => {
             tune::START_TCP

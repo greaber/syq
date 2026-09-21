@@ -1846,40 +1846,62 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
 #[cfg(debug_assertions)]
 #[test]
 fn tuning_history_records_tcp_preflight_for_push_and_pull() {
-    for pull in [false, true] {
+    for (pull, descriptor) in [(false, false), (true, false), (false, true), (true, true)] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
         let data = prng(5 * 1024 * 1024 + 123, 912);
         write(&t.path("source"), &data);
-        let output = history_command(&t)
-            .args([
-                "cp",
-                &t.s("source"),
-                if pull { "--from" } else { "--to" },
-                "host",
-                "--as",
-                &t.s("destination"),
-                "--rsh",
-                rsh.to_str().unwrap(),
-                "--syq-path",
-                env!("CARGO_BIN_EXE_syq"),
-                "--tcp-ports",
-                EPHEMERAL_TCP_PORTS,
-                "--no-progress",
-                "--performance-tuning",
-                "workers=1",
-            ])
+        let mut command = history_command(&t);
+        command.stdin(Stdio::null());
+        command.args([
+            "cp",
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+            "--no-progress",
+            "--performance-tuning",
+            "workers=1",
+        ]);
+        if descriptor && !pull {
+            command
+                .args(["--src-fd", "0"])
+                .stdin(fs::File::open(t.path("source")).unwrap());
+        } else {
+            command.arg(t.path("source"));
+        }
+        command.args([if pull { "--from" } else { "--to" }, "host"]);
+        if descriptor && pull {
+            command.args(["--as-fd", "1"]);
+        } else {
+            command.args(["--as", &t.s("destination")]);
+        }
+        let output = command
             .env("SYQ_TEST_REQUIRE_TCP", "1")
+            .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
             .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_CACHE_HOME", t.path("cache"))
-            .run()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap()
+            .wait_with_output()
             .unwrap();
         assert_output_ok(&output);
-        assert_eq!(read(&t.path("destination")), data);
+        if descriptor && pull {
+            assert!(output.stdout == data, "descriptor pull contents differ");
+        } else {
+            assert!(
+                read(&t.path("destination")) == data,
+                "copy contents differ: pull={pull}, descriptor={descriptor}"
+            );
+        }
         let output = history_command(&t)
             .args(["tuning-cache", "export"])
             .run()
@@ -1894,7 +1916,7 @@ fn tuning_history_records_tcp_preflight_for_push_and_pull() {
             .iter()
             .filter(|r| r["event"]["kind"] == "tcp_preflight")
             .collect();
-        assert_eq!(probes.len(), 1);
+        assert_eq!(probes.len(), 1, "pull={pull}, descriptor={descriptor}");
         let probe = &probes[0]["event"]["data"];
         assert_eq!(probe["role"], if pull { "source" } else { "destination" });
         assert_eq!(probe["encrypted"], true);
