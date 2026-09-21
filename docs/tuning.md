@@ -86,10 +86,7 @@ Syq remembers useful starting worker counts from successful filesystem copies
 and continues adjusting as the next copy runs. History is matched to the route,
 filesystems, transport, and copy settings when that information is available.
 A remembered count is a starting point, not a fixed limit or a promise of the
-best speed for a different workload. During a copy, syq judges a worker-count
-change against its recent baseline rather than requiring it to match an earlier
-best speed. A clear upward gain allows further growth; an inconclusive increase
-keeps the extra workers but pauses growth. Reductions require a measured gain.
+best speed for a different workload.
 
 On macOS and Linux, remote-copy hints also distinguish local networks using
 available default-router hardware addresses, without requesting Wi-Fi location
