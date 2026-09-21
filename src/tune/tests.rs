@@ -1167,3 +1167,43 @@ fn network_keys_preserve_the_v060_legacy_map() {
     assert_eq!(cached_at(&path, &home), Some(8));
     assert_eq!(cached_at(&path, &office), Some(32));
 }
+
+#[test]
+fn upward_gain_uses_live_baseline_despite_higher_historical_scores() {
+    for (historical_count, age) in [(32, 0), (10, 0), (10, EVIDENCE_MAX_AGE + 1)] {
+        let mut p = Policy::refine(8, MIN, MAX);
+        measure(&mut p, 64.0);
+        assert_eq!(p.n, 10);
+        p.tick += age;
+        p.points.insert(
+            historical_count,
+            Point {
+                score: 100.0,
+                measured_at: p.tick - age,
+            },
+        );
+        p.fails[Direction::Up.index()] = 2;
+        measure(&mut p, 70.0);
+        assert_eq!(p.recommended(), 10);
+        assert_eq!(p.fails[Direction::Up.index()], 0);
+        assert!(p.n > 10, "a current gain must continue upward: {p:?}");
+        assert_eq!(p.probe_base(), Some(70.0));
+    }
+}
+
+#[test]
+fn smaller_upward_gain_does_not_resume_growth_below_old_high_water() {
+    let mut p = Policy::refine(8, MIN, MAX);
+    measure(&mut p, 64.0);
+    p.points.insert(
+        32,
+        Point {
+            score: 100.0,
+            measured_at: p.tick,
+        },
+    );
+    measure(&mut p, 66.0);
+    assert_eq!(p.n, 10);
+    assert_eq!(p.recommended(), 8);
+    assert!(matches!(p.state, State::Hold));
+}
