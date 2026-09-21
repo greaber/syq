@@ -1765,7 +1765,14 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     assert!(fs.is_some(), "test filesystem did not provide an identity");
     db.execute("UPDATE runs SET eligible=1,workers=3", [])
         .unwrap();
-    assert_output_ok(&copy("second", &[]));
+    let copy_with_hint = |name: &str, controls: &[&str]| {
+        // Even these small copies can complete a tuning comparison on a slow
+        // host. Keep later results from superseding the seeded run under test.
+        db.execute("UPDATE runs SET eligible=0 WHERE id!=1", [])
+            .unwrap();
+        copy(name, controls)
+    };
+    assert_output_ok(&copy_with_hint("second", &[]));
     assert!(startup_doubling(2));
     let event: String = db
         .query_row(
@@ -1777,7 +1784,10 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     let event: serde_json::Value = serde_json::from_str(&event).unwrap();
     assert_eq!(event["data"]["workers"], 3);
     assert_eq!(event["data"]["hint"]["matched"], "filesystems");
-    assert_output_ok(&copy("capped", &["--resource-limits", "workers=2"]));
+    assert_output_ok(&copy_with_hint(
+        "capped",
+        &["--resource-limits", "workers=2"],
+    ));
     assert!(startup_doubling(3));
     let event: String = db
         .query_row(
@@ -1788,7 +1798,10 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
         .unwrap();
     let event: serde_json::Value = serde_json::from_str(&event).unwrap();
     assert_eq!(event["data"]["workers"], 2);
-    assert_output_ok(&copy("fixed", &["--performance-tuning", "workers=1"]));
+    assert_output_ok(&copy_with_hint(
+        "fixed",
+        &["--performance-tuning", "workers=1"],
+    ));
     let event: String = db
         .query_row(
             "SELECT data FROM events WHERE run=4 AND json_extract(data,'$.kind')='starting_count'",
@@ -1805,11 +1818,11 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
         [],
     )
     .unwrap();
-    assert_output_ok(&copy("confirmed", &[]));
+    assert_output_ok(&copy_with_hint("confirmed", &[]));
     assert!(!startup_doubling(5));
     // Clamping a strong count changes the starting point; don't transfer its
     // confidence to a lower count that was not measured as the plateau.
-    assert_output_ok(&copy(
+    assert_output_ok(&copy_with_hint(
         "confirmed-capped",
         &["--resource-limits", "workers=2"],
     ));
