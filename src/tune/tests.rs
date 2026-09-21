@@ -1086,3 +1086,44 @@ fn recommendation_changes_only_with_justified_growth_or_reduction() {
     policy.cancel_unapplied();
     assert_eq!(policy.recommended(), lower);
 }
+
+#[test]
+fn ceiling_does_not_prevent_upward_recovery_after_descending() {
+    let mut p = Policy::new(MAX, MIN, MAX);
+    for _ in 0..200 {
+        // A sharp optimum between the geometric steps on the way down.
+        let rate = if p.n <= 12 {
+            p.n as f64 / 12.0
+        } else {
+            12.0 / p.n as f64
+        };
+        measure(&mut p, rate * 100.0);
+    }
+    assert!(
+        p.history.contains(&12),
+        "never explored optimum: {:?}",
+        p.history
+    );
+}
+
+#[test]
+fn floor_does_not_prevent_downward_recovery_after_growing() {
+    let mut p = Policy::refine(1, 1, 4);
+    // Reaching the lower boundary must not permanently disable this direction.
+    assert!(!p.begin(Direction::Down, 100.0));
+    for _ in 0..20 {
+        let rate = p.n as f64 * 100.0;
+        measure(&mut p, rate);
+    }
+    assert_eq!(p.settled(), 4);
+    let after_growth = p.history.len();
+    // All counts now provide the same rate; downward probes should resume.
+    for _ in 0..200 {
+        measure(&mut p, 100.0);
+    }
+    assert!(
+        p.history[after_growth..].iter().any(|&n| n < 4),
+        "never resumed downward probing: {:?}",
+        p.history
+    );
+}
