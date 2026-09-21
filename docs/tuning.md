@@ -71,28 +71,22 @@ request budget's full tuning range.
 For S3 streams, see [Descriptor copies](object-storage.md#descriptor-copies)
 for buffering and upload-size limits. S3 tuning is not saved between runs.
 
+Large unfiltered prefix copies, current-object removals, and destination scans
+for pruning can list subtrees concurrently. Discovery may use extra LIST
+requests; selectors still name literal keys and prefixes. For copies,
+`--performance-tuning s3-max-concurrent-parts-per-object=N` also caps unfiltered
+discovery; setting `N=1` keeps flat pagination. If a policy denies discovery, these operations retry with flat
+pagination at the original prefix.
+
 <a id="s3-streams"></a>
 
 ## Remembered connection counts
 
-Syq first looks for a previous successful, measured worker count for the same
-source and destination filesystems, direction, transport, and copy settings.
-This also works for local copies. Filesystem identities are best-effort hints
-reported by the operating system; syq uses the selected roots and marks a run
-as mixed if planning observes other filesystems. Unknown or mixed filesystems
-can use a route-level hint for remote copies. SSH, encrypted TCP, and plaintext
-TCP histories are separate. Destination hints come from existing filesystem
-inspection responses; some restricted routes and copies onto existing individual
-files do not provide them. Local copies without both filesystem hints use the
-normal starting count.
-
-Without a matching history result, remote copies can use the older connection
-cache, then fall back to 8 workers over SSH or 16 over TCP. Local copies start
-with 32 workers, or 16 when at most two CPUs are available. Startup can reduce
-these counts when there is little parallel work. A remembered count is a starting
-guess; syq keeps exploring quickly unless a successful transfer closely matches
-the current filesystems and settings and measured a throughput plateau. Live
-tuning continues unless you fix `workers`.
+Syq remembers useful starting worker counts from successful filesystem copies
+and continues adjusting as the next copy runs. History is matched to the route,
+filesystems, transport, and copy settings when that information is available.
+A remembered count is a starting point, not a fixed limit or a promise of the
+best speed for a different workload.
 
 On macOS and Linux, remote-copy hints also distinguish local networks using
 available default-router hardware addresses, without requesting Wi-Fi location
@@ -101,32 +95,20 @@ they cannot detect changes upstream of a phone hotspot. Linux currently reads
 IPv4 routers; macOS also reads IPv6 routers. If the network cannot be identified,
 syq uses its existing route and filesystem matches. Hints without network
 context remain available for that fallback; a known network starts its own
-history. Local-copy hints are unchanged.
+history. Local-copy hints are unchanged. A change of transport or observed
+network context during a copy prevents saving a new hint for its initial path.
 
-Supplying `--performance-tuning` bypasses remembered counts and does not publish
-a new recommendation. With `--resource-limits workers=N`, syq clamps the starting
-count and leaves recommendations unchanged. Bandwidth-limited runs have separate
-history matches. Only successful runs with a completed worker-count comparison
-can supply a recommendation; a short run's ending count is not treated as an
-optimum. A change of data transport or observed network context during the copy also prevents publication.
+`--performance-tuning` bypasses remembered counts and does not save a new
+recommendation. `--resource-limits workers=N` caps the starting count while
+leaving recommendations unchanged.
 
 The older cache remains at `~/.cache/syq/tuning.json`, in its existing format.
 `SYQ_TUNING_CACHE` names another file; an empty value disables both this cache
 and the history below. `XDG_CACHE_HOME` changes their parent directory.
 
-When an increase gives similar throughput, syq keeps the extra workers and
-pauses growth; later experiments can reduce the count. That inconclusive
-increase does not raise the starting count remembered for future copies. A
-downward experiment is kept only when it measures higher throughput than the
-previous count; equal or slower results restore the previous count.
-When tuning reduces the worker count, connected workers wait without taking new
-work. Syq keeps connections available during an experiment so it can promptly
-restore the previous count. It also prepares likely increases ahead of time,
-using observed connection setup times to allow a margin. During longer waits
-between experiments, surplus connections can close and reopen nearer the next
-probe. Setup can still delay an increase if it takes longer than expected.
-Idle connections and their helper processes hold resources; the active worker
-count is not a count of open connections.
+Syq can keep idle connections ready for later tuning changes. These connections
+and their helper processes still use resources, so the active worker count is
+not a count of open connections.
 
 ## Inspect tuning history
 

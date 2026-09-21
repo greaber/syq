@@ -1,10 +1,28 @@
 <a id="syq-for-python"></a>
+<a id="python-sdk"></a>
+<a id="guide-and-examples"></a>
 
-# Guide and examples
+# Python
 
-Use the `syq` package to call syq from Python. See
-[installation](https://greaber.github.io/syq/python.html#install) if you have not
-installed it yet.
+Copy, remove, and reorganize files with typed results and streaming events.
+Synchronous and asyncio clients are available.
+
+<a id="preview-a-copy"></a>
+
+## Install
+
+The [syq package on PyPI](https://pypi.org/project/syq/) supports Python 3.13.4+
+on Linux and macOS:
+
+```sh
+python -m pip install syq
+```
+
+Prebuilt wheels include the matching syq executable, so no Rust compiler or
+separate syq installation is needed. The `syq` command is also available in
+the Python environment.
+
+<a id="try-a-copy"></a>
 
 ## Copy files
 
@@ -173,7 +191,7 @@ aborts it. The reader checks transfer success when its `with` block exits,
 reading any bytes your code left unread. To cancel instead, call `abort()`.
 If you extract or publish files from a stream, wait for both decoding and the
 reader context to finish successfully before making those files available.
-See [Byte streams](https://greaber.github.io/syq/python-reference.html#byte-streams)
+See [Byte streams](https://greaber.github.io/syq/python-streams.html#byte-streams)
 for wrappers, explicit completion, and async behavior.
 
 For several generated files, put producers in a mapping. syq starts them as
@@ -193,7 +211,7 @@ syq.cp(mapping=[syq.MappingEntry(syq.StreamSource(partial(pack, name)), f"{name}
 
 A `StreamDestination(consumer)` receives downloaded bytes in the same way.
 Archive formats belong to your callback.
-See [Callback mappings](https://greaber.github.io/syq/python-reference.html#callback-mappings)
+See [Callback mappings](https://greaber.github.io/syq/python-streams.html#callback-mappings)
 for completion, retries, and async callbacks.
 
 ## Use asyncio
@@ -243,7 +261,7 @@ result = client.cp("data", into="backup", timeout=None)
 
 To use an existing executable, pass `Client(executable="/opt/bin/syq")`.
 This bypasses the bundled version; see
-[Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility).
+[Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility).
 
 <a id="native-api-reference"></a>
 
@@ -258,8 +276,9 @@ print(result.stdout.decode())
 
 Use it for commands without a typed method, including `rsync` and receiver
 administration. See the
-[API reference](https://greaber.github.io/syq/python-reference.html) for process
-options and exceptions.
+[operations reference](https://greaber.github.io/syq/python-operations.html) for
+process options and [Results and events](https://greaber.github.io/syq/python-results.html#failure-model)
+for exceptions.
 
 To request a command on your receiving machine, use the syq executable you use
 for receiving:
@@ -278,3 +297,11 @@ print(result.stdout.decode())
 This captures output and raises on a nonzero exit. The receiving machine asks
 for approval before running the command. See
 [Run commands on your receiving machine](https://greaber.github.io/syq/receive.html#run-commands-on-your-laptop).
+
+## Building from source
+
+Installing from a source distribution builds the executable and requires Rust
+and a C compiler. Source builds upload themselves to compatible SSH hosts by
+default. See
+[source builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for
+compiler requirements and SSH helper selection.

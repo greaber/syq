@@ -1,3 +1,4 @@
+<!-- ANCHOR: operations-title -->
 <a id="python-native-api"></a>
 
 <a id="positioning"></a>
@@ -6,7 +7,11 @@
 
 <a id="product-readiness"></a>
 
+<!-- ANCHOR_END: operations-title -->
+
 # API reference
+
+<!-- ANCHOR: operations -->
 
 Module functions `syq.cp`, `syq.rm`, `syq.map`, `syq.open_reader`, and
 `syq.open_writer` use a default `Client`.
@@ -14,6 +19,11 @@ Module functions `syq.cp`, `syq.rm`, `syq.map`, `syq.open_reader`, and
 except `map`, `open_reader`, and `open_writer`, which return async context managers.
 
 <a id="synchrony-asyncio-and-resource-ownership"></a>
+
+For generated data and entry transformations, see
+[Streams and mappings](https://greaber.github.io/syq/python-streams.html).
+For returned objects, callbacks, and errors, see
+[Results and events](https://greaber.github.io/syq/python-results.html).
 
 ## Client and executable selection
 
@@ -31,7 +41,7 @@ and `AsyncClient(...)` accept:
 `client.version()` returns the executable version as text.
 `syq.version(executable=None)` does the same without a client.
 `syq.managed_executable(cache_dir=None)` returns the verified executable path,
-downloading it if needed. See [Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility) for version selection and caching.
+downloading it if needed. See [Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility) for version selection and caching.
 
 <a id="the-native-vocabulary-is-the-python-vocabulary"></a>
 
@@ -65,7 +75,7 @@ filesystem and remote checks happen in syq.
 
 ## cp
 
-`cp(*sources, **options)` → [CpResult](https://greaber.github.io/syq/python-reference.html#cpresult) copies files. Choose one placement option unless every destination is a callback.
+`cp(*sources, **options)` → [CpResult](https://greaber.github.io/syq/python-results.html#cpresult) copies files. Choose one placement option unless every destination is a callback.
 In addition to the shared arguments above, it accepts:
 
 | Options | Values / purpose |
@@ -96,7 +106,7 @@ In addition to the shared arguments above, it accepts:
 | `tcp_ports`, `tcp_congestion` | Port range and congestion-control strings |
 | `receiver_max_entries`, `receiver_max_bytes` | Receiver ceilings: integer entries, native size string or integer bytes |
 | `receiver_receipt` | `"sizes"` or `"hashes"` |
-| `on_event`, `results`, `check` | See events and failures below |
+| `on_event`, `results`, `check` | See [events and failures](https://greaber.github.io/syq/python-results.html) |
 
 Option behavior is covered in [Copy files](https://greaber.github.io/syq/reference.html),
 [Remote copy details](https://greaber.github.io/syq/remote-reference.html),
@@ -113,7 +123,7 @@ are not supported. S3 results use `EndpointKind.S3`.
 copies or commands, use `syq persist connect server` and omit `pscope`. See
 [persistence in scripts](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes)
 for setup and cleanup, and
-[Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility)
+[Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility)
 for executable selection.
 
 Typed SSH-to-SSH copies require an enrolled receiver or
@@ -123,7 +133,9 @@ Typed SSH-to-SSH copies require an enrolled receiver or
 `IgnoreFrom(path)` is a frozen dataclass holding a rule-file path (`str`,
 `bytes`, or `os.PathLike`). To interleave rule files and inline patterns:
 `ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`. The last matching rule wins.
+<!-- ANCHOR_END: operations -->
 
+<!-- ANCHOR: streams -->
 ## Byte streams
 
 `client.open_writer(*, as_=None, as_new=None, as_existing=None, to=None,
@@ -240,7 +252,9 @@ transfer process and releases blocked I/O. `AsyncStreamReader` and
 `AsyncStreamWriter` expose async `read`/`write`, `close`, and `abort` methods.
 `AsyncStreamWriter.commit()` explicitly publishes, with the same semantics
 as its synchronous counterpart; successful async context exit commits automatically.
+<!-- ANCHOR_END: streams -->
 
+<!-- ANCHOR: removal -->
 <a id="removal"></a>
 
 ## rm
@@ -254,7 +268,7 @@ always unlinked. Both `follow_src=True` and `follow=True` permit symlinks in
 Directory and contents selectors reject a final symlink even with following
 enabled.
 
-`rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-reference.html#rmresult) removes selected entries. Besides the shared
+`rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-results.html#rmresult) removes selected entries. Besides the shared
 arguments, it accepts `on`, `dry_run`, `performance_tuning`, `syq_path`,
 `no_bootstrap`, `pscope`, `on_event`, `results`, and `check` with the types above.
 It supports local, ordinary SSH, and S3 endpoints. Command-restricted receivers
@@ -266,7 +280,9 @@ removes all selected versions and delete markers; `s3_version_id="ID"` selects
 one version of one exact key. These options are mutually exclusive.
 `RemovalTrace` and `RemovalResult` expose optional `s3_version_id` and
 `s3_delete_marker` fields. The same arguments work with `AsyncClient.rm`.
+<!-- ANCHOR_END: removal -->
 
+<!-- ANCHOR: mappings -->
 <a id="complete-input-guarantee"></a>
 
 <a id="mapping-transformation-and-copy"></a>
@@ -466,8 +482,10 @@ Both types are immutable and provide:
 
 `RelativePath` also implements `os.PathLike`, returning bytes.
 
-<a id="retry-data-not-automatic-retry-policy"></a>
+<!-- ANCHOR_END: mappings -->
 
+<!-- ANCHOR: results -->
+<a id="retry-data-not-automatic-retry-policy"></a>
 ## Events and terminal results
 
 `cp` and `rm` return frozen dataclasses after validating the complete results
@@ -628,7 +646,7 @@ endpoints: tuple[Endpoint, ...]
 Sampled progress for displays; use the terminal result for final totals.
 Byte fields measure file content,
 `scanned` counts scanned entries, and `elapsed_ms` is milliseconds. Optional
-`activity` contains [diagnostic measurements](https://greaber.github.io/syq/automation.html#progress)
+`activity` contains [diagnostic measurements](https://greaber.github.io/syq/performance-measurements.html)
 when the producer collects them; otherwise it is `None`.
 Optional `rate_bytes_per_second` and `eta_ms` provide rate and remaining-time
 estimates; use final byte counts and elapsed time for completed-run measurements.
@@ -854,7 +872,9 @@ These exceptions are not wrapped in `SyqError`.
 Timeout, cancellation, early mapping exit, and streaming failures stop the
 local process group, including SSH children. Filesystem changes already
 completed are not rolled back.
+<!-- ANCHOR_END: results -->
 
+<!-- ANCHOR: execution -->
 <a id="deliberate-exclusions"></a>
 
 <a id="raw-execution"></a>
@@ -862,7 +882,7 @@ completed are not rolled back.
 ## run
 
 `client.run(args, *, check=True, cwd=None, env=None, timeout=CLIENT_DEFAULT, input=None)`
-returns [Result](https://greaber.github.io/syq/python-reference.html#result). `input` accepts bytes. `args` is a sequence of arguments
+returns [Result](https://greaber.github.io/syq/python-operations.html#result). `input` accepts bytes. `args` is a sequence of arguments
 after the executable name, passed without a shell.
 
 Here, `cwd` is the local subprocess directory. `cwd` and `env` use client
@@ -889,7 +909,7 @@ its timeout. Async cancellation still stops mapping-input preparation.
 For `syq exec`, pass `--cwd` in the argument list to select the receiving
 working directory. The SDK's `cwd=` parameter selects the local working
 directory of the requesting process. See the
-[command example](https://greaber.github.io/syq/python-guide.html#run-other-commands).
+[command example](https://greaber.github.io/syq/python.html#run-other-commands).
 
 ### Result
 
@@ -939,3 +959,4 @@ Use `Client(cache_dir=...)` to change the cache root, or
 and verification, so you are responsible for compatibility and origin. Typed
 calls still validate automation output. A failed executable selection does not
 fall back to another binary.
+<!-- ANCHOR_END: execution -->

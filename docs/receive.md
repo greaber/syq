@@ -131,7 +131,7 @@ Downloads confined to that directory need no approval; downloads elsewhere ask.
 `--root`, if configured, remains a hard boundary even with approval.
 Automatic approval trusts all processes running as the connected server accounts,
 including for overwrites inside that directory. You can
-[limit a profile to particular servers](#different-settings-for-different-servers).
+[limit a profile to particular servers](persistence-reference.md#choose-allowed-servers).
 
 Commands on your laptop, authorization for copies between servers, and
 storage authorization require approval every time. See
@@ -198,39 +198,4 @@ command running until completion. See
 [Authorization selection](remote-reference.md#authorization-selection) for
 automatic selection, other authorizers, and supported options.
 
-## Multiple receiving profiles
-
-Give a project its own receiving name and directory:
-
-```sh
-syq persist receive on --name project --root ~/work/project
-syq persist connect server
-```
-
-Then run `syq cp results --to @project` on the server. The directory must already
-exist. Each name has its own settings and approval policy, so you can keep a
-project separate from your general `laptop` destination.
-
-Use `syq persist receive status` to list profiles and
-`syq persist receive off --name project` to stop one. See
-[Names and profiles](persistence-reference.md#names-and-profiles) for more options
-and for moving a name to another laptop.
-
-### Different settings for different servers
-
-By default, each enabled profile is available through every connected server.
-To give a particular server its own inbox:
-
-```sh
-mkdir -p ~/Downloads/work
-syq persist receive on --name work-inbox --server work \
-  --auto-approve-root ~/Downloads/work
-syq persist connect work
-```
-
-On `work`, download with `syq cp results --to @work-inbox`. Other connections
-cannot use that profile. Your general profile can still ask for approval on
-every download. Repeat `--server` to allow several connections, or use
-`--all-servers` to remove the restriction. See the
-[profile reference](persistence-reference.md#names-and-profiles) for how SSH
-destination names match.
+See [Multiple profiles and server-specific settings](persistence-reference.md#names-and-profiles).

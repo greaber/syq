@@ -4,7 +4,7 @@ List the files, change their destination names, then copy them. `syq map`
 produces the list, a script changes it, and `syq cp --mapping` makes the copy.
 
 For Python scripts, see the [Python SDK](python.md) and its
-[mapping examples](python-guide.md).
+[mapping examples](python.md).
 
 ## Lowercase destination names
 
