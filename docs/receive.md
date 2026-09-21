@@ -21,11 +21,6 @@ It needs no SSH server, public address, or incoming network port.
 
 ## Set up receiving
 
-<a id="ssh-setup"></a>
-<a id="persistence-in-scripts"></a>
-<a id="updating-receiving-connections"></a>
-<a id="background-connections"></a>
-
 Receiving starts automatically when syq opens a persistent SSH connection,
 unless you have turned it off or restricted its profiles to other servers.
 To enable persistence and connect to a server now, run this on your laptop

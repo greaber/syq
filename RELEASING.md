@@ -37,11 +37,10 @@ registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.
    environment `release`. Do not put a long-lived crates.io token in GitHub
    secrets. After the first automated publication succeeds, enable
    trusted-publishing-only mode on crates.io and revoke the bootstrap token.
-5. The encrypted inventory initializer generates a dedicated SSH deploy key
-   for `greaber/homebrew-tap`. The sync installs its public half on that
-   repository with write access and places only its private half in the
-   protected `release` environment. It has no access to the syq repository or
-   to any other repository in the account.
+5. Create a dedicated SSH deploy key for `greaber/homebrew-tap`. Install its
+   public half on that repository with write access and supply its private
+   half as `HOMEBREW_TAP_DEPLOY_KEY` in the protected `release` environment.
+   Keep this key scoped to the tap repository.
 
 <a id="encrypted-release-inventory"></a>
 
@@ -358,7 +357,7 @@ preparing the SDK manually, run that command with Nix installed and the native
 release tag fetched, and commit the pin alongside the SDK changes.
 
 `scripts/build-python-dist.sh OUTPUT_DIRECTORY` builds the same artifacts as
-the Python publisher. See [reproducing Python distributions](docs/development.md#reproduce-a-python-distribution)
+the Python publisher. See [reproducing Python distributions](CONTRIBUTING.md#reproduce-a-python-distribution)
 for the locked recipe and optional rebuild comparison. Updating the native pin
 or build inputs changes future outputs; it does not reproduce packages published
 with an earlier recipe.
