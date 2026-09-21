@@ -86,6 +86,10 @@ IPv6 addresses, with the address SSH connected to first. If that data address
 is unreachable, syq can try another advertised address on the same receiver.
 Loopback and link-local addresses are excluded from discovery; an address
 already used by SSH is still included when the data listener supports its family.
+Linux and macOS advertise link rates when their network drivers expose them;
+macOS uses the current Wi-Fi transmit rate or the active Ethernet link rate.
+These describe the local interface and do not measure throughput to the other
+machine. Unavailable rates remain unknown.
 When link speeds are unknown, syq selects the first reachable address in priority
 order without waiting for lower-priority probes. Verbose diagnostics mark any
 unfinished probes as untested. Known-speed multipath still waits for all probes

@@ -1,6 +1,7 @@
 //! Darwin enumeration must stay in-process: spawning while the receiver is
 //! accepting SCM_RIGHTS can leak a descriptor before it becomes close-on-exec.
 use super::InterfaceAddress;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -36,6 +37,7 @@ fn enumerate() -> io::Result<Vec<InterfaceAddress>> {
     // Failure leaves IPv4 and the independently preserved SSH address usable.
     let ipv6 = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None).ok();
     let mut addresses = Vec::new();
+    let mut speeds = HashMap::new();
     let mut next = list.0;
     while !next.is_null() {
         // SAFETY: list owns every node, name and sockaddr for this traversal.
@@ -67,16 +69,34 @@ fn enumerate() -> io::Result<Vec<InterfaceAddress>> {
             }
             _ => continue,
         };
+        let speed_mbps = *speeds
+            .entry(name.to_owned())
+            .or_insert_with(|| interface_speed(name));
         addresses.push(InterfaceAddress {
             name: name.to_string_lossy().into_owned(),
             ip,
-            // getifaddrs exposes a 32-bit baud rate, which cannot reliably
-            // describe modern fast NICs. Preserve the existing unknown-speed
-            // behavior instead of ranking paths by a truncated estimate.
-            speed_mbps: 0,
+            speed_mbps,
         });
     }
     Ok(addresses)
+}
+
+unsafe extern "C" {
+    fn syq_macos_link_speed(name: *const libc::c_char) -> f64;
+}
+
+fn interface_speed(name: &CStr) -> u32 {
+    // SAFETY: name is NUL-terminated and lives throughout the native call.
+    // The bridge returns Mbps, with zero for unavailable/inactive interfaces.
+    speed_mbps(unsafe { syq_macos_link_speed(name.as_ptr()) })
+}
+
+fn speed_mbps(rate: f64) -> u32 {
+    if rate.is_finite() && rate > 0.0 && rate <= u32::MAX as f64 {
+        rate as u32
+    } else {
+        0
+    }
 }
 
 fn ipv6_address_flags(
@@ -128,6 +148,29 @@ mod tests {
             .any(|a| a.ip == IpAddr::V4(Ipv4Addr::LOCALHOST)));
         // IPv6 discovery intentionally degrades to an empty result if its
         // socket or address-flag query is unavailable on this host.
+    }
+
+    #[test]
+    fn link_speeds_keep_fast_and_fractional_rates_without_wrapping() {
+        for (rate, expected) in [
+            (5.5, 5),
+            (1000.0, 1000),
+            (2500.0, 2500),
+            (10000.0, 10000),
+            (100000.0, 100000),
+            (400000.0, 400000),
+        ] {
+            assert_eq!(speed_mbps(rate), expected);
+        }
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY, u32::MAX as f64 + 1.0] {
+            assert_eq!(speed_mbps(rate), 0);
+        }
+    }
+
+    #[test]
+    fn link_speed_is_unknown_for_loopback_and_absent_interfaces() {
+        assert_eq!(interface_speed(c"lo0"), 0);
+        assert_eq!(interface_speed(c"syq-no-iface"), 0);
     }
 
     #[test]
