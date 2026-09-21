@@ -249,7 +249,7 @@ If the producer fails halfway through, syq can still successfully save the
 bytes it received: EOF does not tell it whether the producer succeeded.
 Bash's `set -o pipefail` detects failures in a pipeline but cannot undo a file
 already saved. Process substitution needs a separate check of the producer's
-status. In Python, [managed streams](https://greaber.github.io/syq/python-reference.html#byte-streams) let you commit
+status. In Python, [managed streams](https://greaber.github.io/syq/python-streams.html#byte-streams) let you commit
 only after your producer succeeds.
 
 An output descriptor may contain incomplete data after a failure. Check syq's

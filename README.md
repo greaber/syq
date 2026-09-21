@@ -16,7 +16,7 @@ Quick links to docs for common tasks:
   Your laptop needs no SSH server or incoming network port.
 - [Run commands on your laptop from a server](https://greaber.github.io/syq/receive.html#run-commands-on-your-laptop)
 - [Copy directly between servers without forwarding your SSH agent](https://greaber.github.io/syq/remote-to-remote.html)
-- [Copy to, from, and between S3-compatible buckets](https://greaber.github.io/syq/reference.html#copy-over-the-network)
+- [Copy to, from, and between S3-compatible buckets](https://greaber.github.io/syq/object-storage.html)
 - [Rename and reorganize files during a copy](https://greaber.github.io/syq/mappings.html)
 - Script syq using structured results or the
   [Python SDK](https://greaber.github.io/syq/python.html).

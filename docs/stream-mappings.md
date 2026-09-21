@@ -2,7 +2,7 @@
 
 A program can supply or consume several byte streams in one `syq cp` process.
 Entries share transfer connections and resource limits. This is the subprocess
-interface used by [Python callback mappings](https://greaber.github.io/syq/python-reference.html#callback-mappings).
+interface used by [Python callback mappings](https://greaber.github.io/syq/python-streams.html#callback-mappings).
 Ordinary shell pipelines use [`--src-fd` or `--as-fd`](commands/cp.md#file-descriptors).
 
 ## Start a session

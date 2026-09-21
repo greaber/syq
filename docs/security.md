@@ -67,15 +67,6 @@ policy for following links in supplied paths differs:
 | Rsync 3.5.0 or `syq rsync` | The link belongs to root or the process's effective user, or `--insecure-links` is set (local paths only in `syq rsync`) |
 | Native syq | You explicitly request following with the applicable follow option above |
 
-Rsync's [ownership policy](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md#symlink-defense-for-operator-supplied-paths)
-trusts a root-owned link even if someone else moved it there. Where directory
-permissions allow that move, a relative link can point somewhere new without
-changing its owner. Rsync can therefore follow a trusted-owner link placed by
-an untrusted user. This is why native syq requires an explicit follow option;
-`syq rsync` retains rsync's policy for compatibility. See the
-[rename rules](https://man7.org/linux/man-pages/man2/rename.2.html) for which moves
-filesystem permissions permit.
-
 <a id="limits-to-keep-in-mind"></a>
 <a id="privileged-copies-and-hard-links"></a>
 

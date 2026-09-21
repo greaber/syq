@@ -81,42 +81,20 @@ SSH endpoints use `[USER@]HOST[:PORT]`, for example `alice@server:2222`.
 Enclose IPv6 addresses in brackets: `alice@[2001:db8::1]:2222`.
 A colon in a native path is simply part of the path.
 
-For TCP data connections, Linux and macOS receivers advertise usable IPv4 and
-IPv6 addresses, with the address SSH connected to first. If that data address
-is unreachable, syq can try another advertised address on the same receiver.
-Loopback and link-local addresses are excluded from discovery; an address
-already used by SSH is still included when the data listener supports its family.
-Linux and macOS advertise link rates when their network drivers expose them;
-macOS uses the current Wi-Fi transmit rate or the active Ethernet link rate.
-These describe the local interface and do not measure throughput to the other
-machine. Unavailable rates remain unknown.
-When link speeds are unknown, syq selects the first reachable address in priority
-order without waiting for lower-priority probes. Verbose diagnostics mark any
-unfinished probes as untested. With known speeds, syq uses reachable paths
-reporting at least half the fastest reachable rate. It waits for probes that
-could join or improve that set, within their timeout, and stops waiting for
-the rest.
+For TCP data connections, syq can try other addresses advertised by the same
+receiver if the initial address is unreachable. See
+[TCP access](server-tuning.md#make-tcp-reachable) if copies fall back to SSH.
 
 Use `--to @NAME` to send local source files to a registered receiving machine.
 The `@` is required: `--to laptop` selects an SSH destination, while
 `--to @laptop` selects your connected receiving machine.
 See [Use your laptop from a server](receive.md) for setup and destination paths.
 
-Use S3 buckets with the same selectors and placement options:
-
-```sh
-syq cp photos --to s3://backups --into laptop
-syq cp --from s3://backups laptop/photos --into restored
-syq cp --from s3://backups --srcs-in laptop --to s3://archive --into laptop
-```
-
-See [S3 options and behavior](object-storage.md) for credentials and filesystem differences.
+Use `--from s3://BUCKET` or `--to s3://BUCKET` for object storage. See
+[Use S3 storage](object-storage.md) for credentials, examples, and filesystem
+differences.
 
 For two SSH endpoints, see [Copy between servers](remote-to-remote.md).
-
-On Linux, TCP data-address discovery includes IP over InfiniBand (IPoIB)
-interfaces. Their addresses undergo the same reachability and reported-speed
-selection as other interfaces.
 
 ### Transport compression
 

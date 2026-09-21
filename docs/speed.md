@@ -83,7 +83,7 @@ and process CPU. These wait fractions
 help locate delays; they are not proof of their cause. Add `--results run.ndjson`
 to inspect how worker waits, endpoint operations, CPU and TCP backpressure change
 over time. Remote evidence includes its age. See the
-[`progress`](automation.md#progress) record for interpretation and limitations.
+[performance measurements](performance-measurements.md) reference for interpretation and limitations.
 
 | Symptom | Try |
 |---|---|

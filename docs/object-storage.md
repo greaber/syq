@@ -1,12 +1,13 @@
 <a id="copy-to-and-from-object-storage"></a>
 
-# S3 options and behavior
+<a id="s3-options-and-behavior"></a>
+
+# Use S3 storage
 
 Use buckets with [`cp`](commands/cp.md) and [`rm`](commands/rm.md):
 `--from s3://BUCKET`, `--to s3://BUCKET`, or `--on s3://BUCKET`.
 Selectors and placement options name keys within the bucket.
-For examples, see [Copy over the network](reference.md#copy-over-the-network)
-and [On another machine](remove.md#on-another-machine).
+The bucket must already exist.
 
 <a id="credentials-and-providers"></a>
 <a id="parallelism"></a>
@@ -23,38 +24,35 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
 
 See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
-Large unfiltered prefix copies, current-object removals, and destination scans
-for pruning can list subtrees concurrently. Discovery may use extra LIST
-requests; selectors still name literal keys and prefixes. For copies,
-`--performance-tuning s3-max-concurrent-parts-per-object=N` also caps unfiltered
-discovery; setting `N=1` keeps flat pagination. If a policy denies discovery, these operations retry with flat
-pagination at the original prefix.
 
-## Authorize from your laptop
-
-Add `--auth-from @NAME` to an S3 `cp` or `rm` command to use credentials on a
-connected [receiving machine](receive.md#set-up-receiving).
-`--s3-profile` selects a profile there:
+## Upload and download
 
 ```sh
-syq cp results --to s3://my-bucket --into runs \
-  --auth-from @laptop --s3-profile storage
+syq cp photos --to s3://backups --into laptop
+syq cp --from s3://backups laptop/photos --into restored
 ```
 
-Approve on your laptop, then wait for **storage authorization ready** before
-disconnecting. Data travels directly between the server and storage.
-Authorization lasts up to seven days, subject to credentials and provider
-policies; restarting requires fresh approval. Both machines need the same syq
-build. See [Storage authorization](security.md#storage-authorization) for the
-security implications.
+The first command copies `photos` under `laptop/photos` in the bucket; the
+second downloads it into `restored/photos`. Add `--dry-run` to preview either
+copy. Use `--srcs-in` when you want a directory or prefix's contents instead
+of its name. See [Copy files](reference.md) for placement and filtering.
+
+To copy between buckets in the same service:
+
+```sh
+syq cp --from s3://backups --srcs-in laptop --to s3://archive --into laptop
+```
+
+For removal examples, see [Remove files](remove.md#on-another-machine).
+Read [Versions and deletion](#versions-and-deletion) before deleting versioned
+objects.
 
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>
 
 ## Filesystem differences
 
-- **Buckets and prefixes:** the bucket must already exist. Keys must be relative
-  UTF-8 paths. A named source selects an exact object if present, otherwise its
+- **Buckets and prefixes:** keys must be relative UTF-8 paths. A named source selects an exact object if present, otherwise its
   `NAME/` prefix. Use `--srcs-in` for prefix contents. A prefix exists when it
   contains objects, including an empty directory marker.
 - **Metadata:** syq stores timestamps, permissions, ownership, and symlinks in
@@ -74,6 +72,24 @@ Bucket-to-bucket copies run within one service, using the same endpoint, region,
 and credentials. They preserve metadata and tags. Changes to tags, encryption,
 or storage class alone do not trigger a copy. Content hashing and expected hashes
 are unsupported on this route.
+
+## Authorize from your laptop
+
+Add `--auth-from @NAME` to an S3 `cp` or `rm` command to use credentials on a
+connected [receiving machine](receive.md#set-up-receiving).
+`--s3-profile` selects a profile there:
+
+```sh
+syq cp results --to s3://my-bucket --into runs \
+  --auth-from @laptop --s3-profile storage
+```
+
+Approve on your laptop, then wait for **storage authorization ready** before
+disconnecting. Data travels directly between the server and storage.
+Authorization lasts up to seven days, subject to credentials and provider
+policies; restarting requires fresh approval. Both machines need the same syq
+build. See [Storage authorization](security.md#storage-authorization) for the
+security implications.
 
 <a id="shell-pipelines"></a>
 

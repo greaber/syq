@@ -19,7 +19,9 @@ additional-css = ["theme/copy-demo.css", "theme/tool-examples.css", "theme/brand
 additional-js = ["theme/docs.js", "theme/copy-demo.js", "theme/tool-examples.js", "theme/sidebar.js", "theme/controls.js"]
 
 [output.html.redirect]
-"sdk-compatibility.html" = "python-reference.html#compatibility"
+"python-guide.html" = "python.html"
+"sdk-compatibility.html" = "python-operations.html#compatibility"
 "development.html" = "https://github.com/greaber/syq/blob/master/CONTRIBUTING.md"
 "commands/stream.html" = "index.html"
 "exec.html" = "commands/exec.html"
+"python-reference.html" = "python-operations.html"

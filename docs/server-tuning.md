@@ -18,6 +18,9 @@ Allow the range in any cloud firewall too. Check the transport with
 TCP is blocked. To [Run the copy from a server](remote-to-remote.md#run-the-copy-from-a-server)
 with your laptop’s approval, direct encrypted TCP must be reachable.
 
+On Linux, syq can also discover TCP addresses on IP over InfiniBand (IPoIB)
+interfaces.
+
 ### Tailscale
 
 [Tailscale](https://tailscale.com/kb/1181/firewalls) can make servers reachable
