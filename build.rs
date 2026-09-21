@@ -6,6 +6,16 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn main() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        cc::Build::new()
+            .file("src/server/interfaces/link_speed.m")
+            .flag("-fobjc-arc")
+            .warnings_into_errors(true)
+            .compile("syq_macos_link_speed");
+        println!("cargo::rustc-link-lib=framework=Foundation");
+        println!("cargo::rustc-link-lib=framework=CoreWLAN");
+        println!("cargo::rerun-if-changed=src/server/interfaces/link_speed.m");
+    }
     println!("cargo::rerun-if-env-changed=SYQ_RELEASE_BUILD");
     println!("cargo::rerun-if-env-changed=SYQ_HELPER_RELEASE");
     let packaged = packaged_revision();

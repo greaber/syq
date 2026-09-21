@@ -2033,12 +2033,29 @@ fn collect_probe_results(
     while undetermined > 0 {
         // With unknown speeds, selection uses the first reachable candidate.
         // Once all earlier candidates are resolved, later probes cannot change
-        // that choice. Known-speed multipath still gets its full probe window.
+        // that choice.
         if unknown_speeds
             && candidates
                 .iter()
                 .find(|candidate| candidate.reachable != Some(false))
                 .is_some_and(|candidate| candidate.reachable == Some(true))
+        {
+            break;
+        }
+        let fastest = candidates
+            .iter()
+            .filter(|candidate| candidate.reachable == Some(true))
+            .map(|candidate| candidate.speed_mbps)
+            .max()
+            .unwrap_or(0);
+        // Once a known-speed path is reachable, selection only includes paths
+        // within 2x of the fastest. Wait for every unfinished candidate that
+        // could still join or improve that set; the rest cannot affect it.
+        if fastest > 0
+            && candidates
+                .iter()
+                .filter(|candidate| candidate.reachable.is_none())
+                .all(|candidate| candidate.speed_mbps.saturating_mul(2) < fastest)
         {
             break;
         }

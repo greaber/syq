@@ -1921,6 +1921,49 @@ fn known_speed_probe_keeps_waiting_for_multipath_candidates() {
 }
 
 #[test]
+fn known_speed_probe_skips_only_ineligible_candidates() {
+    // An unresolved higher-priority unknown-speed address cannot displace a
+    // reachable known-speed path. Nor can an interface below half its speed.
+    assert_eq!(
+        replay_probe_results(
+            &[0, 1000, 100],
+            &[&[0], &[1], &[2]],
+            &[(1, true), (0, true), (2, true)],
+        ),
+        [None, Some(true), None],
+    );
+    // The threshold moves only after the faster path actually connects.
+    assert_eq!(
+        replay_probe_results(
+            &[1000, 10000, 500],
+            &[&[0], &[1], &[2]],
+            &[(0, true), (1, true), (2, true)],
+        ),
+        [Some(true), Some(true), None],
+    );
+    // A failed faster candidate must not hide a usable slower one.
+    assert_eq!(
+        replay_probe_results(&[10000, 1000], &[&[0], &[1]], &[(0, false), (1, true)]),
+        [Some(false), Some(true)],
+    );
+}
+
+#[test]
+fn known_speed_probe_preserves_half_speed_boundary_without_overflow() {
+    for (fast, slow, should_wait) in [
+        (1000, 500, true),
+        (1001, 500, false),
+        (u32::MAX, u32::MAX / 2, false),
+        (u32::MAX, u32::MAX / 2 + 1, true),
+    ] {
+        assert_eq!(
+            replay_probe_results(&[fast, slow], &[&[0], &[1]], &[(0, true), (1, true)]),
+            [Some(true), should_wait.then_some(true)],
+        );
+    }
+}
+
+#[test]
 fn unsuccessful_probe_finishes_every_candidate_before_fallback() {
     assert_eq!(
         replay_probe_results(&[0, 0], &[&[0], &[1]], &[(1, false), (0, false)]),
