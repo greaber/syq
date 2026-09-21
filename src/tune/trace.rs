@@ -88,7 +88,11 @@ impl Trace {
         let reason = if comparisons != policy.comparisons {
             if policy.fails != fails && policy.fails.iter().sum::<u32>() > fails.iter().sum::<u32>()
             {
-                "probe_rejected"
+                if policy.n == old_n {
+                    "probe_inconclusive"
+                } else {
+                    "probe_rejected"
+                }
             } else {
                 "probe_accepted"
             }

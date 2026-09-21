@@ -391,9 +391,9 @@ fn trace_distinguishes_acceptance_rejection_and_pending_comparison() {
         &policy,
         &gate,
         "stable",
-        Some(120.0),
+        Some(80.0),
     );
-    trace.observe(&mut policy, 120.0, "stable");
+    trace.observe(&mut policy, 80.0, "stable");
     assert_eq!(policy.settled(), 10);
     trace.end(&policy, false);
     let events = command::read_events(&open(&path).unwrap(), writer.0.lock().unwrap().id).unwrap();
@@ -435,4 +435,30 @@ fn filesystem_tokens_can_be_related_across_transfer_directions() {
     assert_eq!(forward.source_filesystem, reverse.destination_filesystem);
     assert_eq!(forward.destination_filesystem, reverse.source_filesystem);
     assert_ne!(forward.source_filesystem, forward.destination_filesystem);
+}
+
+#[test]
+fn trace_records_inconclusive_upward_hold_without_claiming_a_plateau() {
+    use super::super::{trace::Trace, Policy};
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let writer = recorder(&path);
+    let mut policy = Policy::new(8, 1, 64);
+    let mut trace = Trace::new(Some(writer.clone()), &policy, super::super::SAMPLE);
+    trace.observe(&mut policy, 100.0, "stable");
+    policy.activated();
+    trace.observe(&mut policy, 100.0, "stable");
+    trace.end(&policy, false);
+    let events = command::read_events(&open(&path).unwrap(), writer.0.lock().unwrap().id).unwrap();
+    let decision = events
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "decision")
+        .unwrap();
+    assert_eq!(decision["data"]["reason"], "probe_inconclusive");
+    assert_eq!(decision["data"]["after"]["requested"], 16);
+    assert_eq!(decision["data"]["after"]["state"], "Hold");
+    let end = events.last().unwrap();
+    assert_eq!(end["data"]["completed_comparison"], true);
+    assert_eq!(end["data"]["discovery_complete"], false);
 }

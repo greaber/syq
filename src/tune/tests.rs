@@ -161,7 +161,7 @@ fn unsuccessful_doubling_refines_immediately_then_uses_normal_backoff() {
     assert!(!p.startup_doubling);
     measure(&mut p, 200.0); // 24 paid: refine the remaining 24..32 bracket
     assert_eq!(p.n, 28);
-    measure(&mut p, 200.0); // 28 does not pay: return to 24 and wait
+    measure(&mut p, 180.0); // 28 clearly hurts: return to 24 and wait
     assert_eq!(p.n, 24);
     assert!(matches!(p.state, State::Hold));
     assert!(p.due[Direction::Up.index()] > p.tick);
@@ -198,7 +198,7 @@ fn resume_worker_reset_preserves_cached_and_uncached_startup_modes() {
 
     let mut refined = Policy::new(2, MIN, MAX);
     measure(&mut refined, 20.0);
-    measure(&mut refined, 20.0); // rejected doubling has entered finer search
+    measure(&mut refined, 20.0); // inconclusive doubling has stopped coarse search
     for (policy, expected_next) in [
         (Policy::refine(2, MIN, MAX), 10),
         (Policy::new(2, MIN, MAX), 16),
@@ -254,7 +254,7 @@ fn plateau_evidence_requires_a_nearby_recent_upper_measurement() {
 
     let mut close = Policy::refine(8, MIN, MAX);
     measure(&mut close, 80.0);
-    measure(&mut close, 80.0); // 10 did not help: a nearby completed comparison.
+    measure(&mut close, 60.0); // 10 clearly hurt: a nearby completed comparison.
     assert_eq!(close.settled(), 8);
     assert!(close.discovery_complete());
     let mut slower = close.clone();
@@ -287,7 +287,7 @@ fn doubling_a_weak_start_reaches_the_plateau_before_premature_refinement() {
 }
 
 #[test]
-fn upward_acceptance_uses_the_near_best_objective() {
+fn upward_gain_continues_but_inconclusive_result_holds() {
     let mut worthwhile = Policy::refine(10, MIN, MAX);
     measure(&mut worthwhile, 100.0);
     measure(&mut worthwhile, 107.0);
@@ -296,7 +296,9 @@ fn upward_acceptance_uses_the_near_best_objective() {
     let mut unnecessary = Policy::refine(10, MIN, MAX);
     measure(&mut unnecessary, 100.0);
     measure(&mut unnecessary, 104.0);
-    assert_eq!(unnecessary.settled(), 10);
+    assert_eq!(unnecessary.settled(), 13);
+    assert_eq!(unnecessary.state, State::Hold);
+    assert!(!unnecessary.discovery_complete());
 }
 
 #[test]
@@ -337,10 +339,17 @@ fn upward_probe_refreshes_its_baseline_while_warming() {
 
 #[test]
 fn cached_successful_direction_continues_to_the_plateau() {
-    let p = simulate_policy(Policy::refine(START_SSH, MIN, MAX), 32, 80, |_| 1.0);
+    let mut p = Policy::refine(START_SSH, MIN, MAX);
+    let mut refined = false;
+    for _ in 0..80 {
+        let rate = p.n.min(32) as f64 * 10e6;
+        measure(&mut p, rate);
+        // Later exploration can hold a larger inconclusive candidate; check
+        // that downward refinement still reaches the smallest near-best count.
+        refined |= p.settled() == 31;
+    }
     assert_eq!(&p.history[..6], &[8, 10, 13, 17, 22, 29]);
-    // 31 is the smallest integer within 5% of the observed best (32).
-    assert_eq!(p.settled(), 31, "history {:?}", p.history);
+    assert!(refined, "history {:?}", p.history);
 }
 
 #[test]
@@ -378,7 +387,7 @@ fn a_failed_up_probe_does_not_immediately_bounce_down() {
     let mut p = Policy::refine(10, MIN, MAX);
     measure(&mut p, 100.0); // 10 -> 13
     measure(&mut p, 130.0); // 13 paid; try 17
-    measure(&mut p, 130.0); // 17 did not; return to 13
+    measure(&mut p, 90.0); // 17 clearly hurt; return to 13
     assert_eq!(p.n, 13);
     for _ in 0..PROBE_EVERY - 1 {
         measure(&mut p, 130.0);
@@ -394,7 +403,7 @@ fn refines_to_the_smallest_near_best_integer() {
     let mut p = Policy::refine(10, MIN, MAX);
     measure(&mut p, 100.0);
     measure(&mut p, 130.0);
-    measure(&mut p, 130.0);
+    measure(&mut p, 90.0); // clear loss at 17 leaves the 10..13 bracket
     for _ in 0..PROBE_EVERY {
         measure(&mut p, 130.0);
     }
@@ -409,7 +418,10 @@ fn refines_to_the_smallest_near_best_integer() {
 #[test]
 fn descends_all_the_way_to_one_when_one_saturates_the_link() {
     let p = simulate(START_SSH, 1, 80, |_| 1.0);
-    assert_eq!(p.settled(), 1, "history {:?}", p.history);
+    assert!(p.history.contains(&1), "history {:?}", p.history);
+    // Flat upward probes can be retained later, but must not repeatedly
+    // double and grow beyond the initial inconclusive increase.
+    assert_eq!(p.peak, START_SSH * STARTUP_STEP);
 }
 
 #[test]
@@ -687,7 +699,7 @@ fn out_of_order_readiness_keeps_every_warming_slot() {
 fn preparation_precedes_the_first_decision_without_activating_workers() {
     for (mut policy, candidate) in [
         (Policy::new(16, 1, 64), 32),
-        (Policy::from_cache(16, 1, 64), 21),
+        (Policy::refine(16, 1, 64), 21),
     ] {
         let mut sampler = Sampler::default();
         sampler.reset();
@@ -728,7 +740,7 @@ fn preparation_uses_earliest_sample_boundary_and_keeps_rollback_ready() {
         sampler.earliest_score_in(SAMPLE, Duration::from_secs(2)),
         Duration::from_millis(500)
     );
-    let mut policy = Policy::from_cache(16, 1, 64);
+    let mut policy = Policy::refine(16, 1, 64);
     let plan = policy.connection_plan(
         &sampler,
         SAMPLE,
@@ -739,7 +751,7 @@ fn preparation_uses_earliest_sample_boundary_and_keeps_rollback_ready() {
     assert_eq!(plan.connect, 21);
     policy.observe(100.0);
     policy.activated();
-    policy.observe(100.0); // reject 21 and settle at 16
+    policy.observe(70.0); // reject a clearly slower 21 and settle at 16
     policy.activated();
     assert_eq!(policy.n, 16);
     assert!(policy.begin(Direction::Down, 100.0));
@@ -757,7 +769,7 @@ fn preparation_uses_earliest_sample_boundary_and_keeps_rollback_ready() {
 
 #[test]
 fn distant_probe_releases_spares_then_prepares_before_it_is_due() {
-    let mut policy = Policy::from_cache(16, 1, 64);
+    let mut policy = Policy::refine(16, 1, 64);
     policy.state = State::Hold;
     policy.due = [60, 60];
     let sampler = Sampler::default();
@@ -824,7 +836,7 @@ fn retired_connection_is_not_ready_or_duplicated_before_worker_cleanup() {
 fn warming_forecast_waits_for_candidate_measurements_not_baseline_refresh() {
     for (mut policy, candidate, following) in [
         (Policy::new(16, 1, 64), 32, 64),
-        (Policy::from_cache(16, 1, 64), 21, 27),
+        (Policy::refine(16, 1, 64), 21, 27),
     ] {
         assert_eq!(policy.observe(100.0), candidate);
         assert_eq!(policy.active(), 16);
@@ -888,7 +900,7 @@ fn setup_lead_includes_retries_and_does_not_shrink_after_one_fast_setup() {
 
 #[test]
 fn missed_preparation_still_waits_for_ready_connections_and_optional_failure_isolated() {
-    let mut policy = Policy::from_cache(16, 1, 64);
+    let mut policy = Policy::refine(16, 1, 64);
     let gate = Gate::new(16);
     for id in gate.begin_warming(16) {
         gate.mark_ready(id);
@@ -920,7 +932,7 @@ fn missed_preparation_still_waits_for_ready_connections_and_optional_failure_iso
 
 #[test]
 fn a_preparation_pause_does_not_close_imminently_needed_spares() {
-    let mut policy = Policy::from_cache(16, 1, 64);
+    let mut policy = Policy::refine(16, 1, 64);
     policy.state = State::Hold;
     policy.due = [1, 1];
     let plan = policy.connection_plan(
@@ -972,4 +984,44 @@ fn one_worker_start_prepares_spare_before_initial_connection_is_ready() {
             .connect,
         1
     );
+}
+
+#[test]
+fn inconclusive_doubling_keeps_capacity_without_another_increase() {
+    for score in [95.0, 100.0, 104.0] {
+        let mut policy = Policy::new(8, 1, 64);
+        measure(&mut policy, 100.0);
+        assert_eq!(policy.n, 16);
+        measure(&mut policy, score);
+        assert_eq!(policy.n, 16);
+        assert_eq!(policy.state, State::Hold);
+        assert!(!policy.startup_doubling);
+        assert!(policy.measured());
+        assert!(!policy.discovery_complete());
+        assert_eq!(
+            policy.due[Direction::Up.index()],
+            policy.tick + 2 * PROBE_EVERY
+        );
+        for _ in 0..PROBE_EVERY - 1 {
+            measure(&mut policy, score);
+            assert_eq!(policy.n, 16);
+        }
+    }
+}
+
+#[test]
+fn ambiguous_probe_does_not_change_downward_acceptance_or_clear_loss_rollback() {
+    let mut policy = Policy::refine(8, 1, 64);
+    measure(&mut policy, 100.0);
+    measure(&mut policy, 94.0);
+    assert_eq!(policy.n, 8);
+    for (score, keep_smaller) in [(95.0, true), (94.0, false)] {
+        let mut policy = Policy::refine(16, 1, 64);
+        policy.record(16, 100.0);
+        assert!(policy.begin(Direction::Down, 100.0));
+        policy.activated();
+        let lower = policy.n;
+        measure(&mut policy, score);
+        assert_eq!(policy.settled(), if keep_smaller { lower } else { 16 });
+    }
 }

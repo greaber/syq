@@ -5,7 +5,8 @@
 //! file so small-file transfers count too) is sampled every few seconds; a
 //! worker count has been *measured* once the rate has stopped changing. A
 //! fresh start doubles while upward moves pay, then refines the measured
-//! bounds. A cached start uses smaller steps. A failed move
+//! bounds. Strongly matched plateau hints use smaller steps. An inconclusive
+//! increase keeps the larger count but pauses growth; a clearly worse move
 //! returns to the last good count and leaves a measured bound that later
 //! probes can refine one integer at a time. Independent per-direction aging
 //! and backoff decide when evidence is stale enough to probe again; when both
@@ -56,14 +57,14 @@ pub const START_LOCAL_LOW_CPU: usize = 16;
 /// Never auto-tune below this many.
 pub const MIN: usize = 1;
 /// Policy mechanics version recorded in transfer history.
-pub const POLICY_VERSION: u32 = 3;
+pub const POLICY_VERSION: u32 = 4;
 const STARTUP_STEP: usize = 2;
 
 /// Multiplicative step after discovery, or with a closely matched plateau hint.
 pub const STEP: f64 = 1.3;
-/// Prefer the smallest measured count whose throughput is this close to the
-/// recent best. Probe scheduling handles noise independently from this
-/// objective; acceptance must not impose a stricter, contradictory threshold.
+/// Throughput tolerance for comparisons. Reductions must stay near the recent
+/// best; an inconclusive increase within this tolerance of its own baseline
+/// keeps the larger count without continuing growth.
 const NEAR_BEST_TOLERANCE: f64 = 0.05;
 /// Measurements in the hold phase between probes. Each failed probe in a
 /// direction doubles only that direction's wait (up to
@@ -798,15 +799,29 @@ impl Policy {
                 let best = self.recent_best();
                 let floor = best * (1.0 - NEAR_BEST_TOLERANCE);
                 let keep = match direction {
-                    // Keep the larger count only when it is near-best and the
-                    // smaller baseline is not. If both qualify, the objective
-                    // explicitly prefers the smaller one.
+                    // Continue upward only when the larger count is near-best
+                    // and its smaller baseline is not. An inconclusive result
+                    // is handled separately below.
                     Direction::Up => score >= floor && base < floor,
                     Direction::Down => score >= floor,
                 };
                 self.comparisons += 1;
                 let idx = direction.index();
                 let inverse = direction.opposite().index();
+                if direction == Direction::Up
+                    && !keep
+                    && base > 0.0
+                    && score >= base * (1.0 - NEAR_BEST_TOLERANCE)
+                {
+                    // Uncertainty is not evidence to remove workers, nor to
+                    // keep growing. Stop the ramp and wait before probing.
+                    self.startup_doubling = false;
+                    self.fails[idx] += 1;
+                    self.due[idx] = self.tick + self.retry_after(direction);
+                    self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
+                    self.state = State::Hold;
+                    return self.n;
+                }
                 if keep {
                     self.fails[idx] = 0;
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
