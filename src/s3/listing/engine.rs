@@ -10,8 +10,8 @@ use std::{collections::VecDeque, future::Future};
 
 const MAX_CHILDREN: usize = 256;
 // Recursive discovery has no selective pattern to amortize empty/small child
-// requests. Require evidence of a page-sized child and bound speculative fanout.
-const MAX_RECURSIVE_CHILDREN: usize = 8;
+// requests. Require evidence of substantial child prefixes and bound speculative fanout.
+const MAX_RECURSIVE_CHILDREN: usize = 64;
 const SPLIT_QUEUE_LIMIT: usize = 4096;
 const MAX_RECURSIVE_PROBES: usize = 4;
 
@@ -217,8 +217,9 @@ fn dense_children(query: &str, page: &Page) -> usize {
                 .or_insert(0usize) += 1;
         }
     }
-    // Leave room for root markers and a few direct objects in each sample.
-    counts.values().filter(|count| **count >= 900).count()
+    // A quarter-page child can amortize parallel requests at network latency;
+    // tiny directories cannot. This estimates density, not the total key count.
+    counts.values().filter(|count| **count >= 256).count()
 }
 
 async fn recursive(store: &impl Store, query: String, depth: usize, split: bool) -> Result<Batch> {
@@ -249,7 +250,7 @@ async fn recursive(store: &impl Store, query: String, depth: usize, split: bool)
         return Ok(scan_batch(query, false, flat));
     }
     // One dense leading directory says little about its siblings. Spend at
-    // most one more useful flat page looking for a second page-sized child.
+    // most one more useful flat page looking for a second substantial child.
     if dense_children(&query, &flat) < 2 {
         let next = read(store, &query, false, flat.next.as_deref()).await?;
         flat.entries.extend(next.entries);

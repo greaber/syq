@@ -387,3 +387,54 @@ async fn unordered_stores_do_not_apply_exact_key_shortcut() {
     .unwrap();
     assert_eq!(keys, ["exact"]);
 }
+
+#[tokio::test]
+async fn medium_density_keeps_latency_parallelism_and_reuses_complete_children() {
+    let store = Memory::new(
+        (0..64).flat_map(|d| (0..400).map(move |i| format!("tree/dir{d:03}/file{i:04}"))),
+    );
+    assert_eq!(listed(&store, "tree/**", 32).await.len(), 25600);
+    let calls = store.calls.borrow();
+    assert_eq!(calls.len(), 63);
+    // The first four children are fully covered by the two sampled pages.
+    for d in 0..4 {
+        assert!(!calls
+            .iter()
+            .any(|(prefix, _)| prefix == &format!("tree/dir{d:03}/")));
+    }
+    assert!(store.peak.get() > 1);
+    assert!(store.peak.get() <= 32);
+}
+
+#[tokio::test]
+async fn incomplete_directory_probe_cannot_discard_observed_objects() {
+    struct Incomplete(Memory);
+    impl Store for Incomplete {
+        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+            let mut page = self.0.page(prefix, delimiter, token).await?;
+            if delimiter {
+                page.prefixes.retain(|prefix| prefix != "tree/dir01/");
+            }
+            Ok(page)
+        }
+    }
+    let store =
+        Incomplete(Memory::new((0..8).flat_map(|d| {
+            (0..2000).map(move |i| format!("tree/dir{d:02}/file{i:04}"))
+        })));
+    let mut keys = Vec::new();
+    engine::enumerate_prefix(&store, "tree/", 32, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys.len(), 16000);
+    assert_eq!(keys.into_iter().collect::<BTreeSet<_>>(), store.0.keys);
+    assert!(store
+        .0
+        .calls
+        .borrow()
+        .iter()
+        .all(|(prefix, _)| prefix == "tree/"));
+}
