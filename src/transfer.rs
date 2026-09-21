@@ -1029,9 +1029,34 @@ pub fn run(mut args: Args) -> Result<i32> {
     )? {
         progress.set_results(writer);
     }
+    if !args.dry_run {
+        if let Some(history) = tune::history::Recorder::start(
+            progress.start,
+            serde_json::json!({
+                "policy_version": tune::POLICY_VERSION, "automatic": args.connections_default,
+                "configured_workers": (!args.connections_default).then_some(args.connections), "worker_limit": (args.automatic_worker_limit() != usize::MAX).then(|| args.automatic_worker_limit()),
+                "bandwidth_limit": args.bwlimit_bytes, "compression": args.compress,
+                "inplace": args.inplace, "checksum": args.checksum,
+                "comparison_hash": args.hash_algorithm, "transfer_integrity": args.transfer_integrity,
+                "transfer_hash": args.transfer_hash_type, "overrides": format!("{:?}", args.tuning_options),
+                "sample_ms": tune::SAMPLE.as_millis(), "file_credit": tune::FILE_CREDIT
+            }),
+        ) {
+            let _ = progress.tuning_history.set(history);
+        }
+    }
     let dry_run = args.dry_run;
     let prune = args.delete;
     let outcome = handoff.and_then(|()| run_transfer(args, Arc::clone(&progress)));
+    if let Some(history) = progress.tuning_history.get() {
+        history.complete(matches!(&outcome, Ok(0)), serde_json::json!({
+            "elapsed_ms": progress.start.elapsed().as_millis(),
+            "copying_elapsed_ms": progress.copying_elapsed_ms(),
+            "bytes": progress.bytes_done.load(Relaxed), "files": progress.files_done.load(Relaxed),
+            "unchanged_bytes": progress.bytes_unchanged.load(Relaxed),
+            "errors": progress.errors.load(Relaxed)
+        }));
+    }
     if outcome.is_err() {
         // run_transfer's ticker guard has stopped and joined on every return,
         // including failures in deferred metadata and deletion finalization.
@@ -1553,6 +1578,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // handshakes (at sshd's MaxStartups or a serialized ssh agent). The tuner
     // may spawn more workers later, so the handles live behind a mutex.
     let gate = Gate::new(args.connections);
+    if let Some(history) = progress.tuning_history.get() {
+        gate.set_history(history.clone());
+    }
     let destination_anchor: DestinationAnchorSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let source_roots: SourceRootsSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let destination_anchor_required = args.restricted_grant.is_none();
@@ -1784,7 +1812,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         })
     };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
-    let spawn_workers = |initial: usize, cached_start: bool| {
+    let spawn_workers = |initial: usize, refine_start: Option<usize>| {
+        if let Some(history) = progress.tuning_history.get() {
+            history.event(
+                "workers_start",
+                serde_json::json!({"workers":initial,"active":initial,"automatic":autotune}),
+            );
+        }
         gate.set_active(initial);
         for id in gate.begin_warming(initial) {
             spawn_worker(id);
@@ -1797,8 +1831,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 spawn_worker.clone(),
             );
             let n0 = initial;
-            let policy = if cached_start {
-                tune::Policy::from_cache(n0, tune::MIN, maximum_workers)
+            let policy = if refine_start == Some(n0) {
+                tune::Policy::refine(n0, tune::MIN, maximum_workers)
             } else {
                 tune::Policy::new(n0, tune::MIN, maximum_workers)
             };
@@ -1814,9 +1848,33 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         source_shared_workers,
         source_independent_handoff_workers,
     )?;
+    let source_filesystem = registered_sources
+        .first()
+        .and_then(|root| root.filesystem.clone())
+        .filter(|first| {
+            registered_sources
+                .iter()
+                .all(|root| root.filesystem.as_ref() == Some(first))
+        });
     source_roots
         .set(registered_sources)
         .expect("source roots set once");
+    if let Some(history) = progress.tuning_history.get() {
+        let key = tune::history::context_key(
+            history,
+            &src_ep,
+            &dst_ep,
+            source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
+            None,
+            "setup".into(),
+        );
+        history.context(&key);
+        history.event(
+            "context",
+            serde_json::json!({"stage":"source_registered", "key":key,
+            "source_type":source_filesystem.as_ref().map(|fs| &fs.kind)}),
+        );
+    }
     // A native push of a few small local files needs no data worker and no
     // separate preflight: one control-connection turn selects, anchors,
     // checks, and publishes. Source registration above was local, so nothing
@@ -1837,6 +1895,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             t0,
         )? {
             SmallCopy::Done(code) => {
+                if let Some(history) = progress.tuning_history.get() {
+                    history.event(
+                        "copy_path",
+                        serde_json::json!({"path":"fused_control_copy", "tuning":"not_started"}),
+                    );
+                }
                 if let Some(benchmark) = &opts.benchmark {
                     benchmark.lock().unwrap().native_small_copies += 1;
                 }
@@ -2152,6 +2216,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             && initial_destination_filesystem
                 .as_ref()
                 .is_some_and(|info| info.empty == Some(true)));
+    let destination_filesystem = initial_destination_filesystem
+        .as_ref()
+        .and_then(|info| info.filesystem.clone());
     let fresh_capacity = initial_destination_filesystem.and_then(|info| {
         fresh_destination.then_some(FreshCapacityPlan {
             device: info.device,
@@ -2419,7 +2486,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !destination_tree_known_missing
         && std::env::var_os("SYQ_INTERNAL_DETACH_READY").is_none()
         && !pending_tcp_setups.is_empty();
-    let mut finish_transport_setup = |args: &mut Args| -> Result<(bool, Option<String>, bool)> {
+    let history_context = std::cell::RefCell::new(None);
+    let mut finish_transport_setup = |args: &mut Args| -> Result<_> {
         for (spec, pending) in std::mem::take(&mut pending_tcp_setups) {
             if let Err(error) = spec.finish_tcp_setup(pending) {
                 handle_tcp_setup_error(
@@ -2495,9 +2563,52 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = remembered;
             gate.set_active(remembered);
         }
+        let mut selected_history = None;
+        if let Some(history) = progress.tuning_history.get() {
+            let key = tune::history::context_key(
+                history,
+                &src_ep,
+                &dst_ep,
+                source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
+                destination_filesystem
+                    .as_ref()
+                    .map(|fs| fs.identity.as_str()),
+                format!(
+                    "inplace={};compress={};bandwidth={};checksum={};hash={:?};integrity={};transfer_hash={:?}",
+                    opts.inplace, args.compress, args.bwlimit_bytes, args.checksum,
+                    args.hash_algorithm, args.transfer_integrity, args.transfer_hash_type
+                ),
+            );
+            history.context(&key);
+            history.event(
+                "context",
+                serde_json::json!({"key":key,
+                "source_type":source_filesystem.as_ref().map(|fs|&fs.kind),
+                "destination_type":destination_filesystem.as_ref().map(|fs|&fs.kind)}),
+            );
+            let hint = (autotune && args.tuning_options.is_none())
+                .then(|| history.hint(&key, src_ep.is_remote() || dst_ep.is_remote()))
+                .flatten();
+            if let Some(hint) = &hint {
+                args.connections = hint.workers.min(args.automatic_worker_limit());
+                gate.set_active(args.connections);
+            }
+            history.event("starting_count", serde_json::json!({"workers":args.connections,
+                "reason":if hint.is_some() {"history"} else if remembered_start.is_some() {"legacy_cache"} else if autotune {"default"} else {"explicit"},
+                "hint":hint,"legacy_workers":remembered_start}));
+            selected_history = hint;
+            *history_context.borrow_mut() = Some(key);
+        }
         print_transport_diagnostics(args, &src_ep, &dst_ep);
         if args.verbose >= 2 {
-            if let Some(remembered) = remembered_start {
+            if let Some(hint) = &selected_history {
+                crate::output::diagnostic!(
+                    "syq: auto-tuning: starting with {} connections from transfer {} ({} match)",
+                    args.connections,
+                    hint.run,
+                    hint.matched
+                );
+            } else if let Some(remembered) = remembered_start {
                 crate::output::diagnostic!(
                     "syq: auto-tuning: starting with {remembered} connections remembered for this path"
                 );
@@ -2506,7 +2617,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Ok((
             all_remote_endpoints_use_tcp,
             tuning_key,
-            remembered_start.is_some(),
+            selected_history
+                .as_ref()
+                .filter(|hint| hint.refine)
+                .map(|hint| hint.workers),
         ))
     };
     let mut transport_setup = if defer_transport_setup {
@@ -2528,9 +2642,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         connect_after_file_plan.store(true, Relaxed);
         spawn_workers(
             args.connections,
-            transport_setup
-                .as_ref()
-                .is_some_and(|(_, _, cached)| *cached),
+            transport_setup.as_ref().and_then(|(_, _, refine)| *refine),
         );
         workers_started = true;
     }
@@ -2710,7 +2822,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if transport_setup.is_none() {
         transport_setup = Some(finish_transport_setup(&mut args)?);
     }
-    let (all_remote_endpoints_use_tcp, tuning_key, cached_start) =
+    let (all_remote_endpoints_use_tcp, tuning_key, refine_start) =
         transport_setup.expect("transport setup completed before releasing planned work");
     // The complete buffered scan lets small trees keep the same bounded
     // starting count as normal scheduling. Open TCP workers while the control
@@ -2759,7 +2871,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
                     opts.tuning.batch_bytes(),
                 ),
-                cached_start,
+                refine_start,
             );
             workers_started = true;
         }
@@ -2803,6 +2915,49 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 if count == 1 { "" } else { "s" },
                 if count == 1 { "it is" } else { "they are" }
             ),
+        );
+    }
+    if let (Some(history), Some(key)) = (
+        progress.tuning_history.get(),
+        history_context.borrow_mut().as_mut(),
+    ) {
+        let source_mixed = source_filesystem.as_ref().is_some_and(|fs| {
+            sched
+                .jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|job| job.entry.dev != fs.device)
+        });
+        let destination_mixed = destination_filesystem.as_ref().is_some_and(|fs| {
+            progress
+                .tuning_destination_devices
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|device| *device != fs.device)
+        });
+        if source_mixed {
+            key.source_filesystem = None;
+        }
+        if destination_mixed {
+            key.destination_filesystem = None;
+        }
+        if source_mixed || destination_mixed {
+            history.context(key);
+            history.event("context_revised",serde_json::json!({"reason":"mixed_filesystems","source_mixed":source_mixed,"destination_mixed":destination_mixed,"key":key}));
+        }
+    }
+    if let Some(history) = progress.tuning_history.get() {
+        history.event(
+            "planned",
+            serde_json::json!({
+                "files": progress.files_total.load(Relaxed),
+                "bytes": progress.bytes_total.load(Relaxed),
+                "completed_files": progress.files_done.load(Relaxed),
+                "completed_bytes": progress.bytes_done.load(Relaxed),
+                "scan_failed": scan_err.is_some()
+            }),
         );
     }
     let collision = st.collision;
@@ -2902,7 +3057,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         sched.arm_direct_fallback(args.connections);
                         initial = 1;
                     }
-                    spawn_workers(initial, cached_start);
+                    spawn_workers(initial, refine_start);
                 }
             }
         }
@@ -2912,16 +3067,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     // Join workers; the tuner may add more while we do, until it exits.
+    let mut tuner = tuner.lock().unwrap().take();
+    let mut tuned = None;
     loop {
         let batch: Vec<_> = std::mem::take(&mut *workers.lock().unwrap());
         if batch.is_empty() {
-            let tuning = tuner
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|t| !t.is_finished());
-            if !tuning {
+            let Some(thread) = tuner.as_ref() else {
                 break;
+            };
+            if thread.is_finished() || sched.finished() || sched.is_aborted() {
+                // Once work ends, join the tuner directly: flushing its final
+                // history must not add a polling interval to a short copy.
+                tuned = match tuner.take().unwrap().join() {
+                    Ok(policy) => Some(policy),
+                    Err(_) => {
+                        progress.error("syq: auto-tuning thread panicked");
+                        sched.abort();
+                        None
+                    }
+                };
+                // Drain any workers the tuner added before it observed the end.
+                continue;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
@@ -2937,17 +3103,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     }
-    let tuned = match tuner.lock().unwrap().take() {
-        Some(thread) => match thread.join() {
-            Ok(policy) => Some(policy),
-            Err(_) => {
-                progress.error("syq: auto-tuning thread panicked");
-                sched.abort();
-                None
-            }
-        },
-        None => None,
-    };
     if debug() {
         crate::output::diagnostic!(
             "syq: file workers complete at {:.2}s",
@@ -3162,6 +3317,26 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .is_none_or(|limits| limits.workers.is_none())
     {
         if let Some(policy) = tuned.as_ref().filter(|policy| policy.measured()) {
+            if args.tuning_options.is_none() {
+                if let (Some(history), Some(initial)) = (
+                    progress.tuning_history.get(),
+                    history_context.borrow().as_ref(),
+                ) {
+                    let final_key = tune::history::context_key(
+                        history,
+                        &src_ep,
+                        &dst_ep,
+                        source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
+                        destination_filesystem
+                            .as_ref()
+                            .map(|fs| fs.identity.as_str()),
+                        initial.mode.clone(),
+                    );
+                    if initial.route == final_key.route {
+                        history.recommend(policy.settled(), policy.discovery_complete());
+                    }
+                }
+            }
             // A TCP failure affects later connections but leaves earlier TCP
             // workers alive, so a changed key means the measurements may mix
             // transports. Such a run is useful live evidence but not a safe

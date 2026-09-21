@@ -200,7 +200,7 @@ fn resume_worker_reset_preserves_cached_and_uncached_startup_modes() {
     measure(&mut refined, 20.0);
     measure(&mut refined, 20.0); // rejected doubling has entered finer search
     for (policy, expected_next) in [
-        (Policy::from_cache(2, MIN, MAX), 10),
+        (Policy::refine(2, MIN, MAX), 10),
         (Policy::new(2, MIN, MAX), 16),
         (refined, 10),
     ] {
@@ -221,21 +221,79 @@ fn resume_worker_reset_preserves_cached_and_uncached_startup_modes() {
 }
 
 #[test]
-fn cached_start_keeps_modest_probes() {
-    let mut p = Policy::from_cache(START_SSH, MIN, MAX);
+fn plateau_hint_keeps_modest_probes() {
+    let mut p = Policy::refine(START_SSH, MIN, MAX);
     measure(&mut p, 80.0);
     assert_eq!(p.n, 10);
     assert_eq!(p.history, vec![8, 10]);
 }
 
 #[test]
+fn measured_search_and_cancelled_probe_do_not_imply_a_plateau() {
+    let mut p = Policy::new(8, MIN, MAX);
+    assert!(!p.discovery_complete());
+    measure(&mut p, 80.0);
+    p.observe(160.0); // 16 helped; 32 is still only a proposal.
+    assert!(p.measured());
+    assert!(!p.discovery_complete());
+    p.cancel_unapplied();
+    assert!(!p.discovery_complete());
+
+    let mut capped = Policy::new(8, MIN, 16);
+    measure(&mut capped, 80.0);
+    measure(&mut capped, 160.0);
+    assert!(!capped.discovery_complete());
+}
+
+#[test]
+fn plateau_evidence_requires_a_nearby_recent_upper_measurement() {
+    let mut wide = Policy::new(8, MIN, MAX);
+    measure(&mut wide, 80.0);
+    measure(&mut wide, 80.0); // 16 did not help, but 8..16 still needs refinement.
+    assert!(!wide.discovery_complete());
+
+    let mut close = Policy::refine(8, MIN, MAX);
+    measure(&mut close, 80.0);
+    measure(&mut close, 80.0); // 10 did not help: a nearby completed comparison.
+    assert_eq!(close.settled(), 8);
+    assert!(close.discovery_complete());
+    let mut slower = close.clone();
+    slower.observe(1.0);
+    assert!(!slower.discovery_complete());
+    close.tick += EVIDENCE_MAX_AGE + 1;
+    assert!(!close.discovery_complete());
+}
+
+#[test]
+fn doubling_a_weak_start_reaches_the_plateau_before_premature_refinement() {
+    // Controlled worker/throughput model, not a wall-clock transfer benchmark.
+    // The cache may supply the same count as a default; only strong evidence
+    // should change how quickly we move away from a count below the plateau.
+    fn measurements_to_plateau(mut p: Policy) -> usize {
+        for measurements in 1..=16 {
+            let score = p.active().min(64) as f64;
+            if score >= 64.0 * (1.0 - NEAR_BEST_TOLERANCE) {
+                return measurements;
+            }
+            measure(&mut p, score);
+        }
+        panic!("did not reach plateau: {:?}", p.history);
+    }
+    let weak = measurements_to_plateau(Policy::new(8, MIN, 128));
+    let premature_refinement = measurements_to_plateau(Policy::refine(8, MIN, 128));
+    assert_eq!(weak, 4);
+    assert_eq!(premature_refinement, 9);
+    assert_eq!(measurements_to_plateau(Policy::refine(64, MIN, 128)), 1);
+}
+
+#[test]
 fn upward_acceptance_uses_the_near_best_objective() {
-    let mut worthwhile = Policy::from_cache(10, MIN, MAX);
+    let mut worthwhile = Policy::refine(10, MIN, MAX);
     measure(&mut worthwhile, 100.0);
     measure(&mut worthwhile, 107.0);
     assert_eq!(worthwhile.settled(), 13);
 
-    let mut unnecessary = Policy::from_cache(10, MIN, MAX);
+    let mut unnecessary = Policy::refine(10, MIN, MAX);
     measure(&mut unnecessary, 100.0);
     measure(&mut unnecessary, 104.0);
     assert_eq!(unnecessary.settled(), 10);
@@ -265,7 +323,7 @@ fn remaining_work_requirement_scales_with_rate_not_worker_count() {
 
 #[test]
 fn upward_probe_refreshes_its_baseline_while_warming() {
-    let mut policy = Policy::from_cache(10, MIN, MAX);
+    let mut policy = Policy::refine(10, MIN, MAX);
     policy.observe(100.0);
     assert_eq!(policy.active(), 10);
     assert_eq!(policy.n, 13);
@@ -279,7 +337,7 @@ fn upward_probe_refreshes_its_baseline_while_warming() {
 
 #[test]
 fn cached_successful_direction_continues_to_the_plateau() {
-    let p = simulate_policy(Policy::from_cache(START_SSH, MIN, MAX), 32, 80, |_| 1.0);
+    let p = simulate_policy(Policy::refine(START_SSH, MIN, MAX), 32, 80, |_| 1.0);
     assert_eq!(&p.history[..6], &[8, 10, 13, 17, 22, 29]);
     // 31 is the smallest integer within 5% of the observed best (32).
     assert_eq!(p.settled(), 31, "history {:?}", p.history);
@@ -287,7 +345,7 @@ fn cached_successful_direction_continues_to_the_plateau() {
 
 #[test]
 fn cached_gain_at_the_cap_holds_at_the_cap() {
-    let p = simulate_policy(Policy::from_cache(START_LOCAL, MIN, MAX), 200, 40, |_| 1.0);
+    let p = simulate_policy(Policy::refine(START_LOCAL, MIN, MAX), 200, 40, |_| 1.0);
     // Once the cap establishes the best score, downward refinement finds
     // the smallest integer within the 5% near-best tolerance.
     assert_eq!(p.settled(), 61, "history {:?}", p.history);
@@ -317,7 +375,7 @@ fn uncached_start_reaches_full_rate_early_and_then_trims_excess_workers() {
 
 #[test]
 fn a_failed_up_probe_does_not_immediately_bounce_down() {
-    let mut p = Policy::from_cache(10, MIN, MAX);
+    let mut p = Policy::refine(10, MIN, MAX);
     measure(&mut p, 100.0); // 10 -> 13
     measure(&mut p, 130.0); // 13 paid; try 17
     measure(&mut p, 130.0); // 17 did not; return to 13
@@ -333,7 +391,7 @@ fn a_failed_up_probe_does_not_immediately_bounce_down() {
 
 #[test]
 fn refines_to_the_smallest_near_best_integer() {
-    let mut p = Policy::from_cache(10, MIN, MAX);
+    let mut p = Policy::refine(10, MIN, MAX);
     measure(&mut p, 100.0);
     measure(&mut p, 130.0);
     measure(&mut p, 130.0);

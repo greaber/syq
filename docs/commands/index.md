@@ -30,6 +30,7 @@ syq --self-update
 | [`rsync`](rsync.md) | Copy using rsync-compatible syntax |
 | [`persist`](persist.md) | Manage persistent connections, receiving, and return destinations |
 | [`completion`](completion.md) | Generate shell completion and manage cached endpoint suggestions |
+| [`tuning-cache`](tuning-cache.md) | Inspect and clear local transfer tuning history |
 | [`receiver`](receiver.md) | Manage manual receiver enrollment and recovery |
 | [`help`](#syq-help) | Show help for any command or nested command |
 

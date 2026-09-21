@@ -447,6 +447,8 @@ pub struct SourceLeafIdentity {
 /// beneath its selected parent.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RegisteredSourceRoot {
+    /// Performance hint only; never authority or a resume identity.
+    pub filesystem: Option<FilesystemHint>,
     pub ticket: DescriptorTicket,
     /// Pins an exact non-directory selection. FIFO sources on platforms
     /// without an inert metadata descriptor omit this ticket; their parent
@@ -1211,8 +1213,18 @@ pub struct SeededBasis {
     pub selected_final: bool,
 }
 
+/// Identity of the filesystem owning an already-open object. Missing when the
+/// platform/filesystem cannot identify it; this is only a performance hint.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct FilesystemHint {
+    pub identity: String,
+    pub kind: String,
+    pub device: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct DestinationFilesystemInfo {
+    pub filesystem: Option<FilesystemHint>,
     pub device: u64,
     pub available_bytes: u64,
     /// Filesystems that do not expose a meaningful inode population report

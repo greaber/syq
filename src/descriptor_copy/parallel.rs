@@ -489,7 +489,29 @@ pub(crate) async fn execute(
     let budget = session.budget.clone();
     let (jobs_tx, jobs_rx) = mpsc::channel(64);
     let (results_tx, mut results_rx) = mpsc::channel(64);
+    if let Some(history) = controls.progress.tuning_history.get() {
+        let local = crate::conn::Endpoint::local();
+        let (source, destination) = if input.is_some() {
+            (&local, &session.endpoint)
+        } else {
+            (&session.endpoint, &local)
+        };
+        let key = tune::history::context_key(
+            history,
+            source,
+            destination,
+            None,
+            None,
+            "descriptor".into(),
+        );
+        history.context(&key);
+        history.event("context", serde_json::json!({"key":key}));
+    }
     let gate = tune::Gate::new(prepared.workers);
+    if let Some(history) = controls.progress.tuning_history.get() {
+        gate.set_history(history.clone());
+        history.event("workers_start",serde_json::json!({"workers":prepared.workers,"active":prepared.workers,"automatic":args.connections_default}));
+    }
     let draining = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(tokio::sync::Notify::new());
     let workers = Workers {
@@ -543,6 +565,11 @@ pub(crate) async fn execute(
         spawn(&mut tasks, id);
     }
     let mut policy = tune::Policy::new(prepared.workers, 1, prepared.worker_limit);
+    let mut trace = tune::trace::Trace::new(
+        controls.progress.tuning_history.get().cloned(),
+        &policy,
+        tune::SAMPLE,
+    );
     let mut sampler = tune::Sampler::default();
     let mut interval = tokio::time::interval(tune::SAMPLE);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -655,17 +682,32 @@ pub(crate) async fn execute(
                 value = &mut transfer => break value?,
                 value = tasks.join_next(), if !tasks.is_empty() => { value.unwrap()??; }
                 _ = interval.tick(), if args.connections_default => {
-                    if !gate.ready_through(policy.n) { continue; }
-                    if gate.active() != policy.n { gate.set_active(policy.n); policy.activated(); sampler.reset(); last = (Instant::now(), controls.progress.bytes_done.load(Relaxed)); continue; }
                     let now = (Instant::now(), controls.progress.bytes_done.load(Relaxed));
                     let elapsed = now.0.duration_since(last.0).as_secs_f64();
+                    if !gate.ready_through(policy.n) {
+                        trace.sample((last.1,0),(now.1,0),elapsed,&policy,&gate,"workers_connecting",None);
+                        trace.waiting("workers_connecting",&policy);
+                        continue;
+                    }
+                    if gate.active() != policy.n {
+                        trace.sample((last.1,0),(now.1,0),elapsed,&policy,&gate,"partial_before_activation",None);
+                        gate.set_active(policy.n); policy.activated();
+                        trace.transition(&policy,"candidate_ready");
+                        sampler.reset(); last = (Instant::now(), controls.progress.bytes_done.load(Relaxed)); continue;
+                    }
                     if elapsed < tune::SAMPLE.as_secs_f64() / 2.0 { continue; }
                     let rate = (now.1.saturating_sub(last.1)) as f64 / elapsed;
+                    let score = sampler.push(rate);
+                    trace.sample((last.1,0),(now.1,0),elapsed,&policy,&gate,sampler.last_status,score);
                     last = now;
-                    if let Some(score) = sampler.push(rate) {
-                        let target = policy.observe(score);
+                    if let Some(score) = score {
+                        trace.observe(&mut policy,score,sampler.last_status);
+                        let target = policy.n;
                         if target != gate.active() {
-                            if target < gate.active() { gate.set_active(target); gate.set_connect_target(target.max(2)); policy.activated(); }
+                            if target < gate.active() {
+                                gate.set_active(target); gate.set_connect_target(target.max(2)); policy.activated();
+                                trace.transition(&policy,"decrease_activated");
+                            }
                             for id in gate.begin_warming(target) { spawn(&mut tasks, id); }
                             sampler.reset();
                         }
@@ -710,9 +752,20 @@ pub(crate) async fn execute(
     for retired in retirements {
         retired.wait().await;
     }
-    if let Some(payload) = callback {
-        payload.transferred(result.as_ref().err())?;
-    }
+    let callback_result = callback
+        .map(|payload| payload.transferred(result.as_ref().err()))
+        .transpose();
+    trace.sample(
+        (last.1, 0),
+        (controls.progress.bytes_done.load(Relaxed), 0),
+        last.0.elapsed().as_secs_f64(),
+        &policy,
+        &gate,
+        "final_partial",
+        None,
+    );
+    trace.end(&policy, result.is_err() || callback_result.is_err());
+    callback_result?;
     result
 }
 pub(crate) async fn direct(

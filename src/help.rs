@@ -329,8 +329,14 @@ pub(crate) fn root() -> Command {
         .subcommand(Command::new("rsync").about("Copy using rsync-compatible syntax"))
         .subcommand(Command::new("persist").about("Manage persistent connections, receiving, and return destinations"))
         .subcommand(Command::new("completion").about("Generate shell completion and manage cached endpoint suggestions"))
+        .subcommand(Command::new("tuning-cache").about("Inspect and clear local transfer tuning history"))
         .subcommand(Command::new("receiver").about("Enroll, list, or revoke command-restricted receivers"))
         .subcommand(Command::new("help").about("Show help for a command, e.g. syq help cp")))
+}
+
+/// Keep inspection commands out of common help without hiding completion.
+pub(crate) fn root_for_help(full: bool) -> Command {
+    root().mut_subcommand("tuning-cache", |command| command.hide(!full))
 }
 
 pub(crate) fn lifecycle() -> Command {
@@ -400,11 +406,12 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
         topics.pop();
     }
     let mut command = match topics.first().copied() {
-        None => root(),
+        None => root_for_help(full),
         Some("exec") => crate::destination::exec::command_for_help(),
         Some("persist") => crate::persistence::command_for_help(),
         Some("completion") => crate::completion::command_for_help(),
         Some("receiver") => receiver(),
+        Some("tuning-cache") => crate::tune::history::command_for_help(),
         Some("--self-update") => lifecycle(),
         Some(name) => crate::cli::command_for_completion(name)
             .ok_or_else(|| anyhow::anyhow!("unknown help topic {name:?}"))?,

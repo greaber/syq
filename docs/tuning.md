@@ -75,18 +75,36 @@ for buffering and upload-size limits. S3 tuning is not saved between runs.
 
 ## Remembered connection counts
 
-Remote copies start from the last learned count for the same route, direction,
-and transport, or from 8 workers over SSH and 16 over TCP. Successful copies
-update the cache after comparing enough worker counts. Short copies may finish
-before syq learns a better count.
+Syq first looks for a previous successful, measured worker count for the same
+source and destination filesystems, direction, transport, and copy settings.
+This also works for local copies. Filesystem identities are best-effort hints
+reported by the operating system; syq uses the selected roots and marks a run
+as mixed if planning observes other filesystems. Unknown or mixed filesystems
+can use a route-level hint for remote copies. SSH, encrypted TCP, and plaintext
+TCP histories are separate. Destination hints come from existing filesystem
+inspection responses; some restricted routes and copies onto existing individual
+files do not provide them. Local copies without both filesystem hints use the
+normal starting count.
 
-The cache is `~/.cache/syq/tuning.json`; `XDG_CACHE_HOME` changes its parent.
-`SYQ_TUNING_CACHE` names another file, or disables the cache when empty.
-Supplying `--performance-tuning` bypasses the cache. With
-`--resource-limits workers=N`, syq starts from the remembered count or the
-ceiling, whichever is lower, and leaves the cache unchanged. A bandwidth limit
-alone still reads and updates it.
-Live tuning continues unless you fix `workers`. Use `-vv` to see the starting count.
+Without a matching history result, remote copies can use the older connection
+cache, then fall back to 8 workers over SSH or 16 over TCP. Local copies start
+with 32 workers, or 16 when at most two CPUs are available. Startup can reduce
+these counts when there is little parallel work. A remembered count is a starting
+guess; syq keeps exploring quickly unless a successful transfer closely matches
+the current filesystems and settings and measured a throughput plateau. Live
+tuning continues unless you fix `workers`.
+
+Supplying `--performance-tuning` bypasses remembered counts and does not publish
+a new recommendation. With `--resource-limits workers=N`, syq clamps the starting
+count and leaves recommendations unchanged. Bandwidth-limited runs have separate
+history matches. Only successful runs with a completed worker-count comparison
+can supply a recommendation; a short run's ending count is not treated as an
+optimum. A change of data transport during the copy also prevents publication.
+
+The older cache remains at `~/.cache/syq/tuning.json`, in its existing format.
+`SYQ_TUNING_CACHE` names another file; an empty value disables both this cache
+and the history below. `XDG_CACHE_HOME` changes their parent directory.
+
 When tuning reduces the worker count, connected workers wait without taking new
 work. Syq keeps connections available during an experiment so it can promptly
 restore the previous count. It also prepares likely increases ahead of time,
@@ -95,6 +113,53 @@ between experiments, surplus connections can close and reopen nearer the next
 probe. Setup can still delay an increase if it takes longer than expected.
 Idle connections and their helper processes hold resources; the active worker
 count is not a count of open connections.
+
+## Inspect tuning history
+
+Filesystem copies record a local timeline by default, including short and failed
+copies. The history contains opaque endpoint and filesystem identifiers, the
+UTC date, copy settings, numerical progress, worker readiness, and tuning
+decisions. It does not contain filenames, command lines, file contents, or
+Wi-Fi names, and nothing is uploaded. Timing and sizes still reveal activity;
+this is performance history, not anonymous data or a complete audit trail.
+
+```sh
+syq tuning-cache list
+syq tuning-cache show 42
+syq tuning-cache show 42 --html > tuning-42.html
+syq tuning-cache export 42 > tuning-42.ndjson
+syq tuning-cache clear
+```
+
+Open the HTML file in a browser to plot worker counts and byte progress, then
+select a decision to inspect its evidence. It is a standalone file with no
+external scripts. `export` without an ID exports all retained transfers as
+NDJSON. These diagnostic records are versioned, but their event details may
+evolve; they are separate from the [automation results](automation.md) contract.
+
+The timeline distinguishes requested workers from workers ready to copy, and
+shows which measurements informed each decision. Copies completed by a single
+control request record that copy path without a tuning timeline.
+
+Descriptor and pipe copies also record their tuning decisions, but do not use
+filesystem history to choose their starting count. S3 copies do not currently
+record these timelines. For remote-coordinated copies, history belongs to the
+machine running the coordinator; run the inspection commands there.
+
+The default file is `~/.cache/syq/tuning.history-v1.sqlite`. When
+`SYQ_TUNING_CACHE` selects another file, the history uses that name with its
+extension replaced by `.history-v1.sqlite`. `SYQ_TUNING_HISTORY` selects an
+independent history file; an empty value disables history and its startup hints
+while leaving the older cache available. New database files are private to the
+user. SQLite may create adjacent `-wal` and `-shm` files while in use.
+
+`SYQ_TUNING_HISTORY_SIZE` sets how much history to keep, default `128M`, minimum
+`16M`. History may be removed when this size target is exceeded.
+
+Recording is best effort: an interrupted transfer or a storage error can leave
+gaps in the history. Copies still proceed when history cannot be saved.
+Clearing history also removes its startup hints; it leaves the older
+connection-count cache intact.
 
 ## Filesystem tuning examples
 

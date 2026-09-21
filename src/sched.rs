@@ -9,6 +9,21 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
+/// The values used by the tuner's remaining-work gate. No paths or file identities.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub(crate) struct TuningWork {
+    pub scan_done: bool,
+    pub remaining_bytes: u64,
+    pub queued_files: usize,
+    pub work_units: usize,
+    pub minimum_split: u64,
+    pub workers: usize,
+    pub activity: u64,
+    pub minimum_activity: u64,
+    pub parallel: bool,
+    pub sufficient: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct FileJob<D = Option<Entry>, S = FileJobData> {
     pub data: S,
@@ -711,9 +726,33 @@ impl Sched {
     /// time needed for a complete sampling window; queued files add the same
     /// completion credit the tuner uses for small-file workloads.
     pub fn work_left_for(&self, n: usize, minimum_activity: u64, file_credit: u64) -> bool {
+        self.tuning_work(n, minimum_activity, file_credit)
+            .sufficient
+    }
+
+    pub(crate) fn tuning_work(
+        &self,
+        n: usize,
+        minimum_activity: u64,
+        file_credit: u64,
+    ) -> TuningWork {
         let g = self.inner.lock().unwrap();
+        let mut evidence = TuningWork {
+            scan_done: g.scan_done,
+            remaining_bytes: 0,
+            queued_files: 0,
+            work_units: 0,
+            minimum_split: self.min_split,
+            workers: n,
+            activity: 0,
+            minimum_activity,
+            parallel: false,
+            sufficient: false,
+        };
+        // While scanning, the queue is incomplete and none of its totals qualify
+        // a probe. Preserve the existing early return and mark that explicitly.
         if !g.scan_done {
-            return false;
+            return evidence;
         }
         let mut bytes = g.files.bytes + g.ranges.bytes;
         bytes += g
@@ -724,10 +763,15 @@ impl Sched {
                 r.end.saturating_sub(r.pos)
             })
             .sum::<u64>();
-        let activity = bytes.saturating_add((g.files.len() as u64).saturating_mul(file_credit));
-        let work_units = g.files.len() + g.ranges.len() + g.inflight.len();
-        let parallel = work_units >= n || bytes >= (n as u64).saturating_mul(self.min_split);
-        parallel && activity >= minimum_activity
+        evidence.remaining_bytes = bytes;
+        evidence.queued_files = g.files.len();
+        evidence.activity =
+            bytes.saturating_add((g.files.len() as u64).saturating_mul(file_credit));
+        evidence.work_units = g.files.len() + g.ranges.len() + g.inflight.len();
+        evidence.parallel =
+            evidence.work_units >= n || bytes >= (n as u64).saturating_mul(self.min_split);
+        evidence.sufficient = evidence.parallel && evidence.activity >= minimum_activity;
+        evidence
     }
 
     /// Hand the unread remainder of an in-flight range back to the queue (a
