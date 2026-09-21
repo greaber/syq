@@ -107,7 +107,9 @@ and the history below. `XDG_CACHE_HOME` changes their parent directory.
 
 When an increase gives similar throughput, syq keeps the extra workers and
 pauses growth; later experiments can reduce the count. That inconclusive
-increase does not raise the starting count remembered for future copies.
+increase does not raise the starting count remembered for future copies. A
+downward experiment is kept only when it measures higher throughput than the
+previous count; equal or slower results restore the previous count.
 When tuning reduces the worker count, connected workers wait without taking new
 work. Syq keeps connections available during an experiment so it can promptly
 restore the previous count. It also prepares likely increases ahead of time,
