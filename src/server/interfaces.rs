@@ -4,7 +4,7 @@ use std::net::IpAddr;
 fn is_virtual_iface(name: &str) -> bool {
     matches!(name, "lo" | "lo0")
         || [
-            "docker", "veth", "br-", "virbr", "vmnet", "cni", "flannel", "cali", "kube", "ib",
+            "docker", "veth", "br-", "virbr", "vmnet", "cni", "flannel", "cali", "kube",
         ]
         .iter()
         .any(|p| name.starts_with(p))
@@ -262,6 +262,35 @@ mod tests {
         let ssh = "fdaa:0:1:a7b::2".parse().ok();
         let got = advertised_addrs(parse_ip_addrs(IP_ADDR_SHOW, speeds), ssh, v4);
         assert!(!got.iter().any(|(ip, _)| ip.starts_with("fdaa")));
+    }
+
+    #[test]
+    fn advertised_addrs_includes_ipoib_addresses_with_known_or_unknown_speed() {
+        let listing = "\
+    2: eth0    inet 192.0.2.2/24 scope global eth0
+    3: ib0    inet 192.0.2.3/24 scope global ib0
+    4: ib0.8001    inet6 2001:db8::4/64 scope global
+    4: ib0.8001    inet6 fe80::4/64 scope link
+    5: docker0    inet 172.17.0.1/16 scope global docker0
+    ";
+        let both = BoundFamilies { v4: true, v6: true };
+        let got = advertised_addrs(
+            parse_ip_addrs(listing, |name| match name {
+                "ib0" => 100_000,
+                "eth0" => 10_000,
+                _ => 0,
+            }),
+            None,
+            both,
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("192.0.2.3".into(), 100_000),
+                ("192.0.2.2".into(), 10_000),
+                ("2001:db8::4".into(), 0),
+            ]
+        );
     }
 
     #[test]
