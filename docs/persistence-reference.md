@@ -7,15 +7,16 @@ For everyday setup, start with [Keep connections open](persistence.md) or
 
 ## Names and profiles
 
-Give different receiving locations their own names:
+Give a project its own receiving name and directory:
 
 ```sh
+mkdir -p ~/work/project
 syq persist receive on --name laptop --cwd ~
 syq persist receive on --name project --root ~/work/project
 syq persist connect server
 ```
 
-Both names work from the same server account: `syq cp results --to @project`
+Both profiles work from the same server account: `syq cp results --to @project`
 and `syq cp report.pdf --to @laptop`. Each profile has its own directory, copy
 root, limits, automatic approval root, and background connection to each
 allowed server.
@@ -52,6 +53,19 @@ the receiving profile. Without `--name`, `receive wait` waits for every enabled
 profile on that server.
 
 ### Choose allowed servers
+
+To give one server an inbox for downloads that do not need approval:
+
+```sh
+mkdir -p ~/Downloads/work
+syq persist receive on --name work-inbox --server work \
+  --auto-approve-root ~/Downloads/work
+syq persist connect work
+```
+
+On `work`, use `syq cp results --to @work-inbox`. Other connections cannot
+use that profile. Your general profile can still ask for approval on every
+download.
 
 Profiles default to all connected servers. `receive on --name NAME --server HOST`
 restricts a profile to the exact SSH destination used on the receiving machine.
