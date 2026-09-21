@@ -61,7 +61,15 @@ pub(super) fn local_addrs(families: BoundFamilies) -> Vec<(String, u32)> {
     let ssh_ip = std::env::var("SSH_CONNECTION")
         .ok()
         .and_then(|c| c.split_whitespace().nth(2).and_then(|ip| ip.parse().ok()));
-    advertised_addrs(interface_addresses(), ssh_ip, families)
+    let interfaces = interface_addresses();
+    // Fallback fixtures must not depend on the host's reachable interfaces.
+    #[cfg(debug_assertions)]
+    let interfaces = if std::env::var_os("SYQ_TEST_NO_INTERFACE_ADDRESSES").is_some() {
+        Vec::new()
+    } else {
+        interfaces
+    };
+    advertised_addrs(interfaces, ssh_ip, families)
 }
 
 #[cfg(target_os = "linux")]

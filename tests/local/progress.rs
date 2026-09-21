@@ -265,6 +265,7 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("FAKE_IP_LOG", t.path("ip.log"))
         .env("FAKE_SSH_CONNECTION", "192.0.2.2 40000 192.0.2.1 22")
+        .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
         .env("XDG_CONFIG_HOME", t.path("config"))
         .run()
         .expect("run double-verbose dry-run with TCP fallback");
@@ -303,8 +304,8 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
 fn double_verbose_dry_run_reports_ipv6_arrival_address_as_reachable() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    // No usable interface listing: only the address ssh arrived on, an IPv6
-    // loopback here, can be advertised. It must be listened on and selected.
+    // Suppress discovery so this specifically exercises the IPv6 SSH arrival
+    // address. It must be listened on and selected.
     executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
     write(&t.path("src"), b"v6");
     let remote = format!("diagnostic.invalid:{}", t.s("dst"));
@@ -323,6 +324,7 @@ fn double_verbose_dry_run_reports_ipv6_arrival_address_as_reachable() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("FAKE_SSH_CONNECTION", "::1 40000 ::1 22")
+        .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
         .env("XDG_CONFIG_HOME", t.path("config"))
         .run()
         .expect("run double-verbose dry-run over IPv6");

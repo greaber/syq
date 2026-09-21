@@ -1518,7 +1518,8 @@ fn buffered_remote_scan_overlaps_tcp_setup() {
                 },
             )
             .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("SYQ_TEST_SETUP_EVENTS", &events);
+            .env("SYQ_TEST_SETUP_EVENTS", &events)
+            .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1");
         if require_tcp {
             command.env("SYQ_TEST_REQUIRE_TCP", "1");
         }
