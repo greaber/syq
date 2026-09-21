@@ -6,6 +6,9 @@ mod test_support;
 #[path = "s3/streams.rs"]
 mod streams;
 
+#[path = "s3/listing.rs"]
+mod listing;
+
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},

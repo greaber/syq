@@ -560,7 +560,7 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let args_before = &words[2..index];
     match command {
-        "completion" | "persist" | "receiver" | "exec" | "tuning-cache" => {
+        "completion" | "persist" | "receiver" | "exec" | "tuning-cache" | "_ls" => {
             management_candidates(command, args_before, current)
         }
         "help" => Ok(help_candidates(args_before, current)),
@@ -709,6 +709,7 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
         "exec",
         "rm",
         "clean-partials",
+        "_ls",
         "map",
         "rsync",
         "persist",

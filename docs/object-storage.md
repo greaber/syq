@@ -105,3 +105,9 @@ Named removal selectors choose exact keys; `--src-dir` and `--srcs-in` choose
 prefix trees and accept a trailing `/`. When deleting an exact directory-marker
 version, keep the trailing `/` in its key. An empty S3 source prefix is rejected
 by `cp`, so it cannot prune an entire local destination.
+
+## Experimental listing
+
+Use [`syq _ls`](commands/_ls.md) to list matching S3 objects
+without downloading them. Its interface is experimental and may change
+between releases.

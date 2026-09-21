@@ -26,6 +26,7 @@ syq --self-update
 | [`exec`](exec.md) | Run a command on a named receiving machine after local approval |
 | [`rm`](rm.md) | Remove selected files and directory trees |
 | [`clean-partials`](clean-partials.md) | Delete syq partial files in directory trees |
+| [`_ls`](_ls.md) | List S3 objects (experimental; interface may change) |
 | [`map`](map.md) | Print source-to-destination mappings as NDJSON |
 | [`rsync`](rsync.md) | Copy using rsync-compatible syntax |
 | [`persist`](persist.md) | Manage persistent connections, receiving, and return destinations |

@@ -279,6 +279,15 @@ fn main() {
             }
         }
     }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("_ls") {
+        match s3::listing::run(&argv[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                crate::output::diagnostic!("syq _ls: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("tuning-cache") {
         match tune::history::run(&argv[2..]) {
             Ok(code) => std::process::exit(code),

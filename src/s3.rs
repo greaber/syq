@@ -7,6 +7,7 @@ mod client;
 mod delete;
 mod diagnostics;
 mod dns;
+pub(crate) mod listing;
 mod local;
 mod remove;
 pub(crate) use remove::RemoveFlags;

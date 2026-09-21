@@ -913,6 +913,7 @@ pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
         "rm" => Some(crate::help::filesystem(NativeRmCommand::command())),
         "clean-partials" => Some(crate::help::filesystem(CleanPartialsCommand::command())),
         "map" => Some(crate::help::filesystem(NativeMapCommand::command())),
+        "_ls" => Some(crate::s3::listing::command_for_help()),
         _ => None,
     }
 }

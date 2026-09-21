@@ -3239,6 +3239,7 @@ dependencies = [
  "percent-encoding",
  "postcard",
  "rayon",
+ "regex",
  "rusqlite",
  "semver",
  "serde",
