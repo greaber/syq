@@ -818,6 +818,8 @@ fn automatic_ssh_restores_workers_for_a_single_file_partial() {
         .arg("--no-progress")
         .env("SYQ_TEST_WORKER_EVENTS", &events)
         .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
+        // Match the unscoped legacy cache fixture regardless of the host network.
+        .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_CACHE_HOME", t.path("cache"))
         .run()

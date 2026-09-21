@@ -117,6 +117,8 @@ fn automatic_workers_can_start_above_64_from_the_cache() {
         }
         let output = command
             .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
+            // Match the unscoped legacy cache fixture regardless of the host network.
+            .env("SYQ_TEST_TUNING_NETWORK", "")
             .env(
                 "SYQ_TUNING_HISTORY",
                 t.path(&format!("history-{label}.sqlite")),
