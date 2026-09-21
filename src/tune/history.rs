@@ -16,6 +16,7 @@ pub(crate) use command::{command_for_help, run};
 const SCHEMA: i64 = 1;
 const DEFAULT_BUDGET: u64 = 1 << 30;
 const MAX_PENDING: usize = 4096;
+const FINISH_LOCK_WAIT: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub(crate) struct Recorder(Arc<Mutex<Writer>>);
@@ -340,6 +341,13 @@ impl Writer {
             return Ok(());
         }
         let transaction = self.db.unchecked_transaction()?;
+        self.write_pending(&transaction)?;
+        transaction.commit()?;
+        self.mark_flushed();
+        Ok(())
+    }
+
+    fn write_pending(&self, transaction: &rusqlite::Transaction<'_>) -> Result<()> {
         // Context revisions (for example, discovering a mixed-filesystem tree)
         // must survive contention just like samples. Finish flushes this before
         // publishing any recommendation under the context.
@@ -362,11 +370,13 @@ impl Writer {
             "UPDATE runs SET lost=?1,updated_day=?3 WHERE id=?2",
             params![self.lost, self.id, day()],
         )?;
-        transaction.commit()?;
+        Ok(())
+    }
+
+    fn mark_flushed(&mut self) {
         self.pending.clear();
         self.pending_context = None;
         self.last_flush = Instant::now();
-        Ok(())
     }
 
     fn finish(
@@ -376,8 +386,18 @@ impl Writer {
         workers: Option<usize>,
         summary: Value,
     ) -> Result<()> {
-        self.flush()?;
-        self.db.execute(
+        // Pay at most one small lock wait for the entire final save. Once the
+        // immediate transaction owns the writer lock, samples, context and the
+        // recommendation commit together without per-statement busy waits.
+        self.db.busy_timeout(FINISH_LOCK_WAIT)?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        );
+        self.db.busy_timeout(Duration::ZERO)?;
+        let transaction = transaction?;
+        self.write_pending(&transaction)?;
+        transaction.execute(
             "UPDATE runs SET status=?1,eligible=?2,workers=?3,summary=?4,lost=?5 WHERE id=?6",
             params![
                 if success { "success" } else { "failed" },
@@ -388,6 +408,9 @@ impl Writer {
                 self.id
             ],
         )?;
+        transaction.commit()?;
+        self.mark_flushed();
+        // Maintenance is best effort and must not renew the lock-wait budget.
         prune(&self.db, self.budget, self.id)?;
         Ok(())
     }

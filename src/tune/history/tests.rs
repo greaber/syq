@@ -157,6 +157,79 @@ fn lock_contention_keeps_samples_and_context_for_later_flush() {
 }
 
 #[test]
+fn final_save_preserves_pending_evidence_and_restores_nonblocking_writes() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let recorder = recorder(&path);
+    let other = open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    recorder.context(&key("a"));
+    recorder.event("sample", json!({"bytes":123}));
+    let mut writer = recorder.0.lock().unwrap();
+    let error = writer.finish(true, true, Some(8), json!({})).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::DatabaseBusy
+    ));
+    let timeout: i64 = writer
+        .db
+        .pragma_query_value(None, "busy_timeout", |r| r.get(0))
+        .unwrap();
+    assert_eq!(timeout, 0);
+    assert!(!writer.pending.is_empty());
+    assert!(writer.pending_context.is_some());
+    other.execute_batch("COMMIT").unwrap();
+    assert_eq!(
+        command::read_run(&other, writer.id).unwrap()["status"],
+        "incomplete"
+    );
+
+    writer
+        .finish(true, true, Some(8), json!({"files":1}))
+        .unwrap();
+    let timeout: i64 = writer
+        .db
+        .pragma_query_value(None, "busy_timeout", |r| r.get(0))
+        .unwrap();
+    assert_eq!(timeout, 0);
+    assert!(writer.pending.is_empty());
+    assert!(writer.pending_context.is_none());
+    let run = command::read_run(&other, writer.id).unwrap();
+    assert_eq!(run["status"], "success");
+    assert_eq!(run["selected_workers"], 8);
+    assert_eq!(run["context"]["destination_filesystem"], "a");
+    assert_eq!(run["recommendation_eligible"], true);
+    assert!(command::read_events(&other, writer.id)
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "sample"));
+}
+
+#[test]
+fn failed_final_save_does_not_publish_partial_context_or_samples() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let recorder = recorder(&path);
+    let mut writer = recorder.0.lock().unwrap();
+    writer.pending_context = Some(key("a"));
+    writer
+        .pending
+        .push(json!({"sequence":1,"elapsed_us":1,"kind":"sample","data":{}}));
+    writer.db.execute_batch("CREATE TRIGGER fail_completion BEFORE UPDATE OF status ON runs BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+    assert!(writer.finish(true, true, Some(8), json!({})).is_err());
+    let run = command::read_run(&writer.db, writer.id).unwrap();
+    assert_eq!(run["status"], "incomplete");
+    assert_eq!(run["context"], json!({}));
+    assert_eq!(
+        command::read_events(&writer.db, writer.id).unwrap().len(),
+        1
+    );
+    assert!(!writer.pending.is_empty());
+    assert!(writer.pending_context.is_some());
+}
+
+#[test]
 fn decisions_include_comparison_evidence_and_unapplied_candidates() {
     use super::super::{trace::Trace, Gate, Policy};
     let temp = crate::test_support::tempdir().unwrap();
