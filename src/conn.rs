@@ -955,7 +955,8 @@ pub struct TcpCandidate {
     pub address: String,
     pub speed_mbps: u32,
     pub source: DataAddressSource,
-    pub reachable: bool,
+    /// None means the probe did not finish before route selection.
+    pub reachable: Option<bool>,
     pub selected: bool,
 }
 
@@ -1692,7 +1693,7 @@ impl RemoteSpec {
                 address,
                 speed_mbps,
                 source: DataAddressSource::RemoteInterface,
-                reachable: false,
+                reachable: None,
                 selected: false,
             })
             .collect();
@@ -1714,15 +1715,15 @@ impl RemoteSpec {
                         address: h,
                         speed_mbps: 0,
                         source: DataAddressSource::SshTarget,
-                        reachable: false,
+                        reachable: None,
                         selected: false,
                     },
                 );
             }
         }
         // Probing is independent of the authenticated control stream. Let the
-        // coordinator do destination preflight and plan payloads while every
-        // candidate receives its complete bounded probe window.
+        // coordinator do destination preflight and plan payloads while route
+        // selection probes the candidates.
         let probe = std::thread::spawn(move || {
             probe_reachable(&mut candidates, port)?;
             Ok(candidates)
@@ -1754,13 +1755,13 @@ impl RemoteSpec {
         // Tailscale, say) would drag the transfer down, so we don't.
         let fastest = candidates
             .iter()
-            .filter(|candidate| candidate.reachable)
+            .filter(|candidate| candidate.reachable == Some(true))
             .map(|candidate| candidate.speed_mbps)
             .max()
             .unwrap_or(0);
         let mut selected_unknown = false;
         for candidate in &mut candidates {
-            candidate.selected = candidate.reachable
+            candidate.selected = candidate.reachable == Some(true)
                 && if fastest > 0 {
                     candidate.speed_mbps.saturating_mul(2) >= fastest
                 } else if selected_unknown {
@@ -2006,8 +2007,6 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
 
     let timeout = std::time::Duration::from_millis(1000);
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut undetermined = remaining.iter().filter(|&&count| count > 0).count();
-    let mut determined = vec![false; candidates.len()];
     for (t, (addr, _)) in targets.iter().enumerate() {
         let tx = tx.clone();
         let addr = *addr;
@@ -2019,11 +2018,41 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
     }
     drop(tx);
 
-    // Every path gets its complete bounded probe window. Do not cut off a
-    // higher-bandwidth path merely because the public SSH fallback connected
-    // first; a higher-latency rail may still be the better transfer path.
-    let deadline = std::time::Instant::now() + timeout + std::time::Duration::from_millis(100);
+    collect_probe_results(
+        candidates,
+        &targets,
+        remaining,
+        rx,
+        std::time::Instant::now() + timeout + std::time::Duration::from_millis(100),
+    );
+    Ok(())
+}
+
+fn collect_probe_results(
+    candidates: &mut [TcpCandidate],
+    targets: &[(SocketAddr, Vec<usize>)],
+    mut remaining: Vec<usize>,
+    rx: std::sync::mpsc::Receiver<(usize, bool)>,
+    deadline: std::time::Instant,
+) {
+    let unknown_speeds = candidates.iter().all(|candidate| candidate.speed_mbps == 0);
+    let mut undetermined = remaining.iter().filter(|&&count| count > 0).count();
+    for (candidate, count) in candidates.iter_mut().zip(&remaining) {
+        // A name resolving to no addresses is already known to be unusable.
+        candidate.reachable = (*count == 0).then_some(false);
+    }
     while undetermined > 0 {
+        // With unknown speeds, selection uses the first reachable candidate.
+        // Once all earlier candidates are resolved, later probes cannot change
+        // that choice. Known-speed multipath still gets its full probe window.
+        if unknown_speeds
+            && candidates
+                .iter()
+                .find(|candidate| candidate.reachable != Some(false))
+                .is_some_and(|candidate| candidate.reachable == Some(true))
+        {
+            break;
+        }
         let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
             break;
         };
@@ -2031,18 +2060,16 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
             break;
         };
         for &i in &targets[t].1 {
-            if determined[i] {
+            if candidates[i].reachable.is_some() {
                 continue;
             }
             remaining[i] -= 1;
             if reachable || remaining[i] == 0 {
-                candidates[i].reachable = reachable;
-                determined[i] = true;
+                candidates[i].reachable = Some(reachable);
                 undetermined -= 1;
             }
         }
     }
-    Ok(())
 }
 
 fn validate_advertised_tcp_port(port: u16, requested: (u16, u16)) -> Result<()> {

@@ -7,11 +7,14 @@ use crate::proto::*;
 use crate::tcp_records::{Cipher, RecordReader, RecordWriter};
 use anyhow::{bail, Context, Result};
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
+
+mod interfaces;
+use interfaces::{local_addrs, BoundFamilies};
 
 struct RequestReader {
     rx: Option<std::sync::mpsc::Receiver<io::Result<crate::wire_budget::Budgeted<Request>>>>,
@@ -890,157 +893,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
         );
     }
     Ok(())
-}
-
-fn is_virtual_iface(name: &str) -> bool {
-    name == "lo"
-        || [
-            "docker", "veth", "br-", "virbr", "vmnet", "cni", "flannel", "cali", "kube", "ib",
-        ]
-        .iter()
-        .any(|p| name.starts_with(p))
-        || std::path::Path::new(&format!("/sys/class/net/{name}/bridge")).exists()
-}
-
-fn iface_speed(name: &str) -> u32 {
-    std::fs::read_to_string(format!("/sys/class/net/{name}/speed"))
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .filter(|&v| v > 0)
-        .map(|v| v as u32)
-        .unwrap_or(0)
-}
-
-/// Which address families the data listener bound, and so which advertised
-/// addresses a client could possibly connect to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BoundFamilies {
-    v4: bool,
-    v6: bool,
-}
-
-impl BoundFamilies {
-    fn accepts(self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(_) => self.v4,
-            IpAddr::V6(_) => self.v6,
-        }
-    }
-}
-
-/// (ip, speed_mbps) for each real NIC the client might reach us on, over
-/// both IPv4 and IPv6. The ssh session's own server address is first (and is
-/// included even when the interface listing is unavailable); virtual
-/// interfaces (docker/bridges/etc.) are skipped so multipath never fans out
-/// onto a dead bridge.
-fn local_addrs(families: BoundFamilies) -> Vec<(String, u32)> {
-    let ssh_ip = std::env::var("SSH_CONNECTION").ok().and_then(|c| {
-        c.split_whitespace()
-            .nth(2)
-            .and_then(|ip| ip.parse::<IpAddr>().ok())
-    });
-    // The Darwin receiver must not spawn children while receiving SCM_RIGHTS.
-    #[cfg(target_os = "linux")]
-    let text = std::process::Command::new("ip")
-        .args(["-o", "addr", "show"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    #[cfg(not(target_os = "linux"))]
-    let text = String::new();
-    advertised_addrs(&text, ssh_ip, families, iface_speed)
-}
-
-/// Priority bucket for an advertised address: lower sorts first. The address
-/// ssh arrived on is bucket 0 (handled by the caller); this classifies the
-/// rest so that LAN addresses are tried before public ones and overlay
-/// (CGNAT / Tailscale) addresses last.
-fn addr_bucket(ip: IpAddr) -> u8 {
-    if crate::conn::is_overlay_address(&ip.to_string()) {
-        return 3; // CGNAT / Tailscale
-    }
-    match ip {
-        IpAddr::V4(v4) if v4.is_private() => 1,
-        // Unique local (fc00::/7), e.g. a private cloud network.
-        IpAddr::V6(v6) if (v6.segments()[0] & 0xfe00) == 0xfc00 => 1,
-        _ => 2, // public
-    }
-}
-
-/// Parse `ip -o addr show` output into the addresses worth advertising, in
-/// priority order: the ssh arrival address, then by bucket, then by NIC speed
-/// (fastest first). Only `scope global` addresses of a bound family count,
-/// which drops loopback and link-local addresses (a client cannot use an
-/// `fe80::` address without the interface scope, which syq does not carry).
-fn advertised_addrs(
-    text: &str,
-    ssh_ip: Option<IpAddr>,
-    families: BoundFamilies,
-    iface_speed: impl Fn(&str) -> u32,
-) -> Vec<(String, u32)> {
-    let mut addrs: Vec<(IpAddr, u32, u8)> = Vec::new(); // (ip, speed, priority-bucket)
-    for line in text.lines() {
-        // "3: bond0    inet 10.2.201.45/24 brd ... scope global bond0\ ..."
-        // "3: bond0    inet6 fdaa:0:1::2/112 scope global \ ..."
-        let f: Vec<&str> = line.split_whitespace().collect();
-        let Some(iface) = f.get(1) else {
-            continue;
-        };
-        let Some(family_at) = f.iter().position(|w| *w == "inet" || *w == "inet6") else {
-            continue;
-        };
-        let Some(ipcidr) = f.get(family_at + 1) else {
-            continue;
-        };
-        let scope = f
-            .iter()
-            .position(|w| *w == "scope")
-            .and_then(|at| f.get(at + 1))
-            .copied();
-        if scope != Some("global") {
-            continue;
-        }
-        // An address the kernel is still checking, or is retiring, is not a
-        // reliable route to advertise.
-        if f.iter().any(|w| *w == "tentative" || *w == "deprecated") {
-            continue;
-        }
-        if is_virtual_iface(iface) {
-            continue;
-        }
-        let Some(ip) = ipcidr
-            .split('/')
-            .next()
-            .and_then(|ip| ip.parse::<IpAddr>().ok())
-        else {
-            continue;
-        };
-        if !families.accepts(ip) || ip.is_loopback() {
-            continue;
-        }
-        let bucket = if ssh_ip == Some(ip) {
-            0
-        } else {
-            addr_bucket(ip)
-        };
-        addrs.push((ip, iface_speed(iface), bucket));
-    }
-    // The address ssh arrived on is reachable by construction (loopback
-    // included: the client is then on this host). Advertise it even when the
-    // listing did not name it (no `ip` tool, or an address on an interface
-    // the listing filtered out).
-    if let Some(ip) = ssh_ip {
-        if families.accepts(ip) && !addrs.iter().any(|a| a.0 == ip) {
-            addrs.push((ip, 0, 0));
-        }
-    }
-    // ssh-arrival ip first, then by bucket, then by speed (fastest first).
-    addrs.sort_by(|a, b| a.2.cmp(&b.2).then(b.1.cmp(&a.1)));
-    addrs.dedup_by(|a, b| a.0 == b.0);
-    addrs
-        .into_iter()
-        .map(|(ip, sp, _)| (ip.to_string(), sp))
-        .collect()
 }
 
 /// Bind the data listener on the first free port in `lo..=hi`, on both
