@@ -137,3 +137,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo 'Every release validation suite in this workflow succeeded.'
+
+  # Explicit evidence that this scheduled run did not execute validation.
+  nightly-unchanged:
+    needs: scope
+    if: github.event_name == 'schedule' && needs.scope.outputs.conformance == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Nightly test inputs are unchanged; reuse earlier certified evidence.'

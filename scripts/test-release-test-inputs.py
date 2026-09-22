@@ -106,6 +106,8 @@ if '/jobs?' in url:
     jobs = [] if '/runs/2/' in url else [{'name':'release-certification','status':'completed','conclusion':'success'}]
     if '/runs/2/' in url and os.environ.get('CURRENT_DOCS'):
         jobs = [{'name':'rust', 'steps':[{'name':'Test executable mapping documentation','status':'completed','conclusion':'success'}]}]
+    if os.environ.get('NIGHTLY_SEQUENCE'):
+        jobs = [{'name':'nightly-unchanged' if '/runs/2/' in url else 'release-certification','status':'completed','conclusion':'success'}]
     print(json.dumps([{'jobs': jobs}]))
 else:
     sha = url.split('head_sha=')[1].split('&')[0]
@@ -113,7 +115,12 @@ else:
     status = 'completed' if is_base else os.environ.get('CURRENT_STATUS', 'completed')
     conclusion = 'success' if is_base else os.environ.get('CURRENT_CONCLUSION', 'success')
     run = dict(id=1 if is_base else 2,run_attempt=1,run_number=1,head_sha=sha,head_branch='master',head_repository={'full_name':'greaber/syq'},event='push',status=status,conclusion=conclusion)
-    print(json.dumps([{'workflow_runs':[run]}]))
+    if os.environ.get('NIGHTLY_SEQUENCE'):
+        run.update(id=2, run_number=2, event='schedule', status=os.environ.get('CURRENT_STATUS', 'completed'), conclusion=os.environ.get('CURRENT_CONCLUSION', 'success'))
+        older = dict(run, id=1, run_number=1, status='completed', conclusion='success')
+        print(json.dumps([{'workflow_runs':[run, older]}]))
+    else:
+        print(json.dumps([{'workflow_runs':[run]}]))
 ''')
         gh.chmod(0o755)
         env = {**os.environ, 'PATH': str(fakebin) + os.pathsep + os.environ['PATH'], 'BASE': self.base}
@@ -127,6 +134,18 @@ else:
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertTrue(all(w['state'] == expected for w in json.loads(result.stdout)['workflows']))
 
+
+        # A skipped nightly on the same SHA must not hide the full certificate.
+        sequence_env = {**env, 'NIGHTLY_SEQUENCE': '1'}
+        result = subprocess.run(cmd, env=sequence_env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(w['run_id'] == 1 and w['evidence_commit'] == head
+                            for w in json.loads(result.stdout)['workflows']))
+        for variables, expected in [({'CURRENT_CONCLUSION': 'failure'}, 'repair'),
+                                    ({'CURRENT_STATUS': 'in_progress'}, 'wait')]:
+            result = subprocess.run(cmd, env={**sequence_env, **variables}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertTrue(all(w['state'] == expected for w in json.loads(result.stdout)['workflows']))
 
         # Changed examples require their focused tests, not new native suites.
         Path('docs').mkdir()

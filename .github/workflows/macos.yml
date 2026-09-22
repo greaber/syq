@@ -331,3 +331,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo 'The complete Apple Silicon native, SDK, and release-tool suites passed.'
+
+  # Explicit evidence that this scheduled run did not execute validation.
+  nightly-unchanged:
+    needs: scope
+    if: github.event_name == 'schedule' && needs.scope.outputs.needed == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Nightly test inputs are unchanged; reuse earlier certified evidence.'

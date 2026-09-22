@@ -36,14 +36,31 @@ for workflow in ci.yml rsync-compat.yml macos.yml; do
   while IFS= read -r evidence_commit; do
     runs=$(gh api --paginate --slurp \
       "repos/$repository/actions/workflows/$workflow/runs?head_sha=$evidence_commit&per_page=100") || exit 2
-    latest=$(jq -c --arg commit "$evidence_commit" --arg repository "$repository" '
+    candidates=$(jq -c --arg commit "$evidence_commit" --arg repository "$repository" '
       [.[].workflow_runs[]? |
         select(.head_sha == $commit and .head_branch == "master"
           and .head_repository.full_name == $repository
           and (.event == "workflow_dispatch" or .event == "push" or .event == "schedule"))] |
       sort_by([(.run_number // 0), (.run_attempt // 0)]) |
-      last // null
+      reverse
     ' <<<"$runs") || exit 2
+    # Only explicit successful unchanged-nightly markers allow walking past
+    # a newer run. Failures, pending runs, and ordinary uncertified runs retain
+    # their existing meaning; never inspect an older attempt of the same run.
+    while :; do
+      latest=$(jq -c '.[0] // null' <<<"$candidates")
+      if ! jq -e '.event == "schedule" and .status == "completed" and .conclusion == "success"' <<<"$latest" >/dev/null; then
+        break
+      fi
+      skipped_id=$(jq '.id' <<<"$latest")
+      skipped_attempt=$(jq '.run_attempt' <<<"$latest")
+      skipped_jobs=$(gh api --paginate --slurp \
+        "repos/$repository/actions/runs/$skipped_id/attempts/$skipped_attempt/jobs?per_page=100") || exit 2
+      if ! jq -e '[.[].jobs[]? | select(.name == "nightly-unchanged" and .status == "completed" and .conclusion == "success")] | length == 1' <<<"$skipped_jobs" >/dev/null; then
+        break
+      fi
+      candidates=$(jq '.[1:]' <<<"$candidates")
+    done
     run_id=$(jq '.id // null' <<<"$latest")
     attempt=$(jq '.run_attempt // null' <<<"$latest")
     url=$(jq -r '.html_url // ""' <<<"$latest")
