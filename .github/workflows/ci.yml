@@ -457,7 +457,7 @@ jobs:
 
   cache-probe:
     if: inputs.cache_probe == 'seed' || inputs.cache_probe == 'read'
-    runs-on: namespace-profile-syq-linux
+    runs-on: namespace-profile-syq-linux;github.run-id=${{ github.run_id }}
     timeout-minutes: 5
     steps:
       - name: Inspect raw cache volume
