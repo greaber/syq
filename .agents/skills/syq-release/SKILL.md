@@ -80,9 +80,13 @@ CI workflow's state and next action. Perform only missing work:
 
 Follow the publication and recovery procedures in the checkout's `RELEASING.md`.
 Run `scripts/release-preflight.sh v<version>` from the clean candidate. It accepts
-a task branch or detached checkout matching remote master; an independent clone
-is unnecessary. If master advances before tagging, reassess the candidate and
-rerun readiness/preflight. Restore tmux SSH-agent variables per `AGENTS.md` if
+a clean task branch or detached checkout at the pinned candidate, which must
+remain an ancestor of remote master; an independent clone is unnecessary.
+Later master commits do not automatically replace the candidate. Assess them
+for significant fixes worth restarting the release for; otherwise continue
+with the pinned commit and its existing validation. Once CI and local SSH
+validation pass, tag even if the candidate binaries are still building: the
+release workflow waits for them while validating the source crate in parallel. Restore tmux SSH-agent variables per `AGENTS.md` if
 signing is unavailable. Sign and push the matching annotated tag after preflight.
 
 Use `scripts/release-status.sh v<version>` to follow the exact release run,

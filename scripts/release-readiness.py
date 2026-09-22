@@ -113,8 +113,9 @@ def readiness(tag):
                               capture_output=True, text=True)
     if tracking.returncode or tracking.stdout.strip() != master:
         missing("origin/master is stale or missing", "git fetch origin master")
-    if commit != master:
-        missing(f"candidate is not remote master {master}", "Merge preparation through a PR, then use a clean checkout of remote master.")
+    elif subprocess.run(["git", "merge-base", "--is-ancestor", commit, master]).returncode:
+        missing(f"candidate is not merged into remote master {master}",
+                "Merge preparation through a PR, then use a clean checkout of the chosen release commit.")
     if run("git", "status", "--porcelain", "--untracked-files=all"):
         missing("working tree is dirty", "Commit the release preparation on its task branch.")
     version = re.search(r'^version = "([^"]+)"', Path("Cargo.toml").read_text(), re.M).group(1)
@@ -146,7 +147,9 @@ def readiness(tag):
         if workflow["state"] != "ready":
             action = workflow["next_action"]
             if commit != master and workflow["state"] == "dispatch":
-                action = "Merge preparation first; dispatch on master would validate a different commit."
+                action = ("This candidate lacks full-suite evidence; dispatching on current master would "
+                          "validate a different commit. Inspect existing candidate runs or deliberately "
+                          "select a newer merged candidate before dispatching.")
             missing(workflow["message"], action)
     return {"schema": 1, "tag": tag, "commit": commit, "remote_master": master,
             "ready": not issues, "ssh": evidence, "ci": certification, "missing": issues,
