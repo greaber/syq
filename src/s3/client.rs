@@ -141,13 +141,27 @@ impl Intercept for Headers {
         &self,
         context: &mut BeforeTransmitInterceptorContextMut<'_>,
         _: &RuntimeComponents,
-        _: &mut ConfigBag,
+        cfg: &mut ConfigBag,
     ) -> std::result::Result<(), BoxError> {
         for Header(name, value) in &self.0 {
             context
                 .request_mut()
                 .headers_mut()
                 .try_insert(name.clone(), value.clone())?;
+        }
+        let request = context.request();
+        if request.method() == "PUT" {
+            if let Some(checksum) = request.headers().get("x-amz-checksum-sha256") {
+                let multipart = url::Url::parse(request.uri())?
+                    .query_pairs()
+                    .any(|(key, _)| key == "uploadId");
+                if let Some(hash) =
+                    super::checksum::single_put_payload("PUT", multipart, Some(checksum))?
+                {
+                    cfg.interceptor_state()
+                        .store_put(aws_runtime::auth::PayloadSigningOverride::Precomputed(hash));
+                }
+            }
         }
         Ok(())
     }
@@ -1298,3 +1312,6 @@ mod control_latency_tests;
 
 #[cfg(test)]
 mod upload_timeout_tests;
+
+#[cfg(test)]
+mod payload_signing_tests;

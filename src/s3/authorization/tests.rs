@@ -185,6 +185,12 @@ fn presigns_bind_the_payload_marker_and_write_condition() {
     for request in [
         Unsigned::new("HEAD", "allowed/file"),
         Unsigned::new("PUT", "allowed/file").header("if-none-match", "*"),
+        Unsigned::new("PUT", "allowed/file")
+            .header("if-none-match", "*")
+            .header(
+                "x-amz-checksum-sha256",
+                &crate::s3::checksum::Algorithm::Sha256.digest(b"abc"),
+            ),
     ] {
         let url = url::Url::parse(&signer.sign(&request).unwrap()).unwrap();
         let headers = url

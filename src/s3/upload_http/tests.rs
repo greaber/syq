@@ -1,6 +1,38 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[test]
+fn file_upload_accepts_precomputed_digest_but_rejects_placeholder_hash() {
+    let checksum = crate::s3::checksum::Algorithm::Sha256.digest(b"abc");
+    let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    for (query, native, signed, valid) in [
+        ("", Some(checksum.as_str()), digest, true),
+        ("", Some(checksum.as_str()), empty, false),
+        ("", Some(checksum.as_str()), "UNSIGNED-PAYLOAD", false),
+        ("", None, "UNSIGNED-PAYLOAD", true),
+        ("", None, empty, false),
+        (
+            "?uploadId=id&partNumber=1",
+            Some(checksum.as_str()),
+            "UNSIGNED-PAYLOAD",
+            true,
+        ),
+    ] {
+        let mut request = http::Request::builder()
+            .method("PUT")
+            .uri(format!("https://storage.example/bucket/key{query}"))
+            .header("x-amz-content-sha256", signed);
+        if let Some(native) = native {
+            request = request.header("x-amz-checksum-sha256", native);
+        }
+        assert_eq!(
+            check_payload(&request.body(SdkBody::empty()).unwrap()).is_ok(),
+            valid
+        );
+    }
+}
+
 #[tokio::test]
 async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests() {
     for synchronous in [false, true] {

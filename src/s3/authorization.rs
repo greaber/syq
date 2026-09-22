@@ -313,6 +313,15 @@ pub(crate) struct Unsigned {
     pub headers: BTreeMap<String, String>,
 }
 impl Unsigned {
+    fn payload_sha256(&self) -> Result<Option<String>> {
+        super::checksum::single_put_payload(
+            &self.method,
+            self.query.contains_key("uploadId"),
+            self.headers
+                .get("x-amz-checksum-sha256")
+                .map(String::as_str),
+        )
+    }
     pub(super) fn new(method: &str, key: &str) -> Self {
         Self {
             bucket: None,
@@ -466,6 +475,8 @@ impl Signer {
             .build()?
             .into();
         let url = request_url(&self.configuration.endpoint, &self.request.bucket, request)?;
+        let payload = request.payload_sha256()?;
+        let payload_header = payload.as_deref().unwrap_or("UNSIGNED-PAYLOAD");
         let signable = SignableRequest::new(
             &request.method,
             &url,
@@ -474,10 +485,12 @@ impl Signer {
                 .iter()
                 .filter(|(k, _)| k.as_str() != "x-amz-content-sha256")
                 .map(|(k, v)| (k.as_str(), v.as_str()))
-                // The transport sends this marker, including for HEAD/GET.
+                // The transport derives the same value from the approved checksum.
                 // R2 requires it in SignedHeaders whenever it is present.
-                .chain([("x-amz-content-sha256", "UNSIGNED-PAYLOAD")]),
-            SignableBody::UnsignedPayload,
+                .chain([("x-amz-content-sha256", payload_header)]),
+            payload
+                .clone()
+                .map_or(SignableBody::UnsignedPayload, SignableBody::Precomputed),
         )?;
         let (instructions, _) = sign(signable, &params)?.into_parts();
         let mut http = http::Request::builder()
