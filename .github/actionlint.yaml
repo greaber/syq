@@ -1,4 +1,0 @@
-self-hosted-runner:
-  labels:
-    - namespace-profile-syq-linux
-    - namespace-profile-syq-macos
