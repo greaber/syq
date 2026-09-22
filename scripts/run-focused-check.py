@@ -50,8 +50,8 @@ def main():
             "provider": args.provider,
             "revision": revision,
             "script": script,
-            "cargo_cache": args.cargo_cache,
-            "timeout": args.timeout,
+            "cargo_cache": str(args.cargo_cache).lower(),
+            "timeout": str(args.timeout),
         },
     }
     print(f"Checking {repo}@{revision} on {args.provider}/{args.runner}", flush=True)

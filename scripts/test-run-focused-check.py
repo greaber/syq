@@ -79,8 +79,8 @@ class DispatchTests(unittest.TestCase):
                     dirty=True, remote="b" * 40)
         self.assertEqual(self.payload["ref"], "other")
         self.assertEqual(self.payload["inputs"]["revision"], "b" * 40)
-        self.assertTrue(self.payload["inputs"]["cargo_cache"])
-        self.assertEqual(self.payload["inputs"]["timeout"], 3)
+        self.assertEqual(self.payload["inputs"]["cargo_cache"], "true")
+        self.assertEqual(self.payload["inputs"]["timeout"], "3")
 
     def test_missing_run_id_is_not_success(self):
         with self.assertRaises(ValueError):
