@@ -154,14 +154,7 @@ impl Connector {
                             == Some(file.length.to_string().as_str()),
                         "file body length differs from signed request"
                     );
-                    anyhow::ensure!(
-                        request
-                            .headers()
-                            .get("x-amz-content-sha256")
-                            .and_then(|v| v.to_str().ok())
-                            == Some("UNSIGNED-PAYLOAD"),
-                        "file body requires unsigned payload"
-                    );
+                    check_payload(&request)?;
                     let mut source = file.source.open()?;
                     source.seek(SeekFrom::Start(file.offset))?;
                     let check = source.try_clone()?;
@@ -201,6 +194,32 @@ impl Connector {
         })
     }
 }
+fn check_payload(request: &http::Request<SdkBody>) -> anyhow::Result<()> {
+    let multipart = url::Url::parse(&request.uri().to_string())?
+        .query_pairs()
+        .any(|(key, _)| key == "uploadId");
+    let payload = super::checksum::single_put_payload(
+        request.method().as_str(),
+        multipart,
+        request
+            .headers()
+            .get("x-amz-checksum-sha256")
+            .map(|v| v.to_str())
+            .transpose()?,
+    )?;
+    // The SDK sees a placeholder body. Never send its hash as the file's hash;
+    // only the prepared checksum (or an unsigned payload) describes this body.
+    anyhow::ensure!(
+        request
+            .headers()
+            .get("x-amz-content-sha256")
+            .and_then(|v| v.to_str().ok())
+            == Some(payload.as_deref().unwrap_or("UNSIGNED-PAYLOAD")),
+        "file body payload signing differs from prepared checksum"
+    );
+    Ok(())
+}
+
 pub(super) fn client(
     fallback: SharedHttpClient,
     cancellation: Arc<Cancellation>,
