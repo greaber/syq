@@ -177,7 +177,8 @@ release request does not require another preparation PR or another test run.
    `scripts/release_test_inputs.py` permits reuse only across changes to the syq
    package version in Cargo.toml/Cargo.lock and recognized prose: root project
    guides, changelog, release notes, and Markdown under docs except the executable
-   mappings examples. It compares all remaining committed inputs. The report
+   examples in mappings.md, automation.md, and commands/map.md. It compares all
+   remaining committed inputs. The report
    names the actual tested commit for each workflow. A newer failed or pending
    run is never hidden by earlier successful evidence. Runs made before
    certificates were introduced need a fresh manual run.

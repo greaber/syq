@@ -29,7 +29,8 @@ def version_neutral(path, data):
 def prose(path):
     return (path in {'README.md', 'CHANGELOG.md', 'RELEASING.md', 'CONTRIBUTING.md', 'AGENTS.md'}
             or path.startswith('.github/release-notes/') and path.endswith('.md')
-            or path.startswith('docs/') and path.endswith('.md') and path != 'docs/mappings.md')
+            or path.startswith('docs/') and path.endswith('.md') and path not in {
+                'docs/mappings.md', 'docs/automation.md', 'docs/commands/map.md'})
 
 
 def fingerprint(commit):

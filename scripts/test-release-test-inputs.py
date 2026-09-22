@@ -66,7 +66,8 @@ class InputsTests(unittest.TestCase):
 
     def test_test_build_workflow_and_executable_docs_changes_require_tests(self):
         for name in ['tests/test.rs', 'build.rs', '.github/workflows/ci.yml',
-                     'docs/mappings.md', 'scripts/check.sh', 'sdk/python/pyproject.toml']:
+                     'docs/mappings.md', 'docs/automation.md', 'docs/commands/map.md',
+                     'scripts/check.sh', 'sdk/python/pyproject.toml']:
             with self.subTest(name=name):
                 self.git('reset', '--hard', self.base)
                 p = Path(name)
