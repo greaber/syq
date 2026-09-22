@@ -489,7 +489,8 @@ cargo test --bin syq
 For a small, well-understood runtime fix, formatting and focused tests may be
 sufficient; state what they cover and any concrete uncertainty left. Broaden
 when that uncertainty matters, not merely because runtime code changed.
-Select the integration tests that can plausibly exercise the changed behavior. Prefer exact or narrow filters in the `local` target (`tests/local.rs`
+Select the integration tests that can plausibly exercise the changed behavior.
+Prefer exact or narrow filters in the `local` target (`tests/local.rs`
 holds the shared helpers and `tests/local/<topic>.rs` the tests, named
 `<topic>::<test>`); those tests invoke the built binary against temporary trees. Run `cargo test --all-targets` before
 handoff when a change is broad, crosses subsystem boundaries, changes shared
@@ -520,7 +521,9 @@ workflow setup regression, reproduce the relevant setup as well as the failing
 command. Inputs and logs are public: do not include secrets. Confirm exact Rust
 tests actually ran; Cargo accepts filters that match zero tests.
 
-The helper selects the current remote branch, pins its checkout commit, prints
+The focused workflow must be merged to the default branch once before GitHub
+allows dispatching it. The helper selects the current remote branch, pins its
+checkout commit, prints
 the SHA and run URL, and watches that exact run through `gh run watch`.
 `--provider github` selects GitHub instead of Namespace; `--ref` explicitly tests
 another pushed branch or tag; `--timeout` changes the default 15-minute limit.

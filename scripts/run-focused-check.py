@@ -56,7 +56,7 @@ def main():
     }
     print(f"Checking {repo}@{revision} on {args.provider}/{args.runner}", flush=True)
     response = json.loads(output(
-        "gh", "api", f"repos/{repo}/actions/workflows/macos.yml/dispatches",
+        "gh", "api", f"repos/{repo}/actions/workflows/focused-check.yml/dispatches",
         "-H", "X-GitHub-Api-Version: 2026-03-10", "--input", "-",
         input=json.dumps(payload),
     ))
