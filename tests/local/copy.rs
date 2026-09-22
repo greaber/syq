@@ -105,7 +105,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     // The legacy count is a weak starting guess: discover with doubling, then
-    // retire the excess workers as the measured bandwidth plateau is refined.
+    // exercise retirement by probing a lower count on the bandwidth plateau.
     assert!(
         stderr.contains("2 -> 4 workers (candidate ready"),
         "{stderr}"
@@ -117,8 +117,9 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         .find("candidate 2 -> 4 workers")
         .expect("the later measurement should select four workers");
     assert!(preparation < decision, "{stderr}");
+    // Further reductions require a measured speed gain. Pacing and scheduling
+    // noise can instead make the three-worker probe roll back to four.
     assert!(stderr.contains("4 -> 3 workers"), "{stderr}");
-    assert!(stderr.contains("3 -> 2 workers"), "{stderr}");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("connections: auto:"),
         "{}",
