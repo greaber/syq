@@ -323,10 +323,13 @@ Apple Silicon coverage. Old runs without the required certificates need one
 manual certification. Failed latest runs must be investigated, not replaced by
 older success.
 
-Cargo caches in CI and release builds separate platform/architecture,
-toolchain, lockfile, and job/build mode. Release builds can restore trusted
-master dependency/build caches, but still build and check the shipping identity
-with release flags and the configured public key. A cache hit never substitutes
+Cargo caches in CI and release builds prefer a matching platform/architecture,
+toolchain, lockfile, and job/build mode. If the lockfile changes, they can reuse
+a cache for the same platform, toolchain, and job; Cargo checks the current
+locked inputs and rebuilds affected artifacts. This also preserves dependency
+builds across package-version bumps. Release builds can restore trusted master
+dependency/build caches, but still build and check the shipping identity with
+release flags and the configured public key. A cache hit never substitutes
 for a test or certificate. GitHub scopes tag caches to that tag; later tags can
 reuse master caches, not earlier tag caches. Source-package identity testing
 extracts and compiles the crate once, using a separate reusable target directory.
