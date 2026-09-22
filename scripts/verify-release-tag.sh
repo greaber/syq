@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Require a maintainer-signed, GitHub-verified annotated tag that directly names
 # the workflow commit, is reachable from the protected branch, and
-# has every named CI check concluded successfully. Pull requests do not run CI;
-# the tagged commit's own post-merge or manual check runs are what prove it.
+# has every named CI check concluded successfully. Native releases may reuse
+# ancestor evidence only for unchanged test inputs; SDK checks remain exact.
 set -euo pipefail
 
 if [ "$#" -ne 5 ]; then
@@ -93,15 +93,25 @@ if [ "$base_commit" != "$target_commit" ] || [ "$merge_base" != "$target_commit"
   exit 1
 fi
 
-check_runs=$(gh api "repos/$repository/commits/$target_commit/check-runs?filter=latest&per_page=100")
+certification=
+case "$tag" in
+  v[0-9]*) certification=$("$script_dir/verify-release-ci.sh" --json "$repository" "$target_commit") ;;
+esac
 IFS=, read -ra check_names <<<"$required_checks"
 for check_name in "${check_names[@]}"; do
+  checked_commit=$target_commit
+  if [ -n "$certification" ]; then
+    workflow=ci.yml
+    [ "$check_name" != conformance ] || workflow=rsync-compat.yml
+    checked_commit=$(jq -er --arg workflow "$workflow" '.workflows[] | select(.workflow == $workflow) | .evidence_commit' <<<"$certification")
+  fi
+  check_runs=$(gh api "repos/$repository/commits/$checked_commit/check-runs?filter=latest&per_page=100")
   conclusion=$(jq -r --arg name "$check_name" '
     [.check_runs[] | select(.name == $name)] |
     sort_by([(.started_at // .completed_at // ""), (.id // 0)]) |
     if length == 0 then "missing" else last.conclusion // "pending" end' <<<"$check_runs")
   test "$conclusion" = success || {
-    echo "required check $check_name is $conclusion on release commit $target_commit" >&2
+    echo "required check $check_name is $conclusion on certified commit $checked_commit" >&2
     exit 1
   }
 done

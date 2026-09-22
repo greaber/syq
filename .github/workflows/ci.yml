@@ -5,6 +5,11 @@ on:
     branches: [master]
   workflow_dispatch:
     inputs:
+      documentation_only:
+        description: Run only executable documentation tests
+        required: false
+        default: false
+        type: boolean
       scope_commit:
         description: Commit whose diff determines the selected checks
         required: false
@@ -42,6 +47,7 @@ jobs:
       - name: Classify changed paths
         id: changes
         env:
+          SYQ_CI_DOCUMENTATION_ONLY: ${{ inputs.documentation_only }}
           SYQ_CI_SCOPE_COMMIT: ${{ inputs.scope_commit }}
         run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
@@ -119,7 +125,7 @@ jobs:
           needs.scope.outputs.mapping_docs == 'true' &&
           (needs.scope.outputs.native != 'true' ||
            needs.scope.outputs.full_suite != 'true')
-        run: cargo test --locked --test local mappings_md_
+        run: cargo test --locked --test local _md_
       - name: Test Cargo package identity
         if: >-
           needs.scope.outputs.tooling == 'true' ||

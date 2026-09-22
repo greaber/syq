@@ -334,6 +334,7 @@ expect_failure 'is not checked out' env \
 
 # Exercise dispatch identity, stale ref recovery, and exact-commit SDK gating.
 "$script_dir/test-generated-sdk-post-merge-ci.sh"
+python3 "$script_dir/test-release-test-inputs.py"
 
 # Build a clean disposable canonical checkout and serve every GitHub/registry
 # response from fixtures. The preflight must not create a tag or publication.
@@ -467,6 +468,7 @@ mkdir "$option_scripts"
 cp "$script_dir/release-preflight.sh" "$option_scripts/"
 ln -s "$script_dir/release-readiness.py" "$option_scripts/release-readiness.py"
 ln -s "$script_dir/verify-release-ci.sh" "$option_scripts/verify-release-ci.sh"
+ln -s "$script_dir/release_test_inputs.py" "$option_scripts/release_test_inputs.py"
 for options in '' 'namespaces="git"' 'namespaces="git, file",valid-before="20990101"'; do
   printf 'syq-release %s %s\n' "$options" "$signing_key" >"$option_scripts/release-tag-signers"
   (cd "$preflight_repo" && env "${preflight_env[@]}" \

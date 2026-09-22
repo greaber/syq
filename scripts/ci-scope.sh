@@ -24,6 +24,8 @@ run_everything() {
 
 if [ -n "${SYQ_TEST_CHANGED_PATHS_FILE:-}" ]; then
   changed_paths=$(cat "$SYQ_TEST_CHANGED_PATHS_FILE")
+elif [ "${SYQ_CI_DOCUMENTATION_ONLY:-}" = true ]; then
+  changed_paths=$'docs/mappings.md\ndocs/automation.md\ndocs/commands/map.md'
 elif [ -n "$event_path" ] && [ -f "$event_path" ]; then
   event_name=$(jq -r 'if has("pull_request") then "pull_request" elif has("before") then "push" else "workflow_dispatch" end' "$event_path")
   case "$event_name" in
@@ -82,6 +84,13 @@ else
   exit 2
 fi
 
+preparation_only=false
+if [ -n "${base:-}" ] && [ -n "${head:-}" ]; then
+  script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+  if python3 "$script_dir/release_test_inputs.py" "$head" --native --equivalent-to "$base"; then
+    preparation_only=true
+  fi
+fi
 native=false
 sdks=false
 python_sdk=false
@@ -132,7 +141,7 @@ while IFS= read -r path; do
       javascript_sdk=true
       go_sdk=true
       ;;
-    MAPPINGS.md|docs/mappings.md)
+    MAPPINGS.md|docs/mappings.md|docs/automation.md|docs/commands/map.md)
       # The documented jq programs are executable integration-test inputs.
       mapping_docs=true
       ;;
@@ -144,7 +153,10 @@ while IFS= read -r path; do
       native=true
       python_sdk=true
       ;;
-    Cargo.toml|Cargo.lock|rust-toolchain.toml|build.rs|src/*|tests/*.rs|schemas/*)
+    Cargo.toml|Cargo.lock)
+      if [ "$preparation_only" != true ]; then native=true; fi
+      ;;
+    rust-toolchain.toml|build.rs|src/*|tests/*.rs|schemas/*)
       native=true
       ;;
     .github/workflows/ci.yml)
