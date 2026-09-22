@@ -87,7 +87,7 @@ fi
 preparation_only=false
 if [ -n "${base:-}" ] && [ -n "${head:-}" ]; then
   script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-  if python3 "$script_dir/release_test_inputs.py" "$head" --equivalent-to "$base"; then
+  if python3 "$script_dir/release_test_inputs.py" "$head" --native --equivalent-to "$base"; then
     preparation_only=true
   fi
 fi
