@@ -259,6 +259,8 @@ default; pass `timeout=None` to disable it for that call:
 result = client.cp("data", into="backup", timeout=None)
 ```
 
+The timeout also applies while collecting subprocess output after syq exits.
+
 To use an existing executable, pass `Client(executable="/opt/bin/syq")`.
 This bypasses the bundled version; see
 [Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility).

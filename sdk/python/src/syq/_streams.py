@@ -102,6 +102,7 @@ class _Process:
         self.results_error: Exception | None = None
         self.timeout = timeout
         self.expired = False
+        self.cleanup_expired = False
         self.done = threading.Event()
         self.control = None
         self.stderr = bytearray()
@@ -185,11 +186,23 @@ class _Process:
     def _deadline(self) -> None:
         if not self.done.wait(self.timeout):
             self.expired = True
+            # An exited coordinator cannot clean up descendants holding pipes.
+            if self.process.poll() is not None:
+                # Drained diagnostics do not imply payload EOF: read() may
+                # still be blocked on a pipe held by a descendant. Only release
+                # after payload completion may finish without killing the group.
+                if (self._released and not self.drain.is_alive()
+                        and not self.results_drain.is_alive()):
+                    return
+                self.cleanup_expired = True
+                _signal_group(self.process, signal.SIGKILL)
+                return
             # Let the coordinator close its helper sessions and discard staging.
             # Signalling the entire group here also kills local SSH helpers before
             # they can process Shutdown; the bounded fallback below kills leftovers.
             self.process.terminate()
             if not self.done.wait(6):
+                self.cleanup_expired = True
                 _signal_group(self.process, signal.SIGKILL)
 
     def _release(self) -> None:
@@ -197,11 +210,13 @@ class _Process:
             if self._released:
                 return
             self._released = True
+            # Completion includes EOF on both diagnostic and result pipes.
+            # Keep the watchdog active until their owners actually close them.
+            self.drain.join()
+            self.results_drain.join()
             self.done.set()
             if self.watchdog is not None:
                 self.watchdog.join()
-            self.drain.join()
-            self.results_drain.join()
             self.process.stderr.close()
             control, self.control = self.control, None
             if control is not None:
@@ -211,13 +226,13 @@ class _Process:
     def finish(self) -> None:
         self.process.wait()
         self._release()
+        if self.cleanup_expired or (self.expired and self.process.returncode != 0):
+            raise subprocess.TimeoutExpired(self.argv, self.timeout, stderr=bytes(self.stderr))
         if self.process.returncode == 0:
             if self.results_error is not None:
                 raise self.results_error
             self.decoder.finish(0)
             return
-        if self.expired:
-            raise subprocess.TimeoutExpired(self.argv, self.timeout, stderr=bytes(self.stderr))
         if self.process.returncode:
             from .client import Result
             raise SyqProcessError(Result(self.argv, self.process.returncode, b"", bytes(self.stderr)))

@@ -395,7 +395,7 @@ class _LineProcess:
             self.returncode = self._process.wait(timeout=_remaining(self._deadline))
         except subprocess.TimeoutExpired:
             raise subprocess.TimeoutExpired(self.argv, self.timeout) from None
-        self._capture_stderr()
+        self._capture_stderr(timeout=_remaining(self._deadline))
         self._close_files()
         return self.returncode
 
@@ -410,8 +410,10 @@ class _LineProcess:
         self._capture_stderr()
         self._close_files()
 
-    def _capture_stderr(self) -> None:
-        self._stderr_thread.join()
+    def _capture_stderr(self, *, timeout: float | None = None) -> None:
+        self._stderr_thread.join(timeout)
+        if self._stderr_thread.is_alive():
+            raise subprocess.TimeoutExpired(self.argv, self.timeout)
         self.stderr = bytes(self._stderr_tail)
 
     def _drain_stderr(self) -> None:
