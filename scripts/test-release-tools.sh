@@ -247,7 +247,7 @@ SYQ_TEST_WORKFLOW_RUNS_JSON="$workflow_runs_json" \
 
 SYQ_TEST_WORKFLOW_RUNS_JSON="$workflow_runs_json" PATH="$fakebin:$PATH" \
   "$script_dir/verify-release-ci.sh" greaber/syq "$commit" >/dev/null
-expect_failure 'has no push or workflow_dispatch run on master' env \
+expect_failure 'has no push, schedule, or workflow_dispatch run on master' env \
   SYQ_TEST_WORKFLOW_RUNS_JSON='{"workflow_runs":[]}' PATH="$fakebin:$PATH" \
   "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
 failed_workflow_runs=$(jq -cn --arg commit "$commit" '{workflow_runs:[
@@ -276,7 +276,7 @@ expect_failure 'lacks successful full-suite' env \
 for mutation in '.head_sha = "wrong"' '.head_branch = "feature"' \
   '.head_repository.full_name = "someone/syq"' '.event = "pull_request"'; do
   untrusted=$(jq ".workflow_runs[] |= ($mutation)" <<<"$push_runs")
-  expect_failure 'has no push or workflow_dispatch run on master' env \
+  expect_failure 'has no push, schedule, or workflow_dispatch run on master' env \
     SYQ_TEST_WORKFLOW_RUNS_JSON="$untrusted" PATH="$fakebin:$PATH" \
     "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
 done
@@ -307,7 +307,7 @@ for pair in 'pending:wait' 'failed:repair' 'missing:dispatch' 'passed:ready'; do
   if [ "$expected" = ready ]; then test "$status" -eq 0; else test "$status" -eq 1; fi
   jq -e --arg expected "$expected" '.workflows | length == 3 and all(.[]; .state == $expected)' "$work/ci.json" >/dev/null
 done
-expect_failure 'macos.yml has no push or workflow_dispatch run' env \
+expect_failure 'macos.yml has no push, schedule, or workflow_dispatch run' env \
   SYQ_TEST_MACOS_RUNS_JSON='{"workflow_runs":[]}' SYQ_TEST_WORKFLOW_RUNS_JSON="$push_runs" \
   PATH="$fakebin:$PATH" "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
 
