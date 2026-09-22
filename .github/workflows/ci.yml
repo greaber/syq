@@ -236,7 +236,7 @@ jobs:
            needs.scope.outputs.full_suite == 'true')
         run: git ls-files -z -- '*.sh' | xargs -0 shellcheck
 
-  sdks:
+  sdk-languages:
     strategy:
       fail-fast: false
       matrix:
@@ -365,6 +365,21 @@ jobs:
           test -z "$(gofmt -l .)"
           go vet ./...
           go test ./...
+
+  # Keep the public check name consumed by generated-SDK validation and release
+  # preflight. A successful subset cannot hide a failed/cancelled matrix job.
+  sdks:
+    needs: [scope, sdk-languages]
+    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful SDK validation
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          SDK_RESULT: ${{ needs.sdk-languages.result }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          test "$SDK_RESULT" = success
 
   # The release workflow builds on this runner; libc field types differ from
   # x86-64 (st_nlink is u32 here), so include it in full validation.

@@ -43,7 +43,8 @@ case "$1:$2" in
         ;;
       *'/jobs?per_page=100 '*)
         jq -cn --arg conclusion "${SYQ_TEST_SDK_CONCLUSION:-success}" \
-          '{jobs:[{name:"sdks",status:"completed",conclusion:$conclusion}]}'
+          '{jobs:[{name:"sdk-languages (python)",status:"completed",conclusion:$conclusion},
+                  {name:"sdks",status:"completed",conclusion:$conclusion}]}'
         ;;
       *'/actions/runs/'*)
         id=${2##*/}
@@ -125,3 +126,20 @@ run_case '' 1 SYQ_TEST_WATCH_FAIL=true
 run_case 'sdks job is completed/failure' 1 SYQ_TEST_SDK_CONCLUSION=failure
 run_case 'sdks job is completed/skipped' 1 SYQ_TEST_SDK_CONCLUSION=skipped
 printf 'generated SDK CI dispatch tests passed\n'
+
+# Execute the aggregate's actual shell body against every dependency result.
+workflow="$script_dir/../.github/workflows/ci.yml"
+grep -Fx '    needs: [scope, sdk-languages]' "$workflow" >/dev/null
+aggregate=$(sed -n '/^  sdks:$/,/^  # The release workflow builds/p' "$workflow" | sed -n '/^        run: |$/,/^$/p' | sed '1d; /^$/d; s/^          //')
+[ -n "$aggregate" ]
+SCOPE_RESULT=success SDK_RESULT=success bash -euo pipefail -c "$aggregate"
+for result in failure cancelled skipped; do
+  if SCOPE_RESULT=success SDK_RESULT="$result" bash -euo pipefail -c "$aggregate"; then
+    echo "SDK aggregate accepted $result" >&2
+    exit 1
+  fi
+  if SCOPE_RESULT="$result" SDK_RESULT=success bash -euo pipefail -c "$aggregate"; then
+    echo "SDK aggregate accepted failed scope $result" >&2
+    exit 1
+  fi
+done
