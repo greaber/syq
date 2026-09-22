@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       linux_trial:
-        description: Run only the Linux Rust job on the selected provider
+        description: Run only Linux on this provider (disabled keeps normal CI on Namespace)
         type: choice
         default: disabled
         options:
@@ -62,7 +62,7 @@ jobs:
   rust:
     needs: scope
     if: always()
-    runs-on: ${{ inputs.linux_trial == 'namespace' && format('namespace-profile-syq-linux;github.run-id={0}', github.run_id) || (inputs.linux_trial == 'github' && 'ubuntu-24.04' || 'ubuntu-latest') }}
+    runs-on: ${{ inputs.linux_trial != 'github' && format('namespace-profile-syq-linux;github.run-id={0}', github.run_id) || 'ubuntu-24.04' }}
     steps:
       - name: Require successful path classification
         if: needs.scope.result != 'success'
@@ -90,7 +90,7 @@ jobs:
           free -h
           df -h .
       - name: Attach Namespace Cargo cache
-        if: inputs.linux_trial == 'namespace'
+        if: inputs.linux_trial != 'github' && (needs.scope.outputs.native == 'true' || needs.scope.outputs.tooling == 'true' || needs.scope.outputs.mapping_docs == 'true')
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           path: |
@@ -98,7 +98,7 @@ jobs:
             ~/.cargo/git
             target
       - name: Cache Cargo dependencies and build output
-        if: inputs.linux_trial != 'namespace' && (needs.scope.outputs.native == 'true' || needs.scope.outputs.tooling == 'true' || needs.scope.outputs.mapping_docs == 'true')
+        if: inputs.linux_trial == 'github' && (needs.scope.outputs.native == 'true' || needs.scope.outputs.tooling == 'true' || needs.scope.outputs.mapping_docs == 'true')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -143,9 +143,9 @@ jobs:
           needs.scope.outputs.native == 'true' &&
           needs.scope.outputs.full_suite == 'true'
         env:
-          NAMESPACE_TRIAL: ${{ inputs.linux_trial == 'namespace' }}
+          NAMESPACE_RUNNER: ${{ inputs.linux_trial != 'github' }}
         run: |
-          if [[ "$NAMESPACE_TRIAL" == true ]]; then
+          if [[ "$NAMESPACE_RUNNER" == true ]]; then
             # The container's overlay filesystem has no stable filesystem ID.
             # Use the attached native volume for filesystem-sensitive fixtures.
             test_tmp=$(mktemp -d /cache/syq-tests.XXXXXX)
