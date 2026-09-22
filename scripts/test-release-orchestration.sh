@@ -677,5 +677,6 @@ jq -e '.tag_state == "invalid-target" and .tag_commit == null' \
 
 python3 "$script_dir/test-release-readiness.py"
 python3 "$script_dir/test-release-timings.py"
+python3 "$script_dir/test-find-release-build.py"
 
 echo 'release orchestration tests passed'

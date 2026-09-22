@@ -161,8 +161,23 @@ release request does not require another preparation PR or another test run.
    independent clone needs its own check. `scripts/test-real-ssh.sh` remains
    available for development checks without release recording.
 
-2. Once the release commit is the exact `master` tip, check for existing full
-   validation on that commit before starting any more tests:
+2. Once the release commit is the exact `master` tip, start the release binary
+   builds while validation runs:
+
+   ```sh
+   gh workflow run reproducible-builds.yml --ref master
+   ```
+
+   Start this once per release candidate and track the returned run with
+   `gh run watch --exit-status`. These four platform builds need no publication
+   credentials. The signed-tag workflow reuses a successful manual build from
+   the exact same master commit, including its platform smoke tests. It waits
+   if that build is still running. Missing or expired artifacts cause fresh
+   builds; a changed candidate needs its own builds. Failed validation can
+   therefore waste a build, but cannot publish it. This does not add builds to
+   ordinary pushes. Artifacts remain available for seven days.
+
+   Check for existing full validation on that commit before starting more tests:
 
    ```sh
    candidate=$(git rev-parse HEAD)
