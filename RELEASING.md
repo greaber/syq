@@ -340,8 +340,13 @@ what was verified. A merge does not wait for GitHub to repeat those checks.
 Post-merge checks select affected areas: native changes run Linux formatting,
 linting, and unit tests, plus directly edited integration-test targets; SDK changes select the corresponding language checks;
 rsync compatibility changes run Linux conformance. Explicit macOS source,
-test, or workflow changes select the Apple Silicon suite. Matching automatic
-jobs cancel superseded work as configured by their concurrency groups.
+or test changes select the Apple Silicon suite. Workflow changes select workflow
+lint and orchestration fixtures, without selecting product suites. Tooling
+changes select their owning test scripts where mapped in `scripts/ci-scope.sh`;
+unmapped tooling retains the broad tooling checks. Cargo package identity is
+checked for packaging inputs and full runs, rather than every tooling edit.
+Matching automatic jobs cancel superseded work only when their selected checks
+match.
 
 At 02:17 UTC each day, `ci.yml`, `rsync-compat.yml`, and `macos.yml` run their
 full suites if test inputs differ from their last successful nightly run.

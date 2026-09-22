@@ -43,6 +43,7 @@ jobs:
       javascript_sdk: ${{ steps.changes.outputs.javascript_sdk }}
       go_sdk: ${{ steps.changes.outputs.go_sdk }}
       tooling: ${{ steps.changes.outputs.tooling }}
+      tooling_checks: ${{ steps.changes.outputs.tooling_checks }}
       shellcheck: ${{ steps.changes.outputs.shellcheck }}
       mapping_docs: ${{ steps.changes.outputs.mapping_docs }}
       macos: ${{ steps.changes.outputs.macos }}
@@ -66,7 +67,7 @@ jobs:
     # Cancel only matching automatic checks; manual runs keep a unique group.
     concurrency:
       # Full native suites already include tooling, shell lint, and mapping tests.
-      group: ${{ github.workflow }}-rust-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.integration_targets }}-${{ needs.scope.outputs.native == 'true' && needs.scope.outputs.full_suite == 'true' && 'full' || format('{0}-{1}-{2}-{3}-{4}', needs.scope.outputs.native, needs.scope.outputs.tooling, needs.scope.outputs.shellcheck, needs.scope.outputs.mapping_docs, needs.scope.outputs.full_suite) }}
+      group: ${{ github.workflow }}-rust-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.integration_targets }}-${{ needs.scope.outputs.tooling_checks }}-${{ needs.scope.outputs.native == 'true' && needs.scope.outputs.full_suite == 'true' && 'full' || format('{0}-{1}-{2}-{3}-{4}', needs.scope.outputs.native, needs.scope.outputs.tooling, needs.scope.outputs.shellcheck, needs.scope.outputs.mapping_docs, needs.scope.outputs.full_suite) }}
       cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: always()
@@ -98,7 +99,7 @@ jobs:
           free -h
           df -h .
       - name: Attach Namespace Cargo cache
-        if: inputs.linux_trial != 'github' && (needs.scope.outputs.native == 'true' || needs.scope.outputs.tooling == 'true' || needs.scope.outputs.mapping_docs == 'true')
+        if: inputs.linux_trial != 'github' && (needs.scope.outputs.native == 'true' || contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' package ') || contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' release ') || needs.scope.outputs.mapping_docs == 'true')
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           path: |
@@ -106,7 +107,7 @@ jobs:
             ~/.cargo/git
             target
       - name: Cache Cargo dependencies and build output
-        if: inputs.linux_trial == 'github' && (needs.scope.outputs.native == 'true' || needs.scope.outputs.tooling == 'true' || needs.scope.outputs.mapping_docs == 'true')
+        if: inputs.linux_trial == 'github' && (needs.scope.outputs.native == 'true' || contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' package ') || contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' release ') || needs.scope.outputs.mapping_docs == 'true')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -179,54 +180,42 @@ jobs:
         run: cargo test --locked --test local _md_
       - name: Test Cargo package identity
         if: >-
-          needs.scope.outputs.tooling == 'true' ||
-          (needs.scope.outputs.native == 'true' &&
-           needs.scope.outputs.full_suite == 'true')
+          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' package ')
         run: scripts/test-cargo-package.sh
       - name: Test installer tooling
         if: >-
-          needs.scope.outputs.tooling == 'true' ||
-          (needs.scope.outputs.native == 'true' &&
-           needs.scope.outputs.full_suite == 'true')
+          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' installer ')
         run: scripts/test-installer.sh
       - name: Test interactive benchmark
         if: >-
-          needs.scope.outputs.tooling == 'true' ||
-          (needs.scope.outputs.native == 'true' &&
-           needs.scope.outputs.full_suite == 'true')
+          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' benchmark ')
         run: python3 scripts/test-try-benchmark.py
       - name: Test release tooling
         if: >-
-          needs.scope.outputs.tooling == 'true' ||
-          (needs.scope.outputs.native == 'true' &&
-           needs.scope.outputs.full_suite == 'true')
-        # The package-identity step above has the same condition and already
-        # built and verified this candidate. Reuse it instead of building the
-        # checkout again with Cargo's non-test dependency feature set.
-        run: scripts/test-release-tools.sh --syq "$GITHUB_WORKSPACE/target/package-identity/debug/syq"
+          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' release ')
+        env:
+          TOOLING_CHECKS: ${{ needs.scope.outputs.tooling_checks }}
+        run: |
+          if [[ " $TOOLING_CHECKS " == *" package "* ]]; then
+            scripts/test-release-tools.sh --syq "$GITHUB_WORKSPACE/target/package-identity/debug/syq"
+          else
+            scripts/test-release-tools.sh
+          fi
       - name: Test release orchestration
         if: >-
-          needs.scope.outputs.tooling == 'true' ||
-          (needs.scope.outputs.native == 'true' &&
-           needs.scope.outputs.full_suite == 'true')
+          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' orchestration ')
         run: scripts/test-release-orchestration.sh
       - name: Test focused check dispatch
         if: >-
-          needs.scope.outputs.tooling == 'true' ||
-          (needs.scope.outputs.native == 'true' &&
-           needs.scope.outputs.full_suite == 'true')
+          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' focused ')
         run: python3 scripts/test-run-focused-check.py
       - name: Test branch status tooling
         if: >-
-          needs.scope.outputs.tooling == 'true' ||
-          (needs.scope.outputs.native == 'true' &&
-           needs.scope.outputs.full_suite == 'true')
+          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' branch ')
         run: scripts/test-branch-status.sh
       - name: Validate workflow syntax
         if: >-
-          needs.scope.outputs.tooling == 'true' ||
-          (needs.scope.outputs.native == 'true' &&
-           needs.scope.outputs.full_suite == 'true')
+          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' workflows ')
         run: scripts/check-workflows.sh
       - name: Lint tracked shell scripts
         if: >-
