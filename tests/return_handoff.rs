@@ -1,4 +1,8 @@
 //! Failures at the local build handoff must precede approval and SSH fallback.
+#[allow(dead_code)]
+#[path = "../src/process.rs"]
+mod process;
+use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -43,7 +47,7 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.temp.path().join("config"))
             .env("XDG_RUNTIME_DIR", self.temp.path().join("runtime"))
             .env("SYQ_NO_UPDATE_CHECK", "1")
-            .output()
+            .capture_output()
             .unwrap()
     }
 
@@ -183,7 +187,7 @@ sys.exit(23)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let input = b"original stdin\n\x00\xff";
     child.stdin.take().unwrap().write_all(input).unwrap();
@@ -212,7 +216,7 @@ sys.exit(23)
         .env("SYQ_NO_UPDATE_CHECK", "1")
         .env("SYQ_CP_OPTIONS", "--dry-run --quiet")
         .env("SYQ_RM_OPTIONS", "--dry-run")
-        .output()
+        .capture_output()
         .unwrap();
     assert_eq!(output.status.code(), Some(23), "{output:?}");
 }
@@ -255,7 +259,7 @@ sys.exit(23)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let input = b"*.tmp\n";
     child.stdin.take().unwrap().write_all(input).unwrap();

@@ -1347,7 +1347,7 @@ fn named_destination_offline_failure_settles_results_and_completes_names_locally
         .env("HOME", t.path(""))
         .env("SYQ_NO_UPDATE_CHECK", "1")
         .current_dir(t.path(""))
-        .output()
+        .capture_output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
     let records: Vec<serde_json::Value> = fs::read_to_string(t.path("result.ndjson"))
@@ -1375,7 +1375,7 @@ fn named_destination_offline_failure_settles_results_and_completes_names_locally
         .env("HOME", t.path(""))
         .env("SYQ_NO_UPDATE_CHECK", "1")
         .current_dir(t.path(""))
-        .output()
+        .capture_output()
         .unwrap();
     assert_output_ok(&completion);
     assert_eq!(completion.stdout, b"@laptop\0");
@@ -1405,7 +1405,7 @@ fn offline_receiver_ownership_keeps_names_but_allows_remote_completion() {
             "@fake",
         ],
     )
-    .output()
+    .capture_output()
     .unwrap();
     assert_output_ok(&names);
     assert_eq!(names.stdout, b"@fake\0");
@@ -1436,7 +1436,7 @@ fn offline_receiver_ownership_keeps_names_but_allows_remote_completion() {
         "PATH",
         format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
     )
-    .output()
+    .capture_output()
     .unwrap();
     assert_output_ok(&output);
     assert_eq!(
@@ -1547,7 +1547,7 @@ fn return_via_completes_only_explicit_names_without_contacting_hosts() {
                 .env("PATH", t.path("bin"))
                 .env("SYQ_NO_UPDATE_CHECK", "1")
                 .current_dir(t.path(""))
-                .output()
+                .capture_output()
                 .unwrap();
             assert_output_ok(&output);
             assert_eq!(output.stdout, expected, "{prefix}");
@@ -1603,7 +1603,7 @@ fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
         let output = completion_command(&t, &args)
             .current_dir(t.path(""))
             .env("PATH", t.path("bin"))
-            .output()
+            .capture_output()
             .unwrap();
         assert_output_ok(&output);
         assert!(output.stdout.is_empty(), "{output:?}");
@@ -1636,7 +1636,7 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
             .env("HOME", t.path("home"))
             .env("PATH", t.path("bin"))
             .env("SYQ_NO_UPDATE_CHECK", "1")
-            .output()
+            .capture_output()
             .unwrap();
         assert!(!output.status.success());
         if name == "@absent" {
@@ -1660,7 +1660,7 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
         .args(["exec", "--on", "@laptop", "--", "true"])
         .env("HOME", t.path("home"))
         .env("PATH", t.path("bin"))
-        .output()
+        .capture_output()
         .unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
@@ -1680,7 +1680,7 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
         .args(["exec", "--on", "@laptop", "--", "true"])
         .env("HOME", t.path("home"))
         .env("PATH", t.path("bin"))
-        .output()
+        .capture_output()
         .unwrap();
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
@@ -1705,7 +1705,7 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
         ],
     )
     .env("PATH", t.path("bin"))
-    .output()
+    .capture_output()
     .unwrap();
     assert_output_ok(&output);
     assert!(output.stdout.is_empty());

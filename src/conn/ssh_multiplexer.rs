@@ -79,7 +79,7 @@ pub(crate) fn openssh_version(program: &str) -> Option<OpenSshVersion> {
     let version = Command::new(program)
         .arg("-V")
         .stdin(Stdio::null())
-        .output()
+        .capture_output()
         .ok()
         .and_then(|output| {
             parse_openssh_version(&output.stderr).or_else(|| parse_openssh_version(&output.stdout))

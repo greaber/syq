@@ -1,4 +1,8 @@
 //! Keep ambient symlinks out of fixtures without hiding symlinks under test.
+#[allow(dead_code)]
+#[path = "../src/process.rs"]
+mod process;
+use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -21,7 +25,7 @@ fn symlinked_tmpdir_resolves_fixture_roots_only() {
             ])
             .env(CHILD, "1")
             .env("TMPDIR", &alias)
-            .output()
+            .capture_output()
             .unwrap();
         assert!(
             output.status.success(),
@@ -49,7 +53,7 @@ fn symlinked_tmpdir_resolves_fixture_roots_only() {
             .arg(destination)
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .env("XDG_CONFIG_HOME", temp.path().join("config"))
-            .output()
+            .capture_output()
             .unwrap()
     };
     let output = copy(&source, &destination);

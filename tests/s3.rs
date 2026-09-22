@@ -1,5 +1,9 @@
 //! Network fault tests use a local independent HTTP fixture. Real S3 protocol
 //! and signature interoperability are exercised by scripts/test-s3.sh.
+#[allow(dead_code)]
+#[path = "../src/process.rs"]
+mod process;
+use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -135,7 +139,7 @@ impl Server {
         self.command(temp)
             .args(["--s3-endpoint", &self.address])
             .args(args)
-            .output()
+            .capture_output()
             .unwrap()
     }
 }
@@ -2007,7 +2011,7 @@ fn s3_wrong_region_redirects_name_the_bucket_region() {
                 "object",
             ])
             .args(flags)
-            .output()
+            .capture_output()
             .unwrap();
         assert!(!output.status.success());
         assert!(
@@ -2194,7 +2198,7 @@ fn s3_service_profile_endpoints_keep_recovery_separate() {
                 "--as",
                 "download",
             ])
-            .output()
+            .capture_output()
             .unwrap();
         assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
         assert!(server.requests.load(Ordering::Relaxed) >= 3);
@@ -2366,7 +2370,7 @@ fn s3_upload_native_checksum_reuse_and_expected_hash() {
             .args(["--s3-endpoint", &server.address])
             .args(options)
             .args(["source", "--to", "s3://bucket", "--as", "object"])
-            .output()
+            .capture_output()
             .unwrap();
         assert!(output.status.success(), "{fault}: {}", output_text(&output));
         assert!(server.gate.0.load(Ordering::Acquire));
@@ -2825,7 +2829,7 @@ fn s3_get_throttling_without_a_body_is_retried() {
                 "--as",
                 "result",
             ])
-            .output()
+            .capture_output()
             .unwrap();
         assert_eq!(
             output.status.code(),
@@ -2866,7 +2870,7 @@ fn s3_download_retries_share_one_budget_across_statuses_and_error_codes() {
                 "--as",
                 "result",
             ])
-            .output()
+            .capture_output()
             .unwrap();
         assert_eq!(
             output.status.code(),
@@ -2903,7 +2907,7 @@ fn s3_upload_retries_share_one_budget_for_throttling_and_transient_errors() {
                 "--as",
                 "object",
             ])
-            .output()
+            .capture_output()
             .unwrap();
         assert_eq!(
             output.status.code(),
@@ -2934,7 +2938,7 @@ fn s3_upload_retries_request_timeout_error_codes_within_the_budget() {
                 "--as",
                 "object",
             ])
-            .output()
+            .capture_output()
             .unwrap();
         assert_eq!(
             output.status.code(),
@@ -2981,7 +2985,7 @@ fn s3_head_throttling_uses_the_retry_budget_and_keeps_permanent_errors_final() {
                 "--as",
                 "object",
             ])
-            .output()
+            .capture_output()
             .unwrap();
         assert_eq!(
             output.status.code(),
@@ -3023,7 +3027,7 @@ fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
                 "--results",
                 "results.ndjson",
             ])
-            .output()
+            .capture_output()
             .unwrap();
         assert_eq!(
             output.status.code(),
@@ -3115,7 +3119,7 @@ fn s3_remove_dry_run_and_usage_errors_do_not_delete() {
             "--dry-run",
             "-v",
         ])
-        .output()
+        .capture_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -3147,7 +3151,7 @@ fn s3_remove_dry_run_and_usage_errors_do_not_delete() {
         let output = Command::new(env!("CARGO_BIN_EXE_syq"))
             .arg("rm")
             .args(options)
-            .output()
+            .capture_output()
             .unwrap();
         assert!(!output.status.success());
     }
@@ -3161,7 +3165,7 @@ fn s3_remove_retries_bodyless_head_throttling_without_decoding_copy_metadata() {
         .command_for(temp.path(), "rm")
         .args(["--s3-endpoint", &server.address])
         .args(["--on", "s3://bucket", "key", "--dry-run"])
-        .output()
+        .capture_output()
         .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
     assert_eq!(server.requests.load(Ordering::Relaxed), 2);
@@ -3351,7 +3355,7 @@ fn s3_remove_prefix_existence_is_bounded_and_usage_mentions_removal() {
             "--src-non-dir",
             "tree",
         ])
-        .output()
+        .capture_output()
         .unwrap();
     assert!(!output.status.success());
     assert!(output_text(&output).contains("non-directory selector names a prefix"));
@@ -3373,7 +3377,7 @@ fn s3_remove_prefix_existence_is_bounded_and_usage_mentions_removal() {
         let output = Command::new(env!("CARGO_BIN_EXE_syq"))
             .arg("rm")
             .args(args)
-            .output()
+            .capture_output()
             .unwrap();
         assert!(!output.status.success());
         assert!(
@@ -3403,7 +3407,7 @@ fn s3_remove_follow_still_allows_local_results_symlinks() {
             "--results",
         ])
         .arg(&results)
-        .output()
+        .capture_output()
         .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(std::fs::symlink_metadata(&results)
@@ -3437,7 +3441,7 @@ fn s3_remove_exact_history_and_tree_are_selected_explicitly() {
                 "results.ndjson",
             ])
             .args(selector)
-            .output()
+            .capture_output()
             .unwrap();
         assert!(
             output.status.success(),
@@ -3473,7 +3477,7 @@ fn s3_remove_exact_versions_stops_before_unrelated_prefixes() {
             "--dry-run",
             "-v",
         ])
-        .output()
+        .capture_output()
         .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(output_text(&output).contains("old"));
@@ -3503,7 +3507,7 @@ fn s3_remove_batches_are_concurrent_and_preserve_markers_after_late_failure() {
                 "--results",
                 "results.ndjson",
             ])
-            .output()
+            .capture_output()
             .unwrap();
         assert_eq!(output.status.code(), Some(exit), "{}", output_text(&output));
         assert_eq!(server.requests.load(Ordering::Relaxed), requests);
@@ -3559,7 +3563,7 @@ fn s3_remove_interrupt_cancels_stalled_planning_without_deleting() {
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !server.gate.0.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
@@ -3627,7 +3631,7 @@ fn s3_remove_interrupt_drains_in_flight_results_before_exiting() {
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while server.requests.load(Ordering::SeqCst) < 4 && std::time::Instant::now() < deadline {
@@ -3721,7 +3725,7 @@ fn s3_paginated_download_records_control_latency() {
             "--into",
             "download",
         ])
-        .output()
+        .capture_output()
         .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
     for page in 0..8 {
@@ -3775,7 +3779,7 @@ fn s3_remove_explicit_types_disambiguate_live_object_and_tree_without_extra_prob
             if all_versions {
                 command.arg("--s3-all-versions");
             }
-            let output = command.output().unwrap();
+            let output = command.capture_output().unwrap();
             assert!(output.status.success(), "{}", output_text(&output));
             let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
             let selected: Vec<String> = records
@@ -3799,7 +3803,7 @@ fn s3_remove_explicit_types_disambiguate_live_object_and_tree_without_extra_prob
             "s3://bucket",
             "foo/",
         ])
-        .output()
+        .capture_output()
         .unwrap();
     assert!(!output.status.success());
     assert!(output_text(&output).contains("--src-dir"));
@@ -3886,7 +3890,7 @@ fn server_copy_never_reads_or_relays_object_contents() {
                 "--as",
                 "copied",
             ])
-            .output()
+            .capture_output()
             .unwrap();
         assert_eq!(
             output.status.success(),
@@ -4079,7 +4083,7 @@ fn server_copy_automatic_sizing_uses_one_copy_request() {
             "--as",
             "copied",
         ])
-        .output()
+        .capture_output()
         .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
     assert_eq!(server.requests.load(Ordering::Relaxed), 3);
@@ -4859,7 +4863,7 @@ fn parallel_listing_failure_stops_copy_and_removal_before_mutation() {
         } else {
             process.args(["--on", "s3://bucket", "--srcs-in", "tree"]);
         }
-        let output = process.output().unwrap();
+        let output = process.capture_output().unwrap();
         assert!(!output.status.success(), "{}", output_text(&output));
         assert!(
             output_text(&output).contains("403"),
@@ -4920,7 +4924,7 @@ fn parallel_listing_preserves_exact_prefix_permissions_and_explicit_concurrency(
             } else {
                 process.args(["--on", "s3://bucket", "--srcs-in", "tree"]);
             }
-            let output = process.output().unwrap();
+            let output = process.capture_output().unwrap();
             assert!(
                 output.status.success(),
                 "{command}/{fault}: {}",

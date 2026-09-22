@@ -124,7 +124,7 @@ fn ssh_tool(name: &str) -> PathBuf {
 
 fn command_output(mut command: Command, action: &str) -> std::process::Output {
     let output = command
-        .output()
+        .capture_output()
         .unwrap_or_else(|error| panic!("{action}: {error}"));
     assert!(
         output.status.success(),
@@ -193,7 +193,7 @@ fn start_agent(directory: &TestDir) -> AgentGuard {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_guarded()
         .expect("start test ssh-agent");
     for _ in 0..200 {
         if fs::symlink_metadata(&socket)
@@ -232,7 +232,7 @@ fn sign(payload: &[u8], key: &Path, namespace: &str, agent: Option<&AgentGuard>)
     if let Some(agent) = agent {
         command.env("SSH_AUTH_SOCK", &agent.socket);
     }
-    let mut child = command.spawn().expect("start test signer");
+    let mut child = command.spawn_guarded().expect("start test signer");
     child
         .stdin
         .take()
@@ -1300,7 +1300,9 @@ fn verifier_timeout_kills_its_process_group() {
             Ok(())
         });
     }
-    let child = command.spawn().expect("start stalled verifier fixture");
+    let child = command
+        .spawn_guarded()
+        .expect("start stalled verifier fixture");
     let started = Instant::now();
     let error = wait_for_verifier(child, b"test", Duration::from_millis(50))
         .expect_err("stalled verifier must time out");

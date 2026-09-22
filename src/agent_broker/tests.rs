@@ -273,7 +273,7 @@ fn openssh_quoted_default_collision_is_rejected_end_to_end() {
         .arg(&config)
         .args(["--", "unused.example"])
         .env("LC_ALL", "C")
-        .output()
+        .capture_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -420,7 +420,7 @@ fn openssh_defaults_and_hashed_known_hosts_lookup_are_exercised() {
         .arg(&known_hosts)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
+        .status_guarded()
         .expect("hash test known_hosts entry");
     assert!(status.success(), "ssh-keygen known_hosts hashing failed");
 

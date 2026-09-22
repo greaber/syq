@@ -1,4 +1,6 @@
 //! Platform enumeration feeding shared data-address selection.
+#[cfg(target_os = "linux")]
+use crate::process::CommandExt as _;
 use std::net::IpAddr;
 
 fn is_virtual_iface(name: &str) -> bool {
@@ -76,7 +78,7 @@ pub(super) fn local_addrs(families: BoundFamilies) -> Vec<(String, u32)> {
 fn interface_addresses() -> Vec<InterfaceAddress> {
     let text = std::process::Command::new("ip")
         .args(["-o", "addr", "show"])
-        .output()
+        .capture_output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
     parse_ip_addrs(&text, iface_speed)

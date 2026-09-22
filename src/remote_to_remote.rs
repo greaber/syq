@@ -5,6 +5,7 @@ use crate::cli::PeerAuth;
 use crate::cli::{parse_rsh, Args, Existence, Interface, Location, Placement, SourceSelection};
 use crate::delegation::RequestId;
 use crate::enrollment::EnrollmentId;
+use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use std::io::{BufRead, IsTerminal, Read, Seek, Write};
@@ -1189,7 +1190,9 @@ fn run_remote(
             cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit());
-            cmd.output().with_context(|| format!("spawn {:?}", rsh[0]))
+            cmd.spawn_guarded()
+                .and_then(|child| child.wait_with_output())
+                .with_context(|| format!("spawn {:?}", rsh[0]))
         };
         let mut out = run()?;
         if helper_missing(out.status.code(), spec.bootstrap_helper) {
@@ -1226,7 +1229,9 @@ fn run_remote(
         if receipt_expectation.is_some() {
             cmd.stdout(Stdio::piped());
         }
-        let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", rsh[0]))?;
+        let mut child = cmd
+            .spawn_guarded()
+            .with_context(|| format!("spawn {:?}", rsh[0]))?;
         // Read stdout while sending the manifest, including for large manifests
         // and setup errors. Reuse the same bytes if helper bootstrap retries.
         let input = args.mapping_contents.as_ref().map(|contents| {

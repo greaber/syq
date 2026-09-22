@@ -10,6 +10,7 @@
 use crate::private_broker::{
     ConnectionRegistry, PrivateBroker, PrivateBrokerConfig, TrackedStream,
 };
+use crate::process::CommandExt as _;
 use anyhow::{anyhow, bail, Context, Result};
 use signature::{Signer, Verifier};
 use ssh_agent_lib::proto::extension::{MessageExtension, SessionBind};
@@ -197,7 +198,7 @@ fn inspect_ssh_configuration_at(
     }
     command.args(["--", host]).env("LC_ALL", "C");
     let output = command
-        .output()
+        .capture_output()
         .with_context(|| format!("inspect SSH configuration for {host}"))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -667,7 +668,7 @@ fn read_known_host_keys(
             .args(["-F", lookup, "-f"])
             .arg(file)
             .env("LC_ALL", "C")
-            .output()
+            .capture_output()
             .with_context(|| format!("search {} for {lookup}", file.display()))?;
         if !output.status.success() {
             if output.status.code() == Some(1)

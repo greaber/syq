@@ -1,5 +1,9 @@
 //! Output failures must not replace filesystem outcomes or freeze telemetry.
 
+#[allow(dead_code)]
+#[path = "../src/process.rs"]
+mod process;
+use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -22,7 +26,9 @@ fn command(directory: &std::path::Path) -> Command {
         .current_dir(directory)
         .env("SYQ_NO_UPDATE_CHECK", "1")
         .env("XDG_CONFIG_HOME", directory.join("config"))
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     command
 }
 
@@ -48,13 +54,15 @@ fn closed_human_streams_preserve_copy_and_removal_results() {
             let output = command(&root)
                 .args(args)
                 .args(["--results", result])
+                .stdin(Stdio::null())
                 .stdout(broken_output())
                 .stderr(if broken_stderr {
                     broken_output()
                 } else {
                     Stdio::piped()
                 })
-                .output()
+                .spawn_guarded()
+                .and_then(|child| child.wait_with_output())
                 .unwrap();
             assert!(
                 output.status.success(),
@@ -99,8 +107,11 @@ fn closed_stderr_preserves_failure_exit_status() {
             "--results",
             "result.json",
         ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(broken_output())
-        .output()
+        .spawn_guarded()
+        .and_then(|child| child.wait_with_output())
         .unwrap();
     let code = output.status.code().unwrap();
     assert_ne!(code, 0);
@@ -142,7 +153,7 @@ fn full_stdout_keeps_results_progress_running() {
         ])
         .stdout(Stdio::from(OwnedFd::from(writer)))
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut sampled_times = std::collections::BTreeSet::new();
@@ -205,9 +216,11 @@ fn broken_stdout_warning_does_not_append_to_live_progress() {
             "--performance-tuning",
             "workers=1",
         ])
+        .stdin(Stdio::null())
         .stdout(broken_output())
         .stderr(Stdio::piped())
-        .output()
+        .spawn_guarded()
+        .and_then(|child| child.wait_with_output())
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(fs::read(root.join("dst")).unwrap(), data);
@@ -254,7 +267,8 @@ fn fatal_deferred_metadata_error_leaves_final_incomplete_counts() {
             "result.json",
         ])
         .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "/dst")
-        .output()
+        .spawn_guarded()
+        .and_then(|child| child.wait_with_output())
         .unwrap();
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(

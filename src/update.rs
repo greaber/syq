@@ -5,6 +5,7 @@
 //! update reminders that point at `brew upgrade`. Official release builds embed
 //! the Ed25519 public key supplied by the release workflow at compile time.
 
+use crate::process::CommandExt as _;
 use crate::remote_helper::Target;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
@@ -691,7 +692,7 @@ fn verify_executable(path: &Path, release: &VerifiedRelease) -> Result<()> {
     let version = Command::new(path)
         .arg("--version")
         .stdin(Stdio::null())
-        .output()
+        .capture_output()
         .context("run the downloaded syq update")?;
     if !version.status.success()
         || String::from_utf8_lossy(&version.stdout).trim() != format!("syq {}", release.version)
@@ -701,7 +702,7 @@ fn verify_executable(path: &Path, release: &VerifiedRelease) -> Result<()> {
     let identity = Command::new(path)
         .arg("--build-identity")
         .stdin(Stdio::null())
-        .output()
+        .capture_output()
         .context("read the downloaded syq build identity")?;
     if !identity.status.success()
         || String::from_utf8_lossy(&identity.stdout).trim() != release.manifest.tag

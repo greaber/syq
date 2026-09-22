@@ -874,7 +874,7 @@ fn managed_descriptor_upload_requires_commit() {
             "/tests/support/managed-streams.py"
         ))
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .output()
+        .capture_output()
         .expect("run managed stream fixture");
     assert!(
         output.status.success(),

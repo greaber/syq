@@ -161,7 +161,7 @@ impl RemoteSpec {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd
-            .spawn()
+            .spawn_guarded()
             .with_context(|| format!("start helper download on {}", self.label()))?;
         let mut stdin = child
             .stdin
@@ -388,7 +388,7 @@ pub(super) fn run_captured(cmd: &mut Command, input: Option<&[u8]>) -> Result<Ca
     if input.is_some() {
         cmd.stdin(Stdio::piped());
     }
-    let mut child = cmd.spawn().context("start command")?;
+    let mut child = cmd.spawn_guarded().context("start command")?;
     let stdout = child
         .stdout
         .take()

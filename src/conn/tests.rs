@@ -1,3 +1,4 @@
+use crate::process::CommandExt as _;
 #[test]
 fn bootstrap_notices_exclude_ssh_noise_and_preserve_individual_lines() {
     let stderr = b"Warning: new host key\nsshd banner\n\nsyq-remote-install-notice:installed syq\n\nrc noise\n\nsyq-remote-install-notice:check SSH PATH\r\n";
@@ -1073,7 +1074,7 @@ fn malformed_wire_preamble_is_non_retryable_and_refreshes_a_managed_helper() {
 fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
     let child = Command::new("/bin/sh")
         .args(["-c", "exit 255"])
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let mut conn = RemoteConn {
         observation: Default::default(),

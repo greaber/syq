@@ -1,6 +1,10 @@
 //! Copy to a real macOS exFAT volume, including its native capacity counters.
 #![cfg(target_os = "macos")]
 
+#[allow(dead_code)]
+#[path = "../src/process.rs"]
+mod process;
+use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -28,14 +32,14 @@ impl ExfatImage {
         assert!(Command::new("hdiutil")
             .args(["create", "-size", "64m", "-fs", "ExFAT", "-volname", "SYQTEST"])
             .arg(&image)
-            .status()
+            .status_guarded()
             .unwrap()
             .success());
         assert!(Command::new("hdiutil")
             .args(["attach", "-nobrowse", "-mountpoint"])
             .arg(&mount)
             .arg(&image)
-            .status()
+            .status_guarded()
             .unwrap()
             .success());
         Self {
@@ -50,7 +54,7 @@ impl Drop for ExfatImage {
         let detached = Command::new("hdiutil")
             .arg("detach")
             .arg(&self.mount)
-            .status()
+            .status_guarded()
             .is_ok_and(|status| status.success());
         if !detached {
             // Never recursively clean a temporary directory still containing
@@ -90,7 +94,7 @@ fn fresh_exfat_destinations_have_unknown_inode_capacity() {
             .arg(volume.mount.join(destination))
             .arg("--no-progress")
             .args(extra)
-            .output()
+            .capture_output()
             .unwrap()
     };
 
@@ -127,7 +131,7 @@ fn fresh_exfat_destinations_have_unknown_inode_capacity() {
         .arg(volume.mount.join("limited"))
         .arg("--no-progress");
     set_child_nofile_limit(&mut limited, 1664);
-    assert_success(&limited.output().unwrap());
+    assert_success(&limited.capture_output().unwrap());
     assert_eq!(fs::read(volume.mount.join("limited")).unwrap(), payload);
 
     // Unknown inode accounting must not disable the byte-capacity check.

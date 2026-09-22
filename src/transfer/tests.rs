@@ -1,4 +1,5 @@
 use super::*;
+use crate::process::CommandExt as _;
 use crate::sched::tests::test_job as pipeline_job;
 
 #[test]
@@ -1610,7 +1611,7 @@ fn existing_destination_setup_replays_on_v032_receiver() {
             .arg("--server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .spawn()
+            .spawn_guarded()
             .unwrap(),
     );
     let mut input = receiver.0.stdin.take().unwrap();

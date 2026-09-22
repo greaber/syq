@@ -1236,7 +1236,7 @@ fn native_inplace_exdev_fallback_preserves_hardlink_aliases() {
             "-q",
         ])
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
-        .output()
+        .capture_output()
         .unwrap();
 
     assert_output_ok(&out);

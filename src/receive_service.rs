@@ -1,5 +1,6 @@
 //! Background return connections owned by a persistence scope. Settings are
 //! durable; each endpoint's process and advertisement exist only while enabled.
+use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -750,7 +751,9 @@ fn spawn(control: &Path) -> Result<()> {
             Ok(())
         });
     }
-    let mut child = command.spawn().context("start background receiving")?;
+    let mut child = command
+        .spawn_guarded()
+        .context("start background receiving")?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });

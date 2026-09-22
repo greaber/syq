@@ -1,5 +1,9 @@
 //! Integration tests: local -> local copies through the built binary.
 
+#[allow(dead_code)]
+#[path = "../src/process.rs"]
+mod process;
+use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -397,7 +401,7 @@ impl Launch for Command {
         let _spawning = PROCESS_IMAGE_LOCK
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.spawn()
+        self.spawn_guarded()
     }
 }
 
@@ -848,7 +852,7 @@ fn syq_cp_in(dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let mut child = cmd.spawn().expect("spawn syq cp");
+            let mut child = cmd.spawn_guarded().expect("spawn syq cp");
             child
                 .stdin
                 .take()

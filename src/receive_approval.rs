@@ -1027,7 +1027,7 @@ mod tests {
             .arg("-o")
             .arg(temp.path().join("approval.scpt"))
             .args(["-e", APPLESCRIPT])
-            .output()
+            .capture_output()
             .unwrap();
         assert!(
             output.status.success(),

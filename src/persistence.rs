@@ -5,6 +5,7 @@
 //! `--pscope`, avoiding shared configuration state.
 
 use crate::cli::Args;
+use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -996,7 +997,7 @@ fn close_scope(scope: &Path) -> Result<()> {
 
 fn close_master(socket: &Path, record: &EndpointRecord) -> Result<()> {
     let output = master_exit_command(socket, record)
-        .output()
+        .capture_output()
         .with_context(|| format!("ask SSH master for {} to exit", record.label()))?;
     if output.status.success() || !socket_is_live(socket) {
         return Ok(());

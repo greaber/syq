@@ -1,5 +1,6 @@
 //! Shared helpers for unit tests.
 
+use crate::process::CommandExt as _;
 #[path = "../tests/support/temp.rs"]
 mod temporary;
 pub(crate) use temporary::{temp_dir, tempdir};
@@ -18,7 +19,10 @@ pub(crate) fn with_broken_stderr(name: &str) -> bool {
         .stderr(std::process::Stdio::from(std::os::fd::OwnedFd::from(
             writer,
         )))
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn_guarded()
+        .and_then(|child| child.wait_with_output())
         .unwrap();
     assert!(
         result.status.success(),
