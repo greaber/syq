@@ -459,6 +459,16 @@ so macOS `/var` and other host symlinks do not become paths under test.
 Create intentional symlinks inside that root; do not canonicalize product
 arguments or add follow flags merely to make a fixture pass.
 
+Pre-merge validation should provide proportionate confidence in the change,
+not duplicate the post-merge suites or full release validation. In September
+2026, the user explicitly accepted occasional temporary breakage on `master`
+to avoid repeatedly paying for broad checks on narrow changes; `master` is not
+a published release. Use that tradeoff when selecting checks, while giving
+potential data loss, authorization, and compatibility failures the targeted
+coverage their consequences warrant. Keep the release validation gates intact.
+When CI fails, first distinguish product defects from test, fixture, and runner
+problems; investigate the failure rather than reflexively expanding the suite.
+
 Choose checks from the behavior changed, not every workflow available. For a
 narrow change confined to one test or its private fixture, run formatting and
 that exact test on the affected platform. The full Rust baseline below is not
@@ -468,7 +478,7 @@ workflow merely to reach one test, or wait for unrelated checks once the
 needed result is available. State the selected checks and why before running
 expensive validation.
 
-For a Rust runtime change, the normal pre-merge baseline is:
+For a substantial Rust runtime change, the normal pre-merge baseline is:
 
 ```bash
 cargo fmt --all -- --check
@@ -476,8 +486,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --bin syq
 ```
 
-Then select the integration tests that can plausibly exercise the changed
-behavior. Prefer exact or narrow filters in the `local` target (`tests/local.rs`
+For a small, well-understood runtime fix, formatting and focused tests may be
+sufficient; state what they cover and any concrete uncertainty left. Broaden
+when that uncertainty matters, not merely because runtime code changed.
+Select the integration tests that can plausibly exercise the changed behavior. Prefer exact or narrow filters in the `local` target (`tests/local.rs`
 holds the shared helpers and `tests/local/<topic>.rs` the tests, named
 `<topic>::<test>`); those tests invoke the built binary against temporary trees. Run `cargo test --all-targets` before
 handoff when a change is broad, crosses subsystem boundaries, changes shared
@@ -488,7 +500,38 @@ For one exact Rust unit test, use
 `cargo test --locked --bin syq 'module::tests::name' -- --exact`; for an
 integration test, replace `--bin syq` with its target, such as `--test local`.
 Confirm the named test ran; a zero-test or ignored result is not validation.
-For macOS, dispatch the focused job on the pushed task branch:
+
+Choose the evidence needed before choosing a workflow. A workflow lacking a
+focused option is not a reason to run its full suite. For arbitrary checks on
+a Linux or macOS runner, use the manual focused runner from a clean, pushed
+task branch:
+
+```bash
+scripts/run-focused-check.py --runner macos --cargo-cache -- \
+  cargo test --locked --bin syq 'module::tests::name' -- --exact
+scripts/run-focused-check.py --runner linux --script target/check.sh
+```
+
+The script file is local and need not be committed; it may contain setup and
+multiple commands. It runs with Bash `-euo pipefail` in the checked-out repository.
+Use pinned setup commands appropriate to the check; the runner does not install
+all SDK toolchains or reproduce another workflow's setup automatically. For a
+workflow setup regression, reproduce the relevant setup as well as the failing
+command. Inputs and logs are public: do not include secrets. Confirm exact Rust
+tests actually ran; Cargo accepts filters that match zero tests.
+
+The helper selects the current remote branch, pins its checkout commit, prints
+the SHA and run URL, and watches that exact run through `gh run watch`.
+`--provider github` selects GitHub instead of Namespace; `--ref` explicitly tests
+another pushed branch or tag; `--timeout` changes the default 15-minute limit.
+Only enable `--cargo-cache` for checks needing Rust builds. No builds or test
+suites run implicitly, and these checks do not certify a full suite for release.
+Stop once the relevant evidence is available; expand validation only for a
+concrete remaining risk. Add reusable focused checks when repeated use justifies
+them rather than adding a permanent option for every repair.
+
+For an exact macOS Rust test, the existing focused job also verifies that the
+named test exists and includes ignored tests:
 
 ```bash
 gh workflow run macos.yml --ref <task-branch> \
