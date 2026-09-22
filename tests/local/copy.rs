@@ -105,7 +105,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     // The legacy count is a weak starting guess: discover with doubling, then
-    // retire the excess workers as the measured bandwidth plateau is refined.
+    // exercise retirement by probing a lower count on the bandwidth plateau.
     assert!(
         stderr.contains("2 -> 4 workers (candidate ready"),
         "{stderr}"
