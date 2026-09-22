@@ -150,10 +150,12 @@ release request does not require another preparation PR or another test run.
    in isolated containers and records success only for a clean, unchanged
    checkout. Evidence records the commit, complete Git tree, default profile,
    host, Docker/Compose versions, and completion time under the shared Git
-   directory's `syq-release/real-ssh/`. A merge with an identical tree reuses
-   it across task worktrees. Any committed-tree change requires fresh evidence;
-   dirty runs cannot certify a release. A deliberately rerun check invalidates
-   its earlier receipt before execution, so failure cannot leave stale success.
+   directory's `syq-release/real-ssh-inputs/`. Evidence can be reused across
+   worktrees and release preparation when only the syq package version or
+   recognized prose changes. Source, dependencies, tests, workflows, executable
+   documentation, and other build inputs must match. Older full-tree receipts
+   remain readable. Dirty runs cannot certify a release. A deliberately rerun
+   check invalidates its earlier receipt before execution, so failure cannot leave stale success.
    These are local maintainer records, not portable CI certificates. An
    independent clone needs its own check. `scripts/test-real-ssh.sh` remains
    available for development checks without release recording.
@@ -170,9 +172,15 @@ release request does not require another preparation PR or another test run.
    `release-certification` job only when all its release suites were selected
    and passed. Green selective runs with skipped suites do not qualify. The
    verifier requires the latest push or manual run of each workflow on the
-   exact SHA, from this repository's `master`, to succeed and carry that
-   certificate in its current attempt. Runs made before certificates were
-   introduced need a fresh manual run.
+   candidate or an eligible first-parent ancestor, from this repository's
+   `master`, to succeed and carry that certificate in its current attempt.
+   `scripts/release_test_inputs.py` permits reuse only across changes to the syq
+   package version in Cargo.toml/Cargo.lock and recognized prose: root project
+   guides, changelog, release notes, and Markdown under docs except the executable
+   mappings examples. It compares all remaining committed inputs. The report
+   names the actual tested commit for each workflow. A newer failed or pending
+   run is never hidden by earlier successful evidence. Runs made before
+   certificates were introduced need a fresh manual run.
 
    If evidence is missing, dispatch only the workflow that needs it (all three
    commands are shown here):
@@ -198,8 +206,8 @@ release request does not require another preparation PR or another test run.
    coordination branch may remain stale. It also requires matching local
    real-SSH evidence; curated release notes; no pending Python
    API follow-ups; matching Cargo metadata; successful `rust`, `sdks`,
-   `macos`, `linux-arm64`, and `conformance` checks on that SHA; all three full-suite
-   workflow certifications; an SSH tag-signing key registered with
+   `macos`, `linux-arm64`, and `conformance` checks on the certified commits;
+   all three full-suite workflow certifications; an SSH tag-signing key registered with
    GitHub; the selected-Actions allowlist; the protected `release` environment,
    tag policy, variables, and secret names; and absence of the tag or version
    from GitHub, crates.io, and the Homebrew tap. It makes no local or remote
@@ -219,8 +227,8 @@ release request does not require another preparation PR or another test run.
    first verifies that the annotated tag's signature is valid and that it
    directly targets the workflow commit, that this commit is reachable
    from protected `master`, that the `rust`, `sdks`, `macos`, `linux-arm64`,
-   and `conformance` checks all succeeded on that exact commit, and that all three
-   full-suite workflow certifications succeeded. It then uses `flake.lock` and
+   and `conformance` checks all succeeded on its certified commits, and that
+   all three full-suite workflow certifications succeeded. It then uses `flake.lock` and
    the pinned Nix recipe to build static GNU Linux x86-64/ARM64 binaries and
    native macOS Apple Silicon/Intel binaries once per target, with deterministic
    gzip archives. The embedded public key must
@@ -316,9 +324,12 @@ subset on another Apple Silicon runner. It skips its suite for documentation
 changes that do not affect executable documentation or tooling. Each run has
 a unique concurrency group; later pushes do not cancel earlier evidence.
 
-A release requires successful exact-SHA full-suite certificates from `ci.yml`,
-`rsync-compat.yml`, and `macos.yml`. The stable `macos` check in `ci.yml` now
-represents Intel validation; the separate macOS certificate establishes full
+A release requires successful full-suite certificates from `ci.yml`,
+`rsync-compat.yml`, and `macos.yml` for the candidate or unchanged test inputs
+under the release-preparation exception above. Version-only preparation does
+not automatically rerun native suites; changed dependencies or other build
+inputs do. Manual dispatch still runs the full suites. The stable `macos` check
+in `ci.yml` represents Intel validation; the separate macOS certificate establishes full
 Apple Silicon coverage. Old runs without the required certificates need one
 manual certification. Failed latest runs must be investigated, not replaced by
 older success.

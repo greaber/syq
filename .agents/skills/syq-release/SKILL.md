@@ -55,8 +55,10 @@ CI workflow's state and next action. Perform only missing work:
 - For new preparation or fixes, update Cargo metadata and curated notes,
   resolve native Python API follow-ups, and run proportionate local checks
   from `AGENTS.md`. Commit before running the readiness command's `--check-ssh`
-  mode. It records default-profile real-SSH success for that entire committed
-  tree; an identical-tree merge reuses it. Reuse only explicitly owned task work.
+  mode. It records default-profile real-SSH success for the committed test inputs.
+  Version-only and recognized prose preparation can reuse that evidence;
+  dependencies, source, tests, workflows, and build inputs must match. Reuse only
+  explicitly owned task work.
 - Merge needed preparation/repair PRs after branch-status and exact PR-head
   checks. Use a clean task checkout at the actual remote master SHA afterward.
 - Wait for existing CI with the reported `gh run watch --exit-status` command.

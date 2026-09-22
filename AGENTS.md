@@ -194,12 +194,19 @@ report actual access or decision blockers instead of bypassing them.
 ## Release tag lifecycle
 
 - Before pushing a syq release tag, require successful full-suite runs of
-  `ci.yml`, `rsync-compat.yml`, and `macos.yml` on the exact clean remote
-  `master` commit. A task branch or detached checkout at that SHA is sufficient;
+  `ci.yml`, `rsync-compat.yml`, and `macos.yml` on the clean remote
+  `master` commit or a first-parent ancestor with unchanged test inputs. The
+  release-preparation exception permits only syq package-version edits and
+  prose documents recognized by `scripts/release_test_inputs.py`; dependencies,
+  source, tests, executable documentation, workflows, and build inputs must
+  match. Report both the candidate and reused evidence SHAs. A task branch or
+  detached checkout at the candidate SHA is sufficient;
   do not update the coordination checkout or clone solely to obtain a branch
   named `master`. Start with `scripts/release-readiness.py v<version>` and reuse
-  its recorded default real-SSH validation when the entire committed tree is
-  unchanged. Its `--check-ssh` mode runs and records missing local validation. Reuse post-merge or manual runs when `scripts/verify-release-ci.sh`
+  its recorded default real-SSH validation when its test inputs are
+  unchanged under the same release-preparation exception. Its `--check-ssh` mode
+  runs and records missing local validation. Reuse post-merge or manual runs
+  when `scripts/verify-release-ci.sh`
   accepts their full-suite certificates; dispatch only workflows missing that
   evidence and wait for them to succeed. Then run
   `scripts/release-preflight.sh v<version>` from that same commit. Treat any
@@ -511,8 +518,8 @@ the intervening changes before repeating it; rerun when they affect the SSH
 scenarios or leave meaningful uncertainty that focused tests cannot resolve.
 Report the SHA of the last successful full run, the checks on the current SHA,
 and why a repeat was unnecessary. Do not describe an earlier run as testing the
-current tree. Release validation still follows the exact-commit requirements
-under release tag lifecycle.
+current tree. Release validation follows the commit and release-preparation
+evidence rules under release tag lifecycle.
 
 Pull requests do not start automated test workflows. The agent remains
 responsible for selecting checks under the rules above, choosing integration tests,

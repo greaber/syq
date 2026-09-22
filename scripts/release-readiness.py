@@ -16,6 +16,8 @@ import subprocess
 import sys
 import tempfile
 
+from release_test_inputs import candidates, fingerprint
+
 SCRIPTS = Path(__file__).resolve().parent
 REPOSITORY = "greaber/syq"
 
@@ -35,27 +37,44 @@ def receipt_path(tree):
     return common / "syq-release" / "real-ssh" / f"{tree}.json"
 
 
+def inputs_receipt_path(commit):
+    common = Path(run("git", "rev-parse", "--git-common-dir")).resolve()
+    return common / "syq-release" / "real-ssh-inputs" / f"{fingerprint(commit)}.json"
+
+
 def ssh_evidence():
     commit, tree = clean_candidate()
-    path = receipt_path(tree)
+    path = inputs_receipt_path(commit)
     if not path.is_file():
-        return None
+        # Existing full-tree receipts remain usable if their tested inputs match.
+        for ancestor in candidates(commit):
+            path = receipt_path(run("git", "rev-parse", ancestor + "^{tree}"))
+            if path.is_file():
+                break
+        else:
+            return None
     receipt = json.loads(path.read_text())
-    if (receipt.get("schema") != 1 or receipt.get("tree") != tree
-            or receipt.get("profile") != "default" or receipt.get("result") != "success"
-            or not re.fullmatch(r"[0-9a-f]{40}", receipt.get("commit", ""))
-            or run("git", "rev-parse", receipt["commit"] + "^{tree}") != tree):
+    checked = receipt.get("commit", "")
+    if (receipt.get("schema") not in (1, 2) or receipt.get("profile") != "default"
+            or not re.fullmatch(r"[0-9a-f]{40}", checked)
+            or run("git", "rev-parse", checked + "^{tree}") != receipt.get("tree")
+            or fingerprint(checked) != fingerprint(commit)):
         raise ValueError(f"invalid real-SSH evidence: {path}")
+    if receipt.get("result") != "success":
+        return None
     return {**receipt, "candidate": commit, "path": str(path)}
 
 
 def check_ssh():
     commit, tree = clean_candidate()
     # Invalidate an earlier success before a deliberate rerun, including on failure.
-    path = receipt_path(tree)
-    path.unlink(missing_ok=True)
+    path = inputs_receipt_path(commit)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A failed deliberate rerun must also supersede old equivalent-tree evidence.
+    path.write_text(json.dumps({"schema": 2, "commit": commit, "tree": tree,
+                                "profile": "default", "result": "pending"}))
     receipt = {
-        "schema": 1, "commit": commit, "tree": tree, "profile": "default",
+        "schema": 2, "commit": commit, "tree": tree, "profile": "default",
         "host": platform.platform(), "docker": run("docker", "--version"),
         "compose": run("docker", "compose", "version"),
     }
@@ -116,7 +135,7 @@ def readiness(tag):
         evidence = None
         missing(str(error), "Commit preparation, then rerun readiness.")
     if not evidence:
-        missing("default real-SSH validation is missing for this committed tree",
+        missing("default real-SSH validation is missing for these test inputs",
                 f"scripts/release-readiness.py {tag} --check-ssh")
     ci = subprocess.run([str(SCRIPTS / "verify-release-ci.sh"), "--json", REPOSITORY, commit],
                         capture_output=True, text=True)

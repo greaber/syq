@@ -82,6 +82,13 @@ else
   exit 2
 fi
 
+preparation_only=false
+if [ -n "${base:-}" ] && [ -n "${head:-}" ]; then
+  script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+  if python3 "$script_dir/release_test_inputs.py" "$head" --equivalent-to "$base"; then
+    preparation_only=true
+  fi
+fi
 native=false
 sdks=false
 python_sdk=false
@@ -144,7 +151,10 @@ while IFS= read -r path; do
       native=true
       python_sdk=true
       ;;
-    Cargo.toml|Cargo.lock|rust-toolchain.toml|build.rs|src/*|tests/*.rs|schemas/*)
+    Cargo.toml|Cargo.lock)
+      if [ "$preparation_only" != true ]; then native=true; fi
+      ;;
+    rust-toolchain.toml|build.rs|src/*|tests/*.rs|schemas/*)
       native=true
       ;;
     .github/workflows/ci.yml)
