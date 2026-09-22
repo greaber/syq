@@ -142,7 +142,18 @@ jobs:
         if: >-
           needs.scope.outputs.native == 'true' &&
           needs.scope.outputs.full_suite == 'true'
-        run: cargo test --locked --all-targets
+        env:
+          NAMESPACE_TRIAL: ${{ inputs.linux_trial == 'namespace' }}
+        run: |
+          if [[ "$NAMESPACE_TRIAL" == true ]]; then
+            # The container's overlay filesystem has no stable filesystem ID.
+            # Use the attached native volume for filesystem-sensitive fixtures.
+            test_tmp=$(mktemp -d /cache/syq-tests.XXXXXX)
+            trap 'rm -rf -- "$test_tmp"' EXIT
+            export TMPDIR="$test_tmp"
+            stat -f --format='Test filesystem: %T, ID: %i' "$TMPDIR"
+          fi
+          cargo test --locked --all-targets
       - name: Test executable mapping documentation
         if: >-
           needs.scope.outputs.mapping_docs == 'true' &&
