@@ -13,6 +13,11 @@ on:
           - disabled
           - github
           - namespace
+      documentation_only:
+        description: Run only executable documentation tests
+        required: false
+        default: false
+        type: boolean
       scope_commit:
         description: Commit whose diff determines the selected checks
         required: false
@@ -50,6 +55,7 @@ jobs:
       - name: Classify changed paths
         id: changes
         env:
+          SYQ_CI_DOCUMENTATION_ONLY: ${{ inputs.documentation_only }}
           SYQ_CI_SCOPE_COMMIT: ${{ inputs.scope_commit }}
         run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
@@ -99,8 +105,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
-          restore-keys: cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+          key: cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Install Rust check components
         if: needs.scope.outputs.native == 'true'
         run: rustup component add rustfmt clippy
@@ -139,7 +148,7 @@ jobs:
           needs.scope.outputs.mapping_docs == 'true' &&
           (needs.scope.outputs.native != 'true' ||
            needs.scope.outputs.full_suite != 'true')
-        run: cargo test --locked --test local mappings_md_
+        run: cargo test --locked --test local _md_
       - name: Test Cargo package identity
         if: >-
           needs.scope.outputs.tooling == 'true' ||
@@ -216,8 +225,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
-          restore-keys: cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+          key: cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - id: python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         if: needs.scope.outputs.python_sdk == 'true'
@@ -343,8 +355,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
-          restore-keys: cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+          key: cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - if: needs.scope.outputs.linux_arm64 == 'true'
         run: cargo check --locked --all-targets
 
@@ -370,8 +385,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
-          restore-keys: cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+          key: cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - run: cargo check --locked --all-targets
       - name: Exercise the Intel standalone-update artifact selection
         run: cargo test --locked --test update

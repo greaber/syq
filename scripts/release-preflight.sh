@@ -71,18 +71,25 @@ remote_tags=$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}") 
 [ -z "$remote_tags" ] \
   || die "remote tag $tag already exists"
 
-checks=$(gh api "repos/$CANONICAL_REPOSITORY/commits/$head/check-runs?filter=latest&per_page=100")
+certification=$("$script_dir/verify-release-ci.sh" --json "$CANONICAL_REPOSITORY" "$head") || {
+  printf '%s\n' "$certification" >&2
+  die 'full release CI is not ready'
+}
+jq -r '.workflows[] | "Full release CI: \(.workflow) certified at \(.evidence_commit)"' <<<"$certification"
 IFS=, read -ra check_names <<<"$REQUIRED_CHECKS"
 for check_name in "${check_names[@]}"; do
+  workflow=ci.yml
+  [ "$check_name" != conformance ] || workflow=rsync-compat.yml
+  checked_commit=$(jq -er --arg workflow "$workflow" '.workflows[] | select(.workflow == $workflow) | .evidence_commit' <<<"$certification")
+  checks=$(gh api "repos/$CANONICAL_REPOSITORY/commits/$checked_commit/check-runs?filter=latest&per_page=100")
   conclusion=$(jq -r --arg name "$check_name" '
     [.check_runs[] | select(.name == $name)] |
     sort_by([(.started_at // .completed_at // ""), (.id // 0)]) |
     if length == 0 then "missing" else last.conclusion // "pending" end
   ' <<<"$checks")
   [ "$conclusion" = success ] \
-    || die "required check $check_name is $conclusion on $head"
+    || die "required check $check_name is $conclusion on $checked_commit"
 done
-"$script_dir/verify-release-ci.sh" "$CANONICAL_REPOSITORY" "$head"
 
 signing_key=$(git config --get user.signingkey 2>/dev/null || true)
 signing_key=${signing_key#key::}

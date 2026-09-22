@@ -28,6 +28,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Require curated release notes
         run: test -s ".github/release-notes/$GITHUB_REF_NAME.md"
       - name: Require the Python native API to be synchronized
@@ -47,7 +48,6 @@ jobs:
           scripts/verify-release-tag.sh \
             "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" master \
             rust,sdks,macos,linux-arm64,conformance
-          scripts/verify-release-ci.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA"
 
   build:
     needs: verify-tag
@@ -68,10 +68,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          key: cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
+            cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
             cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
             cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+            cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Compile and validate the source package once
         run: scripts/prepare-release-crate.sh "$GITHUB_REF_NAME" "$RUNNER_TEMP/source-crate"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

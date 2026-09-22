@@ -65,6 +65,24 @@ class ReleaseTests(unittest.TestCase):
         os.chdir(other)
         self.assertEqual(readiness.ssh_evidence()["commit"], checked)
 
+    def test_release_prose_reuses_evidence_and_failed_rerun_supersedes_it(self):
+        self.record()
+        checked = self.git("rev-parse", "HEAD")
+        Path("CHANGELOG.md").write_text("Release notes")
+        self.commit()
+        self.assertEqual(readiness.ssh_evidence()["commit"], checked)
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.record("exit 1\n")
+        self.assertIsNone(readiness.ssh_evidence())
+
+    def test_documentation_examples_do_not_require_another_ssh_lab(self):
+        self.record()
+        checked = self.git("rev-parse", "HEAD")
+        Path("docs").mkdir()
+        Path("docs/automation.md").write_text("changed example")
+        self.commit()
+        self.assertEqual(readiness.ssh_evidence()["commit"], checked)
+
     def test_changed_committed_tree_invalidates_evidence(self):
         self.record()
         Path("source").write_text("two")
@@ -105,7 +123,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_wrong_profile_is_rejected(self):
         self.record()
-        path = readiness.receipt_path(self.git("rev-parse", "HEAD^{tree}"))
+        path = readiness.inputs_receipt_path(self.git("rev-parse", "HEAD"))
         receipt = json.loads(path.read_text())
         receipt["profile"] = "max-sessions-1"
         path.write_text(json.dumps(receipt))
