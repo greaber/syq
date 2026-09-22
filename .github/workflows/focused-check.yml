@@ -29,8 +29,8 @@ on:
         default: false
       timeout:
         description: Timeout in minutes
-        type: number
-        default: 15
+        type: string
+        default: "15"
 
 permissions:
   contents: read
@@ -38,7 +38,7 @@ permissions:
 jobs:
   check:
     runs-on: ${{ inputs.provider == 'namespace' && (inputs.runner == 'macos' && 'namespace-profile-syq-macos' || format('namespace-profile-syq-linux;github.run-id={0}', github.run_id)) || (inputs.runner == 'macos' && 'macos-26' || 'ubuntu-24.04') }}
-    timeout-minutes: ${{ inputs.timeout }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
