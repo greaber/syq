@@ -59,7 +59,8 @@ jobs:
   rust:
     # Cancel only matching automatic checks; manual runs keep a unique group.
     concurrency:
-      group: ${{ github.workflow }}-rust-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.native }}-${{ needs.scope.outputs.tooling }}-${{ needs.scope.outputs.shellcheck }}-${{ needs.scope.outputs.mapping_docs }}-${{ needs.scope.outputs.full_suite }}
+      # Full native suites already include tooling, shell lint, and mapping tests.
+      group: ${{ github.workflow }}-rust-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.native == 'true' && needs.scope.outputs.full_suite == 'true' && 'full' || format('{0}-{1}-{2}-{3}-{4}', needs.scope.outputs.native, needs.scope.outputs.tooling, needs.scope.outputs.shellcheck, needs.scope.outputs.mapping_docs, needs.scope.outputs.full_suite) }}
       cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: always()
