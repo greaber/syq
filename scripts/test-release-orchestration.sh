@@ -694,3 +694,17 @@ assert_scope "$scope" integration_targets local
 printf '%s\n' tests/support/temp.rs >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" integration_targets all
+
+# Only affected languages become matrix jobs; the no-work case keeps one stub.
+for language in python javascript go; do
+  directory=$language
+  [ "$language" != javascript ] || directory=js
+  printf '%s\n' "sdk/$directory/source" >"$paths"
+  scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+  assert_scope "$scope" sdk_matrix "[\"$language\"]"
+done
+printf '%s\n' src/main.rs >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" sdk_matrix '["none"]'
+scope=$("$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
+assert_scope "$scope" sdk_matrix '["python","javascript","go"]'

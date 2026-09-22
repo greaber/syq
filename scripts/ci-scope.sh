@@ -20,7 +20,8 @@ run_everything() {
     'conformance=true' \
     'macos=true' \
     'linux_arm64=true' \
-    'full_suite=true'
+    'full_suite=true' \
+    'sdk_matrix=["python","javascript","go"]'
 }
 
 if [ -n "${SYQ_TEST_CHANGED_PATHS_FILE:-}" ]; then
@@ -250,3 +251,7 @@ read -r -a selected_targets <<< "$integration_targets"
 integration_targets=$(printf '%s\n' "${selected_targets[@]}" | LC_ALL=C sort -u | paste -sd ' ' -)
 printf 'integration_targets=%s\n' "$integration_targets"
 echo "CI scope: native=$native sdks=$sdks python_sdk=$python_sdk javascript_sdk=$javascript_sdk go_sdk=$go_sdk tooling=$tooling shellcheck=$shellcheck mapping_docs=$mapping_docs conformance=$conformance macos=$macos linux_arm64=$linux_arm64 full_suite=$full_suite" >&2
+
+jq -cn --argjson python "$python_sdk" --argjson javascript "$javascript_sdk" --argjson go "$go_sdk" \
+  '[$python, $javascript, $go] as $enabled | [range(3) | select($enabled[.]) | ["python", "javascript", "go"][.]] | if length == 0 then ["none"] else . end' | \
+  sed 's/^/sdk_matrix=/'
