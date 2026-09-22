@@ -5,6 +5,14 @@ on:
     branches: [master]
   workflow_dispatch:
     inputs:
+      linux_trial:
+        description: Run only the Linux Rust job on the selected provider
+        type: choice
+        default: disabled
+        options:
+          - disabled
+          - github
+          - namespace
       scope_commit:
         description: Commit whose diff determines the selected checks
         required: false
@@ -48,7 +56,7 @@ jobs:
   rust:
     needs: scope
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.linux_trial == 'namespace' && 'namespace-profile-syq-linux' || (inputs.linux_trial == 'github' && 'ubuntu-24.04' || 'ubuntu-latest') }}
     steps:
       - name: Require successful path classification
         if: needs.scope.result != 'success'
@@ -68,8 +76,23 @@ jobs:
           needs.scope.outputs.mapping_docs == 'true'
         with:
           persist-credentials: false
+      - name: Show Linux trial hardware
+        if: inputs.linux_trial == 'github' || inputs.linux_trial == 'namespace'
+        run: |
+          uname -a
+          lscpu
+          free -h
+          df -h .
+      - name: Attach Namespace Cargo cache
+        if: inputs.linux_trial == 'namespace'
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
       - name: Cache Cargo dependencies and build output
-        if: needs.scope.outputs.native == 'true' || needs.scope.outputs.tooling == 'true' || needs.scope.outputs.mapping_docs == 'true'
+        if: inputs.linux_trial != 'namespace' && (needs.scope.outputs.native == 'true' || needs.scope.outputs.tooling == 'true' || needs.scope.outputs.mapping_docs == 'true')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -172,7 +195,7 @@ jobs:
 
   sdks:
     needs: scope
-    if: always()
+    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
     runs-on: ubuntu-latest
     steps:
       - name: Require successful path classification
@@ -299,7 +322,7 @@ jobs:
   # x86-64 (st_nlink is u32 here), so check it after native changes land.
   linux-arm64:
     needs: scope
-    if: always()
+    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Require successful path classification
@@ -331,6 +354,7 @@ jobs:
   macos_intel:
     needs: scope
     if: >-
+      inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
       needs.scope.result == 'success' &&
       needs.scope.outputs.macos == 'true' &&
       needs.scope.outputs.full_suite == 'true'
@@ -356,7 +380,7 @@ jobs:
   # the full macos.yml workflow, required separately by verify-release-ci.sh.
   macos:
     needs: [scope, macos_intel]
-    if: always()
+    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
     runs-on: ubuntu-latest
     steps:
       - name: Require successful path classification
@@ -382,6 +406,7 @@ jobs:
   release-certification:
     needs: [scope, rust, sdks, linux-arm64, macos]
     if: >-
+      inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
       needs.scope.outputs.full_suite == 'true' &&
       needs.scope.outputs.native == 'true' &&
       needs.scope.outputs.python_sdk == 'true' &&
