@@ -738,3 +738,19 @@ printf '%s\n' build.rs >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling_checks package
 assert_scope "$scope" native true
+
+# A mapped path must never suppress another path's broad tooling fallback.
+for fallback_path in nix/python-dist.nix unknown-input scripts/unmapped-tool.py; do
+  for mapped_path in .github/workflows/ci.yml scripts/test-installer.sh; do
+    for order in alone first last; do
+      case "$order" in
+        alone) printf '%s\n' "$fallback_path" >"$paths" ;;
+        first) printf '%s\n' "$fallback_path" "$mapped_path" >"$paths" ;;
+        last) printf '%s\n' "$mapped_path" "$fallback_path" >"$paths" ;;
+      esac
+      scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+      assert_scope "$scope" tooling true
+      assert_scope "$scope" tooling_checks 'benchmark branch focused installer orchestration package release workflows'
+    done
+  done
+done

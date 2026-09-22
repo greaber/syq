@@ -122,6 +122,8 @@ saw_path=false
 while IFS= read -r path; do
   [ -n "$path" ] || continue
   saw_path=true
+  path_tooling=false
+  path_tooling_checks=
   # Shell lint is cheap and independent of the path's product surface.
   # Keep it selected even when the case below deliberately ignores the path.
   if [[ "$path" == *.sh ]]; then
@@ -192,19 +194,19 @@ while IFS= read -r path; do
       native=true
       ;;
     .github/workflows/*)
-      tooling=true
+      path_tooling=true
       ;;
     nix/python-dist.nix|scripts/build-python-dist.sh|scripts/package-python-wheel.py|scripts/pin-python-native-source.sh|scripts/normalize-python-wheel.py|scripts/check-python-api-sync.py|scripts/normalize-python-sdist.py|scripts/check-python-wheel.py|scripts/stage-python-sdk.py|scripts/prepare-python-sdk-release.py|scripts/run-generated-sdk-post-merge-ci.sh|scripts/select-trusted-pr.jq|scripts/test-python-sdk-release-tools.sh|scripts/test-python-release-preparation.py)
-      tooling=true
+      path_tooling=true
       python_sdk=true
       ;;
     scripts/generate-homebrew-formula.sh|scripts/test-homebrew-formula.sh|scripts/generate-installer.sh|scripts/test-installer.sh)
-      tooling=true
+      path_tooling=true
       ;;
     tests/real-ssh/*)
       ;;
     scripts/*|deny.toml)
-      tooling=true
+      path_tooling=true
       ;;
     *.md|docs/*|.github/ISSUE_TEMPLATE/*|.github/dependabot.yml|LICENSE|.gitignore|.claude/*)
       ;;
@@ -214,7 +216,7 @@ while IFS= read -r path; do
       python_sdk=true
       javascript_sdk=true
       go_sdk=true
-      tooling=true
+      path_tooling=true
       shellcheck=true
       mapping_docs=true
       conformance=true
@@ -222,41 +224,46 @@ while IFS= read -r path; do
   esac
   case "$path" in
     .github/workflows/*|scripts/check-workflows.sh)
-      tooling_checks+=" workflows orchestration"
+      path_tooling_checks+=" workflows orchestration"
       ;;
     Cargo.toml|Cargo.lock|rust-toolchain.toml)
-      if [ "$preparation_only" != true ]; then tooling_checks+=" package"; fi
+      if [ "$preparation_only" != true ]; then path_tooling_checks+=" package"; fi
       ;;
     scripts/test-cargo-package.sh|build.rs|src/identity.rs|tests/build_identity.rs)
-      tooling_checks+=" package"
+      path_tooling_checks+=" package"
       ;;
     scripts/generate-installer.sh|scripts/test-installer.sh)
-      tooling_checks+=" installer"
+      path_tooling_checks+=" installer"
       ;;
     scripts/try-benchmark*|scripts/test-try-benchmark.py)
-      tooling_checks+=" benchmark"
+      path_tooling_checks+=" benchmark"
       ;;
     scripts/run-focused-check.py|scripts/test-run-focused-check.py)
-      tooling_checks+=" focused"
+      path_tooling_checks+=" focused"
       ;;
     scripts/branch-status.sh|scripts/test-branch-status.sh)
-      tooling_checks+=" branch"
+      path_tooling_checks+=" branch"
       ;;
     scripts/verify-release-ci.sh)
-      tooling_checks+=" release orchestration"
+      path_tooling_checks+=" release orchestration"
       ;;
     scripts/test-release-tools.sh|scripts/package-release.sh|scripts/verify-crates-io-package.sh|scripts/verify-release-*|scripts/generate-release-*|scripts/sign-release-*)
-      tooling_checks+=" release"
+      path_tooling_checks+=" release"
       ;;
     scripts/ci-scope.sh|scripts/*release-orchestration*|scripts/release-preflight.sh|scripts/release-status.sh|scripts/release-readiness.py|scripts/release-timings.py|scripts/release_test_inputs.py|scripts/release-tag-signers|scripts/find-release-build.py|scripts/nightly-ci.py|scripts/test-release-readiness.py|scripts/test-release-timings.py|scripts/test-release-test-inputs.py|scripts/test-find-release-build.py|scripts/test-nightly-ci.py|scripts/*generated-sdk-post-merge-ci.sh)
-      tooling_checks+=" orchestration"
+      path_tooling_checks+=" orchestration"
       ;;
     scripts/rsync-compat.py) ;;
     scripts/*|deny.toml)
       # Retain broad coverage for tooling whose ownership is not yet mapped.
-      tooling_checks+=" $all_tooling"
+      path_tooling_checks+=" $all_tooling"
       ;;
   esac
+  # Apply fallback to this path before combining it with other selections.
+  if [ "$path_tooling" = true ] && [ -z "$path_tooling_checks" ]; then
+    path_tooling_checks=$all_tooling
+  fi
+  tooling_checks+=" $path_tooling_checks"
 done <<<"$changed_paths"
 
 if [ "$saw_path" = false ]; then
@@ -264,20 +271,16 @@ if [ "$saw_path" = false ]; then
   python_sdk=true
   javascript_sdk=true
   go_sdk=true
-  tooling=true
+  tooling_checks=$all_tooling
   shellcheck=true
   mapping_docs=true
   conformance=true
 fi
 
-# Unknown non-script inputs retain the existing broad fallback.
-if [ "$tooling" = true ] && [ -z "$tooling_checks" ]; then
-  tooling_checks=$all_tooling
-fi
-if [ -n "$tooling_checks" ]; then tooling=true; fi
 # Sort and deduplicate so equivalent selections share a cancellation group.
 read -r -a selected_tooling <<< "$tooling_checks"
 tooling_checks=$(printf '%s\n' "${selected_tooling[@]}" | sed '/^$/d' | sort -u | paste -sd ' ' -)
+if [ -n "$tooling_checks" ]; then tooling=true; fi
 printf 'tooling_checks=%s\n' "$tooling_checks"
 
 if [ "$python_sdk" = true ] || [ "$javascript_sdk" = true ] || [ "$go_sdk" = true ]; then
