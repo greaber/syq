@@ -40,7 +40,7 @@ for workflow in ci.yml rsync-compat.yml macos.yml; do
       [.[].workflow_runs[]? |
         select(.head_sha == $commit and .head_branch == "master"
           and .head_repository.full_name == $repository
-          and (.event == "workflow_dispatch" or .event == "push"))] |
+          and (.event == "workflow_dispatch" or .event == "push" or .event == "schedule"))] |
       sort_by([(.run_number // 0), (.run_attempt // 0)]) |
       last // null
     ' <<<"$runs") || exit 2
@@ -48,7 +48,7 @@ for workflow in ci.yml rsync-compat.yml macos.yml; do
     attempt=$(jq '.run_attempt // null' <<<"$latest")
     url=$(jq -r '.html_url // ""' <<<"$latest")
     state=dispatch
-    message="full release CI workflow $workflow has no push or workflow_dispatch run on master on $evidence_commit"
+    message="full release CI workflow $workflow has no push, schedule, or workflow_dispatch run on master on $evidence_commit"
     if [ "$latest" != null ]; then
       status=$(jq -r '.status // "unknown"' <<<"$latest")
       conclusion=$(jq -r '.conclusion // "pending"' <<<"$latest")

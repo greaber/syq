@@ -5,6 +5,7 @@ set -euo pipefail
 event_path=${1:-${GITHUB_EVENT_PATH:-}}
 changed_paths=
 full_suite=false
+integration_targets=
 
 run_everything() {
   printf '%s\n' \
@@ -22,7 +23,10 @@ run_everything() {
     'full_suite=true'
 }
 
-if [ "${GITHUB_EVENT_NAME:-}" = schedule ]; then
+if [ -n "${SYQ_TEST_CHANGED_PATHS_FILE:-}" ]; then
+  changed_paths=$(cat "$SYQ_TEST_CHANGED_PATHS_FILE")
+elif [ -n "$event_path" ] && [ -f "$event_path" ] &&
+    jq -e 'has("schedule")' "$event_path" >/dev/null; then
   script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
   if python3 "$script_dir/nightly-ci.py"; then
     run_everything
@@ -33,8 +37,6 @@ if [ "${GITHUB_EVENT_NAME:-}" = schedule ]; then
     # No changed test inputs: emit the ordinary all-false scope below.
     changed_paths=README.md
   fi
-elif [ -n "${SYQ_TEST_CHANGED_PATHS_FILE:-}" ]; then
-  changed_paths=$(cat "$SYQ_TEST_CHANGED_PATHS_FILE")
 elif [ "${SYQ_CI_DOCUMENTATION_ONLY:-}" = true ]; then
   changed_paths=$'docs/mappings.md\ndocs/automation.md\ndocs/commands/map.md'
 elif [ -n "$event_path" ] && [ -f "$event_path" ]; then
@@ -121,6 +123,18 @@ while IFS= read -r path; do
   if [[ "$path" == *.sh ]]; then
     shellcheck=true
   fi
+  case "$path" in
+    tests/local.rs|tests/local/*) integration_targets+=" local" ;;
+    tests/help.rs|tests/help/*) integration_targets+=" help" ;;
+    tests/output.rs|tests/output/*) integration_targets+=" output" ;;
+    tests/update.rs|tests/update/*) integration_targets+=" update" ;;
+    tests/return_handoff.rs|tests/return_handoff/*) integration_targets+=" return_handoff" ;;
+    tests/s3.rs|tests/s3/*) integration_targets+=" s3" ;;
+    tests/build_identity.rs) integration_targets+=" build_identity" ;;
+    tests/temp_paths.rs) integration_targets+=" temp_paths" ;;
+    tests/macos_exfat.rs) integration_targets+=" macos_exfat" ;;
+    tests/support/*|tests/fixtures/*) integration_targets+=" all" ;;
+  esac
   case "$path" in
     sdk/README.md|sdk/RELEASING.md|sdk/python/README-PYTHON.md|sdk/python/NATIVE_API.md|sdk/python/API_DESIGN.md|sdk/js/README.md|sdk/go/README.md)
       # These are prose, not executable SDK test inputs. Keep the exception
@@ -231,4 +245,8 @@ printf 'native=%s\nsdks=%s\npython_sdk=%s\njavascript_sdk=%s\ngo_sdk=%s\ntooling
   "$native" "$sdks" "$python_sdk" "$javascript_sdk" "$go_sdk" \
   "$tooling" "$shellcheck" "$mapping_docs" "$conformance" "$macos" \
   "$linux_arm64" "$full_suite"
+# Canonicalize selections so equivalent changes share a cancellation group.
+read -r -a selected_targets <<< "$integration_targets"
+integration_targets=$(printf '%s\n' "${selected_targets[@]}" | LC_ALL=C sort -u | paste -sd ' ' -)
+printf 'integration_targets=%s\n' "$integration_targets"
 echo "CI scope: native=$native sdks=$sdks python_sdk=$python_sdk javascript_sdk=$javascript_sdk go_sdk=$go_sdk tooling=$tooling shellcheck=$shellcheck mapping_docs=$mapping_docs conformance=$conformance macos=$macos linux_arm64=$linux_arm64 full_suite=$full_suite" >&2

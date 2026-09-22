@@ -452,6 +452,12 @@ preflight_env=(
 (cd "$preflight_repo" && env "${preflight_env[@]}" \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/preflight.out"
 grep -F "Release preflight passed for v9.9.9 at $preflight_head" "$work/preflight.out" >/dev/null
+# Scheduled full certificates satisfy the same release gate as manual runs.
+nightly_runs_json=$(jq '.workflow_runs[0].event = "schedule"' <<<"$workflow_runs_json")
+(cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_WORKFLOW_RUNS_JSON="$nightly_runs_json" \
+  "$script_dir/verify-release-ci.sh" greaber/syq "$preflight_head") >"$work/nightly-certification.out"
+
 # Rotating the repository key must also update the embedded source-build key.
 if (cd "$preflight_repo" && env "${preflight_env[@]}" \
   SYQ_TEST_PUBLIC_KEY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB= \
@@ -498,7 +504,7 @@ if (cd "$preflight_repo" && env "${preflight_env[@]}" \
   echo 'preflight unexpectedly accepted missing full release CI' >&2
   exit 1
 fi
-grep -F 'has no push or workflow_dispatch run on master' "$work/failure.out" >/dev/null
+grep -F 'has no push, schedule, or workflow_dispatch run on master' "$work/failure.out" >/dev/null
 if (cd "$preflight_repo" && env "${preflight_env[@]}" \
   SYQ_TEST_EXISTING_CRATE_VERSION=9.9.9 \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
@@ -681,3 +687,10 @@ python3 "$script_dir/test-find-release-build.py"
 echo 'release orchestration tests passed'
 
 python3 "$script_dir/test-nightly-ci.py"
+
+printf '%s\n' tests/local/transfer.rs >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" integration_targets local
+printf '%s\n' tests/support/temp.rs >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" integration_targets all

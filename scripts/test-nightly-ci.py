@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -39,6 +40,31 @@ class NightlyTests(unittest.TestCase):
     def test_comparison_errors_do_not_skip(self):
         with self.assertRaises(subprocess.CalledProcessError):
             self.invoke([{"head_sha": "missing"}], subprocess.CalledProcessError(128, "git"))
+
+    def test_schedule_scope_runs_skips_and_propagates_api_failure(self):
+        root = Path(__file__).resolve().parent.parent
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            event = Path(tmp) / "event.json"
+            event.write_text(json.dumps({"schedule": "17 2 * * *"}))
+            gh = Path(tmp) / "gh"
+            gh.write_text("#!/bin/sh\n[ \"$FAIL_API\" != 1 ] || exit 1\nprintf '%s\\n' \"$RUNS\"\n")
+            gh.chmod(0o755)
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"],
+                       GITHUB_EVENT_NAME="schedule", GITHUB_REPOSITORY="example/repo",
+                       GITHUB_WORKFLOW_REF="example/repo/.github/workflows/ci.yml@refs/heads/master",
+                       GITHUB_REF_NAME="master", GITHUB_SHA=sha)
+            for runs, full in [([], "true"), ([{"head_sha": sha}], "false")]:
+                env["RUNS"] = json.dumps({"workflow_runs": runs})
+                result = subprocess.run(["scripts/ci-scope.sh", str(event)], cwd=root, env=env,
+                                        text=True, capture_output=True, check=True)
+                self.assertIn(f"full_suite={full}\n", result.stdout)
+                self.assertIn(f"linux_arm64={full}\n", result.stdout)
+            env["FAIL_API"] = "1"
+            result = subprocess.run(["scripts/ci-scope.sh", str(event)], cwd=root, env=env,
+                                    text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("full_suite=false", result.stdout)
 
 
 if __name__ == "__main__":

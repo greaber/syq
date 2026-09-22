@@ -338,7 +338,7 @@ the proportionate local checks described in `AGENTS.md` and reports exactly
 what was verified. A merge does not wait for GitHub to repeat those checks.
 
 Post-merge checks select affected areas: native changes run Linux formatting,
-linting, and unit tests; SDK changes select the corresponding language checks;
+linting, and unit tests, plus directly edited integration-test targets; SDK changes select the corresponding language checks;
 rsync compatibility changes run Linux conformance. Explicit macOS source,
 test, or workflow changes select the Apple Silicon suite. Matching automatic
 jobs cancel superseded work as configured by their concurrency groups.
