@@ -4,6 +4,8 @@ name: macOS suite
 # macOS. Automated validation runs after merges to master and on demand, not
 # on pull requests.
 on:
+  schedule:
+    - cron: "17 2 * * *"
   push:
     branches: [master]
   workflow_dispatch:
@@ -40,6 +42,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   focused-test:
@@ -114,14 +117,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           scope=$(scripts/ci-scope.sh "$GITHUB_EVENT_PATH")
           # ci-scope output is a machine-readable boolean contract.
           needed=false
-          # Mapping examples and shell-lint-only changes have focused Linux
-          # checks. They do not need the complete native/SDK macOS suite.
-          for key in native sdks tooling; do
+          # Only explicit macOS changes select this platform after a merge.
+          # Manual and changed-input nightly runs select the complete suite.
+          for key in macos; do
             if [[ $'\n'"$scope"$'\n' == *$'\n'"$key=true"$'\n'* ]]; then
               needed=true
             fi
@@ -326,3 +331,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo 'The complete Apple Silicon native, SDK, and release-tool suites passed.'
+
+  # Explicit evidence that this scheduled run did not execute validation.
+  nightly-unchanged:
+    needs: scope
+    if: github.event_name == 'schedule' && needs.scope.outputs.needed == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Nightly test inputs are unchanged; reuse earlier certified evidence.'

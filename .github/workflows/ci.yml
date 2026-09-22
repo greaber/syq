@@ -1,6 +1,8 @@
 name: ci
 
 on:
+  schedule:
+    - cron: "17 2 * * *"
   push:
     branches: [master]
   workflow_dispatch:
@@ -25,6 +27,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -44,6 +47,7 @@ jobs:
       macos: ${{ steps.changes.outputs.macos }}
       linux_arm64: ${{ steps.changes.outputs.linux_arm64 }}
       full_suite: ${{ steps.changes.outputs.full_suite }}
+      integration_targets: ${{ steps.changes.outputs.integration_targets }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,6 +56,7 @@ jobs:
       - name: Classify changed paths
         id: changes
         env:
+          GH_TOKEN: ${{ github.token }}
           SYQ_CI_DOCUMENTATION_ONLY: ${{ inputs.documentation_only }}
           SYQ_CI_SCOPE_COMMIT: ${{ inputs.scope_commit }}
         run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
@@ -60,7 +65,7 @@ jobs:
     # Cancel only matching automatic checks; manual runs keep a unique group.
     concurrency:
       # Full native suites already include tooling, shell lint, and mapping tests.
-      group: ${{ github.workflow }}-rust-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.native == 'true' && needs.scope.outputs.full_suite == 'true' && 'full' || format('{0}-{1}-{2}-{3}-{4}', needs.scope.outputs.native, needs.scope.outputs.tooling, needs.scope.outputs.shellcheck, needs.scope.outputs.mapping_docs, needs.scope.outputs.full_suite) }}
+      group: ${{ github.workflow }}-rust-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.integration_targets }}-${{ needs.scope.outputs.native == 'true' && needs.scope.outputs.full_suite == 'true' && 'full' || format('{0}-{1}-{2}-{3}-{4}', needs.scope.outputs.native, needs.scope.outputs.tooling, needs.scope.outputs.shellcheck, needs.scope.outputs.mapping_docs, needs.scope.outputs.full_suite) }}
       cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: always()
@@ -140,11 +145,11 @@ jobs:
       - name: Lint every Rust target
         if: needs.scope.outputs.native == 'true'
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Test every native target
-        if: >-
-          needs.scope.outputs.native == 'true' &&
-          needs.scope.outputs.full_suite == 'true'
+      - name: Test native targets
+        if: needs.scope.outputs.native == 'true'
         env:
+          INTEGRATION_TARGETS: ${{ needs.scope.outputs.integration_targets }}
+          FULL_SUITE: ${{ needs.scope.outputs.full_suite }}
           NAMESPACE_RUNNER: ${{ inputs.linux_trial != 'github' }}
         run: |
           if [[ "$NAMESPACE_RUNNER" == true ]]; then
@@ -155,7 +160,16 @@ jobs:
             export TMPDIR="$test_tmp"
             stat -f --format='Test filesystem: %T, ID: %i' "$TMPDIR"
           fi
-          cargo test --locked --all-targets
+          read -r -a integration_targets <<< "$INTEGRATION_TARGETS"
+          if [[ "$FULL_SUITE" == true || " ${integration_targets[*]} " == *" all "* ]]; then
+            cargo test --locked --all-targets
+          else
+            targets=(--bin syq)
+            for target in "${integration_targets[@]}"; do
+              targets+=(--test "$target")
+            done
+            cargo test --locked "${targets[@]}"
+          fi
       - name: Test executable mapping documentation
         if: >-
           needs.scope.outputs.mapping_docs == 'true' &&
@@ -354,7 +368,7 @@ jobs:
           go test ./...
 
   # The release workflow builds on this runner; libc field types differ from
-  # x86-64 (st_nlink is u32 here), so check it after native changes land.
+  # x86-64 (st_nlink is u32 here), so include it in full validation.
   linux-arm64:
     # Cancel only matching automatic checks; manual runs keep a unique group.
     concurrency:
@@ -369,7 +383,7 @@ jobs:
         run: echo 'Path classification failed.' >&2; exit 1
       - name: Complete the required check when ARM validation is deferred
         if: needs.scope.outputs.linux_arm64 != 'true'
-        run: echo 'ARM validation is deferred to the cumulative post-merge suite.'
+        run: echo 'ARM validation is deferred to nightly or manual full validation.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.scope.outputs.linux_arm64 == 'true'
         with:
@@ -392,7 +406,7 @@ jobs:
 
   # An actual Intel runner catches host-architecture cfg and libc differences
   # before the release workflow builds its x86-64 artifact. Keep this on full
-  # master and manual runs.
+  # nightly and manual runs.
   macos_intel:
     # Cancel only matching automatic checks; manual runs keep a unique group.
     concurrency:
@@ -466,3 +480,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo 'Every release validation suite in this workflow succeeded.'
+
+  # Explicit evidence that this scheduled run did not execute validation.
+  nightly-unchanged:
+    needs: scope
+    if: github.event_name == 'schedule' && needs.scope.outputs.native == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Nightly test inputs are unchanged; reuse earlier certified evidence.'

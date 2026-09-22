@@ -571,7 +571,8 @@ evidence rules under release tag lifecycle.
 
 Pull requests do not start automated test workflows. The agent remains
 responsible for selecting checks under the rules above, choosing integration tests,
-and reporting exactly what was and was not verified before review. The
-cumulative `master` workflows execute the complete native and cross-platform
-suites after merge. Pay particular attention to remote, TCP, platform-specific,
+and reporting exactly what was and was not verified before review. Post-merge
+workflows select affected areas; nightly runs execute the complete
+suites when test inputs have changed. Full validation remains required before
+release. Pay particular attention to remote, TCP, platform-specific,
 and performance behavior when choosing local checks.

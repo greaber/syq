@@ -1,12 +1,15 @@
 name: rsync compatibility
 
 on:
+  schedule:
+    - cron: "17 2 * * *"
   push:
     branches: [master]
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   scope:
@@ -20,6 +23,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Classify changed paths
+        env:
+          GH_TOKEN: ${{ github.token }}
         id: changes
         run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
@@ -132,3 +137,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo 'Every release validation suite in this workflow succeeded.'
+
+  # Explicit evidence that this scheduled run did not execute validation.
+  nightly-unchanged:
+    needs: scope
+    if: github.event_name == 'schedule' && needs.scope.outputs.conformance == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Nightly test inputs are unchanged; reuse earlier certified evidence.'
