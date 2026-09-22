@@ -281,11 +281,14 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                     response = run(put, stdin=stream, env=env)
                 success(response)
                 assert STATE['published'] == payload
+                # A file can inherit its directory's group, independently of
+                # the process's effective group (for example on macOS).
+                source_meta = source.stat()
                 # Existing version-1 format; no digest or new metadata fields.
                 stored = {'x-amz-meta-syq-format': '1', 'x-amz-meta-syq-kind': 'file',
                           'x-amz-meta-syq-mode': str(0o751),
-                          'x-amz-meta-syq-uid': str(os.geteuid()),
-                          'x-amz-meta-syq-gid': str(os.getegid()),
+                          'x-amz-meta-syq-uid': str(source_meta.st_uid),
+                          'x-amz-meta-syq-gid': str(source_meta.st_gid),
                           'x-amz-meta-syq-mtime': '1600000000',
                           'x-amz-meta-syq-mtime-nsec': '123456789'}
                 assert STATE['metadata'] == stored, STATE['metadata']
