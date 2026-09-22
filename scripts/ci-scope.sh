@@ -170,7 +170,7 @@ while IFS= read -r path; do
       tooling=true
       python_sdk=true
       ;;
-    nix/python-dist.nix|scripts/build-python-dist.sh|scripts/pin-python-native-source.sh|scripts/normalize-python-wheel.py|scripts/check-python-api-sync.py|scripts/normalize-python-sdist.py|scripts/check-python-wheel.py|scripts/stage-python-sdk.py|scripts/prepare-python-sdk-release.py|scripts/run-generated-sdk-post-merge-ci.sh|scripts/select-trusted-pr.jq|scripts/test-python-sdk-release-tools.sh|scripts/test-python-release-preparation.py)
+    nix/python-dist.nix|scripts/build-python-dist.sh|scripts/package-python-wheel.py|scripts/pin-python-native-source.sh|scripts/normalize-python-wheel.py|scripts/check-python-api-sync.py|scripts/normalize-python-sdist.py|scripts/check-python-wheel.py|scripts/stage-python-sdk.py|scripts/prepare-python-sdk-release.py|scripts/run-generated-sdk-post-merge-ci.sh|scripts/select-trusted-pr.jq|scripts/test-python-sdk-release-tools.sh|scripts/test-python-release-preparation.py)
       tooling=true
       python_sdk=true
       ;;
