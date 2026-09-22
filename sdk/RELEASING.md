@@ -143,8 +143,12 @@ After `.github/workflows/release.yml` completes successfully and the GitHub
 release is immutable, `.github/workflows/prepare-python-sdk.yml` downloads its
 exact signed manifest and prepares the same Python package version. It opens an
 `automation/python-sdk-vX.Y.Z` pull request containing the version, manifest,
-and lockfile updates. The workflow has already run
-the pinned SDK release-tool and unit-test suites, so it merges that pull request
+and lockfile updates. Preparation runs the pinned SDK release-tool and Python source tests against
+an executable downloaded from the immutable native release, checking its size,
+hash, version, and release identity first. It generates package metadata with
+the pinned PEP 517 backend without compiling Rust or building a wheel. Final
+wheel builds and installed-distribution tests remain in publication. After
+these preparation tests pass, it merges that pull request
 immediately without starting pull-request CI.
 
 GitHub suppresses ordinary push-triggered workflows when a merge uses the

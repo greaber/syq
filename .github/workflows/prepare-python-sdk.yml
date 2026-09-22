@@ -22,6 +22,8 @@ jobs:
       github.event.workflow_run.repository.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      UV_PYTHON: "3.13.13"
     steps:
       - name: Check out current master
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,6 +60,7 @@ jobs:
         id: prepare
         env:
           RELEASE_MANIFEST: ${{ runner.temp }}/syq-release/syq-release-manifest.json
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -70,9 +73,12 @@ jobs:
             exit 0
           fi
           scripts/test-python-sdk-release-tools.sh
-          PYTHONPATH=sdk/python/src \
-            uv run --project sdk/python --frozen \
-            python -m unittest discover -s sdk/python/tests
+          gh release download "$(jq -er .tag "$RELEASE_MANIFEST")" \
+            --pattern syq-linux-x86_64 --dir "$RUNNER_TEMP/syq-release"
+          uv sync --project sdk/python --frozen --no-install-project
+          uv run --project sdk/python --no-sync \
+            python scripts/test-python-release-preparation.py \
+            "$RUNNER_TEMP/syq-release/syq-linux-x86_64"
           python_version=$(python3 -c \
             'import tomllib; print(tomllib.load(open("sdk/python/pyproject.toml", "rb"))["project"]["version"])')
           syq_version=$(jq -er .version "$RELEASE_MANIFEST")

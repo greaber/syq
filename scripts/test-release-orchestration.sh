@@ -101,7 +101,8 @@ for sdk_script in \
   scripts/prepare-python-sdk-release.py \
   scripts/run-generated-sdk-post-merge-ci.sh \
   scripts/select-trusted-pr.jq \
-  scripts/test-python-sdk-release-tools.sh
+  scripts/test-python-sdk-release-tools.sh \
+  scripts/test-python-release-preparation.py
 do
   printf '%s\n' "$sdk_script" >"$paths"
   scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
