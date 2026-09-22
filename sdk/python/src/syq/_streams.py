@@ -188,7 +188,11 @@ class _Process:
             self.expired = True
             # An exited coordinator cannot clean up descendants holding pipes.
             if self.process.poll() is not None:
-                if not self.drain.is_alive() and not self.results_drain.is_alive():
+                # Drained diagnostics do not imply payload EOF: read() may
+                # still be blocked on a pipe held by a descendant. Only release
+                # after payload completion may finish without killing the group.
+                if (self._released and not self.drain.is_alive()
+                        and not self.results_drain.is_alive()):
                     return
                 self.cleanup_expired = True
                 _signal_group(self.process, signal.SIGKILL)

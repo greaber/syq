@@ -1,10 +1,12 @@
 """The operation deadline includes pipes held by an exited leader's children."""
+import json
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 import syq
@@ -64,3 +66,31 @@ os._exit(0)
                     self.assertFalse(process.results_drain.is_alive())
                 finally:
                     process.abort()
+
+    def test_reader_deadline_covers_payload_after_leader_exits(self):
+        records = [json.loads(line) for line in
+                   (Path(__file__).parent / 'fixtures/automation-v2-progress.ndjson').read_bytes().splitlines()]
+        records.insert(1, dict(type='stream_ready', schema='syq.automation', schema_version=2))
+        for seq, record in enumerate(records):
+            record['seq'] = seq
+        fixture = ''.join(json.dumps(record) + '\n' for record in records).encode()
+        self.fake.write_text(f'''#!{sys.executable}
+import os, sys, time
+from pathlib import Path
+Path({str(self.pid)!r}).write_text(str(os.getpid()))
+fd = int(sys.argv[sys.argv.index('--results-fd') + 1])
+os.write(fd, {fixture!r})
+os.close(fd)
+if os.fork() == 0:
+    os.close(2)
+    time.sleep(2)
+os._exit(0)
+''')
+        started = time.monotonic()
+        with syq.Client(executable=self.fake, timeout=.2).open_reader('unused') as reader:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                reader.read()
+            self.assertEqual(reader._process.process.returncode, 0)
+            self.assertFalse(reader._process.drain.is_alive())
+            self.assertFalse(reader._process.results_drain.is_alive())
+        self.assertLess(time.monotonic() - started, 1.5)
