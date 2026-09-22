@@ -82,6 +82,14 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(self.payload["inputs"]["cargo_cache"], "true")
         self.assertEqual(self.payload["inputs"]["timeout"], "3")
 
+    def test_intel_requires_github_provider(self):
+        with self.assertRaises(SystemExit):
+            self.invoke(["--runner", "macos-intel", "--", "true"])
+        self.assertIsNone(self.payload)
+        self.invoke(["--runner", "macos-intel", "--provider", "github", "--", "true"])
+        self.assertEqual(self.payload["inputs"]["runner"], "macos-intel")
+        self.assertEqual(self.payload["inputs"]["provider"], "github")
+
     def test_missing_run_id_is_not_success(self):
         with self.assertRaises(ValueError):
             self.invoke(["--", "true"], response={})

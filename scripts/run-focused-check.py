@@ -16,7 +16,7 @@ def output(*args, **kwargs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runner", choices=("linux", "macos"), required=True)
+    parser.add_argument("--runner", choices=("linux", "macos", "macos-intel"), required=True)
     parser.add_argument("--provider", choices=("namespace", "github"), default="namespace")
     parser.add_argument("--ref", help="Pushed branch/tag; defaults to the current branch")
     parser.add_argument("--script", type=Path, help="Local Bash file, including any setup")
@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--timeout", type=int, default=15, help="Runner timeout in minutes (1–90)")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command after --")
     args = parser.parse_args()
+    if args.runner == "macos-intel" and args.provider != "github":
+        parser.error("macos-intel requires --provider github")
     command = args.command
     if command[:1] == ["--"]:
         command = command[1:]

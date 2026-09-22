@@ -10,7 +10,7 @@ on:
         description: Operating system
         type: choice
         default: linux
-        options: [linux, macos]
+        options: [linux, macos, macos-intel]
       provider:
         description: Runner provider
         type: choice
@@ -37,9 +37,12 @@ permissions:
 
 jobs:
   check:
-    runs-on: ${{ inputs.provider == 'namespace' && (inputs.runner == 'macos' && 'namespace-profile-syq-macos' || format('namespace-profile-syq-linux;github.run-id={0}', github.run_id)) || (inputs.runner == 'macos' && 'macos-26' || 'ubuntu-24.04') }}
+    runs-on: ${{ inputs.provider == 'namespace' && (inputs.runner == 'macos' && 'namespace-profile-syq-macos' || format('namespace-profile-syq-linux;github.run-id={0}', github.run_id)) || (inputs.runner == 'macos-intel' && 'macos-26-intel' || inputs.runner == 'macos' && 'macos-26' || 'ubuntu-24.04') }}
     timeout-minutes: ${{ fromJSON(inputs.timeout) }}
     steps:
+      - name: Validate runner selection
+        if: inputs.runner == 'macos-intel' && inputs.provider != 'github'
+        run: echo 'Intel macOS requires the GitHub provider.' >&2; exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.revision || github.sha }}
@@ -62,7 +65,7 @@ jobs:
             target
           key: focused-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: |
-            cargo-${{ inputs.runner == 'macos' && 'macos-suite' || 'ci-rust' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-${{ inputs.runner == 'macos-intel' && 'ci-macos_intel' || inputs.runner == 'macos' && 'macos-suite' || 'ci-rust' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
       - name: Run the selected check
         shell: bash
         env:

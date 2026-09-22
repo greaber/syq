@@ -2,6 +2,7 @@
   description = "Reproducible syq release binaries and Python distributions";
 
   inputs = {
+    crane.url = "github:ipetkov/crane/v0.24.0";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -9,7 +10,7 @@
     };
   };
 
-  outputs = { self, nixpkgs, rust-overlay }:
+  outputs = { self, nixpkgs, rust-overlay, crane }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
@@ -19,7 +20,7 @@
           pkgs = import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
           lib = pkgs.lib;
           toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          rustPlatform = pkgs.makeRustPlatform { cargo = toolchain; rustc = toolchain; };
+          craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
           manifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
           # Nix removes these SDK stubs in favor of its own libiconv dylib.
           # Standalone executables must instead reference macOS's system copy.
@@ -27,35 +28,54 @@
             mkdir -p "$out/lib"
             cp -d ${pkgs.apple-sdk.src}/usr/lib/libiconv*.tbd "$out/lib/"
           '';
-          release = rustPlatform.buildRustPackage {
+          # Keep Cargo's flags stable across Nix sandbox directories. Apply
+          # path normalization inside wrappers so cached dependencies stay fresh.
+          rustcWrapper = pkgs.writeShellScript "syq-release-rustc" ''
+            exec "$@" --remap-path-prefix="$NIX_BUILD_TOP"=/build \
+              ${lib.optionalString pkgs.stdenv.isDarwin ''-C link-arg=-Wl,-oso_prefix,"$NIX_BUILD_TOP/"''}
+          '';
+          cWrapper = compiler: pkgs.writeShellScript "syq-release-${compiler}" ''
+            exec ${pkgs.stdenv.cc}/bin/${compiler} \
+              -ffile-prefix-map="$NIX_BUILD_TOP"=/build "$@"
+          '';
+          releaseArgs = {
             pname = "syq";
             version = manifest.package.version;
             src = lib.fileset.toSource {
               root = ./.;
               fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./build.rs ./src ];
             };
-            allowSubstitutes = false;
-            cargoLock.lockFile = ./Cargo.lock;
-            cargoBuildFlags = [ "--bin" "syq" ];
+            cargoExtraArgs = "--locked --bin syq";
             # The ordinary test suites run separately; this derivation produces
             # the distributable executable and checks its release identity.
             doCheck = false;
             env = {
-              SYQ_RELEASE_BUILD = "1";
-              SYQ_RELEASE_PUBLIC_KEY = lib.strings.trim (builtins.readFile ./src/release-public-key.txt);
-              RUSTFLAGS = lib.optionalString pkgs.stdenv.isLinux "-C target-feature=+crt-static -L native=${pkgs.glibc.static}/lib";
+              RUSTC_WRAPPER = rustcWrapper;
+              CC = cWrapper "cc";
+              CXX = cWrapper "c++";
+              RUSTFLAGS = if pkgs.stdenv.isLinux
+                then "-C target-feature=+crt-static -L native=${pkgs.glibc.static}/lib"
+                else "-L native=${systemLibiconv}/lib";
+
             };
             # Keep the deployment targets of the published v0.6.0 binaries.
             # Build tools may require a newer macOS than the produced executable.
-            preBuild = ''
-              export RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$NIX_BUILD_TOP=/build"
-              export NIX_CFLAGS_COMPILE="''${NIX_CFLAGS_COMPILE-} -ffile-prefix-map=$NIX_BUILD_TOP=/build"
-            '' + lib.optionalString pkgs.stdenv.isDarwin ''
+            preBuild = lib.optionalString pkgs.stdenv.isDarwin ''
               export MACOSX_DEPLOYMENT_TARGET=${if system == "x86_64-darwin" then "10.12" else "11.0"}
-              # Linker debug-map paths also feed the Mach-O UUID before stripping.
-              export RUSTFLAGS="$RUSTFLAGS -L native=${systemLibiconv}/lib -C link-arg=-Wl,-oso_prefix,$NIX_BUILD_TOP/"
             '';
-            # buildRustPackage delegates stripping to Nix's pinned tools.
+          };
+          release-deps = craneLib.buildDepsOnly (releaseArgs // {
+            # Only release dependencies are needed, not cargo-check metadata.
+            buildPhaseCargoCommand = "cargo build --release --locked --bin syq";
+          });
+          release = craneLib.buildPackage (releaseArgs // {
+            cargoArtifacts = release-deps;
+            allowSubstitutes = false;
+            env = releaseArgs.env // {
+              SYQ_RELEASE_BUILD = "1";
+              SYQ_RELEASE_PUBLIC_KEY = lib.strings.trim (builtins.readFile ./src/release-public-key.txt);
+            };
+            # Nix strips the standalone binary with its pinned tools.
             # Compress only after final stripping and Darwin signing fixups.
             dontPatchELF = true;
             postFixup = ''
@@ -63,9 +83,9 @@
               test "$("$out/bin/syq" --build-identity)" = "v${manifest.package.version}"
               ${pkgs.gzip}/bin/gzip -9 -n -c "$out/bin/syq" > "$out/bin/syq.gz"
             '';
-          };
+          });
         in {
-          inherit release;
+          inherit release release-deps;
           default = release;
           python-dist = import ./nix/python-dist.nix {
             inherit pkgs;
