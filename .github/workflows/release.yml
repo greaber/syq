@@ -69,46 +69,13 @@ jobs:
     if: needs.candidate-build.outputs.run-id == ''
     uses: ./.github/workflows/reproducible-builds.yml
 
-  source-crate:
-    name: validate source crate
-    needs: verify-tag
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Cache Cargo dependencies and build output
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
-          restore-keys: |
-            cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
-            cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
-            cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
-            cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
-            cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
-            cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
-      - name: Compile and validate the source package once
-        run: scripts/prepare-release-crate.sh "$GITHUB_REF_NAME" "$RUNNER_TEMP/source-crate"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: source-crate
-          path: ${{ runner.temp }}/source-crate/*
-          if-no-files-found: error
-          retention-days: 1
-
   release:
     name: verify, attest, and publish
-    needs: [verify-tag, candidate-build, build, source-crate]
+    needs: [verify-tag, candidate-build, build]
     if: >-
       always() && !cancelled() &&
       needs.verify-tag.result == 'success' &&
       needs.candidate-build.result == 'success' &&
-      needs.source-crate.result == 'success' &&
       (needs.build.result == 'success' ||
        (needs.build.result == 'skipped' && needs.candidate-build.outputs.run-id != ''))
     runs-on: ubuntu-latest
@@ -127,6 +94,8 @@ jobs:
       - name: Download the validated source package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.candidate-build.outputs.run-id || github.run_id }}
           name: source-crate
           path: ${{ runner.temp }}/source-crate
       - name: Require identical source-package bytes before any publication

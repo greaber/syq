@@ -58,7 +58,8 @@ class Tests(unittest.TestCase):
 
     def test_missing_expired_and_duplicate_artifacts(self):
         artifacts = [{"name": name, "expired": False} for name in self.assets]
-        for invalid in (artifacts[:-1], artifacts + artifacts[:1],
+        for invalid in (*[artifacts[:i] + artifacts[i + 1:] for i in range(len(artifacts))],
+                        artifacts + artifacts[:1],
                         [item | {"expired": True} for item in artifacts]):
             self.assertEqual(self.select([self.run_record()], invalid)[0], "")
 
@@ -96,11 +97,20 @@ class Tests(unittest.TestCase):
         release = text.split("  release:\n", 1)[1]
         for condition in ("needs.verify-tag.result == 'success'",
                           "needs.candidate-build.result == 'success'",
-                          "needs.source-crate.result == 'success'",
                           "needs.build.result == 'success'",
                           "needs.build.result == 'skipped' && needs.candidate-build.outputs.run-id != ''"):
             self.assertIn(condition, release)
         self.assertIn("run-id: ${{ needs.candidate-build.outputs.run-id || github.run_id }}", release)
+        self.assertEqual(release.count(
+            "run-id: ${{ needs.candidate-build.outputs.run-id || github.run_id }}"), 2)
+        self.assertNotIn("  source-crate:", text)
+        build = workflow.with_name("reproducible-builds.yml").read_text()
+        crate = build.split("  source-crate:\n", 1)[1].split("  build:\n", 1)[0]
+        self.assertNotIn("    needs:", crate)
+        self.assertIn('scripts/prepare-release-crate.sh "v$version"', crate)
+        self.assertIn('name: source-crate', crate)
+        self.assertIn('scripts/verify-prepared-crate.sh "$GITHUB_REF_NAME"', release)
+
 
 
 class PythonTests(Tests):
