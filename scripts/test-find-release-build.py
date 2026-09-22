@@ -64,8 +64,11 @@ class Tests(unittest.TestCase):
             self.assertEqual(self.select([self.run_record()], invalid)[0], "")
 
     def test_latest_failure_does_not_reuse_older_success(self):
-        self.assertEqual(self.select([self.run_record(), self.run_record(
-            id=124, conclusion="failure")])[0], "")
+        for conclusion in ("failure", "cancelled", "timed_out"):
+            with self.subTest(conclusion=conclusion), self.assertRaisesRegex(
+                    RuntimeError, "Candidate build 124.*gh run rerun 124.*--failed"):
+                self.select([self.run_record(), self.run_record(
+                    id=124, conclusion=conclusion)])
 
     def test_running_candidate_is_waited_for(self):
         output, watch = self.select([self.run_record(status="in_progress", conclusion=None)],
@@ -75,11 +78,17 @@ class Tests(unittest.TestCase):
         self.assertFalse(watch.call_args.kwargs["check"])
         self.assertEqual(watch.call_args.kwargs["timeout"], 4500)
 
-    def test_candidate_failing_during_wait_falls_back(self):
+    def test_candidate_failing_during_wait_stops_publication(self):
+        with self.assertRaisesRegex(RuntimeError, "Candidate build 123.*refusing an automatic rebuild"):
+            self.select(
+                [self.run_record(status="in_progress", conclusion=None)],
+                refreshed=self.run_record(conclusion="failure"), watch_status=1)
+
+    def test_deliberate_failed_job_retry_can_reuse_completed_artifacts(self):
         output, watch = self.select(
-            [self.run_record(status="in_progress", conclusion=None)],
-            refreshed=self.run_record(conclusion="failure"), watch_status=1)
-        self.assertEqual(output, "")
+            [self.run_record(status="in_progress", conclusion=None, run_attempt=2)],
+            refreshed=self.run_record(run_attempt=2))
+        self.assertEqual(output, "run-id=123\n")
         watch.assert_called_once()
 
     def test_interrupted_wait_does_not_start_duplicate_build(self):
@@ -87,6 +96,15 @@ class Tests(unittest.TestCase):
             self.select([self.run_record(status="in_progress", conclusion=None)],
                         refreshed=self.run_record(status="in_progress", conclusion=None),
                         watch_status=1)
+
+    def test_candidate_artifacts_can_be_replaced_by_deliberate_job_retry(self):
+        root = Path(__file__).resolve().parent.parent
+        native = (root / ".github/workflows/reproducible-builds.yml").read_text()
+        python = (root / ".github/workflows/publish-sdks.yml").read_text()
+        for text, name in ((native, "source-crate"),
+                           (native, "${{ matrix.platform.name }}"),
+                           (python, "python-sdk-${{ matrix.target }}")):
+            self.assertIn(f"name: {name}\n          overwrite: true", text)
 
     def test_empty(self):
         self.assertEqual(self.select([])[0], "")

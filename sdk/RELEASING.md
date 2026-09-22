@@ -157,8 +157,11 @@ starting pull-request CI.
 Preparation dispatches wheel builds and installed-distribution tests alongside
 post-merge SDK validation. Publication reuses successful manual builds from
 that exact commit in this repository, on master or its generated release
-branch. It waits for an active candidate; missing, failed or expired candidates
-use a fresh build. The signed-tag and SDK-validation gates still apply before
+branch. It waits for an active candidate; missing or expired artifacts
+use a fresh build. A failed candidate stops publication. Investigate the failure,
+then use `gh run rerun <candidate-run-id> --failed` for a deliberate retry that
+keeps successful platform jobs. Once it passes, rerun the failed publication
+jobs to select its artifacts. The signed-tag and SDK-validation gates still apply before
 publication.
 
 GitHub suppresses ordinary push-triggered workflows when a merge uses the
