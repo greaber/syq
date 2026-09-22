@@ -56,10 +56,14 @@ class MappingStreamCopies(unittest.TestCase):
         from pathlib import Path
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name).resolve()
+        fixture = Path(self.temp.name).resolve()
+        self.root = fixture / "data"
+        self.root.mkdir()
         self.binary = Path(os.environ.get("SYQ_CANDIDATE_EXECUTABLE", Path(__file__).resolve().parents[3] / "target/debug/syq"))
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("SYQ_")}
-        self.env["HOME"] = str(self.root)
+        # Tuning history is legitimate cache state, separate from copy outputs.
+        self.env["HOME"] = str(fixture / "home")
+        self.env["XDG_CACHE_HOME"] = str(fixture / "cache")
         self.client = syq.Client(executable=self.binary, env=self.env, timeout=10)
 
     def test_upload_download_mixed_paths_metadata_and_outcomes(self):
