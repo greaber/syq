@@ -50,6 +50,7 @@
             # the distributable executable and checks its release identity.
             doCheck = false;
             env = {
+              CARGO_BUILD_TARGET = pkgs.stdenv.hostPlatform.rust.rustcTarget;
               RUSTC_WRAPPER = rustcWrapper;
               CC = cWrapper "cc";
               CXX = cWrapper "c++";
@@ -64,7 +65,26 @@
               export MACOSX_DEPLOYMENT_TARGET=${if system == "x86_64-darwin" then "10.12" else "11.0"}
             '';
           };
-          release-deps = craneLib.buildDepsOnly (releaseArgs // {
+          # A syq version bump does not change third-party dependencies. Keep
+          # the placeholder crate and its lock entry version-neutral as well.
+          depsLib = craneLib.overrideScope (_final: prev: {
+            cleanCargoToml = args:
+              let cleaned = prev.cleanCargoToml args;
+              in cleaned // { package = cleaned.package // { version = "0.0.0"; }; };
+          });
+          release-deps = depsLib.buildDepsOnly (releaseArgs // {
+            version = "0.0.0";
+            src = lib.fileset.toSource {
+              root = ./.;
+              fileset = lib.fileset.unions [ ./Cargo.toml ./build.rs ./src ];
+            };
+            cargoLock = builtins.toFile "Cargo.lock" (builtins.replaceStrings
+              [ ''name = "syq"
+version = "${manifest.package.version}"'' ]
+              [ ''name = "syq"
+version = "0.0.0"'' ]
+              (builtins.readFile ./Cargo.lock));
+            cargoVendorDir = craneLib.vendorCargoDeps { src = releaseArgs.src; };
             # Only release dependencies are needed, not cargo-check metadata.
             buildPhaseCargoCommand = "cargo build --release --locked --bin syq";
           });
