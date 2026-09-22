@@ -1819,7 +1819,13 @@ fn s3_prefix_discovery_overlaps_reads_and_checks_both_results() {
             assert_eq!(server.requests.load(Ordering::Relaxed), 3);
         } else {
             assert!(!temp.path().join("download/file").exists());
-            assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+            let requests = server.requests.load(Ordering::Relaxed);
+            if fault == "prefix-list-error" {
+                // A failed LIST can cancel HEAD before it reaches the server.
+                assert!((1..=2).contains(&requests), "{fault}: {requests} requests");
+            } else {
+                assert_eq!(requests, 2, "{fault}");
+            }
             let error = output_text(&output);
             assert!(
                 error.contains(if fault == "prefix-collision" {
