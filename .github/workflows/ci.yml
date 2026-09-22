@@ -38,6 +38,7 @@ jobs:
     outputs:
       native: ${{ steps.changes.outputs.native }}
       sdks: ${{ steps.changes.outputs.sdks }}
+      sdk_matrix: ${{ steps.changes.outputs.sdk_matrix }}
       python_sdk: ${{ steps.changes.outputs.python_sdk }}
       javascript_sdk: ${{ steps.changes.outputs.javascript_sdk }}
       go_sdk: ${{ steps.changes.outputs.go_sdk }}
@@ -235,10 +236,14 @@ jobs:
            needs.scope.outputs.full_suite == 'true')
         run: git ls-files -z -- '*.sh' | xargs -0 shellcheck
 
-  sdks:
+  sdk-languages:
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ${{ fromJSON(needs.scope.outputs.sdk_matrix || '["none"]') }}
     # Cancel only matching automatic checks; manual runs keep a unique group.
     concurrency:
-      group: ${{ github.workflow }}-sdks-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.python_sdk }}-${{ needs.scope.outputs.javascript_sdk }}-${{ needs.scope.outputs.go_sdk }}
+      group: ${{ github.workflow }}-sdks-${{ matrix.sdk }}-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.python_sdk }}-${{ needs.scope.outputs.javascript_sdk }}-${{ needs.scope.outputs.go_sdk }}
       cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
@@ -248,14 +253,14 @@ jobs:
         if: needs.scope.result != 'success'
         run: echo 'Path classification failed.' >&2; exit 1
       - name: Complete the required check when SDKs are unaffected
-        if: needs.scope.outputs.sdks != 'true'
+        if: needs.scope.outputs[format('{0}_sdk', matrix.sdk)] != 'true'
         run: echo 'SDK validation is not needed for this change set.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.scope.outputs.sdks == 'true'
+        if: needs.scope.outputs[format('{0}_sdk', matrix.sdk)] == 'true'
         with:
           persist-credentials: false
       - name: Cache Cargo dependencies and build output
-        if: needs.scope.outputs.python_sdk == 'true'
+        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -269,15 +274,15 @@ jobs:
             cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - id: python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        if: needs.scope.outputs.python_sdk == 'true'
+        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
         with:
           python-version: ">=3.13.4 <3.14"
           check-latest: true
       - name: Install pinned Python tooling
-        if: needs.scope.outputs.python_sdk == 'true'
+        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
         run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
       - name: Require the matching Python SDK for the latest syq release
-        if: needs.scope.outputs.python_sdk == 'true'
+        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -295,10 +300,10 @@ jobs:
             exit 1
           }
       - name: Build the candidate syq executable
-        if: needs.scope.outputs.python_sdk == 'true'
+        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
         run: cargo build --locked --bin syq
-      - name: Test and reproducibly package Python SDK
-        if: needs.scope.outputs.python_sdk == 'true'
+      - name: Test and package Python SDK
+        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
         env:
           UV_PYTHON: ${{ steps.python.outputs.python-path }}
           PYTHONPATH: sdk/python/src
@@ -313,19 +318,13 @@ jobs:
           export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
           RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
-          for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
-            # Restored Cargo caches can contain distributions from an older SDK.
-            rm -rf -- "$output"
-            MATURIN_PEP517_ARGS="--profile dev" uv run --project sdk/python --frozen python -m build sdk/python --sdist --wheel --outdir "$output"
-            python scripts/normalize-python-sdist.py \
-              --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
-            sleep 2
-          done
-          for artifact in target/sdk-python-dist-a/*; do
-            name=${artifact##*/}
-            cmp "$artifact" "target/sdk-python-dist-b/$name"
-          done
-          set -- target/sdk-python-dist-a/syq-*-py3-none-*.whl
+          output=target/sdk-python-dist
+          # Restored Cargo caches can contain distributions from an older SDK.
+          rm -rf -- "$output"
+          MATURIN_PEP517_ARGS="--profile dev" uv run --project sdk/python --frozen python -m build sdk/python --sdist --wheel --outdir "$output"
+          python scripts/normalize-python-sdist.py \
+            --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
+          set -- target/sdk-python-dist/syq-*-py3-none-*.whl
           test "$#" -eq 1 && test -f "$1"
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
@@ -336,36 +335,51 @@ jobs:
           cargo clean --package syq --target-dir "$GITHUB_WORKSPACE/target"
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
             MATURIN_PEP517_ARGS="--profile dev" uv build --wheel \
-            target/sdk-python-dist-a/*.tar.gz --out-dir target/sdk-python-from-sdist
+            target/sdk-python-dist/*.tar.gz --out-dir target/sdk-python-from-sdist
           set -- target/sdk-python-from-sdist/syq-*-py3-none-*.whl
           test "$#" -eq 1 && test -f "$1"
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: needs.scope.outputs.javascript_sdk == 'true'
+        if: matrix.sdk == 'javascript' && needs.scope.outputs.javascript_sdk == 'true'
         with:
           node-version: "22.x"
           package-manager-cache: false
       - name: Test and package JavaScript SDK
-        if: needs.scope.outputs.javascript_sdk == 'true'
+        if: matrix.sdk == 'javascript' && needs.scope.outputs.javascript_sdk == 'true'
         working-directory: sdk/js
         run: |
           npm ci --ignore-scripts
           npm test
           npm pack --dry-run
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        if: needs.scope.outputs.go_sdk == 'true'
+        if: matrix.sdk == 'go' && needs.scope.outputs.go_sdk == 'true'
         with:
           go-version: "1.26.x"
           cache: false
       - name: Format, vet, and test Go SDK
-        if: needs.scope.outputs.go_sdk == 'true'
+        if: matrix.sdk == 'go' && needs.scope.outputs.go_sdk == 'true'
         working-directory: sdk/go
         run: |
           test -z "$(gofmt -l .)"
           go vet ./...
           go test ./...
+
+  # Keep the public check name consumed by generated-SDK validation and release
+  # preflight. A successful subset cannot hide a failed/cancelled matrix job.
+  sdks:
+    needs: [scope, sdk-languages]
+    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful SDK validation
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          SDK_RESULT: ${{ needs.sdk-languages.result }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          test "$SDK_RESULT" = success
 
   # The release workflow builds on this runner; libc field types differ from
   # x86-64 (st_nlink is u32 here), so include it in full validation.

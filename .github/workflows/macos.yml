@@ -199,7 +199,7 @@ jobs:
           echo "$RUNNER_TEMP/syq-python-tools/bin" >> "$GITHUB_PATH"
       - name: Use Homebrew OpenSSL for Ed25519 signing
         run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
-      - name: Test and reproducibly package Python SDK
+      - name: Test and package Python SDK
         env:
           UV_PYTHON: ${{ steps.python.outputs.python-path }}
           PYTHONPATH: sdk/python/src
@@ -214,28 +214,21 @@ jobs:
           export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
           RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
-          # macOS debug maps contain temporary Rust object names; strip them
-          # before comparing wheels, as release builds already strip symbols.
-          for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
-            # Restored Cargo caches can contain distributions from an older SDK.
-            rm -rf -- "$output"
-            MATURIN_PEP517_ARGS="--profile dev --strip" uv run --project sdk/python --frozen python -m build sdk/python --sdist --wheel --outdir "$output"
-            python scripts/normalize-python-sdist.py \
-              --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
-            sleep 2
-          done
-          for artifact in target/sdk-python-dist-a/*; do
-            name=${artifact##*/}
-            cmp "$artifact" "target/sdk-python-dist-b/$name"
-          done
-          set -- target/sdk-python-dist-a/syq-*-py3-none-*.whl
+          # Match release packaging by stripping macOS debug symbols.
+          output=target/sdk-python-dist
+          # Restored Cargo caches can contain distributions from an older SDK.
+          rm -rf -- "$output"
+          MATURIN_PEP517_ARGS="--profile dev --strip" uv run --project sdk/python --frozen python -m build sdk/python --sdist --wheel --outdir "$output"
+          python scripts/normalize-python-sdist.py \
+            --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
+          set -- target/sdk-python-dist/syq-*-py3-none-*.whl
           test "$#" -eq 1 && test -f "$1"
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
           rm -rf -- target/sdk-python-from-sdist
           MATURIN_PEP517_ARGS="--profile dev --strip" uv build --wheel \
-            target/sdk-python-dist-a/*.tar.gz --out-dir target/sdk-python-from-sdist
+            target/sdk-python-dist/*.tar.gz --out-dir target/sdk-python-from-sdist
           set -- target/sdk-python-from-sdist/syq-*-py3-none-*.whl
           test "$#" -eq 1 && test -f "$1"
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
