@@ -18,7 +18,7 @@ case "$(uname -s):$(uname -m)" in
   *) echo 'No reproducible release recipe for this host.' >&2; exit 1 ;;
 esac
 output=$(nix --extra-experimental-features 'nix-command flakes' build \
-  .#release --no-update-lock-file --no-link --print-out-paths -L)
+  .#release --no-update-lock-file --no-link --print-out-paths --max-jobs auto -L)
 install -m 755 "$output/bin/syq" "$dist/$asset"
 install -m 644 "$output/bin/syq.gz" "$dist/$asset.gz"
 

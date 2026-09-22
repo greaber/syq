@@ -422,6 +422,12 @@ jobs:
       needs.scope.outputs.macos == 'true' &&
       needs.scope.outputs.full_suite == 'true'
     runs-on: macos-26-intel
+    env:
+      # This job checks compilation and updater behavior, not copy throughput.
+      CARGO_PROFILE_DEV_OPT_LEVEL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_OPT_LEVEL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -433,11 +439,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          key: cargo-ci-macos_intel-fast-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
-            cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
-            cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
-            cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+            cargo-ci-macos_intel-fast-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-ci-macos_intel-fast-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            cargo-ci-macos_intel-fast-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - run: cargo check --locked --all-targets
       - name: Exercise the Intel standalone-update artifact selection
         run: cargo test --locked --test update

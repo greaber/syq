@@ -3,6 +3,12 @@ name: reproducible builds
 on:
   workflow_call:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Build one platform for focused validation, or all release platforms
+        type: choice
+        default: all
+        options: [all, syq-linux-x86_64, syq-linux-aarch64, syq-macos-arm64, syq-macos-x86_64]
 
 permissions:
   contents: read
@@ -47,11 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - { os: ubuntu-24.04, name: syq-linux-x86_64 }
-          - { os: ubuntu-24.04-arm, name: syq-linux-aarch64 }
-          - { os: macos-26, name: syq-macos-arm64 }
-          - { os: macos-26-intel, name: syq-macos-x86_64 }
+        platform: ${{ fromJSON(inputs.platform == 'syq-linux-x86_64' && '[{"os":"ubuntu-24.04","name":"syq-linux-x86_64"}]' || inputs.platform == 'syq-linux-aarch64' && '[{"os":"ubuntu-24.04-arm","name":"syq-linux-aarch64"}]' || inputs.platform == 'syq-macos-arm64' && '[{"os":"macos-26","name":"syq-macos-arm64"}]' || inputs.platform == 'syq-macos-x86_64' && '[{"os":"macos-26-intel","name":"syq-macos-x86_64"}]' || '[{"os":"ubuntu-24.04","name":"syq-linux-x86_64"},{"os":"ubuntu-24.04-arm","name":"syq-linux-aarch64"},{"os":"macos-26","name":"syq-macos-arm64"},{"os":"macos-26-intel","name":"syq-macos-x86_64"}]') }}
     runs-on: ${{ matrix.platform.os }}
     timeout-minutes: 60
     steps:
@@ -60,6 +62,44 @@ jobs:
           persist-credentials: false
       - name: Install checksum-pinned Nix
         run: scripts/install-nix-ci.sh
+      - name: Check dependency cache invalidation
+        if: matrix.platform.name == 'syq-linux-x86_64'
+        run: python3 scripts/test-release-dependency-cache.py
+      - name: Resolve release dependency cache
+        id: deps
+        run: |
+          output=$(nix --extra-experimental-features 'nix-command flakes' eval --no-update-lock-file --raw .#release-deps.outPath)
+          echo "output=$output" >> "$GITHUB_OUTPUT"
+          echo "key=release-deps-v1-$(basename "$output")" >> "$GITHUB_OUTPUT"
+      - name: Restore compiled release dependencies
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-deps.nar
+          key: ${{ steps.deps.outputs.key }}
+      - name: Import cached dependencies
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: |
+          # The runner owns the archive; only the Nix store write needs root.
+          # shellcheck disable=SC2024
+          sudo "$(command -v nix-store)" --import < "$RUNNER_TEMP/release-deps.nar"
+      - name: Build release dependencies
+        run: nix --extra-experimental-features 'nix-command flakes' build .#release-deps --no-update-lock-file --no-link --max-jobs auto -L
+      - name: Export compiled dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          DEPS_OUTPUT: ${{ steps.deps.outputs.output }}
+        run: |
+          nix-store --query --requisites "$DEPS_OUTPUT" > "$RUNNER_TEMP/release-deps-paths"
+          # Export the full closure: Crane references vendored sources as
+          # well as compiled artifacts. Nix store paths contain no whitespace.
+          xargs nix-store --export < "$RUNNER_TEMP/release-deps-paths" > "$RUNNER_TEMP/release-deps.nar"
+      - name: Save compiled release dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-deps.nar
+          key: ${{ steps.deps.outputs.key }}
       - name: Build from locked inputs and smoke-test the executable
         run: scripts/build-reproducible.sh "$RUNNER_TEMP/dist"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
