@@ -47,6 +47,11 @@ jobs:
         with:
           ref: ${{ inputs.revision || github.sha }}
           persist-credentials: false
+      - name: Match the Intel CI test profile
+        if: inputs.runner == 'macos-intel'
+        run: |
+          printf '%s\n' CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+            CARGO_PROFILE_TEST_OPT_LEVEL=0 CARGO_PROFILE_TEST_DEBUG=0 >> "$GITHUB_ENV"
       - name: Attach Namespace Cargo cache
         if: inputs.cargo_cache && inputs.provider == 'namespace'
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9
@@ -56,6 +61,7 @@ jobs:
             ~/.cargo/git
             target
       - name: Restore GitHub Cargo cache
+        id: cargo-cache
         if: inputs.cargo_cache && inputs.provider == 'github'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -63,9 +69,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: focused-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          key: ${{ inputs.runner == 'macos-intel' && format('cargo-ci-macos_intel-fast-v1-{0}-{1}-{2}-{3}-{4}', runner.os, runner.arch, hashFiles('rust-toolchain.toml'), hashFiles('Cargo.lock'), inputs.revision || github.sha) || format('focused-{0}-{1}-{2}', runner.os, runner.arch, hashFiles('rust-toolchain.toml', 'Cargo.lock')) }}
           restore-keys: |
-            cargo-${{ inputs.runner == 'macos-intel' && 'ci-macos_intel' || inputs.runner == 'macos' && 'macos-suite' || 'ci-rust' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-${{ inputs.runner == 'macos-intel' && 'ci-macos_intel-fast-v1' || inputs.runner == 'macos' && 'macos-suite' || 'ci-rust' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
       - name: Run the selected check
         shell: bash
         env:
@@ -75,3 +81,12 @@ jobs:
           test -n "$CHECK_SCRIPT"
           printf '%s\n' "$CHECK_SCRIPT" > "$RUNNER_TEMP/syq-focused-check.sh"
           bash --noprofile --norc -euo pipefail "$RUNNER_TEMP/syq-focused-check.sh"
+      - name: Save the Intel CI Cargo cache
+        if: inputs.cargo_cache && inputs.runner == 'macos-intel' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

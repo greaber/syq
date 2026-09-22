@@ -371,7 +371,8 @@ all suites, and a failed nightly is retried on subsequent nights. Unchanged
 inputs only run the small scope checks. Full runs include SDKs, both rsync
 platforms, Linux ARM64, Intel macOS compilation/updater tests, and the complete
 Apple Silicon suite. Intel compilation/updater checks use unoptimized binaries
-without debug information; the shipped release binaries remain optimized. Manual runs remain available at any time and are not
+without debug information; the shipped release binaries remain optimized.
+Focused Intel checks use that same test profile and Cargo cache. Manual runs remain available at any time and are not
 cancelled by new pushes.
 
 A release requires successful full-suite certificates from `ci.yml`,
