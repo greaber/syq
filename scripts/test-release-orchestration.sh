@@ -524,13 +524,47 @@ git -C "$preflight_repo" switch --detach -q
   "$script_dir/release-readiness.py" v9.9.9 --json) >"$work/readiness.json"
 jq -e '.ready and (.ci.workflows | length == 3) and (.ssh.profile == "default")' \
   "$work/readiness.json" >/dev/null
-# A detached checkout of an old master cannot pass against advancing remote master.
+# A pinned, validated candidate remains releasable after master advances.
+git -C "$preflight_repo" switch -qc later-master
+printf 'new development work\n' >"$preflight_repo/later-source"
+git -C "$preflight_repo" add later-source
+git -C "$preflight_repo" commit -qm later
+later_master=$(git -C "$preflight_repo" rev-parse HEAD)
+git -C "$preflight_repo" switch --detach -q "$preflight_head"
+git -C "$preflight_repo" update-ref refs/remotes/origin/master "$later_master"
+(cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_PREFLIGHT_HEAD="$later_master" \
+  "$script_dir/release-preflight.sh" v9.9.9) >/dev/null
+(cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_PREFLIGHT_HEAD="$later_master" \
+  "$script_dir/release-readiness.py" v9.9.9 --json) >"$work/pinned-readiness.json"
+jq -e --arg candidate "$preflight_head" --arg master "$later_master" \
+  '.ready and .commit == $candidate and .remote_master == $master' \
+  "$work/pinned-readiness.json" >/dev/null
+# An unrelated candidate must still be rejected by both entry points.
+unrelated_master=$(git -C "$preflight_repo" commit-tree "$preflight_tree" -m unrelated)
+git -C "$preflight_repo" update-ref refs/remotes/origin/master "$unrelated_master"
 if (cd "$preflight_repo" && env "${preflight_env[@]}" \
-  SYQ_TEST_PREFLIGHT_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  SYQ_TEST_PREFLIGHT_HEAD="$unrelated_master" \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
-  echo 'preflight unexpectedly accepted stale HEAD' >&2; exit 1
+  echo 'preflight unexpectedly accepted an unmerged candidate' >&2; exit 1
 fi
-grep -F 'HEAD is not synchronized with the remote master' "$work/failure.out" >/dev/null
+grep -F 'not merged into remote master' "$work/failure.out" >/dev/null
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_PREFLIGHT_HEAD="$unrelated_master" \
+  "$script_dir/release-readiness.py" v9.9.9 --json) >"$work/unmerged-readiness.json"; then
+  echo 'readiness unexpectedly accepted an unmerged candidate' >&2; exit 1
+fi
+jq -e '.ready == false and any(.missing[]; .message | contains("not merged into remote master"))' \
+  "$work/unmerged-readiness.json" >/dev/null
+git -C "$preflight_repo" update-ref refs/remotes/origin/master "$preflight_head"
+# Stale tracking refs still require a fetch, without moving the candidate.
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_PREFLIGHT_HEAD="$later_master" \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
+  echo 'preflight unexpectedly accepted stale origin/master' >&2; exit 1
+fi
+grep -F 'origin/master is stale' "$work/failure.out" >/dev/null
 printf 'uncommitted' >"$preflight_repo/untracked"
 if (cd "$preflight_repo" && env "${preflight_env[@]}" \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then

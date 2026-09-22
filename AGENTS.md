@@ -193,9 +193,14 @@ report actual access or decision blockers instead of bypassing them.
 
 ## Release tag lifecycle
 
+- Pin the release candidate once preparation has merged and validation starts.
+  Later merges into `master` do not automatically replace or block that candidate.
+  Assess later changes for significant fixes worth including; restart with a new
+  candidate only when their value justifies repeating affected validation and
+  builds. The candidate must remain an ancestor of remote `master`.
 - Before pushing a syq release tag, require successful full-suite runs of
-  `ci.yml`, `rsync-compat.yml`, and `macos.yml` on the clean remote
-  `master` commit or a first-parent ancestor with unchanged test inputs. The
+  `ci.yml`, `rsync-compat.yml`, and `macos.yml` on the clean pinned candidate
+  or its first-parent ancestor with unchanged test inputs. The
   release-preparation exception permits only syq package-version edits and
   prose documents recognized by `scripts/release_test_inputs.py`; dependencies,
   source, tests, workflows, and build inputs must match. Changed executable

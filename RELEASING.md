@@ -168,6 +168,11 @@ release request does not require another preparation PR or another test run.
    gh workflow run reproducible-builds.yml --ref master
    ```
 
+   Pin that commit as the release candidate. Later merges into `master` do not
+   block its release; consider a newer candidate only for important changes,
+   such as a significant bug fix that should ship now. Keep the pinned checkout
+   and its existing runs rather than synchronizing it automatically.
+
    Start this once per release candidate and track the returned run with
    `gh run watch --exit-status`. These four platform builds need no publication
    credentials. The signed-tag workflow reuses a successful manual build from
@@ -222,9 +227,10 @@ release request does not require another preparation PR or another test run.
    scripts/release-preflight.sh v0.1.9
    ```
 
-   It accepts a clean task branch or detached checkout whose HEAD matches both
-   freshly fetched `origin/master` and the live remote `master` tip. The local
-   coordination branch may remain stale. It also requires matching local
+   It accepts a clean task branch or detached checkout at the pinned candidate,
+   provided that commit remains an ancestor of the live remote `master` tip.
+   Fetch current master for the ancestry check without moving the candidate
+   checkout. The local coordination branch may remain stale. It also requires matching local
    real-SSH evidence; curated release notes; no pending Python
    API follow-ups; matching Cargo metadata; successful `rust`, `sdks`,
    `macos`, `linux-arm64`, and `conformance` checks on the certified commits;
@@ -232,7 +238,9 @@ release request does not require another preparation PR or another test run.
    GitHub; the selected-Actions allowlist; the protected `release` environment,
    tag policy, variables, and secret names; and absence of the tag or version
    from GitHub, crates.io, and the Homebrew tap. It makes no local or remote
-   changes. Then create and push a signed annotated tag matching the package
+   changes. Do not wait for candidate binary builds once these checks pass:
+   the tag workflow can wait for them while validating the source crate in
+   parallel. Then create and push a signed annotated tag matching the package
    version. Its signing key and email must be configured on your GitHub account
    so GitHub reports the tag-object signature as verified:
 

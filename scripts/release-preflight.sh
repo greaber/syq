@@ -46,8 +46,9 @@ head=$(git rev-parse HEAD)
 tracking_master=$(git rev-parse refs/remotes/origin/master 2>/dev/null) \
   || die 'origin/master is unavailable; fetch it first'
 remote_master=$(git ls-remote origin refs/heads/master | awk 'NR == 1 {print $1}')
-[ "$head" = "$tracking_master" ] || die "HEAD is not synchronized with origin/master ($tracking_master)"
-[ "$head" = "$remote_master" ] || die "HEAD is not synchronized with the remote master ($remote_master)"
+[ "$tracking_master" = "$remote_master" ] || die "origin/master is stale; fetch remote master ($remote_master)"
+git merge-base --is-ancestor "$head" "$remote_master" \
+  || die "release candidate $head is not merged into remote master ($remote_master)"
 
 [ -s ".github/release-notes/$tag.md" ] || die "release notes are missing: .github/release-notes/$tag.md"
 "$script_dir/release-readiness.py" "$tag" --verify-ssh
