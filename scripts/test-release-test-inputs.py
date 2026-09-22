@@ -97,6 +97,8 @@ import json, os, sys
 url = sys.argv[-1]
 if '/jobs?' in url:
     jobs = [] if '/runs/2/' in url else [{'name':'release-certification','status':'completed','conclusion':'success'}]
+    if '/runs/2/' in url and os.environ.get('CURRENT_DOCS'):
+        jobs = [{'name':'rust', 'steps':[{'name':'Test executable mapping documentation','status':'completed','conclusion':'success'}]}]
     print(json.dumps([{'jobs': jobs}]))
 else:
     sha = url.split('head_sha=')[1].split('&')[0]
@@ -117,6 +119,39 @@ else:
             result = subprocess.run(cmd, env={**env, **variables}, capture_output=True, text=True)
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertTrue(all(w['state'] == expected for w in json.loads(result.stdout)['workflows']))
+
+
+        # Changed examples require their focused tests, not new native suites.
+        Path('docs').mkdir()
+        Path('docs/automation.md').write_text('changed executable example')
+        doc_head = self.commit()
+        self.assertEqual(fingerprint(self.base, native=True), fingerprint(doc_head, native=True))
+        self.assertNotEqual(fingerprint(self.base), fingerprint(doc_head))
+        cmd[-1] = doc_head
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        workflows = json.loads(result.stdout)['workflows']
+        self.assertIn('documentation_only=true', workflows[0]['next_action'])
+        self.assertTrue(all(w['state'] == 'ready' for w in workflows[1:]))
+        result = subprocess.run(cmd, env={**env, 'CURRENT_DOCS':'true'}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        workflows = json.loads(result.stdout)['workflows']
+        self.assertEqual(workflows[0]['documentation_commit'], doc_head)
+        self.assertTrue(all(w['evidence_commit'] == self.base for w in workflows))
+
+    def test_all_executable_pages_select_focused_tests(self):
+        for page in ['docs/mappings.md', 'docs/automation.md', 'docs/commands/map.md']:
+            paths = self.root / '.git/changed-paths'
+            paths.write_text(page + '\n')
+            output = subprocess.check_output([SCRIPTS / 'ci-scope.sh'], text=True,
+                env={**os.environ, 'SYQ_TEST_CHANGED_PATHS_FILE': str(paths)})
+            self.assertIn('native=false\n', output)
+            self.assertIn('mapping_docs=true\n', output)
+        output = subprocess.check_output([SCRIPTS / 'ci-scope.sh'], text=True,
+            env={**os.environ, 'SYQ_CI_DOCUMENTATION_ONLY':'true'})
+        self.assertIn('native=false\n', output)
+        self.assertIn('mapping_docs=true\n', output)
+        self.assertIn('full_suite=false\n', output)
 
 
 if __name__ == '__main__':

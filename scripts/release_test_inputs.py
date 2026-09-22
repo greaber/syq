@@ -26,14 +26,16 @@ def version_neutral(path, data):
     return data[:section.start()] + neutral + data[section.end():]
 
 
+EXAMPLE_PAGES = {"docs/mappings.md", "docs/automation.md", "docs/commands/map.md"}
+
+
 def prose(path):
     return (path in {'README.md', 'CHANGELOG.md', 'RELEASING.md', 'CONTRIBUTING.md', 'AGENTS.md'}
             or path.startswith('.github/release-notes/') and path.endswith('.md')
-            or path.startswith('docs/') and path.endswith('.md') and path not in {
-                'docs/mappings.md', 'docs/automation.md', 'docs/commands/map.md'})
+            or path.startswith('docs/') and path.endswith('.md') and path not in EXAMPLE_PAGES)
 
 
-def fingerprint(commit):
+def fingerprint(commit, *, native=False):
     result = hashlib.sha256()
     for record in git('ls-tree', '-rz', commit).split(b'\0'):
         if not record:
@@ -41,7 +43,7 @@ def fingerprint(commit):
         metadata, raw_path = record.split(b'\t', 1)
         mode, kind, oid = metadata.split()
         path = raw_path.decode()
-        if mode == b'100644' and kind == b'blob' and prose(path):
+        if mode == b'100644' and kind == b'blob' and (prose(path) or native and path in EXAMPLE_PAGES):
             continue
         if path in ('Cargo.toml', 'Cargo.lock') and kind == b'blob':
             oid = hashlib.sha256(version_neutral(path, git('cat-file', 'blob', oid.decode()))).hexdigest().encode()
@@ -49,11 +51,11 @@ def fingerprint(commit):
     return result.hexdigest()
 
 
-def candidates(commit):
+def candidates(commit, *, native=False):
     """Contiguous first-parent ancestors with the same tested inputs, newest first."""
-    expected = fingerprint(commit)
+    expected = fingerprint(commit, native=native)
     for ancestor in git('rev-list', '--first-parent', commit).decode().splitlines():
-        if fingerprint(ancestor) != expected:
+        if fingerprint(ancestor, native=native) != expected:
             break
         yield ancestor
 
@@ -63,7 +65,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('commit')
     parser.add_argument('--equivalent-to')
+    parser.add_argument('--native', action='store_true', help='exclude separately tested documentation examples')
     args = parser.parse_args()
     if args.equivalent_to:
-        raise SystemExit(0 if fingerprint(args.commit) == fingerprint(args.equivalent_to) else 1)
-    print('\n'.join(candidates(args.commit)))
+        raise SystemExit(0 if fingerprint(args.commit, native=args.native) == fingerprint(args.equivalent_to, native=args.native) else 1)
+    print('\n'.join(candidates(args.commit, native=args.native)))

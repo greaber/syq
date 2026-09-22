@@ -75,6 +75,14 @@ class ReleaseTests(unittest.TestCase):
             self.record("exit 1\n")
         self.assertIsNone(readiness.ssh_evidence())
 
+    def test_documentation_examples_do_not_require_another_ssh_lab(self):
+        self.record()
+        checked = self.git("rev-parse", "HEAD")
+        Path("docs").mkdir()
+        Path("docs/automation.md").write_text("changed example")
+        self.commit()
+        self.assertEqual(readiness.ssh_evidence()["commit"], checked)
+
     def test_changed_committed_tree_invalidates_evidence(self):
         self.record()
         Path("source").write_text("two")

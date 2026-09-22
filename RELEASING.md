@@ -152,8 +152,9 @@ release request does not require another preparation PR or another test run.
    host, Docker/Compose versions, and completion time under the shared Git
    directory's `syq-release/real-ssh-inputs/`. Evidence can be reused across
    worktrees and release preparation when only the syq package version or
-   recognized prose changes. Source, dependencies, tests, workflows, executable
-   documentation, and other build inputs must match. Older full-tree receipts
+   recognized prose changes. Executable documentation is checked separately and
+   does not invalidate the SSH lab. Source, dependencies, tests, workflows, and
+   other build inputs must match. Older full-tree receipts
    remain readable. Dirty runs cannot certify a release. A deliberately rerun
    check invalidates its earlier receipt before execution, so failure cannot leave stale success.
    These are local maintainer records, not portable CI certificates. An
@@ -178,9 +179,13 @@ release request does not require another preparation PR or another test run.
    package version in Cargo.toml/Cargo.lock and recognized prose: root project
    guides, changelog, release notes, and Markdown under docs except the executable
    examples in mappings.md, automation.md, and commands/map.md. It compares all
-   remaining committed inputs. The report
-   names the actual tested commit for each workflow. A newer failed or pending
-   run is never hidden by earlier successful evidence. Runs made before
+   remaining committed inputs. Changes to those examples require successful
+   focused documentation tests on matching inputs, while native/platform
+   certification remains reusable. If that focused evidence is missing, the
+   verifier requests `ci.yml` with `documentation_only=true`. Routine version,
+   changelog, and release-note preparation does not change executable examples
+   and needs no repeated suites. The report names the tested commits. A newer
+   failed or pending run is never hidden by earlier successful evidence. Runs made before
    certificates were introduced need a fresh manual run.
 
    If evidence is missing, dispatch only the workflow that needs it (all three
@@ -329,7 +334,7 @@ A release requires successful full-suite certificates from `ci.yml`,
 `rsync-compat.yml`, and `macos.yml` for the candidate or unchanged test inputs
 under the release-preparation exception above. Version-only preparation does
 not automatically rerun native suites; changed dependencies or other build
-inputs do. Manual dispatch still runs the full suites. The stable `macos` check
+inputs do. Manual dispatch runs full suites unless `documentation_only` is selected. The stable `macos` check
 in `ci.yml` represents Intel validation; the separate macOS certificate establishes full
 Apple Silicon coverage. Old runs without the required certificates need one
 manual certification. Failed latest runs must be investigated, not replaced by

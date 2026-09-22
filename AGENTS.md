@@ -198,8 +198,10 @@ report actual access or decision blockers instead of bypassing them.
   `master` commit or a first-parent ancestor with unchanged test inputs. The
   release-preparation exception permits only syq package-version edits and
   prose documents recognized by `scripts/release_test_inputs.py`; dependencies,
-  source, tests, executable documentation, workflows, and build inputs must
-  match. Report both the candidate and reused evidence SHAs. A task branch or
+  source, tests, workflows, and build inputs must match. Changed executable
+  documentation requires its focused tests; it does not invalidate unrelated
+  native/platform or SSH validation. Routine release preparation does not change
+  those examples. Report both the candidate and reused evidence SHAs. A task branch or
   detached checkout at the candidate SHA is sufficient;
   do not update the coordination checkout or clone solely to obtain a branch
   named `master`. Start with `scripts/release-readiness.py v<version>` and reuse

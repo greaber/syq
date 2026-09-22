@@ -58,7 +58,9 @@ CI workflow's state and next action. Perform only missing work:
   mode. It records default-profile real-SSH success for the committed test inputs.
   Version-only and recognized prose preparation can reuse that evidence;
   dependencies, source, tests, workflows, and build inputs must match. Reuse only
-  explicitly owned task work.
+  explicitly owned task work. Changed executable documentation needs only its
+  focused tests; ordinary release version and notes preparation leaves those
+  examples unchanged.
 - Merge needed preparation/repair PRs after branch-status and exact PR-head
   checks. Use a clean task checkout at the actual remote master SHA afterward.
 - Wait for existing CI with the reported `gh run watch --exit-status` command.

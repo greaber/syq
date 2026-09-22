@@ -39,7 +39,7 @@ def receipt_path(tree):
 
 def inputs_receipt_path(commit):
     common = Path(run("git", "rev-parse", "--git-common-dir")).resolve()
-    return common / "syq-release" / "real-ssh-inputs" / f"{fingerprint(commit)}.json"
+    return common / "syq-release" / "real-ssh-inputs" / f"{fingerprint(commit, native=True)}.json"
 
 
 def ssh_evidence():
@@ -47,7 +47,7 @@ def ssh_evidence():
     path = inputs_receipt_path(commit)
     if not path.is_file():
         # Existing full-tree receipts remain usable if their tested inputs match.
-        for ancestor in candidates(commit):
+        for ancestor in candidates(commit, native=True):
             path = receipt_path(run("git", "rev-parse", ancestor + "^{tree}"))
             if path.is_file():
                 break
@@ -58,7 +58,7 @@ def ssh_evidence():
     if (receipt.get("schema") not in (1, 2) or receipt.get("profile") != "default"
             or not re.fullmatch(r"[0-9a-f]{40}", checked)
             or run("git", "rev-parse", checked + "^{tree}") != receipt.get("tree")
-            or fingerprint(checked) != fingerprint(commit)):
+            or fingerprint(checked, native=True) != fingerprint(commit, native=True)):
         raise ValueError(f"invalid real-SSH evidence: {path}")
     if receipt.get("result") != "success":
         return None

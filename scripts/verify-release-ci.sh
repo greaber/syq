@@ -23,12 +23,16 @@ command -v jq >/dev/null || die 'release CI verification needs jq'
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 evidence_commits=$commit
+documentation_commits=$commit
 if git cat-file -e "$commit^{commit}" 2>/dev/null; then
-  evidence_commits=$(python3 "$script_dir/release_test_inputs.py" "$commit") || exit 2
+  evidence_commits=$(python3 "$script_dir/release_test_inputs.py" "$commit" --native) || exit 2
+  documentation_commits=$(python3 "$script_dir/release_test_inputs.py" "$commit") || exit 2
 fi
 report='[]'
 ready=true
 for workflow in ci.yml rsync-compat.yml macos.yml; do
+  documentation_commit=
+  focused_docs=false
   while IFS= read -r evidence_commit; do
     runs=$(gh api --paginate --slurp \
       "repos/$repository/actions/workflows/$workflow/runs?head_sha=$evidence_commit&per_page=100") || exit 2
@@ -57,11 +61,23 @@ for workflow in ci.yml rsync-compat.yml macos.yml; do
         # Never borrow the certificate from a previous run attempt.
         jobs=$(gh api --paginate --slurp \
           "repos/$repository/actions/runs/$run_id/attempts/$attempt/jobs?per_page=100") || exit 2
+        # Documentation examples have separate focused validation. Only use
+        # an executed test step on a commit with the candidate's example inputs.
+        if [ "$workflow" = ci.yml ] && [ -z "$documentation_commit" ] &&
+            [[ $'\n'"$documentation_commits"$'\n' == *$'\n'"$evidence_commit"$'\n'* ]] &&
+            jq -e '[.[].jobs[]? | .steps[]? |
+              select(.name == "Test executable mapping documentation" or .name == "Test every native target") |
+              select(.status == "completed" and .conclusion == "success")] | length > 0' <<<"$jobs" >/dev/null; then
+          documentation_commit=$evidence_commit
+        fi
         if jq -e '
           [.[].jobs[]? | select(.name == "release-certification")] |
           length == 1 and all(.[]; .status == "completed" and .conclusion == "success")
         ' <<<"$jobs" >/dev/null; then
           state=ready
+          if [[ $'\n'"$documentation_commits"$'\n' == *$'\n'"$evidence_commit"$'\n'* ]]; then
+            documentation_commit=$evidence_commit
+          fi
           message="Full release CI: $workflow run $run_id succeeded on $evidence_commit."
         else
           message="workflow $workflow run $run_id attempt $attempt lacks successful full-suite release-certification on $evidence_commit; dispatch this workflow on master"
@@ -70,17 +86,28 @@ for workflow in ci.yml rsync-compat.yml macos.yml; do
     fi
     [ "$state" = dispatch ] || break
   done <<<"$evidence_commits"
+  if [ "$workflow" = ci.yml ] && [ "$state" = ready ] && [ -z "$documentation_commit" ]; then
+    state=dispatch
+    focused_docs=true
+    message="native CI is certified at $evidence_commit, but changed documentation examples need focused tests"
+  fi
+  if [ "$workflow" = ci.yml ] && [ "$state" = ready ] && [ "$documentation_commit" != "$evidence_commit" ]; then
+    message+=" Executable documentation tests succeeded on $documentation_commit."
+  fi
   case "$state" in
     ready) action="" ;;
-    dispatch) action="gh workflow run $workflow --repo $repository --ref master" ;;
+    dispatch)
+      action="gh workflow run $workflow --repo $repository --ref master"
+      if [ "$focused_docs" = true ]; then action+=" -f documentation_only=true"; fi
+      ;;
     wait) action="gh run watch $run_id --repo $repository --exit-status" ;;
     repair) action="gh run view $run_id --repo $repository --log-failed" ;;
   esac
   report=$(jq -c --arg workflow "$workflow" --arg state "$state" \
     --argjson run_id "$run_id" --argjson attempt "$attempt" --arg url "$url" \
-    --arg message "$message" --arg action "$action" --arg evidence_commit "$evidence_commit" \
+    --arg message "$message" --arg action "$action" --arg evidence_commit "$evidence_commit" --arg documentation_commit "$documentation_commit" \
     '. + [{workflow:$workflow,state:$state,run_id:$run_id,attempt:$attempt,
-      url:$url,message:$message,next_action:$action,evidence_commit:$evidence_commit}]' <<<"$report")
+      url:$url,message:$message,next_action:$action,evidence_commit:$evidence_commit,documentation_commit:$documentation_commit}]' <<<"$report")
   if [ "$state" != ready ]; then ready=false; fi
   if [ "$json" = false ]; then
     if [ "$state" = ready ]; then printf '%s\n' "$message";
