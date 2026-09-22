@@ -37,6 +37,36 @@ jobs:
           output=$(nix --extra-experimental-features 'nix-command flakes' eval --no-update-lock-file --raw .#release-deps.outPath)
           echo "output=$output" >> "$GITHUB_OUTPUT"
           echo "key=release-deps-v1-$(basename "$output")" >> "$GITHUB_OUTPUT"
+          vendor=$(nix --extra-experimental-features 'nix-command flakes' eval --no-update-lock-file --raw .#release-deps.cargoVendorDir)
+          echo "vendor=$vendor" >> "$GITHUB_OUTPUT"
+          echo "vendor-key=release-vendor-v1-$(basename "$vendor")" >> "$GITHUB_OUTPUT"
+      - name: Restore dependency sources
+        id: vendor-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-vendor.nar
+          key: ${{ steps.deps.outputs.vendor-key }}
+      - name: Import cached dependency sources
+        if: steps.vendor-cache.outputs.cache-hit == 'true'
+        run: |
+          # The runner owns the archive; only the Nix store write needs root.
+          # shellcheck disable=SC2024
+          sudo "$(command -v nix-store)" --import < "$RUNNER_TEMP/release-vendor.nar"
+      - name: Prepare dependency sources
+        run: nix --extra-experimental-features 'nix-command flakes' build .#release-deps.cargoVendorDir --no-update-lock-file --no-link -L
+      - name: Export dependency sources
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        env:
+          VENDOR_OUTPUT: ${{ steps.deps.outputs.vendor }}
+        run: |
+          nix-store --query --requisites "$VENDOR_OUTPUT" > "$RUNNER_TEMP/release-vendor-paths"
+          xargs nix-store --export < "$RUNNER_TEMP/release-vendor-paths" > "$RUNNER_TEMP/release-vendor.nar"
+      - name: Save dependency sources
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-vendor.nar
+          key: ${{ steps.deps.outputs.vendor-key }}
       - name: Restore compiled release dependencies
         id: cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
