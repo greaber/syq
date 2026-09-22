@@ -87,6 +87,15 @@ class ReleaseWheelTests(unittest.TestCase):
                     for tag in tags.split("."):
                         self.assertIn(f"Tag: py3-none-{tag}\n", metadata)
 
+    def test_preserves_original_v070_linux_x86_64_tags(self):
+        # Unchanged WHEEL metadata from sdk-python-v0.7.0 at 58d96386.
+        fixture = Path(__file__).with_name("fixtures") / "wheels/v0.7.0-linux-x86_64.WHEEL"
+        expected = {line for line in fixture.read_text().splitlines() if line.startswith("Tag: ")}
+        with zipfile.ZipFile(self.build()) as archive:
+            actual = {line for line in archive.read("syq-0.7.0.dist-info/WHEEL").decode().splitlines()
+                      if line.startswith("Tag: ")}
+        self.assertEqual(actual, expected)
+
     def test_corrupt_native_binary_is_rejected(self):
         self.binary.write_bytes(b"wrong bytes")
         with self.assertRaisesRegex(ValueError, "release manifest"):

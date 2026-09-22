@@ -14,7 +14,7 @@ import tomllib
 import zipfile
 
 PLATFORMS = {
-    "linux-x86_64": "manylinux_2_17_x86_64.manylinux2014_x86_64",
+    "linux-x86_64": "manylinux_2_5_x86_64.manylinux1_x86_64",
     "linux-aarch64": "manylinux_2_17_aarch64.manylinux2014_aarch64",
     "macos-x86_64": "macosx_10_12_x86_64",
     "macos-arm64": "macosx_11_0_arm64",
