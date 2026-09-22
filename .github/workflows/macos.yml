@@ -11,7 +11,7 @@ on:
       runner:
         description: Runner provider for this manual run
         type: choice
-        default: github
+        default: namespace
         options:
           - github
           - namespace
@@ -47,14 +47,14 @@ permissions:
 jobs:
   focused-test:
     if: github.event_name == 'workflow_dispatch' && inputs.test_name != ''
-    runs-on: ${{ inputs.runner == 'namespace' && 'namespace-profile-syq-macos' || 'macos-26' }}
+    runs-on: ${{ inputs.runner != 'github' && 'namespace-profile-syq-macos' || 'macos-26' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Attach Namespace Cargo cache
-        if: inputs.runner == 'namespace'
+        if: inputs.runner != 'github'
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           path: |
@@ -62,13 +62,13 @@ jobs:
             ~/.cargo/git
             target
       - name: Show Namespace runner hardware
-        if: inputs.runner == 'namespace'
+        if: inputs.runner != 'github'
         run: |
           sw_vers
           sysctl hw.model hw.ncpu hw.memsize machdep.cpu.brand_string
           df -h .
       - name: Restore Cargo dependencies and build output
-        if: inputs.runner != 'namespace'
+        if: inputs.runner == 'github'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -134,14 +134,14 @@ jobs:
   suite:
     needs: scope
     if: needs.scope.outputs.needed == 'true'
-    runs-on: ${{ inputs.runner == 'namespace' && 'namespace-profile-syq-macos' || 'macos-26' }}
+    runs-on: ${{ inputs.runner != 'github' && 'namespace-profile-syq-macos' || 'macos-26' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Attach Namespace Cargo cache
-        if: inputs.runner == 'namespace'
+        if: inputs.runner != 'github'
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           path: |
@@ -149,13 +149,13 @@ jobs:
             ~/.cargo/git
             target
       - name: Show Namespace runner hardware
-        if: inputs.runner == 'namespace'
+        if: inputs.runner != 'github'
         run: |
           sw_vers
           sysctl hw.model hw.ncpu hw.memsize machdep.cpu.brand_string
           df -h .
       - name: Cache Cargo dependencies and build output
-        if: inputs.runner != 'namespace'
+        if: inputs.runner == 'github'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -271,7 +271,7 @@ jobs:
 
   clone-benchmark:
     if: github.event_name == 'workflow_dispatch' && inputs.benchmark
-    runs-on: ${{ inputs.runner == 'namespace' && 'namespace-profile-syq-macos' || 'macos-26' }}
+    runs-on: ${{ inputs.runner != 'github' && 'namespace-profile-syq-macos' || 'macos-26' }}
     timeout-minutes: 30
     # Timing/resource failures must not invalidate release evidence. This job's
     # step result still records failure for anyone requesting benchmark results.
@@ -281,7 +281,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Attach Namespace Cargo cache
-        if: inputs.runner == 'namespace'
+        if: inputs.runner != 'github'
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           path: |
@@ -289,12 +289,12 @@ jobs:
             ~/.cargo/git
             target
       - name: Show Namespace runner hardware
-        if: inputs.runner == 'namespace'
+        if: inputs.runner != 'github'
         run: |
           sw_vers
           sysctl hw.model hw.ncpu hw.memsize machdep.cpu.brand_string
           df -h .
-      - if: inputs.runner != 'namespace'
+      - if: inputs.runner == 'github'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
