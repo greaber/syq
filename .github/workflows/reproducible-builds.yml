@@ -50,7 +50,7 @@ jobs:
           # shellcheck disable=SC2024
           sudo "$(command -v nix-store)" --import < "$RUNNER_TEMP/release-deps.nar"
       - name: Build release dependencies
-        run: nix --extra-experimental-features 'nix-command flakes' build .#release-deps --no-update-lock-file --no-link -L
+        run: nix --extra-experimental-features 'nix-command flakes' build .#release-deps --no-update-lock-file --no-link --max-jobs auto -L
       - name: Export compiled dependencies
         if: steps.cache.outputs.cache-hit != 'true'
         env:
