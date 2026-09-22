@@ -4,6 +4,17 @@ User-facing changes are recorded here starting with the release after
 [0.5.2](https://github.com/greaber/syq/releases/tag/v0.5.2).
 Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/releases).
 
+## 0.7.1 — 2026-09-22
+
+- Strengthen single-part S3 upload integrity by reusing the prepared SHA-256
+  checksum for signed payload validation. This lets providers such as Tigris
+  reject corrupted payloads even when they do not enforce the additional
+  checksum header. It applies to direct and delegated uploads without another
+  hashing pass; multipart and MD5-based uploads keep their existing behavior.
+- Reduce release preparation time with reusable validation evidence and Cargo
+  caches, native builds alongside validation, and Python packaging alongside
+  SDK checks. Python wheels reuse the verified native release executables.
+
 ## 0.7.0 — 2026-09-22
 
 Changes since 0.6.0. This release adds S3-compatible storage, byte streams and
