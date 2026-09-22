@@ -150,10 +150,16 @@ exact signed manifest and prepares the same Python package version. It opens an
 and lockfile updates. Preparation runs the pinned SDK release-tool and Python source tests against
 an executable downloaded from the immutable native release, checking its size,
 hash, version, and release identity first. It generates package metadata with
-the pinned PEP 517 backend without compiling Rust or building a wheel. Final
-wheel builds and installed-distribution tests remain in publication. After
-these preparation tests pass, it merges that pull request
-immediately without starting pull-request CI.
+the pinned PEP 517 backend without compiling Rust or building a wheel. After
+these preparation tests pass, it merges that pull request immediately without
+starting pull-request CI.
+
+Preparation dispatches wheel builds and installed-distribution tests alongside
+post-merge SDK validation. Publication reuses successful manual builds from
+that exact commit in this repository, on master or its generated release
+branch. It waits for an active candidate; missing, failed or expired candidates
+use a fresh build. The signed-tag and SDK-validation gates still apply before
+publication.
 
 GitHub suppresses ordinary push-triggered workflows when a merge uses the
 repository's `GITHUB_TOKEN`. To preserve post-merge validation, the preparation
@@ -165,7 +171,9 @@ immutable syq release. The workflow tracks the run ID returned by the dispatch
 API and requires its commit to match the merge. If Actions briefly resolves the branch to its old
 commit, it waits for that run to finish and retries, up to three dispatches.
 A failed run on the correct commit stops validation. The exact merge commit
-must pass its `sdks` job before the automation branch is deleted. A failure
+must pass its `sdks` job before the automation branch is deleted. Preparation
+also waits for candidate packaging to finish before deleting the branch so
+queued build jobs can check it out. A failure
 leaves the generated SDK changes merged and the branch available for diagnosis;
 it does not block unrelated merges. The repository keeps the default workflow token read only and grants
 Actions, contents, and pull-request write scopes only inside this preparation
