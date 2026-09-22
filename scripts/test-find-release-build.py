@@ -3,6 +3,10 @@
 import contextlib
 import importlib.util
 import io
+import os
+import subprocess
+import tempfile
+import textwrap
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -109,6 +113,25 @@ class PythonTests(Tests):
         return super().run_record(**({
             "head_branch": "automation/python-sdk-v0.7.0",
             "path": ".github/workflows/publish-sdks.yml"} | changes))
+
+    def test_shared_tag_gate_rejects_package_version_mismatch(self):
+        root = Path(__file__).resolve().parent.parent
+        workflow = (root / ".github/workflows/publish-sdks.yml").read_text()
+        gate = workflow.split("  verify-tag:\n", 1)[1].split("  candidate-python:\n", 1)[0]
+        step = gate.split("      - name: Require Python tag version to match package\n", 1)[1]
+        self.assertIn("if: startsWith(github.ref, 'refs/tags/sdk-python-v')", step)
+        command = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "sdk/python/pyproject.toml"
+            package.parent.mkdir(parents=True)
+            package.write_text('[project]\nversion = "0.7.0"\n')
+            for tag, expected in (("sdk-python-v0.7.0", 0), ("sdk-python-v0.8.0", 1)):
+                with self.subTest(tag=tag):
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", command], cwd=directory,
+                        env=dict(os.environ, GITHUB_REF_NAME=tag),
+                        capture_output=True, text=True)
+                    self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_master_candidate(self):
         self.assertEqual(self.select([self.run_record(head_branch="master")])[0],

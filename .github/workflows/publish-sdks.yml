@@ -40,6 +40,12 @@ jobs:
         run: |
           scripts/verify-release-tag.sh \
             "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" master sdks
+      - name: Require Python tag version to match package
+        if: startsWith(github.ref, 'refs/tags/sdk-python-v')
+        run: |
+          version=$(python3 -c \
+            'import tomllib; print(tomllib.load(open("sdk/python/pyproject.toml", "rb"))["project"]["version"])')
+          test "$GITHUB_REF_NAME" = "sdk-python-v$version"
 
   candidate-python:
     name: find prepared Python distributions
@@ -114,9 +120,6 @@ jobs:
           set -euo pipefail
           version=$(python -c \
             'import tomllib; print(tomllib.load(open("sdk/python/pyproject.toml", "rb"))["project"]["version"])')
-          if test "$GITHUB_EVENT_NAME" = push; then
-            test "$GITHUB_REF_NAME" = "sdk-python-v$version"
-          fi
           test "$version" = "$(jq -er .version sdk/python/src/syq/syq-release-manifest.json)"
           test "$(gh release view "v$version" --json tagName,isDraft,isImmutable \
             --jq '[.tagName, .isDraft, .isImmutable] | @tsv')" = "v$version"$'\tfalse\ttrue'
