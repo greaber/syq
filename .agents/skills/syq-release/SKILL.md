@@ -67,8 +67,9 @@ CI workflow's state and next action. Perform only missing work:
   `reproducible-builds.yml` with `gh workflow run reproducible-builds.yml --ref master`
   alongside validation. First inspect existing manual runs for that exact SHA;
   reuse a running or successful run instead of dispatching another. The tag
-  workflow waits for and reuses those binaries, so do not wait for validation
-  before starting them. A changed candidate requires new builds.
+  workflow waits for and reuses those binaries and the validated source crate,
+  so do not wait for validation before starting them. A changed candidate
+  requires new builds.
 - Wait for existing CI with the reported `gh run watch --exit-status` command.
   Dispatch only missing certifications. Investigate failed latest runs; do
   not hide them with older successes or create duplicate runs. An explicit
@@ -86,7 +87,8 @@ Later master commits do not automatically replace the candidate. Assess them
 for significant fixes worth restarting the release for; otherwise continue
 with the pinned commit and its existing validation. Once CI and local SSH
 validation pass, tag even if the candidate binaries are still building: the
-release workflow waits for them while validating the source crate in parallel. Restore tmux SSH-agent variables per `AGENTS.md` if
+release workflow waits for the candidate binaries and source crate.
+Restore tmux SSH-agent variables per `AGENTS.md` if
 signing is unavailable. Sign and push the matching annotated tag after preflight.
 
 Use `scripts/release-status.sh v<version>` to follow the exact release run,

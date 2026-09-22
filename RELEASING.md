@@ -162,7 +162,7 @@ release request does not require another preparation PR or another test run.
    available for development checks without release recording.
 
 2. Once the release commit is the exact `master` tip, start the release binary
-   builds while validation runs:
+   builds and source-crate validation while the test suites run:
 
    ```sh
    gh workflow run reproducible-builds.yml --ref master
@@ -176,8 +176,9 @@ release request does not require another preparation PR or another test run.
    Start this once per release candidate and track the returned run with
    `gh run watch --exit-status`. These four platform builds need no publication
    credentials. The signed-tag workflow reuses a successful manual build from
-   the exact same master commit, including its platform smoke tests. It waits
-   if that build is still running. Missing or expired artifacts cause fresh
+   the exact same master commit, including its platform smoke tests and validated
+   source crate. Before publication, it checks that the crate bytes match a fresh
+   package from the tag. It waits if that build is still running. Missing or expired artifacts cause fresh
    builds; a changed candidate needs its own builds. Failed validation can
    therefore waste a build, but cannot publish it. This does not add builds to
    ordinary pushes. Artifacts remain available for seven days.
@@ -239,8 +240,7 @@ release request does not require another preparation PR or another test run.
    tag policy, variables, and secret names; and absence of the tag or version
    from GitHub, crates.io, and the Homebrew tap. It makes no local or remote
    changes. Do not wait for candidate binary builds once these checks pass:
-   the tag workflow can wait for them while validating the source crate in
-   parallel. Then create and push a signed annotated tag matching the package
+   the tag workflow waits for the candidate binaries and source crate. Then create and push a signed annotated tag matching the package
    version. Its signing key and email must be configured on your GitHub account
    so GitHub reports the tag-object signature as verified:
 
@@ -261,8 +261,9 @@ release request does not require another preparation PR or another test run.
    the pinned Nix recipe to build static GNU Linux x86-64/ARM64 binaries and
    native macOS Apple Silicon/Intel binaries once per target, with deterministic
    gzip archives. The embedded public key must
-   match the repository variable. In parallel it
-   compiles the source crate once. The protected publishing job repackages it
+   match the repository variable. It reuses the candidate binaries and source
+   crate when available; otherwise it builds the binaries and compiles the
+   source crate in parallel. The protected publishing job repackages it
    without compiling and requires byte-for-byte equality with that validated
    artifact before any permanent publication. `cargo publish --no-verify`
    later uploads from those same locked inputs without repeating compilation.

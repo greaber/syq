@@ -6,7 +6,8 @@ import json
 import subprocess
 import sys
 
-ASSETS = {"syq-linux-x86_64", "syq-linux-aarch64", "syq-macos-arm64", "syq-macos-x86_64"}
+ASSETS = {"syq-linux-x86_64", "syq-linux-aarch64", "syq-macos-arm64", "syq-macos-x86_64",
+          "source-crate"}
 WORKFLOW = ".github/workflows/reproducible-builds.yml"
 
 
