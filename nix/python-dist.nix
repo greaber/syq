@@ -1,4 +1,4 @@
-{ pkgs, release, root, epoch }:
+{ pkgs, root, epoch }:
 let
   inherit (pkgs) lib;
   pin = builtins.fromJSON (builtins.readFile (root + /sdk/python/native-source.json));
@@ -21,6 +21,17 @@ let
     python ${sdkSource}/scripts/stage-python-sdk.py --root ${sdkSource} --out "$out" \
       --native-source ${nativeSource} --native-revision ${pin.rev}
   '';
+  platform = {
+    x86_64-linux = "linux-x86_64";
+    aarch64-linux = "linux-aarch64";
+    x86_64-darwin = "macos-x86_64";
+    aarch64-darwin = "macos-arm64";
+  }.${pkgs.stdenv.hostPlatform.system};
+  archive = releaseManifest.artifacts.${platform}.archive;
+  nativeArchive = pkgs.fetchurl {
+    url = "https://github.com/greaber/syq/releases/download/${releaseManifest.tag}/${archive.name}";
+    sha256 = archive.sha256;
+  };
   lock = builtins.fromTOML (builtins.readFile (root + /sdk/python/uv.lock));
   maturinSpec = lib.findFirst (p: p.name == "maturin") null lock.package;
   wheelTag = {
@@ -49,13 +60,9 @@ rustPlatform.buildRustPackage {
   version = sdkManifest.project.version;
   src = source;
   cargoLock.lockFile = "${nativeSource}/Cargo.lock";
-  nativeBuildInputs = [ maturin pkgs.python313 ];
+  nativeBuildInputs = [ maturin pkgs.python313 pkgs.cargo-cyclonedx ];
   allowSubstitutes = false;
   doCheck = false;
-  # Share standalone linking, public release identity/key, and path remapping
-  # with the executable recipe, but compile the SDK's pinned native release.
-  inherit (release) preBuild;
-  env = { inherit (release) SYQ_RELEASE_BUILD SYQ_RELEASE_PUBLIC_KEY RUSTFLAGS; };
   buildPhase = ''
     runHook preBuild
     # Nix's Python setup hook overrides this with a Nix-local platform tag.
@@ -63,8 +70,16 @@ rustPlatform.buildRustPackage {
     export SOURCE_DATE_EPOCH=${toString epoch}
     cd sdk/python
     maturin sdist --out "$TMPDIR/dist"
-    maturin build --release --strip --compatibility pypi \
-      --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} --offline --out "$TMPDIR/dist"
+    maturin pep517 write-dist-info --metadata-directory "$TMPDIR/metadata" --offline
+    cd ../..
+    cargo cyclonedx --format json --spec-version 1.5 \
+      --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} --override-filename syq
+    gzip -d -c ${nativeArchive} > "$TMPDIR/syq"
+    python ${root + /scripts/package-python-wheel.py} \
+      --project sdk/python --metadata "$TMPDIR/metadata" \
+      --binary "$TMPDIR/syq" --platform ${platform} --sbom syq.json \
+      --epoch "$SOURCE_DATE_EPOCH" --out "$TMPDIR/dist"
+    cd sdk/python
     python ${root + /scripts/normalize-python-sdist.py} --epoch "$SOURCE_DATE_EPOCH" "$TMPDIR"/dist/*.tar.gz
     python ${root + /scripts/normalize-python-wheel.py} "$TMPDIR"/dist/*.whl
     cd ../..
@@ -74,6 +89,6 @@ rustPlatform.buildRustPackage {
     mkdir -p "$out"
     cp "$TMPDIR"/dist/* "$out/"
   '';
-  # Maturin strips/signs before packaging. Nix must not rewrite wheel contents.
+  # Preserve the exact published binary, including its existing Darwin signature.
   dontFixup = true;
 }

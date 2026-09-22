@@ -92,6 +92,7 @@ assert_scope "$scope" python_sdk true
 for sdk_script in \
   nix/python-dist.nix \
   scripts/build-python-dist.sh \
+  scripts/package-python-wheel.py \
   scripts/pin-python-native-source.sh \
   scripts/normalize-python-wheel.py \
   scripts/check-python-api-sync.py \

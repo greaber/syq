@@ -68,7 +68,7 @@
           inherit release;
           default = release;
           python-dist = import ./nix/python-dist.nix {
-            inherit pkgs release;
+            inherit pkgs;
             root = ./.;
             epoch = self.lastModified;
           };

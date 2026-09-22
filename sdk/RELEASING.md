@@ -87,14 +87,18 @@ use. Set `python/pyproject.toml` to that syq version and replace
 manifest; do not edit its artifact hashes by hand. It preserves the version
 mapping and the trust root for callers explicitly using managed downloads.
 
-Python wheels are built with pinned maturin tooling for Linux x86-64/AArch64
-and macOS Intel/Apple Silicon. The workflow stages the native source from the
-pinned immutable `v<version>` tag alongside the Python SDK being published;
-it must not compile later native changes from the SDK tag. These are new
-builds of that release source, not copies of the manifest's binary artifacts.
-The wheel builds use the release identity, public verification key, and the
-same target flags as the native release. The source distribution includes the
-Rust source and lockfile; installing it requires Rust and a C compiler.
+Python wheels bundle the already-published native executables for Linux
+x86-64/AArch64 and macOS Intel/Apple Silicon. The pinned Nix recipe downloads
+each executable by its immutable release URL and checks its manifest hash;
+packaging preserves those bytes, including the macOS signature. Pinned maturin
+generates the Python metadata, and pinned cargo-cyclonedx records the native
+release's Rust dependencies without compiling them. Wheel timestamps and
+contents are deterministic for the SDK commit.
+
+The workflow also stages native source from the pinned immutable `v<version>`
+tag alongside the Python SDK for its source distribution. It must not include
+later native changes from the SDK tag. Installing the source distribution
+still requires Rust and a C compiler.
 
 Each wheel is installed and tested on its target, including synchronous and
 async copies with no executable on `PATH`, no writable home/cache location,
