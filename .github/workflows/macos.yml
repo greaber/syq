@@ -8,6 +8,13 @@ on:
     branches: [master]
   workflow_dispatch:
     inputs:
+      runner:
+        description: Runner provider for this manual run
+        type: choice
+        default: github
+        options:
+          - github
+          - namespace
       benchmark:
         description: Also run the independent APFS timing benchmark
         type: boolean
@@ -40,13 +47,28 @@ permissions:
 jobs:
   focused-test:
     if: github.event_name == 'workflow_dispatch' && inputs.test_name != ''
-    runs-on: macos-26
+    runs-on: ${{ inputs.runner == 'namespace' && 'namespace-profile-syq-macos' || 'macos-26' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Attach Namespace Cargo cache
+        if: inputs.runner == 'namespace'
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+      - name: Show Namespace runner hardware
+        if: inputs.runner == 'namespace'
+        run: |
+          sw_vers
+          sysctl hw.model hw.ncpu hw.memsize machdep.cpu.brand_string
+          df -h .
       - name: Restore Cargo dependencies and build output
+        if: inputs.runner != 'namespace'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -109,13 +131,28 @@ jobs:
   suite:
     needs: scope
     if: needs.scope.outputs.needed == 'true'
-    runs-on: macos-26
+    runs-on: ${{ inputs.runner == 'namespace' && 'namespace-profile-syq-macos' || 'macos-26' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Attach Namespace Cargo cache
+        if: inputs.runner == 'namespace'
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+      - name: Show Namespace runner hardware
+        if: inputs.runner == 'namespace'
+        run: |
+          sw_vers
+          sysctl hw.model hw.ncpu hw.memsize machdep.cpu.brand_string
+          df -h .
       - name: Cache Cargo dependencies and build output
+        if: inputs.runner != 'namespace'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -228,7 +265,7 @@ jobs:
 
   clone-benchmark:
     if: github.event_name == 'workflow_dispatch' && inputs.benchmark
-    runs-on: macos-26
+    runs-on: ${{ inputs.runner == 'namespace' && 'namespace-profile-syq-macos' || 'macos-26' }}
     timeout-minutes: 30
     # Timing/resource failures must not invalidate release evidence. This job's
     # step result still records failure for anyone requesting benchmark results.
@@ -237,7 +274,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      - name: Attach Namespace Cargo cache
+        if: inputs.runner == 'namespace'
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+      - name: Show Namespace runner hardware
+        if: inputs.runner == 'namespace'
+        run: |
+          sw_vers
+          sysctl hw.model hw.ncpu hw.memsize machdep.cpu.brand_string
+          df -h .
+      - if: inputs.runner != 'namespace'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             ~/.cargo/registry
