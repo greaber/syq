@@ -37,9 +37,11 @@ def main():
     if run["status"] != "completed":
         # A candidate build may outlast validation. Wait rather than build twice.
         subprocess.run(["gh", "run", "watch", str(run_id), "--repo", repository,
-                        "--exit-status", "--interval", "30"], check=True,
+                        "--exit-status", "--interval", "30"], check=False,
                        timeout=75 * 60, stdout=sys.stderr)
         run = api(f"{prefix}/runs/{run_id}")
+        if run["status"] != "completed":
+            raise RuntimeError("Candidate build wait ended before completion")
     if not eligible(run, repository, commit) or run["conclusion"] != "success":
         return
     artifacts = api(f"{prefix}/runs/{run_id}/artifacts?per_page=100")["artifacts"]

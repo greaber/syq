@@ -19,7 +19,7 @@ class Tests(unittest.TestCase):
                     head_repository={"full_name": "owner/repo"},
                     status="completed", conclusion="success") | changes
 
-    def select(self, runs, artifacts=None, refreshed=None):
+    def select(self, runs, artifacts=None, refreshed=None, watch_status=0):
         def api(path):
             if "artifacts?" in path:
                 return {"artifacts": artifacts if artifacts is not None else [
@@ -31,6 +31,11 @@ class Tests(unittest.TestCase):
         with patch.object(builds, "api", side_effect=api), patch.object(
                 builds.sys, "argv", ["script", "owner/repo", "abc"]), patch.object(
                 builds.subprocess, "run") as watch, contextlib.redirect_stdout(output):
+            def finish_watch(command, **kwargs):
+                if watch_status and kwargs["check"]:
+                    raise builds.subprocess.CalledProcessError(watch_status, command)
+                return builds.subprocess.CompletedProcess(command, watch_status)
+            watch.side_effect = finish_watch
             builds.main()
         return output.getvalue(), watch
 
@@ -59,8 +64,21 @@ class Tests(unittest.TestCase):
                                     refreshed=self.run_record())
         self.assertEqual(output, "run-id=123\n")
         watch.assert_called_once()
-        self.assertTrue(watch.call_args.kwargs["check"])
+        self.assertFalse(watch.call_args.kwargs["check"])
         self.assertEqual(watch.call_args.kwargs["timeout"], 4500)
+
+    def test_candidate_failing_during_wait_falls_back(self):
+        output, watch = self.select(
+            [self.run_record(status="in_progress", conclusion=None)],
+            refreshed=self.run_record(conclusion="failure"), watch_status=1)
+        self.assertEqual(output, "")
+        watch.assert_called_once()
+
+    def test_interrupted_wait_does_not_start_duplicate_build(self):
+        with self.assertRaisesRegex(RuntimeError, "before completion"):
+            self.select([self.run_record(status="in_progress", conclusion=None)],
+                        refreshed=self.run_record(status="in_progress", conclusion=None),
+                        watch_status=1)
 
     def test_empty(self):
         self.assertEqual(self.select([])[0], "")
