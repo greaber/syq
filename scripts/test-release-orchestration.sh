@@ -146,13 +146,13 @@ done
 printf '.github/workflows/rsync-compat.yml\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
-assert_scope "$scope" conformance true
+assert_scope "$scope" conformance false
 assert_scope "$scope" native false
 printf '.github/workflows/python-api-sync.yml\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
-assert_scope "$scope" sdks true
-assert_scope "$scope" python_sdk true
+assert_scope "$scope" sdks false
+assert_scope "$scope" python_sdk false
 assert_scope "$scope" native false
 
 # The surface touched by PR #190 should run the Rust baseline, Python SDK, and
@@ -261,7 +261,7 @@ assert_macos_needed false docs/mappings.md src/main.rs
 assert_macos_needed false sdk/python/native-api.json
 assert_macos_needed false sdk/python/src/syq/client.py
 assert_macos_needed false scripts/test-installer.sh
-assert_macos_needed true .github/workflows/macos.yml
+assert_macos_needed false .github/workflows/macos.yml
 assert_macos_needed true src/tune/network/macos.rs
 assert_macos_needed true tests/macos_exfat.rs
 assert_macos_needed false unknown-input
@@ -708,3 +708,33 @@ scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" sdk_matrix '["none"]'
 scope=$("$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
 assert_scope "$scope" sdk_matrix '["python","javascript","go"]'
+
+# Tooling changes select their own suites, without product builds.
+for fixture in \
+  'scripts/test-release-tools.sh|release' \
+  'scripts/test-installer.sh|installer' \
+  'scripts/test-try-benchmark.py|benchmark' \
+  'scripts/test-run-focused-check.py|focused' \
+  'scripts/test-branch-status.sh|branch' \
+  'scripts/test-release-orchestration.sh|orchestration' \
+  '.github/workflows/macos.yml|orchestration workflows' \
+  '.github/workflows/ci.yml|orchestration workflows'
+do
+  printf '%s\n' "${fixture%%|*}" >"$paths"
+  scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+  assert_scope "$scope" tooling_checks "${fixture#*|}"
+  for key in native sdks conformance macos; do assert_scope "$scope" "$key" false; done
+done
+printf '%s\n' scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-installer.sh >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" tooling_checks 'installer release'
+scope=$("$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
+assert_scope "$scope" tooling_checks 'package installer benchmark release orchestration focused branch workflows'
+
+printf '%s\n' scripts/test-release-tools.sh scripts/test-installer.sh >"$paths"
+reverse_scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$reverse_scope" tooling_checks 'installer release'
+printf '%s\n' build.rs >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" tooling_checks package
+assert_scope "$scope" native true
