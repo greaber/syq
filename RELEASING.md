@@ -338,6 +338,13 @@ source builds instead include their Git revision and cannot populate the
 managed remote-helper cache. Release manifests and binaries use the release tag
 as their sole release identity.
 
+Release builds cache compiled Rust dependencies separately from the executable.
+The cache key is the Nix dependency output identity, including the platform,
+toolchain, dependency versions/features, and build settings. Source-only edits
+and syq version bumps reuse dependencies; the final executable is built from
+the selected candidate and smoke-tested. A missing cache builds dependencies
+normally. Release optimization remains enabled; debug information is omitted.
+
 ## CI scope
 
 Pull requests do not start automated test or documentation workflows, and
@@ -363,7 +370,8 @@ executable documentation changes still count. The first nightly run executes
 all suites, and a failed nightly is retried on subsequent nights. Unchanged
 inputs only run the small scope checks. Full runs include SDKs, both rsync
 platforms, Linux ARM64, Intel macOS compilation/updater tests, and the complete
-Apple Silicon suite. Manual runs remain available at any time and are not
+Apple Silicon suite. Intel compilation/updater checks use unoptimized binaries
+without debug information; the shipped release binaries remain optimized. Manual runs remain available at any time and are not
 cancelled by new pushes.
 
 A release requires successful full-suite certificates from `ci.yml`,

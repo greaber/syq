@@ -28,6 +28,9 @@ jobs:
           persist-credentials: false
       - name: Install checksum-pinned Nix
         run: scripts/install-nix-ci.sh
+      - name: Check dependency cache invalidation
+        if: matrix.platform.name == 'syq-linux-x86_64'
+        run: python3 scripts/test-release-dependency-cache.py
       - name: Resolve release dependency cache
         id: deps
         run: |
