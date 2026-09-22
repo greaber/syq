@@ -25,6 +25,9 @@ impl HttpConnector for Connector {
                 .map_err(|e| ConnectorError::other(e.into(), None))?;
             let unsigned = describe(&mut request, &authorization)
                 .map_err(|e| ConnectorError::other(e.into(), None))?;
+            let payload = unsigned
+                .payload_sha256()
+                .map_err(|e| ConnectorError::other(e.into(), None))?;
             let signed = tokio::task::spawn_blocking(move || authorization.signed(unsigned))
                 .await
                 .map_err(|_| failure("storage authorization task failed"))?
@@ -38,7 +41,8 @@ impl HttpConnector for Connector {
             request.headers_mut().remove("host");
             request.headers_mut().insert(
                 "x-amz-content-sha256",
-                http::HeaderValue::from_static("UNSIGNED-PAYLOAD"),
+                http::HeaderValue::from_str(payload.as_deref().unwrap_or("UNSIGNED-PAYLOAD"))
+                    .map_err(|_| failure("invalid storage payload checksum"))?,
             );
             inner
                 .call(
@@ -138,6 +142,100 @@ pub(in crate::s3) fn signed_header(name: &str, method: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct CheckPayload {
+        expected: String,
+        signed: String,
+    }
+    impl HttpConnector for CheckPayload {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            assert_eq!(request.uri(), self.signed);
+            assert_eq!(
+                request.headers().get("x-amz-content-sha256"),
+                Some(self.expected.as_str())
+            );
+            assert!(request.headers().get("authorization").is_none());
+            HttpConnectorFuture::ready(Ok(
+                aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
+                    200.try_into().unwrap(),
+                    aws_smithy_types::body::SdkBody::empty(),
+                ),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_transport_preserves_approved_payload_digest() {
+        let checksum = crate::s3::checksum::Algorithm::Sha256.digest(b"abc");
+        for (method, query, header, value, expected) in [
+            (
+                "PUT",
+                "",
+                "x-amz-checksum-sha256",
+                checksum.as_str(),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                "PUT",
+                "?uploadId=upload&partNumber=1",
+                "x-amz-checksum-sha256",
+                checksum.as_str(),
+                "UNSIGNED-PAYLOAD",
+            ),
+            (
+                "PUT",
+                "",
+                "content-md5",
+                "kAFQmDzST7DWlj99KOF/cg==",
+                "UNSIGNED-PAYLOAD",
+            ),
+            ("GET", "", "if-match", "etag", "UNSIGNED-PAYLOAD"),
+        ] {
+            let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let authorization = Arc::new(Authorization::new(
+                "fixture".into(),
+                Configuration {
+                    endpoint: "https://storage.example".into(),
+                    region: "auto".into(),
+                    expires_at: now().unwrap() + 60,
+                    requested_lifetime: 60,
+                },
+                socket,
+            ));
+            let mut request = http::Request::builder()
+                .method(method)
+                .uri(format!("https://storage.example/fixture/key{query}"))
+                .header(header, value)
+                .header("authorization", "local credentials")
+                .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+                .body(aws_smithy_types::body::SdkBody::empty())
+                .unwrap();
+            let unsigned = describe(&mut request, &authorization).unwrap();
+            let signed = format!(
+                "https://storage.example/fixture/key{query}{}X-Amz-Signature=fixture",
+                if query.is_empty() { "?" } else { "&" }
+            );
+            authorization
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .insert(unsigned, signed.clone());
+            let connector = Connector {
+                inner: SharedHttpConnector::new(CheckPayload {
+                    expected: expected.into(),
+                    signed,
+                }),
+                authorization,
+            };
+            connector
+                .call(HttpRequest::try_from(request).unwrap())
+                .await
+                .unwrap();
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct ResetOnce {
         attempts: Arc<std::sync::atomic::AtomicUsize>,

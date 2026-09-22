@@ -51,9 +51,11 @@ its checksum.
 For a complete check of a local copy, use an [expected hash](#expected-hashes).
 
 For local/S3 copies, provider request checksums remain enabled. The `transfer`
-algorithm records a whole-file hash on upload and checks stored hashes on
-download when present. Use an expected hash for objects without a stored
-hash. See [Filesystem differences](object-storage.md#filesystem-differences).
+setting does not disable them. Single-part uploads with a SHA-256 request
+checksum also reuse that digest for payload signing, without another hashing
+pass. The `transfer` algorithm records a whole-file hash on upload and checks
+stored hashes on download when present. Use an expected hash for objects without
+a stored hash. See [Filesystem differences](object-storage.md#filesystem-differences).
 
 Server-side S3 copies preserve stored hashes without reading or verifying
 object bodies. They do not support content-hash comparison, extra transfer

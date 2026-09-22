@@ -1392,6 +1392,13 @@ fn serve(
             headers["x-amz-checksum-sha256"],
             base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&body))
         );
+        assert_eq!(
+            headers["x-amz-content-sha256"],
+            sha2::Sha256::digest(&body)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
         assert!(!headers.contains_key("x-amz-meta-syq-blake3"));
         if fault == "upload-metadata" {
             assert_eq!(headers["x-amz-meta-syq-mode"], "416");
