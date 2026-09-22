@@ -34,7 +34,7 @@ jobs:
       - name: Resolve release dependency cache
         id: deps
         run: |
-          output=$(nix --extra-experimental-features 'nix-command flakes' eval --raw .#release-deps.outPath)
+          output=$(nix --extra-experimental-features 'nix-command flakes' eval --no-update-lock-file --raw .#release-deps.outPath)
           echo "output=$output" >> "$GITHUB_OUTPUT"
           echo "key=release-deps-v1-$(basename "$output")" >> "$GITHUB_OUTPUT"
       - name: Restore compiled release dependencies

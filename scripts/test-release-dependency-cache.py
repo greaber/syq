@@ -4,6 +4,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -29,9 +30,9 @@ with tempfile.TemporaryDirectory(prefix="syq-release-cache-") as tmp:
     source = tree / "src/main.rs"
     source.write_text(source.read_text() + "\n// Dependency-cache fixture.\n")
     assert output(tree, "release-deps") == deps, "source edit invalidated dependencies"
-    assert output(tree, "release") != release, "source edit reused the final binary"
+    source_release = output(tree, "release")
+    assert source_release != release, "source edit reused the final binary"
 
-    import tomllib
     manifest = tree / "Cargo.toml"
     old = tomllib.loads(manifest.read_text())["package"]["version"]
     for name in ("Cargo.toml", "Cargo.lock"):
@@ -41,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix="syq-release-cache-") as tmp:
         path.write_text(path.read_text().replace(before, 'name = "syq"\nversion = "99.0.0"'))
     assert output(tree, "release-deps") == deps, "version bump invalidated dependencies"
     changed_release = output(tree, "release")
-    assert changed_release != release, "version bump reused the final binary"
+    assert changed_release != source_release, "version bump reused the final binary"
 
     manifest.write_text(manifest.read_text().replace('bytes = "1"',
                         'bytes = { version = "1", features = ["serde"] }'))

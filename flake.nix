@@ -57,7 +57,6 @@
               RUSTFLAGS = if pkgs.stdenv.isLinux
                 then "-C target-feature=+crt-static -L native=${pkgs.glibc.static}/lib"
                 else "-L native=${systemLibiconv}/lib";
-
             };
             # Keep the deployment targets of the published v0.6.0 binaries.
             # Build tools may require a newer macOS than the produced executable.
@@ -79,10 +78,8 @@
               fileset = lib.fileset.unions [ ./Cargo.toml ./build.rs ./src ];
             };
             cargoLock = builtins.toFile "Cargo.lock" (builtins.replaceStrings
-              [ ''name = "syq"
-version = "${manifest.package.version}"'' ]
-              [ ''name = "syq"
-version = "0.0.0"'' ]
+              [ "name = \"syq\"\nversion = \"${manifest.package.version}\"" ]
+              [ "name = \"syq\"\nversion = \"0.0.0\"" ]
               (builtins.readFile ./Cargo.lock));
             cargoVendorDir = craneLib.vendorCargoDeps { src = releaseArgs.src; };
             # Only release dependencies are needed, not cargo-check metadata.
