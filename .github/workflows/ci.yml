@@ -23,9 +23,6 @@ on:
         required: false
         type: string
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.run_id }}
-
 permissions:
   contents: read
 
@@ -60,6 +57,11 @@ jobs:
         run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
   rust:
+    # Cancel only matching automatic checks; manual runs keep a unique group.
+    concurrency:
+      # Full native suites already include tooling, shell lint, and mapping tests.
+      group: ${{ github.workflow }}-rust-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.native == 'true' && needs.scope.outputs.full_suite == 'true' && 'full' || format('{0}-{1}-{2}-{3}-{4}', needs.scope.outputs.native, needs.scope.outputs.tooling, needs.scope.outputs.shellcheck, needs.scope.outputs.mapping_docs, needs.scope.outputs.full_suite) }}
+      cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: always()
     runs-on: ${{ inputs.linux_trial != 'github' && format('namespace-profile-syq-linux;github.run-id={0}', github.run_id) || 'ubuntu-24.04' }}
@@ -214,6 +216,10 @@ jobs:
         run: git ls-files -z -- '*.sh' | xargs -0 shellcheck
 
   sdks:
+    # Cancel only matching automatic checks; manual runs keep a unique group.
+    concurrency:
+      group: ${{ github.workflow }}-sdks-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.python_sdk }}-${{ needs.scope.outputs.javascript_sdk }}-${{ needs.scope.outputs.go_sdk }}
+      cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
     runs-on: ubuntu-latest
@@ -344,6 +350,10 @@ jobs:
   # The release workflow builds on this runner; libc field types differ from
   # x86-64 (st_nlink is u32 here), so check it after native changes land.
   linux-arm64:
+    # Cancel only matching automatic checks; manual runs keep a unique group.
+    concurrency:
+      group: ${{ github.workflow }}-linux-arm64-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.linux_arm64 }}
+      cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
     runs-on: ubuntu-24.04-arm
@@ -378,6 +388,10 @@ jobs:
   # before the release workflow builds its x86-64 artifact. Keep this on full
   # master and manual runs.
   macos_intel:
+    # Cancel only matching automatic checks; manual runs keep a unique group.
+    concurrency:
+      group: ${{ github.workflow }}-macos_intel-${{ github.event_name == 'push' && github.ref || github.run_id }}
+      cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: >-
       inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
@@ -409,7 +423,7 @@ jobs:
   # the full macos.yml workflow, required separately by verify-release-ci.sh.
   macos:
     needs: [scope, macos_intel]
-    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
+    if: always() && needs.macos_intel.result != 'cancelled' && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
     runs-on: ubuntu-latest
     steps:
       - name: Require successful path classification

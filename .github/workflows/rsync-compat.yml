@@ -5,9 +5,6 @@ on:
     branches: [master]
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.run_id }}
-
 permissions:
   contents: read
 
@@ -27,6 +24,10 @@ jobs:
         run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
   conformance_platforms:
+    # Cancel only matching automatic checks; manual runs keep a unique group.
+    concurrency:
+      group: ${{ github.workflow }}-conformance_platforms-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ matrix.os }}
+      cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: >-
       needs.scope.result == 'success' &&
@@ -102,7 +103,7 @@ jobs:
   # on the selected platform cells above.
   conformance:
     needs: [scope, conformance_platforms]
-    if: always()
+    if: always() && needs.conformance_platforms.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
       - name: Require successful path classification

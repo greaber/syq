@@ -38,9 +38,6 @@ on:
           - macos_exfat
           - s3
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.run_id }}
-
 permissions:
   contents: read
 
@@ -132,6 +129,10 @@ jobs:
           echo "needed=$needed" >> "$GITHUB_OUTPUT"
 
   suite:
+    # Cancel only matching automatic checks; manual runs keep a unique group.
+    concurrency:
+      group: ${{ github.workflow }}-suite-${{ github.event_name == 'push' && github.ref || github.run_id }}
+      cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: needs.scope.outputs.needed == 'true'
     runs-on: ${{ inputs.runner != 'github' && 'namespace-profile-syq-macos' || 'macos-26' }}
