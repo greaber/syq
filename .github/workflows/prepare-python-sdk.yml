@@ -141,7 +141,13 @@ jobs:
           git merge-base --is-ancestor "$merge_sha" origin/master
           git push origin "$merge_sha:refs/heads/$branch"
           echo "Merged $pr_url at $merge_sha; running post-merge Python SDK validation"
+          gh workflow run publish-sdks.yml --repo "$GITHUB_REPOSITORY" \
+            --ref "$branch" -f "candidate_commit=$merge_sha"
           scripts/run-generated-sdk-post-merge-ci.sh \
             "$GITHUB_REPOSITORY" "$branch" "$merge_sha"
+          # Keep the branch available until queued candidate checkouts finish.
+          # A failed candidate still permits the publication build fallback.
+          python3 scripts/find-release-build.py "$GITHUB_REPOSITORY" "$merge_sha" \
+            --python-version "$PYTHON_VERSION"
           git push origin --delete "$branch"
           echo "Post-merge Python SDK validation passed for $merge_sha"
