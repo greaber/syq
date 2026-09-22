@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "syq"
-version = "0.7.0"
+version = "0.7.1"
 description = "Official client for the syq file transfer tool"
 readme = "README-PYTHON.md"
 requires-python = ">=3.13.4"
