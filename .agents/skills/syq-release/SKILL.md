@@ -69,7 +69,9 @@ CI workflow's state and next action. Perform only missing work:
   reuse a running or successful run instead of dispatching another. The tag
   workflow waits for and reuses those binaries and the validated source crate,
   so do not wait for validation before starting them. A changed candidate
-  requires new builds.
+  requires new builds. A failed candidate stops publication; investigate it
+  before deliberately rerunning its failed jobs. Reuse successful platform jobs
+  and rerun the failed publication jobs after the candidate passes.
 - Wait for existing CI with the reported `gh run watch --exit-status` command.
   Dispatch only missing certifications. Investigate failed latest runs; do
   not hide them with older successes or create duplicate runs. An explicit

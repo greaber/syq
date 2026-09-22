@@ -177,6 +177,7 @@ jobs:
         if: always()
         with:
           name: python-sdk-${{ matrix.target }}
+          overwrite: true
           path: sdk-dist/*
           if-no-files-found: error
           retention-days: 1

@@ -179,7 +179,10 @@ release request does not require another preparation PR or another test run.
    the exact same master commit, including its platform smoke tests and validated
    source crate. Before publication, it checks that the crate bytes match a fresh
    package from the tag. It waits if that build is still running. Missing or expired artifacts cause fresh
-   builds; a changed candidate needs its own builds. Failed validation can
+   builds; a changed candidate needs its own builds. A failed candidate stops
+   publication. Investigate before deliberately retrying its failed jobs with
+   `gh run rerun <candidate-run-id> --failed`; successful platform jobs remain
+   reusable. Once the candidate passes, rerun the failed publication jobs. Failed validation can
    therefore waste a build, but cannot publish it. This does not add builds to
    ordinary pushes. Artifacts remain available for seven days.
 

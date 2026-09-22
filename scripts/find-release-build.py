@@ -56,8 +56,14 @@ def main():
         run = api(f"{prefix}/runs/{run_id}")
         if run["status"] != "completed":
             raise RuntimeError("Candidate build wait ended before completion")
-    if not eligible(run, repository, commit, workflow, branches) or run["conclusion"] != "success":
-        return
+    if not eligible(run, repository, commit, workflow, branches):
+        raise RuntimeError("Candidate build identity changed while waiting")
+    if run["conclusion"] != "success":
+        raise RuntimeError(
+            f"Candidate build {run_id} concluded {run['conclusion']}; refusing an automatic rebuild. "
+            f"Investigate the failure, then deliberately retry failed jobs with "
+            f"gh run rerun {run_id} --repo {repository} --failed. "
+            "After they pass, rerun the failed publication jobs.")
     artifacts = api(f"{prefix}/runs/{run_id}/artifacts?per_page=100")["artifacts"]
     if complete_artifacts(artifacts, assets):
         print(f"run-id={run_id}")
