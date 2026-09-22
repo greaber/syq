@@ -5,6 +5,11 @@ on:
     branches: [master]
   workflow_dispatch:
     inputs:
+      cache_probe:
+        description: Temporary Namespace cache persistence probe
+        type: choice
+        default: disabled
+        options: [disabled, seed, read]
       linux_trial:
         description: Run only the Linux Rust job on the selected provider
         type: choice
@@ -34,6 +39,7 @@ env:
 
 jobs:
   scope:
+    if: inputs.cache_probe != 'seed' && inputs.cache_probe != 'read'
     runs-on: ubuntu-latest
     outputs:
       native: ${{ steps.changes.outputs.native }}
@@ -61,7 +67,7 @@ jobs:
 
   rust:
     needs: scope
-    if: always()
+    if: inputs.cache_probe != 'seed' && inputs.cache_probe != 'read' && always()
     runs-on: ${{ inputs.linux_trial == 'namespace' && 'namespace-profile-syq-linux' || (inputs.linux_trial == 'github' && 'ubuntu-24.04' || 'ubuntu-latest') }}
     steps:
       - name: Require successful path classification
@@ -215,7 +221,7 @@ jobs:
 
   sdks:
     needs: scope
-    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
+    if: inputs.cache_probe != 'seed' && inputs.cache_probe != 'read' && always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
     runs-on: ubuntu-latest
     steps:
       - name: Require successful path classification
@@ -345,7 +351,7 @@ jobs:
   # x86-64 (st_nlink is u32 here), so check it after native changes land.
   linux-arm64:
     needs: scope
-    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
+    if: inputs.cache_probe != 'seed' && inputs.cache_probe != 'read' && always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Require successful path classification
@@ -380,6 +386,7 @@ jobs:
   macos_intel:
     needs: scope
     if: >-
+      inputs.cache_probe != 'seed' && inputs.cache_probe != 'read' &&
       inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
       needs.scope.result == 'success' &&
       needs.scope.outputs.macos == 'true' &&
@@ -409,7 +416,7 @@ jobs:
   # the full macos.yml workflow, required separately by verify-release-ci.sh.
   macos:
     needs: [scope, macos_intel]
-    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
+    if: inputs.cache_probe != 'seed' && inputs.cache_probe != 'read' && always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
     runs-on: ubuntu-latest
     steps:
       - name: Require successful path classification
@@ -435,6 +442,7 @@ jobs:
   release-certification:
     needs: [scope, rust, sdks, linux-arm64, macos]
     if: >-
+      inputs.cache_probe != 'seed' && inputs.cache_probe != 'read' &&
       inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
       needs.scope.outputs.full_suite == 'true' &&
       needs.scope.outputs.native == 'true' &&
@@ -446,3 +454,48 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo 'Every release validation suite in this workflow succeeded.'
+
+  cache-probe:
+    if: inputs.cache_probe == 'seed' || inputs.cache_probe == 'read'
+    runs-on: namespace-profile-syq-linux
+    timeout-minutes: 5
+    steps:
+      - name: Inspect raw cache volume
+        run: |
+          findmnt -T /cache -o SOURCE,FSTYPE,TARGET
+          df -h /cache
+          if [[ -f /cache/syq-persistence-probe/marker ]]; then
+            echo "Raw marker: $(cat /cache/syq-persistence-probe/marker)"
+          else
+            echo 'Raw marker: missing'
+          fi
+      - name: Attach marker through the cache action
+        id: cache
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+        with:
+          path: ~/.cache/syq-persistence-probe
+      - name: Write or verify both markers
+        env:
+          PROBE_MODE: ${{ inputs.cache_probe }}
+          ACTION_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          echo "Cache action hit: $ACTION_CACHE_HIT"
+          marker='syq-namespace-persistence-probe-v1'
+          if [[ "$PROBE_MODE" == seed ]]; then
+            mkdir -p /cache/syq-persistence-probe "$HOME/.cache/syq-persistence-probe"
+            printf '%s\n' "$marker" > /cache/syq-persistence-probe/marker
+            printf '%s\n' "$marker" > "$HOME/.cache/syq-persistence-probe/marker"
+            sync
+            echo 'Both markers written.'
+          else
+            status=0
+            for path in /cache/syq-persistence-probe/marker "$HOME/.cache/syq-persistence-probe/marker"; do
+              if [[ -f "$path" ]] && [[ "$(cat "$path")" == "$marker" ]]; then
+                echo "PASS: $path"
+              else
+                echo "FAIL: $path"
+                status=1
+              fi
+            done
+            exit "$status"
+          fi
