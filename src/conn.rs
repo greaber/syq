@@ -28,6 +28,19 @@ pub(crate) use local::*;
 pub(crate) use ssh_multiplexer::*;
 pub(crate) use tcp_socket::*;
 
+// Darwin creates each stdio pipe before setting FD_CLOEXEC. Concurrent helper
+// spawns can inherit a sibling's pipe during that gap, keeping its response
+// reader alive after the intended child exits. Serialize only pipe creation
+// and spawn; helper startup and SSH handshakes still run concurrently.
+fn spawn_helper_process(command: &mut Command) -> std::io::Result<Child> {
+    #[cfg(target_os = "macos")]
+    let _guard = {
+        static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SPAWN.lock().unwrap_or_else(|error| error.into_inner())
+    };
+    command.spawn()
+}
+
 pub trait Conn: Send {
     fn observe(
         &mut self,
@@ -1562,7 +1575,7 @@ impl RemoteSpec {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let mut child = cmd.spawn().with_context(|| {
+        let mut child = spawn_helper_process(&mut cmd).with_context(|| {
             if self.local_process {
                 "spawn local receiver".to_string()
             } else {

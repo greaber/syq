@@ -301,6 +301,29 @@ class StreamTests(unittest.TestCase):
                 input.read()
         self.assertTrue(caught.exception.result.stderr)
 
+    def test_remote_helpers_do_not_inherit_sibling_pipes(self):
+        rsh = self.root / 'rsh'
+        rsh.write_text(
+            f'#!{sys.executable}\n'
+            'import fcntl, os, sys\n'
+            'for fd in range(3, 256):\n'
+            '    try: fcntl.fcntl(fd, fcntl.F_GETFD)\n'
+            '    except OSError: continue\n'
+            '    sys.exit(f"helper inherited unrelated descriptor {fd}")\n'
+            'os.execv("/bin/sh", ["sh", "-c", sys.argv[2]])\n')
+        rsh.chmod(0o700)
+        options = dict(to='127.0.0.1', rsh=str(rsh), syq_path=str(SYQ),
+                       no_tcp=True, resource_limits='workers=8')
+        # Each copy starts independent helper processes concurrently. Repetition
+        # exercises Darwin's pipe/create-close-on-exec race without loosening
+        # the existing stream timeout or closing leaked descriptors in the shim.
+        for attempt in range(16):
+            with self.subTest(attempt=attempt):
+                target = self.root / f'pipe-check-{attempt}'
+                with self.client.open_writer(as_=target, **options) as output:
+                    output.write(b'checked helper descriptors')
+                self.assertEqual(target.read_bytes(), b'checked helper descriptors')
+
     def test_wrappers_close_payload_without_committing_on_success_or_exception(self):
         for remote in (False, True):
             rsh = self.root / 'wrapper-rsh'

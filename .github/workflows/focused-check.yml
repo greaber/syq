@@ -62,7 +62,7 @@ jobs:
             target
           key: focused-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: |
-            cargo-${{ inputs.runner == 'macos' && 'macos-suite' || 'ci-rust' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
       - name: Run the selected check
         shell: bash
         env:
