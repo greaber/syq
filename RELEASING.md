@@ -184,7 +184,7 @@ release request does not require another preparation PR or another test run.
    scripts/verify-release-ci.sh greaber/syq "$candidate"
    ```
 
-   A successful post-merge run is reusable. Each workflow records a
+   A successful full nightly or manual run is reusable. Each workflow records a
    `release-certification` job only when all its release suites were selected
    and passed. Green selective runs with skipped suites do not qualify. The
    verifier requires the latest push or manual run of each workflow on the
@@ -337,13 +337,21 @@ branch protection does not require test status contexts. The working agent runs
 the proportionate local checks described in `AGENTS.md` and reports exactly
 what was verified. A merge does not wait for GitHub to repeat those checks.
 
-Every native push to `master` runs the complete native and SDK suites, Linux
-and macOS conformance, Linux ARM64 validation, and an Intel macOS
-compile-and-updater check. The `macos.yml` workflow owns the complete Apple
-Silicon native, SDK, and release-tool coverage; CI does not repeat a focused
-subset on another Apple Silicon runner. It skips its suite for documentation
-changes that do not affect executable documentation or tooling. Each run has
-a unique concurrency group; later pushes do not cancel earlier evidence.
+Post-merge checks select affected areas: native changes run Linux formatting,
+linting, and unit tests; SDK changes select the corresponding language checks;
+rsync compatibility changes run Linux conformance. Explicit macOS source,
+test, or workflow changes select the Apple Silicon suite. Matching automatic
+jobs cancel superseded work as configured by their concurrency groups.
+
+At 02:17 UTC each day, `ci.yml`, `rsync-compat.yml`, and `macos.yml` run their
+full suites if test inputs differ from their last successful nightly run.
+The comparison uses the same version/prose exclusions as release evidence;
+executable documentation changes still count. The first nightly run executes
+all suites, and a failed nightly is retried on subsequent nights. Unchanged
+inputs only run the small scope checks. Full runs include SDKs, both rsync
+platforms, Linux ARM64, Intel macOS compilation/updater tests, and the complete
+Apple Silicon suite. Manual runs remain available at any time and are not
+cancelled by new pushes.
 
 A release requires successful full-suite certificates from `ci.yml`,
 `rsync-compat.yml`, and `macos.yml` for the candidate or unchanged test inputs

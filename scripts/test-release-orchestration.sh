@@ -234,14 +234,9 @@ jq -n --arg before "$scope_head" --arg after "$advanced_base" \
   '{before:$before,after:$after}' >"$push_event"
 scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$push_event")
 assert_scope "$scope" native true
-assert_scope "$scope" sdks true
-assert_scope "$scope" python_sdk true
-assert_scope "$scope" javascript_sdk true
-assert_scope "$scope" go_sdk true
-assert_scope "$scope" conformance true
-assert_scope "$scope" macos true
-assert_scope "$scope" linux_arm64 true
-assert_scope "$scope" full_suite true
+for key in sdks python_sdk javascript_sdk go_sdk conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" false
+done
 
 # Exercise the real macOS classification step, rather than duplicating its
 # selection logic here. Missing/renamed step boundaries fail this check.
@@ -262,12 +257,14 @@ assert_macos_needed() {
 assert_macos_needed false docs/mappings.md sdk/python/NATIVE_API.md
 assert_macos_needed false theme/docs.js book.toml
 assert_macos_needed false tests/real-ssh/scenarios.sh docs/example.sh
-assert_macos_needed true docs/mappings.md src/main.rs
-assert_macos_needed true sdk/python/native-api.json
-assert_macos_needed true sdk/python/src/syq/client.py
-assert_macos_needed true scripts/test-installer.sh
+assert_macos_needed false docs/mappings.md src/main.rs
+assert_macos_needed false sdk/python/native-api.json
+assert_macos_needed false sdk/python/src/syq/client.py
+assert_macos_needed false scripts/test-installer.sh
 assert_macos_needed true .github/workflows/macos.yml
-assert_macos_needed true unknown-input
+assert_macos_needed true src/tune/network/macos.rs
+assert_macos_needed true tests/macos_exfat.rs
+assert_macos_needed false unknown-input
 
 # Reproduce a documentation-only post-merge push, including the SDK guide and
 # executable mapping examples. Only the focused example checks are selected.
@@ -284,7 +281,7 @@ jq -n --arg before "$advanced_base" --arg after "$documentation_head" \
 scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$push_event")
 for key in "${scope_keys[@]}"; do
   case "$key" in
-    mapping_docs|full_suite) assert_scope "$scope" "$key" true ;;
+    mapping_docs) assert_scope "$scope" "$key" true ;;
     *) assert_scope "$scope" "$key" false ;;
   esac
 done
@@ -682,3 +679,5 @@ python3 "$script_dir/test-release-timings.py"
 python3 "$script_dir/test-find-release-build.py"
 
 echo 'release orchestration tests passed'
+
+python3 "$script_dir/test-nightly-ci.py"

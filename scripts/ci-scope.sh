@@ -22,7 +22,18 @@ run_everything() {
     'full_suite=true'
 }
 
-if [ -n "${SYQ_TEST_CHANGED_PATHS_FILE:-}" ]; then
+if [ "${GITHUB_EVENT_NAME:-}" = schedule ]; then
+  script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+  if python3 "$script_dir/nightly-ci.py"; then
+    run_everything
+    exit 0
+  else
+    status=$?
+    [ "$status" = 3 ] || exit "$status"
+    # No changed test inputs: emit the ordinary all-false scope below.
+    changed_paths=README.md
+  fi
+elif [ -n "${SYQ_TEST_CHANGED_PATHS_FILE:-}" ]; then
   changed_paths=$(cat "$SYQ_TEST_CHANGED_PATHS_FILE")
 elif [ "${SYQ_CI_DOCUMENTATION_ONLY:-}" = true ]; then
   changed_paths=$'docs/mappings.md\ndocs/automation.md\ndocs/commands/map.md'
@@ -37,7 +48,6 @@ elif [ -n "$event_path" ] && [ -f "$event_path" ]; then
     push)
       base=$(jq -er .before "$event_path")
       head=$(jq -er .after "$event_path")
-      full_suite=true
       if [[ "$base" =~ ^0+$ ]]; then
         run_everything
         echo 'CI scope: new branch or incomplete push history; running every check' >&2
@@ -156,6 +166,10 @@ while IFS= read -r path; do
     Cargo.toml|Cargo.lock)
       if [ "$preparation_only" != true ]; then native=true; fi
       ;;
+    src/*macos*|tests/macos*|.github/workflows/macos.yml)
+      native=true
+      macos=true
+      ;;
     rust-toolchain.toml|build.rs|src/*|tests/*.rs|schemas/*)
       native=true
       ;;
@@ -207,17 +221,6 @@ if [ "$saw_path" = false ]; then
   shellcheck=true
   mapping_docs=true
   conformance=true
-fi
-
-# The cumulative master state gets broad cross-subsystem and platform coverage
-# once after merge.
-if [ "$full_suite" = true ] && [ "$native" = true ]; then
-  python_sdk=true
-  javascript_sdk=true
-  go_sdk=true
-  conformance=true
-  macos=true
-  linux_arm64=true
 fi
 
 if [ "$python_sdk" = true ] || [ "$javascript_sdk" = true ] || [ "$go_sdk" = true ]; then

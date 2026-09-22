@@ -1,6 +1,8 @@
 name: ci
 
 on:
+  schedule:
+    - cron: "17 2 * * *"
   push:
     branches: [master]
   workflow_dispatch:
@@ -25,6 +27,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -52,6 +55,7 @@ jobs:
       - name: Classify changed paths
         id: changes
         env:
+          GH_TOKEN: ${{ github.token }}
           SYQ_CI_DOCUMENTATION_ONLY: ${{ inputs.documentation_only }}
           SYQ_CI_SCOPE_COMMIT: ${{ inputs.scope_commit }}
         run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
@@ -140,11 +144,10 @@ jobs:
       - name: Lint every Rust target
         if: needs.scope.outputs.native == 'true'
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Test every native target
-        if: >-
-          needs.scope.outputs.native == 'true' &&
-          needs.scope.outputs.full_suite == 'true'
+      - name: Test native targets
+        if: needs.scope.outputs.native == 'true'
         env:
+          FULL_SUITE: ${{ needs.scope.outputs.full_suite }}
           NAMESPACE_RUNNER: ${{ inputs.linux_trial != 'github' }}
         run: |
           if [[ "$NAMESPACE_RUNNER" == true ]]; then
@@ -155,7 +158,11 @@ jobs:
             export TMPDIR="$test_tmp"
             stat -f --format='Test filesystem: %T, ID: %i' "$TMPDIR"
           fi
-          cargo test --locked --all-targets
+          if [[ "$FULL_SUITE" == true ]]; then
+            cargo test --locked --all-targets
+          else
+            cargo test --locked --bin syq
+          fi
       - name: Test executable mapping documentation
         if: >-
           needs.scope.outputs.mapping_docs == 'true' &&
@@ -354,7 +361,7 @@ jobs:
           go test ./...
 
   # The release workflow builds on this runner; libc field types differ from
-  # x86-64 (st_nlink is u32 here), so check it after native changes land.
+  # x86-64 (st_nlink is u32 here), so include it in full validation.
   linux-arm64:
     # Cancel only matching automatic checks; manual runs keep a unique group.
     concurrency:
@@ -369,7 +376,7 @@ jobs:
         run: echo 'Path classification failed.' >&2; exit 1
       - name: Complete the required check when ARM validation is deferred
         if: needs.scope.outputs.linux_arm64 != 'true'
-        run: echo 'ARM validation is deferred to the cumulative post-merge suite.'
+        run: echo 'ARM validation is deferred to nightly or manual full validation.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.scope.outputs.linux_arm64 == 'true'
         with:
@@ -392,7 +399,7 @@ jobs:
 
   # An actual Intel runner catches host-architecture cfg and libc differences
   # before the release workflow builds its x86-64 artifact. Keep this on full
-  # master and manual runs.
+  # nightly and manual runs.
   macos_intel:
     # Cancel only matching automatic checks; manual runs keep a unique group.
     concurrency:
