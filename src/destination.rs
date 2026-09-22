@@ -3,6 +3,7 @@
 //! Persistence maintains transient advertisements and durable name ownership,
 //! independent of restricted receiver enrollments. The remote account is the
 //! requester identity: shells and jobs under it share access to registrations.
+use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -1284,7 +1285,11 @@ pub(crate) fn serve_background(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .process_group(0);
-            let mut child = OwnedSsh(command.spawn().context("start receiving SSH connection")?);
+            let mut child = OwnedSsh(
+                command
+                    .spawn_guarded()
+                    .context("start receiving SSH connection")?,
+            );
             *state.lock().unwrap() = crate::receive_service::ConnectionState {
                 phase: "connecting".into(),
                 error: None,

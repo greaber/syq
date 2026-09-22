@@ -1,4 +1,5 @@
 use super::*;
+use crate::process::CommandExt as _;
 use clap::Parser;
 use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -158,7 +159,7 @@ esac
             .env("SYQ_TEST_UPLOAD", root.join("uploaded"))
             .env("SYQ_TEST_REMOTE_OS", os)
             .env("SYQ_TEST_REMOTE_ARCH", arch)
-            .output()
+            .capture_output()
             .unwrap();
         assert!(
             output.status.success(),
@@ -366,7 +367,7 @@ fn management_stage_is_scoped_to_one_shell_session() {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         child.stdin.take().unwrap().write_all(script).unwrap();
         child.wait_with_output().unwrap()

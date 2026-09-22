@@ -1,4 +1,8 @@
 //! Public help must be useful without invoking filesystem or update operations.
+#[allow(dead_code)]
+#[path = "../src/process.rs"]
+mod process;
+use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -9,7 +13,7 @@ fn run(args: &[&str]) -> Output {
         .args(args)
         .env("NO_COLOR", "1")
         .env("SYQ_NO_UPDATE_CHECK", "1")
-        .output()
+        .capture_output()
         .unwrap()
 }
 
@@ -162,7 +166,7 @@ fn help_like_operands_are_data_and_rsync_h_remains_human_readable() {
             .current_dir(&dir)
             .args(["cp", &format!("--src={name}"), "--as", "copied", "-q"])
             .env("SYQ_NO_UPDATE_CHECK", "1")
-            .output()
+            .capture_output()
             .unwrap();
         assert!(
             output.status.success(),
@@ -174,7 +178,7 @@ fn help_like_operands_are_data_and_rsync_h_remains_human_readable() {
             .current_dir(&dir)
             .args(["map", "--", name])
             .env("SYQ_NO_UPDATE_CHECK", "1")
-            .output()
+            .capture_output()
             .unwrap();
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("\"dst\""));
@@ -183,7 +187,7 @@ fn help_like_operands_are_data_and_rsync_h_remains_human_readable() {
         .current_dir(&dir)
         .args(["rsync", "-h", "copied", "rsync-copy"])
         .env("SYQ_NO_UPDATE_CHECK", "1")
-        .output()
+        .capture_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -202,7 +206,7 @@ fn help_like_operands_are_data_and_rsync_h_remains_human_readable() {
             "filtered-copy",
         ])
         .env("SYQ_NO_UPDATE_CHECK", "1")
-        .output()
+        .capture_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -398,7 +402,7 @@ fn command_reference_matches_public_help() {
             "--check",
             env!("CARGO_BIN_EXE_syq"),
         ])
-        .output()
+        .capture_output()
         .expect("python3 is required to check command-reference coverage");
     assert!(
         output.status.success(),

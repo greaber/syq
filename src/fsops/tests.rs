@@ -1,3 +1,4 @@
+use crate::process::CommandExt as _;
 #[test]
 fn replacement_names_preserve_existing_recovery_format() {
     assert_eq!(recovery_name(123, 456), ".syq-swap-123-456");
@@ -584,7 +585,7 @@ fn confinement_matrix_guarded_receiver_refuses_root_and_parent_swaps() {
             .env("SYQ_TEST_GUARDED_MUTATION_SUFFIX", "parent/escaped")
             .env("SYQ_TEST_GUARDED_MUTATION_READY_FILE", &ready)
             .env("SYQ_TEST_GUARDED_MUTATION_CONTINUE_FILE", &continuation)
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !ready.exists() && std::time::Instant::now() < deadline {
@@ -1333,7 +1334,7 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
             ])
             .env(CHILD_ENV, "1")
             .env("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "/two")
-            .output()
+            .capture_output()
             .unwrap();
         assert!(
             output.status.success(),

@@ -1,4 +1,5 @@
 use super::*;
+use crate::process::CommandExt as _;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -190,7 +191,7 @@ fn apfs_clone_refuses_compression_added_after_source_snapshot() {
         .arg("--hfsCompression")
         .arg(&original)
         .arg(&compressed)
-        .status()
+        .status_guarded()
         .unwrap()
         .success());
     let source = File::open(&compressed).unwrap();
@@ -226,7 +227,7 @@ fn apfs_clone_falls_back_for_destination_acl_inheritance() {
         assert!(Command::new("/bin/chmod")
             .args(["+a", "everyone deny delete"])
             .arg(t.path())
-            .status()
+            .status_guarded()
             .unwrap()
             .success());
         assert_eq!(
@@ -243,7 +244,7 @@ fn apfs_clone_falls_back_for_destination_acl_inheritance() {
         assert!(Command::new("/bin/chmod")
             .args(["+a", rule])
             .arg(t.path())
-            .status()
+            .status_guarded()
             .unwrap()
             .success());
         assert_eq!(
@@ -260,7 +261,7 @@ fn apfs_clone_falls_back_for_destination_acl_inheritance() {
         assert!(Command::new("/bin/chmod")
             .arg("-N")
             .arg(t.path())
-            .status()
+            .status_guarded()
             .unwrap()
             .success());
         // Ineligibility is per-directory, never cached for the volume.
@@ -292,7 +293,7 @@ fn apfs_clone_normalizes_mode_before_opening() {
     assert!(Command::new("/bin/chmod")
         .args(["+a", "everyone allow read"])
         .arg(&path)
-        .status()
+        .status_guarded()
         .unwrap()
         .success());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o044)).unwrap();
@@ -301,7 +302,7 @@ fn apfs_clone_normalizes_mode_before_opening() {
     assert!(Command::new("/bin/chmod")
         .arg("-N")
         .arg(&path)
-        .status()
+        .status_guarded()
         .unwrap()
         .success());
     assert!(Command::new("/bin/chmod")
@@ -310,7 +311,7 @@ fn apfs_clone_normalizes_mode_before_opening() {
             "everyone allow read,readattr,readextattr,readsecurity"
         ])
         .arg(&path)
-        .status()
+        .status_guarded()
         .unwrap()
         .success());
     assert_eq!(
@@ -368,7 +369,7 @@ fn apfs_clone_noownercopy_does_not_copy_source_acl() {
         assert!(Command::new("/bin/chmod")
             .args(["+a", rule])
             .arg(&path)
-            .status()
+            .status_guarded()
             .unwrap()
             .success());
     }
@@ -389,12 +390,12 @@ fn apfs_clone_noownercopy_does_not_copy_source_acl() {
     let source_acl = Command::new("/bin/ls")
         .arg("-le")
         .arg(&path)
-        .output()
+        .capture_output()
         .unwrap();
     let clone_acl = Command::new("/bin/ls")
         .arg("-le")
         .arg(t.path().join("raw-clone"))
-        .output()
+        .capture_output()
         .unwrap();
     assert!(source_acl.status.success() && clone_acl.status.success());
     let source_acl = String::from_utf8(source_acl.stdout).unwrap();
@@ -1038,7 +1039,7 @@ fn operator_resolver_handles_deep_path_with_low_fd_limit() {
         let status = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(CHILD_ENV, "1")
-            .status()
+            .status_guarded()
             .unwrap();
         assert!(status.success(), "low-FD resolver subprocess failed");
         return;

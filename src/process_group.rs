@@ -1,4 +1,5 @@
 //! Own a foreground child and kill its process group before reaping its leader.
+use crate::process::CommandExt as _;
 use std::process::{Child, Command, ExitStatus};
 
 pub(crate) struct ProcessGroup {
@@ -9,7 +10,7 @@ impl ProcessGroup {
     pub fn spawn(command: &mut Command) -> std::io::Result<Self> {
         use std::os::unix::process::CommandExt;
         Ok(Self {
-            child: command.process_group(0).spawn()?,
+            child: command.process_group(0).spawn_guarded()?,
             status: None,
         })
     }

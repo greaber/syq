@@ -16,6 +16,7 @@
 //! the ordinary OpenSSH prompt or warning.
 
 use crate::descriptor_broker::{receive_message, send_message};
+use crate::process::CommandExt as _;
 use crate::proto::{ConnectionRole, FrameWriter};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -174,7 +175,7 @@ pub(crate) fn ensure(control: &Path, endpoint: &PoolEndpoint) {
             Ok(())
         });
     }
-    if let Ok(mut child) = command.spawn() {
+    if let Ok(mut child) = command.spawn_guarded() {
         // The pool outlives this process; reap it only if it exits first.
         std::thread::spawn(move || {
             let _ = child.wait();
@@ -520,7 +521,7 @@ impl Pool {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
+            .status_guarded()
             .context("check the SSH master")?;
         if !live.success() {
             bail!("no live SSH master");
@@ -533,7 +534,7 @@ impl Pool {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_guarded()
             .context("start a spare session")?;
         match greet_spare(&mut child) {
             Ok((stdin, stdout, stderr)) => Ok(Spare {

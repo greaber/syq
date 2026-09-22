@@ -1,6 +1,7 @@
 //! Connections to endpoints: local (in-process) or remote (over an ssh child).
 
 use crate::fsops::{self, FsOps};
+use crate::process::CommandExt as _;
 #[allow(unused_imports)]
 use crate::proto::SizeHint;
 use crate::proto::*;
@@ -27,19 +28,6 @@ use bootstrap::*;
 pub(crate) use local::*;
 pub(crate) use ssh_multiplexer::*;
 pub(crate) use tcp_socket::*;
-
-// Darwin creates each stdio pipe before setting FD_CLOEXEC. Concurrent helper
-// spawns can inherit a sibling's pipe during that gap, keeping its response
-// reader alive after the intended child exits. Serialize only pipe creation
-// and spawn; helper startup and SSH handshakes still run concurrently.
-fn spawn_helper_process(command: &mut Command) -> std::io::Result<Child> {
-    #[cfg(target_os = "macos")]
-    let _guard = {
-        static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        SPAWN.lock().unwrap_or_else(|error| error.into_inner())
-    };
-    command.spawn()
-}
 
 pub trait Conn: Send {
     fn observe(
@@ -1575,7 +1563,7 @@ impl RemoteSpec {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let mut child = spawn_helper_process(&mut cmd).with_context(|| {
+        let mut child = cmd.spawn_guarded().with_context(|| {
             if self.local_process {
                 "spawn local receiver".to_string()
             } else {
@@ -1830,7 +1818,7 @@ impl RemoteSpec {
             )
             .arg("--")
             .arg(&self.host)
-            .output()
+            .capture_output()
             .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         text.lines()

@@ -1,4 +1,5 @@
 //! Fault and descriptor tests use an independent loopback HTTP fixture.
+use crate::process::CommandExt as _;
 use std::process::Command;
 
 fn scenario(name: &str) {
@@ -9,7 +10,7 @@ fn scenario(name: &str) {
         ))
         .arg(env!("CARGO_BIN_EXE_syq"))
         .arg(name)
-        .output()
+        .capture_output()
         .expect("run local stream fixture");
     assert!(
         output.status.success(),

@@ -4,6 +4,8 @@ use crate::fsops::{
     join, lstat_entry, path_bytes, require_source_leaf_identity, rooted_entry_in_directory,
     rooted_source_entry,
 };
+#[cfg(test)]
+use crate::process::CommandExt as _;
 use crate::proto::ContainerGuard;
 use crate::proto::{Entry, PathBytes, SourceLeafIdentity};
 use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
@@ -865,7 +867,7 @@ mod tests {
             let status = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST_NAME, "--nocapture"])
                 .env(CHILD_ENV, "1")
-                .status()
+                .status_guarded()
                 .unwrap();
             assert!(status.success(), "low-FD descriptor scan subprocess failed");
             return;

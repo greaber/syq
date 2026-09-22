@@ -1181,7 +1181,7 @@ fn jq(program: &str, args: &[&str], input: &[u8]) -> Output {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("jq must be installed to verify the documented examples");
     child.stdin.take().unwrap().write_all(input).unwrap();
     child.wait_with_output().unwrap()

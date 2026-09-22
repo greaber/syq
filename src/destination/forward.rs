@@ -382,7 +382,7 @@ impl ForwardChild {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
-            .spawn()?;
+            .spawn_guarded()?;
         let mut stderr = child.stderr.take().unwrap();
         let errors = Arc::new(Mutex::new(Vec::new()));
         let captured = errors.clone();

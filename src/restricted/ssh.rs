@@ -3,6 +3,8 @@
 
 use super::RestrictedAuthority;
 use crate::private_broker::{PrivateBroker, PrivateBrokerConfig};
+#[cfg(test)]
+use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -228,7 +230,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name, "--nocapture"])
             .env("SYQ_TEST_SSH_RECEIVER_STATE", &state)
-            .output()
+            .capture_output()
             .unwrap();
         assert!(
             output.status.success(),
@@ -348,7 +350,7 @@ mod tests {
                 .args(["--exact", name, "--nocapture"])
                 .env("SYQ_TEST_SSH_RECEIVER_STATE", other.path())
                 .env("SYQ_TEST_FOREIGN_WORKER_TICKET", &ticket)
-                .output()
+                .capture_output()
                 .unwrap();
             assert!(
                 output.status.success(),

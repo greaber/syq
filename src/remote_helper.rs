@@ -6,6 +6,8 @@
 //! the cached binary directly. On a miss, `conn` probes the target and either
 //! authorizes a release download or uploads a matching executable.
 
+#[cfg(test)]
+use crate::process::CommandExt as _;
 pub const RELEASE_BASE_URL: &str = "https://dl.syq.christmas";
 pub const HELPER_MISSING_EXIT: i32 = 125;
 pub const HELPER_NOT_EXECUTABLE_EXIT: i32 = 126;
@@ -379,7 +381,7 @@ mod tests {
                 .args(["-c", INSTALL_COMMAND])
                 .env("HOME", home.path())
                 .env("program", home.path().join("missing-installer"))
-                .output()
+                .capture_output()
                 .unwrap();
             assert!(output.status.success(), "{entry}: {output:?}");
             assert_eq!(
@@ -481,7 +483,7 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         let binary = format!(
             "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'syq {}'; else exit 1; fi\n",

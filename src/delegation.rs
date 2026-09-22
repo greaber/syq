@@ -33,6 +33,7 @@
 //! scopes from overlapping its executable, SSH configuration, verifier, or
 //! enrollment state.
 
+use crate::process::CommandExt as _;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -1061,7 +1062,7 @@ impl SshsigPolicy {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_guarded()
             .context("start trusted ssh-keygen SSHSIG verifier")?;
         let output = wait_for_verifier(child, payload, VERIFIER_TIMEOUT)?;
         if !output.status.success() {

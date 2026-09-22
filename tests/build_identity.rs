@@ -1,4 +1,8 @@
 //! Exercise the actual Cargo build script in isolated source directories.
+#[allow(dead_code)]
+#[path = "../src/process.rs"]
+mod process;
+use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -37,14 +41,14 @@ fn packaged_provenance_and_helper_selection() {
         if let Some(release) = release {
             command.env("SYQ_HELPER_RELEASE", release);
         }
-        command.output().unwrap()
+        command.capture_output().unwrap()
     };
     for enclosing_git in [false, true] {
         if enclosing_git {
             assert!(Command::new("git")
                 .args(["init", "-q"])
                 .current_dir(root.path())
-                .status()
+                .status_guarded()
                 .unwrap()
                 .success());
             assert!(Command::new("git")
@@ -59,7 +63,7 @@ fn packaged_provenance_and_helper_selection() {
                     "enclosing checkout"
                 ])
                 .current_dir(root.path())
-                .status()
+                .status_guarded()
                 .unwrap()
                 .success());
             fs::write(root.path().join("unrelated"), "unrelated edits").unwrap();

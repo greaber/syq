@@ -1023,11 +1023,12 @@ mod tests {
     #[test]
     fn macos_dialog_script_compiles_without_opening_a_prompt() {
         let temp = crate::test_support::tempdir().unwrap();
+        use crate::process::CommandExt as _;
         let output = Command::new("/usr/bin/osacompile")
             .arg("-o")
             .arg(temp.path().join("approval.scpt"))
             .args(["-e", APPLESCRIPT])
-            .output()
+            .capture_output()
             .unwrap();
         assert!(
             output.status.success(),

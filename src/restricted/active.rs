@@ -5,6 +5,8 @@
 //! their processes have stopped without identifying or signalling a numeric PID.
 
 use super::{atomic_write, lock_directory, open_directory};
+#[cfg(test)]
+use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -210,7 +212,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .process_group(0)
-            .spawn()
+            .spawn_guarded()
             .unwrap();
         let mut child = Worker(child);
         wait_until("receiver readiness", || {
@@ -360,7 +362,7 @@ mod tests {
             .env("SYQ_TEST_ACTIVE_READY", home.join("ready-normal"))
             .env("SYQ_TEST_ACTIVE_MODE", "normal")
             .process_group(0)
-            .spawn()
+            .spawn_guarded()
             .map(Worker)
             .unwrap();
         assert!(exited(&mut child).success());

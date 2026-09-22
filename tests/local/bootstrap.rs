@@ -183,7 +183,7 @@ exec /bin/sh -c "$1""#,
         if quiet {
             command.arg("--quiet");
         }
-        let output = command.output().unwrap();
+        let output = command.capture_output().unwrap();
         assert!(!output.status.success(), "{output:?}");
         assert!(cached_remote_helper(&t).is_file(), "{output:?}");
         assert!(t.path("remote-home/.local/bin/syq").is_file(), "{output:?}");

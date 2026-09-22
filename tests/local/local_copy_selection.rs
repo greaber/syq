@@ -869,7 +869,7 @@ fn macos_clone_mkdir_permission_and_link_limits_fall_back() {
     assert!(Command::new("/bin/chmod")
         .args(["+a", "everyone deny add_subdirectory"])
         .arg(t.path("dst"))
-        .status()
+        .status_guarded()
         .unwrap()
         .success());
     let out = compat_command()

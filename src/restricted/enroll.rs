@@ -1,4 +1,5 @@
 use super::*;
+use crate::process::CommandExt as _;
 
 pub(super) fn local_state_base() -> Result<PathBuf> {
     let (_, home) = current_account()?;
@@ -173,7 +174,7 @@ pub(super) fn run_ssh(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command
-        .spawn()
+        .spawn_guarded()
         .map_err(|error| enrollment_ssh_error(target, true, error))?;
     let mut stdin = child
         .stdin

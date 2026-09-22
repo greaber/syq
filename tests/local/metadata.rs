@@ -393,7 +393,7 @@ fn forgetting_offline_owner_recreates_missing_lock() {
         .args(["persist", "destinations", "forget", "laptop"])
         .env("HOME", t.path(""))
         .env("SYQ_NO_UPDATE_CHECK", "1")
-        .output()
+        .capture_output()
         .unwrap();
     assert_output_ok(&output);
     assert!(!t.path(".syq-destinations-v3/laptop.owner").exists());
@@ -550,7 +550,7 @@ fn descriptor_copies_preserve_bytes_offsets_flags_and_publication() {
             "/tests/support/descriptor-copies.py"
         ))
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .output()
+        .capture_output()
         .expect("run descriptor-copy fixture");
     assert!(
         output.status.success(),

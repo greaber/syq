@@ -1,5 +1,7 @@
 //! Best-effort interactive installation after a release helper is bootstrapped.
 
+#[cfg(test)]
+use crate::process::CommandExt as _;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -180,7 +182,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(TEST_ARGS)
             .env(CHILD_HOME, home.path())
-            .output()
+            .capture_output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(home.path().join(".local/bin/syq").is_file());

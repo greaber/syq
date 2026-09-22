@@ -7,6 +7,8 @@
 //! worker reopens an operator pathname.
 
 use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
+#[cfg(test)]
+use crate::process::CommandExt as _;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1191,7 +1193,7 @@ mod tests {
             )
             .env("SYQ_TEST_DESCRIPTOR_BROKER_DEV", identity.dev().to_string())
             .env("SYQ_TEST_DESCRIPTOR_BROKER_INO", identity.ino().to_string())
-            .status()
+            .status_guarded()
             .unwrap();
         assert!(status.success(), "descriptor handoff subprocess failed");
     }

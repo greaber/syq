@@ -5,6 +5,10 @@
 //! host so the same update contract is exercised on every release platform.
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
+#[allow(dead_code)]
+#[path = "../src/process.rs"]
+mod process;
+use crate::process::CommandExt as _;
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use flate2::{write::GzEncoder, Compression};
@@ -152,7 +156,7 @@ impl UpdateFixture {
                 "https://release.invalid/download",
             )
             .env("SYQ_TEST_FIXTURES", self.temp.path("fixtures"))
-            .output()
+            .capture_output()
             .unwrap()
     }
 
@@ -244,7 +248,7 @@ fn signed_self_update_replaces_only_the_receipted_copy() {
 
     let version = Command::new(&fixture.installed)
         .arg("--version")
-        .output()
+        .capture_output()
         .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&version.stdout).trim(),
@@ -371,7 +375,7 @@ fn remote_command_registration_enables_signed_update_without_changing_helper() {
         .env_remove("XDG_CONFIG_HOME")
         .env("SYQ_TEST_RELEASE_BUILD", "1")
         .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
-        .output()
+        .capture_output()
         .unwrap();
     assert_success(&install);
     let receipt = || -> serde_json::Value {
@@ -402,7 +406,7 @@ fn remote_install_is_independent_of_other_standalone_installations() {
         .env("XDG_CONFIG_HOME", &fixture.config)
         .env("SYQ_TEST_RELEASE_BUILD", "1")
         .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
-        .output()
+        .capture_output()
         .unwrap();
     assert_success(&install);
     assert!(home.join(".local/bin/syq").is_file());
@@ -431,7 +435,7 @@ fn remote_install_reports_receipt_failure_without_removing_the_command() {
         .env("XDG_CONFIG_HOME", &fixture.config)
         .env("SYQ_TEST_RELEASE_BUILD", "1")
         .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
-        .output()
+        .capture_output()
         .unwrap();
     assert_success(&install);
     assert_eq!(
@@ -486,7 +490,7 @@ fn registration_needs_no_config_and_does_not_change_bin_permissions() {
         .env_remove("XDG_CONFIG_HOME")
         .env("SYQ_TEST_RELEASE_BUILD", "1")
         .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
-        .output()
+        .capture_output()
         .unwrap();
     assert_success(&output);
     assert_eq!(
@@ -512,7 +516,7 @@ fn remote_install_preserves_deleted_command_until_its_receipt_is_removed() {
             .env("PATH", &other_bin)
             .env("SYQ_TEST_RELEASE_BUILD", "1")
             .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
-            .output()
+            .capture_output()
             .unwrap()
     };
     assert_success(&install());
@@ -569,7 +573,7 @@ fn legacy_receipt_preserves_deleted_command_and_is_bound_to_its_path() {
             } else {
                 command.env_remove("XDG_CONFIG_HOME");
             }
-            command.output().unwrap()
+            command.capture_output().unwrap()
         };
         let skipped = install();
         assert_success(&skipped);
@@ -614,7 +618,7 @@ fn custom_build_does_not_inherit_upstream_update_ownership() {
                 .env("SYQ_TEST_RELEASE_HELPERS", helpers)
                 .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
                 .env("XDG_CONFIG_HOME", &fixture.config)
-                .output()
+                .capture_output()
                 .unwrap();
             assert_failure_contains(&output, "source builds must be rebuilt");
             assert_eq!(fs::read(&receipt_path).unwrap(), receipt);

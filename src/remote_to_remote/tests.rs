@@ -33,7 +33,7 @@ fn detached_timeout_terminates_the_complete_process_group() {
     let output = Command::new("sh")
         .args(["-c", &launcher])
         .env("HOME", directory.path())
-        .output()
+        .capture_output()
         .unwrap();
 
     assert!(!output.status.success());

@@ -553,7 +553,7 @@ fn receiver_wait_and_list_do_not_block_on_a_full_listen_queue() {
             .args(args)
             .env("HOME", t.path(""))
             .env("SYQ_NO_UPDATE_CHECK", "1")
-            .output()
+            .capture_output()
             .unwrap()
     };
     let wait = run(&["persist", "destinations", "wait", "stuck", "--timeout", "1"]);
@@ -650,7 +650,7 @@ fn owned_receiver_wait_respects_deadline_with_partial_identity_reply() {
         ])
         .env("HOME", t.path(""))
         .env("SYQ_NO_UPDATE_CHECK", "1")
-        .output()
+        .capture_output()
         .unwrap();
     let elapsed = start.elapsed();
     // The reply stays incomplete until the client exits; fixture cleanup does
@@ -681,7 +681,7 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
             .env("XDG_RUNTIME_DIR", t.path("runtime"))
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .current_dir(t.path(""))
-            .output()
+            .capture_output()
             .unwrap()
     };
     let status = || {
@@ -781,7 +781,7 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
             .env("XDG_RUNTIME_DIR", t.path("runtime"))
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .current_dir(t.path(""))
-            .output()
+            .capture_output()
             .unwrap()
     };
     let state = || {
@@ -861,7 +861,7 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
             .env("SSH_MARKER", t.path("ssh-used"))
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .current_dir(t.path(""))
-            .output()
+            .capture_output()
             .unwrap()
     };
     let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
@@ -1000,7 +1000,7 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_RUNTIME_DIR", t.path("runtime"))
             .env("SYQ_NO_UPDATE_CHECK", "1")
-            .output()
+            .capture_output()
             .unwrap()
     };
     let output = run(&["persist", "receive", "status", "--json"]);
@@ -1063,7 +1063,7 @@ fn return_via_rejects_unsupported_routes_and_never_falls_back_to_ssh() {
                 .env("XDG_RUNTIME_DIR", t.path("runtime"))
                 .env("PATH", t.path("bin"))
                 .env("SYQ_NO_UPDATE_CHECK", "1")
-                .output()
+                .capture_output()
                 .unwrap();
             assert!(!output.status.success(), "{:?}", output);
             assert!(
@@ -1090,7 +1090,7 @@ fn remote_copy_addition_preserves_approval_preferences_from_f752ee8() {
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_RUNTIME_DIR", t.path("runtime"))
         .env("SYQ_NO_UPDATE_CHECK", "1")
-        .output()
+        .capture_output()
         .unwrap();
     assert_output_ok(&output);
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -1134,7 +1134,7 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
             .env("PATH", &paths)
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .current_dir(t.path(""))
-            .output()
+            .capture_output()
             .unwrap()
     };
     let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
@@ -1310,7 +1310,7 @@ fn receiving_profiles_preserve_independent_settings_and_select_names() {
             .env("XDG_RUNTIME_DIR", t.path("runtime"))
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .current_dir(t.path(""))
-            .output()
+            .capture_output()
             .unwrap()
     };
     let status = || {
@@ -1391,7 +1391,7 @@ fn receiving_profiles_reject_explicit_files_without_overwriting_saved_settings()
             .env("XDG_RUNTIME_DIR", t.path("runtime"))
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .current_dir(t.path(""))
-            .output()
+            .capture_output()
             .unwrap()
     };
     assert_output_ok(&run(&["on", "--name", "project", "--root", "project"]));
@@ -1430,7 +1430,7 @@ fn receiving_profiles_migrate_unchanged_v051_preferences_and_reject_duplicates()
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_RUNTIME_DIR", t.path("runtime"))
             .env("SYQ_NO_UPDATE_CHECK", "1")
-            .output()
+            .capture_output()
             .unwrap()
     };
     assert_output_ok(&run(&["persist", "receive", "status", "--json"]));

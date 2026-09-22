@@ -107,7 +107,7 @@ fn experimental_listing_streams_encoded_keys_and_reports_partial_failure() {
     let temp = test_support::tempdir().unwrap();
     for fail in [false, true] {
         let server = ListingServer::start(fail, false);
-        let output = server.command(temp.path()).output().unwrap();
+        let output = server.command(temp.path()).capture_output().unwrap();
         assert_eq!(
             output.status.success(),
             !fail,
@@ -135,7 +135,7 @@ fn experimental_listing_streams_encoded_keys_and_reports_partial_failure() {
         }
     }
     let server = ListingServer::start(false, true);
-    let output = server.command(temp.path()).output().unwrap();
+    let output = server.command(temp.path()).capture_output().unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("continuation token"));
 }
@@ -150,7 +150,7 @@ fn experimental_listing_help_and_invalid_arguments() {
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(args)
-            .output()
+            .capture_output()
             .unwrap();
         assert!(output.status.success());
         assert_eq!(
@@ -161,7 +161,7 @@ fn experimental_listing_help_and_invalid_arguments() {
     for args in [["_ls", "--help"], ["help", "_ls"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(args)
-            .output()
+            .capture_output()
             .unwrap();
         assert!(output.status.success());
         let help = String::from_utf8(output.stdout).unwrap();
@@ -170,12 +170,12 @@ fn experimental_listing_help_and_invalid_arguments() {
     }
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["_ls", "s3://bucket/**", "--concurrency", "0"])
-        .output()
+        .capture_output()
         .unwrap();
     assert!(!output.status.success());
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["_ls", "/local/path"])
-        .output()
+        .capture_output()
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("s3://"));
