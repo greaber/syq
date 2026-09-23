@@ -43,16 +43,10 @@ tests. Later runs reuse the prepared suite. Pass `--rsync-src PATH` to use an
 already configured checkout at the exact pin. Reports are written as JSON,
 Markdown, static HTML, and a raw log under `target/rsync-compat/reports/`.
 
-Only the classified runnable subset is executed, not all 351 inventoried
-tests. The 38 runnable upstream test sources currently produce 40 independently
-reported scenarios. A non-root Linux run selects 36 scenarios and a root run
-adds four. A non-root macOS run selects 33 scenarios and a root run adds three;
-the four Linux-only cases depend on setgid-directory inheritance, Linux
-search-only-directory behavior, `/proc` interposition, or
-`fs.protected_regular`. Warm non-root runs take about 22 seconds on Linux and
-27 seconds on macOS on the development machines. A first run also downloads
-and prepares the pinned rsync checkout and may do a cold Rust build. The exact
-cold time depends mostly on network and Cargo state.
+Only the classified runnable subset is executed. [LEDGER.md](LEDGER.md) lists
+the current inventory and runnable scenarios; each run's reports show the
+selection for its platform and privileges. The first run also downloads and
+prepares the pinned rsync checkout and may do a cold Rust build.
 
 ## What upstream's security testing means here
 
@@ -75,9 +69,9 @@ The upstream security regressions use several complementary shapes:
 
 Only the first three shapes can usually be reused directly against SYQ. The C
 helpers call rsync internals, while the malicious-peer and daemon cases exercise
-protocols and services SYQ does not implement. ACL, xattr, `--relative`,
-alternate-destination, backup, and `--temp-dir` cases also remain inapplicable
-until the corresponding user-facing feature exists.
+protocols and services SYQ does not implement. Cases that depend on unsupported
+`--relative`, alternate-destination, backup, or `--temp-dir` options also remain
+inapplicable.
 
 The current `security` area has seven scenarios: five unmodified upstream tests
 and two narrow adaptations. Five run without privileges; a root run adds both
@@ -120,10 +114,8 @@ keg-only OpenSSL cannot make macOS configuration depend on undeclared flags.
 
 ## Inventory, observations, and product positions
 
-`inventory.tsv` names every test at the pinned commit. At the current pin,
-all 351 are classified: 47 runnable sources, 120 unsupported user features,
-and 184 tests of rsync internals, protocol, daemon, or restricted wrappers.
-None are unassessed. Updating the pin without
+`inventory.tsv` names every test at the pinned commit.
+[LEDGER.md](LEDGER.md) summarizes the classifications. Updating the pin without
 classifying every added or removed test is an error. Its classifications are:
 
 - `conformance`: a relevant upstream test used without modification.
