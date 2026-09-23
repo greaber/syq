@@ -368,6 +368,9 @@ reject these options. Existing descriptor-backed regular-file copies support
 only their original time, permission, and ownership options. Neither `-a` nor
 native copy defaults select ACLs, xattrs, hardlinks, or access times.
 
+These options do not preserve filesystem flags such as immutable or append-only,
+restore ctime or inode numbers, or create rsync `--fake-super` backup records.
+
 Use `--preserve=atimes` (rsync `-U`/`--atimes`) to restore access times captured
 before reading the source. It covers regular files, directories, links themselves,
 and copied special nodes on local and ordinary SSH filesystem copies. Linux
