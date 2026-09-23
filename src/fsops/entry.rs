@@ -42,6 +42,7 @@ pub fn entry_from_meta(rel: PathBytes, full: &Path, md: &fs::Metadata) -> Entry 
         dev: md.dev(),
         ino: md.ino(),
         ctime: md.ctime(),
+        inode_metadata: None,
         nlink: md.nlink(),
         ctime_nsec: md.ctime_nsec() as u32,
         link,
@@ -165,6 +166,7 @@ pub(super) fn entry_from_root_metadata(
         dev: metadata.dev,
         ino: metadata.ino,
         ctime: metadata.ctime,
+        inode_metadata: None,
         nlink: metadata.nlink,
         ctime_nsec: metadata.ctime_nsec,
         link,
@@ -174,4 +176,106 @@ pub(super) fn entry_from_root_metadata(
 pub fn lstat_entry(rel: PathBytes, full: &Path) -> io::Result<Entry> {
     let md = fs::symlink_metadata(full)?;
     Ok(entry_from_meta(rel, full, &md))
+}
+
+impl FsOps {
+    pub(crate) fn preserving_inode_metadata(&self) -> bool {
+        self.inode_preservation.any()
+    }
+    pub(crate) fn capture_scan_metadata(
+        &self,
+        root: &[u8],
+        source: Option<&RegisteredPath>,
+        follow_root: bool,
+        entries: &mut [Entry],
+    ) -> Result<()> {
+        if !self.inode_preservation.any() {
+            return Ok(());
+        }
+        for entry in entries {
+            let path = join(root, &entry.path);
+            let reference = source.map(|s| s.join(&entry.path)).transpose()?;
+            self.capture_entry_metadata(
+                &path,
+                reference.as_ref(),
+                follow_root && entry.path.is_empty(),
+                entry,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn capture_entry_metadata(
+        &self,
+        path: &[u8],
+        source: Option<&RegisteredPath>,
+        follow: bool,
+        entry: &mut Entry,
+    ) -> Result<()> {
+        if !self.inode_preservation.any() {
+            return Ok(());
+        }
+        let file = if let Some(source) = source {
+            let target = self.registered_source_target(source)?;
+            target.root.open_metadata(&target.relative)?
+        } else if let Some(target) = self.rooted_destination_target(path, None)? {
+            target.root.open_metadata(&target.relative)?
+        } else {
+            #[cfg(target_os = "linux")]
+            {
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(
+                        libc::O_PATH | libc::O_CLOEXEC | if follow { 0 } else { libc::O_NOFOLLOW },
+                    )
+                    .open(resolve(path))?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = follow;
+                bail!("inode metadata capture is unavailable on this platform");
+            }
+        };
+        let opened = file.metadata()?;
+        anyhow::ensure!(
+            (
+                opened.dev(),
+                opened.ino(),
+                opened.ctime(),
+                opened.ctime_nsec() as u32
+            ) == (entry.dev, entry.ino, entry.ctime, entry.ctime_nsec),
+            "{} changed before reading inode metadata",
+            resolve(path).display()
+        );
+        entry.inode_metadata = crate::inode_metadata::capture(&file, self.inode_preservation)
+            .with_context(|| format!("read inode metadata: {}", resolve(path).display()))?;
+        Ok(())
+    }
+
+    pub(super) fn stat_many_request(
+        &mut self,
+        paths: &[PathBytes],
+        sources: Option<&[RegisteredPath]>,
+        follow: bool,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<Vec<Option<Entry>>> {
+        let mut entries = self.stat_many_unadorned_request(paths, sources, follow, guard)?;
+        if self.inode_preservation.any() {
+            anyhow::ensure!(
+                guard.is_none(),
+                "signed receivers do not support ACL or xattr preservation"
+            );
+            for (index, entry) in entries.iter_mut().enumerate() {
+                if let Some(entry) = entry {
+                    self.capture_entry_metadata(
+                        &paths[index],
+                        sources.map(|s| &s[index]),
+                        follow,
+                        entry,
+                    )?;
+                }
+            }
+        }
+        Ok(entries)
+    }
 }

@@ -23,6 +23,7 @@ pub const MAX_FRAME: usize = 65 * 1024 * 1024;
 pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME: usize = 1024 * 1024;
 const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
+pub(crate) const METADATA_BATCH_BYTES: usize = 6 * 1024 * 1024;
 /// Supported comparison granularity floor, enforced by receivers as well as the CLI.
 /// Smaller blocks increase the number of hashes per file; this is a protocol
 /// policy, not a minimum input size imposed by the hash algorithm.
@@ -186,6 +187,7 @@ pub struct Entry {
     pub ctime: i64,
     pub ctime_nsec: u32,
     pub link: Option<PathBytes>,
+    pub inode_metadata: Option<Box<crate::inode_metadata::InodeMetadata>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -243,6 +245,12 @@ pub enum NativeRemoveErrorClass {
 }
 
 impl Entry {
+    pub(crate) fn size_hint(&self) -> usize {
+        self.path.len()
+            + self.link.as_ref().map_or(0, Vec::len)
+            + self.inode_metadata.as_ref().map_or(0, |m| m.size_hint())
+            + 192
+    }
     pub fn meta(&self) -> Meta {
         Meta {
             mode: self.mode,
@@ -250,6 +258,7 @@ impl Entry {
             gid: self.gid,
             mtime: self.mtime,
             mtime_nsec: self.mtime_nsec,
+            inode_metadata: self.inode_metadata.clone(),
         }
     }
 }
@@ -320,13 +329,20 @@ pub struct SmallBlock {
     pub hash: ContentDigest,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Meta {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
     pub mtime: i64,
     pub mtime_nsec: u32,
+    pub inode_metadata: Option<Box<crate::inode_metadata::InodeMetadata>>,
+}
+
+impl Meta {
+    pub(crate) fn size_hint(&self) -> usize {
+        64 + self.inode_metadata.as_ref().map_or(0, |m| m.size_hint())
+    }
 }
 
 /// Which parts of a `Meta` to apply.
@@ -433,6 +449,23 @@ pub enum Op {
     /// Remove a non-directory; a directory that has appeared there is an
     /// error, never recursed into (used by --delete for planned leaves).
     Unlink { path: PathBytes },
+}
+
+impl Op {
+    pub(crate) fn size_hint(&self) -> usize {
+        match self {
+            Self::SetMeta { path, meta, .. } | Self::SetFileMetaIfSame { path, meta, .. } => {
+                path.len() + meta.size_hint() + 64
+            }
+            Self::Hardlink { path, source, .. } => path.len() + source.len() + 64,
+            Self::Symlink { path, target, .. } => path.len() + target.len() + 64,
+            Self::Mkdir { path, .. }
+            | Self::Mknod { path, .. }
+            | Self::Remove { path }
+            | Self::Unlink { path }
+            | Self::Rmdir { path } => path.len() + 96,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -968,6 +1001,7 @@ pub enum WireRequest<Data> {
     /// Reuse a drained stream worker within its original endpoint session.
     /// None releases its file before the control connection publishes it.
     BindStream(Option<(DescriptorTicket, crate::descriptor_copy::Settings)>),
+    ConfigurePreservation(crate::inode_metadata::Selection),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1094,6 +1128,7 @@ impl Request {
         matches!(
             self,
             Request::ConfigureHashing(_)
+                | Request::ConfigurePreservation(_)
                 | Request::Scan { .. }
                 | Request::StatMany { .. }
                 | Request::HashBlocks { .. }
@@ -1219,6 +1254,8 @@ pub enum Response {
         ino: u64,
     },
     PublishedBatch(Vec<std::result::Result<Option<(u64, u64)>, WireError>>),
+    /// Non-final fragment of a rich-metadata stat response.
+    StatsMore(Vec<Option<Entry>>),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
@@ -1377,7 +1414,7 @@ impl SizeHint for Request {
             }
             Request::PutSmallBatch(puts) => {
                 puts.iter()
-                    .map(|put| put.data.len() + put.path.len() + 96)
+                    .map(|put| put.data.len() + put.path.len() + put.meta.size_hint() + 96)
                     .sum::<usize>()
                     + 16
             }
@@ -1401,7 +1438,7 @@ impl SizeHint for Request {
                     .sum::<usize>()
                     + 48
             }
-            Request::Apply { ops, .. } => ops.len() * 128 + 16,
+            Request::Apply { ops, .. } => ops.iter().map(Op::size_hint).sum::<usize>() + 16,
             Request::NativeRemove { selections, .. } => {
                 selections
                     .iter()
@@ -1448,7 +1485,7 @@ impl SizeHint for Response {
                     .sum::<usize>()
                     + 16
             }
-            Response::ScanBatch(v) => v.len() * 160 + 16,
+            Response::ScanBatch(v) => v.iter().map(Entry::size_hint).sum::<usize>() + 16,
             Response::NativeRemoveBatch(v) => {
                 v.iter()
                     .map(|outcome| {
@@ -1469,7 +1506,12 @@ impl SizeHint for Response {
                     .sum::<usize>()
                     + 16
             }
-            Response::Stats(v) => v.len() * 96 + 16,
+            Response::Stats(v) | Response::StatsMore(v) => {
+                v.iter()
+                    .map(|e| e.as_ref().map_or(1, Entry::size_hint))
+                    .sum::<usize>()
+                    + 16
+            }
             Response::BatchPlan {
                 partial_paths,
                 directories,

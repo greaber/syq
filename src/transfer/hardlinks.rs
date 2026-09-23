@@ -84,6 +84,11 @@ impl Planner<'_> {
                     &leaf.e,
                     destination.as_ref().unwrap(),
                 ) != 0
+                    || self.opts.inode_metadata_differs(
+                        &leaf.dst_rel,
+                        &leaf.e,
+                        destination.as_ref().unwrap(),
+                    )
                 {
                     self.dry_run_changes.metadata_files += 1;
                     self.emit_trace(

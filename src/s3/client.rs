@@ -424,6 +424,7 @@ fn is_blake3(algorithm: &crate::hashing::HashAlgorithm) -> bool {
 impl Metadata {
     pub(super) fn override_with(&mut self, metadata: &crate::mapping::Metadata) {
         let mut meta = crate::proto::Meta {
+            inode_metadata: None,
             mode: self.mode,
             uid: self.uid,
             gid: self.gid,

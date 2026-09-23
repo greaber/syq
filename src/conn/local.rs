@@ -248,6 +248,11 @@ impl Conn for LocalConn {
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
+        let mut capture = |mut batch: Vec<Entry>| {
+            self.ops
+                .capture_scan_metadata(root, source, follow_root, &mut batch)?;
+            sink(batch)
+        };
         if let Some(source) = self.ops.source_scan_root(source)? {
             return crate::scan::scan_descriptor(
                 source.root,
@@ -257,7 +262,7 @@ impl Conn for LocalConn {
                 false,
                 ignore,
                 report_ignored,
-                sink,
+                &mut capture,
                 ignored,
                 warn,
             );
@@ -271,7 +276,7 @@ impl Conn for LocalConn {
                 true,
                 ignore,
                 report_ignored,
-                sink,
+                &mut capture,
                 ignored,
                 warn,
             );
@@ -282,7 +287,7 @@ impl Conn for LocalConn {
             follow_root,
             ignore,
             report_ignored,
-            sink,
+            &mut capture,
             ignored,
             warn,
         )

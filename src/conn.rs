@@ -83,7 +83,33 @@ pub trait Conn: Send {
             _ => None,
         };
         self.send(req)?;
-        let response = self.recv()?;
+        let mut response = self.recv()?;
+        if matches!(response, Response::StatsMore(_)) {
+            let Some(("stat", expected_count)) = expected else {
+                bail!("unexpected fragmented metadata response");
+            };
+            let mut entries = Vec::new();
+            loop {
+                match response {
+                    Response::StatsMore(batch) => {
+                        anyhow::ensure!(
+                            !batch.is_empty()
+                                && entries.len().saturating_add(batch.len()) < expected_count,
+                            "invalid metadata fragment count"
+                        );
+                        entries.extend(batch);
+                        response = self.recv()?;
+                    }
+                    Response::Stats(batch) => {
+                        entries.extend(batch);
+                        response = Response::Stats(entries);
+                        break;
+                    }
+                    Response::Err(_) | Response::EndpointError(_) => break,
+                    _ => bail!("unexpected response in fragmented metadata"),
+                }
+            }
+        }
         if let Some((operation, expected)) = expected {
             let actual = match &response {
                 Response::Stats(values) => Some(values.len()),

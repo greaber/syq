@@ -995,3 +995,7 @@ mod rm;
 mod selection;
 #[path = "local/tuning.rs"]
 mod tuning;
+
+#[cfg(target_os = "linux")]
+#[path = "local/inode_metadata.rs"]
+mod inode_metadata;

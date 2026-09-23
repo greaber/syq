@@ -515,8 +515,15 @@ impl Worker {
         let mut path_bytes = 0usize;
         for (i, job) in jobs.iter().enumerate() {
             let source_bytes = source_request_bytes(&job.src, Some(&job.source));
+            let file_bytes = job.entry.size.saturating_add(
+                job.entry
+                    .inode_metadata
+                    .as_ref()
+                    .map_or(0, |m| m.size_hint()) as u64,
+            );
             if i > start
-                && (bytes.saturating_add(job.entry.size) > group_bytes
+                && (bytes.saturating_add(file_bytes)
+                    > group_bytes.min(crate::proto::MAX_READ_BYTES)
                     || path_bytes.saturating_add(source_bytes) > SOURCE_BATCH_PATH_BYTES)
             {
                 groups.push(start..i);
@@ -524,7 +531,7 @@ impl Worker {
                 bytes = 0;
                 path_bytes = 0;
             }
-            bytes += job.entry.size;
+            bytes += file_bytes;
             path_bytes = path_bytes.saturating_add(source_bytes);
         }
         if start < jobs.len() {
@@ -619,6 +626,9 @@ impl Worker {
                         || e.size != j.entry.size
                         || e.mtime != j.entry.mtime
                         || e.mtime_nsec != j.entry.mtime_nsec
+                        || (j.entry.inode_metadata.is_some()
+                            && (e.dev, e.ino, e.ctime, e.ctime_nsec)
+                                != (j.entry.dev, j.entry.ino, j.entry.ctime, j.entry.ctime_nsec))
                 }
                 None => true,
             };
@@ -1773,6 +1783,14 @@ impl Worker {
                     || e.size != job.entry.size
                     || e.mtime != job.entry.mtime
                     || e.mtime_nsec != job.entry.mtime_nsec
+                    || (job.entry.inode_metadata.is_some()
+                        && (e.dev, e.ino, e.ctime, e.ctime_nsec)
+                            != (
+                                job.entry.dev,
+                                job.entry.ino,
+                                job.entry.ctime,
+                                job.entry.ctime_nsec,
+                            ))
             }
             None => true,
         };
@@ -1961,6 +1979,9 @@ impl Worker {
                 .opts
                 .metadata_fix_flags(&job.rel_bytes, &job.entry, destination)
                 == 0
+                && !self
+                    .opts
+                    .inode_metadata_differs(&job.rel_bytes, &job.entry, destination)
             {
                 return Ok(());
             }

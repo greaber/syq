@@ -516,13 +516,16 @@ pub(super) fn set_meta_rooted(
         flags & flags::MODE_MASK != 0 && !is_link && metadata.mode & 0o7777 != meta.mode & 0o7777;
     let time_differs = flags & flags::TIMES != 0
         && (metadata.mtime != meta.mtime || metadata.mtime_nsec != meta.mtime_nsec);
-    if !owner_differs && !mode_differs && !time_differs {
+    if !owner_differs && !mode_differs && !time_differs && meta.inode_metadata.is_none() {
         return Ok(());
     }
     if is_link {
+        let handle = target.root.open_metadata(&target.relative)?;
+        require_rooted_metadata(&handle, metadata, &target.label)?;
         apply_owner_if_changed(flags, meta, metadata.uid, metadata.gid, |uid, gid| {
             target.root.chown(&target.relative, uid, gid)
         })?;
+        crate::inode_metadata::apply(&handle, meta.inode_metadata.as_deref(), meta.mode)?;
     } else {
         let handle = target.root.open_metadata(&target.relative)?;
         let opened = handle.metadata()?;
@@ -847,7 +850,7 @@ pub(super) fn set_meta_handle_known(
     if flags & flags::TIMES != 0 {
         bail!("metadata-only O_PATH repair does not support timestamp changes");
     }
-    Ok(())
+    crate::inode_metadata::apply(file, meta.inode_metadata.as_deref(), meta.mode)
 }
 
 #[cfg(target_os = "linux")]

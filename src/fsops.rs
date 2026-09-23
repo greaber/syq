@@ -424,6 +424,7 @@ fn is_superuser() -> bool {
 }
 
 pub struct FsOps {
+    inode_preservation: crate::inode_metadata::Selection,
     descriptor_copy: crate::descriptor_copy::Session,
     stream_worker: Option<crate::descriptor_copy::FileWorker>,
     stream_ticket: Option<crate::descriptor_broker::DescriptorTicket>,
@@ -602,6 +603,7 @@ impl FsOps {
         let observations = Arc::new(crate::transfer_observations::Registry::default());
         let operation = observations.actor("filesystem");
         FsOps {
+            inode_preservation: Default::default(),
             descriptor_copy: Default::default(),
             stream_worker: None,
             stream_ticket: None,
@@ -919,7 +921,7 @@ impl FsOps {
                 staged.push(None);
                 continue;
             }
-            let mut meta = file.meta;
+            let mut meta = file.meta.clone();
             // Without source permission preservation, a replacement keeps
             // the destination's mode, as in the ordinary worker.
             if request.flags & flags::MODE == 0 {
@@ -1026,7 +1028,7 @@ impl FsOps {
                                         &[Op::SetFileMetaIfSame {
                                             path,
                                             condition,
-                                            meta: file.meta,
+                                            meta: file.meta.clone(),
                                             flags: repair,
                                         }],
                                         None,
@@ -1914,6 +1916,7 @@ impl FsOps {
             | Request::WriteStreamFence
             | Request::ShrinkReadStream { .. }
             | Request::MappingChunk { .. }
+            | Request::ConfigurePreservation(_)
             | Request::StopReadStream => {}
         }
         Ok(())
@@ -2256,7 +2259,7 @@ impl FsOps {
         .collect()
     }
 
-    fn stat_many_request(
+    fn stat_many_unadorned_request(
         &mut self,
         paths: &[PathBytes],
         sources: Option<&[RegisteredPath]>,

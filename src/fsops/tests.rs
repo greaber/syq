@@ -217,6 +217,7 @@ fn expected_hash_failure_preserves_existing_destination() {
         )
         .unwrap();
     let meta = Meta {
+        inode_metadata: None,
         mode: 0o600,
         uid: 0,
         gid: 0,
@@ -500,6 +501,7 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
             true,
             &copy_id,
             &Meta {
+                inode_metadata: None,
                 mode: 0o600,
                 uid: 0,
                 gid: 0,
@@ -1151,6 +1153,7 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
         data: b"new".to_vec(),
         hash: content_digest(b"new"),
         meta: Meta {
+            inode_metadata: None,
             mode: 0o600,
             uid: 0,
             gid: 0,
@@ -1236,6 +1239,7 @@ fn put_small_stages_with_final_mode_and_truncates_reused_sidecar() {
         data: b"new".to_vec(),
         hash: content_digest(b"new"),
         meta: Meta {
+            inode_metadata: None,
             mode,
             uid: 0,
             gid: 0,
@@ -1268,6 +1272,7 @@ fn put_small_stages_with_final_mode_and_truncates_reused_sidecar() {
 #[test]
 fn staged_file_mode_withholds_bits_that_could_widen_access_before_publication() {
     let meta = |mode: u32| Meta {
+        inode_metadata: None,
         mode,
         uid: 0,
         gid: 0,
@@ -1365,6 +1370,7 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
                 data: name.as_bytes().to_vec(),
                 hash: content_digest(name.as_bytes()),
                 meta: Meta {
+                    inode_metadata: None,
                     mode: 0o600,
                     uid: 0,
                     gid: 0,
@@ -1438,6 +1444,7 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
         data: data.to_vec(),
         hash: content_digest(data),
         meta: Meta {
+            inode_metadata: None,
             mode: 0o640,
             uid: 0,
             gid: 0,
@@ -1720,6 +1727,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
             b"basis",
             &copy_id,
             &Meta {
+                inode_metadata: None,
                 mode: 0o600,
                 uid: 0,
                 gid: 0,
@@ -1826,6 +1834,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
     fs::write(selected.join("inplace"), b"replacement-root").unwrap();
 
     let meta = Meta {
+        inode_metadata: None,
         mode: 0o600,
         uid: 0,
         gid: 0,
@@ -1839,7 +1848,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             copy_id,
             data: b"small-data".to_vec(),
             hash: content_digest(b"small-data"),
-            meta,
+            meta: meta.clone(),
             flags: 0,
             inplace: false,
             condition: TargetCondition::Absent,
@@ -1859,7 +1868,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             copy_id,
             data: b"new".to_vec(),
             hash: content_digest(b"new"),
-            meta,
+            meta: meta.clone(),
             flags: 0,
             inplace: false,
             condition: TargetCondition::Matches {
@@ -2062,6 +2071,7 @@ fn rooted_ranged_write_does_not_follow_a_swapped_parent() {
             false,
             &copy_id,
             &Meta {
+                inode_metadata: None,
                 mode: 0o600,
                 uid: 0,
                 gid: 0,
@@ -2138,6 +2148,7 @@ fn rooted_finalize_rejects_replacement_of_the_opened_partial() {
             false,
             &copy_id,
             &Meta {
+                inode_metadata: None,
                 mode: 0o600,
                 uid: 0,
                 gid: 0,
@@ -2241,6 +2252,7 @@ fn retained_basis_cannot_be_consumed_under_another_root() {
             b"basis",
             &copy_id,
             &Meta {
+                inode_metadata: None,
                 mode: 0o600,
                 uid: 0,
                 gid: 0,
@@ -2290,6 +2302,7 @@ fn destination_apply_uses_the_adopted_root_not_its_old_name() {
     fs::write(selected.join("sentinel"), b"replacement").unwrap();
 
     let meta = |mode| Meta {
+        inode_metadata: None,
         mode,
         uid: 0,
         gid: 0,
@@ -2984,6 +2997,7 @@ fn guarded_root_metadata_updates_once_then_becomes_a_noop() {
         .as_rooted();
     let current = fs::symlink_metadata(&dir).unwrap();
     let meta = Meta {
+        inode_metadata: None,
         mode: current.mode(),
         uid: current.uid(),
         gid: current.gid(),

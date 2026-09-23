@@ -206,7 +206,7 @@ pub(crate) fn run(
         };
         let source_meta = descriptor.as_ref().and_then(Descriptor::metadata);
         if options.route == crate::s3::Route::Upload {
-            controls.metadata.source(source_meta)?;
+            controls.metadata.source(source_meta.clone())?;
             if let Some(size) = descriptor.as_ref().map(Descriptor::remaining_len).transpose()?.flatten() {
                 controls.set_size(size);
             }
@@ -452,7 +452,13 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
             let stored = client::Metadata::decode(head.metadata())?;
             let mtime =
                 stored.map_or_else(|| head.last_modified().map_or(0, |t| t.secs()), |m| m.mtime);
-            if mtime > plan.source_meta.context("missing source timestamp")?.mtime {
+            if mtime
+                > plan
+                    .source_meta
+                    .as_ref()
+                    .context("missing source timestamp")?
+                    .mtime
+            {
                 report.skip();
             }
         }
@@ -469,12 +475,14 @@ fn digest(algorithm: Algorithm, data: &[u8]) -> String {
 fn upload_metadata(plan: &Plan<'_>) -> Option<std::collections::HashMap<String, String>> {
     let controls = plan.controls;
     plan.source_meta
+        .clone()
         .or_else(|| {
             controls.metadata.overrides.map(|_| {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
                 crate::proto::Meta {
+                    inode_metadata: None,
                     mode: 0o666 & !crate::fsops::process_umask(),
                     uid: unsafe { libc::geteuid() },
                     gid: unsafe { libc::getegid() },
@@ -724,6 +732,7 @@ async fn download(
             .filter(|m| m.kind == client::ObjectKind::File)
             .map_or_else(
                 || crate::proto::Meta {
+                    inode_metadata: None,
                     mode: 0o666,
                     uid: unsafe { libc::geteuid() },
                     gid: unsafe { libc::getegid() },
@@ -731,6 +740,7 @@ async fn download(
                     mtime_nsec: 0,
                 },
                 |m| crate::proto::Meta {
+                    inode_metadata: None,
                     mode: m.mode,
                     uid: m.uid,
                     gid: m.gid,

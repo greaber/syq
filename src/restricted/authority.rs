@@ -1713,6 +1713,10 @@ impl RestrictedAuthority {
         condition: &mut proto::TargetCondition,
         target: ReceiverModeTarget,
     ) -> Result<()> {
+        anyhow::ensure!(
+            meta.inode_metadata.is_none(),
+            "signed grants do not authorize ACL or xattr changes"
+        );
         if *flags & proto::flags::RECEIVER_MODE != 0 {
             let decision = self.receiver_mode(path, meta.mode, target)?;
             meta.mode = decision.mode;
@@ -2575,6 +2579,9 @@ impl RestrictedAuthority {
             }
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a command-restricted destination")
+            }
+            Request::ConfigurePreservation(_) => {
+                bail!("signed grants do not authorize ACL or xattr preservation")
             }
             Request::DescriptorCopy(_) | Request::BindStream(_) => {
                 bail!("descriptor copies are not valid on a command-restricted receiver")

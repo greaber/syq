@@ -379,6 +379,64 @@ with tempfile.TemporaryDirectory(prefix='syq-hardlinks-') as scratch:
         assert (pull / 'a').stat().st_ino == (pull / 'b').stat().st_ino
 PY_HARDLINKS
 
+printf 'case: ACLs and xattrs reconcile through ordinary SSH and TCP\n'
+python3 - <<'PY_INODE_METADATA'
+import os
+from pathlib import Path
+import struct
+import subprocess
+import tempfile
+
+acl = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *entry) for entry in [(1,7,0xffffffff),(2,6,12345),(4,5,0xffffffff),(16,4,0xffffffff),(32,0,0xffffffff)])
+with tempfile.TemporaryDirectory(prefix='syq-inode-metadata-') as scratch:
+    root = Path(scratch)
+    source = root / 'source'
+    source.mkdir()
+    (source / 'file').write_bytes(b'payload')
+    os.link(source / 'file', source / 'alias')
+    os.setxattr(source / 'file', 'user.binary', b'\x00\xffbytes')
+    os.setxattr(source / 'file', 'user.empty', b'')
+    os.setxattr(source / 'file', 'system.posix_acl_access', acl)
+    os.setxattr(source, 'system.posix_acl_default', acl)
+    for label, transport in [('ssh', ['--no-tcp']), ('tcp', [])]:
+        destination = '/tmp/syq-real-ssh/inode-metadata-' + label
+        push = ['syq', 'cp', '--preserve=hardlinks,acls,xattrs', '--srcs-in', str(source), '--to', 'destination', '--into', destination, *transport]
+        subprocess.run(push, check=True, timeout=30)
+        subprocess.run(push, check=True, timeout=30)
+        pull = root / label
+        subprocess.run(['syq', 'cp', '--preserve=hardlinks,acls,xattrs', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30)
+        for name in ['user.binary','user.empty','system.posix_acl_access']:
+            assert os.getxattr(source / 'file',name) == os.getxattr(pull / 'file',name), name
+        assert os.getxattr(source,'system.posix_acl_default') == os.getxattr(pull,'system.posix_acl_default')
+        assert (pull / 'file').stat().st_ino == (pull / 'alias').stat().st_ino
+        os.removexattr(pull / 'file','user.empty')
+        os.removexattr(pull / 'file','system.posix_acl_access')
+        os.removexattr(pull,'system.posix_acl_default')
+        subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs','--srcs-in',str(pull),'--to','destination','--into',destination,*transport],check=True,timeout=30)
+        verify = root / (label + '-reconciled')
+        subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs','--from','destination','--srcs-in',destination,'--into',str(verify),*transport],check=True,timeout=30)
+        assert 'user.empty' not in os.listxattr(verify / 'file')
+        assert 'system.posix_acl_access' not in os.listxattr(verify / 'file')
+        assert 'system.posix_acl_default' not in os.listxattr(verify)
+    # Each full scan/stat batch exceeds the control frame budget. The remote
+    # helper must fragment metadata without dropping entries or losing framing.
+    rich = root / 'rich'
+    rich.mkdir()
+    value = b'\x00\xff' * 1536
+    for index in range(5000):
+        file = rich / str(index)
+        file.write_bytes(b'data')
+        os.setxattr(file, 'user.rich', value)
+    remote = '/tmp/syq-real-ssh/rich-metadata'
+    command = ['syq', 'cp', '--preserve=xattrs', '--srcs-in', str(rich), '--to', 'destination', '--into', remote, '--no-tcp']
+    subprocess.run(command, check=True, timeout=90)
+    subprocess.run(command, check=True, timeout=90)
+    copied = root / 'rich-copy'
+    subprocess.run(['syq', 'cp', '--preserve=xattrs', '--from', 'destination', '--srcs-in', remote, '--into', str(copied), '--no-tcp'], check=True, timeout=90)
+    for index in range(5000):
+        assert os.getxattr(copied / str(index), 'user.rich') == value
+PY_INODE_METADATA
+
 printf 'case: return copies await local approval and denial leaves no destination\n'
 timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as denied' &
 return_copy_pid=$!

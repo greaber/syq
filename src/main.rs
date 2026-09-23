@@ -21,6 +21,7 @@ mod fsops;
 mod hashing;
 mod help;
 mod identity;
+mod inode_metadata;
 mod janky_cat;
 #[cfg(target_os = "linux")]
 mod local_copy;

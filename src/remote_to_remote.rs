@@ -984,6 +984,12 @@ fn run_remote(
     for line in &args.ignore_lines {
         remote.push(format!("--ignore={line}"));
     }
+    if args.acls {
+        remote.push("--preserve=acls".into());
+    }
+    if args.xattrs {
+        remote.push("--preserve=xattrs".into());
+    }
     if args.hardlinks {
         remote.push("--preserve=hardlinks".into());
     }
