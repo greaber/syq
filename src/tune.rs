@@ -58,7 +58,7 @@ pub const START_LOCAL_LOW_CPU: usize = 16;
 /// Never auto-tune below this many.
 pub const MIN: usize = 1;
 /// Policy mechanics version recorded in transfer history.
-pub const POLICY_VERSION: u32 = 7;
+pub const POLICY_VERSION: u32 = 8;
 const STARTUP_STEP: usize = 2;
 
 /// Multiplicative step after discovery, or with a closely matched plateau hint.
@@ -898,6 +898,7 @@ enum SlotPhase {
 struct Slot {
     phase: SlotPhase,
     setup_started: Option<Instant>,
+    whole_file: bool,
 }
 
 impl Default for Slot {
@@ -905,6 +906,7 @@ impl Default for Slot {
         Self {
             phase: SlotPhase::Absent,
             setup_started: None,
+            whole_file: false,
         }
     }
 }
@@ -928,6 +930,17 @@ pub struct Gate {
     slots: Mutex<Vec<Slot>>,
     cv: Condvar,
     history: std::sync::OnceLock<history::Recorder>,
+}
+
+pub(crate) struct WholeFile {
+    gate: Arc<Gate>,
+    id: usize,
+}
+
+impl Drop for WholeFile {
+    fn drop(&mut self) {
+        self.gate.slots.lock().unwrap()[self.id].whole_file = false;
+    }
 }
 
 /// Extend the slot table so `id`s below `n` exist. Slots are never dropped:
@@ -1090,6 +1103,25 @@ impl Gate {
 
     pub fn connection_needed(&self, id: usize) -> bool {
         id < self.connect_target.load(Relaxed)
+    }
+
+    pub(crate) fn whole_file(self: &Arc<Self>, id: usize) -> WholeFile {
+        let mut slots = self.slots.lock().unwrap();
+        grow_to(&mut slots, id + 1);
+        slots[id].whole_file = true;
+        WholeFile {
+            gate: self.clone(),
+            id,
+        }
+    }
+
+    fn whole_files_draining(&self, n: usize) -> bool {
+        self.slots
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(n)
+            .any(|slot| slot.whole_file)
     }
 
     pub fn ready_through(&self, n: usize) -> bool {
@@ -1350,14 +1382,14 @@ pub fn run(
                 let now = (meter.bytes(), meter.files());
                 let secs = sample_start.elapsed().as_secs_f64();
                 sample_start = std::time::Instant::now();
-                if !gate.ready_through(active) {
+                if !gate.ready_through(active) || gate.whole_files_draining(active) {
                     trace.sample(
                         last,
                         now,
                         secs,
                         &policy,
                         &gate,
-                        "active_workers_connecting",
+                        "active_workers_settling",
                         None,
                     );
                     last = now;
@@ -1427,20 +1459,22 @@ pub fn run(
         let secs = sample_start.elapsed().as_secs_f64();
         sample_start = std::time::Instant::now();
         // Only judge a configuration once every requested worker is actually
-        // connected (ssh sessions can take seconds each).
-        if !gate.ready_through(active) {
+        // connected (ssh sessions can take seconds each), and excess whole-file
+        // writers from a reduction have finished their non-preemptible copies.
+        if !gate.ready_through(active) || gate.whole_files_draining(active) {
             trace.sample(
                 last,
                 now,
                 secs,
                 &policy,
                 &gate,
-                "active_workers_connecting",
+                "active_workers_settling",
                 None,
             );
-            trace.waiting("active_workers_connecting", &policy);
+            trace.waiting("active_workers_settling", &policy);
             last = now;
             sampler.reset();
+            collapse_samples = 0;
             continue;
         }
         // Per second, so jitter in the sample length doesn't masquerade as a
