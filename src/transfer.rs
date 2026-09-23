@@ -1560,6 +1560,28 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     };
+    let platform = |endpoint: &Endpoint| -> Result<String> {
+        match endpoint {
+            Endpoint::Remote(spec) => Ok(spec
+                .diagnostics()
+                .peer
+                .context("handshake did not report metadata platform")?
+                .platform),
+            Endpoint::Local { .. } => Ok(crate::identity::platform()),
+        }
+    };
+    let destination_metadata_platform =
+        if opts.inode_preservation.acls || opts.inode_preservation.xattrs {
+            platform(&dst_ep)?
+        } else {
+            String::new()
+        };
+    if opts.inode_preservation.acls {
+        crate::inode_metadata::validate_acl_platforms(
+            &platform(&src_ep)?,
+            &destination_metadata_platform,
+        )?;
+    }
     if opts.inode_preservation.crtimes {
         configure_preservation(&mut *dst_ctl, opts.inode_preservation, opts.sparse, true)?;
     }
@@ -2731,6 +2753,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         progress: &progress,
         opts: &opts,
         destination_supports_confined_socket_nodes,
+        destination_metadata_platform,
         destination_tree_known_missing,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),

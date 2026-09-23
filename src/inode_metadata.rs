@@ -5,6 +5,11 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 
+#[cfg(target_os = "macos")]
+mod macos_acl;
+#[cfg(target_os = "macos")]
+mod macos_xattrs;
+
 pub(crate) const MAX_INODE_METADATA: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,8 +31,8 @@ impl Selection {
         Ok(())
     }
     pub(crate) fn validate(self) -> Result<()> {
-        if (self.acls || self.xattrs) && !cfg!(target_os = "linux") {
-            bail!("ACL and extended-attribute preservation currently requires Linux endpoints");
+        if (self.acls || self.xattrs) && !cfg!(any(target_os = "linux", target_os = "macos")) {
+            bail!("ACL and extended-attribute preservation requires Linux or macOS endpoints");
         }
         Ok(())
     }
@@ -42,9 +47,24 @@ pub(crate) struct Timestamp {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InodeMetadata {
     pub acls: Option<PosixAcls>,
+    pub macos_acl: Option<MacAcl>,
     pub xattrs: Option<ExtendedAttributes>,
     pub atime: Option<Timestamp>,
     pub crtime: Option<Timestamp>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MacAcl {
+    pub flags: u32,
+    pub entries: Vec<MacAce>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MacAce {
+    pub principal: [u8; 16],
+    pub tag: u32,
+    pub permissions: u64,
+    pub flags: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,11 +95,16 @@ impl InodeMetadata {
         let _ = mode;
     }
     pub(crate) fn size_hint(&self) -> usize {
-        64 + self.acls.as_ref().map_or(0, |a| {
-            a.access.as_ref().map_or(0, Vec::len) + a.default.as_ref().map_or(0, Vec::len)
-        }) + self.xattrs.as_ref().map_or(0, |x| {
-            x.values.iter().map(|(n, v)| n.len() + v.len() + 32).sum()
-        })
+        64 + self
+            .macos_acl
+            .as_ref()
+            .map_or(0, |a| 16 + a.entries.len() * 40)
+            + self.acls.as_ref().map_or(0, |a| {
+                a.access.as_ref().map_or(0, Vec::len) + a.default.as_ref().map_or(0, Vec::len)
+            })
+            + self.xattrs.as_ref().map_or(0, |x| {
+                x.values.iter().map(|(n, v)| n.len() + v.len() + 32).sum()
+            })
     }
 }
 
@@ -265,6 +290,10 @@ mod platform {
             metadata.size_hint() <= MAX_INODE_METADATA,
             "inode metadata exceeds the 4 MiB transfer limit"
         );
+        anyhow::ensure!(
+            metadata.macos_acl.is_none(),
+            "macOS ACLs cannot be converted to Linux POSIX ACLs"
+        );
         let current = file.metadata()?;
         if let Some(acls) = &metadata.acls {
             anyhow::ensure!(
@@ -359,10 +388,21 @@ pub(crate) fn capture(
         {
             metadata = platform::capture(file, selection)?;
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
-            let _ = file;
-            unreachable!();
+            use std::os::unix::fs::MetadataExt;
+            let before = file.metadata()?;
+            if selection.acls {
+                metadata.macos_acl = Some(macos_acl::read(file)?);
+            }
+            if selection.xattrs {
+                metadata.xattrs = Some(macos_xattrs::capture(file)?);
+            }
+            let after = file.metadata()?;
+            anyhow::ensure!(
+                (before.ctime(), before.ctime_nsec()) == (after.ctime(), after.ctime_nsec()),
+                "inode metadata changed while reading it"
+            );
         }
     }
     metadata.atime = selection.atimes.then_some(atime);
@@ -373,6 +413,10 @@ pub(crate) fn capture(
                 .context("source filesystem does not report birth time")?,
         )?);
     }
+    anyhow::ensure!(
+        metadata.size_hint() <= MAX_INODE_METADATA,
+        "inode metadata exceeds the 4 MiB transfer limit"
+    );
     Ok(Some(Box::new(metadata)))
 }
 pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) -> Result<()> {
@@ -389,16 +433,28 @@ pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) ->
     );
     #[cfg(target_os = "linux")]
     {
-        if metadata.acls.is_some() || metadata.xattrs.is_some() {
+        if metadata.acls.is_some() || metadata.macos_acl.is_some() || metadata.xattrs.is_some() {
             platform::apply(file, metadata, mode)?;
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         let _ = mode;
         anyhow::ensure!(
-            metadata.acls.is_none() && metadata.xattrs.is_none(),
-            "Linux inode metadata cannot be applied on this platform"
+            metadata.acls.is_none(),
+            "Linux POSIX ACLs cannot be converted to macOS ACLs"
+        );
+        // Apply attributes before restrictive ACLs that may deny later writes.
+        if let Some(attributes) = &metadata.xattrs {
+            macos_xattrs::apply(file, attributes)?;
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = mode;
+        anyhow::ensure!(
+            metadata.acls.is_none() && metadata.macos_acl.is_none() && metadata.xattrs.is_none(),
+            "inode metadata cannot be applied on this platform"
         );
     }
     if let Some(atime) = metadata.atime {
@@ -474,6 +530,10 @@ pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) ->
                 }
             }
         }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(acl) = &metadata.macos_acl {
+        macos_acl::apply(file, acl)?;
     }
     Ok(())
 }
@@ -577,4 +637,63 @@ mod timestamp_tests {
             Timestamp::default()
         );
     }
+}
+
+/// ACL models are not interchangeable. Check the negotiated endpoints before
+/// registering or creating the destination, including for empty source trees.
+pub(crate) fn validate_acl_platforms(source: &str, destination: &str) -> Result<()> {
+    let model = |platform: &str| {
+        if platform.starts_with("linux-") {
+            Some("POSIX")
+        } else if platform.starts_with("macos-") {
+            Some("macOS")
+        } else {
+            None
+        }
+    };
+    anyhow::ensure!(model(source).is_some() && model(source) == model(destination),
+        "ACL preservation requires matching Linux POSIX or macOS ACL models ({source} -> {destination}); ACL conversion is unsupported");
+    Ok(())
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    #[test]
+    fn acl_models_match_across_architectures_but_not_operating_systems() {
+        assert!(validate_acl_platforms("linux-x86_64", "linux-aarch64").is_ok());
+        assert!(validate_acl_platforms("macos-x86_64", "macos-aarch64").is_ok());
+        assert!(validate_acl_platforms("linux-x86_64", "macos-aarch64").is_err());
+        assert!(validate_acl_platforms("macos-aarch64", "linux-x86_64").is_err());
+        assert!(validate_acl_platforms("unknown", "unknown").is_err());
+    }
+}
+
+/// Validate representable names/values before scheduling writes. Receiver-side
+/// checks remain necessary for refreshed source metadata and untrusted requests.
+pub(crate) fn validate_xattr_destination(
+    attributes: &ExtendedAttributes,
+    platform: &str,
+) -> Result<()> {
+    for (name, value) in &attributes.values {
+        if platform.starts_with("macos-") {
+            let name = name
+                .strip_prefix(b"user.")
+                .context("macOS can receive only Linux user.* extended attributes")?;
+            anyhow::ensure!(
+                !name.is_empty()
+                    && name.len() <= 127
+                    && !name.contains(&0)
+                    && name != b"com.apple.system.Security"
+                    && name != b"com.apple.decmpfs",
+                "invalid or storage-internal macOS extended attribute"
+            );
+        } else {
+            anyhow::ensure!(
+                name.len() <= 255 && value.len() <= 65536,
+                "extended attribute exceeds Linux's name or value limit"
+            );
+        }
+    }
+    Ok(())
 }

@@ -13,6 +13,7 @@ pub(super) struct Planner<'a> {
     /// Capability reported by the destination receiver's authenticated
     /// handshake. The coordinator may be running on a different platform.
     pub(super) destination_supports_confined_socket_nodes: bool,
+    pub(super) destination_metadata_platform: String,
     /// Destination paths claimed by source entries (see `Claim`).
     pub(super) dst_seen: std::collections::HashMap<PathBytes, Claim>,
     /// Directories this run will not create — --existing: they don't exist
@@ -1349,6 +1350,25 @@ impl Planner<'_> {
     /// Everything after the mapping loop: stat, create directories, filter,
     /// enqueue.
     pub(super) fn apply_mapped(&mut self, mapped: Mapped) -> Result<()> {
+        if self.opts.inode_preservation.xattrs {
+            for entry in mapped
+                .dirs
+                .iter()
+                .map(|(_, _, e)| e)
+                .chain(mapped.others.iter().map(|p| &p.e))
+            {
+                if let Some(attributes) = entry
+                    .inode_metadata
+                    .as_ref()
+                    .and_then(|m| m.xattrs.as_ref())
+                {
+                    crate::inode_metadata::validate_xattr_destination(
+                        attributes,
+                        &self.destination_metadata_platform,
+                    )?;
+                }
+            }
+        }
         if self.collision {
             return Ok(());
         }

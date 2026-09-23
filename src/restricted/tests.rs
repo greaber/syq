@@ -4637,6 +4637,7 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
             access: None,
             default: None,
         }),
+        macos_acl: None,
         xattrs: None,
         atime: None,
         crtime: None,
