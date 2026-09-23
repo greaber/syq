@@ -1258,6 +1258,9 @@ pub enum Response {
         size: Option<u64>,
         metadata: Option<Meta>,
     },
+    /// Cumulative bytes written by the current CopyLocal request. This is
+    /// progress only; a terminal response still determines success.
+    CopyLocalProgress(u64),
     Published {
         dev: u64,
         ino: u64,

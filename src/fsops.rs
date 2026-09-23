@@ -167,12 +167,12 @@ enum FileSystemKey {
 }
 
 // Whole-file copying uses Linux offload or macOS cloning.
-#[derive(Clone, Copy)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-struct CopyLocalPolicy {
+struct CopyLocalPolicy<'a> {
     inplace: bool,
     allow_sequential_nfs_fallback: bool,
     allow_sequential_local_fallback: bool,
+    progress: &'a mut dyn FnMut(u64) -> Result<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
