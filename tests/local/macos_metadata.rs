@@ -231,3 +231,69 @@ fn native_metadata_survives_lost_publication_reply_and_plain_copy_does_not_selec
     verify(&t.path("source"), &t.path("remote"));
     assert_eq!(read(&t.path("source")), read(&t.path("remote")));
 }
+
+#[test]
+fn compressed_storage_is_excluded_and_resource_fork_conflicts_fail_without_corruption() {
+    use std::os::macos::fs::MetadataExt;
+    let t = Tmp::new();
+    let data = b"compressible metadata test\n".repeat(200_000);
+    write(&t.path("original"), &data);
+    let output = Command::new("/usr/bin/ditto")
+        .arg("--hfsCompression")
+        .args([&t.s("original"), &t.s("compressed")])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_ne!(
+        fs::metadata(t.path("compressed")).unwrap().st_flags() & libc::UF_COMPRESSED,
+        0
+    );
+    set_attr(&t.path("compressed"), "org.syq.binary", b"public attribute");
+    run_ok(&["-aAX", &t.s("compressed"), &t.s("copy")]);
+    assert_eq!(read(&t.path("copy")), data);
+    assert_eq!(
+        fs::metadata(t.path("copy")).unwrap().st_flags() & libc::UF_COMPRESSED,
+        0
+    );
+    assert_eq!(
+        attr(&t.path("copy"), "org.syq.binary"),
+        Some(b"public attribute".to_vec())
+    );
+    set_attr(
+        &t.path("original"),
+        "com.apple.ResourceFork",
+        b"user resource fork",
+    );
+    let output = compat_command()
+        .args(["-aXc", &t.s("original"), &t.s("compressed")])
+        .run()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("resource fork on a compressed destination"),
+        "{output:?}"
+    );
+    assert_eq!(read(&t.path("compressed")), data);
+}
+
+#[test]
+fn an_acl_denying_deletion_can_be_published() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"protected content");
+    chmod(&t.path("source"), &["+a", "everyone deny delete"]);
+    let expected = acl(&t.path("source"));
+    let output = compat_command()
+        .args(["-aA", &t.s("source"), &t.s("copy")])
+        .run()
+        .unwrap();
+    let copied = t.path("copy").exists().then(|| acl(&t.path("copy")));
+    // Remove the fixture's deletion denial even when publication failed.
+    chmod(&t.path("source"), &["-N"]);
+    if copied.is_some() {
+        chmod(&t.path("copy"), &["-N"]);
+    }
+    assert_output_ok(&output);
+    assert_eq!(copied, Some(expected));
+    assert_eq!(read(&t.path("copy")), b"protected content");
+}
