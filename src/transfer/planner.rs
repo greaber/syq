@@ -1243,11 +1243,34 @@ impl Planner<'_> {
         }
     }
 
+    pub(super) fn buffered_file_population(&self, fast_limit: u64) -> (usize, u64, bool) {
+        let mut files = 0;
+        let mut bytes = 0u64;
+        let mut all_small = true;
+        for planned in self
+            .buffer
+            .iter()
+            .flatten()
+            .flat_map(|mapped| &mapped.others)
+        {
+            let entry = &planned.e;
+            if entry.kind == Kind::File
+                && self.opts.max_size.is_none_or(|max| entry.size <= max)
+                && self.opts.min_size.is_none_or(|min| entry.size >= min)
+            {
+                files += 1;
+                bytes = bytes.saturating_add(entry.size);
+                all_small &= entry.size <= fast_limit;
+            }
+        }
+        (files, bytes, all_small)
+    }
+
     /// Several sources: every batch has been mapped and claimed, nothing
     /// applied. Contested claims (two sources naming one regular file) are
     /// fine only when one of them *is* the destination file; settle those
     /// with one stat pass, then apply everything if there was no conflict.
-    pub(super) fn replay_buffered(&mut self) -> Result<()> {
+    pub(super) fn replay_buffered(&mut self, before_apply: impl FnOnce()) -> Result<()> {
         let Some(mut buffered) = self.buffer.take() else {
             return Ok(());
         };
@@ -1338,8 +1361,17 @@ impl Planner<'_> {
                 p.contested = false;
             }
         }
+        before_apply();
         for m in buffered {
             self.apply_mapped(m)?;
+            #[cfg(debug_assertions)]
+            if !self.sched.jobs.lock().unwrap().is_empty() {
+                crate::fsops::test_race_barrier(
+                    "SYQ_TEST_PLANNED_BATCH_READY_FILE",
+                    "SYQ_TEST_PLANNED_BATCH_CONTINUE_FILE",
+                    "buffered planning batch",
+                )?;
+            }
         }
         if !self.collision {
             self.finish_hardlink_planning()?;

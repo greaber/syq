@@ -776,8 +776,85 @@ pub(crate) fn send_message(socket: RawFd, payload: &[u8], descriptors: &[RawFd])
 /// Receive one payload of at most `max_payload` bytes and the descriptors
 /// sent with it, each wrapped exactly once and close-on-exec.
 pub(crate) fn receive_message(
+    socket: &UnixStream,
+    max_payload: usize,
+) -> io::Result<(Vec<u8>, Vec<File>)> {
+    #[cfg(target_os = "macos")]
+    return receive_message_waiting(socket, max_payload);
+    #[cfg(not(target_os = "macos"))]
+    loop {
+        match receive_message_once(socket.as_raw_fd(), max_payload, 0) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+// Darwin cannot receive SCM_RIGHTS with close-on-exec set atomically. Only
+// the nonblocking receive and descriptor protection belong under the launch
+// guard; waiting for a slow pool must not serialize unrelated child launches.
+#[cfg(any(target_os = "macos", test))]
+fn receive_message_waiting(
+    socket: &UnixStream,
+    max_payload: usize,
+) -> io::Result<(Vec<u8>, Vec<File>)> {
+    use std::time::Instant;
+    let deadline = socket
+        .read_timeout()?
+        .map(|timeout| Instant::now() + timeout);
+    let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let nonblocking = flags & libc::O_NONBLOCK != 0;
+    loop {
+        let result = crate::process::with_inheritance_guard(|| {
+            receive_message_once(socket.as_raw_fd(), max_payload, libc::MSG_DONTWAIT)
+        });
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted && nonblocking => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock && !nonblocking => {}
+            result => return result,
+        }
+        loop {
+            let milliseconds = match deadline {
+                None => -1,
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::ErrorKind::WouldBlock.into());
+                    }
+                    remaining
+                        .as_nanos()
+                        .div_ceil(1_000_000)
+                        .min(i32::MAX as u128) as i32
+                }
+            };
+            let mut poll = libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll, 1, milliseconds) };
+            if ready > 0 {
+                break;
+            }
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            // A signal or an early timeout must not restart the socket's budget.
+        }
+    }
+}
+
+fn receive_message_once(
     socket: RawFd,
     max_payload: usize,
+    flags: libc::c_int,
 ) -> io::Result<(Vec<u8>, Vec<File>)> {
     let mut payload = vec![0u8; max_payload];
     let mut iovec = libc::iovec {
@@ -793,26 +870,18 @@ pub(crate) fn receive_message(
     message.msg_control = unsafe { control.bytes.as_mut_ptr().cast() };
     message.msg_controllen = MESSAGE_CONTROL_LEN as _;
     #[cfg(target_os = "linux")]
-    let flags = libc::MSG_CMSG_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
-    let flags = 0;
-    let received = loop {
-        let received = unsafe { libc::recvmsg(socket, &mut message, flags) };
-        if received > 0 {
-            break received as usize;
-        }
-        if received == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "peer closed without a message",
-            ));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    };
-    payload.truncate(received);
+    let flags = flags | libc::MSG_CMSG_CLOEXEC;
+    let received = unsafe { libc::recvmsg(socket, &mut message, flags) };
+    if received < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if received == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed without a message",
+        ));
+    }
+    payload.truncate(received as usize);
     let mut descriptors = Vec::new();
     let mut malformed = message.msg_flags & libc::MSG_CTRUNC != 0;
     // SAFETY: as in receive_descriptor; every received descriptor is wrapped
@@ -1299,5 +1368,140 @@ mod tests {
         let debug = format!("{ticket:?}");
         assert!(debug.contains("root_id"));
         assert!(!debug.contains(&hex(&ticket.secret)));
+    }
+}
+
+#[cfg(test)]
+mod message_receive_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    #[test]
+    fn delayed_message_keeps_descriptors_protected_and_socket_flags_unchanged() {
+        let (receiver, sender) = UnixStream::pair().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let flags = unsafe { libc::fcntl(receiver.as_raw_fd(), libc::F_GETFL) };
+        let temporary = crate::test_support::tempdir().unwrap();
+        let file = File::create(temporary.path().join("payload")).unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            send_message(sender.as_raw_fd(), b"reply", &[file.as_raw_fd()]).unwrap();
+        });
+        let (message, descriptors) = receive_message_waiting(&receiver, 32).unwrap();
+        assert_eq!(message, b"reply");
+        assert_eq!(descriptors.len(), 1);
+        assert_ne!(
+            unsafe { libc::fcntl(descriptors[0].as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(receiver.as_raw_fd(), libc::F_GETFL) },
+            flags
+        );
+        assert_eq!(
+            receiver.read_timeout().unwrap(),
+            Some(Duration::from_secs(2))
+        );
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn silent_peer_obeys_socket_timeout_and_nonblocking_mode() {
+        let (receiver, _sender) = UnixStream::pair().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            receive_message_waiting(&receiver, 32).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(start.elapsed() >= Duration::from_millis(40));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            receive_message_waiting(&receiver, 32).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn peer_eof_is_not_a_timeout() {
+        let (receiver, sender) = UnixStream::pair().unwrap();
+        drop(sender);
+        assert_eq!(
+            receive_message_waiting(&receiver, 32).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn waiting_for_a_message_does_not_block_child_launches() {
+        let (receiver, sender) = UnixStream::pair().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let receiving = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            receive_message_waiting(&receiver, 32)
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let start = Instant::now();
+        let status = std::process::Command::new("/usr/bin/true")
+            .status_guarded()
+            .unwrap();
+        let elapsed = start.elapsed();
+        send_message(sender.as_raw_fd(), b"ready", &[]).unwrap();
+        assert!(status.success());
+        assert_eq!(receiving.join().unwrap().unwrap().0, b"ready");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "child launch waited for a silent peer: {elapsed:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn received_descriptors_share_the_child_launch_guard() {
+        let (receiver, sender) = UnixStream::pair().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
+        let file = File::create(temporary.path().join("payload")).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let receiving = crate::process::with_inheritance_guard(|| {
+            send_message(sender.as_raw_fd(), b"ready", &[file.as_raw_fd()]).unwrap();
+            let receiving = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = receive_message(&receiver, 32);
+                done_tx.send(()).unwrap();
+                result
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+            receiving
+        });
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (_, descriptors) = receiving.join().unwrap().unwrap();
+        assert_eq!(descriptors.len(), 1);
+        assert_ne!(
+            unsafe { libc::fcntl(descriptors[0].as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
     }
 }

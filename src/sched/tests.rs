@@ -855,3 +855,42 @@ fn retry_of_an_empty_claim_preserves_finalization() {
     assert!(!inner.outstanding.contains_key(&5));
     assert_eq!(inner.finishes, vec![(5, false)]);
 }
+
+#[test]
+fn preflight_release_runs_jobs_without_treating_an_empty_queue_as_eof() {
+    let sched = Arc::new(Sched::new(64, 128));
+    sched.push_file(test_job(b"first", 1));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_sched = sched.clone();
+    let worker = std::thread::spawn(move || {
+        while let Item::File(index) = worker_sched.next() {
+            worker_sched.ranges_ready(index, Vec::new());
+            tx.send(Some(index)).unwrap();
+        }
+        tx.send(None).unwrap();
+    });
+    assert!(rx
+        .recv_timeout(std::time::Duration::from_millis(30))
+        .is_err());
+    sched.release_preflighted_work();
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+        Some(0)
+    );
+    assert!(!sched.finished());
+    assert!(rx
+        .recv_timeout(std::time::Duration::from_millis(30))
+        .is_err());
+    sched.push_file(test_job(b"second", 1));
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+        Some(1)
+    );
+    sched.scan_done();
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+        None
+    );
+    worker.join().unwrap();
+    assert!(sched.finished());
+}
