@@ -283,3 +283,228 @@ fn hardlink_representatives_keep_the_local_copy_path() {
     assert_eq!(tuning_observed(&output)["local_whole_files"], 1);
     assert_eq!(tuning_observed(&output)["range_requests"], 0);
 }
+
+fn hash_manifest(expected: &[Option<(&str, String)>]) -> String {
+    expected
+        .iter()
+        .enumerate()
+        .map(|(index, hash)| {
+            let name = format!("file-{index}");
+            let mut entry = serde_json::json!({
+                "src": {"encoding":"utf-8", "value":name},
+                "dst": {"encoding":"utf-8", "value":name}, "kind":"file"
+            });
+            if let Some((algorithm, value)) = hash {
+                entry["expected_hash"] = serde_json::json!({"algorithm":algorithm,"value":value});
+            }
+            entry.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn hardlink_hash_assertions_accept_omitted_repeated_and_mixed_algorithms() {
+    use sha2::Digest as _;
+    let bytes = prng(2 * 1024 * 1024 + 53, 318);
+    let sha = (
+        "sha256",
+        sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    );
+    let blake = ("blake3", blake3::hash(&bytes).to_hex().to_string());
+    for hashes in [
+        vec![None, Some(sha.clone())],
+        vec![Some(sha.clone()), None],
+        vec![Some(sha.clone()), Some(sha.clone())],
+        vec![None, Some(sha.clone()), Some(blake), Some(sha.clone())],
+    ] {
+        for extra in [
+            &[][..],
+            &["--performance-tuning=copy-path=ranges"],
+            &["--inplace"],
+        ] {
+            let t = Tmp::new();
+            write(&t.path("src/file-0"), &bytes);
+            for index in 1..hashes.len() {
+                fs::hard_link(t.path("src/file-0"), t.path(&format!("src/file-{index}"))).unwrap();
+            }
+            let manifest = hash_manifest(&hashes);
+            let mut args = vec![
+                "--preserve=hardlinks",
+                "--mapping",
+                "-",
+                "-C",
+                "src",
+                "--into",
+                "dst",
+                "--results",
+                "results.ndjson",
+            ];
+            args.extend_from_slice(extra);
+            for phase in 0..4 {
+                if phase > 0 {
+                    fs::remove_file(t.path("results.ndjson")).unwrap();
+                }
+                if phase == 2 {
+                    fs::remove_file(t.path("dst/file-1")).unwrap();
+                } else if phase == 3 {
+                    // Same size and mtime must not hide a failed assertion,
+                    // including when only a follower supplied the requirement.
+                    let metadata = fs::metadata(t.path("dst/file-0")).unwrap();
+                    write(&t.path("dst/file-0"), &vec![0; bytes.len()]);
+                    fs::File::open(t.path("dst/file-0"))
+                        .unwrap()
+                        .set_times(fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+                        .unwrap();
+                }
+                let output = syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes()));
+                assert_output_ok(&output);
+                for index in 0..hashes.len() {
+                    let path = t.path(&format!("dst/file-{index}"));
+                    assert_eq!(read(&path), bytes);
+                    assert_eq!(identity(&path), identity(&t.path("dst/file-0")));
+                }
+                if phase == 0 {
+                    let records: Vec<serde_json::Value> =
+                        fs::read_to_string(t.path("results.ndjson"))
+                            .unwrap()
+                            .lines()
+                            .map(|line| serde_json::from_str(line).unwrap())
+                            .collect();
+                    for (index, expected) in hashes.iter().enumerate() {
+                        let name = format!("file-{index}");
+                        let record = records
+                            .iter()
+                            .find(|r| r["type"] == "operation_result" && r["dst"]["value"] == name)
+                            .unwrap();
+                        match expected {
+                            Some((algorithm, value)) => assert_eq!(
+                                record["expected_hash"],
+                                serde_json::json!({"algorithm":algorithm,"value":value})
+                            ),
+                            None => assert!(record.get("expected_hash").is_none()),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn hardlink_hash_conflicts_and_failed_alias_assertions_do_not_publish_the_group() {
+    let correct = blake3::hash(b"source").to_hex().to_string();
+    for hashes in [
+        vec![
+            Some(("blake3", correct.clone())),
+            Some(("blake3", "0".repeat(64))),
+        ],
+        vec![Some(("blake3", correct)), Some(("sha256", "0".repeat(64)))],
+        vec![None, Some(("sha256", "0".repeat(64)))],
+    ] {
+        for existing in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("src/file-0"), b"source");
+            fs::hard_link(t.path("src/file-0"), t.path("src/file-1")).unwrap();
+            if existing {
+                write(&t.path("dst/file-0"), b"old first");
+                write(&t.path("dst/file-1"), b"old second");
+            }
+            let manifest = hash_manifest(&hashes);
+            let output = syq_cp_in(
+                &t.path(""),
+                &[
+                    "--preserve=hardlinks",
+                    "--mapping",
+                    "-",
+                    "-C",
+                    "src",
+                    "--into",
+                    "dst",
+                ],
+                Some(manifest.as_bytes()),
+            );
+            assert!(!output.status.success(), "{output:?}");
+            assert!(stderr_of(&output).contains("expected"), "{output:?}");
+            if existing {
+                assert_eq!(read(&t.path("dst/file-0")), b"old first");
+                assert_eq!(read(&t.path("dst/file-1")), b"old second");
+            } else {
+                assert!(!t.path("dst/file-0").exists());
+                assert!(!t.path("dst/file-1").exists());
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hardlink_mixed_hashes_cross_transports_and_recover_lost_publication_reply() {
+    use sha2::Digest as _;
+    let data = prng(2 * 1024 * 1024 + 17, 319);
+    let sha = sha2::Sha256::digest(&data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let manifest = hash_manifest(&[
+        None,
+        Some(("sha256", sha)),
+        Some(("blake3", blake3::hash(&data).to_hex().to_string())),
+    ]);
+    for tcp in [false, true] {
+        for pull in [false, true] {
+            let t = Tmp::new();
+            let rsh = fake_rsh(&t);
+            write(&t.path("src/file-0"), &data);
+            for index in 1..3 {
+                fs::hard_link(t.path("src/file-0"), t.path(&format!("src/file-{index}"))).unwrap();
+            }
+            write(&t.path("mapping.ndjson"), manifest.as_bytes());
+            let marker = t.path("drop-finalize-once");
+            for _ in 0..2 {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.arg("cp");
+                if pull {
+                    command.args(["--from", "fake"]);
+                }
+                command.args([
+                    "--preserve=hardlinks",
+                    "--mapping",
+                    &t.s("mapping.ndjson"),
+                    "-C",
+                    &t.s("src"),
+                    "--into",
+                    &t.s("dst"),
+                    "--rsh",
+                    rsh.to_str().unwrap(),
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--tcp-ports",
+                    EPHEMERAL_TCP_PORTS,
+                    "--performance-tuning=workers=1,copy-path=ranges",
+                    "--no-progress",
+                ]);
+                if !pull {
+                    command.args(["--to", "fake"]);
+                }
+                if !tcp {
+                    command.arg("--no-tcp");
+                }
+                command
+                    .env("SYQ_TEST_DROP_AFTER_REQUEST", "finalize")
+                    .env("SYQ_TEST_DROP_MARKER", &marker);
+                assert_output_ok(&command.run().unwrap());
+                assert!(marker.exists(), "publication reply was not dropped");
+                for index in 0..3 {
+                    let path = t.path(&format!("dst/file-{index}"));
+                    assert_eq!(read(&path), data);
+                    assert_eq!(identity(&path), identity(&t.path("dst/file-0")));
+                }
+                assert!(partial_files(&t.0).is_empty());
+            }
+        }
+    }
+}

@@ -222,6 +222,7 @@ fn pipeline_worker(
         hash_policy: Default::default(),
         mapping_metadata: Default::default(),
         mapping_expected_hashes: Default::default(),
+        hardlink_expected_hashes: Default::default(),
         block: 512,
         tuning: crate::transfer_tuning::TransferTuning {
             copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
