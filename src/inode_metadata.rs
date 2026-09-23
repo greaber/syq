@@ -136,6 +136,9 @@ mod platform {
             return Err(error).with_context(|| format!("read attribute {:?}", name));
         }
         value.truncate(count as usize);
+        // These values live in the scan plan. Do not retain a 64 KiB read
+        // buffer for every tiny ACL or attribute on a large source tree.
+        value.shrink_to_fit();
         Ok(Some(value))
     }
     fn set(file: &File, name: &[u8], value: Option<&[u8]>) -> Result<()> {
