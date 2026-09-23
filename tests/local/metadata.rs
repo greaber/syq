@@ -594,6 +594,21 @@ fn access_time(path: &Path) -> (i64, i64) {
 }
 
 #[test]
+fn unchanged_symlink_access_time_is_restored_after_target_comparison() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("source")).unwrap();
+    std::os::unix::fs::symlink("missing", t.path("source/link")).unwrap();
+    for _ in 0..2 {
+        set_access_time(&t.path("source/link"), 700_000_000, 123_456_789);
+        let expected = access_time(&t.path("source/link"));
+        // On a rerun the destination already has this time, but reading its
+        // target can update it after the planner's initial stat (e.g. on XFS).
+        run_ok(&["-aHU", &t.s("source/"), &t.s("destination/")]);
+        assert_eq!(access_time(&t.path("destination/link")), expected);
+    }
+}
+
+#[test]
 fn access_times_survive_copy_updates_checksums_and_hardlinks() {
     let t = Tmp::new();
     write(&t.path("src/small"), b"small file");
