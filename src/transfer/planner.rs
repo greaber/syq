@@ -2081,7 +2081,10 @@ impl Planner<'_> {
                 let preexisting = existing_dirs.contains(name);
                 let succeeded = err.is_none();
                 let created = succeeded && !preexisting;
-                if created && opts.preserve_existing_directory_metadata {
+                if created
+                    && (opts.preserve_existing_directory_metadata
+                        || self.destination_children_known_missing)
+                {
                     self.created_dirs.insert(name.clone());
                 }
                 let os_kind = err.as_ref().and_then(wire_os_kind);
@@ -3173,20 +3176,20 @@ impl Planner<'_> {
         &mut self,
         paths: impl Iterator<Item = &'p PathBytes> + Clone,
     ) -> Result<Vec<Option<Entry>>> {
-        let root = if paths.clone().any(|path| path == &self.dst_root) {
-            self.stat_many(vec![self.dst_root.clone()])?.pop().flatten()
-        } else {
-            None
-        };
-        Ok(paths
-            .map(|path| {
-                if path == &self.dst_root {
-                    root.clone()
-                } else {
-                    None
-                }
-            })
-            .collect())
+        let mut stats = vec![None; paths.clone().count()];
+        // Earlier batches may have created a shared directory. Inspect it
+        // again so creation accounting and metadata decisions see that state.
+        let (positions, inspect): (Vec<_>, Vec<_>) = paths
+            .enumerate()
+            .filter(|(_, path)| *path == &self.dst_root || self.created_dirs.contains(*path))
+            .map(|(index, path)| (index, path.clone()))
+            .unzip();
+        if !inspect.is_empty() {
+            for (index, entry) in positions.into_iter().zip(self.stat_many(inspect)?) {
+                stats[index] = entry;
+            }
+        }
+        Ok(stats)
     }
 
     pub(super) fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {

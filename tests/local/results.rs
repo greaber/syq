@@ -617,6 +617,58 @@ fn native_cp_results_preexisting_directory_is_not_reported_created() {
 }
 
 #[test]
+fn fresh_shared_directory_is_reported_created_only_once() {
+    for empty_destination in [false, true] {
+        for only_new in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("a/shared/a"), b"a");
+            write(&t.path("b/shared/b"), b"b");
+            if empty_destination {
+                fs::create_dir(t.path("dst")).unwrap();
+            }
+            let mut args = vec![
+                "--srcs-in",
+                "a",
+                "--srcs-in",
+                "b",
+                "--into",
+                "dst",
+                "--results",
+                "results.ndjson",
+                "-q",
+            ];
+            if only_new {
+                args.push("--only-new");
+            }
+            let output = syq_cp_in(&t.path(""), &args, None);
+            assert_output_ok(&output);
+            assert_eq!(read(&t.path("dst/shared/a")), b"a");
+            assert_eq!(read(&t.path("dst/shared/b")), b"b");
+            let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results.ndjson"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let created: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    record["type"] == "operation_result"
+                        && record["action"] == "create_directory"
+                        && record["disposition"] == "succeeded"
+                })
+                .collect();
+            assert_eq!(
+                created.len(),
+                1,
+                "empty_destination={empty_destination}, only_new={only_new}: {created:?}"
+            );
+            assert_eq!(created[0]["dst"]["value"], "shared");
+            assert_eq!(records.last().unwrap()["directories_created"], 1);
+        }
+    }
+}
+
+#[test]
 fn native_cp_results_fatal_failure_emits_terminal_record() {
     let t = Tmp::new();
     let out = syq_cp_in(
