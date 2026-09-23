@@ -12,7 +12,7 @@ pub(super) fn starting_count(
         if (specific && !exact) || (!specific && !allow_route) {
             continue;
         }
-        let mut statement = db.prepare("SELECT id,day FROM runs WHERE route=?1 AND mode=?2 AND status='success' AND lost=0 AND (?3=0 OR (source_fs=?4 AND destination_fs=?5)) ORDER BY id DESC LIMIT 32")?;
+        let mut statement = db.prepare("SELECT id,day,CASE WHEN length(CAST(summary AS BLOB))<=65536 THEN summary END FROM runs WHERE route=?1 AND mode=?2 AND status='success' AND lost=0 AND (?3=0 OR (source_fs=?4 AND destination_fs=?5)) ORDER BY id DESC LIMIT 32")?;
         let runs = statement
             .query_map(
                 params![
@@ -22,20 +22,25 @@ pub(super) fn starting_count(
                     key.source_filesystem,
                     key.destination_filesystem
                 ],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut choices = Vec::new();
-        for (rank, (run, when)) in runs.into_iter().enumerate() {
-            let mut events =
-                db.prepare("SELECT data FROM events WHERE run=?1 ORDER BY sequence")?;
-            let records = events.query_map([run], |r| r.get::<_, String>(0))?;
-            let mut evidence = RunEvidence::default();
-            for record in records {
-                if let Ok(event) = serde_json::from_str::<Value>(&record?) {
-                    evidence.push(&event);
-                }
-            }
+        for (rank, (run, when, summary)) in runs.into_iter().enumerate() {
+            let evidence = summary
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|s| {
+                    serde_json::from_value::<RunEvidence>(s["measurement_totals"].clone()).ok()
+                });
+            let Some(evidence) = evidence else {
+                continue;
+            };
             if let Some((workers, refine)) = evidence.finish() {
                 let age = day().saturating_sub(when).max(0) as f64;
                 let weight = 2.0_f64.powf(-age / 7.0) / (rank + 1) as f64;
@@ -65,17 +70,20 @@ pub(super) fn starting_count(
     Ok(None)
 }
 
-#[derive(Default)]
-struct RunEvidence {
+#[derive(Default, Serialize, Deserialize)]
+pub(super) struct RunEvidence {
+    // Worker count -> (total activity, observed seconds, interval count).
+    // Persist measurements, never a selected starting count or a utility score.
     observations: BTreeMap<usize, (f64, f64, usize)>,
     consistent: bool,
     incompatible: bool,
 }
 
 impl RunEvidence {
-    fn push(&mut self, event: &Value) {
+    pub(super) fn push(&mut self, event: &Value) {
         if event["kind"] == "start" {
             self.incompatible |= event["data"]["automatic"] == false
+                || !event["data"]["worker_limit"].is_null()
                 || event["data"]
                     .get("overrides")
                     .is_some_and(|v| !v.is_null() && v != "None");
@@ -116,7 +124,9 @@ impl RunEvidence {
         let points: Vec<_> = self
             .observations
             .into_iter()
-            .filter(|(_, (_, seconds, count))| *seconds >= 2.5 && *count >= 2)
+            .filter(|(n, (_, seconds, count))| {
+                (1..=65536).contains(n) && seconds.is_finite() && *seconds >= 2.5 && *count >= 2
+            })
             .map(|(n, (activity, seconds, _))| (n, activity / seconds))
             .filter(|(_, rate)| rate.is_finite())
             .collect();
@@ -160,6 +170,60 @@ mod tests {
     fn observation(n: usize, rate: f64, usable: bool) -> Value {
         json!({"kind":"observation","data":{"active":n,
             "seconds":2.5,"rate":rate,"usable":usable}})
+    }
+
+    #[test]
+    fn worker_capped_runs_cannot_displace_unrestricted_comparisons() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let key = super::super::tests::key("a");
+        let record = |cap: Option<usize>, points: &[(usize, f64)]| {
+            let writer = super::super::tests::recorder(&path);
+            writer.context(&key);
+            writer.event("start", json!({"automatic":true,"worker_limit":cap}));
+            writer.event("learning_context", context()["data"].clone());
+            for &(n, rate) in points {
+                for _ in 0..2 {
+                    writer.event("observation", observation(n, rate, true)["data"].clone());
+                }
+            }
+            writer.finish(true, false, None, json!({}));
+            writer
+        };
+        let capped_only = record(Some(1), &[(1, 100.0)]);
+        assert!(capped_only.starting_count(&key, false).is_none());
+        record(None, &[(8, 100.0), (16, 200.0)]);
+        for (cap, points) in [(1, vec![(1, 100.0)]), (8, vec![(4, 100.0), (8, 200.0)])] {
+            let capped = record(Some(cap), &points);
+            assert_eq!(capped.starting_count(&key, false).unwrap().workers, 16);
+        }
+    }
+
+    #[test]
+    fn startup_reads_bounded_summaries_without_reading_timelines() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let key = super::super::tests::key("a");
+        let writer = super::super::tests::recorder(&path);
+        writer.context(&key);
+        writer.event("learning_context", context()["data"].clone());
+        for (n, rate) in [(8, 100.0), (16, 200.0)] {
+            for _ in 0..2 {
+                writer.event("observation", observation(n, rate, true)["data"].clone());
+            }
+        }
+        writer.finish(true, false, None, json!({}));
+        let db = Connection::open(path).unwrap();
+        // Lookup must work even with no timeline table: its size cannot affect
+        // the amount of event data fetched or parsed at startup.
+        db.execute("DROP TABLE events", []).unwrap();
+        assert_eq!(
+            starting_count(&db, &key, false).unwrap().unwrap().workers,
+            16
+        );
+        db.execute("UPDATE runs SET summary=?1", [" ".repeat(65537)])
+            .unwrap();
+        assert!(starting_count(&db, &key, false).unwrap().is_none());
     }
 
     #[test]

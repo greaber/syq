@@ -89,9 +89,9 @@ to the route, filesystems, transport, and copy settings when available. Starting
 choices are computed when a copy begins; earlier saved recommendations are not
 used. Short copies can contribute measurements without completing a tuning
 comparison. A starting choice is not a fixed limit or a promise of the best
-speed for a different workload. Startup learning uses the new
-observation records; older sample-only history remains available for inspection
-but does not determine starting counts.
+speed for a different workload. Startup learning reads per-worker measurement totals recorded during each copy;
+the detailed timeline remains available for inspection. Histories without those
+totals and runs with an explicit worker cap do not determine starting counts.
 
 On macOS and Linux, remote-copy hints also distinguish local networks using
 available default-router hardware addresses, without requesting Wi-Fi location

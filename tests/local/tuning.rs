@@ -1771,29 +1771,20 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
         .query_row("SELECT source_fs FROM runs LIMIT 1", [], |row| row.get(0))
         .unwrap();
     assert!(fs.is_some(), "test filesystem did not provide an identity");
-    // Seed observation records: saved recommendations are deliberately
-    // misleading and must not determine the starting count.
+    // Saved recommendations are misleading; only measurement totals count.
     db.execute("UPDATE runs SET eligible=1,workers=99", [])
         .unwrap();
-    db.execute(
-        "DELETE FROM events WHERE run=1 AND json_extract(data,'$.kind')='observation'",
-        [],
-    )
-    .unwrap();
-    let seed_samples = |workers: usize, sequence: i64| {
-        for index in 0..2 {
-            let event = serde_json::json!({"kind":"observation","data":{
-                "active":workers,"ready":workers,"failed":0,"seconds":2.5,
-                "rate":if workers == 2 {99.0} else {100.0},"usable":true
-            }});
-            db.execute(
-                "INSERT INTO events VALUES(1,?1,0,?2)",
-                rusqlite::params![sequence + index, event.to_string()],
-            )
-            .unwrap();
-        }
+    let mut totals = serde_json::json!({"observations":{},"consistent":true,"incompatible":false});
+    let mut seed_samples = |workers: usize| {
+        let rate = if workers == 2 { 99.0 } else { 100.0 };
+        totals["observations"][workers.to_string()] = serde_json::json!([rate * 5.0, 5.0, 2]);
+        db.execute(
+            "UPDATE runs SET summary=json_set(summary,'$.measurement_totals',json(?1)) WHERE id=1",
+            [totals.to_string()],
+        )
+        .unwrap();
     };
-    seed_samples(3, 100000);
+    seed_samples(3);
     let copy_with_hint = |name: &str, controls: &[&str]| {
         // Even these small copies can complete a tuning comparison on a slow
         // host. Keep later results from superseding the seeded run under test.
@@ -1818,6 +1809,17 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
         &["--resource-limits", "workers=2"],
     ));
     assert!(startup_doubling(3));
+    let capped_incompatible: bool = db
+        .query_row(
+            "SELECT json_extract(summary,'$.measurement_totals.incompatible') FROM runs WHERE id=3",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        capped_incompatible,
+        "explicit caps must not seed unrestricted starts"
+    );
     let event: String = db
         .query_row(
             "SELECT data FROM events WHERE run=3 AND json_extract(data,'$.kind')='starting_count'",
@@ -1842,7 +1844,7 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
     assert_eq!(event["data"]["workers"], 1);
     assert_eq!(event["data"]["reason"], "explicit");
     // Additional observations, not a saved discovery decision, establish a plateau.
-    seed_samples(2, 100002);
+    seed_samples(2);
     assert_output_ok(&copy_with_hint("confirmed", &[]));
     let workers: i64 = db
         .query_row(
@@ -2135,7 +2137,7 @@ fn whole_file_progress_reaches_tuner_before_completion() {
     }
 }
 
-/// Seed observations under the context established by a real
+/// Seed measurement totals under the context established by a real
 /// command. Tests must not depend on the implementation of opaque route tokens.
 pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) {
     let db = rusqlite::Connection::open(cache.with_extension("history-v1.sqlite")).unwrap();
@@ -2148,22 +2150,11 @@ pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) 
         [id],
     )
     .unwrap();
-    let context = serde_json::json!({"kind":"learning_context","data":{
-        "consistent":true,"automatic":true}});
+    let totals = serde_json::json!({"observations":{workers.to_string():[500.0,5.0,2]},
+        "consistent":true,"incompatible":false});
     db.execute(
-        "INSERT INTO events VALUES(?1,2,0,?2)",
-        rusqlite::params![id, context.to_string()],
+        "UPDATE runs SET summary=json_set(summary,'$.measurement_totals',json(?1)) WHERE id=?2",
+        rusqlite::params![totals.to_string(), id],
     )
     .unwrap();
-    for sequence in 0..2 {
-        let event = serde_json::json!({"kind":"observation","data":{
-            "active":workers,"ready":workers,"failed":0,"seconds":2.5,
-            "rate":100.0,"usable":true
-        }});
-        db.execute(
-            "INSERT INTO events VALUES(?1,?2,0,?3)",
-            rusqlite::params![id, sequence, event.to_string()],
-        )
-        .unwrap();
-    }
 }

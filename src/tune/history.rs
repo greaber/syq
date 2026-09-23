@@ -34,6 +34,7 @@ struct Writer {
     budget: u64,
     finished: bool,
     recommendation: Option<(usize, bool)>,
+    measurements: inference::RunEvidence,
     salt: [u8; 32],
 }
 
@@ -232,6 +233,7 @@ impl Recorder {
             budget,
             finished: false,
             recommendation: None,
+            measurements: Default::default(),
             salt,
         })));
         recorder.event("start", details);
@@ -290,9 +292,10 @@ impl Recorder {
         let sequence = state.sequence;
         state.sequence += 1;
         if state.pending.len() < MAX_PENDING {
-            state
-                .pending
-                .push(json!({"sequence":sequence,"elapsed_us":elapsed_us,"kind":kind,"data":data}));
+            let event =
+                json!({"sequence":sequence,"elapsed_us":elapsed_us,"kind":kind,"data":data});
+            state.measurements.push(&event);
+            state.pending.push(event);
         } else {
             state.lost += 1;
         }
@@ -447,8 +450,9 @@ impl Writer {
         success: bool,
         eligible: bool,
         workers: Option<usize>,
-        summary: Value,
+        mut summary: Value,
     ) -> Result<()> {
+        summary["measurement_totals"] = serde_json::to_value(&self.measurements)?;
         // Pay at most one small lock wait for the entire final save. Once the
         // immediate transaction owns the writer lock, samples, context and the
         // recommendation commit together without per-statement busy waits.
