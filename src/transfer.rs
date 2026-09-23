@@ -120,6 +120,10 @@ pub struct Opts {
     pub hash_policy: crate::hashing::HashPolicy,
     pub mapping_metadata: std::collections::HashMap<PathBytes, crate::mapping::Metadata>,
     pub mapping_expected_hashes: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
+    // Installed only for mapping assertions on hardlinked files, before those
+    // representatives enter the queue. Ordinary files keep their original path.
+    hardlink_expected_hashes:
+        std::sync::OnceLock<std::collections::HashMap<PathBytes, crate::hashing::ExpectedHashes>>,
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
@@ -244,6 +248,29 @@ impl Opts {
     fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
         self.mapping_expected_hashes.get(path)
     }
+    fn group_expected(
+        &self,
+        job: &crate::sched::FileJobData,
+    ) -> Option<&crate::hashing::ExpectedHashes> {
+        if !self.hardlinks {
+            return None;
+        }
+        self.hardlink_expected_hashes.get()?.get(&job.rel_bytes)
+    }
+
+    fn expected_hashes_for(
+        &self,
+        job: &crate::sched::FileJobData,
+    ) -> Option<crate::hashing::ExpectedHashes> {
+        self.group_expected(job)
+            .cloned()
+            .or_else(|| self.expected_for(&job.rel_bytes).cloned().map(Into::into))
+    }
+
+    fn has_expected_for(&self, job: &crate::sched::FileJobData) -> bool {
+        self.group_expected(job).is_some() || self.expected_for(&job.rel_bytes).is_some()
+    }
+
     fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
         crate::copy_policy::CopyPolicy {
             same_host: self.same_host,
@@ -1444,6 +1471,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .collect()
             })
             .unwrap_or_default(),
+        hardlink_expected_hashes: Default::default(),
         mapping_expected_hashes: mapping_entries
             .as_ref()
             .map(|(entries, _)| {

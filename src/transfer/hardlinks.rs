@@ -49,10 +49,9 @@ impl Planner<'_> {
                     &self.opts.metadata_for(&leaf.dst_rel, &leaf.e),
                     flags,
                 )
-                || self.opts.expected_for(rel) != self.opts.expected_for(&leaf.dst_rel)
             {
                 self.progress.error(&format!(
-                    "syq: hardlinked source paths {} and {} request conflicting destination metadata or hashes",
+                    "syq: hardlinked source paths {} and {} request conflicting destination metadata",
                     display(rel), display(&leaf.dst_rel)
                 ));
                 self.collision = true;
@@ -64,6 +63,17 @@ impl Planner<'_> {
                 dst: leaf.dst,
                 rel: leaf.dst_rel,
                 destination: destination.map(|e| (e.dev, e.ino)),
+            });
+        } else if !self.opts.mapping_expected_hashes.is_empty() {
+            // A later alias can add an assertion to this inode. Delay just
+            // these representatives until all eligible aliases are known.
+            self.hardlinks
+                .by_inode
+                .insert(identity, self.hardlinks.groups.len());
+            self.hardlinks.groups.push(Group {
+                representative: 0,
+                preview: Some(Box::new((leaf, destination))),
+                followers: Vec::new(),
             });
         } else if self.opts.dry_run
             && (!self.opts.checksum
@@ -142,6 +152,46 @@ impl Planner<'_> {
                 followers: Vec::new(),
             });
         }
+    }
+
+    pub(super) fn finish_hardlink_planning(&mut self) -> Result<()> {
+        if !self.opts.hardlinks || self.opts.mapping_expected_hashes.is_empty() {
+            return Ok(());
+        }
+        let mut hashes = std::collections::HashMap::new();
+        for group in &self.hardlinks.groups {
+            let (leaf, _) = &**group
+                .preview
+                .as_ref()
+                .expect("hashed groups wait for planning");
+            let required = crate::hashing::ExpectedHashes::collect(
+                std::iter::once(&leaf.dst_rel)
+                    .chain(group.followers.iter().map(|f| &f.rel))
+                    .filter_map(|path| self.opts.expected_for(path)),
+            )
+            .with_context(|| format!("hardlinked source {}", display(&leaf.dst_rel)))?;
+            if let Some(required) = required {
+                hashes.insert(leaf.dst_rel.clone(), required);
+            }
+        }
+        self.opts
+            .hardlink_expected_hashes
+            .set(hashes)
+            .expect("hardlink assertions set once");
+        // Publish the complete assertion map before any worker can see a job.
+        for index in 0..self.hardlinks.groups.len() {
+            let (leaf, destination) = *self.hardlinks.groups[index].preview.take().unwrap();
+            let representative = self.enqueue(
+                (leaf.src, leaf.source),
+                leaf.dst,
+                leaf.rel,
+                leaf.dst_rel,
+                leaf.e,
+                destination,
+            );
+            self.hardlinks.groups[index].representative = representative;
+        }
+        Ok(())
     }
 
     /// Workers have joined, but their per-file identities are still alive.
@@ -282,19 +332,22 @@ impl Planner<'_> {
                 self.progress.files_total.fetch_add(1, Relaxed);
                 self.progress.add_files(1);
                 if let Some(results) = self.progress.results_writer() {
-                    results.emit_operation(&crate::results::OperationRecord {
-                        action: "transfer_file",
-                        dst: &follower.rel,
-                        src: self.mapping_source_rel(&follower.rel).as_deref(),
-                        kind: "file",
-                        disposition: "succeeded",
-                        bytes: Some(0),
-                        attempts: Some(1),
-                        retryable: None,
-                        class: None,
-                        os_kind: None,
-                        message: None,
-                    });
+                    results.emit_operation_expected(
+                        &crate::results::OperationRecord {
+                            action: "transfer_file",
+                            dst: &follower.rel,
+                            src: self.mapping_source_rel(&follower.rel).as_deref(),
+                            kind: "file",
+                            disposition: "succeeded",
+                            bytes: Some(0),
+                            attempts: Some(1),
+                            retryable: None,
+                            class: None,
+                            os_kind: None,
+                            message: None,
+                        },
+                        self.opts.expected_for(&follower.rel),
+                    );
                 }
                 if self.opts.verbose > 0 {
                     self.progress.println(&format!(
@@ -386,7 +439,7 @@ impl Worker {
         meta.mode = self.create_mode(job);
         let response = ok(
             self.dst.call(Request::FinishBasis {
-                expected_hash: self.opts.expected_for(&job.rel_bytes).cloned(),
+                expected_hash: self.opts.expected_hashes_for(job),
                 path: job.dst.clone(),
                 copy_id: self.copy_id(),
                 meta,

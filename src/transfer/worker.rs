@@ -238,7 +238,7 @@ impl Worker {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
         !self.opts.dry_run
-            && self.opts.expected_for(&j.rel_bytes).is_none()
+            && !self.opts.has_expected_for(j)
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
             && jobs.destination(idx).is_none()
@@ -1668,7 +1668,7 @@ impl Worker {
         meta.mode = self.create_mode(&job);
         let finalized = ok(
             self.dst.call(Request::Finalize {
-                expected_hash: self.opts.expected_for(&job.rel_bytes).cloned(),
+                expected_hash: self.opts.expected_hashes_for(&job),
                 path: job.dst.clone(),
                 inplace: job.inplace,
                 copy_id: self.copy_id(),
@@ -1856,7 +1856,7 @@ impl Worker {
     // validates the expected digest. Explicit --hash continues to compare both
     // endpoints regardless of matching metadata or an expected digest.
     pub(super) fn try_expected_match(&mut self, idx: usize, job: &WorkerJob) -> Result<bool> {
-        let expected = self.opts.expected_for(&job.rel_bytes).cloned();
+        let expected = self.opts.expected_hashes_for(job);
         if expected.is_none() && !(self.opts.hardlinks && job.entry.nlink > 1) {
             return Ok(false);
         }
@@ -1913,7 +1913,7 @@ impl Worker {
     }
 
     pub(super) fn validate_expected_destination(&mut self, job: &WorkerJob) -> Result<()> {
-        if let Some(expected) = self.opts.expected_for(&job.rel_bytes).cloned() {
+        if let Some(expected) = self.opts.expected_hashes_for(job) {
             ok(
                 self.dst.call(Request::ValidateDigest {
                     path: job.dst.clone(),

@@ -837,7 +837,7 @@ pub enum WireRequest<Data> {
     /// renamed over the final path meanwhile, its complete file remains the
     /// winner and this only touches the now-unlinked old inode.
     FinishBasis {
-        expected_hash: Option<crate::hashing::Digest>,
+        expected_hash: Option<crate::hashing::ExpectedHashes>,
         path: PathBytes,
         copy_id: CopyId,
         meta: Meta,
@@ -910,7 +910,7 @@ pub enum WireRequest<Data> {
         guard: Option<ContainerGuard>,
     },
     Finalize {
-        expected_hash: Option<crate::hashing::Digest>,
+        expected_hash: Option<crate::hashing::ExpectedHashes>,
         path: PathBytes,
         inplace: bool,
         copy_id: CopyId,
@@ -994,7 +994,7 @@ pub enum WireRequest<Data> {
     ConfigureHashing(crate::hashing::HashPolicy),
     ValidateDigest {
         path: PathBytes,
-        expected: crate::hashing::Digest,
+        expected: crate::hashing::ExpectedHashes,
         guard: Option<ContainerGuard>,
     },
     DescriptorCopy(crate::descriptor_copy::Operation),
