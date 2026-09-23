@@ -592,6 +592,13 @@ impl Sched {
     /// Release validated jobs while the planner finishes preparing later
     /// batches. An empty queue is still a wait, not EOF, until scan_done.
     pub fn release_preflighted_work(&self) {
+        // Path-specific fixtures need the complete file population before any
+        // worker chooses a copy path. scan_done releases all workers after
+        // buffered replay, preserving their configured concurrency.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_COPY_AFTER_PLANNING").is_some() {
+            return;
+        }
         self.inner.lock().unwrap().work_released = true;
         self.cv.notify_all();
     }

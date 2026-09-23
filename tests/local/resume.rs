@@ -1269,6 +1269,7 @@ fn copy_local_disk_whole_files_write_concurrently() {
             &t.s("dst/"),
         ])
         .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_COPY_AFTER_PLANNING", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_COPY_LOCAL_FS", "local")
         .env("SYQ_TEST_COPY_LOCAL_WRITTEN_FILE", t.path("ready"))
