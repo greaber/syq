@@ -25,6 +25,7 @@ pub(super) fn starting_count(
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let local_copy = key.source_transport == "Local" && key.destination_transport == "Local";
         let mut choices = Vec::new();
         for (rank, (run, when)) in runs.into_iter().enumerate() {
             let mut events =
@@ -36,13 +37,26 @@ pub(super) fn starting_count(
                     evidence.push(&event);
                 }
             }
+            let corrected = evidence.corrected_local_progress;
             if let Some((workers, refine)) = evidence.finish() {
                 let age = day().saturating_sub(when).max(0) as f64;
                 let weight = 2.0_f64.powf(-age / 7.0) / (rank + 1) as f64;
                 if weight > 0.0 {
-                    choices.push((workers, weight, run, refine));
+                    choices.push((
+                        workers,
+                        weight,
+                        run,
+                        refine && (!local_copy || corrected),
+                        corrected,
+                    ));
                 }
             }
+        }
+        // Before policy 8, whole-file local copies reported completion bursts
+        // and could attribute draining writers to a reduced count. Keep this
+        // history as a fallback, without letting it outvote corrected evidence.
+        if local_copy && choices.iter().any(|c| c.4) {
+            choices.retain(|c| c.4);
         }
         // Each transfer contributes once; a long run's correlated intervals do
         // not outvote multiple independent runs. Compare relative rates within
@@ -50,7 +64,7 @@ pub(super) fn starting_count(
         choices.sort_by_key(|c| c.0);
         let half = choices.iter().map(|c| c.1).sum::<f64>() * 0.5;
         let mut cumulative = 0.0;
-        for (workers, weight, run, refine) in choices {
+        for (workers, weight, run, refine, _) in choices {
             cumulative += weight;
             if cumulative > half {
                 return Ok(Some(Hint {
@@ -72,10 +86,16 @@ struct RunEvidence {
     modern: bool,
     consistent: bool,
     incompatible: bool,
+    corrected_local_progress: bool,
 }
 
 impl RunEvidence {
     fn push(&mut self, event: &Value) {
+        if event["kind"] == "start" || event["kind"] == "policy_start" {
+            self.corrected_local_progress |= event["data"]["policy_version"]
+                .as_u64()
+                .is_some_and(|version| version >= 8);
+        }
         if event["kind"] == "start" {
             self.incompatible |= event["data"]["automatic"] == false
                 || event["data"]
@@ -195,6 +215,54 @@ mod tests {
     fn sample(n: usize, rate: f64, disposition: &str) -> Value {
         json!({"kind":"sample","data":{"active":n,"ready":n,"failed":0,
             "seconds":2.5,"rate":rate,"disposition":disposition}})
+    }
+
+    #[test]
+    fn corrected_local_history_takes_precedence_but_old_history_remains_a_fallback() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let mut key = super::super::tests::key("local");
+        key.source_transport = "Local".into();
+        key.destination_transport = "Local".into();
+        let add_run = |version, worker, usable| {
+            let writer = super::super::tests::recorder(&path);
+            writer.context(&key);
+            writer.event("policy_start", json!({"policy_version":version}));
+            for n in [worker, worker * 2] {
+                for _ in 0..2 {
+                    writer.event(
+                        "sample",
+                        sample(
+                            n,
+                            100.0,
+                            if usable {
+                                "stable"
+                            } else {
+                                "active_workers_settling"
+                            },
+                        )["data"]
+                            .clone(),
+                    );
+                }
+            }
+            writer.finish(true, false, None, json!({}));
+            writer
+        };
+        let old = add_run(7, 16, true);
+        let hint = old.starting_count(&key, false).unwrap();
+        assert_eq!(hint.workers, 16);
+        assert!(
+            !hint.refine,
+            "old reporting must not slow initial exploration"
+        );
+        let empty = add_run(8, 4, false);
+        assert_eq!(empty.starting_count(&key, false).unwrap().workers, 16);
+        add_run(8, 4, true);
+        // Even newer old-binary runs cannot displace corrected evidence.
+        let latest = add_run(7, 16, true);
+        let hint = latest.starting_count(&key, false).unwrap();
+        assert_eq!(hint.workers, 4);
+        assert!(hint.refine);
     }
 
     #[test]

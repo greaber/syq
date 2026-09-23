@@ -670,3 +670,107 @@ fn trace_clock_units_match_the_driver() {
         );
     }
 }
+
+#[test]
+fn driver_excludes_draining_writers_and_the_first_interval_after_drain() {
+    use crate::tune::{Gate, Meter, Policy, State, WholeFile};
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    struct Progress {
+        history: Recorder,
+        sched: Arc<crate::sched::Sched>,
+        start: Instant,
+        excess: Mutex<Option<WholeFile>>,
+        drained: AtomicBool,
+    }
+    impl Meter for Progress {
+        fn history(&self) -> Option<Recorder> {
+            Some(self.history.clone())
+        }
+        fn files(&self) -> u64 {
+            0
+        }
+        fn set_active(&self, _: usize) {}
+        fn bytes(&self) -> u64 {
+            let elapsed = self.start.elapsed().as_secs_f64();
+            if elapsed >= 3.0 && !self.drained.swap(true, Relaxed) {
+                self.excess.lock().unwrap().take();
+            }
+            if elapsed >= 6.5 {
+                self.sched.abort();
+            }
+            (elapsed * 1_000_000.0) as u64
+        }
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let history = recorder(&path);
+    let sched = Arc::new(crate::sched::Sched::new(4 << 20, 32 << 20));
+    sched.push_file(crate::sched::tests::test_job(b"pending", 1 << 30));
+    sched.scan_done();
+    let gate = Gate::new(4);
+    for id in 0..4 {
+        gate.mark_ready(id);
+    }
+    let excess = gate.whole_file(3);
+    gate.set_active(2);
+    let mut policy = Policy::new(2, 1, 4);
+    policy.state = State::Explore {
+        from: 4,
+        base: 100_000.0,
+        direction: crate::tune::Direction::Down,
+    };
+    let progress = Arc::new(Progress {
+        history: history.clone(),
+        sched: sched.clone(),
+        start: Instant::now(),
+        excess: Mutex::new(Some(excess)),
+        drained: AtomicBool::new(false),
+    });
+    crate::tune::run(policy, gate, sched, progress, |_| {
+        panic!("workers already ready")
+    });
+    history.finish(true, false, None, json!({}));
+    let db = Connection::open(path).unwrap();
+    let events: Vec<Value> = db
+        .prepare("SELECT data FROM events ORDER BY sequence")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+        .collect();
+    let observations: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "observation")
+        .collect();
+    let first_settled = observations
+        .iter()
+        .position(|e| e["data"]["settled"] == true)
+        .unwrap();
+    assert!(first_settled >= 2);
+    assert!(observations[..=first_settled]
+        .iter()
+        .all(|e| e["data"]["usable"] == false));
+    assert!(observations[first_settled + 1..]
+        .iter()
+        .any(|e| e["data"]["usable"] == true));
+    let first_clean_id = observations[first_settled + 1]["data"]["observation"]
+        .as_u64()
+        .unwrap();
+    let decisions: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "sequential_evidence")
+        .collect();
+    assert!(
+        !decisions.is_empty(),
+        "clean observations must eventually permit a decision"
+    );
+    for decision in decisions {
+        let data = &decision["data"];
+        let end = data["ending_observation"].as_u64().unwrap();
+        let count = data["score"]["intervals"].as_u64().unwrap();
+        assert!(
+            end + 1 - count >= first_clean_id,
+            "decision used draining-writer evidence"
+        );
+    }
+}

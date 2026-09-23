@@ -61,7 +61,7 @@ pub const START_LOCAL_LOW_CPU: usize = 16;
 /// Never auto-tune below this many.
 pub const MIN: usize = 1;
 /// Policy mechanics version recorded in transfer history.
-pub const POLICY_VERSION: u32 = 8;
+pub const POLICY_VERSION: u32 = 9;
 const STARTUP_STEP: usize = 2;
 
 /// Multiplicative step after discovery, or with a closely matched plateau hint.
@@ -1160,6 +1160,10 @@ impl Gate {
             .any(|slot| slot.whole_file)
     }
 
+    fn measurement_ready(&self, n: usize) -> bool {
+        self.ready_through(n) && !self.whole_files_draining(n)
+    }
+
     pub fn ready_through(&self, n: usize) -> bool {
         let slots = self.slots.lock().unwrap();
         slots.len() >= n
@@ -1255,7 +1259,7 @@ pub fn run(
     let mut observation_last = last;
     let mut observation_workers = active;
     let mut supplied =
-        sched.tuning_work(active, 0, FILE_CREDIT).parallel && gate.ready_through(active);
+        sched.tuning_work(active, 0, FILE_CREDIT).parallel && gate.measurement_ready(active);
     let mut interval_usable = true;
     let mut evidence = evidence::Evidence::default();
     meter.set_active(active);
@@ -1272,10 +1276,11 @@ pub fn run(
             let now = (meter.bytes(), meter.files());
             let seconds = observation_start.elapsed().as_secs_f64();
             let work = sched.tuning_work(active, 0, FILE_CREDIT);
+            let settled = gate.measurement_ready(active);
             let usable = observation_workers == active
                 && supplied
                 && work.parallel
-                && gate.ready_through(active)
+                && settled
                 && activity_rate(observation_last, now, seconds).is_some();
             let rate = activity_rate(observation_last, now, seconds);
             observation_id += 1;
@@ -1285,14 +1290,14 @@ pub fn run(
                     "observation":observation_id,"seconds":seconds,"cumulative_bytes":now.0,"cumulative_files":now.1,
                     "bytes":now.0.checked_sub(observation_last.0),
                     "files":now.1.checked_sub(observation_last.1),"rate":rate,
-                    "active":active,"usable":usable,"work":work
+                    "active":active,"usable":usable,"settled":settled,"work":work
                 }),
             );
             interval_usable &= usable;
             observation_start = Instant::now();
             observation_last = now;
             observation_workers = active;
-            supplied = work.parallel && gate.ready_through(active);
+            supplied = work.parallel && settled;
             if usable && active == policy.n {
                 if let (Some(rate), Some(base)) = (rate, policy.probe_base()) {
                     if let Some(score) = evidence.push(rate, seconds, base) {
@@ -1419,7 +1424,8 @@ pub fn run(
             observation_workers = active;
             observation_last = (meter.bytes(), meter.files());
             observation_start = Instant::now();
-            supplied = sched.tuning_work(active, 0, FILE_CREDIT).parallel;
+            supplied = sched.tuning_work(active, 0, FILE_CREDIT).parallel
+                && gate.measurement_ready(active);
             interval_usable = true;
             evidence.clear();
             sampler.reset();
@@ -1479,7 +1485,8 @@ pub fn run(
                 observation_workers = active;
                 observation_last = (meter.bytes(), meter.files());
                 observation_start = Instant::now();
-                supplied = sched.tuning_work(active, 0, FILE_CREDIT).parallel;
+                supplied = sched.tuning_work(active, 0, FILE_CREDIT).parallel
+                    && gate.measurement_ready(active);
                 interval_usable = true;
                 evidence.clear();
                 sampler.reset();
@@ -1504,7 +1511,7 @@ pub fn run(
                 let now = (meter.bytes(), meter.files());
                 let secs = sample_start.elapsed().as_secs_f64();
                 sample_start = std::time::Instant::now();
-                if !gate.ready_through(active) || gate.whole_files_draining(active) {
+                if !gate.measurement_ready(active) {
                     trace.sample(
                         last,
                         now,
@@ -1583,7 +1590,7 @@ pub fn run(
         // Only judge a configuration once every requested worker is actually
         // connected (ssh sessions can take seconds each), and excess whole-file
         // writers from a reduction have finished their non-preemptible copies.
-        if !gate.ready_through(active) || gate.whole_files_draining(active) {
+        if !gate.measurement_ready(active) {
             trace.sample(
                 last,
                 now,
@@ -1604,8 +1611,8 @@ pub fn run(
         let Some(rate) = activity_rate(last, now, secs) else {
             trace.sample(last, now, secs, &policy, &gate, "counter_regressed", None);
             // Progress can be retracted after uncertain acknowledgements. The
-            // production meter is monotonic, but keep the generic driver safe
-            // and discard any interval from a regressing implementation.
+            // production meter can retract provisional whole-file credit too;
+            // discard the affected interval instead of interpreting it as loss.
             last = now;
             sampler.reset();
             collapse_samples = 0;
@@ -1627,7 +1634,8 @@ pub fn run(
                 None,
             );
             sampler.reset();
-            evidence.clear();
+            // Fine evidence was cleared at the invalid observation itself.
+            // Keep any clean observations collected since then.
             collapse_samples = 0;
             continue;
         }

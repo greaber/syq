@@ -89,7 +89,10 @@ to the route, filesystems, transport, and copy settings when available. Starting
 choices are computed when a copy begins; earlier saved recommendations are not
 used. Short copies can contribute measurements without completing a tuning
 comparison. A starting choice is not a fixed limit or a promise of the best
-speed for a different workload.
+speed for a different workload. For local copies, measurements made with
+in-flight progress reporting take precedence over older completion-only
+measurements; older history remains a fallback when no usable corrected
+measurements are available.
 
 On macOS and Linux, remote-copy hints also distinguish local networks using
 available default-router hardware addresses, without requesting Wi-Fi location
