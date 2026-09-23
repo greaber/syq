@@ -2533,18 +2533,35 @@ fn set_meta_file_inner(
     before_publication: bool,
 ) -> Result<()> {
     use std::os::unix::io::AsRawFd;
-    // Owner first: chown clears setuid/setgid, so mode must be set afterwards.
-    let owner_changed =
-        apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
-            std::os::unix::fs::fchown(f, uid, gid)
-        })?;
-    // macOS mode and ACL must change together. Keep the private staging
+    // macOS mode and ACL must change together. Keep private staging
     // permissions until publication instead of opening a mode-only window.
     let atomic_acl_mode = cfg!(target_os = "macos")
         && meta
             .inode_metadata
             .as_ref()
             .is_some_and(|m| m.macos_acl.is_some());
+    if before_publication
+        && atomic_acl_mode
+        && flags & flags::OWNER != 0
+        && current.uid() != meta.uid
+    {
+        // The final owner may itself be denied read access by the source ACL.
+        // Do not hand that account the staging inode's owner read permission.
+        f.set_permissions(fs::Permissions::from_mode(0))?;
+    }
+    // Owner first: chown clears setuid/setgid, so final mode follows it.
+    let owner_changed =
+        apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
+            std::os::unix::fs::fchown(f, uid, gid)
+        })?;
+    #[cfg(debug_assertions)]
+    if before_publication && atomic_acl_mode && owner_changed {
+        test_race_barrier(
+            "SYQ_TEST_ACL_OWNER_READY_FILE",
+            "SYQ_TEST_ACL_OWNER_CONTINUE_FILE",
+            "ACL stage after ownership change",
+        )?;
+    }
     if flags & flags::MODE_MASK != 0 && !atomic_acl_mode {
         // On network filesystems every setattr is a round trip; skip it when
         // the mode is already right (but always run it after a chown that could

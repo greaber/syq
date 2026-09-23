@@ -544,3 +544,49 @@ fn acl_restoration_failure_cannot_be_accepted_as_a_content_match() {
         );
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+#[ignore = "requires root to preserve ownership of an ACL-denied owner"]
+fn acl_staging_stays_private_when_ownership_changes() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let t = Tmp::new();
+    let data = prng(32 * 1024, 921);
+    write(&t.path("source"), &data);
+    fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o644)).unwrap();
+    let nobody = unsafe { libc::getpwnam(c"nobody".as_ptr()) };
+    assert!(!nobody.is_null());
+    let uid = unsafe { (*nobody).pw_uid };
+    std::os::unix::fs::chown(t.path("source"), Some(uid), None).unwrap();
+    chmod(&t.path("source"), &["+a", "user:nobody deny read"]);
+    fs::create_dir(t.path("destination")).unwrap();
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let mut child = compat_command()
+        .args([
+            "-aA",
+            "--no-progress",
+            &t.s("source"),
+            &t.s("destination/file"),
+        ])
+        .env("SYQ_TEST_ACL_OWNER_READY_FILE", &ready)
+        .env("SYQ_TEST_ACL_OWNER_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "ACL stage after ownership change");
+    let stages = partial_files(&t.path("destination"));
+    assert_eq!(stages.len(), 1);
+    let metadata = fs::metadata(&stages[0]).unwrap();
+    release_confinement_barrier(&continuation);
+    assert_output_ok(&child.wait_with_output().unwrap());
+    assert_eq!(metadata.uid(), uid);
+    assert_eq!(
+        metadata.mode() & 0o777,
+        0,
+        "ownership change exposed the staging payload"
+    );
+    assert_eq!(read(&t.path("destination/file")), data);
+    assert_eq!(acl(&t.path("source")), acl(&t.path("destination/file")));
+}

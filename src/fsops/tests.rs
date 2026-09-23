@@ -4719,9 +4719,8 @@ fn acl_resume_replaces_previously_readable_staging_inodes() {
             assert!(std::process::Command::new("chmod")
                 .args(["+a", "everyone allow read"])
                 .arg(&path)
-                .run()
+                .status_guarded()
                 .unwrap()
-                .status
                 .success());
         }
         let root = Root::open(temporary.path()).unwrap();
