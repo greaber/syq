@@ -1004,3 +1004,97 @@ fn checksum_inplace_rerun_accepts_matching_readonly_destination() {
     assert_eq!(metadata.mode() & 0o7777, 0o400);
     assert_eq!(metadata.mtime(), 1_577_934_245);
 }
+
+fn check_new_readonly_inplace_copy(native: bool, fallback: bool, umask: libc::mode_t) {
+    let t = Tmp::new();
+    fs::create_dir(t.path("dst")).unwrap();
+    let data = prng(16 << 20, 96);
+    // Two files also cover the cached unsupported-filesystem result after
+    // the first CopyLocal probe falls back to ranges.
+    for name in ["a", "b"] {
+        let path = t.path(&format!("src/{name}"));
+        write(&path, &data);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        set_mtime(&path, 1_577_934_245);
+    }
+    let mut command = if native {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--no-tcp",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+        ]);
+        command
+    } else {
+        let mut command = compat_command();
+        command.args(["-a", "--syq-no-tcp", &t.s("src/"), &t.s("dst/")]);
+        command
+    };
+    command.args([
+        "--inplace",
+        "--performance-tuning=comparison-block-size=1M",
+        "--no-progress",
+    ]);
+    if fallback {
+        command
+            .arg("--performance-tuning=workers=1")
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "unsupported");
+    } else {
+        command.arg("--performance-tuning=copy-path=ranges,workers=4,split-min-size=1M");
+    }
+    // Set only the child umask; other tests keep their process-wide setting.
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(umask);
+            Ok(())
+        });
+    }
+    let output = command.env("SYQ_DEBUG", "1").run().unwrap();
+    assert_output_ok(&output);
+    let observed = tuning_observed(&output);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert!(observed["range_requests"].as_u64().unwrap() > 1);
+    for name in ["a", "b"] {
+        let destination = t.path(&format!("dst/{name}"));
+        assert_eq!(read(&destination), data);
+        let metadata = fs::metadata(&destination).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o400);
+        assert_eq!(metadata.mtime(), 1_577_934_245);
+    }
+    // Temporary write permission belongs only to fresh files. A later copy
+    // cannot use it to overwrite an existing read-only destination.
+    fs::set_permissions(t.path("src/a"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(t.path("src/a"), b"changed source").unwrap();
+    if unsafe { libc::geteuid() } != 0 {
+        let output = command.run().unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(read(&t.path("dst/a")), data);
+        assert_eq!(
+            fs::metadata(t.path("dst/a")).unwrap().mode() & 0o7777,
+            0o400
+        );
+    }
+}
+
+#[test]
+fn inplace_ranges_create_readonly_files_with_parallel_writers() {
+    for native in [false, true] {
+        for umask in [0o022, 0o222] {
+            check_new_readonly_inplace_copy(native, false, umask);
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn inplace_copy_local_fallback_creates_readonly_files() {
+    for native in [false, true] {
+        for umask in [0o022, 0o222] {
+            check_new_readonly_inplace_copy(native, true, umask);
+        }
+    }
+}

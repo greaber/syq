@@ -40,6 +40,20 @@ impl FsOps {
         root.create_file(relative, mode)
     }
 
+    fn create_inplace_file(root: &Root, relative: &RelativePath, mode: u32) -> Result<File> {
+        // Other range workers, or Prepare after a CopyLocal fallback, must
+        // reopen this new inode for writing. Finalize applies the requested
+        // mode after every writer is done. Never chmod an existing destination
+        // here: its write permissions still decide whether an update is allowed.
+        let file = root.create_file(relative, mode | 0o200)?;
+        let permissions = file.metadata()?.permissions();
+        if permissions.mode() & 0o200 == 0 {
+            // A umask or inherited default ACL can remove even owner write.
+            file.set_permissions(fs::Permissions::from_mode(permissions.mode() | 0o200))?;
+        }
+        Ok(file)
+    }
+
     fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
         #[cfg(target_os = "macos")]
         if self.inode_preservation.acls {
@@ -379,7 +393,7 @@ impl FsOps {
                         bail!("destination {} is a directory", target.label.display())
                     }
                     Some(_) => target.root.unlink(&target.relative)?,
-                    None => match target.root.create_file(&target.relative, mode) {
+                    None => match Self::create_inplace_file(&target.root, &target.relative, mode) {
                         Ok(file) => {
                             self.set_copy_length(&file, size).with_context(|| {
                                 format!("resize confined file {}", target.label.display())
@@ -823,17 +837,19 @@ impl FsOps {
                         bail!("destination {} is a directory", target_label.display())
                     }
                     Some(_) => destination_root.unlink(&target_relative)?,
-                    None => match destination_root.create_file(&target_relative, mode) {
-                        Ok(file) => {
-                            opened = Some(file);
-                            break;
+                    None => {
+                        match Self::create_inplace_file(&destination_root, &target_relative, mode) {
+                            Ok(file) => {
+                                opened = Some(file);
+                                break;
+                            }
+                            Err(error)
+                                if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                                    error.kind() == io::ErrorKind::AlreadyExists
+                                }) => {}
+                            Err(error) => return Err(error),
                         }
-                        Err(error)
-                            if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                                error.kind() == io::ErrorKind::AlreadyExists
-                            }) => {}
-                        Err(error) => return Err(error),
-                    },
+                    }
                 }
             }
             opened.with_context(|| {
