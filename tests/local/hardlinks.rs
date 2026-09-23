@@ -166,34 +166,43 @@ fn failed_hardlink_representative_never_links_followers_and_rerun_repairs_them()
 
 #[test]
 fn hardlink_mapping_conflicting_metadata_fails_before_payload_copy() {
-    let t = Tmp::new();
-    write(&t.path("src/a"), b"payload");
-    fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
-    let manifest = [
-        serde_json::json!({"src":{"encoding":"utf-8","value":"a"},"dst":{"encoding":"utf-8","value":"a"},"metadata":{"mode":384}}),
-        serde_json::json!({"src":{"encoding":"utf-8","value":"b"},"dst":{"encoding":"utf-8","value":"b"},"metadata":{"mode":420}}),
-    ].map(|v| v.to_string()).join("\n");
-    let output = syq_cp_in(
-        &t.path(""),
-        &[
-            "--preserve=hardlinks",
-            "--mapping",
-            "-",
-            "-C",
-            "src",
-            "--into",
-            "dst",
-        ],
-        Some(manifest.as_bytes()),
-    );
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("conflicting destination metadata"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!t.path("dst/a").exists());
-    assert!(!t.path("dst/b").exists());
+    for padding in [0, 4500] {
+        let t = Tmp::new();
+        write(&t.path("src/a"), b"payload");
+        fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+        let entry = |source: &str, destination: &str, mode: u32| {
+            serde_json::json!({"src":{"encoding":"utf-8","value":source},"dst":{"encoding":"utf-8","value":destination},"metadata":{"mode":mode}}).to_string()
+        };
+        let mut entries = vec![entry("a", "a", 0o600)];
+        // Put the conflicting alias in a later planning batch. Local replay
+        // can overlap ordinary copies, but must not publish this group early.
+        for index in 0..padding {
+            entries.push(entry("a", &format!("padding-{index:04}"), 0o600));
+        }
+        entries.push(entry("b", "b", 0o644));
+        let manifest = entries.join("\n");
+        let output = syq_cp_in(
+            &t.path(""),
+            &[
+                "--preserve=hardlinks",
+                "--mapping",
+                "-",
+                "-C",
+                "src",
+                "--into",
+                "dst",
+            ],
+            Some(manifest.as_bytes()),
+        );
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("conflicting destination metadata"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!t.path("dst/a").exists());
+        assert!(!t.path("dst/b").exists());
+    }
 }
 
 #[cfg(debug_assertions)]
