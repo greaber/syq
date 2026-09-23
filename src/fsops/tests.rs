@@ -4635,3 +4635,50 @@ fn metadata_parent_reuse_keeps_final_ancestor_replacement_check() {
     );
     assert_eq!(fs::read(outside.path().join("leaf")).unwrap(), b"outside");
 }
+
+#[test]
+fn reused_parent_errors_keep_paths_and_os_error_codes() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let mut ops = destination_ops(tree.path());
+    let long_name = vec![b'd'; 256];
+    let errors = ops.apply(
+        &[
+            Op::Mkdir {
+                path: long_name.clone(),
+                mode: 0o755,
+                condition: TargetCondition::Any,
+            },
+            Op::SetMeta {
+                path: b"missing-metadata-target".to_vec(),
+                meta: Meta {
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                },
+                flags: flags::TIMES,
+                condition: TargetCondition::Any,
+            },
+        ],
+        None,
+    );
+    for (error, (path, code)) in errors.iter().zip([
+        (&long_name[..], libc::ENAMETOOLONG),
+        (&b"missing-metadata-target"[..], libc::ENOENT),
+    ]) {
+        let error = error.as_ref().expect("operation should fail");
+        assert!(error.as_str().contains(&*String::from_utf8_lossy(path)));
+        assert_eq!(error.raw_os_error, Some(code));
+    }
+    let error = Root::open(tree.path())
+        .unwrap()
+        .create_directory(&RelativePath::new(&long_name).unwrap(), 0o755)
+        .unwrap_err();
+    assert_eq!(
+        format!("{error:#}")
+            .matches("create confined directory")
+            .count(),
+        1
+    );
+}

@@ -309,7 +309,11 @@ pub(super) fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                 root.resolve_parent(path)?
             };
             if matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
-                match parent.create_directory((*mode & 0o7777) | 0o700) {
+                match parent
+                    .create_directory((*mode & 0o7777) | 0o700)
+                    .with_context(|| {
+                        format!("create confined directory {}", target.label.display())
+                    }) {
                     Ok(()) => return Ok(()),
                     Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
                         if *condition == TargetCondition::Absent {
@@ -489,7 +493,9 @@ pub(super) fn set_meta_rooted(
         );
     }
     let parent = target.root.resolve_parent(&target.relative)?;
-    let metadata = parent.metadata()?;
+    let metadata = parent
+        .metadata()
+        .with_context(|| format!("stat confined path {}", target.label.display()))?;
     require_rooted_condition(metadata, condition, &target.label)?;
     let is_link = metadata.is_symlink();
     let owner_differs = (flags & flags::OWNER != 0
@@ -508,7 +514,9 @@ pub(super) fn set_meta_rooted(
             parent.chown(uid, gid)
         })?;
     } else {
-        let handle = parent.open_metadata()?;
+        let handle = parent
+            .open_metadata()
+            .with_context(|| format!("open confined metadata handle {}", target.label.display()))?;
         let opened = handle.metadata()?;
         if opened.dev() != metadata.dev || opened.ino() != metadata.ino {
             bail!(
@@ -526,7 +534,9 @@ pub(super) fn set_meta_rooted(
                 timespec(0, libc::UTIME_OMIT as u32),
                 timespec(meta.mtime, meta.mtime_nsec),
             ];
-            parent.set_times(&times)?;
+            parent.set_times(&times).with_context(|| {
+                format!("set times on confined path {}", target.label.display())
+            })?;
         }
         // The final lookup resolves from Root again. Release the reused
         // parent first so that check does not raise peak descriptor usage.
@@ -544,7 +554,9 @@ pub(super) fn set_meta_rooted(
             timespec(0, libc::UTIME_OMIT as u32),
             timespec(meta.mtime, meta.mtime_nsec),
         ];
-        parent.set_times(&times)?;
+        parent
+            .set_times(&times)
+            .with_context(|| format!("set times on confined path {}", target.label.display()))?;
     }
     drop(parent);
     let after = target.root.metadata(&target.relative)?;

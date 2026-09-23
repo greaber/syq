@@ -1442,11 +1442,11 @@ pub(crate) struct ResolvedParent<'a> {
 // still resolve it from Root; retaining this handle must not hide replacement
 // of an ancestor during a metadata update.
 impl ResolvedParent<'_> {
-    pub(crate) fn metadata(&self) -> Result<RootMetadata> {
-        metadata_at(self.directory.as_raw_fd(), &self.leaf).context("stat confined directory entry")
+    pub(crate) fn metadata(&self) -> io::Result<RootMetadata> {
+        metadata_at(self.directory.as_raw_fd(), &self.leaf)
     }
 
-    pub(crate) fn open_metadata(&self) -> Result<File> {
+    pub(crate) fn open_metadata(&self) -> io::Result<File> {
         #[cfg(target_os = "linux")]
         let flags =
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
@@ -1460,10 +1460,9 @@ impl ResolvedParent<'_> {
         let flags =
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
         open_at(self.directory.as_raw_fd(), &self.leaf, flags, 0)
-            .context("open confined metadata handle")
     }
 
-    pub(crate) fn create_directory(&self, mode: u32) -> Result<()> {
+    pub(crate) fn create_directory(&self, mode: u32) -> io::Result<()> {
         retry_zero(|| unsafe {
             libc::mkdirat(
                 self.directory.as_raw_fd(),
@@ -1471,10 +1470,9 @@ impl ResolvedParent<'_> {
                 (mode & 0o777) as libc::mode_t,
             )
         })
-        .context("create confined directory")
     }
 
-    pub(crate) fn set_times(&self, times: &[libc::timespec; 2]) -> Result<()> {
+    pub(crate) fn set_times(&self, times: &[libc::timespec; 2]) -> io::Result<()> {
         retry_zero(|| unsafe {
             libc::utimensat(
                 self.directory.as_raw_fd(),
@@ -1483,7 +1481,6 @@ impl ResolvedParent<'_> {
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         })
-        .context("set times on confined directory entry")
     }
 
     pub(crate) fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
