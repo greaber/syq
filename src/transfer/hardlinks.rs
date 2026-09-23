@@ -28,6 +28,33 @@ struct ReadyGroup {
     followers: Vec<Follower>,
 }
 
+/// Hardlink copies already buffer the source scan before destination changes.
+/// Check this structural ACL limitation across batches and source roots, while
+/// allowing a single selected name even when it has links outside the copy.
+pub(super) fn validate_macos_acls<'a>(entries: impl Iterator<Item = &'a Planned>) -> Result<()> {
+    let mut protected = std::collections::HashMap::new();
+    for entry in entries {
+        if entry.e.kind != Kind::File
+            || entry.e.nlink < 2
+            || !entry
+                .e
+                .inode_metadata
+                .as_ref()
+                .and_then(|m| m.macos_acl.as_ref())
+                .is_some_and(|acl| acl.has_deletion_denial())
+        {
+            continue;
+        }
+        if let Some(previous) = protected.insert((entry.e.dev, entry.e.ino), &entry.dst_rel) {
+            bail!(
+                "cannot preserve hardlinks with a macOS ACL that denies deletion: {} and {}; copy these names separately without hardlink preservation",
+                display(previous), display(&entry.dst_rel)
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Planner<'_> {
     pub(super) fn plan_hardlinked_file(&mut self, leaf: Planned, destination: Option<Entry>) {
         let identity = (leaf.e.dev, leaf.e.ino);

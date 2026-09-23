@@ -926,3 +926,32 @@ fn access_time_of_explicit_symlink_is_captured_before_reading_its_target() {
         );
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn incompatible_acl_models_are_rejected_before_destination_creation() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("source")).unwrap();
+    let rsh = fake_rsh(&t);
+    t.expose_remote_syq();
+    let remote = format!("fake:{}", t.s("destination"));
+    let other = if cfg!(target_os = "macos") {
+        "linux-x86_64"
+    } else {
+        "macos-aarch64"
+    };
+    let output = remote_syq_command(
+        &t,
+        &rsh,
+        &["-aA", "--syq-no-bootstrap", &t.s("source/"), &remote],
+    )
+    .env("FAKE_REMOTE_PLATFORM", other)
+    .run()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("ACL conversion is unsupported"),
+        "{output:?}"
+    );
+    assert!(!t.path("destination").exists());
+}

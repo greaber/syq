@@ -27,6 +27,31 @@ impl FsOps {
         Ok(Response::PartialSize(partial_size))
     }
 
+    fn create_partial_rooted(
+        &self,
+        root: &Root,
+        relative: &RelativePath,
+        mode: u32,
+    ) -> Result<File> {
+        #[cfg(target_os = "macos")]
+        if self.inode_preservation.acls {
+            return root.create_private_file(relative);
+        }
+        root.create_file(relative, mode)
+    }
+
+    fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        if self.inode_preservation.acls {
+            // A previously public inode may have readers with open descriptors.
+            // Do not write further protected data through that inode on resume.
+            return Ok(file.metadata()?.mode() & 0o077 == 0
+                && crate::inode_metadata::staging_acl_is_empty(file)?);
+        }
+        let _ = file;
+        Ok(true)
+    }
+
     pub(super) fn open_private_partial_rooted(
         &mut self,
         root: &Root,
@@ -38,7 +63,7 @@ impl FsOps {
         self.uncache_rooted(root, relative);
         let mut repaired_permissions = false;
         if create_if_missing {
-            match root.create_file(relative, create_mode) {
+            match self.create_partial_rooted(root, relative, create_mode) {
                 Ok(file) => return Ok(Some((file, None))),
                 Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
                 Err(error) => return Err(error),
@@ -56,6 +81,17 @@ impl FsOps {
                                 || opened.dev() != named.dev
                                 || opened.ino() != named.ino
                             {
+                                continue;
+                            }
+                            if !self.reusable_partial_permissions(&file)? {
+                                drop(file);
+                                discard_safe_rooted_partial_if_same(
+                                    root,
+                                    relative,
+                                    opened.dev(),
+                                    opened.ino(),
+                                    label,
+                                )?;
                                 continue;
                             }
                             if opened.mode() & 0o7777 != 0o600 {
@@ -129,6 +165,17 @@ impl FsOps {
                                 continue;
                             }
                             require_rooted_metadata(&handle, metadata, label)?;
+                            if !self.reusable_partial_permissions(&handle)? {
+                                drop(handle);
+                                discard_safe_rooted_partial_if_same(
+                                    root,
+                                    relative,
+                                    metadata.dev,
+                                    metadata.ino,
+                                    label,
+                                )?;
+                                continue;
+                            }
                             let repair = (|| -> Result<()> {
                                 fail_partial_chmod_for_test()?;
                                 set_mode_handle(&handle, 0o600)?;
@@ -160,7 +207,7 @@ impl FsOps {
                 Some(_) if !create_if_missing => return Ok(None),
                 Some(_) => root.unlink(relative)?,
                 None if !create_if_missing => return Ok(None),
-                None => match root.create_file(relative, create_mode) {
+                None => match self.create_partial_rooted(root, relative, create_mode) {
                     Ok(file) => return Ok(Some((file, None))),
                     Err(error)
                         if error
@@ -1225,12 +1272,18 @@ impl FsOps {
                 self.open_private_partial_rooted(&rooted.root, relative, label, true, staged_mode)
             })?;
         let (file, basis_size) = opened.context("sidecar creation was requested")?;
+        #[cfg(debug_assertions)]
+        test_race_barrier(
+            "SYQ_TEST_SMALL_STAGE_READY_FILE",
+            "SYQ_TEST_SMALL_STAGE_CONTINUE_FILE",
+            "small-file stage before data",
+        )?;
         if basis_size.is_some() {
             file.set_len(0)?;
         }
         observed_write(&self.operation, &file, data, 0, self.sparse)
             .with_context(|| format!("write {}", label.display()))?;
-        set_meta_file(&file, meta, flags)
+        set_meta_file_for_publication(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
         // `publish_partial_rooted` re-checks the staged name against the
         // open descriptor immediately before the rename, so no separate
@@ -1238,6 +1291,11 @@ impl FsOps {
         #[cfg(debug_assertions)]
         fail_put_small_before_rename_for_test(&rooted.label)?;
         publish_partial_rooted(&rooted.root, &relative, &rooted.relative, &file, condition)?;
+        crate::inode_metadata::finish_publication(
+            &file,
+            meta.inode_metadata.as_deref(),
+            meta.mode,
+        )?;
         published_identity(&file, flags)
     }
 
@@ -1654,7 +1712,7 @@ impl FsOps {
             return published_identity(&destination, flags);
         }
 
-        set_meta_file(&file, meta, flags)
+        set_meta_file_for_publication(&file, meta, flags)
             .with_context(|| format!("set metadata {}", src.display()))?;
         require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
         if target
@@ -1670,6 +1728,11 @@ impl FsOps {
             &target.relative,
             &file,
             condition,
+        )?;
+        crate::inode_metadata::finish_publication(
+            &file,
+            meta.inode_metadata.as_deref(),
+            meta.mode,
         )?;
         published_identity(&file, flags)
     }
@@ -2470,13 +2533,51 @@ pub(super) fn set_meta_file_known(
     flags: u8,
     current: &fs::Metadata,
 ) -> Result<()> {
+    set_meta_file_inner(f, meta, flags, current, false)
+}
+
+fn set_meta_file_for_publication(f: &File, meta: &Meta, flags: u8) -> Result<()> {
+    set_meta_file_inner(f, meta, flags, &f.metadata()?, true)
+}
+
+fn set_meta_file_inner(
+    f: &File,
+    meta: &Meta,
+    flags: u8,
+    current: &fs::Metadata,
+    before_publication: bool,
+) -> Result<()> {
     use std::os::unix::io::AsRawFd;
-    // Owner first: chown clears setuid/setgid, so mode must be set afterwards.
+    // macOS mode and ACL must change together. Keep private staging
+    // permissions until publication instead of opening a mode-only window.
+    let atomic_acl_mode = cfg!(target_os = "macos")
+        && meta
+            .inode_metadata
+            .as_ref()
+            .is_some_and(|m| m.macos_acl.is_some());
+    if before_publication
+        && atomic_acl_mode
+        && flags & flags::OWNER != 0
+        && current.uid() != meta.uid
+    {
+        // The final owner may itself be denied read access by the source ACL.
+        // Do not hand that account the staging inode's owner read permission.
+        f.set_permissions(fs::Permissions::from_mode(0o000))?;
+    }
+    // Owner first: chown clears setuid/setgid, so final mode follows it.
     let owner_changed =
         apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
             std::os::unix::fs::fchown(f, uid, gid)
         })?;
-    if flags & flags::MODE_MASK != 0 {
+    #[cfg(debug_assertions)]
+    if before_publication && atomic_acl_mode && owner_changed {
+        test_race_barrier(
+            "SYQ_TEST_ACL_OWNER_READY_FILE",
+            "SYQ_TEST_ACL_OWNER_CONTINUE_FILE",
+            "ACL stage after ownership change",
+        )?;
+    }
+    if flags & flags::MODE_MASK != 0 && !atomic_acl_mode {
         // On network filesystems every setattr is a round trip; skip it when
         // the mode is already right (but always run it after a chown that could
         // have cleared setuid/setgid bits we need to restore).
@@ -2498,7 +2599,15 @@ pub(super) fn set_meta_file_known(
             return Err(io::Error::last_os_error().into());
         }
     }
-    crate::inode_metadata::apply(f, meta.inode_metadata.as_deref(), meta.mode)
+    if before_publication {
+        crate::inode_metadata::apply_before_publication(
+            f,
+            meta.inode_metadata.as_deref(),
+            meta.mode,
+        )
+    } else {
+        crate::inode_metadata::apply(f, meta.inode_metadata.as_deref(), meta.mode)
+    }
 }
 
 /// Apply only ownership fields whose requested values differ from the

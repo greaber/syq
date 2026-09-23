@@ -4704,3 +4704,42 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_existing_inode() {
     assert_eq!(fs::read(&target).unwrap(), data);
     assert_eq!(fs::read(directory.path().join("alias")).unwrap(), data);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn acl_resume_replaces_previously_readable_staging_inodes() {
+    use std::io::{Read, Write};
+    for (mode, access_acl) in [(0o644, false), (0o600, true), (0o000, true)] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let path = temporary.path().join("partial");
+        fs::write(&path, b"").unwrap();
+        let mut old_reader = File::open(&path).unwrap();
+        let old_inode = old_reader.metadata().unwrap().ino();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        if access_acl {
+            assert!(std::process::Command::new("chmod")
+                .args(["+a", "everyone allow read"])
+                .arg(&path)
+                .status_guarded()
+                .unwrap()
+                .success());
+        }
+        let root = Root::open(temporary.path()).unwrap();
+        let relative = RelativePath::new(b"partial").unwrap();
+        let mut ops = FsOps::new();
+        ops.inode_preservation.acls = true;
+        let (mut file, basis) = ops
+            .open_private_partial_rooted(&root, &relative, &path, true, 0o644)
+            .unwrap()
+            .unwrap();
+        assert!(basis.is_none());
+        assert_ne!(file.metadata().unwrap().ino(), old_inode);
+        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+        assert!(crate::inode_metadata::staging_acl_is_empty(&file).unwrap());
+        file.write_all(b"protected payload").unwrap();
+        let mut exposed = Vec::new();
+        old_reader.read_to_end(&mut exposed).unwrap();
+        assert!(exposed.is_empty(), "old reader saw protected copy contents");
+        assert_eq!(fs::read(&path).unwrap(), b"protected payload");
+    }
+}
