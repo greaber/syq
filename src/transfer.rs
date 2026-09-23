@@ -2926,7 +2926,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // checks. A local tree can now copy earlier batches while subsequent
         // batches prepare their directories and destination metadata. Preserve
         // the single-file offload path and the existing bounded small-tree start.
+        // Hardlink groups are validated across replay batches; their payloads
+        // must wait until every eligible alias's metadata has been checked.
         let local_start = if opts.same_host
+            && !opts.hardlinks
             && st.fresh_capacity.is_some()
             && !workers_started
             && !opts.dry_run

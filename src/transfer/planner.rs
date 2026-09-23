@@ -408,9 +408,12 @@ impl Planner<'_> {
     }
 
     pub(super) fn assess_fresh_capacity(&mut self) -> Result<Option<FreshCapacityAssessment>> {
-        let Some(plan) = self.fresh_capacity.take() else {
+        let Some(plan) = self.fresh_capacity.as_mut() else {
             return Ok(None);
         };
+        // Replay still uses the plan's presence to release preflighted local
+        // work. Keep that marker without retaining or cloning the scan's set.
+        plan.hardlink_inodes = Default::default();
         if plan.overflowed {
             return Err(std::io::Error::from_raw_os_error(libc::ENOSPC)).context(
                 "fresh destination logical size or object count exceeds supported limits",
