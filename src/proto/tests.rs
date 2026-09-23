@@ -496,15 +496,20 @@ fn released_v040_preamble_keeps_its_build_identity_boundary() {
 }
 
 #[test]
-fn released_v052_preamble_rejects_new_transfer_messages_before_decoding() {
-    // Literal v0.5.2 preamble, independent of today's enum encodings.
+fn released_preambles_reject_new_transfer_messages_before_decoding() {
+    // Literal released preambles, independent of today's enum encodings.
     const V052: &[u8] = b"SYQWIRE\0\0\x06v0.5.2";
-    if crate::identity::build() != "v0.5.2" {
-        let error = FrameReader::new(V052).read_msg::<Response>().unwrap_err();
-        assert!(
-            error.to_string().contains("build identity mismatch"),
-            "{error}"
-        );
+    const V071: &[u8] = b"SYQWIRE\0\0\x06v0.7.1";
+    for (identity, preamble) in [("v0.5.2", V052), ("v0.7.1", V071)] {
+        if crate::identity::build() != identity {
+            let error = FrameReader::new(preamble)
+                .read_msg::<Response>()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("build identity mismatch"),
+                "{error}"
+            );
+        }
     }
 }
 

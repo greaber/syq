@@ -58,6 +58,9 @@ pub struct FileJobData {
     /// Opened directory identity that anchors descendant target mutations.
     pub container_guard: Option<ContainerGuard>,
     pub attempt: u32,
+    /// Rsync's fresh-file permissions derived from the destination parent.
+    /// None keeps native creation and explicit preservation behavior unchanged.
+    pub creation_mode: Option<u16>,
     /// Bytes of this file in place on the destination (transferred or matched).
     pub done: Arc<AtomicU64>,
     /// Written directly to the final path (no partial + rename).
