@@ -11,10 +11,10 @@ Configured command prefix: `syq rsync`.
 
 | Classification | Tests |
 |---|---:|
-| conformance | 17 |
-| adapted | 27 |
-| unsupported | 124 |
-| out-of-scope | 183 |
+| conformance | 18 |
+| adapted | 29 |
+| unsupported | 120 |
+| out-of-scope | 184 |
 | unassessed | 0 |
 
 ## Runnable behavioral tests
@@ -23,7 +23,10 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 
 | Area | Test | Baseline | Product position | Provenance | Circumstances | Note |
 |---|---|---|---|---|---|---|
+| acls | `acls` | pass | Compatible | invocation adaptation (acls-syq-cli) | platform=linux; setfacl; getfacl; POSIX ACL filesystem | Compare named-user and named-group ACLs on files and directories after an archive copy; omit only the rsync-specific -VV capability probe. |
+| acls | `acls-default` | fail | Policy open | invocation adaptation (acls-default-syq-cli) | platform=linux; setfacl; getfacl; POSIX ACL filesystem | Without -A or -p, rsync derives a new destination container's permissions from its parent default ACL. SYQ currently creates that container as 0755; the upstream assertion remains unchanged. Omit only the rsync-specific -VV capability probe. |
 | acls | `acls-depth` | pass | Compatible | invocation adaptation (acls-depth-syq-cli) | platform=linux; setfacl; getfacl; POSIX ACL filesystem | POSIX named-user ACLs at every tree depth; omit the rsync-specific -VV capability probe. |
+| acls | `acls-unpinnable` | pass | Compatible | invocation adaptation (acls-unpinnable-syq-cli) | platform=linux; setfacl; getfacl; POSIX ACL filesystem | Replace stale destination ACL grants on a directory without owner-read permission, including when source directory listing fails. Omit only the rsync-specific -VV capability probe. |
 | atimes | `atimes` | pass | Compatible | invocation adaptation (atimes-syq-cli) | platform=linux,macos; access-time support | Preserve the upstream access-time assertions; omit only the rsync-specific -VV capability probe. |
 | atimes | `open-noatime` | pass | Compatible | invocation adaptation (open-noatime-syq-cli) | platform=linux; access-time support | Preserve the upstream access-time assertions; omit only the rsync-specific -VV capability probe. |
 | crtimes | `crtimes` | pass | Compatible | invocation adaptation (crtimes-syq-cli) | platform=macos; settable birth times | Preserve the upstream file and directory birth-time assertions; omit only the rsync-specific -VV capability probe. |
@@ -43,7 +46,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | metadata | `metadata-depth` | pass | Compatible | subset adaptation (metadata-supported-subset) | platform=linux,macos; POSIX modes and mtimes | Preserve modes and mtimes throughout a deep tree; upstream's unsupported --chmod case is omitted. |
 | paths | `deep-path` | pass | Compatible | subset adaptation (deep-path-local) | platform=linux,macos; paths deeper than 64 components | Copy a 70-level local tree; the rsync-daemon half is outside SYQ's scope. |
 | paths | `dest-symlinked-dir` | pass | Compatible | unmodified upstream | platform=linux,macos; symlinks | Follow an operator-named destination symlink to a directory. |
-| paths | `longdir` | pass | Compatible | subset adaptation (longdir-no-hardlinks) | platform=linux,macos; long path components | Copy and delete within a tree containing three 175-character path components. |
+| paths | `longdir` | pass | Compatible | unmodified upstream | platform=linux,macos; long path components | Copy and delete with hardlink preservation within a tree containing three 175-character path components, using the unchanged upstream test. |
 | permissions | `protected-regular` | pass | Compatible | unmodified upstream | platform=linux; run-as=root; root; Linux fs.protected_regular | --inplace can update a foreign-owned file in a sticky directory when the caller has authority. |
 | permissions | `search-only-destination` | pass | Compatible | unmodified upstream | platform=linux; Linux search-only directory semantics; setpriv when run as root | Traverse a searchable but unreadable destination parent. |
 | publication | `inplace` | pass | Compatible | invocation adaptation (inplace-syq-cli) | platform=linux,macos; stable inode numbers | --inplace retains the destination inode while the default atomic path replaces it. |
@@ -78,7 +81,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `rsync-daemon` | Exercises rsync daemon configuration, modules, authentication, or daemon transport; SYQ has no rsync daemon mode. |
 | `rsync-internal` | Exercises rsync's implementation, build, helper programs, or test harness rather than command-line filesystem semantics. |
 | `rsync-wire` | Exercises rsync's sender/receiver protocol or a malicious/legacy rsync peer; SYQ intentionally speaks a different protocol. |
-| `unsupported-acls` | Remaining rsync ACL fixtures need separate classification for their inheritance, race, capability-probe and protocol expectations. |
 | `unsupported-alt-dest` | Requires rsync backup, link-dest, compare-dest, copy-dest, or alternate-basis behavior, which SYQ does not implement. |
 | `unsupported-batch` | Requires rsync batch-file behavior, which SYQ does not implement. |
 | `unsupported-filters` | Requires rsync's filter language; SYQ currently exposes gitignore-style filters instead. |
@@ -92,10 +94,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 
 | Test | Reason |
 |---|---|
-| `acl-symlink-race` | `unsupported-acls` |
-| `acls` | `unsupported-acls` |
-| `acls-default` | `unsupported-acls` |
-| `acls-unpinnable` | `unsupported-acls` |
 | `alt-dest` | `unsupported-alt-dest` |
 | `alt-dest-deep` | `unsupported-alt-dest` |
 | `alt-dest-symlink-race` | `unsupported-alt-dest` |
@@ -222,6 +220,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | Test | Reason |
 |---|---|
 | `00-hello` | `rsync-internal` |
+| `acl-symlink-race` | `rsync-daemon` |
 | `authenticate-no-ocloexec-build-regression` | `rsync-internal` |
 | `bare-do-open-symlink-race` | `rsync-internal` |
 | `chdir-symlink-race` | `rsync-internal` |

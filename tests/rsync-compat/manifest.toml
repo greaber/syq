@@ -16,7 +16,6 @@ rsync-internal = "Exercises rsync's implementation, build, helper programs, or t
 rsync-wire = "Exercises rsync's sender/receiver protocol or a malicious/legacy rsync peer; SYQ intentionally speaks a different protocol."
 rsync-daemon = "Exercises rsync daemon configuration, modules, authentication, or daemon transport; SYQ has no rsync daemon mode."
 rrsync = "Exercises rrsync, rsync's restricted-command wrapper, rather than the copy command's filesystem semantics."
-unsupported-acls = "Remaining rsync ACL fixtures need separate classification for their inheritance, race, capability-probe and protocol expectations."
 unsupported-alt-dest = "Requires rsync backup, link-dest, compare-dest, copy-dest, or alternate-basis behavior, which SYQ does not implement."
 unsupported-batch = "Requires rsync batch-file behavior, which SYQ does not implement."
 unsupported-filters = "Requires rsync's filter language; SYQ currently exposes gitignore-style filters instead."
@@ -228,16 +227,14 @@ note = "--inplace retains the destination inode while the default atomic path re
 
 [[tests]]
 name = "longdir"
-classification = "adapted"
-adaptation = "longdir-no-hardlinks"
-adaptation_kind = "subset"
+classification = "conformance"
 area = "paths"
 position = "compatible"
 baseline = "pass"
 platforms = ["linux", "macos"]
 tags = ["local", "paths", "long-names"]
 requirements = ["long path components"]
-note = "Copy and delete within a tree containing three 175-character path components."
+note = "Copy and delete with hardlink preservation within a tree containing three 175-character path components, using the unchanged upstream test."
 
 [[tests]]
 name = "metadata-depth"
@@ -597,3 +594,42 @@ platforms = ["linux", "macos"]
 tags = ["local", "sparse"]
 requirements = ["sparse filesystem"]
 note = "Keep all upstream byte/allocation assertions; omit --no-sparse because sparse mode is already off by default."
+
+[[tests]]
+name = "acls"
+classification = "adapted"
+adaptation = "acls-syq-cli"
+adaptation_kind = "invocation"
+area = "acls"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "acls"]
+requirements = ["setfacl", "getfacl", "POSIX ACL filesystem"]
+note = "Compare named-user and named-group ACLs on files and directories after an archive copy; omit only the rsync-specific -VV capability probe."
+
+[[tests]]
+name = "acls-default"
+classification = "adapted"
+adaptation = "acls-default-syq-cli"
+adaptation_kind = "invocation"
+area = "acls"
+position = "policy-open"
+baseline = "fail"
+platforms = ["linux"]
+tags = ["local", "metadata", "acls"]
+requirements = ["setfacl", "getfacl", "POSIX ACL filesystem"]
+note = "Without -A or -p, rsync derives a new destination container's permissions from its parent default ACL. SYQ currently creates that container as 0755; the upstream assertion remains unchanged. Omit only the rsync-specific -VV capability probe."
+
+[[tests]]
+name = "acls-unpinnable"
+classification = "adapted"
+adaptation = "acls-unpinnable-syq-cli"
+adaptation_kind = "invocation"
+area = "acls"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "acls"]
+requirements = ["setfacl", "getfacl", "POSIX ACL filesystem"]
+note = "Replace stale destination ACL grants on a directory without owner-read permission, including when source directory listing fails. Omit only the rsync-specific -VV capability probe."

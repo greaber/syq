@@ -2,11 +2,11 @@
 # Every upstream *_test.py must appear once. Update and review this file with the pin.
 # test<TAB>classification<TAB>reason-id (or -)
 00-hello	out-of-scope	rsync-internal
-acl-symlink-race	unsupported	unsupported-acls
-acls	unsupported	unsupported-acls
-acls-default	unsupported	unsupported-acls
+acl-symlink-race	out-of-scope	rsync-daemon
+acls	adapted	-
+acls-default	adapted	-
 acls-depth	adapted	-
-acls-unpinnable	unsupported	unsupported-acls
+acls-unpinnable	adapted	-
 alt-dest	unsupported	unsupported-alt-dest
 alt-dest-deep	unsupported	unsupported-alt-dest
 alt-dest-symlink-race	unsupported	unsupported-alt-dest
@@ -184,7 +184,7 @@ link-dest-symlink-enotsup	unsupported	unsupported-alt-dest
 links	adapted	-
 log-control-chars	unsupported	unsupported-transfer-mode
 log-file-symlink	unsupported	unsupported-transfer-mode
-longdir	adapted	-
+longdir	conformance	-
 macos-setgid-ordinary-mode-regression	unsupported	unsupported-metadata
 malicious-dot-dir-delete-scope	out-of-scope	rsync-wire
 malicious-dot-file-delete-scope	out-of-scope	rsync-wire

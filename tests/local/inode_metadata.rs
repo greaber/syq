@@ -466,7 +466,9 @@ fn posix_acls_cover_fifo_inodes() {
 fn xattrs_preserve_long_listings_and_large_and_empty_values() {
     let t = Tmp::new();
     write(&t.path("source"), b"payload");
-    let large = prng(4096, 811);
+    // Exceed the 256-byte read buffer while keeping the full attribute set
+    // within filesystems that store all xattrs in a single 4 KiB block.
+    let large = prng(1024, 811);
     for index in 0..40 {
         set_attr(
             &t.path("source"),
