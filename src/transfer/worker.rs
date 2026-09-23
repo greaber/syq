@@ -132,7 +132,8 @@ impl Worker {
                         // Keep rate-limited batches to one file so a push can't
                         // accumulate locally and then hit the network in a burst.
                         if self.bwlimit.is_none() {
-                            batch.extend(self.sched.take_small(
+                            batch.extend(self.sched.take_small_near(
+                                idx,
                                 fast_file_size_limit(&self.opts, self.bwlimit.as_deref()),
                                 target - batch.len(),
                                 self.opts.tuning.batch_bytes().saturating_sub(first_bytes),

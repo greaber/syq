@@ -554,7 +554,9 @@ fn initial_ranges_leave_diff_ranges_and_other_files_alone() {
             let mut inner = sched.inner.lock().unwrap();
             inner.probing = 1;
             if queued_file {
-                inner.files.push((64 << 20, Reverse(FileOrder::new(1))));
+                inner
+                    .files
+                    .push_test((64 << 20, Reverse(FileOrder::new(1))));
             }
         }
         sched.reserve_initial_ranges(8);
@@ -717,8 +719,8 @@ fn tail_gate_combines_bytes_file_credit_and_duration_requirement() {
     {
         let mut inner = sched.inner.lock().unwrap();
         inner.scan_done = true;
-        inner.files.push((100, Reverse(FileOrder::new(0))));
-        inner.files.push((100, Reverse(FileOrder::new(1))));
+        inner.files.push_test((100, Reverse(FileOrder::new(0))));
+        inner.files.push_test((100, Reverse(FileOrder::new(1))));
     }
     assert!(sched.work_left_for(2, 1_200, 512));
     assert!(!sched.work_left_for(2, 1_300, 512));
@@ -749,7 +751,7 @@ fn claimed_small_files_do_not_request_replacement_capacity() {
         .lock()
         .unwrap()
         .files
-        .push((100, Reverse(FileOrder::new(0))));
+        .push_test((100, Reverse(FileOrder::new(0))));
     assert!(sched.needs_worker_capacity());
 }
 
@@ -760,7 +762,7 @@ fn fast_batches_share_the_queue_across_active_workers() {
         let mut inner = sched.inner.lock().unwrap();
         inner.scan_done = true;
         for idx in 0..2000 {
-            inner.files.push((4096, Reverse(FileOrder::new(idx))));
+            inner.files.push_test((4096, Reverse(FileOrder::new(idx))));
         }
     }
 
@@ -892,4 +894,33 @@ fn preflight_release_runs_jobs_without_treating_an_empty_queue_as_eof() {
     );
     worker.join().unwrap();
     assert!(sched.finished());
+}
+
+#[test]
+fn small_batches_keep_siblings_and_requeue_preserves_directory() {
+    let sched = Sched::new(64, 128);
+    for parent in ["a", "b", "c"] {
+        for i in 0..8 {
+            sched.push_file(test_job(format!("{parent}/{i}").as_bytes(), 128));
+        }
+    }
+    sched.scan_done();
+    let mut seen = HashSet::new();
+    while let Item::File(first) = sched.next() {
+        let siblings = sched.take_small_near(first, 128, 10, 3 * 128);
+        assert!(siblings.len() <= 3);
+        for idx in std::iter::once(first).chain(siblings) {
+            assert_eq!(idx / 8, first / 8);
+            assert!(seen.insert(idx));
+            sched.ranges_ready(idx, Vec::new());
+        }
+    }
+    assert_eq!(seen.len(), 24);
+    sched.requeue(5);
+    sched.requeue(6);
+    assert!(matches!(sched.next(), Item::File(6)));
+    assert_eq!(sched.take_small_near(6, 128, 10, 1024), vec![5]);
+    sched.ranges_ready(5, Vec::new());
+    sched.ranges_ready(6, Vec::new());
+    assert!(matches!(sched.next(), Item::Exit));
 }

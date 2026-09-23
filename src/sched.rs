@@ -358,35 +358,80 @@ impl FileOrder {
     }
 }
 
-/// Keep queue size accounting at the mutation boundary for tuner samples.
+/// Keep largest-first selection between directories, while allowing a small
+/// file batch to consume siblings from its first file's directory. Each file
+/// appears in one heap; only directory heads are in the global ordered set.
 #[derive(Default)]
 struct FileQueue {
-    heap: BinaryHeap<(u64, Reverse<FileOrder>)>,
+    heads: BTreeSet<((u64, Reverse<FileOrder>), usize)>,
+    directories: HashMap<PathBytes, usize>,
+    groups: Vec<BinaryHeap<(u64, Reverse<FileOrder>)>>,
+    group_of: Vec<usize>,
+    count: usize,
     bytes: u64,
 }
 
 impl FileQueue {
-    fn push(&mut self, item: (u64, Reverse<FileOrder>)) {
-        self.heap.push(item);
-        self.bytes += item.0;
+    fn register(&mut self, idx: usize, destination: &[u8]) {
+        let end = destination.iter().rposition(|&b| b == b'/').unwrap_or(0);
+        let parent = &destination[..end];
+        let group = match self.directories.get(parent) {
+            Some(&group) => group,
+            None => {
+                let group = self.groups.len();
+                self.groups.push(BinaryHeap::new());
+                self.directories.insert(parent.to_vec(), group);
+                group
+            }
+        };
+        self.group_of.resize(self.group_of.len().max(idx + 1), 0);
+        self.group_of[idx] = group;
     }
 
-    fn pop(&mut self) -> Option<(u64, Reverse<FileOrder>)> {
-        let item = self.heap.pop()?;
+    fn push(&mut self, item: (u64, Reverse<FileOrder>)) {
+        let group = self.group_of[item.1 .0.index()];
+        let heap = &mut self.groups[group];
+        if let Some(&head) = heap.peek() {
+            self.heads.remove(&(head, group));
+        }
+        heap.push(item);
+        self.heads.insert((*heap.peek().unwrap(), group));
+        self.bytes += item.0;
+        self.count += 1;
+    }
+
+    fn pop_group(&mut self, group: usize) -> Option<(u64, Reverse<FileOrder>)> {
+        let heap = &mut self.groups[group];
+        let item = heap.pop()?;
+        self.heads.remove(&(item, group));
+        if let Some(&head) = heap.peek() {
+            self.heads.insert((head, group));
+        }
         self.bytes -= item.0;
+        self.count -= 1;
         Some(item)
     }
 
+    fn pop(&mut self) -> Option<(u64, Reverse<FileOrder>)> {
+        let &(_, group) = self.heads.last()?;
+        self.pop_group(group)
+    }
+
     fn peek(&self) -> Option<&(u64, Reverse<FileOrder>)> {
-        self.heap.peek()
+        self.heads.last().map(|(item, _)| item)
     }
 
     fn len(&self) -> usize {
-        self.heap.len()
+        self.count
+    }
+    fn is_empty(&self) -> bool {
+        self.count == 0
     }
 
-    fn is_empty(&self) -> bool {
-        self.heap.is_empty()
+    #[cfg(test)]
+    fn push_test(&mut self, item: (u64, Reverse<FileOrder>)) {
+        self.register(item.1 .0.index(), b"fixture");
+        self.push(item);
     }
 }
 
@@ -477,13 +522,14 @@ impl Sched {
 
     pub fn push_file(&self, job: FileJob) -> usize {
         let size = job.entry.size;
-        let idx = {
-            let mut jobs = self.jobs.lock().unwrap();
-            jobs.push(job);
-            jobs.len() - 1
-        };
+        // No scheduler path takes the jobs lock while holding inner.
+        let mut jobs = self.jobs.lock().unwrap();
+        jobs.push(job);
+        let idx = jobs.len() - 1;
         let mut inner = self.inner.lock().unwrap();
+        inner.files.register(idx, &jobs[idx].dst);
         inner.files.push((size, Reverse(FileOrder::new(idx))));
+        drop(jobs);
         // New batches can run once the source-wide preflights have passed.
         let runnable = inner.scan_done || inner.work_released;
         drop(inner);
@@ -863,18 +909,47 @@ impl Sched {
     /// Pop further queued files no larger than `max_size` (largest-first order
     /// means once the top is small, everything left is). Each is marked as
     /// being probed, like `Item::File`.
+    #[cfg(test)]
     pub fn take_small(&self, max_size: u64, max_n: usize, max_bytes: u64) -> Vec<usize> {
+        self.take_small_group(None, max_size, max_n, max_bytes)
+    }
+
+    pub fn take_small_near(
+        &self,
+        first: usize,
+        max_size: u64,
+        max_n: usize,
+        max_bytes: u64,
+    ) -> Vec<usize> {
+        self.take_small_group(Some(first), max_size, max_n, max_bytes)
+    }
+
+    fn take_small_group(
+        &self,
+        first: Option<usize>,
+        max_size: u64,
+        max_n: usize,
+        max_bytes: u64,
+    ) -> Vec<usize> {
         let mut g = self.inner.lock().unwrap();
+        let group = first.map(|idx| g.files.group_of[idx]);
         let mut out = Vec::new();
         let mut bytes = 0u64;
         while out.len() < max_n {
-            match g.files.peek() {
-                Some(&(size, _)) if size <= max_size && bytes + size <= max_bytes => {
-                    let (size, Reverse(order)) = g.files.pop().unwrap();
-                    let idx = order.index();
+            let next = match group {
+                Some(group) => g.files.groups[group].peek(),
+                None => g.files.peek(),
+            };
+            match next {
+                Some(&(size, _)) if size <= max_size && size <= max_bytes - bytes => {
+                    let (size, Reverse(order)) = match group {
+                        Some(group) => g.files.pop_group(group),
+                        None => g.files.pop(),
+                    }
+                    .unwrap();
                     bytes += size;
                     g.probing += 1;
-                    out.push(idx);
+                    out.push(order.index());
                 }
                 _ => break,
             }
