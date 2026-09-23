@@ -14,12 +14,13 @@ pub(crate) fn write_at(
         .checked_add(data.len() as u64)
         .filter(|end| *end <= i64::MAX as u64)
         .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
-    // APFS can fill the gap when a write extends past EOF. Establish and
-    // punch the new zero range before writing its nonzero contents.
+    // Establish EOF before writes on APFS. Explicitly punch even fresh zero
+    // ranges: merely skipping writes can leave delayed zero allocations.
     #[cfg(target_os = "macos")]
     if offset + data.len() as u64 > file.metadata()?.len() {
         set_len(file, offset + data.len() as u64)?;
     }
+    let clear_existing = clear_existing || cfg!(target_os = "macos");
     let block = block_size(file)?;
     let mut cursor = 0;
     let mut written = 0;
@@ -52,25 +53,8 @@ pub(crate) fn write_at(
     file.write_all_at(&data[written..], offset + written as u64)
 }
 
-/// APFS can allocate zero-filled ranges on growth, including writes past EOF.
-/// Punch newly added whole blocks explicitly; preserve the old partial block.
 /// Callers serialize resizing with writes to the same output.
 pub(crate) fn set_len(file: &File, size: u64) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let old_size = file.metadata()?.len();
-        file.set_len(size)?;
-        if size > old_size {
-            let block = block_size(file)?;
-            let start = old_size.div_ceil(block) * block;
-            let end = size / block * block;
-            if end > start {
-                punch(file, start, end - start)?;
-            }
-        }
-        Ok(())
-    }
-    #[cfg(not(target_os = "macos"))]
     file.set_len(size)
 }
 
@@ -163,6 +147,36 @@ mod tests {
                 assert!(file.metadata().unwrap().blocks() * 512 < size as u64 / 4);
             }
             assert_eq!(std::fs::read(path).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn sparse_range_order_does_not_allocate_unwritten_zero_ranges() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = crate::test_support::tempdir().unwrap();
+        let chunk = 1024 * 1024;
+        for reverse in [false, true] {
+            let path = directory.path().join(reverse.to_string());
+            let file = File::create(&path).unwrap();
+            set_len(&file, 8 * chunk as u64).unwrap();
+            let mut expected = vec![0; 8 * chunk];
+            for index in 0..8 {
+                let index = if reverse { 7 - index } else { index };
+                let offset = index * chunk;
+                // Data at both ends exercises holes followed by later writes.
+                expected[offset..offset + 4096].fill(7);
+                expected[offset + chunk - 4096..offset + chunk].fill(9);
+                write_at(
+                    &file,
+                    &expected[offset..offset + chunk],
+                    offset as u64,
+                    false,
+                )
+                .unwrap();
+            }
+            file.sync_all().unwrap();
+            assert!(file.metadata().unwrap().blocks() * 512 < expected.len() as u64 / 4);
+            assert_eq!(std::fs::read(path).unwrap(), expected);
         }
     }
 

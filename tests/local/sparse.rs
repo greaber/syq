@@ -12,25 +12,29 @@ fn write_sparse_source(path: &Path, data: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let file = fs::File::create(path).unwrap();
     file.set_len(data.len() as u64).unwrap();
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::fd::AsRawFd;
-        // On APFS, extending with ftruncate can allocate zero-filled extents.
-        // Make the source sparse explicitly before testing clone preservation.
-        let hole = libc::fpunchhole_t {
-            fp_flags: 0,
-            reserved: 0,
-            fp_offset: 0,
-            fp_length: (data.len() / 4096 * 4096) as _,
-        };
-        assert_eq!(
-            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &hole) },
-            0
-        );
-    }
     for (index, block) in data.chunks(4096).enumerate() {
         if block.iter().any(|byte| *byte != 0) {
             file.write_all_at(block, (index * 4096) as u64).unwrap();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // Punch after writing data so APFS does not materialize delayed zero
+        // allocations when the independently built source fixture is synced.
+        for (index, block) in data.chunks(4096).enumerate() {
+            if block.len() == 4096 && block.iter().all(|byte| *byte == 0) {
+                let hole = libc::fpunchhole_t {
+                    fp_flags: 0,
+                    reserved: 0,
+                    fp_offset: (index * 4096) as _,
+                    fp_length: 4096,
+                };
+                assert_eq!(
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &hole) },
+                    0
+                );
+            }
         }
     }
     assert_sparse_copy(path, data);
