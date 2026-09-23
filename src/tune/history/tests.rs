@@ -328,6 +328,27 @@ fn decisions_include_comparison_evidence_and_unapplied_candidates() {
 }
 
 #[test]
+fn opening_existing_history_needs_no_writer_lock() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let db = open(&path).unwrap();
+    // A released history has only the original indexes. Keep another writer
+    // active: opening it must not attempt a schema change over the old runs.
+    db.execute_batch(
+        "DROP INDEX IF EXISTS measured_filesystems;
+        DROP INDEX IF EXISTS measured_routes;
+        BEGIN IMMEDIATE;",
+    )
+    .unwrap();
+    let opened = open(&path);
+    db.execute_batch("ROLLBACK").unwrap();
+    assert!(
+        opened.is_ok(),
+        "opening history needed a write lock: {opened:?}"
+    );
+}
+
+#[test]
 fn concurrent_initialization_shares_one_identity_key() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");

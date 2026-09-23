@@ -7,15 +7,11 @@ use std::collections::BTreeMap;
 // turning a collection of one-sided comparisons into a maximum-ever rule.
 const STARTUP_CONNECTION_COST: f64 = 0.01;
 
-// Shared by the partial indexes and lookup: filtering precedes the run limit.
-// CASE also keeps malformed/oversized diagnostic summaries out of JSON parsing.
-pub(super) const MATCHABLE: &str = "status='success' AND lost=0 AND CASE WHEN length(CAST(summary AS BLOB))<=65536 AND json_valid(summary) THEN json_extract(summary,'$.measurement_totals.consistent')=1 AND json_extract(summary,'$.measurement_totals.incompatible')=0 AND json_extract(summary,'$.measured_worker_counts')>=2 ELSE 0 END";
-
-pub(super) fn index(db: &Connection) -> Result<()> {
-    db.execute_batch(&format!("CREATE INDEX IF NOT EXISTS measured_filesystems ON runs(route,mode,source_fs,destination_fs,id DESC) WHERE {MATCHABLE};
-        CREATE INDEX IF NOT EXISTS measured_routes ON runs(route,mode,id DESC) WHERE {MATCHABLE};"))?;
-    Ok(())
-}
+// The schema's original indexes already partition runs by `eligible`. Reserve
+// a distinct value for raw comparisons; 1 belongs to legacy recommendations.
+// Tag new measurements at completion instead of indexing historical JSON at open.
+pub(super) const MEASUREMENTS: i64 = 2;
+pub(super) const MAX_SUMMARY: usize = 65536;
 
 struct Comparison {
     workers: usize,
@@ -51,7 +47,7 @@ pub(super) fn starting_count(
         } else {
             "AND ?3 IS NULL AND ?4 IS NULL"
         };
-        let mut statement = db.prepare(&format!("SELECT id,day,summary FROM runs WHERE route=?1 AND mode=?2 AND {MATCHABLE} {filesystem_match} ORDER BY id DESC LIMIT 32"))?;
+        let mut statement = db.prepare(&format!("SELECT id,day,CASE WHEN length(CAST(summary AS BLOB))<={MAX_SUMMARY} THEN summary END FROM runs WHERE route=?1 AND mode=?2 AND eligible={MEASUREMENTS} AND status='success' AND lost=0 {filesystem_match} ORDER BY id DESC LIMIT 32"))?;
         let runs = statement
             .query_map(
                 params![
@@ -190,6 +186,13 @@ impl RunEvidence {
 
     pub(super) fn measured_counts(&self) -> usize {
         self.points().count()
+    }
+
+    pub(super) fn reusable(&self) -> bool {
+        self.consistent
+            && !self.incompatible
+            && self.measured_counts() >= 2
+            && self.points().any(|(_, rate)| rate > 0.0)
     }
 
     fn finish(self) -> Option<Comparison> {
@@ -337,6 +340,9 @@ mod tests {
             // Fixed-count runs and automatic single-count runs are excluded.
             record(&path, &key, None, i % 2 == 0, &[(1, 100.0)]);
         }
+        for _ in 0..40 {
+            record(&path, &key, None, true, &[(2, 0.0), (4, 0.0)]);
+        }
         let fixed = record(&path, &key, None, false, &[(2, 100.0), (4, 200.0)]);
         assert_eq!(fixed.starting_count(&key, false).unwrap().workers, 16);
         let mut route_key = key.clone();
@@ -369,6 +375,28 @@ mod tests {
         db.execute("UPDATE runs SET summary=?1", [" ".repeat(65537)])
             .unwrap();
         assert!(starting_count(&db, &key, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn old_summaries_remain_inspectable_without_startup_backfill() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let key = super::super::tests::key("a");
+        let writer = record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
+        let db = Connection::open(&path).unwrap();
+        let run = command::read_run(&db, 1).unwrap();
+        assert_eq!(run["recommendation_eligible"], false);
+        assert_eq!(run["selected_workers"], Value::Null);
+        assert_eq!(writer.starting_count(&key, false).unwrap().workers, 16);
+        // Earlier writers used 0 (no recommendation) or 1 (recommendation).
+        // Neither is upgraded by scanning the old summaries during startup.
+        for old_eligibility in [0, 1] {
+            db.execute("UPDATE runs SET eligible=?1", [old_eligibility])
+                .unwrap();
+            assert!(writer.starting_count(&key, false).is_none());
+            let run = command::read_run(&db, 1).unwrap();
+            assert_eq!(run["summary"]["measured_worker_counts"], 2);
+        }
     }
 
     #[test]

@@ -1779,7 +1779,7 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
         let rate = if workers == 2 { 99.0 } else { 100.0 };
         totals["observations"][workers.to_string()] = serde_json::json!([rate * 5.0, 5.0, 2]);
         db.execute(
-            "UPDATE runs SET summary=json_set(summary,'$.measurement_totals',json(?1),'$.measured_worker_counts',?2) WHERE id=1",
+            "UPDATE runs SET eligible=2,summary=json_set(summary,'$.measurement_totals',json(?1),'$.measured_worker_counts',?2) WHERE id=1",
             rusqlite::params![totals.to_string(),totals["observations"].as_object().unwrap().len() as i64],
         )
         .unwrap();
@@ -2146,7 +2146,7 @@ pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) 
         .unwrap();
     db.execute("DELETE FROM events WHERE run=?1", [id]).unwrap();
     db.execute(
-        "UPDATE runs SET status='success',eligible=0,workers=NULL,lost=0 WHERE id=?1",
+        "UPDATE runs SET status='success',eligible=2,workers=NULL,lost=0 WHERE id=?1",
         [id],
     )
     .unwrap();

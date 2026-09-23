@@ -184,7 +184,6 @@ fn open(path: &Path) -> Result<Connection> {
     }
     db.busy_timeout(Duration::from_millis(100))?;
     db.pragma_update(None, "foreign_keys", true)?;
-    inference::index(&db)?;
     Ok(db)
 }
 
@@ -455,6 +454,16 @@ impl Writer {
     ) -> Result<()> {
         summary["measured_worker_counts"] = json!(self.measurements.measured_counts());
         summary["measurement_totals"] = serde_json::to_value(&self.measurements)?;
+        let summary = serde_json::to_string(&summary)?;
+        let eligibility = if success && self.lost == 0 {
+            if summary.len() <= inference::MAX_SUMMARY && self.measurements.reusable() {
+                inference::MEASUREMENTS
+            } else {
+                i64::from(eligible && workers.is_some())
+            }
+        } else {
+            0
+        };
         // Pay at most one small lock wait for the entire final save. Once the
         // immediate transaction owns the writer lock, samples, context and the
         // recommendation commit together without per-statement busy waits.
@@ -470,9 +479,9 @@ impl Writer {
             "UPDATE runs SET status=?1,eligible=?2,workers=?3,summary=?4,lost=?5 WHERE id=?6",
             params![
                 if success { "success" } else { "failed" },
-                success && eligible && self.lost == 0 && workers.is_some(),
+                eligibility,
                 workers.map(|n| n as u32),
-                serde_json::to_string(&summary)?,
+                summary,
                 self.lost,
                 self.id
             ],
