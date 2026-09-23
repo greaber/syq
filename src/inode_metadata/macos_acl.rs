@@ -173,12 +173,13 @@ pub(super) fn apply_with_mode(file: &File, value: &MacAcl, mode: u32) -> Result<
             unsafe { filesec_free(self.0) };
         }
     }
-    let security = Security(unsafe { filesec_init() });
+    let raw = unsafe { filesec_init() };
     ensure!(
-        !security.0.is_null(),
+        !raw.is_null(),
         "allocate macOS file security: {}",
         io::Error::last_os_error()
     );
+    let security = Security(raw);
     let mode = (mode & 0o7777) as libc::mode_t;
     checked(
         unsafe { filesec_set_property(security.0, 4, (&mode as *const libc::mode_t).cast()) },

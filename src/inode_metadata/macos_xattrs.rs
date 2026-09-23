@@ -100,14 +100,6 @@ fn set(file: &File, name: &[u8], value: Option<&[u8]>) -> Result<()> {
     // with a user resource fork during an unchanged-content metadata update.
     ensure!(name != RESOURCE_FORK || !compressed(file)?,
         "cannot change a resource fork on a compressed destination; copy to an uncompressed destination");
-    let current = file.metadata()?;
-    use std::os::unix::fs::MetadataExt;
-    let temporary_write = current.mode() & 0o200 == 0
-        && current.uid() == unsafe { libc::geteuid() }
-        && !current.file_type().is_symlink();
-    if temporary_write {
-        crate::fsops::set_mode_handle(file, current.mode() & 0o7777 | 0o200)?;
-    }
     let name = CString::new(name)?;
     let result = match value {
         Some(value) => unsafe {
@@ -122,14 +114,8 @@ fn set(file: &File, name: &[u8], value: Option<&[u8]>) -> Result<()> {
         },
         None => unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr(), 0) },
     };
-    let error = (result != 0).then(io::Error::last_os_error);
-    let restore = if temporary_write {
-        crate::fsops::set_mode_handle(file, current.mode() & 0o7777)
-    } else {
-        Ok(())
-    };
-    restore.context("restore permissions after extended attributes")?;
-    if let Some(error) = error {
+    if result != 0 {
+        let error = io::Error::last_os_error();
         if value.is_none() && error.raw_os_error() == Some(libc::ENOATTR) {
             return Ok(());
         }
@@ -180,17 +166,38 @@ pub(super) fn apply(file: &File, attributes: &ExtendedAttributes) -> Result<()> 
         previous = Some(wire_name);
         values.push((name, value.as_slice()));
     }
+    let mut changes = Vec::new();
     for name in names(file)? {
         if selected(&name, is_compressed)
             && values
                 .binary_search_by(|(n, _)| n.cmp(&name.as_slice()))
                 .is_err()
         {
-            set(file, &name, None)?;
+            changes.push((name, None));
         }
     }
     for (name, value) in values {
-        set(file, name, Some(value))?;
+        if get(file, name)?.as_deref() != Some(value) {
+            changes.push((name.to_vec(), Some(value)));
+        }
     }
-    Ok(())
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let current = file.metadata()?;
+    use std::os::unix::fs::MetadataExt;
+    let temporary_write = current.mode() & 0o200 == 0
+        && current.uid() == unsafe { libc::geteuid() }
+        && !current.file_type().is_symlink();
+    if temporary_write {
+        crate::fsops::set_mode_handle(file, current.mode() & 0o7777 | 0o200)?;
+    }
+    let result = changes
+        .into_iter()
+        .try_for_each(|(name, value)| set(file, &name, value));
+    if temporary_write {
+        crate::fsops::set_mode_handle(file, current.mode() & 0o7777)
+            .context("restore permissions after extended attributes")?;
+    }
+    result
 }
