@@ -461,3 +461,34 @@ fn posix_acls_cover_fifo_inodes() {
     run_ok(&["-aAX", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(attr(&t.path("dst/fifo"), "system.posix_acl_access"), None);
 }
+
+#[test]
+fn xattrs_preserve_long_listings_and_large_and_empty_values() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"payload");
+    let large = prng(4096, 811);
+    for index in 0..40 {
+        set_attr(
+            &t.path("source"),
+            &format!("user.attribute_{index:02}"),
+            b"small",
+        );
+    }
+    set_attr(&t.path("source"), "user.large", &large);
+    set_attr(&t.path("source"), "user.empty", b"");
+    let command = ["-aAX", &t.s("source"), &t.s("destination")];
+    run_ok(&command);
+    for index in 0..40 {
+        let name = format!("user.attribute_{index:02}");
+        assert_eq!(
+            attr(&t.path("source"), &name),
+            attr(&t.path("destination"), &name)
+        );
+    }
+    assert_eq!(attr(&t.path("destination"), "user.large"), Some(large));
+    assert_eq!(attr(&t.path("destination"), "user.empty"), Some(Vec::new()));
+    remove_attr(&t.path("source"), "user.large");
+    run_ok(&command);
+    assert_eq!(attr(&t.path("destination"), "user.large"), None);
+    assert_eq!(attr(&t.path("destination"), "user.empty"), Some(Vec::new()));
+}
