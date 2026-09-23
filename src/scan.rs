@@ -402,25 +402,48 @@ fn produce_descriptor_scan(
     let mut entries_in_chunk = 0;
     let mut retained_directories = 0;
     while !directories.is_empty() {
-        let count = DIRECTORY_WORKERS.min(directories.len());
-        let work: Vec<_> = (0..count).map(|_| directories.pop().unwrap()).collect();
-        retained_directories -= work.iter().filter(|d| d.opened.is_some()).count();
-        let available = DESCRIPTOR_DIRECTORY_FDS.saturating_sub(retained_directories + count);
-        // Tasks return at most one metadata chunk and never wait for the
-        // consumer. A shared pool is therefore safe even when another scan is
-        // backpressured. Indexed collection preserves deterministic output.
+        // Keep the dispatcher inside the pool across a few empty rounds.
+        // Empty steps have no children, remainders, events or warnings, so
+        // skipping the producer round trip cannot change traversal order.
+        // Return every productive round before sending to the consumer: a
+        // backpressured scan must never occupy one of the shared pool threads.
         use rayon::prelude::*;
-        let steps: Vec<_> = pool.install(|| {
-            work.into_par_iter()
-                .enumerate()
-                .map(|(index, directory)| {
-                    let label = directory.relative.clone();
-                    let retain = available / count + usize::from(index < available % count);
-                    scan.step(directory, retain, count == 1).map_err(|error| {
-                        format!("scan: {}: {error:#}", String::from_utf8_lossy(&label))
+        let steps = pool.install(|| {
+            let started = Instant::now();
+            for round in 0..8 {
+                let count = DIRECTORY_WORKERS.min(directories.len());
+                let work: Vec<_> = (0..count).map(|_| directories.pop().unwrap()).collect();
+                retained_directories -= work.iter().filter(|d| d.opened.is_some()).count();
+                let available =
+                    DESCRIPTOR_DIRECTORY_FDS.saturating_sub(retained_directories + count);
+                let steps: Vec<_> = work
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(index, directory)| {
+                        let label = directory.relative.clone();
+                        let retain = available / count + usize::from(index < available % count);
+                        scan.step(directory, retain, count == 1).map_err(|error| {
+                            format!("scan: {}: {error:#}", String::from_utf8_lossy(&label))
+                        })
                     })
-                })
-                .collect()
+                    .collect();
+                let productive = steps.iter().any(|step| match step {
+                    Ok(step) => {
+                        !step.events.is_empty()
+                            || !step.children.is_empty()
+                            || step.remainder.is_some()
+                    }
+                    Err(_) => true,
+                });
+                if productive
+                    || directories.is_empty()
+                    || round == 7
+                    || started.elapsed() >= FIRST_BATCH_MAX_DELAY
+                {
+                    return steps;
+                }
+            }
+            unreachable!("bounded empty-directory rounds always return")
         });
         let mut children = Vec::new();
         let mut remainders = Vec::new();
@@ -1053,6 +1076,40 @@ mod tests {
             scans.push((paths, ignored));
         }
         assert_eq!(scans[0], scans[1]);
+    }
+
+    #[test]
+    fn descriptor_scan_empty_rounds_keep_later_payload_and_parent_order() {
+        let temp = crate::test_support::tempdir().unwrap();
+        for index in 0..192 {
+            fs::create_dir(temp.path().join(format!("d{index:03}"))).unwrap();
+        }
+        fs::write(temp.path().join("d063/file"), b"first").unwrap();
+        fs::create_dir(temp.path().join("d129/nested")).unwrap();
+        fs::write(temp.path().join("d129/nested/file"), b"second").unwrap();
+        let root = Arc::new(Root::from_directory(File::open(temp.path()).unwrap()).unwrap());
+        let mut previous = None;
+        for _ in 0..2 {
+            let (entries, ignored, warnings) = descriptor_entries(root.clone());
+            assert!(ignored.is_empty());
+            assert!(warnings.is_empty(), "{warnings:?}");
+            let paths: Vec<_> = entries.into_iter().map(|entry| entry.path).collect();
+            assert_eq!(paths.len(), 196);
+            assert!(paths.contains(&b"d063/file".to_vec()));
+            assert!(paths.contains(&b"d129/nested/file".to_vec()));
+            let mut seen = std::collections::HashSet::new();
+            for path in &paths {
+                if !path.is_empty() {
+                    let end = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
+                    assert!(seen.contains(&path[..end]));
+                }
+                assert!(seen.insert(path.clone()));
+            }
+            if let Some(previous) = previous {
+                assert_eq!(paths, previous);
+            }
+            previous = Some(paths);
+        }
     }
 
     #[test]
