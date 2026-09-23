@@ -4512,6 +4512,120 @@ fn source_descriptor_budget_accounts_for_registry_control_and_workers() {
     assert!(source_descriptor_requirement(0, usize::MAX, usize::MAX, usize::MAX).is_err());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn descriptor_capacity_reservation_preserves_descriptors_and_limits() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    const CHILD: &str = "SYQ_TEST_DESCRIPTOR_CAPACITY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        for mode in ["ordinary", "low-hard-limit"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "fsops::tests::descriptor_capacity_reservation_preserves_descriptors_and_limits",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .capture_output()
+                .unwrap();
+            assert!(output.status.success(), "{mode}: {output:?}");
+        }
+        return;
+    }
+
+    fn capacity() -> usize {
+        fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("FDSize:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+    fn descriptors() -> Vec<i32> {
+        let mut fds: Vec<_> = fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        fds.sort_unstable();
+        fds
+    }
+
+    // Only the isolated children change limits; other tests are unaffected.
+    if std::env::var(CHILD).unwrap() == "low-hard-limit" {
+        let low = nofile_limits().unwrap().rlim_max.min(128);
+        set_nofile_limits(&libc::rlimit {
+            rlim_cur: low,
+            rlim_max: low,
+        })
+        .unwrap();
+    }
+    let original = nofile_limits().unwrap();
+    let low = original.rlim_max.min(128);
+    let limits = libc::rlimit {
+        rlim_cur: low,
+        rlim_max: original.rlim_max,
+    };
+    set_nofile_limits(&limits).unwrap();
+    let before = descriptors();
+    let initial = capacity();
+    reserve_descriptor_capacity(16 * 1024);
+    assert!(capacity() >= low as usize);
+    assert_eq!(capacity(), initial.max((low as usize).next_power_of_two()));
+    assert_eq!(descriptors(), before, "reservation leaked a descriptor");
+    let after = nofile_limits().unwrap();
+    assert_eq!((after.rlim_cur, after.rlim_max), (low, original.rlim_max));
+
+    // An inherited descriptor at the target must not be overwritten, even
+    // when it is the last slot permitted by the soft limit.
+    let zero = File::open("/dev/zero").unwrap();
+    let fd = unsafe { libc::fcntl(zero.as_raw_fd(), libc::F_DUPFD_CLOEXEC, low as i32 - 1) };
+    assert!(fd >= 0, "{}", io::Error::last_os_error());
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let occupied = descriptors();
+    reserve_descriptor_capacity(low as usize);
+    assert_eq!(descriptors(), occupied);
+    let mut byte = 1u8;
+    assert_eq!(
+        unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) },
+        1
+    );
+    assert_eq!(byte, 0, "reservation replaced /dev/zero");
+    drop(owned);
+    drop(zero);
+
+    // The existing source budget can request more than the initial 16K.
+    let larger = original.rlim_max.min(32 * 1024);
+    set_nofile_limits(&libc::rlimit {
+        rlim_cur: larger,
+        rlim_max: original.rlim_max,
+    })
+    .unwrap();
+    if larger >= 32 * 1024 {
+        require_source_descriptor_capacity(1, 800, 0).unwrap();
+        assert!(capacity() >= 32 * 1024);
+    } else {
+        reserve_descriptor_capacity(larger as usize);
+        assert!(capacity() >= larger as usize);
+    }
+    assert_eq!(descriptors(), before);
+    let reserved = capacity();
+    reserve_descriptor_capacity(0);
+    reserve_descriptor_capacity(64);
+    assert_eq!(capacity(), reserved, "reuse shrank the table");
+    assert_eq!(descriptors(), before);
+}
+
 #[test]
 fn live_descriptor_snapshot_includes_this_process() {
     let limits = nofile_limits().unwrap();
@@ -4741,5 +4855,62 @@ fn acl_resume_replaces_previously_readable_staging_inodes() {
         old_reader.read_to_end(&mut exposed).unwrap();
         assert!(exposed.is_empty(), "old reader saw protected copy contents");
         assert_eq!(fs::read(&path).unwrap(), b"protected payload");
+    }
+}
+
+#[test]
+fn inplace_prepare_rejects_replaced_hashed_basis_before_mutation() {
+    for replacement in ["file", "symlink", "missing"] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        fs::write(root.join("file"), b"hashed contents").unwrap();
+        fs::write(root.join("outside"), b"untouched").unwrap();
+        let mut ops = FsOps::new();
+        ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
+        ops.destination_prefix = Some(path_bytes(root));
+        let copy_id = [91; 16];
+        ops.hash_and_hold(
+            b"file",
+            &copy_id,
+            MIN_HASH_BLOCK_BYTES,
+            14,
+            TargetCondition::Any,
+            None,
+        )
+        .unwrap();
+        fs::rename(root.join("file"), root.join("original")).unwrap();
+        match replacement {
+            "file" => fs::write(root.join("file"), b"replacement contents").unwrap(),
+            "symlink" => symlink("outside", root.join("file")).unwrap(),
+            _ => {}
+        }
+        let result = ops.prepare(
+            PartialTarget {
+                path: b"file",
+                id: &copy_id,
+                guard: None,
+            },
+            PrepareOptions {
+                size: 0,
+                inplace: true,
+                mode: 0o600,
+                attempt: 0,
+                create_if_missing: true,
+            },
+        );
+        assert!(result.is_err(), "accepted {replacement} replacement");
+        assert_eq!(fs::read(root.join("original")).unwrap(), b"hashed contents");
+        assert_eq!(fs::read(root.join("outside")).unwrap(), b"untouched");
+        match replacement {
+            "file" => assert_eq!(
+                fs::read(root.join("file")).unwrap(),
+                b"replacement contents"
+            ),
+            "symlink" => assert_eq!(
+                fs::read_link(root.join("file")).unwrap(),
+                Path::new("outside")
+            ),
+            _ => assert!(!root.join("file").exists()),
+        }
     }
 }

@@ -849,6 +849,21 @@ impl Worker {
             // through a sidecar + atomic rename. Small new files normally take
             // the batched small-file path instead of reaching this worker path.
 
+            // Compare before requesting write access or resizing an in-place
+            // destination. A matching read-only file needs only metadata work.
+            // Prepare binds any writes to this held inode, and the comparison
+            // below is reused rather than hashing the contents a second time.
+            let inplace_ranges = if inplace && final_is_file {
+                let diff = self.diff_final_and_hold(&job)?;
+                if diff.ranges.is_empty() && diff.held_len == Some(size) {
+                    self.finish_matched_basis(idx, &job)?;
+                    return Ok((vec![], false));
+                }
+                Some(diff.ranges)
+            } else {
+                None
+            };
+
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
             // absent until the content comparison shows a difference.
@@ -873,10 +888,7 @@ impl Worker {
                 self.sched.request_direct_fallback();
             }
             if inplace {
-                if final_is_file && size > 0 {
-                    return Ok((self.diff_blocks(&job, Which::Final)?, true));
-                }
-                return Ok((full(), true));
+                return Ok((inplace_ranges.unwrap_or_else(full), true));
             }
             // A retry's own output must be finished (and thus consumed), even
             // if another copy has meanwhile published identical final bytes.

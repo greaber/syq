@@ -956,6 +956,55 @@ fn incompatible_acl_models_are_rejected_before_destination_creation() {
     assert!(!t.path("destination").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn inplace_local_copy_finalizes_a_new_readonly_file() {
+    let t = Tmp::new();
+    let data = prng(2 << 20, 94);
+    write(&t.path("source"), &data);
+    fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o400)).unwrap();
+    set_mtime(&t.path("source"), 1_577_934_245);
+    let args = ["-a", "--inplace", &t.s("source"), &t.s("destination")];
+    run_ok(&args);
+    assert_eq!(read(&t.path("destination")), data);
+    let metadata = fs::metadata(t.path("destination")).unwrap();
+    assert_eq!(metadata.mode() & 0o7777, 0o400);
+    assert_eq!(metadata.mtime(), 1_577_934_245);
+
+    // Keeping the creation descriptor must not bypass write permissions on
+    // an existing destination in a later invocation.
+    fs::set_permissions(t.path("destination"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(t.path("destination"), b"existing read-only data").unwrap();
+    fs::set_permissions(t.path("destination"), fs::Permissions::from_mode(0o400)).unwrap();
+    let output = syq(&args);
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(!output.status.success());
+        assert_eq!(read(&t.path("destination")), b"existing read-only data");
+    } else {
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("destination")), data);
+    }
+}
+
+#[test]
+fn checksum_inplace_rerun_accepts_matching_readonly_destination() {
+    let t = Tmp::new();
+    let data = prng(2 << 20, 95);
+    write(&t.path("source"), &data);
+    write(&t.path("destination"), &data);
+    for name in ["source", "destination"] {
+        fs::set_permissions(t.path(name), fs::Permissions::from_mode(0o400)).unwrap();
+        set_mtime(&t.path(name), 1_577_934_245);
+    }
+    let inode = fs::metadata(t.path("destination")).unwrap().ino();
+    run_ok(&["-ac", "--inplace", &t.s("source"), &t.s("destination")]);
+    assert_eq!(read(&t.path("destination")), data);
+    let metadata = fs::metadata(t.path("destination")).unwrap();
+    assert_eq!(metadata.ino(), inode);
+    assert_eq!(metadata.mode() & 0o7777, 0o400);
+    assert_eq!(metadata.mtime(), 1_577_934_245);
+}
+
 fn check_new_readonly_inplace_copy(native: bool, fallback: bool, umask: libc::mode_t) {
     let t = Tmp::new();
     fs::create_dir(t.path("dst")).unwrap();
