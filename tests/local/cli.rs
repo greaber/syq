@@ -527,13 +527,13 @@ fn unsupported_rsync_flags_explain_themselves() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("after the transfer"));
 
-    // Bundled short flags from a pasted `rsync -aHz` are caught too (the
+    // Bundled short flags from a pasted `rsync -aSz` are caught too (the
     // unsupported letter is found inside the cluster).
-    let out = syq(&["-aHz", &t.s("src/"), &t.s("dst/")]);
+    let out = syq(&["-aSz", &t.s("src/"), &t.s("dst/")]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("hard links"),
-        "bundled -H should be explained: {}",
+        String::from_utf8_lossy(&out.stderr).contains("sparse"),
+        "bundled -S should be explained: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 

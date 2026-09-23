@@ -5,6 +5,7 @@ pub(super) fn op_path(op: &Op) -> &[u8] {
         Op::Mkdir { path, .. }
         | Op::Symlink { path, .. }
         | Op::Mknod { path, .. }
+        | Op::Hardlink { path, .. }
         | Op::SetMeta { path, .. }
         | Op::SetFileMetaIfSame { path, .. }
         | Op::Remove { path }
@@ -56,6 +57,22 @@ pub(super) fn apply_one(
     }
     if let Some(guard) = guard {
         let target = guarded_target(op_path(op), guard)?;
+        if let Op::Hardlink {
+            path,
+            source,
+            dev,
+            ino,
+        } = op
+        {
+            let source = guarded_target(source, guard)?;
+            let operation = Op::Hardlink {
+                path: path.clone(),
+                source: source.relative.to_path_buf().into_os_string().into_vec(),
+                dev: *dev,
+                ino: *ino,
+            };
+            return apply_one_rooted(&operation, &target.as_rooted());
+        }
         return apply_one_rooted(op, &target.as_rooted());
     }
     let Some(target) = registered_target else {
@@ -406,6 +423,9 @@ pub(super) fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                 None => root.create_node(path, *mode, *rdev),
             }
         }
+        Op::Hardlink {
+            source, dev, ino, ..
+        } => root.publish_hardlink(&RelativePath::new(source)?, path, (*dev, *ino)),
         Op::SetMeta {
             meta,
             flags,

@@ -1830,6 +1830,9 @@ impl RestrictedAuthority {
         outcomes: &mut Vec<PendingOutcome>,
         touched: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
+        if matches!(operation, Op::Hardlink { .. }) {
+            bail!("hardlink creation is not authorized by the signed grant");
+        }
         let path = match &*operation {
             Op::Mkdir { path, .. }
             | Op::SetMeta { path, .. }
@@ -1846,6 +1849,7 @@ impl RestrictedAuthority {
                 }
                 path
             }
+            Op::Hardlink { .. } => unreachable!("hardlinks rejected above"),
             Op::Remove { .. } => {
                 bail!("recursive remove is not supported by the root-confined receiver")
             }
@@ -1889,6 +1893,7 @@ impl RestrictedAuthority {
             bail!("expected hash requires a regular file");
         }
         match operation {
+            Op::Hardlink { .. } => bail!("hardlink creation is not authorized by the signed grant"),
             Op::Mkdir {
                 path,
                 mode,

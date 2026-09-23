@@ -448,7 +448,7 @@ impl FsOps {
         flags: u8,
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
-    ) -> Result<()> {
+    ) -> Result<Option<(u64, u64)>> {
         let (held, target) = self.take_held_basis(path, copy_id, guard)?;
         require_open_target(&held.file, &held.label, condition)?;
         set_meta_file(&held.file, meta, flags)
@@ -475,7 +475,7 @@ impl FsOps {
                 condition,
             )?;
         }
-        Ok(())
+        published_identity(&held.file, flags)
     }
 
     pub(super) fn seed_basis(
@@ -1072,7 +1072,7 @@ impl FsOps {
     /// Write a whole small file through its private partial and atomically
     /// rename it into place. Keeping this as one request preserves pipelining;
     /// unlike an in-place write, no partial final-named file is ever visible.
-    pub(super) fn put_small(&mut self, put: &SmallPut) -> Result<()> {
+    pub(super) fn put_small(&mut self, put: &SmallPut) -> Result<Option<(u64, u64)>> {
         let target = PartialTarget {
             path: &put.path,
             id: &put.copy_id,
@@ -1156,7 +1156,7 @@ impl FsOps {
                     condition,
                 )?;
             }
-            return Ok(());
+            return published_identity(&file, flags);
         }
         if target.guard.is_none()
             && matches!(
@@ -1182,7 +1182,7 @@ impl FsOps {
                 &file,
                 condition,
             )?;
-            return Ok(());
+            return published_identity(&file, flags);
         }
 
         // New/replace small files, and the existing guarded-receiver
@@ -1206,7 +1206,7 @@ impl FsOps {
         #[cfg(debug_assertions)]
         fail_put_small_before_rename_for_test(&rooted.label)?;
         publish_partial_rooted(&rooted.root, &relative, &rooted.relative, &file, condition)?;
-        Ok(())
+        published_identity(&file, flags)
     }
 
     pub(super) fn hash_blocks(
@@ -1480,7 +1480,7 @@ impl FsOps {
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
         expected: Option<&crate::hashing::Digest>,
-    ) -> Result<()> {
+    ) -> Result<Option<(u64, u64)>> {
         if let Some(expected) = expected {
             Self::verify_expected_file(
                 &self.held_basis.as_ref().context("no retained basis")?.file,
@@ -1499,7 +1499,7 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         mutation: TargetMutation<'_>,
-    ) -> Result<()> {
+    ) -> Result<Option<(u64, u64)>> {
         self.finalize_expected(None, path, inplace, copy_id, meta, flags, mutation)
     }
 
@@ -1513,7 +1513,7 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         mutation: TargetMutation<'_>,
-    ) -> Result<()> {
+    ) -> Result<Option<(u64, u64)>> {
         let target = self.destination_mutation_target(path, mutation.guard)?;
         self.finalize_rooted(&target, inplace, copy_id, meta, flags, mutation, expected)
     }
@@ -1528,7 +1528,7 @@ impl FsOps {
         flags: u8,
         mutation: TargetMutation<'_>,
         expected: Option<&crate::hashing::Digest>,
-    ) -> Result<()> {
+    ) -> Result<Option<(u64, u64)>> {
         let TargetMutation { condition, guard } = mutation;
         let guarded = guard.is_some();
         if inplace {
@@ -1552,7 +1552,7 @@ impl FsOps {
                     condition,
                 )?;
             }
-            return Ok(());
+            return published_identity(&file, flags);
         }
         let (src_relative, src, file) = with_rooted_partial(target, copy_id, |relative, _| {
             self.uncache_rooted(&target.root, relative)
@@ -1611,7 +1611,7 @@ impl FsOps {
                 staged_metadata.ino(),
                 &src,
             )?;
-            return Ok(());
+            return published_identity(&destination, flags);
         }
 
         set_meta_file(&file, meta, flags)
@@ -1631,7 +1631,7 @@ impl FsOps {
             &file,
             condition,
         )?;
-        Ok(())
+        published_identity(&file, flags)
     }
 
     pub fn file_hash(
@@ -1939,7 +1939,7 @@ impl FsOps {
                     guard.as_ref(),
                     expected_hash.as_ref(),
                 )
-                .map(|_| Response::Ok),
+                .map(publication_response),
             Request::SeedBasis {
                 path,
                 copy_id,
@@ -1987,11 +1987,21 @@ impl FsOps {
                     CopyLocalOutcome::Copied => Response::Ok,
                     CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
                 }),
-            Request::PutSmallBatch(puts) => Ok(Response::Applied(
-                puts.iter()
-                    .map(|put| self.put_small(put).err().as_ref().map(wire_error))
-                    .collect(),
-            )),
+            Request::PutSmallBatch(puts) => {
+                if puts.iter().any(|p| p.flags & flags::REPORT_IDENTITY != 0) {
+                    Ok(Response::PublishedBatch(
+                        puts.iter()
+                            .map(|put| self.put_small(put).map_err(|e| wire_error(&e)))
+                            .collect(),
+                    ))
+                } else {
+                    Ok(Response::Applied(
+                        puts.iter()
+                            .map(|put| self.put_small(put).err().as_ref().map(wire_error))
+                            .collect(),
+                    ))
+                }
+            }
             Request::HashBlocks {
                 path,
                 source,
@@ -2102,7 +2112,7 @@ impl FsOps {
                         guard: guard.as_ref(),
                     },
                 )
-                .map(|_| Response::Ok),
+                .map(publication_response),
             Request::FileHash {
                 path,
                 source,
@@ -2459,5 +2469,21 @@ pub(super) fn apply_owner_if_changed(
             Ok(false)
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+// Read from the completed descriptor, never from its mutable published name.
+fn published_identity(file: &File, flags: u8) -> Result<Option<(u64, u64)>> {
+    if flags & flags::REPORT_IDENTITY == 0 {
+        return Ok(None);
+    }
+    let metadata = file.metadata()?;
+    Ok(Some((metadata.dev(), metadata.ino())))
+}
+
+fn publication_response(identity: Option<(u64, u64)>) -> Response {
+    match identity {
+        Some((dev, ino)) => Response::Published { dev, ino },
+        None => Response::Ok,
     }
 }

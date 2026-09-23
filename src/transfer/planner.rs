@@ -102,6 +102,7 @@ pub(super) struct Planner<'a> {
     /// Descriptor-session capability for the source currently feeding
     /// planner batches. Buffered jobs retain their own derived path.
     pub(super) active_source: Option<RegisteredPath>,
+    pub(super) hardlinks: super::hardlinks::Hardlinks,
 }
 
 /// What a source entry asserts about its destination path. Two dirs merge;
@@ -383,6 +384,13 @@ impl Planner<'_> {
         let Some(plan) = &mut self.fresh_capacity else {
             return;
         };
+        if self.opts.hardlinks
+            && entry.kind == Kind::File
+            && entry.nlink > 1
+            && !plan.hardlink_inodes.insert((entry.dev, entry.ino))
+        {
+            return;
+        }
         // When source contents map directly into an existing empty container,
         // the source's root directory reuses that one existing inode.
         if !(plan.root_existed && reuses_existing_root) {
@@ -400,7 +408,7 @@ impl Planner<'_> {
     }
 
     pub(super) fn assess_fresh_capacity(&mut self) -> Result<Option<FreshCapacityAssessment>> {
-        let Some(plan) = self.fresh_capacity.clone() else {
+        let Some(plan) = self.fresh_capacity.take() else {
             return Ok(None);
         };
         if plan.overflowed {
@@ -990,6 +998,13 @@ impl Planner<'_> {
         sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
+        if self.opts.hardlinks
+            && batch
+                .iter()
+                .any(|e| e.nlink > 1 && !matches!(e.kind, Kind::File | Kind::Dir))
+        {
+            bail!("hardlink preservation currently supports regular files only; the source contains a multiply linked non-regular file");
+        }
         let namespace_files = self.collect_namespace_files(&batch, src_root, sub, dst_root);
         if !namespace_files.is_empty() {
             self.sched.anticipate_file_work();
@@ -1518,6 +1533,21 @@ impl Planner<'_> {
             });
         if dst_newer {
             self.progress.files_excluded.fetch_add(1, Relaxed);
+            return;
+        }
+        if opts.hardlinks && e.nlink > 1 {
+            self.plan_hardlinked_file(
+                Planned {
+                    src: src_path,
+                    source,
+                    dst: dst_path,
+                    dst_rel,
+                    rel,
+                    e,
+                    contested,
+                },
+                dst_entry,
+            );
             return;
         }
         if same && !opts.checksum && (opts.dry_run || opts.expected_for(&dst_rel).is_none()) {
@@ -2782,7 +2812,7 @@ impl Planner<'_> {
         rel_bytes: PathBytes,
         entry: Entry,
         dst_entry: Option<Entry>,
-    ) {
+    ) -> usize {
         let (src, source) = source_path;
         let target_condition = self.exact_condition_for(&dst);
         let src_rel = self.mapping_source_rel(&rel_bytes);
@@ -2806,7 +2836,7 @@ impl Planner<'_> {
                     && self.container_guard.is_none(),
                 src_rel,
             },
-        });
+        })
     }
 
     /// --ignore-existing / --existing for a leaf, given what's on the destination.
@@ -3301,6 +3331,7 @@ pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
         dev: 0,
         ino: 0,
         ctime: 0,
+        nlink: 1,
         ctime_nsec: 0,
         link: None,
     }

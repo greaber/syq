@@ -1183,6 +1183,87 @@ impl Root {
         })
     }
 
+    /// Link a representative through a held object, then publish its new name.
+    /// This deliberately does not use the single-link staging-file helpers.
+    pub(crate) fn publish_hardlink(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+        identity: (u64, u64),
+    ) -> Result<()> {
+        let file = self.open_metadata(source)?;
+        let opened = root_metadata_from_std(&file.metadata()?)?;
+        if !opened.is_file() || (opened.dev, opened.ino) != identity {
+            bail!(
+                "hardlink representative {} changed before publication",
+                source.label()
+            );
+        }
+        let parent = self.resolve_parent(target)?;
+        match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
+            Ok(existing) if (existing.dev, existing.ino) == identity => return Ok(()),
+            Ok(existing) if existing.is_dir() => {
+                bail!("hardlink destination {} is a directory", target.label())
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(target_os = "linux")]
+        let source_name = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        #[cfg(not(target_os = "linux"))]
+        let source_parent = self.resolve_parent(source)?;
+        #[cfg(any(target_os = "linux", test))]
+        let _permit = self.mutation_permit(target)?;
+        let temporary = create_temporary(&parent, |fd, name| {
+            #[cfg(target_os = "linux")]
+            let result = retry_zero(|| unsafe {
+                libc::linkat(
+                    libc::AT_FDCWD,
+                    source_name.as_ptr(),
+                    fd,
+                    name.as_ptr(),
+                    libc::AT_SYMLINK_FOLLOW,
+                )
+            });
+            #[cfg(not(target_os = "linux"))]
+            let result = retry_zero(|| unsafe {
+                libc::linkat(
+                    source_parent.directory.as_raw_fd(),
+                    source_parent.leaf.as_ptr(),
+                    fd,
+                    name.as_ptr(),
+                    0,
+                )
+            });
+            result
+        })?;
+        let result = (|| {
+            // On platforms without fd-relative link creation, a raced source
+            // name can create a different temporary inode. Never publish it.
+            let linked = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
+            if !linked.is_file() || (linked.dev, linked.ino) != identity {
+                bail!(
+                    "hardlink representative {} changed while linking",
+                    source.label()
+                );
+            }
+            retry_zero(|| unsafe {
+                libc::renameat(
+                    parent.directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                )
+            })
+            .with_context(|| format!("publish hardlink {}", target.label()))
+        })();
+        if result.is_err() {
+            let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
+        }
+        result
+    }
+
     /// Atomically publish a staged regular file with ordinary rename
     /// replacement semantics. Both parents are retained before the rename, so
     /// a concurrent ancestor replacement cannot redirect either side. A later

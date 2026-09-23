@@ -984,6 +984,9 @@ fn run_remote(
     for line in &args.ignore_lines {
         remote.push(format!("--ignore={line}"));
     }
+    if args.hardlinks {
+        remote.push("--preserve=hardlinks".into());
+    }
     if args.perms {
         remote.push("--preserve=permissions".into());
     }
