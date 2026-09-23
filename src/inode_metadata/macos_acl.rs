@@ -6,14 +6,14 @@ use anyhow::{ensure, Context, Result};
 use std::{ffi::c_void, fs::File, io, os::fd::AsRawFd, ptr};
 
 type Acl = *mut c_void;
-const EXTENDED: u32 = 0x100;
+const EXTENDED: libc::c_int = 0x100;
 const MAX_ENTRIES: usize = 128;
 const ACL_FLAGS: u32 = 1 | (1 << 17);
 const ENTRY_FLAGS: u32 = 0x1f0;
 
 unsafe extern "C" {
-    fn acl_get_fd_np(fd: libc::c_int, kind: u32) -> Acl;
-    fn acl_set_fd_np(fd: libc::c_int, acl: Acl, kind: u32) -> libc::c_int;
+    fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> Acl;
+    fn acl_set_fd_np(fd: libc::c_int, acl: Acl, kind: libc::c_int) -> libc::c_int;
     fn acl_init(count: libc::c_int) -> Acl;
     fn acl_free(object: *mut c_void) -> libc::c_int;
     fn acl_get_entry(acl: Acl, index: libc::c_int, entry: *mut Acl) -> libc::c_int;
@@ -25,9 +25,9 @@ unsafe extern "C" {
     fn acl_get_permset_mask_np(entry: Acl, mask: *mut u64) -> libc::c_int;
     fn acl_set_permset_mask_np(entry: Acl, mask: u64) -> libc::c_int;
     fn acl_get_flagset_np(object: Acl, flags: *mut Acl) -> libc::c_int;
-    fn acl_get_flag_np(flags: Acl, flag: u32) -> libc::c_int;
+    fn acl_get_flag_np(flags: Acl, flag: libc::c_int) -> libc::c_int;
     fn acl_clear_flags_np(flags: Acl) -> libc::c_int;
-    fn acl_add_flag_np(flags: Acl, flag: u32) -> libc::c_int;
+    fn acl_add_flag_np(flags: Acl, flag: libc::c_int) -> libc::c_int;
 }
 
 struct OwnedAcl(Acl);
@@ -56,7 +56,7 @@ fn get_flags(object: Acl) -> Result<u32> {
     // unsupported flag is rejected when constructing the destination ACL.
     for bit in 0..32 {
         let flag = 1u32 << bit;
-        let present = unsafe { acl_get_flag_np(set, flag) };
+        let present = unsafe { acl_get_flag_np(set, flag as _) };
         checked(present, "read macOS ACL flag")?;
         if present != 0 {
             value |= flag;
@@ -77,7 +77,7 @@ fn set_flags(object: Acl, value: u32, allowed: u32) -> Result<()> {
     checked(unsafe { acl_clear_flags_np(set) }, "clear macOS ACL flags")?;
     if value != 0 {
         checked(
-            unsafe { acl_add_flag_np(set, value) },
+            unsafe { acl_add_flag_np(set, value as _) },
             "set macOS ACL flags",
         )?;
     }
