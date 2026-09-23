@@ -3,6 +3,12 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 
 fn set_attr(path: &Path, name: &str, value: &[u8]) {
+    let original = fs::symlink_metadata(path).unwrap();
+    let restore = !original.file_type().is_symlink() && original.mode() & 0o200 == 0;
+    if restore {
+        fs::set_permissions(path, fs::Permissions::from_mode(original.mode() | 0o200)).unwrap();
+    }
+    let pathname = path;
     let path = CString::new(path.as_os_str().as_bytes()).unwrap();
     let name = CString::new(name).unwrap();
     assert_eq!(
@@ -20,6 +26,9 @@ fn set_attr(path: &Path, name: &str, value: &[u8]) {
         "{}",
         std::io::Error::last_os_error()
     );
+    if restore {
+        fs::set_permissions(pathname, original.permissions()).unwrap();
+    }
 }
 fn attr(path: &Path, name: &str) -> Option<Vec<u8>> {
     let path = CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -166,6 +175,7 @@ fn native_acl_and_xattrs_cover_clones_ranges_hardlinks_and_reconciliation() {
             fs::metadata(t.path("dst/nested/large")).unwrap().ino()
         );
         fs::set_permissions(t.path("src/small"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(t.path("dst/small"), fs::Permissions::from_mode(0o640)).unwrap();
         write(&t.path("src/small"), b"changed bytes");
         run_ok(&["-aHAXc", "--inplace", &from, &to]);
         assert_eq!(read(&t.path("dst/small")), b"changed bytes");
@@ -234,7 +244,13 @@ fn native_metadata_survives_lost_publication_reply_and_plain_copy_does_not_selec
     let output = remote_syq_command(
         &t,
         &rsh,
-        &["-aAX", "--syq-no-bootstrap", &t.s("source"), &remote],
+        &[
+            "-aAX",
+            "--performance-tuning=copy-path=ranges",
+            "--syq-no-bootstrap",
+            &t.s("source"),
+            &remote,
+        ],
     )
     .env("SYQ_TEST_DROP_AFTER_REQUEST", "finalize")
     .env("SYQ_TEST_DROP_MARKER", &marker)
@@ -310,4 +326,31 @@ fn an_acl_denying_deletion_can_be_published() {
     assert_output_ok(&output);
     assert_eq!(copied, Some(expected));
     assert_eq!(read(&t.path("copy")), b"protected content");
+}
+
+#[test]
+fn hardlinks_with_deletion_denial_can_be_published() {
+    let t = Tmp::new();
+    write(&t.path("src/one"), b"protected content");
+    fs::hard_link(t.path("src/one"), t.path("src/two")).unwrap();
+    chmod(&t.path("src/one"), &["+a", "everyone deny delete"]);
+    let expected = acl(&t.path("src/one"));
+    let output = compat_command()
+        .args(["-aHA", &t.s("src/"), &t.s("dst")])
+        .run()
+        .unwrap();
+    let copied = t.path("dst/one").exists().then(|| acl(&t.path("dst/one")));
+    chmod(&t.path("src/one"), &["-N"]);
+    // Clearing the representative also clears any temporary follower alias.
+    for name in ["dst/one", "dst/two"] {
+        if t.path(name).exists() {
+            chmod(&t.path(name), &["-N"]);
+        }
+    }
+    assert_output_ok(&output);
+    assert_eq!(copied, Some(expected));
+    assert_eq!(
+        fs::metadata(t.path("dst/one")).unwrap().ino(),
+        fs::metadata(t.path("dst/two")).unwrap().ino()
+    );
 }

@@ -1224,7 +1224,7 @@ impl FsOps {
         }
         observed_write(&self.operation, &file, data, 0, self.sparse)
             .with_context(|| format!("write {}", label.display()))?;
-        set_meta_file(&file, meta, flags)
+        set_meta_file_for_publication(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
         // `publish_partial_rooted` re-checks the staged name against the
         // open descriptor immediately before the rename, so no separate
@@ -1232,6 +1232,11 @@ impl FsOps {
         #[cfg(debug_assertions)]
         fail_put_small_before_rename_for_test(&rooted.label)?;
         publish_partial_rooted(&rooted.root, &relative, &rooted.relative, &file, condition)?;
+        crate::inode_metadata::finish_publication(
+            &file,
+            meta.inode_metadata.as_deref(),
+            meta.mode,
+        )?;
         published_identity(&file, flags)
     }
 
@@ -1657,7 +1662,7 @@ impl FsOps {
             return published_identity(&destination, flags);
         }
 
-        set_meta_file(&file, meta, flags)
+        set_meta_file_for_publication(&file, meta, flags)
             .with_context(|| format!("set metadata {}", src.display()))?;
         require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
         if target
@@ -1673,6 +1678,11 @@ impl FsOps {
             &target.relative,
             &file,
             condition,
+        )?;
+        crate::inode_metadata::finish_publication(
+            &file,
+            meta.inode_metadata.as_deref(),
+            meta.mode,
         )?;
         published_identity(&file, flags)
     }
@@ -2464,6 +2474,20 @@ pub(super) fn set_meta_file_known(
     flags: u8,
     current: &fs::Metadata,
 ) -> Result<()> {
+    set_meta_file_inner(f, meta, flags, current, false)
+}
+
+fn set_meta_file_for_publication(f: &File, meta: &Meta, flags: u8) -> Result<()> {
+    set_meta_file_inner(f, meta, flags, &f.metadata()?, true)
+}
+
+fn set_meta_file_inner(
+    f: &File,
+    meta: &Meta,
+    flags: u8,
+    current: &fs::Metadata,
+    before_publication: bool,
+) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     // Owner first: chown clears setuid/setgid, so mode must be set afterwards.
     let owner_changed =
@@ -2492,7 +2516,15 @@ pub(super) fn set_meta_file_known(
             return Err(io::Error::last_os_error().into());
         }
     }
-    crate::inode_metadata::apply(f, meta.inode_metadata.as_deref(), meta.mode)
+    if before_publication {
+        crate::inode_metadata::apply_before_publication(
+            f,
+            meta.inode_metadata.as_deref(),
+            meta.mode,
+        )
+    } else {
+        crate::inode_metadata::apply(f, meta.inode_metadata.as_deref(), meta.mode)
+    }
 }
 
 /// Apply only ownership fields whose requested values differ from the

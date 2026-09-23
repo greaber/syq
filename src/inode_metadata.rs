@@ -420,6 +420,37 @@ pub(crate) fn capture(
     Ok(Some(Box::new(metadata)))
 }
 pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) -> Result<()> {
+    apply_inner(file, metadata, mode, false)
+}
+
+pub(crate) fn apply_before_publication(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+    mode: u32,
+) -> Result<()> {
+    apply_inner(file, metadata, mode, true)
+}
+
+pub(crate) fn finish_publication(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+    mode: u32,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Some(acl) = metadata.and_then(|m| m.macos_acl.as_ref()) {
+        macos_acl::apply_with_mode(file, acl, mode)?;
+    }
+    let _ = (file, metadata, mode);
+    Ok(())
+}
+
+fn apply_inner(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+    mode: u32,
+    before_publication: bool,
+) -> Result<()> {
+    let _ = before_publication;
     let Some(metadata) = metadata else {
         return Ok(());
     };
@@ -533,7 +564,11 @@ pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) ->
     }
     #[cfg(target_os = "macos")]
     if let Some(acl) = &metadata.macos_acl {
-        macos_acl::apply(file, acl)?;
+        if before_publication {
+            macos_acl::apply_with_mode(file, &MacAcl::default(), 0)?;
+        } else {
+            macos_acl::apply(file, acl)?;
+        }
     }
     Ok(())
 }

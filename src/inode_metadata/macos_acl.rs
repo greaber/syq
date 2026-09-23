@@ -12,6 +12,14 @@ const ACL_FLAGS: u32 = 1 | (1 << 17);
 const ENTRY_FLAGS: u32 = 0x1f0;
 
 unsafe extern "C" {
+    fn filesec_init() -> *mut c_void;
+    fn filesec_free(security: *mut c_void);
+    fn filesec_set_property(
+        security: *mut c_void,
+        property: libc::c_int,
+        value: *const c_void,
+    ) -> libc::c_int;
+    fn fchmodx_np(fd: libc::c_int, security: *mut c_void) -> libc::c_int;
     fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> Acl;
     fn acl_set_fd_np(fd: libc::c_int, acl: Acl, kind: libc::c_int) -> libc::c_int;
     fn acl_init(count: libc::c_int) -> Acl;
@@ -145,13 +153,52 @@ pub(super) fn read(file: &File) -> Result<MacAcl> {
 }
 
 pub(super) fn apply(file: &File, value: &MacAcl) -> Result<()> {
+    if &read(file)? == value {
+        return Ok(());
+    }
+    let acl = build(value)?;
+    checked(
+        unsafe { acl_set_fd_np(file.as_raw_fd(), acl.0, EXTENDED) },
+        "restore macOS ACL on held inode",
+    )
+}
+
+// Publish mode and ACL together: neither a mode-only nor an ACL-only update
+// may temporarily grant access denied by the final combination.
+pub(super) fn apply_with_mode(file: &File, value: &MacAcl, mode: u32) -> Result<()> {
+    let acl = build(value)?;
+    struct Security(*mut c_void);
+    impl Drop for Security {
+        fn drop(&mut self) {
+            unsafe { filesec_free(self.0) };
+        }
+    }
+    let security = Security(unsafe { filesec_init() });
+    ensure!(
+        !security.0.is_null(),
+        "allocate macOS file security: {}",
+        io::Error::last_os_error()
+    );
+    let mode = (mode & 0o7777) as libc::mode_t;
+    checked(
+        unsafe { filesec_set_property(security.0, 4, (&mode as *const libc::mode_t).cast()) },
+        "set final macOS mode",
+    )?;
+    checked(
+        unsafe { filesec_set_property(security.0, 5, (&acl.0 as *const Acl).cast()) },
+        "set final macOS ACL",
+    )?;
+    checked(
+        unsafe { fchmodx_np(file.as_raw_fd(), security.0) },
+        "restore macOS mode and ACL on published inode",
+    )
+}
+
+fn build(value: &MacAcl) -> Result<OwnedAcl> {
     ensure!(
         value.entries.len() <= MAX_ENTRIES,
         "macOS ACL exceeds 128 entries"
     );
-    if &read(file)? == value {
-        return Ok(());
-    }
     let raw = unsafe { acl_init(value.entries.len() as _) };
     ensure!(
         !raw.is_null(),
@@ -184,8 +231,5 @@ pub(super) fn apply(file: &File, value: &MacAcl) -> Result<()> {
         )?;
         set_flags(entry, value.flags, ENTRY_FLAGS)?;
     }
-    checked(
-        unsafe { acl_set_fd_np(file.as_raw_fd(), acl.0, EXTENDED) },
-        "restore macOS ACL on held inode",
-    )
+    Ok(acl)
 }

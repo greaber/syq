@@ -100,6 +100,14 @@ fn set(file: &File, name: &[u8], value: Option<&[u8]>) -> Result<()> {
     // with a user resource fork during an unchanged-content metadata update.
     ensure!(name != RESOURCE_FORK || !compressed(file)?,
         "cannot change a resource fork on a compressed destination; copy to an uncompressed destination");
+    let current = file.metadata()?;
+    use std::os::unix::fs::MetadataExt;
+    let temporary_write = current.mode() & 0o200 == 0
+        && current.uid() == unsafe { libc::geteuid() }
+        && !current.file_type().is_symlink();
+    if temporary_write {
+        crate::fsops::set_mode_handle(file, current.mode() & 0o7777 | 0o200)?;
+    }
     let name = CString::new(name)?;
     let result = match value {
         Some(value) => unsafe {
@@ -114,8 +122,14 @@ fn set(file: &File, name: &[u8], value: Option<&[u8]>) -> Result<()> {
         },
         None => unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr(), 0) },
     };
-    if result != 0 {
-        let error = io::Error::last_os_error();
+    let error = (result != 0).then(io::Error::last_os_error);
+    let restore = if temporary_write {
+        crate::fsops::set_mode_handle(file, current.mode() & 0o7777)
+    } else {
+        Ok(())
+    };
+    restore.context("restore permissions after extended attributes")?;
+    if let Some(error) = error {
         if value.is_none() && error.raw_os_error() == Some(libc::ENOATTR) {
             return Ok(());
         }
