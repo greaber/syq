@@ -2039,7 +2039,7 @@ fn local_unchanged_multiple_sources_do_not_start_workers() {
 #[test]
 fn whole_file_progress_reaches_tuner_before_completion() {
     // Exercise both the in-process destination and the local --server helper.
-    for native in [true, false] {
+    for (native, userspace) in [(true, true), (false, true), (true, false), (false, false)] {
         let t = Tmp::new();
         for n in 0..2 {
             write(&t.path(&format!("src/{n}")), &prng(8 << 20, n));
@@ -2051,13 +2051,20 @@ fn whole_file_progress_reaches_tuner_before_completion() {
             command.args(["rsync", "-a", &t.s("src/"), &t.s("dst/")]);
         }
         let continuation = t.path("continue");
+        if userspace {
+            command.env("SYQ_TEST_COPY_LOCAL_EXDEV", "1");
+        } else {
+            // Exercise copy_file_range even on filesystems that can clone.
+            command.env("SYQ_TEST_LOCAL_READ_AHEAD", "1");
+        }
         let mut child = command
             .arg("--no-progress")
             .env("SYQ_TEST_TUNE_SAMPLE_MS", "50")
-            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
             .env("SYQ_TEST_COPY_LOCAL_FS", "local")
             .env("SYQ_TEST_COPY_LOCAL_WRITTEN_FILE", t.path("ready"))
             .env("SYQ_TEST_COPY_LOCAL_CONTINUE_FILE", &continuation)
+            .env("SYQ_TEST_OVERLAP_READY", t.path("ready"))
+            .env("SYQ_TEST_OVERLAP_CONTINUE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
@@ -2082,7 +2089,7 @@ fn whole_file_progress_reaches_tuner_before_completion() {
             }
             if start.elapsed() >= next_report {
                 eprintln!(
-                    "waiting for in-flight copy progress (native={native}, observed={observed})"
+                    "waiting for in-flight copy progress (native={native}, userspace={userspace}, observed={observed})"
                 );
                 next_report += std::time::Duration::from_secs(1);
             }
@@ -2093,7 +2100,7 @@ fn whole_file_progress_reaches_tuner_before_completion() {
         assert_output_ok(&out);
         assert!(
             observed,
-            "no in-flight progress with native={native}: {out:?}"
+            "no in-flight progress with native={native}, userspace={userspace}: {out:?}"
         );
         assert_same_tree(&t.path("src"), &t.path("dst"));
         let db = rusqlite::Connection::open(t.path("history.sqlite")).unwrap();
