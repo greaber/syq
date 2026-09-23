@@ -1389,12 +1389,7 @@ impl Planner<'_> {
             let stats = if self.destination_tree_known_missing {
                 vec![None; dirs.len()]
             } else if self.destination_children_known_missing {
-                self.stat_fresh_descendants(
-                    &dirs
-                        .iter()
-                        .map(|(path, _, _)| path.clone())
-                        .collect::<Vec<_>>(),
-                )?
+                self.stat_fresh_descendants(dirs.iter().map(|(path, _, _)| path))?
             } else if let Some(stats) = dir_stats {
                 stats
             } else {
@@ -1420,12 +1415,7 @@ impl Planner<'_> {
         let stats = if self.destination_tree_known_missing {
             vec![None; others.len()]
         } else if self.destination_children_known_missing {
-            self.stat_fresh_descendants(
-                &others
-                    .iter()
-                    .map(|planned| planned.dst.clone())
-                    .collect::<Vec<_>>(),
-            )?
+            self.stat_fresh_descendants(others.iter().map(|planned| &planned.dst))?
         } else if let Some(stats) = &mut other_stats {
             others
                 .iter()
@@ -3179,14 +3169,16 @@ impl Planner<'_> {
         Ok(n)
     }
 
-    fn stat_fresh_descendants(&mut self, paths: &[PathBytes]) -> Result<Vec<Option<Entry>>> {
-        let root = if paths.iter().any(|path| path == &self.dst_root) {
+    fn stat_fresh_descendants<'p>(
+        &mut self,
+        paths: impl Iterator<Item = &'p PathBytes> + Clone,
+    ) -> Result<Vec<Option<Entry>>> {
+        let root = if paths.clone().any(|path| path == &self.dst_root) {
             self.stat_many(vec![self.dst_root.clone()])?.pop().flatten()
         } else {
             None
         };
         Ok(paths
-            .iter()
             .map(|path| {
                 if path == &self.dst_root {
                     root.clone()
