@@ -80,6 +80,7 @@ pub(crate) struct RootMetadata {
     pub(crate) len: u64,
     pub(crate) mtime: i64,
     pub(crate) mtime_nsec: u32,
+    pub(crate) atime: crate::inode_metadata::Timestamp,
     pub(crate) ctime: i64,
     pub(crate) ctime_nsec: u32,
     pub(crate) uid: u32,
@@ -338,11 +339,10 @@ impl Root {
         let flags =
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
         #[cfg(target_os = "macos")]
-        let flags = libc::O_EVTONLY
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | libc::O_NOCTTY
-            | libc::O_CLOEXEC;
+        // O_SYMLINK opens the link itself. O_NOFOLLOW takes precedence on
+        // macOS and would reject that link instead.
+        let flags =
+            libc::O_EVTONLY | libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let flags =
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
@@ -1928,6 +1928,10 @@ fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
         len: stat.st_size as u64,
         mtime: stat_mtime(&stat),
         mtime_nsec: stat_mtime_nsec(&stat),
+        atime: crate::inode_metadata::Timestamp {
+            seconds: stat.st_atime,
+            nanoseconds: stat.st_atime_nsec as u32,
+        },
         ctime: stat_ctime(&stat),
         ctime_nsec: stat_ctime_nsec(&stat),
         uid: stat.st_uid,
@@ -1945,6 +1949,10 @@ pub(crate) fn root_metadata_from_std(metadata: &std::fs::Metadata) -> Result<Roo
         len: metadata.len(),
         mtime: metadata.mtime(),
         mtime_nsec: u32::try_from(metadata.mtime_nsec()).context("negative mtime nanoseconds")?,
+        atime: crate::inode_metadata::Timestamp {
+            seconds: metadata.atime(),
+            nanoseconds: metadata.atime_nsec() as u32,
+        },
         ctime: metadata.ctime(),
         ctime_nsec: u32::try_from(metadata.ctime_nsec()).context("negative ctime nanoseconds")?,
         uid: metadata.uid(),

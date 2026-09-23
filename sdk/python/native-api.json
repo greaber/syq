@@ -48,6 +48,7 @@
         "ignore",
         "ignore-from",
         "preserve",
+        "open-noatime",
         "inplace",
         "s3-endpoint",
         "s3-region",

@@ -1715,7 +1715,7 @@ impl RestrictedAuthority {
     ) -> Result<()> {
         anyhow::ensure!(
             meta.inode_metadata.is_none(),
-            "signed grants do not authorize ACL or xattr changes"
+            "signed grants do not authorize additional inode metadata"
         );
         if *flags & proto::flags::RECEIVER_MODE != 0 {
             let decision = self.receiver_mode(path, meta.mode, target)?;
@@ -2580,8 +2580,8 @@ impl RestrictedAuthority {
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a command-restricted destination")
             }
-            Request::ConfigurePreservation(_) => {
-                bail!("signed grants do not authorize ACL or xattr preservation")
+            Request::ConfigurePreservation { .. } => {
+                bail!("signed grants do not authorize additional inode metadata or read policies")
             }
             Request::DescriptorCopy(_) | Request::BindStream(_) => {
                 bail!("descriptor copies are not valid on a command-restricted receiver")

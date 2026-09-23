@@ -123,6 +123,19 @@ def main():
             assert (target / "executable").stat().st_ino == (target / "alias").stat().st_ino
         print("Privileged xattrs, ownership and set-ID ordering passed", flush=True)
 
+        # A reader without ownership/CAP_FOWNER must warn and copy normally.
+        root.chmod(0o755)
+        foreign = root / "noatime-foreign"
+        foreign.write_bytes(b"readable by another user")
+        foreign.chmod(0o644)
+        target = root / "noatime-user"
+        target.mkdir()
+        os.chown(target, 1000, 1000)
+        result = run(["runuser", "-u", "syq", "--", "syq", "cp", "--open-noatime", "--preserve=atimes", str(foreign), "--as", str(target / "copied")], capture_output=True, text=True)
+        assert "--open-noatime unavailable" in result.stderr, result.stderr
+        assert (target / "copied").read_bytes() == foreign.read_bytes()
+        print("Nonowner no-atime reads warn and complete", flush=True)
+
         selected = root / "typed-link"
         destination = root / "typed-link-copy"
         # The ownership opt-out permits a typed directory symlink while

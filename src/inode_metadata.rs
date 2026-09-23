@@ -1,6 +1,5 @@
 //! Opt-in inode metadata. Absence means unrequested; an empty selected set
 //! means reconciliation, including removal of destination-only values.
-#[cfg(target_os = "linux")]
 use anyhow::Context;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -12,24 +11,40 @@ pub(crate) const MAX_INODE_METADATA: usize = 4 * 1024 * 1024;
 pub(crate) struct Selection {
     pub acls: bool,
     pub xattrs: bool,
+    pub atimes: bool,
+    pub crtimes: bool,
+    pub open_noatime: bool,
 }
 
 impl Selection {
     pub(crate) fn any(self) -> bool {
-        self.acls || self.xattrs
+        self.acls || self.xattrs || self.atimes || self.crtimes
+    }
+    pub(crate) fn validate_destination(self) -> Result<()> {
+        self.validate()?;
+        anyhow::ensure!(!self.crtimes || cfg!(target_os = "macos"), "birth-time preservation requires a macOS destination; this platform cannot set arbitrary birth times");
+        Ok(())
     }
     pub(crate) fn validate(self) -> Result<()> {
-        if self.any() && !cfg!(target_os = "linux") {
+        if (self.acls || self.xattrs) && !cfg!(target_os = "linux") {
             bail!("ACL and extended-attribute preservation currently requires Linux endpoints");
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Timestamp {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InodeMetadata {
     pub acls: Option<PosixAcls>,
     pub xattrs: Option<ExtendedAttributes>,
+    pub atime: Option<Timestamp>,
+    pub crtime: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -202,7 +217,10 @@ mod platform {
         } else {
             None
         };
-        let mut metadata = InodeMetadata { acls, xattrs: None };
+        let mut metadata = InodeMetadata {
+            acls,
+            ..Default::default()
+        };
         if selection.xattrs {
             let privileged = unsafe { libc::geteuid() == 0 };
             let mut values = Vec::new();
@@ -336,20 +354,36 @@ mod platform {
     }
 }
 
-pub(crate) fn capture(file: &File, selection: Selection) -> Result<Option<Box<InodeMetadata>>> {
+pub(crate) fn capture(
+    file: &File,
+    selection: Selection,
+    atime: Timestamp,
+) -> Result<Option<Box<InodeMetadata>>> {
     if !selection.any() {
         return Ok(None);
     }
     selection.validate()?;
-    #[cfg(target_os = "linux")]
-    {
-        platform::capture(file, selection).map(|m| Some(Box::new(m)))
+    let mut metadata = InodeMetadata::default();
+    if selection.acls || selection.xattrs {
+        #[cfg(target_os = "linux")]
+        {
+            metadata = platform::capture(file, selection)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = file;
+            unreachable!();
+        }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = file;
-        unreachable!()
+    metadata.atime = selection.atimes.then_some(atime);
+    if selection.crtimes {
+        metadata.crtime = Some(Timestamp::from_system_time(
+            file.metadata()?
+                .created()
+                .context("source filesystem does not report birth time")?,
+        )?);
     }
+    Ok(Some(Box::new(metadata)))
 }
 pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) -> Result<()> {
     let Some(metadata) = metadata else {
@@ -359,13 +393,198 @@ pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) ->
         metadata.size_hint() <= MAX_INODE_METADATA,
         "inode metadata exceeds the 4 MiB transfer limit"
     );
+    anyhow::ensure!(
+        metadata.crtime.is_none() || cfg!(target_os = "macos"),
+        "birth-time preservation requires a macOS destination"
+    );
     #[cfg(target_os = "linux")]
     {
-        platform::apply(file, metadata, mode)
+        if metadata.acls.is_some() || metadata.xattrs.is_some() {
+            platform::apply(file, metadata, mode)?;
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (file, metadata, mode);
-        bail!("Linux inode metadata cannot be applied on this platform")
+        let _ = mode;
+        anyhow::ensure!(
+            metadata.acls.is_none() && metadata.xattrs.is_none(),
+            "Linux inode metadata cannot be applied on this platform"
+        );
+    }
+    if let Some(atime) = metadata.atime {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        anyhow::ensure!(
+            atime.nanoseconds < 1_000_000_000,
+            "invalid access-time nanoseconds"
+        );
+        let current = file.metadata()?;
+        if (current.atime(), current.atime_nsec() as u32) != (atime.seconds, atime.nanoseconds) {
+            let times = [
+                libc::timespec {
+                    tv_sec: atime.seconds as _,
+                    tv_nsec: atime.nanoseconds as _,
+                },
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT as _,
+                },
+            ];
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                libc::utimensat(
+                    file.as_raw_fd(),
+                    c"".as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            #[cfg(not(target_os = "linux"))]
+            let result = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("restore access time on held inode");
+            }
+        }
+    }
+    if let Some(crtime) = metadata.crtime {
+        anyhow::ensure!(
+            crtime.nanoseconds < 1_000_000_000,
+            "invalid birth-time nanoseconds"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let current = Timestamp::from_system_time(file.metadata()?.created()?)?;
+            if current != crtime {
+                let mut attributes = libc::attrlist {
+                    bitmapcount: libc::ATTR_BIT_MAP_COUNT as _,
+                    reserved: 0,
+                    commonattr: libc::ATTR_CMN_CRTIME,
+                    volattr: 0,
+                    dirattr: 0,
+                    fileattr: 0,
+                    forkattr: 0,
+                };
+                let mut time = libc::timespec {
+                    tv_sec: crtime.seconds as _,
+                    tv_nsec: crtime.nanoseconds as _,
+                };
+                if unsafe {
+                    libc::fsetattrlist(
+                        file.as_raw_fd(),
+                        (&mut attributes as *mut libc::attrlist).cast(),
+                        (&mut time as *mut libc::timespec).cast(),
+                        std::mem::size_of_val(&time),
+                        0,
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error())
+                        .context("restore birth time on held inode");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Timestamp {
+    fn from_system_time(time: std::time::SystemTime) -> Result<Self> {
+        match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => Ok(Self {
+                seconds: i64::try_from(duration.as_secs())?,
+                nanoseconds: duration.subsec_nanos(),
+            }),
+            Err(error) => {
+                let duration = error.duration();
+                let seconds = i64::try_from(duration.as_secs())?
+                    .checked_neg()
+                    .context("birth time out of range")?;
+                if duration.subsec_nanos() == 0 {
+                    Ok(Self {
+                        seconds,
+                        nanoseconds: 0,
+                    })
+                } else {
+                    Ok(Self {
+                        seconds: seconds.checked_sub(1).context("birth time out of range")?,
+                        nanoseconds: 1_000_000_000 - duration.subsec_nanos(),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Best-effort read policy, applied before the first data access. Changing the
+/// status flags keeps the already-confined descriptor and never reopens a path.
+pub(crate) fn prepare_read(file: &File, requested: bool) {
+    if !requested {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    let error = {
+        use std::os::fd::AsRawFd;
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags >= 0
+            && unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NOATIME) } == 0
+        {
+            return;
+        }
+        std::io::Error::last_os_error().to_string()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let error = {
+        let _ = file;
+        "not supported on this platform".to_string()
+    };
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::output::diagnostic!("syq: warning: --open-noatime unavailable ({error}); reads may update source access times");
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn birth_time_capture_uses_the_filesystems_creation_time() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let file = File::create(temporary.path().join("file")).unwrap();
+        let observed = file.metadata().unwrap().created();
+        let result = capture(
+            &file,
+            Selection {
+                crtimes: true,
+                ..Default::default()
+            },
+            Timestamp::default(),
+        );
+        match observed {
+            Ok(created) => assert_eq!(
+                result.unwrap().unwrap().crtime,
+                Some(Timestamp::from_system_time(created).unwrap())
+            ),
+            Err(_) => {
+                assert!(format!("{:#}", result.unwrap_err()).contains("does not report birth time"))
+            }
+        }
+    }
+
+    #[test]
+    fn pre_epoch_birth_times_keep_the_fraction_positive() {
+        let time = std::time::UNIX_EPOCH - std::time::Duration::new(2, 123_456_789);
+        assert_eq!(
+            Timestamp::from_system_time(time).unwrap(),
+            Timestamp {
+                seconds: -3,
+                nanoseconds: 876_543_211
+            }
+        );
+        assert_eq!(
+            Timestamp::from_system_time(std::time::UNIX_EPOCH).unwrap(),
+            Timestamp::default()
+        );
     }
 }

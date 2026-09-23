@@ -505,7 +505,7 @@ pub(crate) fn require_source_leaf_identity(
 /// exact operator-selected leaf, validating the opened descriptor is the
 /// decisive check: once it matches, the descriptor itself pins that object for
 /// the whole read even if its name is replaced concurrently.
-fn open_registered_source(target: &RegisteredSourceTarget) -> Result<File> {
+fn open_registered_source(target: &RegisteredSourceTarget, noatime: bool) -> Result<File> {
     let file = target.root.open_regular_read(&target.relative)?;
     match (&target.expected_leaf, &target.leaf_object) {
         (Some(expected), Some(object)) => {
@@ -517,6 +517,7 @@ fn open_registered_source(target: &RegisteredSourceTarget) -> Result<File> {
         (None, None) => {}
         _ => bail!("registered source leaf identity and retained object disagree"),
     }
+    crate::inode_metadata::prepare_read(&file, noatime);
     Ok(file)
 }
 
@@ -1248,6 +1249,9 @@ impl FsOps {
                             dev: metadata.dev,
                             ino: metadata.ino,
                             file_type: metadata.file_type(),
+                            symlink_atime: (metadata.is_symlink()
+                                && self.inode_preservation.atimes)
+                                .then_some(metadata.atime),
                             symlink_target,
                         }),
                         object,
@@ -1916,7 +1920,7 @@ impl FsOps {
             | Request::WriteStreamFence
             | Request::ShrinkReadStream { .. }
             | Request::MappingChunk { .. }
-            | Request::ConfigurePreservation(_)
+            | Request::ConfigurePreservation { .. }
             | Request::StopReadStream => {}
         }
         Ok(())
@@ -2053,6 +2057,7 @@ impl FsOps {
                 self.fds.remove(&victim);
             }
             let f = open_existing_regular(p, false)?;
+            crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
             self.fds.insert(key.clone(), CachedFile::new(f));
             self.fd_order.push(key.clone());
         }
@@ -2173,7 +2178,10 @@ impl FsOps {
             }
             self.fds.insert(
                 key.clone(),
-                CachedFile::new(open_registered_source(target)?),
+                CachedFile::new(open_registered_source(
+                    target,
+                    self.inode_preservation.open_noatime,
+                )?),
             );
             self.fd_order.push(key.clone());
         }

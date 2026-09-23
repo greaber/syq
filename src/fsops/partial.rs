@@ -636,7 +636,7 @@ impl FsOps {
             .registered_source_target(source)
             .context("resolve registered local-copy source")?;
         let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
-        let s = open_registered_source(&source_target)
+        let s = open_registered_source(&source_target, self.inode_preservation.open_noatime)
             .with_context(|| format!("open registered source {}", source_label.display()))?;
         let destination_root = self
             .destination_root
@@ -1237,7 +1237,8 @@ impl FsOps {
                 bail!("source block hash is only valid for the final source file");
             }
             if let Some((_, source_target)) = self.source_content_target(target.source)? {
-                let mut file = open_registered_source(&source_target)?;
+                let mut file =
+                    open_registered_source(&source_target, self.inode_preservation.open_noatime)?;
                 return hash_reader_observed(
                     &mut file,
                     block,
@@ -1291,6 +1292,7 @@ impl FsOps {
             )?
             .map(Ok)
             .unwrap_or_else(|| open_existing_regular(&p, false))?;
+        crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
         f.seek(SeekFrom::Start(0))?;
         if which == Which::Partial {
             require_safe_partial(&f, &p)?;
@@ -1644,7 +1646,7 @@ impl FsOps {
                 bail!("source file hash cannot carry a destination guard");
             }
             if let Some((_, target)) = self.source_content_target(source)? {
-                open_registered_source(&target)?
+                open_registered_source(&target, self.inode_preservation.open_noatime)?
             } else {
                 // Explicit rsync --insecure-links compatibility path.
                 open_existing_regular(&resolve(path), false)?
@@ -1657,6 +1659,7 @@ impl FsOps {
         } else {
             open_existing_regular(&resolve(path), false)?
         };
+        crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
         let mut h = self.hash_policy.algorithm.hasher();
         let mut buf = vec![0u8; 1 << 20];
         let mut size = 0u64;
@@ -1738,10 +1741,20 @@ impl FsOps {
                     )
                 }
             }
-            Request::ConfigurePreservation(selection) => selection.validate().map(|()| {
-                self.inode_preservation = *selection;
-                Response::Ok
-            }),
+            Request::ConfigurePreservation {
+                selection,
+                destination,
+            } => {
+                let validation = if *destination {
+                    selection.validate_destination()
+                } else {
+                    selection.validate()
+                };
+                validation.map(|()| {
+                    self.inode_preservation = *selection;
+                    Response::Ok
+                })
+            }
             Request::ConfigureHashing(policy) => {
                 self.hash_policy = *policy;
                 Ok(Response::Ok)

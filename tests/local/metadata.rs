@@ -559,3 +559,370 @@ fn descriptor_copies_preserve_bytes_offsets_flags_and_publication() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+fn set_access_time(path: &Path, seconds: i64, nanos: i64) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: seconds as _,
+            tv_nsec: nanos as _,
+        },
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT as _,
+        },
+    ];
+    assert_eq!(
+        unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+}
+
+fn access_time(path: &Path) -> (i64, i64) {
+    let m = fs::symlink_metadata(path).unwrap();
+    (m.atime(), m.atime_nsec())
+}
+
+#[test]
+fn unchanged_symlink_access_time_is_restored_after_target_comparison() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("source")).unwrap();
+    std::os::unix::fs::symlink("missing", t.path("source/link")).unwrap();
+    for _ in 0..2 {
+        set_access_time(&t.path("source/link"), 700_000_000, 123_456_789);
+        let expected = access_time(&t.path("source/link"));
+        // On a rerun the destination already has this time, but reading its
+        // target can update it after the planner's initial stat (e.g. on XFS).
+        run_ok(&["-aHU", &t.s("source/"), &t.s("destination/")]);
+        assert_eq!(access_time(&t.path("destination/link")), expected);
+    }
+}
+
+#[test]
+fn access_times_survive_copy_updates_checksums_and_hardlinks() {
+    let t = Tmp::new();
+    write(&t.path("src/small"), b"small file");
+    write(&t.path("src/nested/large"), &vec![43; 4 * 1024 * 1024]);
+    fs::hard_link(t.path("src/nested/large"), t.path("src/alias")).unwrap();
+    std::os::unix::fs::symlink("small", t.path("src/link")).unwrap();
+    mkfifo(&t.path("src/fifo"));
+    let paths = [
+        "small",
+        "nested/large",
+        "alias",
+        "link",
+        "fifo",
+        "nested",
+        "",
+    ];
+    for phase in 0..4 {
+        if phase == 1 {
+            write(&t.path("src/small"), b"changed file");
+        }
+        let mut expected = Vec::new();
+        for path in paths {
+            set_access_time(
+                &t.path(&format!("src/{path}")),
+                1_000_000_000 + phase,
+                123_456_789,
+            );
+            expected.push(access_time(&t.path(&format!("src/{path}"))));
+        }
+        let mut args = vec!["-aHU", "--performance-tuning=batch-bytes=64K"];
+        if phase == 2 {
+            args.push("--checksum");
+        }
+        if phase == 3 {
+            args.pop(); // range copies do not use small-file batch controls
+            args.extend([
+                "--inplace",
+                "--checksum",
+                "--performance-tuning=copy-path=ranges",
+            ]);
+        }
+        let src = t.s("src/");
+        let dst = t.s("dst/");
+        args.extend([src.as_str(), dst.as_str()]);
+        run_ok(&args);
+        // Verify timestamps before any content or readlink checks can change them.
+        for (path, expected) in paths.iter().zip(expected) {
+            assert_eq!(
+                access_time(&t.path(&format!("dst/{path}"))),
+                expected,
+                "phase {phase}: {path}"
+            );
+        }
+        assert_eq!(
+            fs::metadata(t.path("dst/alias")).unwrap().ino(),
+            fs::metadata(t.path("dst/nested/large")).unwrap().ino()
+        );
+        assert_eq!(
+            read(&t.path("dst/small")),
+            if phase == 0 {
+                b"small file".as_slice()
+            } else {
+                b"changed file".as_slice()
+            }
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repeated_atimes_and_native_noatime_leave_source_file_access_time_unchanged() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), &vec![29; 2 * 1024 * 1024]);
+    for (index, options) in [
+        vec!["-aUU"],
+        vec![
+            "-aUU",
+            "--checksum",
+            "--performance-tuning=copy-path=ranges",
+        ],
+    ]
+    .iter()
+    .enumerate()
+    {
+        set_access_time(&t.path("src/file"), 900_000_000 + index as i64, 321_000_000);
+        let expected = access_time(&t.path("src/file"));
+        let src = t.s("src/");
+        let dst = t.s("dst/");
+        let mut args = options.clone();
+        args.extend([src.as_str(), dst.as_str()]);
+        run_ok(&args);
+        assert_eq!(access_time(&t.path("src/file")), expected);
+        assert_eq!(access_time(&t.path("dst/file")), expected);
+    }
+    set_access_time(&t.path("src/file"), 800_000_000, 111_000_000);
+    let expected = access_time(&t.path("src/file"));
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--open-noatime",
+            "--preserve=atimes",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("native"),
+            "--no-progress",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(access_time(&t.path("src/file")), expected);
+    assert_eq!(access_time(&t.path("native/file")), expected);
+}
+
+#[test]
+fn access_times_are_opt_in_and_dry_run_does_not_restore_them() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"same");
+    set_access_time(&t.path("src/file"), 800_000_000, 0);
+    let source_time = access_time(&t.path("src/file"));
+    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    assert_ne!(access_time(&t.path("dst/file")), source_time);
+    set_access_time(&t.path("src/file"), source_time.0, source_time.1);
+    let destination_time = access_time(&t.path("dst/file"));
+    run_ok(&["-aUn", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(access_time(&t.path("dst/file")), destination_time);
+    run_ok(&["-aU", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(access_time(&t.path("dst/file")), source_time);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn access_time_restored_after_lost_finalize_reply_and_resume() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    t.expose_remote_syq();
+    let data = vec![31; 2 * 1024 * 1024];
+    write(&t.path("src"), &data);
+    set_access_time(&t.path("src"), 800_000_000, 333_000_000);
+    let expected = access_time(&t.path("src"));
+    let remote = format!("fake:{}", t.s("dst"));
+    let marker = t.path("drop-finalize-once");
+    let out = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "-aU",
+            "--syq-no-bootstrap",
+            "--block-size=64K",
+            &t.s("src"),
+            &remote,
+        ],
+    )
+    .env("SYQ_TEST_DROP_AFTER_REQUEST", "finalize")
+    .env("SYQ_TEST_DROP_MARKER", &marker)
+    .run()
+    .unwrap();
+    assert_output_ok(&out);
+    assert!(marker.exists());
+    assert_eq!(access_time(&t.path("dst")), expected);
+    assert_eq!(read(&t.path("dst")), data);
+
+    write(&t.path("small"), b"staged bytes");
+    set_access_time(&t.path("small"), 700_000_000, 444_000_000);
+    let args = ["-aUU", &t.s("small"), &t.s("resumed")];
+    let out = compat_command()
+        .args(args)
+        .env("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "resumed")
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!t.path("resumed").exists());
+    assert!(!partial_files(&t.0).is_empty());
+    // macOS cannot prevent the failed attempt from updating the source atime.
+    // A rerun preserves the value observed at the start of that rerun.
+    let expected = access_time(&t.path("small"));
+    run_ok(&args);
+    assert_eq!(access_time(&t.path("resumed")), expected);
+    assert_eq!(read(&t.path("resumed")), b"staged bytes");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn birth_times_reject_linux_destination_before_creation() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"data");
+    let out = syq(&["-aN", &t.s("source"), &t.s("rsync-copy")]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("birth-time preservation requires a macOS destination"));
+    assert!(!t.path("rsync-copy").exists());
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--preserve=crtimes",
+            &t.s("source"),
+            "--as",
+            &t.s("native-copy"),
+        ])
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("birth-time preservation requires a macOS destination"));
+    assert!(!t.path("native-copy").exists());
+}
+
+#[cfg(target_os = "macos")]
+fn set_birth_time(path: &Path, seconds: i64, nanos: i64) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT as _,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_CRTIME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut time = libc::timespec {
+        tv_sec: seconds as _,
+        tv_nsec: nanos as _,
+    };
+    assert_eq!(
+        unsafe {
+            libc::setattrlist(
+                path.as_ptr(),
+                (&mut attributes as *mut libc::attrlist).cast(),
+                (&mut time as *mut libc::timespec).cast(),
+                std::mem::size_of_val(&time),
+                libc::FSOPT_NOFOLLOW as _,
+            )
+        },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn birth_times_follow_mtime_and_survive_reruns_and_inode_types() {
+    let t = Tmp::new();
+    write(&t.path("src/nested/file"), &vec![37; 2 * 1024 * 1024]);
+    write(&t.path("src/small"), b"small");
+    fs::hard_link(t.path("src/nested/file"), t.path("src/alias")).unwrap();
+    std::os::unix::fs::symlink("small", t.path("src/link")).unwrap();
+    mkfifo(&t.path("src/fifo"));
+    let paths = [
+        "nested/file",
+        "alias",
+        "small",
+        "link",
+        "fifo",
+        "nested",
+        "",
+    ];
+    for phase in 0..3 {
+        if phase == 1 {
+            write(&t.path("src/small"), b"updated");
+        }
+        let mut expected = Vec::new();
+        for path in paths {
+            let path = t.path(&format!("src/{path}"));
+            set_mtime(&path, 800_000_000 + phase);
+            set_birth_time(&path, 1_000_000_000 + phase, 123_456_789);
+            expected.push(fs::symlink_metadata(path).unwrap().created().unwrap());
+        }
+        let src = t.s("src/");
+        let dst = t.s("dst/");
+        let mut args = vec!["-aHUN", "--performance-tuning=batch-bytes=64K", &src, &dst];
+        if phase == 2 {
+            args.extend(["--checksum", "--inplace"]);
+        }
+        run_ok(&args);
+        for (path, expected) in paths.iter().zip(expected) {
+            assert_eq!(
+                fs::symlink_metadata(t.path(&format!("dst/{path}")))
+                    .unwrap()
+                    .created()
+                    .unwrap(),
+                expected,
+                "phase {phase}: {path}"
+            );
+        }
+    }
+}
+
+#[test]
+fn access_time_of_explicit_symlink_is_captured_before_reading_its_target() {
+    let t = Tmp::new();
+    std::os::unix::fs::symlink("missing", t.path("link")).unwrap();
+    for native in [false, true] {
+        set_access_time(&t.path("link"), 700_000_000, 123_456_789);
+        let expected = access_time(&t.path("link"));
+        let out = if native {
+            Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args([
+                    "cp",
+                    "--preserve=atimes",
+                    &t.s("link"),
+                    "--as",
+                    &t.s("native-link"),
+                ])
+                .run()
+                .unwrap()
+        } else {
+            syq(&["-lU", &t.s("link"), &t.s("rsync-link")])
+        };
+        assert_output_ok(&out);
+        assert_eq!(
+            access_time(&t.path(if native { "native-link" } else { "rsync-link" })),
+            expected
+        );
+    }
+}

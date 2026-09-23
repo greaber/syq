@@ -40,9 +40,15 @@ pub(super) fn root_existence_for(existence: Existence) -> RootExistence {
 }
 
 pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
-    if args.hardlinks || args.acls || args.xattrs {
+    if args.hardlinks
+        || args.acls
+        || args.xattrs
+        || args.atimes > 0
+        || args.crtimes
+        || args.open_noatime
+    {
         bail!(
-            "hardlink, ACL and xattr preservation is not supported by command-restricted receivers"
+            "hardlink, ACL, xattr, access-time and birth-time preservation and no-atime reads are not supported by command-restricted receivers"
         );
     }
     if let Some(input) = &args.mapping_contents {

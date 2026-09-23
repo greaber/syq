@@ -1,0 +1,12 @@
+--- a/testsuite/open-noatime_test.py
++++ b/testsuite/open-noatime_test.py
+@@ -15,9 +15,6 @@
+ from rsyncfns import FROMDIR, TMPDIR, TODIR, TOOLDIR, run_rsync, test_fail, test_skipped
+ 
+ 
+-vv = run_rsync('-VV', check=True, capture_output=True)
+-if '"atimes": true' not in vv.stdout:
+-    test_skipped("Rsync is configured without atimes support")
+ 
+ # O_NOATIME is Linux-specific.
+ if platform.system() != 'Linux':

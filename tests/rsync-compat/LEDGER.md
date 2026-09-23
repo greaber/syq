@@ -12,8 +12,8 @@ Configured command prefix: `syq rsync`.
 | Classification | Tests |
 |---|---:|
 | conformance | 17 |
-| adapted | 23 |
-| unsupported | 128 |
+| adapted | 26 |
+| unsupported | 125 |
 | out-of-scope | 183 |
 | unassessed | 0 |
 
@@ -24,6 +24,9 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | Area | Test | Baseline | Product position | Provenance | Circumstances | Note |
 |---|---|---|---|---|---|---|
 | acls | `acls-depth` | pass | Compatible | invocation adaptation (acls-depth-syq-cli) | platform=linux; setfacl; getfacl; POSIX ACL filesystem | POSIX named-user ACLs at every tree depth; omit the rsync-specific -VV capability probe. |
+| atimes | `atimes` | pass | Compatible | invocation adaptation (atimes-syq-cli) | platform=linux,macos; access-time support | Preserve the upstream access-time assertions; omit only the rsync-specific -VV capability probe. |
+| atimes | `open-noatime` | pass | Compatible | invocation adaptation (open-noatime-syq-cli) | platform=linux; access-time support | Preserve the upstream access-time assertions; omit only the rsync-specific -VV capability probe. |
+| crtimes | `crtimes` | pass | Compatible | invocation adaptation (crtimes-syq-cli) | platform=macos; settable birth times | Preserve the upstream file and directory birth-time assertions; omit only the rsync-specific -VV capability probe. |
 | deletion | `delete-deep` | pass | Compatible | subset adaptation (delete-supported-subset) | platform=linux,macos | Deep deletion, --delete-delay/--delete-after, --existing, and --ignore-existing agree; unsupported delete timing and backup cases and SYQ's intentional --max-delete policy difference are omitted. |
 | end-to-end | `hands` | pass | Compatible | subset adaptation (hands-supported-subset) | platform=linux,macos; symlinks; POSIX modes | The canonical rich-tree test covers initial copy, one-file repair, a longer destination, deletion, and explicit multiple-source mapping; only destination-root metadata is normalized because no source root was transferred. Hard-link preservation and delta debugging are omitted. |
 | failure-isolation | `source-read-failure-continues` | pass | Compatible | fixture adaptation (source-read-failure-preload) of upstream source-change-size-continues | platform=linux; C compiler; LD_PRELOAD; /proc/self/fd | An external shim deterministically shrinks a source at its first positioned read. The failure remains visible, preserves the existing destination, and allows a later file to transfer; rsync's exact exit code and diagnostic wording are not required. |
@@ -97,7 +100,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `alt-dest-symlink-race` | `unsupported-alt-dest` |
 | `append` | `unsupported-transfer-mode` |
 | `append-shortsum` | `unsupported-transfer-mode` |
-| `atimes` | `unsupported-metadata` |
 | `backup` | `unsupported-alt-dest` |
 | `backup-acl-xattr-cache` | `unsupported-xattrs` |
 | `backup-crossdev-copy` | `unsupported-alt-dest` |
@@ -119,7 +121,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `copy-dest-source-symlink` | `unsupported-alt-dest` |
 | `copy-dest-symlink-readleak` | `unsupported-alt-dest` |
 | `copy-xattrs-symlink-race` | `unsupported-xattrs` |
-| `crtimes` | `unsupported-metadata` |
 | `cvs-exclude` | `unsupported-filters` |
 | `delay-updates` | `unsupported-transfer-mode` |
 | `delay-updates-deep` | `unsupported-transfer-mode` |
@@ -166,7 +167,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `no-implied-dirs-symlink` | `unsupported-relative` |
 | `nondaemon-symlink-race` | `unsupported-alt-dest` |
 | `omit-times` | `unsupported-metadata` |
-| `open-noatime` | `unsupported-metadata` |
 | `operator-path-backup-dir` | `unsupported-alt-dest` |
 | `operator-path-backup-rmdir` | `unsupported-alt-dest` |
 | `operator-path-backup-symlink` | `unsupported-alt-dest` |

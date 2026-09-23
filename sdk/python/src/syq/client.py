@@ -630,6 +630,7 @@ def _copy_arguments(
     ignore: IgnoreSelector | None,
     ignore_from: Selector | None,
     preserve: str | Iterable[str] | None,
+    open_noatime: bool,
     inplace: bool,
     max_delete: int | None,
     integrity_checking: str | None = None,
@@ -753,11 +754,13 @@ def _copy_arguments(
     if preserve is not None:
         attributes = (preserve,) if isinstance(preserve, str) else tuple(preserve)
         for attribute in attributes:
-            if attribute not in {"times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs"}:
+            if attribute not in {"times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes", "crtimes"}:
                 raise SyqInvocationError(
-                    "--preserve must contain times, permissions, ownership, specials, hardlinks, acls, or xattrs"
+                    "--preserve must contain times, permissions, ownership, specials, hardlinks, acls, xattrs, atimes, or crtimes"
                 )
             argv.extend(("--preserve", attribute))
+    if open_noatime:
+        argv.append("--open-noatime")
     if inplace:
         argv.append("--inplace")
     max_delete = _nonnegative_integer(max_delete, option="--max-delete")
@@ -1239,6 +1242,7 @@ class Client:
         ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
+        open_noatime: bool = False,
         inplace: bool = False,
         max_delete: int | None = None,
         on_event: Callable[[AutomationEvent], object] | None = None,
@@ -1298,6 +1302,7 @@ class Client:
             ignore=ignore,
             ignore_from=ignore_from,
             preserve=preserve,
+            open_noatime=open_noatime,
             inplace=inplace,
             max_delete=max_delete,
             allow_missing_placement=mapping is not None and not isinstance(mapping, (str, bytes, os.PathLike)),
@@ -1509,6 +1514,7 @@ class Client:
             ignore=None,
             ignore_from=None,
             preserve=None,
+            open_noatime=False,
             inplace=False,
             max_delete=None,
         )

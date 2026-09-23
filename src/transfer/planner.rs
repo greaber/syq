@@ -1727,7 +1727,15 @@ impl Planner<'_> {
         // comparison would tolerate truncation by the destination filesystem.
         let time_differs = requested.is_some_and(|r| r.mtime.is_some())
             && (meta.mtime, meta.mtime_nsec) != (destination.mtime, destination.mtime_nsec);
-        if !time_differs && !metadata_differs(&meta, &destination.meta(), flags) {
+        // Comparing a symlink target can change its access time after the
+        // destination stat. Even matching captured times need restoration.
+        let restore_link_atime = source.kind == Kind::Symlink
+            && self.opts.inode_preservation.atimes
+            && !self.opts.dry_run;
+        if !time_differs
+            && !restore_link_atime
+            && !metadata_differs(&meta, &destination.meta(), flags)
+        {
             return;
         }
         if self.opts.dry_run {
@@ -3383,6 +3391,7 @@ pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
         dev: 0,
         ino: 0,
         ctime: 0,
+        atime: Default::default(),
         inode_metadata: None,
         nlink: 1,
         ctime_nsec: 0,

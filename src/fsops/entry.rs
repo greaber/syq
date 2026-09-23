@@ -42,6 +42,10 @@ pub fn entry_from_meta(rel: PathBytes, full: &Path, md: &fs::Metadata) -> Entry 
         dev: md.dev(),
         ino: md.ino(),
         ctime: md.ctime(),
+        atime: crate::inode_metadata::Timestamp {
+            seconds: md.atime(),
+            nanoseconds: md.atime_nsec() as u32,
+        },
         inode_metadata: None,
         nlink: md.nlink(),
         ctime_nsec: md.ctime_nsec() as u32,
@@ -99,6 +103,10 @@ pub(crate) fn rooted_source_entry(
             .symlink_target
             .clone()
             .context("registered source symlink is missing its pinned target")?;
+        let mut metadata = metadata;
+        if let Some(atime) = expected.symlink_atime {
+            metadata.atime = atime;
+        }
         return Ok(entry_from_root_metadata(
             path,
             metadata,
@@ -166,6 +174,7 @@ pub(super) fn entry_from_root_metadata(
         dev: metadata.dev,
         ino: metadata.ino,
         ctime: metadata.ctime,
+        atime: metadata.atime,
         inode_metadata: None,
         nlink: metadata.nlink,
         ctime_nsec: metadata.ctime_nsec,
@@ -215,6 +224,18 @@ impl FsOps {
         if !self.inode_preservation.any() {
             return Ok(());
         }
+        if !self.inode_preservation.acls
+            && !self.inode_preservation.xattrs
+            && !self.inode_preservation.crtimes
+        {
+            // Access time was observed before scanning a directory or reading
+            // a symlink. Do not replace it with a post-read stat value.
+            entry.inode_metadata = Some(Box::new(crate::inode_metadata::InodeMetadata {
+                atime: self.inode_preservation.atimes.then_some(entry.atime),
+                ..Default::default()
+            }));
+            return Ok(());
+        }
         let file = if let Some(source) = source {
             let target = self.registered_source_target(source)?;
             target.root.open_metadata(&target.relative)?
@@ -232,8 +253,14 @@ impl FsOps {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = follow;
-                bail!("inode metadata capture is unavailable on this platform");
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(
+                        libc::O_EVTONLY
+                            | libc::O_CLOEXEC
+                            | if follow { 0 } else { libc::O_SYMLINK },
+                    )
+                    .open(resolve(path))?
             }
         };
         let opened = file.metadata()?;
@@ -247,8 +274,9 @@ impl FsOps {
             "{} changed before reading inode metadata",
             resolve(path).display()
         );
-        entry.inode_metadata = crate::inode_metadata::capture(&file, self.inode_preservation)
-            .with_context(|| format!("read inode metadata: {}", resolve(path).display()))?;
+        entry.inode_metadata =
+            crate::inode_metadata::capture(&file, self.inode_preservation, entry.atime)
+                .with_context(|| format!("read inode metadata: {}", resolve(path).display()))?;
         Ok(())
     }
 

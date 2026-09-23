@@ -241,6 +241,7 @@ fn pin_selection(
                     dev: metadata.dev,
                     ino: metadata.ino,
                     file_type: metadata.file_type(),
+                    symlink_atime: metadata.is_symlink().then_some(metadata.atime),
                     symlink_target,
                 }),
                 _leaf_object: object,

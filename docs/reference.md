@@ -292,6 +292,8 @@ syq cp --preserve=permissions,ownership project --into backup
 | `--preserve=hardlinks` | `-H` (regular files) |
 | `--preserve=acls` | `-A` (Linux POSIX ACLs; implies permissions) |
 | `--preserve=xattrs` | `-X` (Linux extended attributes) |
+| `--preserve=atimes` | `-U` (access times) |
+| `--preserve=crtimes` | `-N` (birth times; macOS destination) |
 
 Setting ownership requires suitable destination permissions. See the
 [rsync option definitions](https://download.samba.org/pub/rsync/rsync.1#opt--perms)
@@ -359,8 +361,30 @@ updates, unchanged-content reruns, and `--inplace`. Both endpoints must be Linux
 Descriptors, stream mappings, S3, and command-restricted or receiving destinations
 reject these options. Existing descriptor-backed regular-file copies support
 only their original time, permission, and ownership options. Neither `-a` nor
-native copy defaults select ACLs, xattrs, or hardlinks. Access times, birth times,
-and sparse allocation are not preserved by these options.
+native copy defaults select ACLs, xattrs, hardlinks, or access times.
+
+Use `--preserve=atimes` (rsync `-U`/`--atimes`) to restore access times captured
+before reading the source. It covers regular files, directories, links themselves,
+and copied special nodes on local and ordinary SSH filesystem copies. Linux
+requires kernel 5.8 or later; macOS support depends on the filesystem. Restoration
+runs after content checks and copying, including metadata-only updates and reruns.
+Reading copied files afterward can change their access times again. Descriptors,
+streams, S3, and command-restricted or receiving destinations reject this option.
+
+`--open-noatime` requests file reads without updating access times. Repeating
+`-U` (`-UU`) enables it too. Linux permits this for a file's owner or a process
+with suitable privileges. If unavailable, syq warns and continues; this option
+does not promise unchanged source access times, including directory scans and
+symlink reads. Destination access-time preservation remains independently selected
+and restoration errors make the copy unsuccessful.
+
+Use `--preserve=crtimes` (rsync `-N`/`--crtimes`) to preserve birth (creation)
+times. The source filesystem must report birth times and the destination must
+be macOS with a filesystem that permits setting them. Linux destinations reject
+this option before copying. It supports the same named filesystem routes and
+entry types as access-time preservation. Neither `-a` nor native defaults select
+it. Inode change time (`ctime`) and sparse allocation are not preserved by these
+options.
 
 ## Symlinks
 

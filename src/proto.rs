@@ -187,6 +187,10 @@ pub struct Entry {
     pub ctime: i64,
     pub ctime_nsec: u32,
     pub link: Option<PathBytes>,
+    // Only used while capturing metadata on the scanning endpoint. The
+    // selected value travels in inode_metadata; ordinary scans pay no wire cost.
+    #[serde(skip)]
+    pub atime: crate::inode_metadata::Timestamp,
     pub inode_metadata: Option<Box<crate::inode_metadata::InodeMetadata>>,
 }
 
@@ -485,6 +489,8 @@ pub struct SourceLeafIdentity {
     pub ino: u64,
     pub file_type: u32,
     pub symlink_target: Option<PathBytes>,
+    /// Captured before reading an explicitly selected symlink target.
+    pub symlink_atime: Option<crate::inode_metadata::Timestamp>,
 }
 
 /// One operator source selection registered by the endpoint control session.
@@ -1001,7 +1007,10 @@ pub enum WireRequest<Data> {
     /// Reuse a drained stream worker within its original endpoint session.
     /// None releases its file before the control connection publishes it.
     BindStream(Option<(DescriptorTicket, crate::descriptor_copy::Settings)>),
-    ConfigurePreservation(crate::inode_metadata::Selection),
+    ConfigurePreservation {
+        selection: crate::inode_metadata::Selection,
+        destination: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1128,7 +1137,7 @@ impl Request {
         matches!(
             self,
             Request::ConfigureHashing(_)
-                | Request::ConfigurePreservation(_)
+                | Request::ConfigurePreservation { .. }
                 | Request::Scan { .. }
                 | Request::StatMany { .. }
                 | Request::HashBlocks { .. }

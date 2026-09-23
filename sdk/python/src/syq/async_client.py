@@ -838,6 +838,7 @@ class AsyncClient:
         ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
+        open_noatime: bool = False,
         inplace: bool = False,
         max_delete: int | None = None,
         on_event: AsyncEventCallback | None = None,
@@ -899,6 +900,7 @@ class AsyncClient:
             ignore=ignore,
             ignore_from=ignore_from,
             preserve=preserve,
+            open_noatime=open_noatime,
             inplace=inplace,
             max_delete=max_delete,
             allow_missing_placement=mapping is not None and not isinstance(mapping, (str, bytes, os.PathLike)),
@@ -1134,6 +1136,7 @@ class AsyncClient:
             ignore=None,
             ignore_from=None,
             preserve=None,
+            open_noatime=False,
             inplace=False,
             max_delete=None,
         )

@@ -4619,10 +4619,16 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
     let root = temporary.path().join("root");
     fs::create_dir(&root).unwrap();
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let mut configuration = Request::ConfigurePreservation(crate::inode_metadata::Selection {
-        acls: true,
-        xattrs: true,
-    });
+    let mut configuration = Request::ConfigurePreservation {
+        selection: crate::inode_metadata::Selection {
+            acls: true,
+            xattrs: true,
+            atimes: true,
+            crtimes: true,
+            open_noatime: true,
+        },
+        destination: true,
+    };
     assert!(authority.authorize(&mut configuration, true).is_err());
     let mut meta = plain_meta();
     meta.inode_metadata = Some(Box::new(crate::inode_metadata::InodeMetadata {
@@ -4631,6 +4637,8 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
             default: None,
         }),
         xattrs: None,
+        atime: None,
+        crtime: None,
     }));
     let mut request = Request::Apply {
         ops: vec![Op::SetMeta {
@@ -4645,7 +4653,25 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
     assert!(
         error
             .to_string()
-            .contains("do not authorize ACL or xattr changes"),
+            .contains("do not authorize additional inode metadata"),
         "{error:#}"
     );
+    let mut time_meta = plain_meta();
+    time_meta.inode_metadata = Some(Box::new(crate::inode_metadata::InodeMetadata {
+        atime: Some(crate::inode_metadata::Timestamp {
+            seconds: 1,
+            nanoseconds: 0,
+        }),
+        ..Default::default()
+    }));
+    let mut time_request = Request::Apply {
+        ops: vec![Op::SetMeta {
+            path: path_bytes(&root.join("target")),
+            meta: time_meta,
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+        }],
+        guard: None,
+    };
+    assert!(authority.authorize(&mut time_request, false).is_err());
 }
