@@ -462,7 +462,7 @@ pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) ->
                 if unsafe {
                     libc::fsetattrlist(
                         file.as_raw_fd(),
-                        &mut attributes,
+                        (&mut attributes as *mut libc::attrlist).cast(),
                         (&mut time as *mut libc::timespec).cast(),
                         std::mem::size_of_val(&time),
                         0,

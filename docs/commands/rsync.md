@@ -31,6 +31,9 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-X, --xattrs` | Preserve extended attributes in the selected privilege namespaces |
 | `-p, --perms` | Preserve permissions |
 | `-t, --times` | Preserve modification times |
+| `-U, --atimes...` | Preserve access times; repeat to request source no-atime reads |
+| `-N, --crtimes` | Preserve birth (creation) times; requires a macOS destination |
+| `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
 | `-g, --group` | Preserve group |
 | `-o, --owner` | Preserve owner (root only) |
 | `-D` | Preserve device and special files |

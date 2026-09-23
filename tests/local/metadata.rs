@@ -822,7 +822,7 @@ fn set_birth_time(path: &Path, seconds: i64, nanos: i64) {
         unsafe {
             libc::setattrlist(
                 path.as_ptr(),
-                &mut attributes,
+                (&mut attributes as *mut libc::attrlist).cast(),
                 (&mut time as *mut libc::timespec).cast(),
                 std::mem::size_of_val(&time),
                 libc::FSOPT_NOFOLLOW as _,
