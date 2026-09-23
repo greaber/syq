@@ -12,8 +12,8 @@ Configured command prefix: `syq rsync`.
 | Classification | Tests |
 |---|---:|
 | conformance | 17 |
-| adapted | 21 |
-| unsupported | 130 |
+| adapted | 23 |
+| unsupported | 128 |
 | out-of-scope | 183 |
 | unassessed | 0 |
 
@@ -23,6 +23,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 
 | Area | Test | Baseline | Product position | Provenance | Circumstances | Note |
 |---|---|---|---|---|---|---|
+| acls | `acls-depth` | pass | Compatible | invocation adaptation (acls-depth-syq-cli) | platform=linux; setfacl; getfacl; POSIX ACL filesystem | POSIX named-user ACLs at every tree depth; omit the rsync-specific -VV capability probe. |
 | deletion | `delete-deep` | pass | Compatible | subset adaptation (delete-supported-subset) | platform=linux,macos | Deep deletion, --delete-delay/--delete-after, --existing, and --ignore-existing agree; unsupported delete timing and backup cases and SYQ's intentional --max-delete policy difference are omitted. |
 | end-to-end | `hands` | pass | Compatible | subset adaptation (hands-supported-subset) | platform=linux,macos; symlinks; POSIX modes | The canonical rich-tree test covers initial copy, one-file repair, a longer destination, deletion, and explicit multiple-source mapping; only destination-root metadata is normalized because no source root was transferred. Hard-link preservation and delta debugging are omitted. |
 | failure-isolation | `source-read-failure-continues` | pass | Compatible | fixture adaptation (source-read-failure-preload) of upstream source-change-size-continues | platform=linux; C compiler; LD_PRELOAD; /proc/self/fd | An external shim deterministically shrinks a source at its first positioned read. The failure remains visible, preserves the existing destination, and allows a later file to transfer; rsync's exact exit code and diagnostic wording are not required. |
@@ -63,6 +64,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | symlinks | `symlink-ignore` | pass | Compatible | unmodified upstream | platform=linux,macos; symlinks | Without -l/-L/-a, omit symlinks while copying referent files. |
 | symlinks | `unsafe-links` | pass | Compatible | subset adaptation (unsafe-links-default) | platform=linux,macos; symlinks | Default -a preserves both in-tree and lexically escaping symlinks without following them; unsupported copy-links variants are omitted. |
 | update | `update` | pass | Compatible | subset adaptation (update-supported-subset) | platform=linux,macos; symlinks | -u skips a newer deep destination, updates an older one, and still replaces a type mismatch. |
+| xattrs | `xattrs-depth` | pass | Compatible | invocation adaptation (xattrs-depth-syq-cli) | platform=linux; Python xattr support; user xattr filesystem | User xattrs at every tree depth; replace the rsync capability probe and omit namespace filters and --super unnecessary for this user.* fixture. |
 
 ## Exclusion reasons
 
@@ -72,7 +74,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `rsync-daemon` | Exercises rsync daemon configuration, modules, authentication, or daemon transport; SYQ has no rsync daemon mode. |
 | `rsync-internal` | Exercises rsync's implementation, build, helper programs, or test harness rather than command-line filesystem semantics. |
 | `rsync-wire` | Exercises rsync's sender/receiver protocol or a malicious/legacy rsync peer; SYQ intentionally speaks a different protocol. |
-| `unsupported-acls` | Requires rsync ACL behavior, which SYQ does not implement. |
+| `unsupported-acls` | Remaining rsync ACL fixtures need separate classification for their inheritance, race, capability-probe and protocol expectations. |
 | `unsupported-alt-dest` | Requires rsync backup, link-dest, compare-dest, copy-dest, or alternate-basis behavior, which SYQ does not implement. |
 | `unsupported-batch` | Requires rsync batch-file behavior, which SYQ does not implement. |
 | `unsupported-filters` | Requires rsync's filter language; SYQ currently exposes gitignore-style filters instead. |
@@ -80,7 +82,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `unsupported-metadata` | Requires an rsync metadata option that SYQ does not implement yet. |
 | `unsupported-relative` | Requires rsync --relative/-R behavior, which SYQ does not implement. |
 | `unsupported-transfer-mode` | Requires an rsync transfer mode or output option that SYQ does not implement. |
-| `unsupported-xattrs` | Requires extended-attribute behavior, which SYQ does not implement. |
+| `unsupported-xattrs` | Requires rsync-specific xattr filters, fake-super, protocol behavior, or fixtures not yet classified for SYQ. |
 
 ## Unsupported user-facing features
 
@@ -89,7 +91,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `acl-symlink-race` | `unsupported-acls` |
 | `acls` | `unsupported-acls` |
 | `acls-default` | `unsupported-acls` |
-| `acls-depth` | `unsupported-acls` |
 | `acls-unpinnable` | `unsupported-acls` |
 | `alt-dest` | `unsupported-alt-dest` |
 | `alt-dest-deep` | `unsupported-alt-dest` |
@@ -214,7 +215,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `write-batch-quoting` | `unsupported-batch` |
 | `xattr-wire-cap` | `unsupported-xattrs` |
 | `xattrs` | `unsupported-xattrs` |
-| `xattrs-depth` | `unsupported-xattrs` |
 | `xattrs-hlink` | `unsupported-xattrs` |
 
 ## Rsync-specific internals, protocol, and services

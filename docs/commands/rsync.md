@@ -27,6 +27,8 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-l, --links` | Copy symlinks as symlinks |
 | `--insecure-links` | Follow symlinks in this machine's rsync operator paths regardless of ownership (local only, as in rsync) |
 | `-H, --hard-links` | Preserve hard links between selected regular files |
+| `-A, --acls` | Preserve POSIX access and default ACLs; implies permissions |
+| `-X, --xattrs` | Preserve extended attributes in the selected privilege namespaces |
 | `-p, --perms` | Preserve permissions |
 | `-t, --times` | Preserve modification times |
 | `-g, --group` | Preserve group |

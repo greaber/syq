@@ -5,7 +5,7 @@
 acl-symlink-race	unsupported	unsupported-acls
 acls	unsupported	unsupported-acls
 acls-default	unsupported	unsupported-acls
-acls-depth	unsupported	unsupported-acls
+acls-depth	adapted	-
 acls-unpinnable	unsupported	unsupported-acls
 alt-dest	unsupported	unsupported-alt-dest
 alt-dest-deep	unsupported	unsupported-alt-dest
@@ -349,6 +349,6 @@ write-batch-filter-injection	unsupported	unsupported-batch
 write-batch-quoting	unsupported	unsupported-batch
 xattr-wire-cap	unsupported	unsupported-xattrs
 xattrs	unsupported	unsupported-xattrs
-xattrs-depth	unsupported	unsupported-xattrs
+xattrs-depth	adapted	-
 xattrs-hlink	unsupported	unsupported-xattrs
 xrsync	out-of-scope	rsync-wire

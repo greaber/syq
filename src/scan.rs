@@ -809,6 +809,7 @@ mod tests {
             dev: 0,
             ino: 0,
             ctime: 0,
+            inode_metadata: None,
             nlink: 1,
             ctime_nsec: 0,
             link: None,

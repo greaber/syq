@@ -40,8 +40,10 @@ pub(super) fn root_existence_for(existence: Existence) -> RootExistence {
 }
 
 pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
-    if args.hardlinks {
-        bail!("hardlink preservation is not supported by command-restricted receivers");
+    if args.hardlinks || args.acls || args.xattrs {
+        bail!(
+            "hardlink, ACL and xattr preservation is not supported by command-restricted receivers"
+        );
     }
     if let Some(input) = &args.mapping_contents {
         input.validate_restricted_bounds()?;

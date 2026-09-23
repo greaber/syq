@@ -237,6 +237,7 @@ fn pipeline_worker(
         links: false,
         perms: false,
         hardlinks: false,
+        inode_preservation: Default::default(),
         hardlink_completions: Mutex::new(Default::default()),
         devices: false,
         checksum: false,

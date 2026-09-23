@@ -912,6 +912,7 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
         data: vec![0; 4],
         hash: [0; 32],
         meta: proto::Meta {
+            inode_metadata: None,
             mode: 0o644,
             uid: 0,
             gid: 0,
@@ -1165,6 +1166,7 @@ fn path_bytes(path: &Path) -> Vec<u8> {
 
 fn plain_meta() -> proto::Meta {
     proto::Meta {
+        inode_metadata: None,
         mode: 0o644,
         uid: 0,
         gid: 0,
@@ -1535,6 +1537,7 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
                 let mut restore = apply(Op::SetMeta {
                     path: path_bytes(&parent),
                     meta: proto::Meta {
+                        inode_metadata: None,
                         mode: 0o7777,
                         ..plain_meta()
                     },
@@ -3264,6 +3267,7 @@ fn grant_distinguishes_receiver_modes_from_source_permission_preservation() {
         ops: vec![Op::SetMeta {
             path: target.clone(),
             meta: proto::Meta {
+                inode_metadata: None,
                 mode: 0o640,
                 uid: 0,
                 gid: 0,
@@ -3386,6 +3390,7 @@ fn receiver_managed_modes_preserve_existing_objects_and_mask_new_ones() {
     let receiver_meta = |path: &Path| Op::SetMeta {
         path: path.as_os_str().as_bytes().to_vec(),
         meta: proto::Meta {
+            inode_metadata: None,
             mode: 0o7777,
             uid: 0,
             gid: 0,
@@ -3495,6 +3500,7 @@ fn receiver_managed_modes_preserve_existing_objects_and_mask_new_ones() {
         data: b"new".to_vec(),
         hash: crate::fsops::content_digest(b"new"),
         meta: proto::Meta {
+            inode_metadata: None,
             mode,
             uid: 0,
             gid: 0,
@@ -3615,6 +3621,7 @@ fn receiver_managed_missing_root_preserves_receiver_umask_and_inherited_setgid()
         ops: vec![Op::SetMeta {
             path: target.as_os_str().as_bytes().to_vec(),
             meta: proto::Meta {
+                inode_metadata: None,
                 // None of these source-proposed special bits are trusted.
                 mode: 0o7777,
                 uid: 0,
@@ -3810,6 +3817,7 @@ fn authority_binds_one_encrypted_listener_and_known_metadata_flags() {
         ops: vec![Op::SetMeta {
             path: target,
             meta: proto::Meta {
+                inode_metadata: None,
                 mode: 0,
                 uid: 0,
                 gid: 0,
@@ -3924,6 +3932,7 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
         data: vec![0],
         hash: [0; 32],
         meta: proto::Meta {
+            inode_metadata: None,
             mode: 0o600,
             uid: 0,
             gid: 0,
@@ -4114,6 +4123,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         inplace: false,
         copy_id: [1; 16],
         meta: proto::Meta {
+            inode_metadata: None,
             mode: 0o644,
             uid: 0,
             gid: 0,
@@ -4132,6 +4142,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         inplace: false,
         copy_id: [9; 16],
         meta: proto::Meta {
+            inode_metadata: None,
             mode: 0o644,
             uid: 0,
             gid: 0,
@@ -4600,4 +4611,41 @@ fn existing_signed_grants_never_authorize_hardlink_creation() {
         "{error:#}"
     );
     assert!(!root.join("target").exists());
+}
+
+#[test]
+fn existing_signed_grants_never_authorize_inode_metadata() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let mut configuration = Request::ConfigurePreservation(crate::inode_metadata::Selection {
+        acls: true,
+        xattrs: true,
+    });
+    assert!(authority.authorize(&mut configuration, true).is_err());
+    let mut meta = plain_meta();
+    meta.inode_metadata = Some(Box::new(crate::inode_metadata::InodeMetadata {
+        acls: Some(crate::inode_metadata::PosixAcls {
+            access: None,
+            default: None,
+        }),
+        xattrs: None,
+    }));
+    let mut request = Request::Apply {
+        ops: vec![Op::SetMeta {
+            path: path_bytes(&root.join("target")),
+            meta,
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+        }],
+        guard: None,
+    };
+    let error = authority.authorize(&mut request, false).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("do not authorize ACL or xattr changes"),
+        "{error:#}"
+    );
 }

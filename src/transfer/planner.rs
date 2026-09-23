@@ -1594,7 +1594,7 @@ impl Planner<'_> {
             // shouldn't keep stale permissions.
             if let Some(d) = &dst_entry {
                 let ff = opts.metadata_fix_flags(&dst_rel, &e, d);
-                if ff != 0 {
+                if ff != 0 || opts.inode_metadata_differs(&dst_rel, &e, d) {
                     self.progress.files_unchanged.fetch_add(1, Relaxed);
                     self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
                     if opts.dry_run {
@@ -1713,14 +1713,19 @@ impl Planner<'_> {
         destination: &Entry,
         ops: &mut LeafOps,
     ) {
-        let Some(requested) = self.opts.mapping_metadata.get(rel) else {
+        let requested = self.opts.mapping_metadata.get(rel);
+        if requested.is_none() && source.inode_metadata.is_none() {
             return;
-        };
+        }
         let meta = self.opts.metadata_for(rel, source);
-        let flags = requested.apply_flags();
+        let flags = if source.inode_metadata.is_some() {
+            self.opts.flags_for(rel)
+        } else {
+            requested.map_or(0, |r| r.apply_flags())
+        };
         // Explicit nanoseconds must be attempted even if preservation's quick
         // comparison would tolerate truncation by the destination filesystem.
-        let time_differs = requested.mtime.is_some()
+        let time_differs = requested.is_some_and(|r| r.mtime.is_some())
             && (meta.mtime, meta.mtime_nsec) != (destination.mtime, destination.mtime_nsec);
         if !time_differs && !metadata_differs(&meta, &destination.meta(), flags) {
             return;
@@ -2453,7 +2458,8 @@ impl Planner<'_> {
         // dry runs may need a depth-by-depth virtual overlay. Keep their stats
         // at the existing application point rather than caching stale or
         // unsafe observations. Sidecar resolution still uses this request.
-        let pre_stat = self.opts.dst_remote
+        let pre_stat = !self.opts.inode_preservation.any()
+            && self.opts.dst_remote
             && self.buffer.is_none()
             && !self.opts.dry_run
             && !self.destination_tree_known_missing
@@ -3307,7 +3313,15 @@ impl Planner<'_> {
         }
     }
 
-    pub(super) fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
+    pub(super) fn apply(&mut self, mut ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
+        if ops.len() > 1
+            && ops.iter().map(Op::size_hint).sum::<usize>() > crate::proto::METADATA_BATCH_BYTES
+        {
+            let tail = ops.split_off(ops.len() / 2);
+            let mut results = self.apply(ops)?;
+            results.extend(self.apply(tail)?);
+            return Ok(results);
+        }
         match ok(
             self.dst.call(Request::Apply {
                 ops,
@@ -3329,7 +3343,7 @@ impl Planner<'_> {
                 .iter()
                 .map(|(p, m, f, _, condition)| Op::SetMeta {
                     path: p.clone(),
-                    meta: *m,
+                    meta: m.clone(),
                     flags: *f,
                     condition: *condition,
                 })
@@ -3369,6 +3383,7 @@ pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
         dev: 0,
         ino: 0,
         ctime: 0,
+        inode_metadata: None,
         nlink: 1,
         ctime_nsec: 0,
         link: None,

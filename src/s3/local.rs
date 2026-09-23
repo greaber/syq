@@ -536,6 +536,7 @@ pub(super) fn apply_file_metadata(
     crate::fsops::set_meta_file(
         file,
         &Meta {
+            inode_metadata: None,
             mode,
             uid: metadata.uid,
             gid: metadata.gid,

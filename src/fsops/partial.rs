@@ -1738,6 +1738,10 @@ impl FsOps {
                     )
                 }
             }
+            Request::ConfigurePreservation(selection) => selection.validate().map(|()| {
+                self.inode_preservation = *selection;
+                Response::Ok
+            }),
             Request::ConfigureHashing(policy) => {
                 self.hash_policy = *policy;
                 Ok(Response::Ok)
@@ -2395,7 +2399,9 @@ pub(super) fn timespec(sec: i64, nsec: u32) -> libc::timespec {
 }
 
 pub(crate) fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
-    if flags & (flags::MODE_MASK | flags::OWNER | flags::GROUP | flags::TIMES) == 0 {
+    if flags & (flags::MODE_MASK | flags::OWNER | flags::GROUP | flags::TIMES) == 0
+        && meta.inode_metadata.is_none()
+    {
         return Ok(());
     }
     let current = f.metadata()?;
@@ -2436,7 +2442,7 @@ pub(super) fn set_meta_file_known(
             return Err(io::Error::last_os_error().into());
         }
     }
-    Ok(())
+    crate::inode_metadata::apply(f, meta.inode_metadata.as_deref(), meta.mode)
 }
 
 /// Apply only ownership fields whose requested values differ from the

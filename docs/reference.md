@@ -290,9 +290,10 @@ syq cp --preserve=permissions,ownership project --into backup
 | `--preserve=ownership` | `-o -g --numeric-ids` |
 | `--preserve=specials` | `-D` (devices and special files) |
 | `--preserve=hardlinks` | `-H` (regular files) |
+| `--preserve=acls` | `-A` (Linux POSIX ACLs; implies permissions) |
+| `--preserve=xattrs` | `-X` (Linux extended attributes) |
 
-Setting ownership requires suitable destination permissions. Syq does not
-preserve ACLs or extended attributes. See the
+Setting ownership requires suitable destination permissions. See the
 [rsync option definitions](https://download.samba.org/pub/rsync/rsync.1#opt--perms)
 and [metadata details](commands/cp.md#metadata-details).
 
@@ -317,6 +318,49 @@ algorithm are rejected before copying the group. Hardlinks across destination
 filesystems fail visibly. Multiply linked symlinks and special files are currently unsupported,
 as are hardlink requests with descriptors, streams, S3, and command-restricted
 or receiving destinations. `-a` retains its existing meaning; add `-H` explicitly.
+
+On Linux, add ACLs and xattrs for filesystem archival copies:
+
+```sh
+syq cp --preserve=permissions,ownership,specials,hardlinks,acls,xattrs --srcs-in source --into backup
+# The rsync-compatible spelling:
+syq rsync -aHAX --numeric-ids source/ backup/
+```
+
+ACL preservation copies POSIX access ACLs and directory default ACLs using
+numeric IDs. It also preserves permissions. It removes destination named ACL
+entries or default ACLs absent from the source, including on unchanged files.
+A mapping's explicit mode changes the access ACL's owner, mask (or group), and
+other permissions as `chmod` does. POSIX ACLs do not apply to Linux symlinks;
+NFSv4 ACL conversion is unsupported.
+
+Xattr preservation copies names and binary values, including empty values,
+and removes destination-only attributes within the selected namespace scope.
+A nonroot source selects `user.*`; a root source selects all namespaces except
+`system.*`, including `security.selinux` and `security.capability`. ACL attributes
+are handled only by ACL preservation. Excluded namespaces remain untouched.
+Reading or applying a selected attribute can require privileges; failures make
+the copy unsuccessful. Each inode's selected ACLs and xattrs must fit within
+4 MiB, and individual values must fit Linux's limits.
+
+| Linux entry type | Hardlinks (`-H`) | ACLs (`-A`) | Xattrs (`-X`) |
+|---|---|---|---|
+| Regular file | Selected source group | Access ACL | Selected namespaces |
+| Directory | Not applicable | Access and default ACL | Selected namespaces |
+| Symlink | Non-regular groups rejected | Not applicable | Attributes on the link itself, where supported |
+| FIFO, device, socket | Non-regular groups rejected | Access ACL, where supported | Selected namespaces, where supported |
+
+Copying special files also requires `--preserve=specials` or `-D` (included in
+`-a`), and creating devices requires suitable privileges. Filesystem restrictions
+on particular attribute namespaces still apply.
+
+ACLs and xattrs work for local and ordinary SSH filesystem copies, including
+updates, unchanged-content reruns, and `--inplace`. Both endpoints must be Linux.
+Descriptors, stream mappings, S3, and command-restricted or receiving destinations
+reject these options. Existing descriptor-backed regular-file copies support
+only their original time, permission, and ownership options. Neither `-a` nor
+native copy defaults select ACLs, xattrs, or hardlinks. Access times, birth times,
+and sparse allocation are not preserved by these options.
 
 ## Symlinks
 

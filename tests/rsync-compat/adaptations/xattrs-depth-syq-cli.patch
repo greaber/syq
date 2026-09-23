@@ -1,0 +1,23 @@
+--- a/testsuite/xattrs-depth_test.py
++++ b/testsuite/xattrs-depth_test.py
+@@ -16,8 +16,8 @@
+     walk_dirs, walk_files, xattr_dump, xattr_set, xattrs_supported,
+ )
+ 
+-if not xattrs_supported():
+-    test_skipped("rsync built without xattr support (or no xattr tooling here)")
++if not hasattr(os, "setxattr"):
++    test_skipped("Python xattr support is unavailable")
+ 
+ src = FROMDIR
+ rmtree(src)
+@@ -36,8 +36,7 @@
+ 
+ want = xattr_dump(*[str(r) for r in entries])
+ 
+-run_rsync('-aX', '-f-x_system.*', '-f-x_security.*', '--super',
+-          f'{src}/', f'{TODIR}/')
++run_rsync('-aX', f'{src}/', f'{TODIR}/')
+ 
+ os.chdir(TODIR)
+ got = xattr_dump(*[str(r) for r in entries])

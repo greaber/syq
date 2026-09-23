@@ -134,6 +134,7 @@ pub struct Opts {
     pub links: bool,
     pub perms: bool,
     pub hardlinks: bool,
+    pub inode_preservation: crate::inode_metadata::Selection,
     hardlink_completions: Mutex<std::collections::HashMap<usize, Option<(u64, u64)>>>,
     pub devices: bool,
     pub checksum: bool,
@@ -179,6 +180,9 @@ impl Opts {
         let mut meta = source.meta();
         if let Some(metadata) = self.mapping_metadata.get(path) {
             metadata.apply(&mut meta);
+            if let Some(inode) = &mut meta.inode_metadata {
+                inode.resolve_mode(meta.mode);
+            }
         }
         meta
     }
@@ -189,6 +193,11 @@ impl Opts {
                 .mapping_metadata
                 .get(path)
                 .map_or(0, |m| m.apply_flags())
+    }
+
+    fn inode_metadata_differs(&self, path: &[u8], source: &Entry, destination: &Entry) -> bool {
+        source.inode_metadata.is_some()
+            && self.metadata_for(path, source).inode_metadata != destination.inode_metadata
     }
 
     fn metadata_fix_flags(&self, path: &[u8], source: &Entry, destination: &Entry) -> u8 {
@@ -389,7 +398,27 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
             transfer_hash_type: args.transfer_hash_type,
         },
     )?;
+    configure_preservation(
+        &mut *connection,
+        crate::inode_metadata::Selection {
+            acls: args.acls,
+            xattrs: args.xattrs,
+        },
+    )?;
     Ok(connection)
+}
+
+fn configure_preservation(
+    connection: &mut dyn Conn,
+    selection: crate::inode_metadata::Selection,
+) -> Result<()> {
+    if selection.any() {
+        ok(
+            connection.call(Request::ConfigurePreservation(selection))?,
+            "configure inode metadata preservation",
+        )?;
+    }
+    Ok(())
 }
 
 fn configure_hashing(connection: &mut dyn Conn, policy: crate::hashing::HashPolicy) -> Result<()> {
@@ -494,6 +523,8 @@ fn small_copy_eligible(
         && args.restricted_grant.is_none()
         && !args.dry_run
         && !args.inplace
+        && !args.acls
+        && !args.xattrs
         && !args.hardlinks
         && !args.delete
         && !args.update
@@ -1466,6 +1497,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         links: args.links,
         perms: args.perms,
         hardlinks: args.hardlinks,
+        inode_preservation: crate::inode_metadata::Selection {
+            acls: args.acls,
+            xattrs: args.xattrs,
+        },
         hardlink_completions: Mutex::new(Default::default()),
         devices: args.devices,
         checksum: args.checksum,
@@ -1741,7 +1776,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                 )?,
                             ))
                         });
-                    let (src, dst) = match conns {
+                    let (mut src, mut dst) = match conns {
                         Ok(conns) => conns,
                         Err(error)
                             if crate::conn::is_tcp_congestion_error(&error)
@@ -1777,6 +1812,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             continue;
                         }
                     };
+                    configure_preservation(&mut *src, opts.inode_preservation)?;
+                    configure_preservation(&mut *dst, opts.inode_preservation)?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let mut worker = Worker {
                         id,
@@ -3689,6 +3726,7 @@ fn mkdir_root_batches(
         batches.push(vec![Op::SetMeta {
             path: dst_root.to_vec(),
             meta: Meta {
+                inode_metadata: None,
                 mode: 0o755,
                 uid: 0,
                 gid: 0,
@@ -4170,7 +4208,8 @@ fn special_creation_supported(destination_supports_sockets: bool, kind: Kind) ->
 }
 
 fn metadata_differs(source: &Meta, destination: &Meta, flags: u8) -> bool {
-    (flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777)
+    (source.inode_metadata.is_some() && source.inode_metadata != destination.inode_metadata)
+        || (flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777)
         || (flags & flags::OWNER != 0 && source.uid != destination.uid)
         || (flags & flags::GROUP != 0 && source.gid != destination.gid)
         || (flags & flags::TIMES != 0
