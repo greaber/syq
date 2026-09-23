@@ -2097,7 +2097,7 @@ fn whole_file_progress_reaches_tuner_before_completion() {
         );
         assert_same_tree(&t.path("src"), &t.path("dst"));
         let db = rusqlite::Connection::open(t.path("history.sqlite")).unwrap();
-        let bytes: u64 = db
+        let bytes: i64 = db
             .query_row(
                 "SELECT json_extract(summary,'$.bytes') FROM runs",
                 [],
