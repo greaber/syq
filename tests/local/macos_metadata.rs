@@ -47,6 +47,20 @@ fn attr(path: &Path, name: &str) -> Option<Vec<u8>> {
     }
 }
 fn chmod(path: &Path, arguments: &[&str]) {
+    // Apple's chmod opens FIFO ACL targets for reading. Keep both ends open
+    // while constructing the fixture so that utility cannot wait for a writer.
+    let _fifo = if fs::symlink_metadata(path).unwrap().file_type().is_fifo() {
+        Some(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .unwrap(),
+        )
+    } else {
+        None
+    };
     let output = Command::new("/bin/chmod")
         .args(arguments)
         .arg(path)
