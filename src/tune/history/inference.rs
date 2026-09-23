@@ -2,6 +2,35 @@
 use super::*;
 use std::collections::BTreeMap;
 
+// Shared by the partial indexes and lookup: filtering precedes the run limit.
+// CASE also keeps malformed/oversized diagnostic summaries out of JSON parsing.
+pub(super) const MATCHABLE: &str = "status='success' AND lost=0 AND CASE WHEN length(CAST(summary AS BLOB))<=65536 AND json_valid(summary) THEN json_extract(summary,'$.measurement_totals.consistent')=1 AND json_extract(summary,'$.measurement_totals.incompatible')=0 AND json_extract(summary,'$.measured_worker_counts')>=2 ELSE 0 END";
+
+pub(super) fn index(db: &Connection) -> Result<()> {
+    db.execute_batch(&format!("CREATE INDEX IF NOT EXISTS measured_filesystems ON runs(route,mode,source_fs,destination_fs,id DESC) WHERE {MATCHABLE};
+        CREATE INDEX IF NOT EXISTS measured_routes ON runs(route,mode,id DESC) WHERE {MATCHABLE};"))?;
+    Ok(())
+}
+
+struct Comparison {
+    workers: usize,
+    refine: bool,
+    // The best count was the highest one measured. This is evidence against
+    // lower counts, not evidence against untested higher counts.
+    lower_bound: bool,
+}
+
+impl Comparison {
+    fn distance(&self, workers: usize) -> f64 {
+        let delta = (workers as f64 / self.workers as f64).log2();
+        if self.lower_bound {
+            (-delta).max(0.0)
+        } else {
+            delta.abs()
+        }
+    }
+}
+
 pub(super) fn starting_count(
     db: &Connection,
     key: &ContextKey,
@@ -12,15 +41,27 @@ pub(super) fn starting_count(
         if (specific && !exact) || (!specific && !allow_route) {
             continue;
         }
-        let mut statement = db.prepare("SELECT id,day,CASE WHEN length(CAST(summary AS BLOB))<=65536 THEN summary END FROM runs WHERE route=?1 AND mode=?2 AND status='success' AND lost=0 AND (?3=0 OR (source_fs=?4 AND destination_fs=?5)) ORDER BY id DESC LIMIT 32")?;
+        let filesystem_match = if specific {
+            "AND source_fs=?3 AND destination_fs=?4"
+        } else {
+            "AND ?3 IS NULL AND ?4 IS NULL"
+        };
+        let mut statement = db.prepare(&format!("SELECT id,day,summary FROM runs WHERE route=?1 AND mode=?2 AND {MATCHABLE} {filesystem_match} ORDER BY id DESC LIMIT 32"))?;
         let runs = statement
             .query_map(
                 params![
                     key.route,
                     key.mode,
-                    specific,
-                    key.source_filesystem,
-                    key.destination_filesystem
+                    if specific {
+                        key.source_filesystem.as_deref()
+                    } else {
+                        None
+                    },
+                    if specific {
+                        key.destination_filesystem.as_deref()
+                    } else {
+                        None
+                    }
                 ],
                 |r| {
                     Ok((
@@ -41,30 +82,38 @@ pub(super) fn starting_count(
             let Some(evidence) = evidence else {
                 continue;
             };
-            if let Some((workers, refine)) = evidence.finish() {
+            if let Some(comparison) = evidence.finish() {
                 let age = day().saturating_sub(when).max(0) as f64;
                 let weight = 2.0_f64.powf(-age / 7.0) / (rank + 1) as f64;
                 if weight > 0.0 {
-                    choices.push((workers, weight, run, refine));
+                    choices.push((comparison, weight, run));
                 }
             }
         }
-        // Each transfer contributes once; a long run's correlated intervals do
-        // not outvote multiple independent runs. Compare relative rates within
-        // each run, never absolute throughput across different conditions.
-        choices.sort_by_key(|c| c.0);
-        let half = choices.iter().map(|c| c.1).sum::<f64>() * 0.5;
-        let mut cumulative = 0.0;
-        for (workers, weight, run, refine) in choices {
-            cumulative += weight;
-            if cumulative > half {
-                return Ok(Some(Hint {
-                    run,
-                    workers,
+        // Combine within-run preferences, never absolute speeds across runs.
+        // A rising ceiling imposes no penalty on higher candidates: many capped
+        // runs therefore cannot drag a better-supported higher start downward.
+        // Equal evidence favors the higher start; live exploration can revise it.
+        choices.sort_by_key(|c| std::cmp::Reverse(c.0.workers));
+        let mut best = None;
+        let mut best_loss = f64::INFINITY;
+        for (comparison, _, run) in &choices {
+            let loss = choices
+                .iter()
+                .map(|(c, w, _)| w * c.distance(comparison.workers))
+                .sum::<f64>();
+            if loss < best_loss {
+                best_loss = loss;
+                best = Some(Hint {
+                    run: *run,
+                    workers: comparison.workers,
                     matched: if specific { "filesystems" } else { "route" }.into(),
-                    refine: specific && refine,
-                }));
+                    refine: specific && comparison.refine,
+                });
             }
+        }
+        if best.is_some() {
+            return Ok(best);
         }
     }
     Ok(None)
@@ -83,7 +132,6 @@ impl RunEvidence {
     pub(super) fn push(&mut self, event: &Value) {
         if event["kind"] == "start" {
             self.incompatible |= event["data"]["automatic"] == false
-                || !event["data"]["worker_limit"].is_null()
                 || event["data"]
                     .get("overrides")
                     .is_some_and(|v| !v.is_null() && v != "None");
@@ -117,19 +165,29 @@ impl RunEvidence {
         point.2 += 1;
     }
 
-    fn finish(self) -> Option<(usize, bool)> {
+    fn points(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
+        self.observations
+            .iter()
+            .filter(|(n, (_, seconds, count))| {
+                (1..=65536).contains(*n) && seconds.is_finite() && *seconds >= 2.5 && *count >= 2
+            })
+            .map(|(n, (activity, seconds, _))| (*n, activity / seconds))
+            .filter(|(_, rate)| rate.is_finite() && *rate >= 0.0)
+    }
+
+    pub(super) fn measured_counts(&self) -> usize {
+        self.points().count()
+    }
+
+    fn finish(self) -> Option<Comparison> {
         if self.incompatible || !self.consistent {
             return None;
         }
-        let points: Vec<_> = self
-            .observations
-            .into_iter()
-            .filter(|(n, (_, seconds, count))| {
-                (1..=65536).contains(n) && seconds.is_finite() && *seconds >= 2.5 && *count >= 2
-            })
-            .map(|(n, (activity, seconds, _))| (n, activity / seconds))
-            .filter(|(_, rate)| rate.is_finite())
-            .collect();
+        let points: Vec<_> = self.points().collect();
+        // One observed count establishes throughput, not a relative preference.
+        if points.len() < 2 {
+            return None;
+        }
         let best = points.iter().map(|p| p.1).fold(0.0, f64::max);
         if best <= 0.0 {
             return None;
@@ -146,7 +204,11 @@ impl RunEvidence {
         let refine = points
             .iter()
             .any(|(n, rate)| *n != workers && *rate >= best * 0.95);
-        Some((workers, refine))
+        Some(Comparison {
+            workers,
+            refine,
+            lower_bound: workers == points.last()?.0,
+        })
     }
 }
 
@@ -156,7 +218,7 @@ fn infer_run(events: &[Value]) -> Option<(usize, bool)> {
     for event in events {
         evidence.push(event);
     }
-    evidence.finish()
+    evidence.finish().map(|c| (c.workers, c.refine))
 }
 
 #[cfg(test)]
@@ -172,31 +234,71 @@ mod tests {
             "seconds":2.5,"rate":rate,"usable":usable}})
     }
 
+    fn record(
+        path: &Path,
+        key: &ContextKey,
+        cap: Option<usize>,
+        automatic: bool,
+        points: &[(usize, f64)],
+    ) -> Recorder {
+        let writer = super::super::tests::recorder(path);
+        writer.context(key);
+        writer.event("start", json!({"automatic":automatic,"worker_limit":cap}));
+        writer.event("learning_context", context()["data"].clone());
+        for &(n, rate) in points {
+            for _ in 0..2 {
+                writer.event("observation", observation(n, rate, true)["data"].clone());
+            }
+        }
+        writer.finish(true, false, None, json!({}));
+        writer
+    }
+
     #[test]
-    fn worker_capped_runs_cannot_displace_unrestricted_comparisons() {
+    fn capped_comparisons_support_lower_bounds_and_winners_below_the_cap() {
         let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().join("history.sqlite");
         let key = super::super::tests::key("a");
-        let record = |cap: Option<usize>, points: &[(usize, f64)]| {
-            let writer = super::super::tests::recorder(&path);
-            writer.context(&key);
-            writer.event("start", json!({"automatic":true,"worker_limit":cap}));
-            writer.event("learning_context", context()["data"].clone());
-            for &(n, rate) in points {
-                for _ in 0..2 {
-                    writer.event("observation", observation(n, rate, true)["data"].clone());
-                }
-            }
-            writer.finish(true, false, None, json!({}));
-            writer
-        };
-        let capped_only = record(Some(1), &[(1, 100.0)]);
-        assert!(capped_only.starting_count(&key, false).is_none());
-        record(None, &[(8, 100.0), (16, 200.0)]);
-        for (cap, points) in [(1, vec![(1, 100.0)]), (8, vec![(4, 100.0), (8, 200.0)])] {
-            let capped = record(Some(cap), &points);
+        for cap in [None, Some(1)] {
+            let single = record(&path, &key, cap, true, &[(1, 100.0)]);
+            assert!(single.starting_count(&key, false).is_none());
+        }
+        let rising = record(&path, &key, Some(8), true, &[(4, 100.0), (8, 200.0)]);
+        assert_eq!(rising.starting_count(&key, false).unwrap().workers, 8);
+        record(
+            &path,
+            &key,
+            None,
+            true,
+            &[(8, 100.0), (16, 200.0), (32, 150.0)],
+        );
+        // Newer rising evidence at a lower ceiling does not oppose 16.
+        for _ in 0..4 {
+            let capped = record(&path, &key, Some(8), true, &[(4, 100.0), (8, 200.0)]);
             assert_eq!(capped.starting_count(&key, false).unwrap().workers, 16);
         }
+        // A newer comparison actually showing a slowdown above 4 is different:
+        // it can revise the start, even though the run had an explicit cap.
+        record(&path, &key, Some(32), true, &[(4, 200.0), (8, 100.0)]);
+        let below = record(&path, &key, Some(32), true, &[(4, 200.0), (8, 100.0)]);
+        assert_eq!(below.starting_count(&key, false).unwrap().workers, 4);
+    }
+
+    #[test]
+    fn exclusions_do_not_consume_the_comparison_window() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let key = super::super::tests::key("a");
+        record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
+        for i in 0..40 {
+            // Fixed-count runs and automatic single-count runs are excluded.
+            record(&path, &key, None, i % 2 == 0, &[(1, 100.0)]);
+        }
+        let fixed = record(&path, &key, None, false, &[(2, 100.0), (4, 200.0)]);
+        assert_eq!(fixed.starting_count(&key, false).unwrap().workers, 16);
+        let mut route_key = key.clone();
+        route_key.destination_filesystem = Some("new filesystem".into());
+        assert_eq!(fixed.starting_count(&route_key, true).unwrap().workers, 16);
     }
 
     #[test]
@@ -239,7 +341,9 @@ mod tests {
             json!({"kind":"start","data":{
                 "automatic":true,"overrides":"Some(TuningOptions { request_size: Some(1024) })"
             }}),
+            observation(4, 50.0, true),
             observation(8, 100.0, true),
+            observation(4, 50.0, true),
             observation(8, 100.0, true),
             context(),
         ];
@@ -279,6 +383,8 @@ mod tests {
     fn work_limited_and_setup_intervals_do_not_establish_a_winner() {
         let mut events = vec![
             context(),
+            observation(4, 50.0, true),
+            observation(4, 50.0, true),
             observation(8, 100.0, true),
             observation(8, 100.0, true),
         ];
@@ -298,6 +404,7 @@ mod tests {
             "active":16,"seconds":0.5,"rate":200.0,"usable":true}});
             6
         ];
+        events.extend([observation(8, 100.0, true), observation(8, 100.0, true)]);
         assert_eq!(infer_run(&events), None);
         events.push(json!({"kind":"learning_context","data":{"consistent":true,"automatic":true}}));
         assert_eq!(infer_run(&events), Some((16, false)));

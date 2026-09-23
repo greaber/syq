@@ -1303,3 +1303,30 @@ fn elapsed_time_expires_backoff_without_accepted_measurements() {
     policy.observe(100.0);
     assert!(policy.n > before);
 }
+
+#[test]
+fn noisy_hold_scores_preserve_failed_probe_deadlines() {
+    let mut policy = Policy::refine(8, 1, 64);
+    policy.state = State::Hold;
+    policy.fails = [3, 3];
+    policy.due = [24, 12];
+    policy.last_observation = Some((8, 100.0));
+    policy.record(16, 100.0);
+    for tick in 1..12 {
+        policy.advance_time(SAMPLE * tick, SAMPLE);
+        policy.observe(if tick % 2 == 0 { 100.0 } else { 200.0 });
+        assert_eq!(
+            policy.n, 8,
+            "noise must not bypass a failed probe's cooldown"
+        );
+        assert_eq!(policy.due, [24, 12]);
+        assert_eq!(policy.fails, [3, 3]);
+    }
+    assert!(
+        !policy.points.contains_key(&16),
+        "stale bracket still cleared"
+    );
+    policy.advance_time(SAMPLE * 12, SAMPLE);
+    policy.observe(200.0);
+    assert!(policy.n > 8, "fresh exploration must resume when due");
+}

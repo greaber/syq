@@ -774,3 +774,55 @@ fn driver_excludes_draining_writers_and_the_first_interval_after_drain() {
         );
     }
 }
+
+#[test]
+fn rejected_counter_interval_does_not_discard_the_next_clean_interval() {
+    use crate::tune::{Gate, Meter, Policy};
+    struct Progress {
+        history: Recorder,
+        sched: Arc<crate::sched::Sched>,
+        start: Instant,
+    }
+    impl Meter for Progress {
+        fn history(&self) -> Option<Recorder> {
+            Some(self.history.clone())
+        }
+        fn files(&self) -> u64 {
+            0
+        }
+        fn set_active(&self, _: usize) {}
+        fn bytes(&self) -> u64 {
+            let elapsed = self.start.elapsed().as_secs_f64();
+            if elapsed >= 5.5 {
+                self.sched.abort();
+            }
+            // A failed whole-file operation retracts its provisional credit.
+            (elapsed * 100_000.0) as u64 + if elapsed < 1.0 { 1_000_000 } else { 0 }
+        }
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let history = recorder(&path);
+    let sched = Arc::new(crate::sched::Sched::new(4 << 20, 32 << 20));
+    sched.push_file(crate::sched::tests::test_job(b"pending", 1 << 30));
+    sched.scan_done();
+    let gate = Gate::new(1);
+    gate.mark_ready(0);
+    let progress = Arc::new(Progress {
+        history: history.clone(),
+        sched: sched.clone(),
+        start: Instant::now(),
+    });
+    crate::tune::run(Policy::new(1, 1, 1), gate, sched, progress, |_| {
+        panic!("no new workers")
+    });
+    history.finish(true, false, None, json!({}));
+    let db = Connection::open(path).unwrap();
+    let statuses: Vec<String> = db.prepare("SELECT json_extract(data,'$.data.disposition') FROM events WHERE json_extract(data,'$.kind')='sample' ORDER BY sequence").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(statuses[0], "counter_regressed");
+    assert_eq!(
+        statuses[1], "warmup_excluded",
+        "clean interval must reach the sampler: {statuses:?}"
+    );
+}

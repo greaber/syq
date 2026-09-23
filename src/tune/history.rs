@@ -184,6 +184,7 @@ fn open(path: &Path) -> Result<Connection> {
     }
     db.busy_timeout(Duration::from_millis(100))?;
     db.pragma_update(None, "foreign_keys", true)?;
+    inference::index(&db)?;
     Ok(db)
 }
 
@@ -452,6 +453,7 @@ impl Writer {
         workers: Option<usize>,
         mut summary: Value,
     ) -> Result<()> {
+        summary["measured_worker_counts"] = json!(self.measurements.measured_counts());
         summary["measurement_totals"] = serde_json::to_value(&self.measurements)?;
         // Pay at most one small lock wait for the entire final save. Once the
         // immediate transaction owns the writer lock, samples, context and the

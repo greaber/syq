@@ -1774,13 +1774,13 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
     // Saved recommendations are misleading; only measurement totals count.
     db.execute("UPDATE runs SET eligible=1,workers=99", [])
         .unwrap();
-    let mut totals = serde_json::json!({"observations":{},"consistent":true,"incompatible":false});
+    let mut totals = serde_json::json!({"observations":{"6":[250.0,5.0,2]},"consistent":true,"incompatible":false});
     let mut seed_samples = |workers: usize| {
         let rate = if workers == 2 { 99.0 } else { 100.0 };
         totals["observations"][workers.to_string()] = serde_json::json!([rate * 5.0, 5.0, 2]);
         db.execute(
-            "UPDATE runs SET summary=json_set(summary,'$.measurement_totals',json(?1)) WHERE id=1",
-            [totals.to_string()],
+            "UPDATE runs SET summary=json_set(summary,'$.measurement_totals',json(?1),'$.measured_worker_counts',?2) WHERE id=1",
+            rusqlite::params![totals.to_string(),totals["observations"].as_object().unwrap().len() as i64],
         )
         .unwrap();
     };
@@ -1817,8 +1817,8 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
         )
         .unwrap();
     assert!(
-        capped_incompatible,
-        "explicit caps must not seed unrestricted starts"
+        !capped_incompatible,
+        "caps alone do not invalidate comparisons"
     );
     let event: String = db
         .query_row(
@@ -2150,10 +2150,10 @@ pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) 
         [id],
     )
     .unwrap();
-    let totals = serde_json::json!({"observations":{workers.to_string():[500.0,5.0,2]},
+    let totals = serde_json::json!({"observations":{workers.to_string():[500.0,5.0,2],(workers+1).to_string():[250.0,5.0,2]},
         "consistent":true,"incompatible":false});
     db.execute(
-        "UPDATE runs SET summary=json_set(summary,'$.measurement_totals',json(?1)) WHERE id=?2",
+        "UPDATE runs SET summary=json_set(summary,'$.measurement_totals',json(?1),'$.measured_worker_counts',2) WHERE id=?2",
         rusqlite::params![totals.to_string(), id],
     )
     .unwrap();

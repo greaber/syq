@@ -838,7 +838,8 @@ impl Policy {
                 n == self.n && previous > 0.0 && (score > previous * 1.2 || score < previous * 0.8)
             })
         {
-            self.due = [self.tick; 2];
+            // Forget stale throughput brackets without allowing noisy scores
+            // to bypass the retry deadlines established by failed probes.
             self.points.clear();
         }
         self.last_observation = Some((self.n, score));
@@ -1511,6 +1512,7 @@ pub fn run(
                 let now = (meter.bytes(), meter.files());
                 let secs = sample_start.elapsed().as_secs_f64();
                 sample_start = std::time::Instant::now();
+                let usable = std::mem::replace(&mut interval_usable, true);
                 if !gate.measurement_ready(active) {
                     trace.sample(
                         last,
@@ -1534,6 +1536,19 @@ pub fn run(
                 let sample_previous = last;
                 last = now;
                 last_rate = Some(rate);
+                if !usable {
+                    trace.sample(
+                        sample_previous,
+                        now,
+                        secs,
+                        &policy,
+                        &gate,
+                        "work_limited",
+                        None,
+                    );
+                    sampler.reset();
+                    continue;
+                }
                 if !trace.enough_work(&sched, policy.n, last_rate, sample) {
                     trace.sample(
                         sample_previous,
@@ -1587,6 +1602,7 @@ pub fn run(
         let now = (meter.bytes(), meter.files());
         let secs = sample_start.elapsed().as_secs_f64();
         sample_start = std::time::Instant::now();
+        let usable = std::mem::replace(&mut interval_usable, true);
         // Only judge a configuration once every requested worker is actually
         // connected (ssh sessions can take seconds each), and excess whole-file
         // writers from a reduction have finished their non-preemptible copies.
@@ -1623,7 +1639,7 @@ pub fn run(
         last_rate = Some(rate);
         // Completed evidence is judged by work availability during the
         // interval, never by time left for another experiment.
-        if !std::mem::replace(&mut interval_usable, true) {
+        if !usable {
             trace.sample(
                 sample_previous,
                 now,
