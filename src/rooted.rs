@@ -339,12 +339,10 @@ impl Root {
         let flags =
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
         #[cfg(target_os = "macos")]
-        let flags = libc::O_EVTONLY
-            | libc::O_SYMLINK
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | libc::O_NOCTTY
-            | libc::O_CLOEXEC;
+        // O_SYMLINK opens the link itself. O_NOFOLLOW takes precedence on
+        // macOS and would reject that link instead.
+        let flags =
+            libc::O_EVTONLY | libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let flags =
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;

@@ -4619,12 +4619,16 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
     let root = temporary.path().join("root");
     fs::create_dir(&root).unwrap();
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let mut configuration = Request::ConfigurePreservation(crate::inode_metadata::Selection {
-        acls: true,
-        xattrs: true,
-        atimes: true,
-        open_noatime: true,
-    });
+    let mut configuration = Request::ConfigurePreservation {
+        selection: crate::inode_metadata::Selection {
+            acls: true,
+            xattrs: true,
+            atimes: true,
+            crtimes: true,
+            open_noatime: true,
+        },
+        destination: true,
+    };
     assert!(authority.authorize(&mut configuration, true).is_err());
     let mut meta = plain_meta();
     meta.inode_metadata = Some(Box::new(crate::inode_metadata::InodeMetadata {
@@ -4634,6 +4638,7 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
         }),
         xattrs: None,
         atime: None,
+        crtime: None,
     }));
     let mut request = Request::Apply {
         ops: vec![Op::SetMeta {

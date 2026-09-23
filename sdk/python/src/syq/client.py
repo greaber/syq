@@ -754,9 +754,9 @@ def _copy_arguments(
     if preserve is not None:
         attributes = (preserve,) if isinstance(preserve, str) else tuple(preserve)
         for attribute in attributes:
-            if attribute not in {"times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes"}:
+            if attribute not in {"times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes", "crtimes"}:
                 raise SyqInvocationError(
-                    "--preserve must contain times, permissions, ownership, specials, hardlinks, acls, xattrs, or atimes"
+                    "--preserve must contain times, permissions, ownership, specials, hardlinks, acls, xattrs, atimes, or crtimes"
                 )
             argv.extend(("--preserve", attribute))
     if open_noatime:

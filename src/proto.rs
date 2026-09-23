@@ -1005,7 +1005,10 @@ pub enum WireRequest<Data> {
     /// Reuse a drained stream worker within its original endpoint session.
     /// None releases its file before the control connection publishes it.
     BindStream(Option<(DescriptorTicket, crate::descriptor_copy::Settings)>),
-    ConfigurePreservation(crate::inode_metadata::Selection),
+    ConfigurePreservation {
+        selection: crate::inode_metadata::Selection,
+        destination: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1132,7 +1135,7 @@ impl Request {
         matches!(
             self,
             Request::ConfigureHashing(_)
-                | Request::ConfigurePreservation(_)
+                | Request::ConfigurePreservation { .. }
                 | Request::Scan { .. }
                 | Request::StatMany { .. }
                 | Request::HashBlocks { .. }

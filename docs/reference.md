@@ -291,6 +291,7 @@ syq cp --preserve=permissions,ownership project --into backup
 | `--preserve=acls` | `-A` (Linux POSIX ACLs; implies permissions) |
 | `--preserve=xattrs` | `-X` (Linux extended attributes) |
 | `--preserve=atimes` | `-U` (access times) |
+| `--preserve=crtimes` | `-N` (birth times; macOS destination) |
 
 Setting ownership requires suitable destination permissions. See the
 [rsync option definitions](https://download.samba.org/pub/rsync/rsync.1#opt--perms)
@@ -368,7 +369,13 @@ does not promise unchanged source access times, including directory scans and
 symlink reads. Destination access-time preservation remains independently selected
 and restoration errors make the copy unsuccessful.
 
-Birth times and sparse allocation are not preserved by these options.
+Use `--preserve=crtimes` (rsync `-N`/`--crtimes`) to preserve birth (creation)
+times. The source filesystem must report birth times and the destination must
+be macOS with a filesystem that permits setting them. Linux destinations reject
+this option before copying. It supports the same named filesystem routes and
+entry types as access-time preservation. Neither `-a` nor native defaults select
+it. Inode change time (`ctime`) and sparse allocation are not preserved by these
+options.
 
 ## Symlinks
 

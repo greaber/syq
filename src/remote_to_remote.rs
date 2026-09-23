@@ -993,6 +993,9 @@ fn run_remote(
     if args.open_noatime || args.atimes > 1 {
         remote.push("--open-noatime".into());
     }
+    if args.crtimes {
+        remote.push("--preserve=crtimes".into());
+    }
     if args.atimes > 0 {
         remote.push("--preserve=atimes".into());
     }

@@ -1736,10 +1736,20 @@ impl FsOps {
                     )
                 }
             }
-            Request::ConfigurePreservation(selection) => selection.validate().map(|()| {
-                self.inode_preservation = *selection;
-                Response::Ok
-            }),
+            Request::ConfigurePreservation {
+                selection,
+                destination,
+            } => {
+                let validation = if *destination {
+                    selection.validate_destination()
+                } else {
+                    selection.validate()
+                };
+                validation.map(|()| {
+                    self.inode_preservation = *selection;
+                    Response::Ok
+                })
+            }
             Request::ConfigureHashing(policy) => {
                 self.hash_policy = *policy;
                 Ok(Response::Ok)

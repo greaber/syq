@@ -2580,7 +2580,7 @@ impl RestrictedAuthority {
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a command-restricted destination")
             }
-            Request::ConfigurePreservation(_) => {
+            Request::ConfigurePreservation { .. } => {
                 bail!("signed grants do not authorize additional inode metadata or read policies")
             }
             Request::DescriptorCopy(_) | Request::BindStream(_) => {

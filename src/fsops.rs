@@ -1917,7 +1917,7 @@ impl FsOps {
             | Request::WriteStreamFence
             | Request::ShrinkReadStream { .. }
             | Request::MappingChunk { .. }
-            | Request::ConfigurePreservation(_)
+            | Request::ConfigurePreservation { .. }
             | Request::StopReadStream => {}
         }
         Ok(())

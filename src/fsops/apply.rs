@@ -487,7 +487,6 @@ pub(super) fn set_meta_rooted(
         require_rooted_metadata(&handle, metadata, &target.label)?;
         let opened = handle.metadata()?;
         require_open_target_known(&opened, &target.label, condition)?;
-        set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
         if flags & flags::TIMES != 0
             && (metadata.mtime != meta.mtime || metadata.mtime_nsec != meta.mtime_nsec)
         {
@@ -497,6 +496,9 @@ pub(super) fn set_meta_rooted(
             ];
             target.root.set_times(&target.relative, &times)?;
         }
+        // Birth time follows mtime: macOS may lower birth time when setting
+        // an older modification time.
+        set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
         return require_rooted_named_identity_known(
             &target.root,
             &target.relative,
@@ -531,6 +533,13 @@ pub(super) fn set_meta_rooted(
         apply_owner_if_changed(flags, meta, metadata.uid, metadata.gid, |uid, gid| {
             target.root.chown(&target.relative, uid, gid)
         })?;
+        if time_differs {
+            let times = [
+                timespec(0, libc::UTIME_OMIT as u32),
+                timespec(meta.mtime, meta.mtime_nsec),
+            ];
+            target.root.set_times(&target.relative, &times)?;
+        }
         if let Some(handle) = &handle {
             crate::inode_metadata::apply(handle, meta.inode_metadata.as_deref(), meta.mode)?;
         }
@@ -547,7 +556,6 @@ pub(super) fn set_meta_rooted(
         // Timestamp mutation is performed separately with no-follow
         // descriptor-relative semantics. All other metadata is applied to
         // the stable opened inode, so a raced leaf symlink cannot redirect it.
-        set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
         if time_differs {
             let times = [
                 timespec(0, libc::UTIME_OMIT as u32),
@@ -555,6 +563,9 @@ pub(super) fn set_meta_rooted(
             ];
             target.root.set_times(&target.relative, &times)?;
         }
+        // Birth time follows mtime: macOS may lower birth time when setting
+        // an older modification time.
+        set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
         return require_rooted_named_identity_known(
             &target.root,
             &target.relative,
@@ -562,13 +573,6 @@ pub(super) fn set_meta_rooted(
             &opened,
             condition,
         );
-    }
-    if time_differs {
-        let times = [
-            timespec(0, libc::UTIME_OMIT as u32),
-            timespec(meta.mtime, meta.mtime_nsec),
-        ];
-        target.root.set_times(&target.relative, &times)?;
     }
     let after = target.root.metadata(&target.relative)?;
     require_rooted_identity(after, condition, &target.label)

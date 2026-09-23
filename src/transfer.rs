@@ -377,8 +377,10 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
             acls: args.acls,
             xattrs: args.xattrs,
             atimes: args.atimes > 0,
+            crtimes: args.crtimes,
             open_noatime: args.open_noatime || args.atimes > 1,
         },
+        false,
     )?;
     Ok(connection)
 }
@@ -386,10 +388,14 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
 fn configure_preservation(
     connection: &mut dyn Conn,
     selection: crate::inode_metadata::Selection,
+    destination: bool,
 ) -> Result<()> {
     if selection.any() || selection.open_noatime {
         ok(
-            connection.call(Request::ConfigurePreservation(selection))?,
+            connection.call(Request::ConfigurePreservation {
+                selection,
+                destination,
+            })?,
             "configure inode metadata preservation",
         )?;
     }
@@ -501,6 +507,7 @@ fn small_copy_eligible(
         && !args.acls
         && !args.xattrs
         && args.atimes == 0
+        && !args.crtimes
         && !args.open_noatime
         && !args.hardlinks
         && !args.delete
@@ -1477,6 +1484,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             acls: args.acls,
             xattrs: args.xattrs,
             atimes: args.atimes > 0,
+            crtimes: args.crtimes,
             open_noatime: args.open_noatime || args.atimes > 1,
         },
         hardlink_completions: Mutex::new(Default::default()),
@@ -1546,6 +1554,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     };
+    if opts.inode_preservation.crtimes {
+        configure_preservation(&mut *dst_ctl, opts.inode_preservation, true)?;
+    }
     if debug() {
         crate::output::diagnostic!(
             "syq: control connections up in {:.2}s",
@@ -1790,8 +1801,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             continue;
                         }
                     };
-                    configure_preservation(&mut *src, opts.inode_preservation)?;
-                    configure_preservation(&mut *dst, opts.inode_preservation)?;
+                    configure_preservation(&mut *src, opts.inode_preservation, false)?;
+                    configure_preservation(&mut *dst, opts.inode_preservation, true)?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let mut worker = Worker {
                         id,

@@ -294,7 +294,7 @@ class NativeClientTests(unittest.TestCase):
             pscope="-scope",
             ignore=["*.tmp", "cache/"],
             ignore_from="ignore.txt",
-            preserve=["times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes"],
+            preserve=["times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes"],
             open_noatime=True,
             inplace=True,
             on_event=events.append,
@@ -323,7 +323,7 @@ class NativeClientTests(unittest.TestCase):
             "--hash", "--no-compress", "--resource-limits", "--performance-tuning",
             "--receiver-max-entries", "--receiver-max-bytes",
             "--receiver-receipt", "--ignore", "--ignore-from",
-            "--preserve", "times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes",
+            "--preserve", "times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes",
             "--open-noatime",
             "--inplace",
         ):

@@ -220,7 +220,10 @@ impl FsOps {
         if !self.inode_preservation.any() {
             return Ok(());
         }
-        if !self.inode_preservation.acls && !self.inode_preservation.xattrs {
+        if !self.inode_preservation.acls
+            && !self.inode_preservation.xattrs
+            && !self.inode_preservation.crtimes
+        {
             // Access time was observed before scanning a directory or reading
             // a symlink. Do not replace it with a post-read stat value.
             entry.inode_metadata = Some(Box::new(crate::inode_metadata::InodeMetadata {
@@ -246,8 +249,14 @@ impl FsOps {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = follow;
-                bail!("inode metadata capture is unavailable on this platform");
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(
+                        libc::O_EVTONLY
+                            | libc::O_CLOEXEC
+                            | if follow { 0 } else { libc::O_SYMLINK },
+                    )
+                    .open(resolve(path))?
             }
         };
         let opened = file.metadata()?;
