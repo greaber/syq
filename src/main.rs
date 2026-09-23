@@ -152,6 +152,9 @@ fn main() {
     let environment_options = cli::EnvironmentOptions::take_from_environment();
     tune_allocator();
     raise_nofile();
+    // Do this in every endpoint process, before any threads can share its
+    // descriptor table. Source setup reserves more when its plan needs it.
+    fsops::reserve_descriptor_capacity(16 * 1024);
     fsops::capture_process_umask();
     let mut argv = match destination::handoff::enter(std::env::args_os().collect()) {
         Ok(argv) => argv,
