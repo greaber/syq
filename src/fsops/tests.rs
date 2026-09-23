@@ -364,6 +364,7 @@ fn direct_copy_rejects_eof_before_the_planned_size() {
             inplace: false,
             allow_sequential_nfs_fallback: false,
             allow_sequential_local_fallback: true,
+            progress: &mut |_| Ok(()),
         },
         &[37; 16],
         100,

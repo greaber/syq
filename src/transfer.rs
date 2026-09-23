@@ -3503,7 +3503,7 @@ struct RangeReplyMismatch;
 
 impl std::fmt::Display for RangeReplyMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("source range reply violates the protocol")
+        f.write_str("transfer reply violates the protocol")
     }
 }
 

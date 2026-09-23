@@ -969,20 +969,36 @@ impl Worker {
         // Keep range parallelism for a single-file copy. Read the planned
         // file count before the RPC so no scheduler lock spans the copy.
         let allow_sequential_local_fallback = self.sched.jobs.lock().unwrap().len() > 1;
-        let resp = self.dst.call(Request::CopyLocal {
-            source: job.source.clone(),
-            dst: job.dst.clone(),
-            inplace,
-            allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
-            allow_sequential_local_fallback,
-            copy_id: self.copy_id(),
-            size: job.entry.size,
-            mode,
-        })?;
-        match resp {
+        let _whole_file = self.gate.whole_file(self.id);
+        let mut credited = 0;
+        let resp = self.dst.copy_local(
+            Request::CopyLocal {
+                source: job.source.clone(),
+                dst: job.dst.clone(),
+                inplace,
+                allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
+                allow_sequential_local_fallback,
+                copy_id: self.copy_id(),
+                size: job.entry.size,
+                mode,
+            },
+            &mut |total| {
+                if total < credited || total > job.entry.size {
+                    return Err(anyhow::Error::new(RangeReplyMismatch)
+                        .context("invalid local-copy progress"));
+                }
+                self.progress.add_bytes(total - credited);
+                credited = total;
+                Ok(())
+            },
+        );
+        if !matches!(resp, Ok(Response::Ok)) {
+            self.progress.bytes_done.fetch_sub(credited, Relaxed);
+        }
+        match resp? {
             Response::Ok => {
                 self.benchmark.local_whole_files += 1;
-                self.progress.add_bytes(job.entry.size);
+                self.progress.add_bytes(job.entry.size - credited);
                 job.done.store(job.entry.size, Relaxed);
                 if let Err(e) = self.finish_file(idx) {
                     if self.transport_dead() {

@@ -2034,3 +2034,76 @@ fn local_unchanged_multiple_sources_do_not_start_workers() {
     }
     assert!(!t.path("worker-events").exists());
 }
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn whole_file_progress_reaches_tuner_before_completion() {
+    // Exercise both the in-process destination and the local --server helper.
+    for native in [true, false] {
+        let t = Tmp::new();
+        for n in 0..2 {
+            write(&t.path(&format!("src/{n}")), &prng(8 << 20, n));
+        }
+        let mut command = history_command(&t);
+        if native {
+            command.args(["cp", "--srcs-in", &t.s("src"), "--into", &t.s("dst")]);
+        } else {
+            command.args(["rsync", "-a", &t.s("src/"), &t.s("dst/")]);
+        }
+        let continuation = t.path("continue");
+        let mut child = command
+            .arg("--no-progress")
+            .env("SYQ_TEST_TUNE_SAMPLE_MS", "50")
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+            .env("SYQ_TEST_COPY_LOCAL_WRITTEN_FILE", t.path("ready"))
+            .env("SYQ_TEST_COPY_LOCAL_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let mut next_report = std::time::Duration::from_secs(1);
+        let mut observed = false;
+        // Observe a flushed sample while both writers are blocked after 1 MiB.
+        // Release the writers before asserting, even if the evidence is missing.
+        while start.elapsed() < std::time::Duration::from_secs(10) {
+            if let Ok(db) = rusqlite::Connection::open_with_flags(
+                t.path("history.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                observed = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE json_extract(data,'$.kind')='sample' AND json_extract(data,'$.data.cumulative_bytes')=2097152 AND json_extract(data,'$.data.cumulative_files')=0)",
+                    [], |row| row.get::<_, bool>(0),
+                ).unwrap_or(false);
+            }
+            if observed || child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if start.elapsed() >= next_report {
+                eprintln!(
+                    "waiting for in-flight copy progress (native={native}, observed={observed})"
+                );
+                next_report += std::time::Duration::from_secs(1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        write(&continuation, b"continue");
+        let out = child.wait_with_output().unwrap();
+        assert_output_ok(&out);
+        assert!(
+            observed,
+            "no in-flight progress with native={native}: {out:?}"
+        );
+        assert_same_tree(&t.path("src"), &t.path("dst"));
+        let db = rusqlite::Connection::open(t.path("history.sqlite")).unwrap();
+        let bytes: u64 = db
+            .query_row(
+                "SELECT json_extract(summary,'$.bytes') FROM runs",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, 16 << 20, "progress was credited twice");
+    }
+}

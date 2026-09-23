@@ -110,7 +110,9 @@ impl Conn for PipelineConn {
         if let Some(latency) = state.latency {
             state.ready.push_back(std::time::Instant::now() + latency);
         }
-        state.max_pending = state.max_pending.max(state.requests.len() - state.received);
+        state.max_pending = state
+            .max_pending
+            .max(state.requests.len().saturating_sub(state.received));
         Ok(())
     }
     fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
@@ -2115,5 +2117,67 @@ fn dry_run_hash_errors_drain_both_endpoints_without_writes() {
                 [Request::FileHash { .. }]
             ));
         }
+    }
+}
+
+#[test]
+fn local_copy_progress_is_live_but_failure_retracts_completion_credit() {
+    for failure in ["none", "error", "disconnect", "regression", "oversize"] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        sched.push_file(pipeline_job(b"source", 4096));
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        let src = Arc::new(Mutex::new(PipelineState::default()));
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        {
+            let mut state = dst.lock().unwrap();
+            state.progress = Some(worker.progress.clone());
+            state.replies.extend([
+                Response::CopyLocalProgress(1024),
+                Response::CopyLocalProgress(match failure {
+                    "regression" => 512,
+                    "oversize" => 4097,
+                    _ => 2048,
+                }),
+                if failure == "error" {
+                    Response::Err("injected copy failure".into())
+                } else {
+                    Response::Ok
+                },
+                Response::Ok, // finalize
+            ]);
+            if failure == "disconnect" {
+                state.fail_receive = Some(3);
+            }
+        }
+        let job = worker.job(0);
+        src.lock()
+            .unwrap()
+            .replies
+            .push_back(Response::Stats(vec![Some(job.entry.clone())]));
+        let result = worker.try_copy_local(0, &job);
+        assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
+        assert_eq!(dst.lock().unwrap().progress_at_receive[1], (1024, 0));
+        assert_eq!(
+            worker.progress.bytes_done.load(Relaxed),
+            if failure == "none" { 4096 } else { 0 }
+        );
+        assert_eq!(
+            job.done.load(Relaxed),
+            if failure == "none" { 4096 } else { 0 }
+        );
+        if matches!(failure, "regression" | "oversize") {
+            assert!(result.unwrap_err().is::<RangeReplyMismatch>());
+        }
+        assert_eq!(
+            dst.lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|r| matches!(r, Request::Finalize { .. }))
+                .count(),
+            usize::from(failure == "none")
+        );
     }
 }

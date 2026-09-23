@@ -1207,3 +1207,22 @@ fn smaller_upward_gain_does_not_resume_growth_below_old_high_water() {
     assert_eq!(p.recommended(), 8);
     assert!(matches!(p.state, State::Hold));
 }
+
+#[test]
+fn whole_file_reductions_wait_for_excess_writers_to_finish() {
+    let gate = Gate::new(4);
+    for id in 0..4 {
+        gate.mark_ready(id);
+    }
+    let kept = gate.whole_file(0);
+    let excess = gate.whole_file(3);
+    assert!(!gate.whole_files_draining(4));
+    gate.set_active(2);
+    assert!(gate.ready_through(2));
+    assert!(gate.whole_files_draining(2));
+    drop(excess);
+    assert!(!gate.whole_files_draining(2));
+    // Work in the retained configuration does not delay its own measurement.
+    drop(kept);
+    assert!(!gate.whole_files_draining(2));
+}
