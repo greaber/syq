@@ -10,6 +10,7 @@ import socket
 import subprocess
 import threading
 
+from ._payload_io import OwnedPayload
 from ._callback_io import AsyncPayload, Reader, TransferState, Writer, _TransferError
 from ._stream_channel import VERSION, receive, send
 from ._stream_endpoints import StreamSource, StreamDestination
@@ -145,7 +146,7 @@ class Callbacks:
         writer = isinstance(endpoint, StreamSource)
         payload = None
         try:
-            payload = io.FileIO(payload_fd, "wb" if writer else "rb", closefd=True)
+            payload = OwnedPayload(io.FileIO(payload_fd, "wb" if writer else "rb", closefd=True))
             stream = Writer(payload, state) if writer else Reader(payload, state)
             function = endpoint.produce if writer else endpoint.consume
             if _async(function):
@@ -163,7 +164,14 @@ class Callbacks:
             else:
                 stream.finish()
             if not self._cancelled.is_set():
-                os.write(commit_fd, b"C")
+                try:
+                    os.write(commit_fd, b"C")
+                except BrokenPipeError:
+                    # Native validation can reject the entry before accepting
+                    # the callback's commit. Its result travels independently
+                    # on the control channel and may still be in flight.
+                    state.wait()
+                    raise  # A successful transfer cannot explain a broken commit.
         except _TransferError:
             pass  # The native per-entry result reports this transfer failure.
         except BaseException as error:
