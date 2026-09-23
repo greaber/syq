@@ -170,6 +170,22 @@ impl Conn for LocalConn {
             _ => None,
         })
     }
+    fn copy_local(
+        &mut self,
+        mut req: Request,
+        progress: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Response> {
+        anyhow::ensure!(
+            self.role == LocalConnectionRole::DestinationWorker
+                && matches!(req, Request::CopyLocal { .. })
+                && self.pending.is_empty()
+                && self.read_stream.is_none()
+                && self.write_stream.is_none(),
+            "local copy requires an idle destination worker"
+        );
+        let _wait = self.rpc_observation.as_ref().map(|o| o.span(true));
+        Ok(self.ops.handle_with_copy_progress(&mut req, progress))
+    }
     fn recv(&mut self) -> Result<Response> {
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
         if self.pending.is_empty() {
