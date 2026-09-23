@@ -965,6 +965,12 @@ fn run_remote(
             remote.push(option.into());
         }
     }
+    if let Some(expression) = &args.where_expression {
+        remote.push(format!("--where={expression}"));
+    }
+    if let Some(expression) = &args.copy_if {
+        remote.push(format!("--copy-if={expression}"));
+    }
     if args.native_follow {
         remote.push("--follow".into());
     } else {

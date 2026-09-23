@@ -16,6 +16,7 @@ mod descriptor_broker;
 mod descriptor_copy;
 mod destination;
 pub mod enrollment;
+mod expression;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod fsops;
 mod hashing;

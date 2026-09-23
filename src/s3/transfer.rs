@@ -64,6 +64,8 @@ impl Drop for Engine {
 }
 #[derive(Clone)]
 struct Download {
+    expression_path: String,
+    expression_destination_path: String,
     kind: ObjectKind,
     key: String,
     path: String,
@@ -134,6 +136,23 @@ struct DownloadState {
 }
 
 impl Engine {
+    fn expression_destination_path<'a>(&self, path: &'a str) -> &'a [u8] {
+        let path = path.trim_end_matches('/');
+        let root = self
+            .args
+            .locations
+            .last()
+            .map(|l| l.path.as_slice())
+            .unwrap_or(b"");
+        let root = std::str::from_utf8(root).unwrap_or("").trim_matches('/');
+        let relative = path.strip_prefix(root).and_then(|s| s.strip_prefix('/'));
+        crate::expression::source_path(
+            path.as_bytes(),
+            relative
+                .unwrap_or_else(|| if path == root { "" } else { path })
+                .as_bytes(),
+        )
+    }
     pub async fn new(args: Arc<Args>, progress: Arc<Progress>) -> Result<Arc<Self>> {
         let setup = super::diagnostics::start();
         let mut options = args.s3.clone().unwrap();
@@ -586,6 +605,20 @@ impl Engine {
         {
             return Ok(UploadPreparation::Skipped);
         }
+        if self.args.expressions.update.is_some()
+            && !self.args.expressions.permits(
+                &source.expression_file()?,
+                source.expression_path(),
+                &existing
+                    .as_ref()
+                    .map(Object::expression_file)
+                    .unwrap_or_default(),
+                self.expression_destination_path(&source.key),
+            )?
+        {
+            return Ok(UploadPreparation::Skipped);
+        }
+
         if self.args.update
             && existing.as_ref().is_some_and(|o| {
                 o.metadata.as_ref().map_or(o.mtime, |m| m.mtime) > source.meta.mtime
@@ -1328,6 +1361,11 @@ impl Engine {
         while let Some(selector) = selectors.next().await {
             let ((key, path, selection, declared_kind, expected_hash, metadata), mut copy_source) =
                 selector?;
+            let expression_root = if self.args.expressions.active() {
+                key.clone()
+            } else {
+                String::new()
+            };
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
                 selection,
@@ -1510,13 +1548,46 @@ impl Engine {
                     } else if self.options.route.is_server_copy()
                         && !self.args.ignore_existing
                         && !self.args.existing
+                        && !self.args.expressions.active()
                     {
                         prune.claim_file(path.as_bytes());
                     } else {
                         prune.protect(path.as_bytes());
                     }
                 }
+                let expression_destination_path = if !self.args.expressions.active() {
+                    String::new()
+                } else {
+                    path.strip_prefix(destination_prefix)
+                        .and_then(|s| s.strip_prefix('/'))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(if destination_prefix.is_empty() {
+                            &path
+                        } else {
+                            path.rsplit('/').next().unwrap_or(&path)
+                        })
+                        .to_owned()
+                };
+                let expression_path = if !self.args.expressions.active() {
+                    String::new()
+                } else if expression_root.is_empty() {
+                    key.clone()
+                } else {
+                    key.strip_prefix(&format!("{expression_root}/"))
+                        .filter(|path| !path.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            expression_root
+                                .trim_end_matches('/')
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or("")
+                                .to_owned()
+                        })
+                };
                 out.push(Download {
+                    expression_path,
+                    expression_destination_path,
                     kind,
                     key,
                     path,
@@ -1573,7 +1644,11 @@ impl Engine {
         // other ranges; the first body is consumed alongside them.
         // Existing files still use HEAD so an unchanged object is not fetched.
         let mut initial_slot = None;
-        let initial = if existing.is_none() && !self.args.dry_run && !job.key.ends_with('/') {
+        let initial = if existing.is_none()
+            && !self.args.dry_run
+            && !job.key.ends_with('/')
+            && !self.args.expressions.active()
+        {
             initial_slot = Some(self.tuning.requests.acquire().await);
             Some(
                 self.client
@@ -1609,6 +1684,30 @@ impl Engine {
                 .context("S3 source disappeared after listing")?
         };
         job.kind = object.kind();
+        if self.args.expressions.active() {
+            let source = object.expression_file();
+            if !self
+                .args
+                .expressions
+                .selects(&source, job.expression_path.as_bytes())?
+            {
+                return Ok(None);
+            }
+            let mut dest = existing
+                .map(crate::expression::File::from_root)
+                .unwrap_or_default();
+            if dest.kind == Some(crate::proto::Kind::Symlink) {
+                dest.link_target = Some(root.read_link(&path)?);
+            }
+            if !self.args.expressions.permits(
+                &source,
+                job.expression_path.as_bytes(),
+                &dest,
+                job.expression_destination_path.as_bytes(),
+            )? {
+                return Ok(None);
+            }
+        }
         let mut initial = initial.map(|output| output.body);
         let mut metadata = object.metadata.clone().unwrap_or(Metadata {
             kind: object.kind(),

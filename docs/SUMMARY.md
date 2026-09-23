@@ -6,6 +6,7 @@
 
 - [Install and setup](install.md)
 - [Copy files](reference.md)
+  - [Select entries with expressions](expressions.md)
 - [Use S3 storage](object-storage.md)
 - [Remove files](remove.md)
 - [Copy between servers](remote-to-remote.md)

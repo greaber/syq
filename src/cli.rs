@@ -400,6 +400,12 @@ pub struct Args {
     /// All ignore patterns, loaded before authorization or opening results.
     #[arg(skip)]
     pub ignore_lines: Vec<String>,
+    #[arg(skip)]
+    pub where_expression: Option<String>,
+    #[arg(skip)]
+    pub copy_if: Option<String>,
+    #[arg(skip)]
+    pub expressions: crate::expression::Policy,
     /// Native copy inputs are read only after selecting the executing build.
     #[arg(skip)]
     pending_ignore_inputs: Vec<IgnoreInput>,
@@ -1088,6 +1094,12 @@ struct NativeCopyOperationalArgs {
     /// Skip regular files newer at the destination; non-directory type replacements still occur
     #[arg(long = "skip-newer", hide = true, conflicts_with_all = ["ignore_existing", "inplace"])]
     update: bool,
+    /// Select source entries with a typed expression; directories remain traversable
+    #[arg(long = "where", value_name = "EXPR")]
+    where_expression: Option<String>,
+    /// Update only entries satisfying a source/destination expression
+    #[arg(long, value_name = "EXPR", conflicts_with = "inplace")]
+    copy_if: Option<String>,
     /// Disable transport compression
     #[arg(long)]
     no_compress: bool,
@@ -2692,6 +2704,8 @@ fn apply_native_copy_operational(
     let NativeCopyOperationalArgs {
         common,
         hash,
+        where_expression,
+        copy_if,
         ignore_existing,
         existing,
         update,
@@ -2709,6 +2723,10 @@ fn apply_native_copy_operational(
         receiver_max_bytes,
         receiver_receipt,
     } = operational;
+    args.expressions =
+        crate::expression::Policy::compile(where_expression.as_deref(), copy_if.as_deref())?;
+    args.where_expression = where_expression;
+    args.copy_if = copy_if;
     args.receiver_receipt = receiver_receipt;
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;

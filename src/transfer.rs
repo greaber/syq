@@ -117,6 +117,7 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
 }
 
 pub struct Opts {
+    pub expressions: crate::expression::Policy,
     pub hash_policy: crate::hashing::HashPolicy,
     pub mapping_metadata: std::collections::HashMap<PathBytes, crate::mapping::Metadata>,
     pub mapping_expected_hashes: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
@@ -552,6 +553,7 @@ fn small_copy_eligible(
         && args.files_from.is_none()
         && args.native_mapping.is_none()
         && args.ignore_lines.is_empty()
+        && !args.expressions.active()
         && args.bwlimit_bytes == 0
         && args.max_size.is_none()
         && args.min_size.is_none()
@@ -1542,6 +1544,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         delete: args.delete,
         delete_excluded: args.delete_excluded,
         max_delete: args.max_delete,
+        expressions: args.expressions.clone(),
         update: args.update,
         ignore_existing: args.ignore_existing,
         preserve_existing_directory_metadata: args.only_new_native_entries(),
@@ -2781,6 +2784,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),
+        unselected_dirs: Default::default(),
+        directory_expression_sources: Default::default(),
         payload_paths: std::collections::HashMap::new(),
         sidecar_paths: std::collections::HashMap::new(),
         unusable_files: std::collections::HashSet::new(),

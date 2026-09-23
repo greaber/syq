@@ -959,6 +959,17 @@ syq cp --skip-newer --no-progress --performance-tuning workers=2 \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
 
+printf 'case: expression selection on source, destination, and local coordinators\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/expressions/sub; printf selected > /tmp/syq-real-ssh/expressions/sub/keep; printf x > /tmp/syq-real-ssh/expressions/sub/tiny'
+for coordinator in source destination local; do
+    syq cp --from source --srcs-in /tmp/syq-real-ssh/expressions \
+        --to destination --into "/tmp/syq-real-ssh/expressions-$coordinator" \
+        --coordinate-at "$coordinator" --no-progress \
+        --where "src.kind = 'file' and src.size > 1B and src.path glob 'sub/*'" \
+        --copy-if 'not dst.exists or src.size > dst.size'
+    ssh destination "test \"\$(cat /tmp/syq-real-ssh/expressions-$coordinator/sub/keep)\" = selected; test ! -e /tmp/syq-real-ssh/expressions-$coordinator/sub/tiny"
+done
+
 printf 'case: destination firewall triggers automatic TCP fallback to SSH\n'
 make_tree source /tmp/syq-real-ssh/firewall-source firewall
 syq cp --no-progress --performance-tuning workers=2 --preserve=permissions \

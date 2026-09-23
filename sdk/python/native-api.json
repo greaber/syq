@@ -57,7 +57,9 @@
         "s3-header",
         "performance-tuning",
         "resource-limits",
-        "integrity-checking"
+        "integrity-checking",
+        "where",
+        "copy-if"
       ],
       "internal": [
         "delegated-operands-b64",

@@ -28,6 +28,16 @@ pub(super) struct Source {
     _pin: Option<Arc<File>>,
 }
 impl Source {
+    pub fn expression_path(&self) -> &[u8] {
+        crate::expression::source_path(&self.label, &self.path)
+    }
+    pub fn expression_file(&self) -> Result<crate::expression::File> {
+        let mut file = crate::expression::File::from_root(self.meta);
+        if self.meta.is_symlink() {
+            file.link_target = Some(self.root.read_link(&RelativePath::new(&self.path)?)?);
+        }
+        Ok(file)
+    }
     pub fn kind(&self) -> ObjectKind {
         if self.meta.is_dir() {
             ObjectKind::Dir
@@ -323,7 +333,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
             if args.delete {
                 if source.kind() == ObjectKind::Dir {
                     prune.claim(source.key.as_bytes());
-                } else if args.existing || args.ignore_existing {
+                } else if args.existing || args.ignore_existing || args.expressions.active() {
                     prune.protect(source.key.as_bytes());
                 } else {
                     prune.claim_file(source.key.as_bytes());
@@ -356,6 +366,15 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                     continue;
                 }
                 source.key.push('/');
+            }
+            if args.expressions.selection.is_some()
+                && !args
+                    .expressions
+                    .selects(&source.expression_file()?, source.expression_path())
+                    .with_context(|| format!("source {}", String::from_utf8_lossy(&source.label)))?
+            {
+                prune.protect(source.key.as_bytes());
+                continue;
             }
             claim(
                 &mut claims,

@@ -259,6 +259,7 @@ fn pipeline_worker(
         delete: false,
         delete_excluded: false,
         max_delete: None,
+        expressions: Default::default(),
         update: false,
         ignore_existing: false,
         preserve_existing_directory_metadata: false,
