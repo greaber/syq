@@ -155,6 +155,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         .try_get_matches_from(full_argv)
         .unwrap_or_else(|error| error.exit());
     let command = PersistCommand::from_arg_matches(&matches)?;
+    crate::fsops::reserve_startup_descriptors();
     match command.action {
         PersistAction::Receive(command) => return crate::receive_service::run_command(command),
         PersistAction::Destinations(command) => return crate::destination::run_command(command),

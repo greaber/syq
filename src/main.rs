@@ -152,9 +152,6 @@ fn main() {
     let environment_options = cli::EnvironmentOptions::take_from_environment();
     tune_allocator();
     raise_nofile();
-    // Do this in every endpoint process, before any threads can share its
-    // descriptor table. Source setup reserves more when its plan needs it.
-    fsops::reserve_descriptor_capacity(16 * 1024);
     fsops::capture_process_umask();
     let mut argv = match destination::handoff::enter(std::env::args_os().collect()) {
         Ok(argv) => argv,
@@ -163,6 +160,40 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Public commands reserve after parsing, so help/version exits and
+    // completion need no large table. Internal endpoints (including both
+    // server spellings) reserve here, before their dispatch can start threads.
+    let command = argv.get(1).and_then(|arg| arg.to_str());
+    let server_mode = command == Some("--server")
+        || (command == Some("rsync")
+            && argv.get(2).and_then(|arg| arg.to_str()) == Some("--server"));
+    let parsed_command = matches!(
+        command,
+        None | Some(
+            "help"
+                | "completion"
+                | "--build-identity"
+                | "--help"
+                | "-h"
+                | "--help-all"
+                | "--version"
+                | "-V"
+                | "cp"
+                | "rsync"
+                | "rm"
+                | "map"
+                | "clean-partials"
+                | "exec"
+                | "persist"
+                | "_ls"
+                | "tuning-cache"
+                | "--self-update"
+                | "--register-standalone-install"
+        )
+    );
+    if server_mode || !parsed_command {
+        fsops::reserve_startup_descriptors();
+    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("help") {
         if let Err(error) = help::show_topic(&argv[2..]) {
             crate::output::diagnostic!("syq: {error:#}");
@@ -235,11 +266,6 @@ fn main() {
         }
         return;
     }
-    // Remote launches may invoke either `syq --server` or
-    // `syq rsync --server`; both enter the same internal server.
-    let server_mode = argv.get(1).and_then(|arg| arg.to_str()) == Some("--server")
-        || (argv.get(1).and_then(|arg| arg.to_str()) == Some("rsync")
-            && argv.get(2).and_then(|arg| arg.to_str()) == Some("--server"));
     if server_mode {
         if let Err(e) = server::run() {
             crate::output::diagnostic!("syq server: {e:#}");
@@ -338,6 +364,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    fsops::reserve_startup_descriptors();
     args.warn_unsupported_options();
     args.normalize();
     if args.self_update {

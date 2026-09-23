@@ -72,6 +72,12 @@ pub(crate) fn set_nofile_limits(limits: &libc::rlimit) -> io::Result<()> {
     Ok(())
 }
 
+/// Reserve initial headroom after informational exits, before worker threads.
+/// Source setup reserves more when its descriptor budget needs it.
+pub(crate) fn reserve_startup_descriptors() {
+    reserve_descriptor_capacity(16 * 1024);
+}
+
 /// Prepare Linux's descriptor table without keeping files open or changing
 /// limits. Growing a table shared by threads can wait for an RCU grace period;
 /// reserve initial headroom before threads start, then use known source demand
