@@ -53,7 +53,9 @@ class NightlyTests(unittest.TestCase):
             env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"],
                        GITHUB_EVENT_NAME="schedule", GITHUB_REPOSITORY="example/repo",
                        GITHUB_WORKFLOW_REF="example/repo/.github/workflows/ci.yml@refs/heads/master",
-                       GITHUB_REF_NAME="master", GITHUB_SHA=sha)
+                       GITHUB_REF_NAME="master", GITHUB_SHA=sha,
+                       SYQ_TEST_CHANGED_PATHS_FILE="", SYQ_CI_SCOPE_COMMIT="",
+                       SYQ_CI_DOCUMENTATION_ONLY="", FAIL_API="")
             for runs, full in [([], "true"), ([{"head_sha": sha}], "false")]:
                 env["RUNS"] = json.dumps({"workflow_runs": runs})
                 result = subprocess.run(["scripts/ci-scope.sh", str(event)], cwd=root, env=env,
