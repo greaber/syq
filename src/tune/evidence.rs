@@ -6,6 +6,13 @@ pub(super) struct Score {
     pub intervals: usize,
 }
 
+// Shared with history inference: a full second of consistently nonzero,
+// less-than-half-rate observations is enough to retain a severe loss.
+// Callers also require at least two observations.
+pub(super) fn severe_loss(seconds: f64, low: f64, high: f64, base: f64) -> bool {
+    seconds >= 1.0 && low > 0.0 && high < base * 0.5
+}
+
 #[derive(Default)]
 pub(super) struct Evidence {
     intervals: std::collections::VecDeque<(f64, f64)>,
@@ -40,7 +47,7 @@ impl Evidence {
             // Zero counters can be batched completion reports. Require the
             // longer exposure before interpreting complete silence as loss.
             if i >= 1
-                && ((elapsed >= 1.0 && low > 0.0 && high < base * 0.5)
+                && (severe_loss(elapsed, low, high, base)
                     || (elapsed >= 2.5 && ((low > 0.0 && high < base * 0.8) || low > base * 1.2))
                     || (elapsed >= 5.0 && (high < base * 0.95 || low * 0.95 > base)))
             {

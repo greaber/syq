@@ -8,9 +8,10 @@ use std::collections::BTreeMap;
 const STARTUP_CONNECTION_COST: f64 = 0.01;
 
 // The schema's original indexes already partition runs by `eligible`. Reserve
-// a distinct value for raw comparisons; 1 belongs to legacy recommendations.
+// a distinct value for comparisons with rate bounds; 1 and 2 identify older
+// recommendation/measurement formats. Old rows stay inspectable, not backfilled.
 // Tag new measurements at completion instead of indexing historical JSON at open.
-pub(super) const MEASUREMENTS: i64 = 2;
+pub(super) const MEASUREMENTS: i64 = 3;
 pub(super) const MAX_SUMMARY: usize = 65536;
 
 struct Comparison {
@@ -130,11 +131,36 @@ pub(super) fn starting_count(
 
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct RunEvidence {
-    // Worker count -> (total activity, observed seconds, interval count).
     // Persist measurements, never a selected starting count or a utility score.
-    observations: BTreeMap<usize, (f64, f64, usize)>,
+    observations: BTreeMap<usize, Observations>,
     consistent: bool,
     incompatible: bool,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Observations {
+    activity: f64,
+    seconds: f64,
+    intervals: usize,
+    low: f64,
+    high: f64,
+}
+
+impl Observations {
+    fn rate(&self) -> Option<f64> {
+        if self.intervals < 2
+            || !self.seconds.is_finite()
+            || self.seconds <= 0.0
+            || !self.low.is_finite()
+            || self.low < 0.0
+            || !self.high.is_finite()
+            || self.high < self.low
+        {
+            return None;
+        }
+        let rate = self.activity / self.seconds;
+        (rate.is_finite() && rate >= 0.0).then_some(rate)
+    }
 }
 
 impl RunEvidence {
@@ -169,19 +195,42 @@ impl RunEvidence {
             return;
         };
         let point = self.observations.entry(n as usize).or_default();
-        point.0 += rate * seconds;
-        point.1 += seconds;
-        point.2 += 1;
+        point.low = if point.intervals == 0 {
+            rate
+        } else {
+            point.low.min(rate)
+        };
+        point.high = point.high.max(rate);
+        point.activity += rate * seconds;
+        point.seconds += seconds;
+        point.intervals += 1;
     }
 
     fn points(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
-        self.observations
+        // A brief probe cannot establish the reference rate. Once another
+        // count has enough exposure, retain consistently severe losses using
+        // the same threshold as live rollback. Averaging alone would mistake
+        // a silence/burst pair for equally strong evidence.
+        let reference = self
+            .observations
             .iter()
-            .filter(|(n, (_, seconds, count))| {
-                (1..=65536).contains(*n) && seconds.is_finite() && *seconds >= 2.5 && *count >= 2
-            })
-            .map(|(n, (activity, seconds, _))| (*n, activity / seconds))
-            .filter(|(_, rate)| rate.is_finite() && *rate >= 0.0)
+            .filter(|(n, point)| (1..=65536).contains(*n) && point.seconds >= 2.5)
+            .filter_map(|(_, point)| point.rate())
+            .fold(0.0, f64::max);
+        self.observations.iter().filter_map(move |(n, point)| {
+            if !(1..=65536).contains(n) {
+                return None;
+            }
+            let rate = point.rate()?;
+            (point.seconds >= 2.5
+                || crate::tune::evidence::severe_loss(
+                    point.seconds,
+                    point.low,
+                    point.high,
+                    reference,
+                ))
+            .then_some((*n, rate))
+        })
     }
 
     pub(super) fn measured_counts(&self) -> usize {
@@ -268,6 +317,139 @@ mod tests {
         }
         writer.finish(true, false, None, json!({}));
         writer
+    }
+
+    #[test]
+    fn fast_rollback_measurements_change_the_next_start() {
+        use crate::tune::{evidence::Evidence, Policy};
+
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let key = super::super::tests::key("a");
+        record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
+        let writer = super::super::tests::recorder(&path);
+        writer.context(&key);
+        writer.event("learning_context", context()["data"].clone());
+        for _ in 0..2 {
+            writer.event("observation", observation(8, 100.0, true)["data"].clone());
+        }
+
+        let mut policy = Policy::new(8, 1, 16);
+        assert_eq!(policy.observe(100.0), 16);
+        policy.activated();
+        let mut evidence = Evidence::default();
+        for i in 0..2 {
+            let data = json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true});
+            writer.event("observation", data);
+            let score = evidence.push(20.0, 0.5, 100.0);
+            if i == 0 {
+                assert!(score.is_none());
+            } else {
+                let score = score.expect("a severe loss warrants an early rollback");
+                assert_eq!(score.seconds, 1.0);
+                assert_eq!(policy.observe(score.rate), 8);
+            }
+        }
+        writer.complete(true, json!({}));
+        drop(writer);
+        let db = Connection::open(&path).unwrap();
+        let saved = command::read_run(&db, 2).unwrap();
+        assert_eq!(saved["selected_workers"], Value::Null);
+        assert_eq!(
+            saved["summary"]["measurement_totals"]["observations"]["16"],
+            json!({"activity":20.0,"seconds":1.0,"intervals":2,"low":20.0,"high":20.0})
+        );
+        let next = super::super::tests::recorder(&path);
+        assert_eq!(
+            next.starting_count(&key, false).unwrap().workers,
+            8,
+            "the next copy must retain the measurements that justified rollback"
+        );
+    }
+
+    #[test]
+    fn brief_observations_require_consistent_severe_loss() {
+        for workers in [4, 16] {
+            for (seconds, rates, accepted) in [
+                (0.5, vec![20.0, 20.0], true),
+                (0.5, vec![49.9, 49.9], true),
+                (0.5, vec![50.0, 50.0], false),
+                (0.5, vec![20.0, 60.0], false),
+                (0.5, vec![0.0, 20.0], false),
+                (0.5, vec![0.0, 0.0], false),
+                (0.5, vec![200.0, 200.0], false),
+                (0.49, vec![20.0, 20.0], false),
+                (1.0, vec![20.0], false),
+            ] {
+                let mut events = vec![
+                    context(),
+                    observation(8, 100.0, true),
+                    observation(8, 100.0, true),
+                ];
+                for rate in &rates {
+                    events.push(json!({"kind":"observation","data":{
+                        "active":workers,"seconds":seconds,"rate":rate,"usable":true}}));
+                }
+                assert_eq!(
+                    infer_run(&events),
+                    accepted.then_some((8, false)),
+                    "workers={workers}, seconds={seconds}, rates={rates:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn short_reference_and_unusable_intervals_cannot_establish_severe_loss() {
+        let short = |n, rate, usable| {
+            json!({"kind":"observation","data":{
+            "active":n,"seconds":0.5,"rate":rate,"usable":usable}})
+        };
+        let mut events = vec![
+            context(),
+            short(8, 100.0, true),
+            short(8, 100.0, true),
+            short(16, 20.0, true),
+            short(16, 20.0, true),
+        ];
+        assert_eq!(
+            infer_run(&events),
+            None,
+            "the reference also needs enough exposure"
+        );
+        events[1] = observation(8, 100.0, true);
+        events[2] = observation(8, 100.0, true);
+        events[3] = short(16, 20.0, false);
+        assert_eq!(infer_run(&events), None, "only one usable loss interval");
+        events[3] = short(16, 20.0, true);
+        assert_eq!(infer_run(&events), Some((8, false)));
+    }
+
+    #[test]
+    fn old_measurement_format_is_inspectable_but_not_a_starting_input() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let key = super::super::tests::key("a");
+        let writer = record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
+        // Unchanged summary representation from #548. No conversion or fallback
+        // should feed a format with no rate bounds into the new inference rule.
+        let old = json!({"measured_worker_counts":2,"measurement_totals":{
+            "observations":{"8":[500.0,5.0,2],"16":[1000.0,5.0,2]},
+            "consistent":true,"incompatible":false}});
+        let db = Connection::open(&path).unwrap();
+        db.execute("UPDATE runs SET eligible=2,summary=?1", [old.to_string()])
+            .unwrap();
+        assert!(writer.starting_count(&key, false).is_none());
+        assert_eq!(command::read_run(&db, 1).unwrap()["summary"], old);
+        let current = record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
+        assert_eq!(current.starting_count(&key, false).unwrap().workers, 16);
+        // The historical recommendation query also excludes the new marker.
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM runs WHERE eligible=1", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -388,9 +570,9 @@ mod tests {
         assert_eq!(run["recommendation_eligible"], false);
         assert_eq!(run["selected_workers"], Value::Null);
         assert_eq!(writer.starting_count(&key, false).unwrap().workers, 16);
-        // Earlier writers used 0 (no recommendation) or 1 (recommendation).
-        // Neither is upgraded by scanning the old summaries during startup.
-        for old_eligibility in [0, 1] {
+        // Earlier writers used 0 (no evidence), 1 (recommendation), or 2
+        // (measurement totals). None is backfilled during startup.
+        for old_eligibility in [0, 1, 2] {
             db.execute("UPDATE runs SET eligible=?1", [old_eligibility])
                 .unwrap();
             assert!(writer.starting_count(&key, false).is_none());
