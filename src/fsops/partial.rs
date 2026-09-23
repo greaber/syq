@@ -2547,7 +2547,7 @@ fn set_meta_file_inner(
     {
         // The final owner may itself be denied read access by the source ACL.
         // Do not hand that account the staging inode's owner read permission.
-        f.set_permissions(fs::Permissions::from_mode(0))?;
+        f.set_permissions(fs::Permissions::from_mode(0o000))?;
     }
     // Owner first: chown clears setuid/setgid, so final mode follows it.
     let owner_changed =
