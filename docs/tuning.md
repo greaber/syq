@@ -92,10 +92,12 @@ comparison. A starting choice is not a fixed limit or a promise of the best
 speed for a different workload. Startup learning reads per-worker measurement totals recorded during each copy;
 the detailed timeline remains available for inspection. Histories without those
 totals do not determine starting counts. Startup inference requires measurements
-at two or more worker counts. Capped runs can contribute those comparisons:
-improvement at the highest tested count supports starting at least that high,
-without treating the cap as evidence against more workers. Fixed-count runs do
-not provide comparisons for startup learning.
+at two or more worker counts. Both capped and uncapped runs can contribute:
+improvement at the highest tested count is evidence for that count, while higher
+counts remain untested. Its influence fades with age and newer evidence; a small
+preference for fewer connections prevents stale high counts from dominating
+startup indefinitely. Fixed-count runs do not provide comparisons for startup
+learning.
 
 On macOS and Linux, remote-copy hints also distinguish local networks using
 available default-router hardware addresses, without requesting Wi-Fi location

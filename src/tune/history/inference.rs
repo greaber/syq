@@ -2,6 +2,11 @@
 use super::*;
 use std::collections::BTreeMap;
 
+// Per doubling, as a fraction of total comparison weight. This weak starting
+// preference lets negligible old support for more workers fade instead of
+// turning a collection of one-sided comparisons into a maximum-ever rule.
+const STARTUP_CONNECTION_COST: f64 = 0.01;
+
 // Shared by the partial indexes and lookup: filtering precedes the run limit.
 // CASE also keeps malformed/oversized diagnostic summaries out of JSON parsing.
 pub(super) const MATCHABLE: &str = "status='success' AND lost=0 AND CASE WHEN length(CAST(summary AS BLOB))<=65536 AND json_valid(summary) THEN json_extract(summary,'$.measurement_totals.consistent')=1 AND json_extract(summary,'$.measurement_totals.incompatible')=0 AND json_extract(summary,'$.measured_worker_counts')>=2 ELSE 0 END";
@@ -91,17 +96,25 @@ pub(super) fn starting_count(
             }
         }
         // Combine within-run preferences, never absolute speeds across runs.
-        // A rising ceiling imposes no penalty on higher candidates: many capped
-        // runs therefore cannot drag a better-supported higher start downward.
-        // Equal evidence favors the higher start; live exploration can revise it.
+        // An unfinished ramp supplies no evidence against higher candidates.
+        // A separate small connection cost prevents arbitrarily weak old bounds
+        // from keeping a high start forever in the absence of a measured slowdown.
+        // Equal final scores favor the higher start; live exploration can revise it.
         choices.sort_by_key(|c| std::cmp::Reverse(c.0.workers));
+        let Some(minimum) = choices.iter().map(|c| c.0.workers).min() else {
+            continue;
+        };
+        let total_weight = choices.iter().map(|c| c.1).sum::<f64>();
         let mut best = None;
         let mut best_loss = f64::INFINITY;
         for (comparison, _, run) in &choices {
             let loss = choices
                 .iter()
                 .map(|(c, w, _)| w * c.distance(comparison.workers))
-                .sum::<f64>();
+                .sum::<f64>()
+                + total_weight
+                    * STARTUP_CONNECTION_COST
+                    * (comparison.workers as f64 / minimum as f64).log2();
             if loss < best_loss {
                 best_loss = loss;
                 best = Some(Hint {
@@ -282,6 +295,36 @@ mod tests {
         record(&path, &key, Some(32), true, &[(4, 200.0), (8, 100.0)]);
         let below = record(&path, &key, Some(32), true, &[(4, 200.0), (8, 100.0)]);
         assert_eq!(below.starting_count(&key, false).unwrap().workers, 4);
+    }
+
+    #[test]
+    fn aging_a_high_lower_bound_allows_recent_lower_starts() {
+        for old_cap in [None, Some(64)] {
+            for new_cap in [None, Some(8)] {
+                let temp = crate::test_support::tempdir().unwrap();
+                let path = temp.path().join("history.sqlite");
+                let key = super::super::tests::key("a");
+                record(&path, &key, old_cap, true, &[(32, 100.0), (64, 200.0)]);
+                let recent = record(&path, &key, new_cap, true, &[(4, 100.0), (8, 200.0)]);
+                // Fresh evidence at 64 is still valuable even if newer work
+                // stopped at 8 without trying higher counts.
+                assert_eq!(recent.starting_count(&key, false).unwrap().workers, 64);
+                let db = Connection::open(&path).unwrap();
+                db.execute("UPDATE runs SET day=day-42 WHERE id=1", [])
+                    .unwrap();
+                // Only the evidence age changed. An old high lower bound must
+                // not veto every lower candidate until it leaves the window.
+                assert_eq!(
+                    recent.starting_count(&key, false).unwrap().workers,
+                    8,
+                    "old_cap={old_cap:?}, new_cap={new_cap:?}"
+                );
+                for _ in 0..4 {
+                    let more = record(&path, &key, new_cap, true, &[(4, 100.0), (8, 200.0)]);
+                    assert_eq!(more.starting_count(&key, false).unwrap().workers, 8);
+                }
+            }
+        }
     }
 
     #[test]
