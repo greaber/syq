@@ -3903,7 +3903,7 @@ fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
     };
     authority.authorize(&mut finish, false).unwrap();
     assert!(
-        matches!(finish, Request::FinishBasis { expected_hash: Some(ref value), .. } if *value == expected)
+        matches!(finish, Request::FinishBasis { expected_hash: Some(ref value), .. } if *value == crate::hashing::ExpectedHashes::Single(expected))
     );
     assert!(authority.authorize(&mut small_put(&target), false).is_err());
 }

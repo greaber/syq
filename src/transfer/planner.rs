@@ -1342,6 +1342,9 @@ impl Planner<'_> {
         for m in buffered {
             self.apply_mapped(m)?;
         }
+        if !self.collision {
+            self.finish_hardlink_planning()?;
+        }
         self.retire_planning_state();
         Ok(())
     }
