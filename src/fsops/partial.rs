@@ -230,6 +230,9 @@ impl FsOps {
     }
 
     pub(super) fn preallocate_new_partial(&mut self, file: &File, size: u64) -> Result<()> {
+        if self.sparse {
+            return file.set_len(size).context("set sparse partial length");
+        }
         #[cfg(target_os = "linux")]
         {
             let dev = file.metadata()?.dev();
@@ -608,9 +611,12 @@ impl FsOps {
                             "SYQ_TEST_REUSE_CONTINUE_FILE",
                             "reuse buffered bytes",
                         )?;
-                        output
-                            .write_all_at(bytes, off)
-                            .context("write reused block")?;
+                        if self.sparse {
+                            crate::sparse::write_at(&output, bytes, off, false)
+                        } else {
+                            output.write_all_at(bytes, off)
+                        }
+                        .context("write reused block")?;
                     }
                     hashes.push(hash);
                 }
@@ -825,8 +831,10 @@ impl FsOps {
             && destination_fs.is_nfs
             && !destination_fs.synchronous;
         // Local files keep parallelism across files without paying transport
-        // and per-range hashing costs. Do not widen the NFS exception above.
-        let use_userspace_fallback = use_sequential_nfs_fallback
+        // and per-range hashing costs. Explicit sparse mode also needs a buffered
+        // writer when cloning cannot preserve its allocation.
+        let use_userspace_fallback = self.sparse
+            || use_sequential_nfs_fallback
             || (allow_sequential_local_fallback
                 && source_fs.local_userspace_copy
                 && destination_fs.local_userspace_copy
@@ -882,7 +890,13 @@ impl FsOps {
             && !destination_fs.is_nfs
             && !destination_fs.synchronous
             && !userspace_fallback;
-        let cloned = local_read_ahead && crate::local_copy::try_clone(&s, &d, size);
+        // copy_file_range can clone on filesystems outside the measured
+        // read-ahead set too. Sparse mode cannot use its byte-copy fallback,
+        // which can fill holes, so try an explicit clone before scanning zeros.
+        let cloned = (local_read_ahead || self.sparse)
+            && !userspace_fallback
+            && crate::local_copy::try_clone(&s, &d, size);
+        userspace_fallback |= self.sparse && !cloned;
         let preparation = &mut self.read_ahead;
         let mut read_ahead = (local_read_ahead && !cloned).then(|| preparation.range(&s, 0..size));
         let mut source_offset: libc::off64_t = 0;
@@ -998,9 +1012,12 @@ impl FsOps {
                 let prepare = before.is_some_and(|before| {
                     crate::read_ahead::Activity::sample().read_wait_since(before)
                 });
-                destination
-                    .write_all(&buffer[..n])
-                    .with_context(|| format!("write {}", target_label.display()))?;
+                if self.sparse {
+                    crate::sparse::write_at(&d, &buffer[..n], size - remaining, false)
+                } else {
+                    destination.write_all(&buffer[..n])
+                }
+                .with_context(|| format!("write {}", target_label.display()))?;
                 #[cfg(debug_assertions)]
                 if remaining == size {
                     test_race_barrier(
@@ -1140,7 +1157,7 @@ impl FsOps {
                     })?
                 }
             };
-            observed_write(&self.operation, &file, data, 0)
+            observed_write(&self.operation, &file, data, 0, self.sparse)
                 .with_context(|| format!("write {}", rooted.label.display()))?;
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", rooted.label.display()))?;
@@ -1170,7 +1187,7 @@ impl FsOps {
             let file = rooted.root.open_regular_write(&rooted.relative, false)?;
             require_open_target(&file, &rooted.label, condition)?;
             file.set_len(0)?;
-            observed_write(&self.operation, &file, data, 0)
+            observed_write(&self.operation, &file, data, 0, self.sparse)
                 .with_context(|| format!("write existing {}", rooted.label.display()))?;
             file.set_len(data.len() as u64)?;
             set_meta_file(&file, meta, flags)
@@ -1196,7 +1213,7 @@ impl FsOps {
         if basis_size.is_some() {
             file.set_len(0)?;
         }
-        observed_write(&self.operation, &file, data, 0)
+        observed_write(&self.operation, &file, data, 0, self.sparse)
             .with_context(|| format!("write {}", label.display()))?;
         set_meta_file(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
@@ -1407,10 +1424,11 @@ impl FsOps {
             bail!("block hash mismatch on receive @{off}");
         }
         let rooted = self.destination_mutation_target(target.path, target.guard)?;
+        let sparse = self.sparse;
         let mut write = |relative: &RelativePath, label: &Path| {
             let file = self.cached_rooted(label, &rooted.root, relative, attempt, !inplace)?;
             let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
-            let result = file.write_range_at(data, off);
+            let result = file.write_range_at(data, off, sparse);
             if result.is_ok() {
                 writing.bytes(data.len() as u64);
             }
@@ -1738,6 +1756,7 @@ impl FsOps {
             }
             Request::ConfigurePreservation {
                 selection,
+                sparse,
                 destination,
             } => {
                 let validation = if *destination {
@@ -1747,6 +1766,7 @@ impl FsOps {
                 };
                 validation.map(|()| {
                     self.inode_preservation = *selection;
+                    self.sparse = *sparse;
                     Response::Ok
                 })
             }

@@ -285,7 +285,7 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         "ignore_existing" | "existing" | "update" | "inplace" | "prune" | "max_delete" => {
             ("Updates and deletion", 2)
         }
-        "preserve" | "open_noatime" | "follow" | "follow_src" | "follow_dst" => {
+        "preserve" | "sparse" | "open_noatime" | "follow" | "follow_src" | "follow_dst" => {
             ("Metadata and symlinks", 3)
         }
         "integrity_checking_arg" | "hash" => ("Verification", 4),

@@ -993,6 +993,8 @@ mod resume;
 mod rm;
 #[path = "local/selection.rs"]
 mod selection;
+#[path = "local/sparse.rs"]
+mod sparse;
 #[path = "local/tuning.rs"]
 mod tuning;
 

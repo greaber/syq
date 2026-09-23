@@ -218,6 +218,9 @@ pub struct Args {
     /// Request reads without access-time updates; warn and continue if unavailable
     #[arg(long)]
     pub open_noatime: bool,
+    /// Turn written zero ranges into sparse holes
+    #[arg(short = 'S', long)]
+    pub sparse: bool,
     /// Preserve group
     #[arg(short = 'g', long)]
     pub group: bool,
@@ -1115,6 +1118,9 @@ struct NativeCopyOperationalArgs {
     /// Request reads without access-time updates; warn and continue if unavailable
     #[arg(long)]
     open_noatime: bool,
+    /// Turn written zero ranges into sparse holes
+    #[arg(long)]
+    sparse: bool,
     /// Update destination files directly, using no full-sized staging file; interruption can leave them incomplete
     #[arg(long)]
     inplace: bool,
@@ -2649,6 +2655,7 @@ fn apply_native_copy_operational(
         ignore_from,
         preserve,
         open_noatime,
+        sparse,
         inplace,
         receiver_max_entries,
         receiver_max_bytes,
@@ -2673,6 +2680,7 @@ fn apply_native_copy_operational(
     args.ignore_from = ignore_from;
     args.inplace = inplace;
     args.open_noatime = open_noatime;
+    args.sparse = sparse;
     for attribute in preserve {
         match attribute {
             NativePreserve::Times => args.times = true,
@@ -2697,10 +2705,11 @@ fn apply_native_copy_operational(
         || args.xattrs
         || args.atimes > 0
         || args.crtimes
-        || args.open_noatime)
+        || args.open_noatime
+        || args.sparse)
         && (args.descriptor_copy.is_some() || args.stream_mapping_fd.is_some() || args.s3.is_some())
     {
-        bail!("hardlink, ACL, xattr, access-time and birth-time preservation and no-atime reads require named filesystem sources and destinations; descriptors, streams, and S3 are unsupported");
+        bail!("hardlink, ACL, xattr, access-time and birth-time preservation, no-atime reads and sparse allocation require named filesystem sources and destinations; descriptors, streams, and S3 are unsupported");
     }
     apply_native_operational(args, common);
     args.apply_advanced()?;
@@ -3064,7 +3073,6 @@ fn message_for_long(base: &str) -> Option<&'static str> {
             DELETE_MSG
         }
         "one-file-system" => "syq does not implement -x/--one-file-system.",
-        "sparse" => "syq does not implement -S/--sparse.",
         "copy-links" | "copy-unsafe-links" | "copy-dirlinks" => SOURCE_LINK_TRAVERSAL_MSG,
         "keep-dirlinks" => DESTINATION_LINK_TRAVERSAL_MSG,
         "safe-links" => {
@@ -3083,7 +3091,6 @@ fn message_for_long(base: &str) -> Option<&'static str> {
 fn message_for_short(c: char) -> Option<&'static str> {
     message_for_long(match c {
         'H' => "hard-links",
-        'S' => "sparse",
         'x' => "one-file-system",
         'L' => "copy-links",
         'k' => "copy-dirlinks",

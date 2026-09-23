@@ -234,6 +234,7 @@ fn pipeline_worker(
         links: false,
         perms: false,
         hardlinks: false,
+        sparse: false,
         inode_preservation: Default::default(),
         hardlink_completions: Mutex::new(Default::default()),
         devices: false,
@@ -1675,6 +1676,7 @@ fn existing_destination_setup_replays_on_v032_receiver() {
 #[test]
 fn fresh_capacity_keeps_a_sixty_four_inode_margin() {
     let assessment = |objects, available_inodes| FreshCapacityAssessment {
+        check_bytes: true,
         logical_bytes: 0,
         objects,
         available_bytes: 0,

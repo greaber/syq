@@ -175,8 +175,9 @@ pub(crate) fn copy(args: &mut crate::cli::Args) -> Result<()> {
             || args.atimes > 0
             || args.crtimes
             || args.open_noatime
+            || args.sparse
         {
-            bail!("hardlink, ACL, xattr, access-time and birth-time preservation and no-atime reads are not supported by named or receiving destinations");
+            bail!("hardlink, ACL, xattr, access-time and birth-time preservation, no-atime reads and sparse allocation are not supported by named or receiving destinations");
         }
         maybe_exec(selection)?;
     } else if ACCEPTED.get().is_some() {

@@ -425,6 +425,7 @@ fn is_superuser() -> bool {
 
 pub struct FsOps {
     inode_preservation: crate::inode_metadata::Selection,
+    sparse: bool,
     descriptor_copy: crate::descriptor_copy::Session,
     stream_worker: Option<crate::descriptor_copy::FileWorker>,
     stream_ticket: Option<crate::descriptor_broker::DescriptorTicket>,
@@ -605,6 +606,7 @@ impl FsOps {
         let operation = observations.actor("filesystem");
         FsOps {
             inode_preservation: Default::default(),
+            sparse: false,
             descriptor_copy: Default::default(),
             stream_worker: None,
             stream_ticket: None,
@@ -840,6 +842,7 @@ impl FsOps {
         if let Some(info) = info.filter(|_| fresh) {
             let assessment = crate::copy_policy::FreshCapacityAssessment {
                 logical_bytes: total,
+                check_bytes: true,
                 objects: request.files.len() as u64,
                 available_bytes: info.available_bytes,
                 available_inodes: info.available_inodes,
@@ -1078,7 +1081,7 @@ impl FsOps {
         if basis_size.is_some() {
             file.set_len(0)?;
         }
-        observed_write(&self.operation, &file, data, 0)
+        observed_write(&self.operation, &file, data, 0, false)
             .with_context(|| format!("write {}", label.display()))?;
         set_meta_file(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
@@ -2550,9 +2553,15 @@ fn observed_write(
     file: &File,
     data: &[u8],
     off: u64,
+    sparse: bool,
 ) -> std::io::Result<()> {
     let writing = actor.span(crate::transfer_observations::Stage::DestinationWrite);
-    file.write_all_at(data, off)?;
+    if sparse {
+        crate::sparse::write_at(file, data, off, false)?;
+        file.set_len(off + data.len() as u64)?;
+    } else {
+        file.write_all_at(data, off)?;
+    }
     writing.bytes(data.len() as u64);
     Ok(())
 }

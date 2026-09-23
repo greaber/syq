@@ -318,7 +318,7 @@ simd-checksum	out-of-scope	rsync-internal
 size-filter	conformance	-
 skiplist-spec	out-of-scope	rsync-internal
 source-change-size-continues	adapted	-
-sparse	unsupported	unsupported-transfer-mode
+sparse	adapted	-
 ssh-basic	adapted	-
 stop-time	unsupported	unsupported-transfer-mode
 symlink-dest-backupdir	unsupported	unsupported-alt-dest

@@ -4620,6 +4620,7 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
     fs::create_dir(&root).unwrap();
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     let mut configuration = Request::ConfigurePreservation {
+        sparse: true,
         selection: crate::inode_metadata::Selection {
             acls: true,
             xattrs: true,
