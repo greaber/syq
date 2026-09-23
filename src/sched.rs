@@ -410,6 +410,8 @@ struct Inner {
     /// namespace checks and directory creation make it runnable.
     file_work_anticipated: bool,
     scan_done: bool,
+    /// Source-wide preflights passed; more validated jobs may still arrive.
+    work_released: bool,
     abort: bool,
 }
 
@@ -459,6 +461,7 @@ impl Sched {
                 fast_groups: Vec::new(),
                 file_work_anticipated: false,
                 scan_done: false,
+                work_released: false,
                 abort: false,
             }),
             cv: Condvar::new(),
@@ -481,9 +484,8 @@ impl Sched {
         };
         let mut inner = self.inner.lock().unwrap();
         inner.files.push((size, Reverse(FileOrder::new(idx))));
-        // Workers cannot consume queued files until namespace planning finishes.
-        // scan_done wakes them together when that work becomes runnable.
-        let runnable = inner.scan_done;
+        // New batches can run once the source-wide preflights have passed.
+        let runnable = inner.scan_done || inner.work_released;
         drop(inner);
         if runnable {
             self.cv.notify_one();
@@ -585,6 +587,13 @@ impl Sched {
             .files
             .push((size, Reverse(FileOrder::new(idx))));
         self.cv.notify_one();
+    }
+
+    /// Release validated jobs while the planner finishes preparing later
+    /// batches. An empty queue is still a wait, not EOF, until scan_done.
+    pub fn release_preflighted_work(&self) {
+        self.inner.lock().unwrap().work_released = true;
+        self.cv.notify_all();
     }
 
     pub fn scan_done(&self) {
@@ -798,7 +807,7 @@ impl Sched {
                 self.tune_cv.notify_one();
                 return Item::Exit;
             }
-            if g.scan_done {
+            if g.scan_done || g.work_released {
                 if let Some((idx, off, end)) = g.ranges.pop() {
                     return Item::Range(g.claim_range(idx, off, end));
                 }

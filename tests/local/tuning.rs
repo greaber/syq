@@ -1931,3 +1931,106 @@ fn tuning_history_records_tcp_preflight_for_push_and_pull() {
         assert_ne!(probe["endpoint"], "host");
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn local_copy_runs_while_later_validated_batches_are_still_being_planned() {
+    for existing in [false, true] {
+        let t = Tmp::new();
+        for index in 0..4500 {
+            write(&t.path(&format!("src/tree/f{index:04}")), b"payload");
+        }
+        write(&t.path("selection"), b"tree\n");
+        if existing {
+            fs::create_dir(t.path("dst")).unwrap();
+        }
+        let ready = t.path("batch-ready");
+        let continuation = t.path("continue");
+        let mut child = compat_command()
+            .args([
+                "-rlpt",
+                "--files-from",
+                &t.s("selection"),
+                &t.s("src/"),
+                &t.s("dst/"),
+                "--no-progress",
+                "--performance-tuning",
+                "workers=2",
+            ])
+            .env("SYQ_TEST_PLANNED_BATCH_READY_FILE", &ready)
+            .env("SYQ_TEST_PLANNED_BATCH_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "first planned batch");
+        wait_for_confinement_marker(
+            &mut child,
+            &t.path("dst/tree/f0000"),
+            "copy during planning",
+        );
+        assert_eq!(read(&t.path("dst/tree/f0000")), b"payload");
+        assert!(
+            !t.path("dst/tree/f4499").exists(),
+            "later batch must still be unplanned"
+        );
+        release_confinement_barrier(&continuation);
+        let output = child.wait_with_output().unwrap();
+        assert_output_ok(&output);
+        for index in 0..4500 {
+            assert_eq!(read(&t.path(&format!("dst/tree/f{index:04}"))), b"payload");
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn local_pipeline_does_not_publish_before_capacity_preflight() {
+    let t = Tmp::new();
+    for index in 0..4 {
+        write(&t.path(&format!("src/tree/f{index}")), b"payload");
+    }
+    write(&t.path("selection"), b"tree\n");
+    fs::create_dir(t.path("dst")).unwrap();
+    let output = compat_command()
+        .args([
+            "-rlpt",
+            "--files-from",
+            &t.s("selection"),
+            &t.s("src/"),
+            &t.s("dst/"),
+            "--no-progress",
+            "--performance-tuning",
+            "workers=2",
+        ])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "0")
+        .run()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr_of(&output).contains("fresh destination capacity preflight failed"));
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn local_unchanged_multiple_sources_do_not_start_workers() {
+    let t = Tmp::new();
+    write(&t.path("source/a"), b"a");
+    write(&t.path("source/b"), b"b");
+    for repeat in 0..2 {
+        let mut command = compat_command();
+        command.args([
+            "-a",
+            "--no-progress",
+            &t.s("source/a"),
+            &t.s("source/b"),
+            &t.s("destination/"),
+        ]);
+        if repeat == 1 {
+            command.env("SYQ_TEST_WORKER_EVENTS", t.path("worker-events"));
+        }
+        let output = command.run().unwrap();
+        assert_output_ok(&output);
+    }
+    assert!(!t.path("worker-events").exists());
+}
