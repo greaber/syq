@@ -611,6 +611,7 @@ impl Planner<'_> {
         // What the planner has been given for each path (Dir or not).
         let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
         let mut recursed: HashSet<PathBytes> = HashSet::new();
+        let mut completed_subtrees: HashSet<PathBytes> = HashSet::new();
         let ancestors = |line: &[u8]| -> Vec<PathBytes> {
             line.iter()
                 .enumerate()
@@ -742,7 +743,18 @@ impl Planner<'_> {
             self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
             self.handle_batch(batch, src_root, b"", dst_root)?;
             for rel in subtrees {
+                if ancestors(&rel)
+                    .iter()
+                    .any(|ancestor| completed_subtrees.contains(ancestor))
+                {
+                    continue;
+                }
                 self.scan_subtree(src, src_root, &rel, dst_root, &mut emitted)?;
+                // A partial walk may miss a readable, explicitly selected
+                // child. After a scan warning, keep walking later selections.
+                if !self.scan_warned {
+                    completed_subtrees.insert(rel);
+                }
             }
         }
         Ok(())

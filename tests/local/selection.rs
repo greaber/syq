@@ -984,6 +984,60 @@ fn files_from_copies_listed_paths_with_their_parents() {
 }
 
 #[test]
+fn files_from_recursive_overlaps_preserve_the_selected_union() {
+    for list in [
+        "a\na/sub\nab\n".to_owned(),
+        "a/sub\na\nab\n".to_owned(),
+        format!("{}a/sub\nab\n", "a\n".repeat(5000)),
+    ] {
+        let t = Tmp::new();
+        for path in ["a/first", "a/sub/second", "ab/third", "unselected/fourth"] {
+            write(&t.path("src").join(path), path.as_bytes());
+        }
+        write(&t.path("list"), list.as_bytes());
+        let output = run_ok(&[
+            "-rlt",
+            "--files-from",
+            &t.s("list"),
+            &t.s("src"),
+            &t.s("dst"),
+        ]);
+        assert_eq!(transferred(&output), 3);
+        assert_eq!(
+            listing(&t.path("dst")),
+            ["a", "a/first", "a/sub", "a/sub/second", "ab", "ab/third"]
+        );
+        for path in ["a/first", "a/sub/second", "ab/third"] {
+            assert_eq!(read(&t.path("dst").join(path)), path.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn files_from_explicit_child_survives_an_unreadable_parent_walk() {
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root can enumerate the otherwise unreadable parent
+    }
+    let t = Tmp::new();
+    write(&t.path("src/parent/child/file"), b"explicitly selected");
+    write(&t.path("list"), b"parent\nparent/child\n");
+    fs::set_permissions(t.path("src/parent"), fs::Permissions::from_mode(0o111)).unwrap();
+    let output = syq(&[
+        "-rt",
+        "--files-from",
+        &t.s("list"),
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
+    fs::set_permissions(t.path("src/parent"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert_eq!(
+        read(&t.path("dst/parent/child/file")),
+        b"explicitly selected"
+    );
+}
+
+#[test]
 fn delete_never_removes_paths_the_source_has_but_skips() {
     let t = Tmp::new();
     write(&t.path("src/plain"), b"p");
