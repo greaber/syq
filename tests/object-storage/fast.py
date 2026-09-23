@@ -41,10 +41,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             events.append(("create",time.monotonic())); self.respond(200,b"<InitiateMultipartUploadResult><UploadId>fixture</UploadId></InitiateMultipartUploadResult>")
     def do_PUT(self):
-        assert self.headers.get("x-amz-content-sha256")=="UNSIGNED-PAYLOAD"
         assert self.headers.get("x-amz-checksum-sha256")
         assert not self.headers.get("x-amz-meta-syq-blake3")
         part=int(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("partNumber",[0])[0])
+        # Single PUTs sign the precomputed SHA-256 digest; multipart parts use
+        # UNSIGNED-PAYLOAD and their separate checksum header.
+        expected_payload = "UNSIGNED-PAYLOAD" if part else base64.b64decode(self.headers["x-amz-checksum-sha256"]).hex()
+        assert self.headers.get("x-amz-content-sha256") == expected_payload
         events.append(("put-start",time.monotonic(),part))
         upload_started.set()
         left=int(self.headers["Content-Length"])
