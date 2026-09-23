@@ -199,5 +199,25 @@ pub(super) fn apply(file: &File, attributes: &ExtendedAttributes) -> Result<()> 
         crate::fsops::set_mode_handle(file, current.mode() & 0o7777)
             .context("restore permissions after extended attributes")?;
     }
+    // Resource-fork writes can change the file's data modification time. The
+    // caller has already restored the requested mtime; keep it intact, then
+    // let the shared metadata layer restore access/birth times and the ACL.
+    let after = file.metadata()?;
+    if (after.mtime(), after.mtime_nsec()) != (current.mtime(), current.mtime_nsec()) {
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT as _,
+            },
+            libc::timespec {
+                tv_sec: current.mtime(),
+                tv_nsec: current.mtime_nsec(),
+            },
+        ];
+        if unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error())
+                .context("restore mtime after extended attributes");
+        }
+    }
     result
 }
