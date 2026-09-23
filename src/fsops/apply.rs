@@ -520,12 +520,20 @@ pub(super) fn set_meta_rooted(
         return Ok(());
     }
     if is_link {
-        let handle = target.root.open_metadata(&target.relative)?;
-        require_rooted_metadata(&handle, metadata, &target.label)?;
+        let handle = meta
+            .inode_metadata
+            .as_ref()
+            .map(|_| target.root.open_metadata(&target.relative))
+            .transpose()?;
+        if let Some(handle) = &handle {
+            require_rooted_metadata(handle, metadata, &target.label)?;
+        }
         apply_owner_if_changed(flags, meta, metadata.uid, metadata.gid, |uid, gid| {
             target.root.chown(&target.relative, uid, gid)
         })?;
-        crate::inode_metadata::apply(&handle, meta.inode_metadata.as_deref(), meta.mode)?;
+        if let Some(handle) = &handle {
+            crate::inode_metadata::apply(handle, meta.inode_metadata.as_deref(), meta.mode)?;
+        }
     } else {
         let handle = target.root.open_metadata(&target.relative)?;
         let opened = handle.metadata()?;

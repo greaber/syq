@@ -918,9 +918,7 @@ fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
             vec![option, "--src-fd=0", "--as", "destination"],
             vec![option, "source", "--to", "s3://bucket", "--into", "prefix"],
         ] {
-            let error = parse_native_copy(&argv(&route))
-                .err()
-                .expect("route must be refused");
+            let error = parse_native_copy(&argv(&route)).expect_err("route must be refused");
             assert!(error.to_string().contains("named filesystem"), "{error:#}");
         }
     }
