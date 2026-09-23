@@ -71,12 +71,20 @@ struct RunEvidence {
     observations: BTreeMap<usize, (f64, f64, usize)>,
     modern: bool,
     consistent: bool,
+    incompatible: bool,
 }
 
 impl RunEvidence {
     fn push(&mut self, event: &Value) {
+        if event["kind"] == "start" {
+            self.incompatible |= event["data"]["automatic"] == false
+                || event["data"]
+                    .get("overrides")
+                    .is_some_and(|v| !v.is_null() && v != "None");
+        }
         if event["kind"] == "learning_context" {
-            self.consistent = event["data"]["consistent"] == true;
+            self.consistent =
+                event["data"]["consistent"] == true && event["data"]["automatic"] == true;
         }
         let modern = event["kind"] == "observation";
         if !modern && event["kind"] != "sample" {
@@ -136,7 +144,7 @@ impl RunEvidence {
     }
 
     fn finish(self) -> Option<(usize, bool)> {
-        if self.modern && !self.consistent {
+        if self.incompatible || (self.modern && !self.consistent) {
             return None;
         }
         let points = if self.modern {
@@ -190,6 +198,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_copy_overrides_do_not_seed_ordinary_copies() {
+        let mut events = vec![
+            json!({"kind":"start","data":{
+                "automatic":true,"overrides":"Some(TuningOptions { request_size: Some(1024) })"
+            }}),
+            sample(8, 100.0, "stable"),
+            sample(8, 100.0, "stable"),
+        ];
+        assert_eq!(infer_run(&events), None);
+        events[0]["data"]["overrides"] = json!("None");
+        assert_eq!(infer_run(&events), Some((8, false)));
+        events[0]["data"]["automatic"] = json!(false);
+        assert_eq!(infer_run(&events), None);
+    }
+
+    #[test]
     fn flat_measurements_do_not_ratchet_starting_counts_upward() {
         let events = vec![
             sample(8, 100.0, "stable"),
@@ -232,7 +256,7 @@ mod tests {
             6
         ];
         assert_eq!(infer_run(&events), None);
-        events.push(json!({"kind":"learning_context","data":{"consistent":true}}));
+        events.push(json!({"kind":"learning_context","data":{"consistent":true,"automatic":true}}));
         assert_eq!(infer_run(&events), Some((16, false)));
         for e in events.iter_mut().take(4) {
             e["data"]["usable"] = json!(false);

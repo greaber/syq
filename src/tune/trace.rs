@@ -1,4 +1,4 @@
-//! Observation of the driver's actual inputs and decisions; never feeds policy.
+//! Record observations for startup inference and decisions for diagnosis.
 use super::*;
 use serde_json::{json, Value};
 
@@ -24,8 +24,9 @@ impl Trace {
             "maximum_samples":MAX_SAMPLES,"near_best_tolerance":NEAR_BEST_TOLERANCE,
             "step":STEP,"startup_step":STARTUP_STEP,"file_credit":FILE_CREDIT,"probe_every":PROBE_EVERY,
             "probe_backoff_max":PROBE_BACKOFF_MAX,"evidence_max_age":EVIDENCE_MAX_AGE,
-            "clock_unit":"elapsed_sample_intervals","upward_max_wait_ms":interval.as_millis()*12,
-            "downward_max_wait_ms":interval.as_millis()*24,"observation_ms":interval.as_millis().min(500),
+            "clock_unit":if policy.wall_clock {"elapsed_sample_intervals"} else {"accepted_measurements"},
+            "upward_max_wait_ms":policy.wall_clock.then_some(interval.as_millis()*12),
+            "downward_max_wait_ms":policy.wall_clock.then_some(interval.as_millis()*24),"observation_ms":policy.wall_clock.then_some(interval.as_millis().min(500)),
             "collapse_fraction":0.5,"collapse_samples":2}));
         trace
     }
@@ -158,7 +159,7 @@ impl Trace {
 
     pub fn end(&self, policy: &Policy, aborted: bool) {
         self.event("policy_end",json!({"active":policy.active(),"requested":policy.n,
-            "last_accepted":policy.settled(),"recommended":policy.recommended(),"completed_comparison":policy.measured(),"discovery_complete":policy.discovery_complete(),
+            "last_accepted":policy.settled(),"completed_comparison":policy.measured(),
             "pending_comparison":matches!(policy.state,State::Explore{..}),"aborted":aborted,"policy":snapshot(policy)}));
         if let Some(recorder) = &self.recorder {
             recorder.flush();
@@ -168,7 +169,7 @@ impl Trace {
 
 fn snapshot(policy: &Policy) -> Value {
     json!({"requested":policy.n,"active":policy.active,"min":policy.min,"max":(policy.max != usize::MAX).then_some(policy.max),
-        "recommended":policy.recommended(),"startup_doubling":policy.startup_doubling,"state":policy.state,"points":policy.points,"clock":policy.tick,"wall_clock":policy.wall_clock,
+        "startup_doubling":policy.startup_doubling,"state":policy.state,"points":policy.points,"clock":policy.tick,"wall_clock":policy.wall_clock,
         "comparisons":policy.comparisons,"failed_probes":policy.fails,"next_probe":policy.due,
         "recent_best":policy.recent_best(),"historical_near_best_floor":policy.recent_best()*(1.0-NEAR_BEST_TOLERANCE)})
 }

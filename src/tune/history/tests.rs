@@ -535,8 +535,8 @@ fn trace_records_inconclusive_upward_hold_without_claiming_a_plateau() {
     let end = events.last().unwrap();
     assert_eq!(end["data"]["completed_comparison"], true);
     assert_eq!(end["data"]["last_accepted"], 16);
-    assert_eq!(end["data"]["recommended"], 8);
-    assert_eq!(end["data"]["discovery_complete"], false);
+    assert!(end["data"].get("recommended").is_none());
+    assert!(end["data"].get("discovery_complete").is_none());
 }
 
 #[test]
@@ -638,4 +638,35 @@ fn network_scoped_hints_separate_known_networks_and_preserve_unknown_fallback() 
         next.hint(&network_key(Some("home")), true).unwrap().workers,
         8
     );
+}
+
+#[test]
+fn trace_clock_units_match_the_driver() {
+    for elapsed in [false, true] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let writer = recorder(&path);
+        let mut policy = super::super::Policy::new(8, 1, 64);
+        if elapsed {
+            policy.advance_time(Duration::ZERO, super::super::SAMPLE);
+        }
+        let trace =
+            super::super::trace::Trace::new(Some(writer.clone()), &policy, super::super::SAMPLE);
+        trace.end(&policy, false);
+        let events =
+            command::read_events(&open(&path).unwrap(), writer.0.lock().unwrap().id).unwrap();
+        let start = &events.iter().find(|e| e["kind"] == "policy_start").unwrap()["data"];
+        assert_eq!(
+            start["clock_unit"],
+            if elapsed {
+                "elapsed_sample_intervals"
+            } else {
+                "accepted_measurements"
+            }
+        );
+        assert_eq!(
+            start["upward_max_wait_ms"],
+            if elapsed { json!(30000) } else { Value::Null }
+        );
+    }
 }

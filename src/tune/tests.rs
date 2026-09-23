@@ -1223,48 +1223,70 @@ fn whole_file_reductions_wait_for_excess_writers_to_finish() {
 }
 
 #[test]
-fn ready_rollback_runs_even_when_there_is_no_work_for_another_probe() {
-    struct StopOnRestore(Arc<Sched>);
-    impl Meter for StopOnRestore {
+fn rollback_bypasses_probe_admission_in_both_directions() {
+    struct StopOnChange {
+        sched: Arc<Sched>,
+        calls: AtomicUsize,
+    }
+    impl Meter for StopOnChange {
         fn bytes(&self) -> u64 {
             0
         }
         fn files(&self) -> u64 {
             0
         }
-        fn set_active(&self, n: usize) {
-            if n == 16 {
-                self.0.abort();
+        fn set_active(&self, _: usize) {
+            if self.calls.fetch_add(1, Relaxed) > 0 {
+                self.sched.abort();
             }
         }
     }
-    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
-    let mut policy = Policy::new(8, 1, 64);
-    policy.n = 16;
-    policy.state = State::Hold;
-    let gate = Gate::new(8);
-    for id in gate.begin_warming(16) {
-        gate.mark_ready(id);
-    }
-    let deadline_sched = sched.clone();
-    let timeout = std::thread::spawn(move || {
-        for _ in 0..20 {
-            if deadline_sched.is_aborted() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+    for (active, requested, state, expected) in [
+        (8, 16, State::Hold, 16),
+        (16, 8, State::Hold, 8),
+        (
+            16,
+            8,
+            State::Explore {
+                from: 16,
+                base: 100.0,
+                direction: Direction::Down,
+            },
+            16,
+        ),
+    ] {
+        let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+        let mut policy = Policy::new(active, 1, 64);
+        policy.n = requested;
+        policy.state = state;
+        let gate = Gate::new(active);
+        for id in gate.begin_warming(16) {
+            gate.mark_ready(id);
         }
-        deadline_sched.abort();
-    });
-    let result = run(
-        policy,
-        gate,
-        sched.clone(),
-        Arc::new(StopOnRestore(sched)),
-        |_| panic!("rollback connections were already ready"),
-    );
-    timeout.join().unwrap();
-    assert_eq!(result.active(), 16);
+        let deadline_sched = sched.clone();
+        let timeout = std::thread::spawn(move || {
+            for _ in 0..20 {
+                if deadline_sched.is_aborted() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            deadline_sched.abort();
+        });
+        let result = run(
+            policy,
+            gate,
+            sched.clone(),
+            Arc::new(StopOnChange {
+                sched,
+                calls: AtomicUsize::new(0),
+            }),
+            |_| panic!("all needed connections were already ready"),
+        );
+        timeout.join().unwrap();
+        assert_eq!(result.active(), expected);
+        assert_eq!(result.n, expected);
+    }
 }
 
 #[test]

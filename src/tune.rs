@@ -400,7 +400,8 @@ pub struct Policy {
     /// Highest count that was actually activated, not merely requested.
     pub peak: usize,
     active: usize,
-    /// Best accepted count for live diagnostics; never a persisted startup choice.
+    /// Legacy recommendation state used only by historical fixture/simulator tests.
+    #[cfg(test)]
     recommended: usize,
     /// Initial discovery doubles unless closely matched evidence supports refinement.
     startup_doubling: bool,
@@ -427,6 +428,7 @@ impl Policy {
             max,
             peak: n,
             active: n,
+            #[cfg(test)]
             recommended: n,
             startup_doubling: true,
             state: State::Initial,
@@ -458,6 +460,7 @@ impl Policy {
     }
 
     /// Best accepted count for diagnostics. Startup inference uses observations.
+    #[cfg(test)]
     pub fn recommended(&self) -> usize {
         self.recommended
     }
@@ -582,6 +585,7 @@ impl Policy {
     /// nearby higher count must have failed to improve it. A rejected doubling
     /// alone leaves too wide a bracket; cancelled warmups and hitting a ceiling
     /// are not plateau measurements either.
+    #[cfg(test)]
     pub fn discovery_complete(&self) -> bool {
         let settled = self.settled();
         // Plateau evidence for the live count must not be attached to a
@@ -886,12 +890,15 @@ impl Policy {
                         self.points
                             .retain(|n, point| *n <= self.n || point.score > score);
                     }
-                    self.recommended = match direction {
-                        Direction::Up => self.n,
-                        // A partial reduction of an inconclusive increase is
-                        // not evidence to raise the future starting count.
-                        Direction::Down => self.recommended.min(self.n),
-                    };
+                    #[cfg(test)]
+                    {
+                        self.recommended = match direction {
+                            Direction::Up => self.n,
+                            // A partial reduction of an inconclusive increase is
+                            // not evidence to raise the future starting count.
+                            Direction::Down => self.recommended.min(self.n),
+                        };
+                    }
                     self.fails[idx] = 0;
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
                     self.state = State::Hold;
@@ -1231,6 +1238,7 @@ pub fn run(
     mut spawn: impl FnMut(usize),
 ) -> Policy {
     let mut policy = policy;
+    policy.advance_time(Duration::ZERO, sample_interval());
     let mut trace = trace::Trace::new(meter.history(), &policy, sample_interval());
     let mut sampler = Sampler::default();
     sampler.reset();
@@ -1382,6 +1390,17 @@ pub fn run(
         // Apply reductions immediately. An increase leaves the current set
         // active while its candidate workers connect in the background.
         if policy.n < active {
+            if matches!(policy.state, State::Explore { .. })
+                && !trace.enough_work(&sched, policy.n, last_rate, sample)
+            {
+                trace.cancel(
+                    &mut policy,
+                    "insufficient_remaining_work",
+                    last_rate,
+                    sample,
+                );
+                continue;
+            }
             let before = active;
             trace.sample(
                 last,
