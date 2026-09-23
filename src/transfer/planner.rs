@@ -22,10 +22,13 @@ pub(super) struct Planner<'a> {
     /// Directory copies blocked by a destination file or symlink. The conflict
     /// is reported at the parent; its descendants must not be copied.
     pub(super) blocked_directory_paths: std::collections::HashSet<PathBytes>,
-    /// Once syq has observed a missing remote destination root, every mapped
-    /// path is missing too. Avoid WAN round trips for impossible descendants;
-    /// local stats stay cheap and warm filesystem metadata for the writers.
+    /// A remote destination root was missing at preflight, so mapped paths
+    /// cannot supply comparison bases. Local fresh trees retain the root
+    /// lookup separately below so its existing metadata is preserved.
     pub(super) destination_tree_known_missing: bool,
+    /// The local destination was missing or empty at preflight. Its root may
+    /// still have metadata to preserve; only descendants are known absent.
+    pub(super) destination_children_known_missing: bool,
     /// Mapped payload paths that look like current sidecars, and every
     /// sidecar path the current job may use. Their intersection is unsafe.
     /// Ordinary payload names cannot collide and do not need to stay in RAM.
@@ -1385,6 +1388,13 @@ impl Planner<'_> {
         if !dirs.is_empty() {
             let stats = if self.destination_tree_known_missing {
                 vec![None; dirs.len()]
+            } else if self.destination_children_known_missing {
+                self.stat_fresh_descendants(
+                    &dirs
+                        .iter()
+                        .map(|(path, _, _)| path.clone())
+                        .collect::<Vec<_>>(),
+                )?
             } else if let Some(stats) = dir_stats {
                 stats
             } else {
@@ -1409,6 +1419,13 @@ impl Planner<'_> {
         }
         let stats = if self.destination_tree_known_missing {
             vec![None; others.len()]
+        } else if self.destination_children_known_missing {
+            self.stat_fresh_descendants(
+                &others
+                    .iter()
+                    .map(|planned| planned.dst.clone())
+                    .collect::<Vec<_>>(),
+            )?
         } else if let Some(stats) = &mut other_stats {
             others
                 .iter()
@@ -2421,6 +2438,7 @@ impl Planner<'_> {
             && self.buffer.is_none()
             && !self.opts.dry_run
             && !self.destination_tree_known_missing
+            && !self.destination_children_known_missing
             && self.container_guard.is_none();
         let directories: Vec<PathBytes> = if pre_stat {
             mapped
@@ -3159,6 +3177,24 @@ impl Planner<'_> {
             run(self, items, true)?;
         }
         Ok(n)
+    }
+
+    fn stat_fresh_descendants(&mut self, paths: &[PathBytes]) -> Result<Vec<Option<Entry>>> {
+        let root = if paths.iter().any(|path| path == &self.dst_root) {
+            self.stat_many(vec![self.dst_root.clone()])?.pop().flatten()
+        } else {
+            None
+        };
+        Ok(paths
+            .iter()
+            .map(|path| {
+                if path == &self.dst_root {
+                    root.clone()
+                } else {
+                    None
+                }
+            })
+            .collect())
     }
 
     pub(super) fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {

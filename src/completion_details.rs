@@ -8,7 +8,10 @@ use std::path::Path;
 
 /// Never let a filename, link target or account name control the terminal.
 pub(crate) fn display_bytes(bytes: &[u8]) -> String {
-    let mut result = String::new();
+    if bytes.iter().all(|byte| (b' '..=b'~').contains(byte)) {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut result = String::with_capacity(bytes.len());
     for character in String::from_utf8_lossy(bytes).chars() {
         if character.is_control()
             || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
@@ -228,6 +231,23 @@ mod tests {
             describe(directory.path(), &entries),
             vec!["[metadata unavailable]"]
         );
+    }
+
+    #[test]
+    fn display_preserves_printable_text_and_escapes_terminal_controls() {
+        let ascii: Vec<_> = (b' '..=b'~').collect();
+        assert_eq!(display_bytes(&ascii).as_bytes(), ascii);
+        for (input, expected) in [
+            ("café/東京".as_bytes(), "café/東京"),
+            (b"bad\xff".as_slice(), "bad�"),
+            (b"name\0\n\x7f".as_slice(), "name\\u{0}\\n\\u{7f}"),
+            (
+                "left\u{85}\u{202e}\u{2066}right".as_bytes(),
+                "left\\u{85}\\u{202e}\\u{2066}right",
+            ),
+        ] {
+            assert_eq!(display_bytes(input), expected);
+        }
     }
 
     #[test]

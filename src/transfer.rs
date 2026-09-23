@@ -2665,6 +2665,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         opts: &opts,
         destination_supports_confined_socket_nodes,
         destination_tree_known_missing,
+        destination_children_known_missing: opts.same_host
+            && fresh_destination
+            && !opts.existing
+            && !opts.ignore_existing
+            && !opts.update
+            && !opts.checksum
+            && !opts.inplace
+            && !opts.restricted_receiver,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),

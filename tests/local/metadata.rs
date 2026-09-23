@@ -559,3 +559,39 @@ fn descriptor_copies_preserve_bytes_offsets_flags_and_publication() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn fresh_local_descendants_preserve_existing_root_metadata() {
+    let t = Tmp::new();
+    write(&t.path("source/nested/file"), b"payload");
+    fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o711)).unwrap();
+    for (label, options, expected_root_mode) in
+        [("default", "-rlt", 0o750), ("perms", "-rlpt", 0o711)]
+    {
+        let fresh = format!("{label}-fresh");
+        let reference = format!("{label}-reference");
+        for destination in [&fresh, &reference] {
+            fs::create_dir(t.path(destination)).unwrap();
+            fs::set_permissions(t.path(destination), fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        // Force the reference through ordinary destination lookup.
+        write(&t.path(&format!("{reference}/sentinel")), b"keep");
+        for destination in [&fresh, &reference] {
+            run_ok(&[options, &t.s("source/"), &format!("{}/", t.s(destination))]);
+        }
+        assert_eq!(
+            fs::metadata(t.path(&fresh)).unwrap().mode() & 0o777,
+            expected_root_mode
+        );
+        for name in ["", "nested", "nested/file"] {
+            let a = fs::metadata(t.path(&format!("{fresh}/{name}"))).unwrap();
+            let b = fs::metadata(t.path(&format!("{reference}/{name}"))).unwrap();
+            assert_eq!(
+                (a.mode(), a.mtime(), a.mtime_nsec()),
+                (b.mode(), b.mtime(), b.mtime_nsec())
+            );
+        }
+        assert_eq!(read(&t.path(&format!("{fresh}/nested/file"))), b"payload");
+        assert_eq!(read(&t.path(&format!("{reference}/sentinel"))), b"keep");
+    }
+}
