@@ -302,6 +302,10 @@ reconstructed. Existing extra destination links are not necessarily split.
 With `--inplace`, writes still affect every existing name for that destination
 inode, including names outside the copy.
 
+Hardlink preservation scans all selected sources before changing the destination.
+Large trees therefore take longer to start copying and require memory for the
+complete file list.
+
 A group transfers one payload. Creating another name is reported as a successful
 file operation with zero transferred bytes. Conflicting per-path metadata fails
 the copy. Every supplied expected hash must match the shared contents: omitted
