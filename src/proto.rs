@@ -187,6 +187,10 @@ pub struct Entry {
     pub ctime: i64,
     pub ctime_nsec: u32,
     pub link: Option<PathBytes>,
+    // Only used while capturing metadata on the scanning endpoint. The
+    // selected value travels in inode_metadata; ordinary scans pay no wire cost.
+    #[serde(skip)]
+    pub atime: crate::inode_metadata::Timestamp,
     pub inode_metadata: Option<Box<crate::inode_metadata::InodeMetadata>>,
 }
 

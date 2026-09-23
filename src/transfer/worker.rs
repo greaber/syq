@@ -1703,7 +1703,9 @@ impl Worker {
                 if !partial_missing {
                     return Err(error);
                 }
-                if self.opts.hardlinks && job.entry.nlink > 1 {
+                if (self.opts.hardlinks && job.entry.nlink > 1)
+                    || self.opts.inode_preservation.atimes
+                {
                     let diff = self.diff_final_and_hold(&job)?;
                     if !diff.ranges.is_empty() || diff.held_len != Some(job.entry.size) {
                         return Err(error);

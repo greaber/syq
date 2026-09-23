@@ -1,6 +1,5 @@
 //! Opt-in inode metadata. Absence means unrequested; an empty selected set
 //! means reconciliation, including removal of destination-only values.
-#[cfg(target_os = "linux")]
 use anyhow::Context;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -12,24 +11,33 @@ pub(crate) const MAX_INODE_METADATA: usize = 4 * 1024 * 1024;
 pub(crate) struct Selection {
     pub acls: bool,
     pub xattrs: bool,
+    pub atimes: bool,
+    pub open_noatime: bool,
 }
 
 impl Selection {
     pub(crate) fn any(self) -> bool {
-        self.acls || self.xattrs
+        self.acls || self.xattrs || self.atimes
     }
     pub(crate) fn validate(self) -> Result<()> {
-        if self.any() && !cfg!(target_os = "linux") {
+        if (self.acls || self.xattrs) && !cfg!(target_os = "linux") {
             bail!("ACL and extended-attribute preservation currently requires Linux endpoints");
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Timestamp {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InodeMetadata {
     pub acls: Option<PosixAcls>,
     pub xattrs: Option<ExtendedAttributes>,
+    pub atime: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,7 +200,10 @@ mod platform {
         } else {
             None
         };
-        let mut metadata = InodeMetadata { acls, xattrs: None };
+        let mut metadata = InodeMetadata {
+            acls,
+            ..Default::default()
+        };
         if selection.xattrs {
             let privileged = unsafe { libc::geteuid() == 0 };
             let mut values = Vec::new();
@@ -326,20 +337,29 @@ mod platform {
     }
 }
 
-pub(crate) fn capture(file: &File, selection: Selection) -> Result<Option<Box<InodeMetadata>>> {
+pub(crate) fn capture(
+    file: &File,
+    selection: Selection,
+    atime: Timestamp,
+) -> Result<Option<Box<InodeMetadata>>> {
     if !selection.any() {
         return Ok(None);
     }
     selection.validate()?;
-    #[cfg(target_os = "linux")]
-    {
-        platform::capture(file, selection).map(|m| Some(Box::new(m)))
+    let mut metadata = InodeMetadata::default();
+    if selection.acls || selection.xattrs {
+        #[cfg(target_os = "linux")]
+        {
+            metadata = platform::capture(file, selection)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = file;
+            unreachable!();
+        }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = file;
-        unreachable!()
-    }
+    metadata.atime = selection.atimes.then_some(atime);
+    Ok(Some(Box::new(metadata)))
 }
 pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) -> Result<()> {
     let Some(metadata) = metadata else {
@@ -351,11 +371,80 @@ pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) ->
     );
     #[cfg(target_os = "linux")]
     {
-        platform::apply(file, metadata, mode)
+        if metadata.acls.is_some() || metadata.xattrs.is_some() {
+            platform::apply(file, metadata, mode)?;
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (file, metadata, mode);
-        bail!("Linux inode metadata cannot be applied on this platform")
+        let _ = mode;
+        anyhow::ensure!(
+            metadata.acls.is_none() && metadata.xattrs.is_none(),
+            "Linux inode metadata cannot be applied on this platform"
+        );
+    }
+    if let Some(atime) = metadata.atime {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        anyhow::ensure!(
+            atime.nanoseconds < 1_000_000_000,
+            "invalid access-time nanoseconds"
+        );
+        let current = file.metadata()?;
+        if (current.atime(), current.atime_nsec() as u32) != (atime.seconds, atime.nanoseconds) {
+            let times = [
+                libc::timespec {
+                    tv_sec: atime.seconds as _,
+                    tv_nsec: atime.nanoseconds as _,
+                },
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT as _,
+                },
+            ];
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                libc::utimensat(
+                    file.as_raw_fd(),
+                    c"".as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            #[cfg(not(target_os = "linux"))]
+            let result = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("restore access time on held inode");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort read policy, applied before the first data access. Changing the
+/// status flags keeps the already-confined descriptor and never reopens a path.
+pub(crate) fn prepare_read(file: &File, requested: bool) {
+    if !requested {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    let error = {
+        use std::os::fd::AsRawFd;
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags >= 0
+            && unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NOATIME) } == 0
+        {
+            return;
+        }
+        std::io::Error::last_os_error().to_string()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let error = {
+        let _ = file;
+        "not supported on this platform".to_string()
+    };
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::output::diagnostic!("syq: warning: --open-noatime unavailable ({error}); reads may update source access times");
     }
 }

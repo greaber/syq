@@ -990,6 +990,13 @@ fn run_remote(
     if args.xattrs {
         remote.push("--preserve=xattrs".into());
     }
+    if args.open_noatime || args.atimes > 1 {
+        remote.push("--open-noatime".into());
+    }
+    if args.atimes > 0 {
+        remote.push("--preserve=atimes".into());
+    }
+
     if args.hardlinks {
         remote.push("--preserve=hardlinks".into());
     }

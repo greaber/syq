@@ -379,7 +379,7 @@ with tempfile.TemporaryDirectory(prefix='syq-hardlinks-') as scratch:
         assert (pull / 'a').stat().st_ino == (pull / 'b').stat().st_ino
 PY_HARDLINKS
 
-printf 'case: ACLs and xattrs reconcile through ordinary SSH and TCP\n'
+printf 'case: ACLs, xattrs and access times reconcile through ordinary SSH and TCP\n'
 python3 - <<'PY_INODE_METADATA'
 import os
 from pathlib import Path
@@ -398,13 +398,17 @@ with tempfile.TemporaryDirectory(prefix='syq-inode-metadata-') as scratch:
     os.setxattr(source / 'file', 'user.empty', b'')
     os.setxattr(source / 'file', 'system.posix_acl_access', acl)
     os.setxattr(source, 'system.posix_acl_default', acl)
+    expected_atime = 1_000_000_000_123456789
+    os.utime(source / 'file', ns=(expected_atime, (source / 'file').stat().st_mtime_ns))
     for label, transport in [('ssh', ['--no-tcp']), ('tcp', [])]:
         destination = '/tmp/syq-real-ssh/inode-metadata-' + label
-        push = ['syq', 'cp', '--preserve=hardlinks,acls,xattrs', '--srcs-in', str(source), '--to', 'destination', '--into', destination, *transport]
+        push = ['syq', 'cp', '--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--srcs-in', str(source), '--to', 'destination', '--into', destination, *transport]
         subprocess.run(push, check=True, timeout=30)
         subprocess.run(push, check=True, timeout=30)
         pull = root / label
-        subprocess.run(['syq', 'cp', '--preserve=hardlinks,acls,xattrs', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30)
+        subprocess.run(['syq', 'cp', '--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30)
+        assert (source / 'file').stat().st_atime_ns == expected_atime
+        assert (pull / 'file').stat().st_atime_ns == expected_atime
         for name in ['user.binary','user.empty','system.posix_acl_access']:
             assert os.getxattr(source / 'file',name) == os.getxattr(pull / 'file',name), name
         assert os.getxattr(source,'system.posix_acl_default') == os.getxattr(pull,'system.posix_acl_default')
@@ -412,9 +416,10 @@ with tempfile.TemporaryDirectory(prefix='syq-inode-metadata-') as scratch:
         os.removexattr(pull / 'file','user.empty')
         os.removexattr(pull / 'file','system.posix_acl_access')
         os.removexattr(pull,'system.posix_acl_default')
-        subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs','--srcs-in',str(pull),'--to','destination','--into',destination,*transport],check=True,timeout=30)
+        subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime','--srcs-in',str(pull),'--to','destination','--into',destination,*transport],check=True,timeout=30)
         verify = root / (label + '-reconciled')
-        subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs','--from','destination','--srcs-in',destination,'--into',str(verify),*transport],check=True,timeout=30)
+        subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime','--from','destination','--srcs-in',destination,'--into',str(verify),*transport],check=True,timeout=30)
+        assert (verify / 'file').stat().st_atime_ns == expected_atime
         assert 'user.empty' not in os.listxattr(verify / 'file')
         assert 'system.posix_acl_access' not in os.listxattr(verify / 'file')
         assert 'system.posix_acl_default' not in os.listxattr(verify)

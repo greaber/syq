@@ -91,7 +91,8 @@ In addition to the shared arguments above, it accepts:
 | `only_new` | Boolean: copy missing entries without replacing existing ones |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
-| `preserve` | Preservation string or iterable: `times`, `permissions`, `ownership`, `specials` |
+| `preserve` | Preservation string or iterable: `times`, `permissions`, `ownership`, `specials`, `hardlinks`, `acls`, `xattrs`, `atimes`; see [filesystem preservation](https://greaber.github.io/syq/reference.html#preserve-metadata) for platform and route support |
+| `open_noatime` | Boolean: request file reads without access-time updates; warns and continues if unavailable |
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` |
 | `resource_limits` | Comma-separated ceilings that keep automatic tuning, e.g. `"bandwidth=10M,workers=4"`; a concurrency key conflicts with the same key in `performance_tuning` |

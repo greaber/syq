@@ -12,7 +12,7 @@ alt-dest-deep	unsupported	unsupported-alt-dest
 alt-dest-symlink-race	unsupported	unsupported-alt-dest
 append	unsupported	unsupported-transfer-mode
 append-shortsum	unsupported	unsupported-transfer-mode
-atimes	unsupported	unsupported-metadata
+atimes	adapted	-
 authenticate-no-ocloexec-build-regression	out-of-scope	rsync-internal
 backup	unsupported	unsupported-alt-dest
 backup-acl-xattr-cache	unsupported	unsupported-xattrs
@@ -205,7 +205,7 @@ no-implied-dirs-symlink	unsupported	unsupported-relative
 nondaemon-symlink-race	unsupported	unsupported-alt-dest
 nonroot-restrictive-perms	out-of-scope	rsync-daemon
 omit-times	unsupported	unsupported-metadata
-open-noatime	unsupported	unsupported-metadata
+open-noatime	adapted	-
 operator-path-backup-dir	unsupported	unsupported-alt-dest
 operator-path-backup-dir-daemon	out-of-scope	rsync-daemon
 operator-path-backup-dir-exclude-daemon	out-of-scope	rsync-daemon

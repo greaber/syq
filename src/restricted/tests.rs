@@ -4622,6 +4622,8 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
     let mut configuration = Request::ConfigurePreservation(crate::inode_metadata::Selection {
         acls: true,
         xattrs: true,
+        atimes: true,
+        open_noatime: true,
     });
     assert!(authority.authorize(&mut configuration, true).is_err());
     let mut meta = plain_meta();
@@ -4631,6 +4633,7 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
             default: None,
         }),
         xattrs: None,
+        atime: None,
     }));
     let mut request = Request::Apply {
         ops: vec![Op::SetMeta {
@@ -4645,7 +4648,25 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
     assert!(
         error
             .to_string()
-            .contains("do not authorize ACL or xattr changes"),
+            .contains("do not authorize additional inode metadata"),
         "{error:#}"
     );
+    let mut time_meta = plain_meta();
+    time_meta.inode_metadata = Some(Box::new(crate::inode_metadata::InodeMetadata {
+        atime: Some(crate::inode_metadata::Timestamp {
+            seconds: 1,
+            nanoseconds: 0,
+        }),
+        ..Default::default()
+    }));
+    let mut time_request = Request::Apply {
+        ops: vec![Op::SetMeta {
+            path: path_bytes(&root.join("target")),
+            meta: time_meta,
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+        }],
+        guard: None,
+    };
+    assert!(authority.authorize(&mut time_request, false).is_err());
 }

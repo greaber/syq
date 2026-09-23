@@ -22,6 +22,7 @@ pub(crate) fn test_job(name: &[u8], size: u64) -> FileJob {
                 dev: 1,
                 ino: 1,
                 ctime: 0,
+                atime: Default::default(),
                 inode_metadata: None,
                 nlink: 1,
                 ctime_nsec: 0,

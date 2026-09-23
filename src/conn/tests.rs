@@ -1227,6 +1227,7 @@ fn entry(path: &[u8]) -> Entry {
         dev: 0,
         ino: 0,
         ctime: 0,
+        atime: Default::default(),
         inode_metadata: None,
         nlink: 1,
         ctime_nsec: 0,

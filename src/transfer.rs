@@ -376,6 +376,8 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
         crate::inode_metadata::Selection {
             acls: args.acls,
             xattrs: args.xattrs,
+            atimes: args.atimes > 0,
+            open_noatime: args.open_noatime || args.atimes > 1,
         },
     )?;
     Ok(connection)
@@ -385,7 +387,7 @@ fn configure_preservation(
     connection: &mut dyn Conn,
     selection: crate::inode_metadata::Selection,
 ) -> Result<()> {
-    if selection.any() {
+    if selection.any() || selection.open_noatime {
         ok(
             connection.call(Request::ConfigurePreservation(selection))?,
             "configure inode metadata preservation",
@@ -498,6 +500,8 @@ fn small_copy_eligible(
         && !args.inplace
         && !args.acls
         && !args.xattrs
+        && args.atimes == 0
+        && !args.open_noatime
         && !args.hardlinks
         && !args.delete
         && !args.update
@@ -1472,6 +1476,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         inode_preservation: crate::inode_metadata::Selection {
             acls: args.acls,
             xattrs: args.xattrs,
+            atimes: args.atimes > 0,
+            open_noatime: args.open_noatime || args.atimes > 1,
         },
         hardlink_completions: Mutex::new(Default::default()),
         devices: args.devices,
