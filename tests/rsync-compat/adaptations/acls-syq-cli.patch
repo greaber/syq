@@ -1,0 +1,12 @@
+--- a/testsuite/acls_test.py
++++ b/testsuite/acls_test.py
+@@ -12,9 +12,6 @@
+ from rsyncfns import FROMDIR, SCRATCHDIR, TODIR, makepath, run_rsync, test_fail, test_skipped
+ 
+ 
+-vv = run_rsync('-VV', check=True, capture_output=True)
+-if '"ACLs": true' not in vv.stdout:
+-    test_skipped("Rsync is configured without ACL support")
+ 
+ makepath(FROMDIR / 'foo')
+ (FROMDIR / 'file1').write_text("something\n")

@@ -1,0 +1,12 @@
+--- a/testsuite/acls-default_test.py
++++ b/testsuite/acls-default_test.py
+@@ -16,9 +16,6 @@
+ )
+ 
+ 
+-vv = run_rsync('-VV', check=True, capture_output=True)
+-if '"ACLs": true' not in vv.stdout:
+-    test_skipped("Rsync is configured without ACL support")
+ 
+ setfacl_nodef = os.environ.get('setfacl_nodef', 'true')
+ if setfacl_nodef == 'true':

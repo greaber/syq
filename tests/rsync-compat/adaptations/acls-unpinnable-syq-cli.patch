@@ -1,0 +1,11 @@
+--- a/testsuite/acls-unpinnable_test.py
++++ b/testsuite/acls-unpinnable_test.py
+@@ -34,8 +34,6 @@
+     test_skipped("POSIX ACL test is Linux-only (setfacl/getfacl semantics)")
+ if not shutil.which('setfacl') or not shutil.which('getfacl'):
+     test_skipped("setfacl/getfacl not available")
+-if '"ACLs": true' not in run_rsync('-VV', check=True, capture_output=True).stdout:
+-    test_skipped("rsync built without ACL support")
+ proto = forced_protocol()
+ if proto is not None and proto < 30:
+     test_skipped(f"ACL transfer requires protocol 30+ (negotiated {proto})")

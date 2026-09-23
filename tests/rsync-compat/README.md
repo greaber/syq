@@ -121,8 +121,8 @@ keg-only OpenSSL cannot make macOS configuration depend on undeclared flags.
 ## Inventory, observations, and product positions
 
 `inventory.tsv` names every test at the pinned commit. At the current pin,
-all 351 are classified: 38 runnable sources, 130 unsupported user features,
-and 183 tests of rsync internals, protocol, daemon, or restricted wrappers.
+all 351 are classified: 47 runnable sources, 120 unsupported user features,
+and 184 tests of rsync internals, protocol, daemon, or restricted wrappers.
 None are unassessed. Updating the pin without
 classifying every added or removed test is an error. Its classifications are:
 
