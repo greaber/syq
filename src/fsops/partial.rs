@@ -1219,6 +1219,12 @@ impl FsOps {
                 self.open_private_partial_rooted(&rooted.root, relative, label, true, staged_mode)
             })?;
         let (file, basis_size) = opened.context("sidecar creation was requested")?;
+        #[cfg(debug_assertions)]
+        test_race_barrier(
+            "SYQ_TEST_SMALL_STAGE_READY_FILE",
+            "SYQ_TEST_SMALL_STAGE_CONTINUE_FILE",
+            "small-file stage before data",
+        )?;
         if basis_size.is_some() {
             file.set_len(0)?;
         }

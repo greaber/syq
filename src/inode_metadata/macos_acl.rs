@@ -167,6 +167,25 @@ pub(super) fn apply(file: &File, value: &MacAcl) -> Result<()> {
 // may temporarily grant access denied by the final combination.
 pub(super) fn apply_with_mode(file: &File, value: &MacAcl, mode: u32) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
+    #[cfg(debug_assertions)]
+    if !value.entries.is_empty() {
+        if let Some(marker) = std::env::var_os("SYQ_TEST_FAIL_MACOS_ACL_RESTORE") {
+            let fail = if marker == "always" {
+                true
+            } else {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(marker)
+                {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+                    Err(error) => return Err(error).context("create ACL fault marker"),
+                }
+            };
+            anyhow::ensure!(!fail, "injected macOS ACL restoration failure");
+        }
+    }
     if file.metadata()?.mode() & 0o7777 == mode & 0o7777 && &read(file)? == value {
         return Ok(());
     }

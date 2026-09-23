@@ -403,3 +403,144 @@ fn hardlinks_with_deletion_denial_are_rejected_before_copying() {
         fs::metadata(t.path("independent/two")).unwrap().ino()
     );
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn acl_staging_is_private_before_small_and_ranged_writes() {
+    for native in [true, false] {
+        for ranges in [false, true] {
+            for inherited in [false, true] {
+                let t = Tmp::new();
+                let bytes = prng(32 * 1024, 918);
+                write(&t.path("source"), &bytes);
+                fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o644)).unwrap();
+                chmod(&t.path("source"), &["+a", "user:nobody deny read"]);
+                fs::create_dir(t.path("destination")).unwrap();
+                if inherited {
+                    chmod(&t.path("destination"), &["+a", "everyone allow read,readattr,readextattr,readsecurity,file_inherit,directory_inherit"]);
+                }
+                let ready = t.path("ready");
+                let continuation = t.path("continue");
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                if native {
+                    command.args([
+                        "cp",
+                        "--preserve=acls",
+                        &t.s("source"),
+                        "--as",
+                        &t.s("destination/file"),
+                    ]);
+                } else {
+                    command.args(["rsync", "-aA", &t.s("source"), &t.s("destination/file")]);
+                }
+                command.arg("--no-progress");
+                if ranges {
+                    command.arg("--performance-tuning=copy-path=ranges,workers=1");
+                }
+                command
+                    .env(
+                        if ranges {
+                            "SYQ_TEST_PARTIAL_READY_FILE"
+                        } else {
+                            "SYQ_TEST_SMALL_STAGE_READY_FILE"
+                        },
+                        &ready,
+                    )
+                    .env(
+                        if ranges {
+                            "SYQ_TEST_PARTIAL_CONTINUE_FILE"
+                        } else {
+                            "SYQ_TEST_SMALL_STAGE_CONTINUE_FILE"
+                        },
+                        &continuation,
+                    )
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = command.start().unwrap();
+                wait_for_confinement_marker(&mut child, &ready, "ACL stage before data");
+                let stages = partial_files(&t.path("destination"));
+                assert_eq!(stages.len(), 1);
+                let mode = fs::metadata(&stages[0]).unwrap().mode() & 0o777;
+                let staged_acl = acl(&stages[0]);
+                release_confinement_barrier(&continuation);
+                let output = child.wait_with_output().unwrap();
+                assert_output_ok(&output);
+                assert_eq!(read(&t.path("destination/file")), bytes);
+                assert_eq!(acl(&t.path("source")), acl(&t.path("destination/file")));
+                assert_eq!(
+                    mode, 0o600,
+                    "native={native}, ranges={ranges}, inherited={inherited}"
+                );
+                assert!(
+                    staged_acl.is_empty(),
+                    "inherited access on stage: {staged_acl:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[ignore = "requires root to exercise recovery reads through mode-000 publication"]
+fn acl_restoration_failure_cannot_be_accepted_as_a_content_match() {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run this focused regression as root"
+    );
+    for persistent in [true, false] {
+        let t = Tmp::new();
+        let data = prng(2 << 20, 919);
+        write(&t.path("source"), &data);
+        fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o640)).unwrap();
+        chmod(&t.path("source"), &["+a", "user:nobody deny read"]);
+        let args = [
+            "cp",
+            "--preserve=acls",
+            "--performance-tuning=copy-path=ranges,workers=1",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--no-progress",
+        ];
+        let failure = if persistent {
+            "always".to_owned()
+        } else {
+            t.s("failed-once")
+        };
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("SYQ_TEST_FAIL_MACOS_ACL_RESTORE", failure)
+            .run()
+            .unwrap();
+        assert_eq!(
+            read(&t.path("destination")),
+            data,
+            "must reach publication before failure"
+        );
+        if persistent {
+            assert!(
+                !output.status.success(),
+                "ACL restoration failure reported success: {output:?}"
+            );
+            assert!(
+                stderr_of(&output).contains("injected macOS ACL restoration failure"),
+                "{output:?}"
+            );
+            assert_output_ok(
+                &Command::new(env!("CARGO_BIN_EXE_syq"))
+                    .args(args)
+                    .run()
+                    .unwrap(),
+            );
+        } else {
+            assert_output_ok(&output);
+        }
+        assert_eq!(acl(&t.path("source")), acl(&t.path("destination")));
+        assert_eq!(
+            fs::metadata(t.path("destination")).unwrap().mode() & 0o777,
+            0o640
+        );
+    }
+}
