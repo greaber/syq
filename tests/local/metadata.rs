@@ -956,7 +956,7 @@ fn incompatible_acl_models_are_rejected_before_destination_creation() {
     assert!(!t.path("destination").exists());
 }
 
-fn check_new_readonly_inplace_copy(native: bool, fallback: bool, umask: u32) {
+fn check_new_readonly_inplace_copy(native: bool, fallback: bool, umask: libc::mode_t) {
     let t = Tmp::new();
     fs::create_dir(t.path("dst")).unwrap();
     let data = prng(16 << 20, 96);
