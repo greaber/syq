@@ -2558,7 +2558,7 @@ fn observed_write(
     let writing = actor.span(crate::transfer_observations::Stage::DestinationWrite);
     if sparse {
         crate::sparse::write_at(file, data, off, false)?;
-        file.set_len(off + data.len() as u64)?;
+        crate::sparse::set_len(file, off + data.len() as u64)?;
     } else {
         file.write_all_at(data, off)?;
     }

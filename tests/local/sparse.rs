@@ -12,11 +12,28 @@ fn write_sparse_source(path: &Path, data: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let file = fs::File::create(path).unwrap();
     file.set_len(data.len() as u64).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // On APFS, extending with ftruncate can allocate zero-filled extents.
+        // Make the source sparse explicitly before testing clone preservation.
+        let hole = libc::fpunchhole_t {
+            fp_flags: 0,
+            reserved: 0,
+            fp_offset: 0,
+            fp_length: (data.len() / 4096 * 4096) as _,
+        };
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &hole) },
+            0
+        );
+    }
     for (index, block) in data.chunks(4096).enumerate() {
         if block.iter().any(|byte| *byte != 0) {
             file.write_all_at(block, (index * 4096) as u64).unwrap();
         }
     }
+    assert_sparse_copy(path, data);
 }
 
 fn assert_sparse_copy(path: &Path, expected: &[u8]) {
@@ -89,6 +106,9 @@ fn sparse_updates_and_inplace_clear_old_nonzero_data() {
     write(&t.path("src"), &data);
     for (inplace, block) in [(false, "64K"), (true, "1M"), (true, "64K")] {
         write(&t.path("dst"), &prng(data.len() + 777, 29));
+        // Exercise holes in committed allocated data, not filesystem-specific
+        // accounting for still-dirty records from fixture creation.
+        fs::File::open(t.path("dst")).unwrap().sync_all().unwrap();
         let old_inode = fs::metadata(t.path("dst")).unwrap().ino();
         let block_option = format!("--block-size={block}");
         let mut args = vec![
@@ -103,9 +123,10 @@ fn sparse_updates_and_inplace_clear_old_nonzero_data() {
         let destination = t.s("dst");
         args.extend([source.as_str(), destination.as_str()]);
         run_ok(&args);
-        if inplace && block == "64K" {
-            // Small punches can clear bytes within larger filesystem records
-            // without freeing those records. Contents and size still must match.
+        // Hole punching preserves contents regardless of the filesystem's
+        // record size, sharing and allocation accounting. Assert allocated
+        // space for fresh outputs, where zero ranges were never written.
+        if inplace {
             assert_eq!(read(&t.path("dst")), data);
         } else {
             assert_sparse_copy(&t.path("dst"), &data);

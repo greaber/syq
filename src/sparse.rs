@@ -46,6 +46,17 @@ pub(crate) fn write_at(
     file.write_all_at(&data[written..], offset + written as u64)
 }
 
+/// Grow with a final zero byte on macOS: APFS may allocate the entire added
+/// range when ftruncate extends a file. Writing past EOF leaves a hole instead.
+/// Shrinking still uses ftruncate, and growth cannot overwrite existing data.
+pub(crate) fn set_len(file: &File, size: u64) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if size > file.metadata()?.len() {
+        return file.write_all_at(&[0], size - 1);
+    }
+    file.set_len(size)
+}
+
 #[cfg(not(target_os = "macos"))]
 fn block_size(_: &File) -> io::Result<u64> {
     Ok(4096)
@@ -120,7 +131,7 @@ mod tests {
     #[test]
     fn fresh_sparse_writes_keep_trailing_zeros_and_small_zero_files() {
         let directory = crate::test_support::tempdir().unwrap();
-        for size in [0, 17, 4096, 65_539] {
+        for size in [0, 17, 4096, 65_539, 8 * 1024 * 1024] {
             let path = directory.path().join(size.to_string());
             let file = File::create(&path).unwrap();
             let mut data = vec![0; size];
@@ -128,7 +139,12 @@ mod tests {
                 data[4090..4100].fill(7);
             }
             write_at(&file, &data, 0, false).unwrap();
-            file.set_len(size as u64).unwrap();
+            set_len(&file, size as u64).unwrap();
+            if size > 1024 * 1024 {
+                use std::os::unix::fs::MetadataExt;
+                file.sync_all().unwrap();
+                assert!(file.metadata().unwrap().blocks() * 512 < size as u64 / 4);
+            }
             assert_eq!(std::fs::read(path).unwrap(), data);
         }
     }

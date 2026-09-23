@@ -229,9 +229,17 @@ impl FsOps {
             .collect()
     }
 
+    fn set_copy_length(&self, file: &File, size: u64) -> io::Result<()> {
+        if self.sparse {
+            crate::sparse::set_len(file, size)
+        } else {
+            file.set_len(size)
+        }
+    }
+
     pub(super) fn preallocate_new_partial(&mut self, file: &File, size: u64) -> Result<()> {
         if self.sparse {
-            return file.set_len(size).context("set sparse partial length");
+            return crate::sparse::set_len(file, size).context("set sparse partial length");
         }
         #[cfg(target_os = "linux")]
         {
@@ -292,7 +300,7 @@ impl FsOps {
                         // as range writes.
                         let file = target.root.open_regular_read_write(&target.relative)?;
                         require_rooted_metadata(&file, metadata, &target.label)?;
-                        file.set_len(size).with_context(|| {
+                        self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
                         })?;
                         self.cache_file(target.location(), attempt, false, file);
@@ -304,7 +312,7 @@ impl FsOps {
                     Some(_) => target.root.unlink(&target.relative)?,
                     None => match target.root.create_file(&target.relative, mode) {
                         Ok(file) => {
-                            file.set_len(size).with_context(|| {
+                            self.set_copy_length(&file, size).with_context(|| {
                                 format!("resize confined file {}", target.label.display())
                             })?;
                             self.cache_file(target.location(), attempt, false, file);
@@ -341,7 +349,7 @@ impl FsOps {
         };
         if let Some(old_size) = basis_size {
             if old_size > size {
-                file.set_len(size)?;
+                self.set_copy_length(&file, size)?;
             }
         } else {
             self.preallocate_new_partial(&file, size)?;
@@ -623,7 +631,7 @@ impl FsOps {
             }
         }
         if output.metadata()?.len() != len {
-            output.set_len(len)?;
+            self.set_copy_length(&output, len)?;
         }
         self.cache_file(location, attempt, true, output);
         Ok(SeededBasis {
@@ -1033,7 +1041,8 @@ impl FsOps {
                 remaining -= n as u64;
                 prepared.advance(size - remaining, prepare);
             }
-            d.set_len(size)?;
+            drop(prepared);
+            self.set_copy_length(&d, size)?;
         }
         _copy.bytes(size);
         Ok(CopyLocalOutcome::Copied)
@@ -1612,9 +1621,23 @@ impl FsOps {
             destination.set_len(0)?;
             staged.seek(SeekFrom::Start(0))?;
             destination.seek(SeekFrom::Start(0))?;
-            io::copy(&mut staged, &mut destination)
-                .with_context(|| format!("update existing {}", target.label.display()))?;
-            destination.set_len(size)?;
+            let copy = if self.sparse {
+                let mut buffer = vec![0; 1 << 20];
+                let mut offset = 0;
+                (|| -> io::Result<u64> {
+                    while offset < size {
+                        let want = (size - offset).min(buffer.len() as u64) as usize;
+                        staged.read_exact(&mut buffer[..want])?;
+                        crate::sparse::write_at(&destination, &buffer[..want], offset, false)?;
+                        offset += want as u64;
+                    }
+                    Ok(offset)
+                })()
+            } else {
+                io::copy(&mut staged, &mut destination)
+            };
+            copy.with_context(|| format!("update existing {}", target.label.display()))?;
+            self.set_copy_length(&destination, size)?;
             set_meta_file(&destination, meta, flags)
                 .with_context(|| format!("set metadata {}", target.label.display()))?;
             require_rooted_named_identity(
