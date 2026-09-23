@@ -55,7 +55,7 @@ connect-prog-nested-singlequote-host-injection	out-of-scope	rsync-daemon
 copy-dest-source-symlink	unsupported	unsupported-alt-dest
 copy-dest-symlink-readleak	unsupported	unsupported-alt-dest
 copy-xattrs-symlink-race	unsupported	unsupported-xattrs
-crtimes	unsupported	unsupported-metadata
+crtimes	adapted	-
 cvs-exclude	unsupported	unsupported-filters
 daemon	out-of-scope	rsync-daemon
 daemon-access	out-of-scope	rsync-daemon

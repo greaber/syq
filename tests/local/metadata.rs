@@ -882,3 +882,32 @@ fn birth_times_follow_mtime_and_survive_reruns_and_inode_types() {
         }
     }
 }
+
+#[test]
+fn access_time_of_explicit_symlink_is_captured_before_reading_its_target() {
+    let t = Tmp::new();
+    std::os::unix::fs::symlink("missing", t.path("link")).unwrap();
+    for native in [false, true] {
+        set_access_time(&t.path("link"), 700_000_000, 123_456_789);
+        let expected = access_time(&t.path("link"));
+        let out = if native {
+            Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args([
+                    "cp",
+                    "--preserve=atimes",
+                    &t.s("link"),
+                    "--as",
+                    &t.s("native-link"),
+                ])
+                .run()
+                .unwrap()
+        } else {
+            syq(&["-lU", &t.s("link"), &t.s("rsync-link")])
+        };
+        assert_output_ok(&out);
+        assert_eq!(
+            access_time(&t.path(if native { "native-link" } else { "rsync-link" })),
+            expected
+        );
+    }
+}

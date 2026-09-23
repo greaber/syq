@@ -103,6 +103,10 @@ pub(crate) fn rooted_source_entry(
             .symlink_target
             .clone()
             .context("registered source symlink is missing its pinned target")?;
+        let mut metadata = metadata;
+        if let Some(atime) = expected.symlink_atime {
+            metadata.atime = atime;
+        }
         return Ok(entry_from_root_metadata(
             path,
             metadata,

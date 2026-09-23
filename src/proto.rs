@@ -489,6 +489,8 @@ pub struct SourceLeafIdentity {
     pub ino: u64,
     pub file_type: u32,
     pub symlink_target: Option<PathBytes>,
+    /// Captured before reading an explicitly selected symlink target.
+    pub symlink_atime: Option<crate::inode_metadata::Timestamp>,
 }
 
 /// One operator source selection registered by the endpoint control session.

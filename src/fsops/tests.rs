@@ -3209,6 +3209,7 @@ fn source_initialization_rejects_mismatched_bad_and_excess_roots_atomically() {
         ino: 2,
         file_type: 0,
         symlink_target: None,
+        symlink_atime: None,
     });
     assert!(worker.initialize_sources(&[malformed]).is_err());
     assert!(worker.source_roots.is_empty());

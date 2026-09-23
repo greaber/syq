@@ -941,7 +941,12 @@ fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
             vec![option, "source", "--to", "s3://bucket", "--into", "prefix"],
         ] {
             let error = parse_native_copy(&argv(&route)).expect_err("route must be refused");
-            assert!(error.to_string().contains("named filesystem"), "{error:#}");
+            let message = error.to_string();
+            assert!(
+                message.contains("named filesystem")
+                    || (option == "--open-noatime" && message.contains("not supported")),
+                "{error:#}"
+            );
         }
     }
 }

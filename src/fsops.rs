@@ -1249,6 +1249,9 @@ impl FsOps {
                             dev: metadata.dev,
                             ino: metadata.ino,
                             file_type: metadata.file_type(),
+                            symlink_atime: (metadata.is_symlink()
+                                && self.inode_preservation.atimes)
+                                .then_some(metadata.atime),
                             symlink_target,
                         }),
                         object,
