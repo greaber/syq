@@ -306,9 +306,12 @@ With `--inplace`, writes still affect every existing name for that destination
 inode, including names outside the copy.
 
 A group transfers one payload. Creating another name is reported as a successful
-file operation with zero transferred bytes. Conflicting per-path metadata or
-expected hashes fail the copy. Hardlinks across destination filesystems fail
-visibly. Multiply linked symlinks and special files are currently unsupported,
+file operation with zero transferred bytes. Conflicting per-path metadata fails
+the copy. Every supplied expected hash must match the shared contents: omitted
+hashes impose no requirement, identical hashes are checked once, and different
+algorithms are checked together in one read. Different values for the same
+algorithm are rejected before copying the group. Hardlinks across destination
+filesystems fail visibly. Multiply linked symlinks and special files are currently unsupported,
 as are hardlink requests with descriptors, streams, S3, and command-restricted
 or receiving destinations. `-a` retains its existing meaning; add `-H` explicitly.
 

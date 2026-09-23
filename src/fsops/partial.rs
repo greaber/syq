@@ -1428,7 +1428,7 @@ impl FsOps {
     pub(super) fn verify_expected_inode(
         writer: &File,
         reader: &File,
-        expected: &crate::hashing::Digest,
+        expected: &crate::hashing::ExpectedHashes,
     ) -> Result<()> {
         let written = writer.metadata()?;
         let read = reader.metadata()?;
@@ -1440,28 +1440,19 @@ impl FsOps {
 
     pub(super) fn verify_expected_file(
         file: &File,
-        expected: &crate::hashing::Digest,
+        expected: &crate::hashing::ExpectedHashes,
     ) -> Result<()> {
         let mut reader = file;
         reader.seek(SeekFrom::Start(0))?;
-        let mut hasher = expected.algorithm.hasher();
-        let mut buffer = vec![0; 1024 * 1024];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
         expected
-            .verify(&hasher.finalize())
+            .verify_reader(&mut reader)
             .context("expected file digest mismatch")
     }
 
     pub(super) fn validate_expected_path(
         &self,
         path: &[u8],
-        expected: &crate::hashing::Digest,
+        expected: &crate::hashing::ExpectedHashes,
         guard: Option<&ContainerGuard>,
     ) -> Result<()> {
         let file = if let Some(target) = self.rooted_destination_target(path, guard)? {
@@ -1481,7 +1472,7 @@ impl FsOps {
         flags: u8,
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
-        expected: Option<&crate::hashing::Digest>,
+        expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
         if let Some(expected) = expected {
             Self::verify_expected_file(
@@ -1508,7 +1499,7 @@ impl FsOps {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finalize_expected(
         &mut self,
-        expected: Option<&crate::hashing::Digest>,
+        expected: Option<&crate::hashing::ExpectedHashes>,
         path: &[u8],
         inplace: bool,
         copy_id: &CopyId,
@@ -1529,7 +1520,7 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         mutation: TargetMutation<'_>,
-        expected: Option<&crate::hashing::Digest>,
+        expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
         let TargetMutation { condition, guard } = mutation;
         let guarded = guard.is_some();
