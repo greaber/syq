@@ -160,40 +160,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // Public commands reserve after parsing, so help/version exits and
-    // completion need no large table. Internal endpoints (including both
-    // server spellings) reserve here, before their dispatch can start threads.
-    let command = argv.get(1).and_then(|arg| arg.to_str());
-    let server_mode = command == Some("--server")
-        || (command == Some("rsync")
-            && argv.get(2).and_then(|arg| arg.to_str()) == Some("--server"));
-    let parsed_command = matches!(
-        command,
-        None | Some(
-            "help"
-                | "completion"
-                | "--build-identity"
-                | "--help"
-                | "-h"
-                | "--help-all"
-                | "--version"
-                | "-V"
-                | "cp"
-                | "rsync"
-                | "rm"
-                | "map"
-                | "clean-partials"
-                | "exec"
-                | "persist"
-                | "_ls"
-                | "tuning-cache"
-                | "--self-update"
-                | "--register-standalone-install"
-        )
-    );
-    if server_mode || !parsed_command {
-        fsops::reserve_startup_descriptors();
-    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("help") {
         if let Err(error) = help::show_topic(&argv[2..]) {
             crate::output::diagnostic!("syq: {error:#}");
@@ -202,6 +168,7 @@ fn main() {
         return;
     }
     if argv.len() == 2 && argv[1] == "--install-remote-command" {
+        fsops::reserve_startup_descriptors();
         remote_user_install::install();
         return;
     }
@@ -216,6 +183,7 @@ fn main() {
             );
             std::process::exit(2);
         }
+        fsops::reserve_startup_descriptors();
         if let Err(e) = update::write_manifest_signing_payload(std::path::Path::new(&argv[2])) {
             crate::output::diagnostic!("syq: {e:#}");
             std::process::exit(1);
@@ -227,6 +195,7 @@ fn main() {
             crate::output::diagnostic!("syq: restricted installer takes no command-line arguments");
             std::process::exit(2);
         }
+        fsops::reserve_startup_descriptors();
         if let Err(error) = restricted::remote_install() {
             crate::output::diagnostic!("syq restricted installer: {error:#}");
             std::process::exit(1);
@@ -238,6 +207,7 @@ fn main() {
             crate::output::diagnostic!("syq: restricted revoker takes no command-line arguments");
             std::process::exit(2);
         }
+        fsops::reserve_startup_descriptors();
         if let Err(error) = restricted::remote_revoke() {
             crate::output::diagnostic!("syq restricted revoker: {error:#}");
             std::process::exit(1);
@@ -253,6 +223,7 @@ fn main() {
             crate::output::diagnostic!("syq: restricted receiver requires exactly --enrollment=ID");
             std::process::exit(2);
         }
+        fsops::reserve_startup_descriptors();
         if let Err(error) = restricted::run_receiver(enrollment.unwrap()) {
             crate::output::diagnostic!("syq restricted receiver: {error:#}");
             std::process::exit(1);
@@ -260,13 +231,20 @@ fn main() {
         return;
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--session-pool") {
+        fsops::reserve_startup_descriptors();
         if let Err(error) = session_pool::run(&argv[2..]) {
             crate::output::diagnostic!("syq session pool: {error:#}");
             std::process::exit(1);
         }
         return;
     }
+    // Remote launches may invoke either `syq --server` or
+    // `syq rsync --server`; both enter the same internal server.
+    let server_mode = argv.get(1).and_then(|arg| arg.to_str()) == Some("--server")
+        || (argv.get(1).and_then(|arg| arg.to_str()) == Some("rsync")
+            && argv.get(2).and_then(|arg| arg.to_str()) == Some("--server"));
     if server_mode {
+        fsops::reserve_startup_descriptors();
         if let Err(e) = server::run() {
             crate::output::diagnostic!("syq server: {e:#}");
             std::process::exit(1);
@@ -294,6 +272,7 @@ fn main() {
         }
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("cat") {
+        fsops::reserve_startup_descriptors();
         match janky_cat::run(&argv[2..]) {
             Ok(code) => std::process::exit(code),
             Err(error) => {
