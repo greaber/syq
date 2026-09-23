@@ -1474,6 +1474,7 @@ fn copy_local_disk_exdev_uses_parallel_whole_file_workers() {
         }
         let out = command
             .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_COPY_AFTER_PLANNING", "1")
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
             .env("SYQ_TEST_COPY_LOCAL_FS", "local")
             .run()

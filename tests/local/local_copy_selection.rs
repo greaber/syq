@@ -258,31 +258,11 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
             .env("SYQ_TEST_COPY_LOCAL_FS", "local");
         command
     };
-    // Workers can start while the planner is still enqueueing files. Hold the
-    // only worker until both jobs are planned so the sequential local fallback
-    // (and its injected write failure) cannot be bypassed as a single-file copy.
-    let setup_events = t.path("setup-events");
-    let continuation = t.path("worker-continue");
-    let child = run()
-        .arg("--performance-tuning=workers=1")
-        .env("SYQ_TEST_SETUP_EVENTS", &setup_events)
-        .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", t.path("worker-ready"))
-        .env("SYQ_TEST_WORKER_CONNECT_CONTINUE_FILE", &continuation)
+    let failed = run()
+        .env("SYQ_TEST_COPY_AFTER_PLANNING", "1")
         .env("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn_guarded()
+        .run()
         .unwrap();
-    wait_for(
-        "both local-copy jobs to be planned",
-        std::time::Duration::from_secs(30),
-        || {
-            fs::read_to_string(&setup_events)
-                .is_ok_and(|events| events.lines().any(|line| line == "scan_complete"))
-        },
-    );
-    release_confinement_barrier(&continuation);
-    let failed = wait_for_child_output(child, std::time::Duration::from_secs(30));
     assert_eq!(failed.status.code(), Some(1), "{failed:?}");
     assert!(stderr_of(&failed).contains("test local-copy write failure"));
     assert!(!t.path("dst/file").exists());
