@@ -27,9 +27,8 @@ syq tuning-cache <COMMAND>
 
 ## syq tuning-cache list
 
-List recent transfers, newest first. The worker column shows legacy saved
-recommendations in older records. New transfers show `?`: their measurements
-are evaluated when a later transfer starts, rather than saving a recommendation.
+List recent transfers, newest first. The worker column contains saved counts
+from older records; new transfers show `?`.
 
 <!-- CLI: tuning-cache list -->
 ```text
