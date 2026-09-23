@@ -268,6 +268,8 @@ syq cp --inplace large-file --to server --into /backup
 This avoids the disk space for a second full copy and can reduce disk I/O.
 However, readers can see a mixture of old and new contents during the copy or
 after an interruption. Writes through a hard link also affect its other names.
+New files keep owner-write permission until the copy succeeds and applies their
+final permissions; an interrupted copy can leave that write permission in place.
 See [Update policies](commands/cp.md#update-policies) before combining
 in-place writes with other copy policies.
 
