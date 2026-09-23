@@ -900,7 +900,13 @@ impl FsOps {
                     &mut source_offset,
                     d.as_raw_fd(),
                     &mut destination_offset,
-                    remaining.min(crate::read_ahead::BLOCK) as usize,
+                    if read_ahead.is_some() {
+                        remaining.min(crate::read_ahead::BLOCK) as usize
+                    } else {
+                        // Preserve server-side copy offload as one operation.
+                        // Progress follows its successful return, like a clone.
+                        remaining as usize
+                    },
                     0,
                 )
             };

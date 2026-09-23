@@ -109,9 +109,10 @@ for example when comparing its effect on CPU use and copy speed.
 ## Progress
 
 Syq shows a progress bar in a terminal, with elapsed time, speed, and an
-estimated finish time. Local copies report bytes as they are written, including
-while a large file is still being copied. The final summary reports copied and skipped files
-and any errors. Add `-v` to list copied paths.
+estimated finish time. Buffered local copies report progress while a large file
+is still being copied; filesystem clones and copy offloads report when the
+operation completes. The final summary reports copied and skipped files and any
+errors. Add `-v` to list copied paths.
 
 Use `--progress` to show the bar when output is redirected, or `--no-progress`
 to hide it. For connection details and ways to investigate performance, see
