@@ -2976,20 +2976,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !opts.tuning.force_ranges()
         && bwlimit.is_none()
     {
-        let mut files = 0;
-        let mut bytes = 0u64;
-        let mut all_small = true;
-        for planned in st.buffer.iter().flatten().flat_map(|mapped| &mapped.others) {
-            let entry = &planned.e;
-            if entry.kind == Kind::File
-                && opts.max_size.is_none_or(|max| entry.size <= max)
-                && opts.min_size.is_none_or(|min| entry.size >= min)
-            {
-                files += 1;
-                bytes = bytes.saturating_add(entry.size);
-                all_small &= entry.size <= fast_file_size_limit(&opts, bwlimit.as_deref());
-            }
-        }
+        let (files, bytes, all_small) =
+            st.buffered_file_population(fast_file_size_limit(&opts, bwlimit.as_deref()));
         if files > 0 && all_small {
             spawn_workers(
                 initial_fast_workers(
@@ -3017,7 +3005,50 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     if scan_err.is_none() && !st.collision {
-        if let Err(error) = st.replay_buffered() {
+        // The complete source population has passed namespace and capacity
+        // checks. A local tree can now copy earlier batches while subsequent
+        // batches prepare their directories and destination metadata. Preserve
+        // the single-file offload path and the existing bounded small-tree start.
+        // Hardlink groups are validated across replay batches; their payloads
+        // must wait until every eligible alias's metadata has been checked.
+        let local_start = if opts.same_host
+            && !opts.hardlinks
+            && st.fresh_capacity.is_some()
+            && !workers_started
+            && !opts.dry_run
+            && !opts.inplace
+            && !opts.checksum
+            && !opts.update
+            && !opts.ignore_existing
+            && !opts.existing
+        {
+            let (files, bytes, all_small) =
+                st.buffered_file_population(fast_file_size_limit(&opts, bwlimit.as_deref()));
+            (files > 1).then(|| {
+                if all_small && !opts.tuning.force_ranges() && bwlimit.is_none() {
+                    initial_fast_workers(
+                        args.connections,
+                        files,
+                        bytes,
+                        opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
+                        opts.tuning.batch_bytes(),
+                    )
+                } else {
+                    args.connections
+                }
+            })
+        } else {
+            None
+        };
+        if let Err(error) = st.replay_buffered(|| {
+            if let Some(initial) = local_start {
+                // replay_buffered establishes a missing destination root before
+                // this callback; workers only receive its retained authority.
+                spawn_workers(initial, refine_start);
+                workers_started = true;
+                sched.release_preflighted_work();
+            }
+        }) {
             scan_err = Some(error);
         }
     }
@@ -3189,8 +3220,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 }
             }
         }
-        // No worker opens a sidecar until every payload/sidecar namespace
-        // collision is known and the receiving root has been retained.
+        // All jobs have now been supplied. Workers released during buffered
+        // replay can finish instead of waiting for another planning batch.
         sched.scan_done();
     }
 

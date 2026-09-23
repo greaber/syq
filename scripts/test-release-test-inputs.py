@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from release_test_inputs import fingerprint, candidates
 
@@ -14,6 +15,14 @@ SCRIPTS = Path(__file__).resolve().parent
 
 class InputsTests(unittest.TestCase):
     def setUp(self):
+        # Each fixture selects its own event and scope. In particular, an
+        # ambient scheduled event must not turn a local assertion into an API call.
+        environment = patch.dict(os.environ, {
+            'GITHUB_EVENT_PATH': '', 'SYQ_TEST_CHANGED_PATHS_FILE': '',
+            'SYQ_CI_SCOPE_COMMIT': '', 'SYQ_CI_DOCUMENTATION_ONLY': '',
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
         self.original = Path.cwd()
         self.temp = tempfile.TemporaryDirectory(prefix='syq-release-inputs.')
         self.root = Path(self.temp.name)

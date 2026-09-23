@@ -36,7 +36,10 @@ impl Payload {
     ) -> Result<(Descriptor, Descriptor)> {
         // Each payload has one direction. Pipes also reuse the descriptor
         // engine's bounded capacity hint, reducing producer/consumer wakeups.
-        let (reader, writer) = std::io::pipe()?;
+        let ((reader, writer), (commit, acknowledge)) =
+            crate::process::with_inheritance_guard(|| {
+                Ok::<_, std::io::Error>((std::io::pipe()?, UnixStream::pair()?))
+            })?;
         let (reader, writer) = (
             File::from(OwnedFd::from(reader)),
             File::from(OwnedFd::from(writer)),
@@ -46,7 +49,6 @@ impl Payload {
         } else {
             (writer, reader)
         };
-        let (commit, acknowledge) = UnixStream::pair()?;
         let descriptor = Descriptor::owned(native, upload, cancelled.clone())?;
         let commit = Descriptor::owned(File::from(OwnedFd::from(commit)), true, cancelled)?;
         self.channel.send(
