@@ -13,6 +13,9 @@ mod streams;
 #[path = "s3/listing.rs"]
 mod listing;
 
+#[path = "s3/map.rs"]
+mod map;
+
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},

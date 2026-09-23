@@ -40,6 +40,7 @@ from .client import (
     _s3_arguments,
     _insert_mapping_option,
     _map_stream_cwd,
+    _map_options,
     _mapping_line,
     _prepare_results_file,
     _rm_arguments,
@@ -420,16 +421,17 @@ class AsyncMapStream(AsyncMapping):
         self,
         client: AsyncClient,
         argv: list[Argument],
-        cwd: Path,
+        cwd: PathArgument,
         timeout: float | None,
         *,
         confined: bool = False,
         follow_src: bool = False,
+        from_: str | None = None,
     ) -> None:
         # Initialize only source context: this stream supplies its own iterator.
         _ContextMapping.__init__(
             self, cwd=None if confined else cwd,
-            root=cwd if confined else None, follow_src=follow_src,
+            root=cwd if confined else None, follow_src=follow_src, from_=from_,
         )
         self._client = client
         self._argv = argv
@@ -846,6 +848,9 @@ class AsyncClient:
         timeout: Timeout = CLIENT_DEFAULT,
         check: bool = True,
     ) -> CpResult:
+        from_, cwd, root, follow_src = _source_options(
+            mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
+        )
         if (
             from_ is not None
             and to is not None
@@ -859,9 +864,6 @@ class AsyncClient:
                 "a remote-to-remote dry run cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
-        cwd, root, follow_src = _source_options(
-            mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
-        )
         results = await _complete_task(
             asyncio.create_task(asyncio.to_thread(_prepare_results_file, results))
         )
@@ -1082,6 +1084,15 @@ class AsyncClient:
         srcs_in: Selector | None = None,
         src_non_dir: Selector | None = None,
         src_dir: Selector | None = None,
+        from_: str | None = None,
+        include: Iterable[str] | None = None,
+        rsh: str | None = None,
+        syq_path: str | os.PathLike[str] | None = None,
+        no_bootstrap: bool = False,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow: bool = False,
@@ -1110,7 +1121,7 @@ class AsyncClient:
             srcs_in=srcs_in_values,
             src_non_dir=src_non_dir_values,
             src_dir=src_dir_values,
-            from_=None,
+            from_=from_,
             cwd=cwd,
             root=root,
             follow=follow,
@@ -1143,6 +1154,9 @@ class AsyncClient:
             inplace=False,
             max_delete=None,
         )
+        _map_options(argv, include=include, rsh=rsh, syq_path=syq_path,
+                     no_bootstrap=no_bootstrap)
+        _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
         selected_base = root if root is not None else cwd
@@ -1157,9 +1171,9 @@ class AsyncClient:
             producer.process_cwd,
             producer.env,
             selected_base,
-            contents_selector,
+            contents_selector, from_,
         )
         return AsyncMapStream(
             producer, argv, effective_cwd, producer.timeout,
-            confined=root is not None, follow_src=follow or follow_src,
+            confined=root is not None, follow_src=follow or follow_src, from_=from_,
         )

@@ -1,4 +1,4 @@
-"""Lazy mapping transformations that preserve local source context."""
+"""Lazy mapping transformations that preserve source context."""
 
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ from .models import MappingEntry
 
 @dataclass(frozen=True, slots=True)
 class _Source:
-    base: Path
+    base: Path | str
+    from_: str | None
     confined: bool
     follow_src: bool
 
@@ -24,6 +25,7 @@ class _Source:
 class _ContextMapping:
     def __init__(
         self, *,
+        from_: str | None = None,
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow_src: bool = False,
@@ -31,17 +33,23 @@ class _ContextMapping:
         if cwd is not None and root is not None:
             raise SyqInvocationError("cwd and root are mutually exclusive")
         self._source = _Source(
-            _map_stream_cwd(None, None, root if root is not None else cwd, None),
+            _map_stream_cwd(None, None, root if root is not None else cwd, None, from_),
+            from_,
             root is not None, follow_src,
         )
 
     @property
-    def cwd(self) -> Path:
-        """Absolute source-base spelling, without resolving symlinks or '..'."""
+    def from_(self) -> str | None:
+        """Source endpoint, or None for local sources."""
+        return self._source.from_
+
+    @property
+    def cwd(self) -> Path | str:
+        """Source base at its endpoint, without resolving symlinks or '..'."""
         return self._source.base
 
     @property
-    def root(self) -> Path | None:
+    def root(self) -> Path | str | None:
         """Source confinement root, or None for an unconfined mapping."""
         return self.cwd if self._source.confined else None
 
@@ -88,15 +96,16 @@ class _AsyncTransformedEntries(AsyncIterable[MappingEntry]):
 
 
 class Mapping(_ContextMapping, Iterable[MappingEntry]):
-    """Entries plus a local source base; transform returns another lazy mapping."""
+    """Entries plus a source endpoint and base; transform returns another lazy mapping."""
 
     def __init__(
         self, entries: Iterable[MappingEntry], *,
+        from_: str | None = None,
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow_src: bool = False,
     ) -> None:
-        super().__init__(cwd=cwd, root=root, follow_src=follow_src)
+        super().__init__(from_=from_, cwd=cwd, root=root, follow_src=follow_src)
         self._entries = entries
 
     def __iter__(self) -> Iterator[MappingEntry]:
@@ -107,20 +116,21 @@ class Mapping(_ContextMapping, Iterable[MappingEntry]):
         return Mapping(
             _TransformedEntries(self, function),
             cwd=None if self.root is not None else self.cwd,
-            root=self.root, follow_src=self.follow_src,
+            root=self.root, from_=self.from_, follow_src=self.follow_src,
         )
 
 
 class AsyncMapping(_ContextMapping, AsyncIterable[MappingEntry]):
-    """Async entries plus a local source base; transforms may be awaitable."""
+    """Async entries plus a source endpoint and base; transforms may be awaitable."""
 
     def __init__(
         self, entries: AsyncIterable[MappingEntry], *,
+        from_: str | None = None,
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow_src: bool = False,
     ) -> None:
-        super().__init__(cwd=cwd, root=root, follow_src=follow_src)
+        super().__init__(from_=from_, cwd=cwd, root=root, follow_src=follow_src)
         self._entries = entries
 
     def __aiter__(self) -> AsyncIterator[MappingEntry]:
@@ -133,19 +143,20 @@ class AsyncMapping(_ContextMapping, AsyncIterable[MappingEntry]):
         return AsyncMapping(
             _AsyncTransformedEntries(self, function),
             cwd=None if self.root is not None else self.cwd,
-            root=self.root, follow_src=self.follow_src,
+            root=self.root, from_=self.from_, follow_src=self.follow_src,
         )
 
 
 def _source_options(
     mapping: object, *, from_: str | None, cwd: PathArgument | None,
     root: PathArgument | None, follow_src: bool,
-) -> tuple[PathArgument | None, PathArgument | None, bool]:
+) -> tuple[str | None, PathArgument | None, PathArgument | None, bool]:
     if not isinstance(mapping, _ContextMapping):
-        return cwd, root, follow_src
+        return from_, cwd, root, follow_src
     if from_ is not None or cwd is not None or root is not None:
         raise SyqInvocationError("a context-carrying mapping cannot override from_, cwd, or root")
     return (
+        mapping.from_,
         None if mapping.root is not None else mapping.cwd,
         mapping.root,
         follow_src or mapping.follow_src,

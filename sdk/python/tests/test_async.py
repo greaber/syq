@@ -212,6 +212,18 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stream.cwd, Path.cwd() / "source-root" / "source")
         self.assertEqual(self.argv()[0], "cp")
 
+    async def test_remote_map_context_and_fields(self) -> None:
+        stream = self.client.map(from_="s3://bucket", srcs_in="photos/", cwd="prefix",
+                                 include=["s3_last_modified"], s3_region="us-east-1")
+        async with stream:
+            transformed = stream.transform(lambda entry: entry)
+            self.assertEqual(transformed.from_, "s3://bucket")
+            self.assertEqual(transformed.cwd, "prefix/photos")
+            entries = [entry async for entry in transformed]
+        self.assertEqual(len(entries), 1)
+        self.assertIn("--include=s3_last_modified", self.argv())
+        self.assertIn("--s3-region=us-east-1", self.argv())
+
     async def test_map_cwd_preserves_the_unresolved_source_spelling(self) -> None:
         base = self.root / "base"
         outside = self.root / "outside"

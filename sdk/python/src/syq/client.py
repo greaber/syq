@@ -561,6 +561,24 @@ def _positive_integer(value: int | None, *, option: str) -> int | None:
     return value
 
 
+def _map_options(argv: list[Argument], *, include: Iterable[str] | None,
+                 rsh: str | None, syq_path: str | os.PathLike[str] | None,
+                 no_bootstrap: bool) -> None:
+    if include is not None:
+        if isinstance(include, (str, bytes)):
+            raise SyqInvocationError("include must be an iterable of field names")
+        for field in include:
+            if field not in {"kind", "size", "mtime", "s3_last_modified"}:
+                raise SyqInvocationError(f"unknown mapping field: {field!r}")
+            argv.append("--include=" + field)
+    if rsh is not None:
+        argv.append("--rsh=" + _text_arg(rsh, label="rsh"))
+    if syq_path is not None:
+        argv.append("--syq-path=" + _text_arg(syq_path, label="syq_path"))
+    if no_bootstrap:
+        argv.append("--no-bootstrap")
+
+
 def _s3_arguments(
     argv: list[Argument], endpoint: str | None, region: str | None,
     profile: str | None, headers: Iterable[str] | None,
@@ -900,11 +918,11 @@ class MapStream(FileMapping):
 
     def __init__(
         self, process: _LineProcess, cwd: PathArgument, *,
-        confined: bool = False, follow_src: bool = False,
+        confined: bool = False, follow_src: bool = False, from_: str | None = None,
     ) -> None:
         super().__init__(
             (), cwd=None if confined else cwd,
-            root=cwd if confined else None, follow_src=follow_src,
+            root=cwd if confined else None, follow_src=follow_src, from_=from_,
         )
         self._process = process
         self._complete = False
@@ -1253,6 +1271,9 @@ class Client:
         timeout: Timeout = CLIENT_DEFAULT,
         check: bool = True,
     ) -> CpResult:
+        from_, cwd, root, follow_src = _source_options(
+            mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
+        )
         if (
             from_ is not None
             and to is not None
@@ -1266,9 +1287,6 @@ class Client:
                 "a remote-to-remote dry run cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
-        cwd, root, follow_src = _source_options(
-            mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
-        )
         results = _prepare_results_file(results)
         argv, source_count, source_end = _copy_arguments(
             "cp",
@@ -1471,6 +1489,15 @@ class Client:
         srcs_in: Selector | None = None,
         src_non_dir: Selector | None = None,
         src_dir: Selector | None = None,
+        from_: str | None = None,
+        include: Iterable[str] | None = None,
+        rsh: str | None = None,
+        syq_path: str | os.PathLike[str] | None = None,
+        no_bootstrap: bool = False,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow: bool = False,
@@ -1491,7 +1518,7 @@ class Client:
             srcs_in=srcs_in_values,
             src_non_dir=src_non_dir_values,
             src_dir=src_dir_values,
-            from_=None,
+            from_=from_,
             cwd=cwd,
             root=root,
             follow=follow,
@@ -1524,6 +1551,9 @@ class Client:
             inplace=False,
             max_delete=None,
         )
+        _map_options(argv, include=include, rsh=rsh, syq_path=syq_path,
+                     no_bootstrap=no_bootstrap)
+        _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
         command = (self._executable_value(), *argv)
@@ -1539,7 +1569,7 @@ class Client:
             self.process_cwd,
             self.env,
             selected_base,
-            contents_selector,
+            contents_selector, from_,
         )
         return MapStream(
             _LineProcess(
@@ -1550,5 +1580,5 @@ class Client:
             ),
             effective_cwd,
             confined=root is not None,
-            follow_src=follow or follow_src,
+            follow_src=follow or follow_src, from_=from_,
         )

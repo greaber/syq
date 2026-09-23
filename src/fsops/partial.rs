@@ -2307,6 +2307,7 @@ impl FsOps {
             Request::BindStream(_)
             | Request::Hello { .. }
             | Request::Scan { .. }
+            | Request::NativeMap(_)
             | Request::NativeRemove { .. }
             | Request::TransportStats
             | Request::Receipt

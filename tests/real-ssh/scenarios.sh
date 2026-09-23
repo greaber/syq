@@ -242,6 +242,9 @@ for commit in (b'', b'C'):
     assert result.stdout == (payload if commit else b'local producer')
 PY_DESCRIPTORS
 
+printf 'case: remote mapping generation\n'
+python3 /usr/local/libexec/syq-test-map-generation.py
+
 printf 'case: shared stream mappings over TCP and SSH\n'
 timeout --kill-after=5s 120s python3 /usr/local/libexec/syq-test-stream-mappings.py
 

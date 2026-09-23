@@ -2577,6 +2577,9 @@ impl RestrictedAuthority {
             | Request::AnchorDestination { .. } => {
                 bail!("destination-anchor management is not valid on a root-confined receiver")
             }
+            Request::NativeMap(_) => {
+                bail!("mapping generation is not valid on a command-restricted destination")
+            }
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a command-restricted destination")
             }

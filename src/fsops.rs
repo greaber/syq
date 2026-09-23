@@ -1908,6 +1908,7 @@ impl FsOps {
             | Request::ListDir { .. }
             | Request::ListDirDetails { .. }
             | Request::ListDirNoFollowFinal { .. }
+            | Request::NativeMap(_)
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }

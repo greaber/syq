@@ -186,7 +186,7 @@ def _destination_metadata(record: dict[str, Any]) -> DestinationMetadata | None:
 
 def parse_mapping_line(line: bytes) -> MappingEntry:
     record = _object(line, label="mapping record")
-    unknown = set(record) - {"src", "dst", "kind", "size", "mtime", "expected_hash", "metadata"}
+    unknown = set(record) - {"src", "dst", "kind", "size", "mtime", "s3_last_modified", "expected_hash", "metadata"}
     if unknown:
         raise SyqProtocolError(
             f"mapping record has unknown field {sorted(unknown)[0]!r}"
@@ -202,7 +202,8 @@ def parse_mapping_line(line: bytes) -> MappingEntry:
         _integer(record, "mtime", nonnegative=False) if "mtime" in record else None
     )
     try:
-        return MappingEntry(src.raw, dst.raw, kind, size, mtime, _expected_hash(record), _destination_metadata(record))
+        return MappingEntry(src.raw, dst.raw, kind, size, mtime, _expected_hash(record), _destination_metadata(record),
+            _integer(record, "s3_last_modified", nonnegative=False) if "s3_last_modified" in record else None)
     except (TypeError, ValueError) as error:
         raise SyqProtocolError(f"mapping path is invalid: {error}") from error
 

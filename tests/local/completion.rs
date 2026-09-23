@@ -304,6 +304,8 @@ fn completion_respects_conflicts_selection_modes_and_source_order() {
     assert_completion_candidates(&t, &["syq", "cp", "--mapping", "manifest", "--src"], &[]);
     assert_completion_candidates(&t, &["syq", "cp", "--mapping", "manifest", "s"], &[]);
     assert_completion_candidates(&t, &["syq", "cp", "source", "--mapping"], &[]);
+    assert_completion_candidates(&t, &["syq", "map", "--from", "s3://bucket", "s"], &[]);
+    assert_completion_candidates(&t, &["syq", "map", "--include", "mt"], &["mtime"]);
     assert_completion_candidates(&t, &["syq", "map", "--srcs-in", ".", "s"], &[]);
     assert_completion_candidates(&t, &["syq", "map", "source", "--srcs-in"], &[]);
     assert_completion_candidates(&t, &["syq", "map", "--srcs-in", ".", "--src"], &[]);
@@ -704,7 +706,7 @@ fn remote_completion_obeys_symlink_policy_types_and_literal_option_values() {
             ],
         ),
     ];
-    for command in ["cp", "rm"] {
+    for command in ["cp", "rm", "map"] {
         for follow in ["--follow", "--follow-src"] {
             let endpoint = if command == "rm" { "--on" } else { "--from" };
             let common = vec![

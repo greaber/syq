@@ -98,6 +98,7 @@ impl Conn for LocalConn {
                     | Request::ListDir { .. }
                     | Request::ListDirDetails { .. }
                     | Request::ListDirNoFollowFinal { .. }
+                    | Request::NativeMap(_)
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }

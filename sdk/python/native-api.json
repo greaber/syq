@@ -137,7 +137,16 @@
         "src",
         "src-dir",
         "src-non-dir",
-        "srcs-in"
+        "srcs-in",
+        "from",
+        "include",
+        "rsh",
+        "syq-path",
+        "no-bootstrap",
+        "s3-endpoint",
+        "s3-region",
+        "s3-profile",
+        "s3-header"
       ],
       "internal": [],
       "aliases": {

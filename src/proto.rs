@@ -1012,6 +1012,7 @@ pub enum WireRequest<Data> {
         sparse: bool,
         destination: bool,
     },
+    NativeMap(crate::native_map::Options),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1269,6 +1270,8 @@ pub enum Response {
     PublishedBatch(Vec<std::result::Result<Option<(u64, u64)>, WireError>>),
     /// Non-final fragment of a rich-metadata stat response.
     StatsMore(Vec<Option<Entry>>),
+    NativeMapData(Vec<u8>),
+    NativeMapDone,
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
@@ -1452,6 +1455,17 @@ impl SizeHint for Request {
                     + 48
             }
             Request::Apply { ops, .. } => ops.iter().map(Op::size_hint).sum::<usize>() + 16,
+            Request::NativeMap(options) => {
+                options
+                    .sources
+                    .iter()
+                    .map(|s| s.path.len() + 16)
+                    .sum::<usize>()
+                    + options.cwd.as_ref().map_or(0, Vec::len)
+                    + options.root.as_ref().map_or(0, Vec::len)
+                    + options.target.as_ref().map_or(0, Vec::len)
+                    + 128
+            }
             Request::NativeRemove { selections, .. } => {
                 selections
                     .iter()
@@ -1499,6 +1513,7 @@ impl SizeHint for Response {
                     + 16
             }
             Response::ScanBatch(v) => v.iter().map(Entry::size_hint).sum::<usize>() + 16,
+            Response::NativeMapData(data) => data.len() + 16,
             Response::NativeRemoveBatch(v) => {
                 v.iter()
                     .map(|outcome| {

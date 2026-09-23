@@ -372,10 +372,10 @@ fn main() {
         stream_mapping::run(args)
     } else if args.descriptor_copy.is_some() {
         descriptor_copy::run(args)
-    } else if args.s3.is_some() {
-        s3::run(args)
     } else if args.interface == cli::Interface::NativeMap {
         native_map::run(&args)
+    } else if args.s3.is_some() {
+        s3::run(args)
     } else if args.rm {
         rm::run(args)
     } else {

@@ -30,7 +30,9 @@ pub enum Existence {
     Existing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum SourceSelection {
     #[default]
     Rsync,
@@ -140,6 +142,8 @@ pub struct Args {
     /// `syq map` never contacts a destination.
     #[arg(skip)]
     pub native_map_target: Option<Vec<u8>>,
+    #[arg(skip)]
+    pub native_map_include: Vec<crate::native_map::Field>,
     /// NDJSON mapping manifest consumed by native cp instead of selectors;
     /// `-` reads stdin and the complete input is acquired before mutation.
     #[arg(skip)]
@@ -1414,12 +1418,25 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
 #[command(
     name = "syq map",
     version,
-    about = "Print source-to-destination mappings as NDJSON.\n\nScan local sources and write one JSON object per line for later cp --mapping.\n--as changes placement relative to that copy's destination directory.\nNamed selectors must be relative (use -C for the source base).\n--srcs-in must be the only selector; --as requires one named object.\nNames must be valid UTF-8. No destination is contacted.",
+    about = "Print source-to-destination mappings as NDJSON.\n\nScan local, SSH, or S3 sources and write one JSON object per line for later cp --mapping.\n--as changes placement relative to that copy's destination directory.\nNamed selectors must be relative (use -C for the source base).\n--srcs-in must be the only selector; --as requires one named object.\nNames must be valid UTF-8. No destination is contacted.",
     before_help = "Examples:\n  syq map --srcs-in photos\n  syq map photos --as archive/photos > mapping.ndjson\n  syq cp --mapping mapping.ndjson --into backup",
-    long_about = "Print source-to-destination mappings as NDJSON.\n\nScan local sources for later cp --mapping. Named selectors must be relative (use -C for the source base). --srcs-in must be the only selector; --as requires one named object and changes its placement relative to the future destination directory.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8. Attach path option values beginning with `-` by using `=`, for example --src-dir=-.",
+    long_about = "Print source-to-destination mappings as NDJSON.\n\nScan local, SSH, or S3 sources for later cp --mapping. Named selectors must be relative (use -C for the source base). --srcs-in must be the only selector; --as requires one named object and changes its placement relative to the future destination directory.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), with optional fields selected by --include. kind adds a copy-time type check. size and timestamps are informational. Missing stored S3 mtime is omitted; s3_last_modified is independent of filesystem mtime. Generation reads sources without contacting a destination. Names must be valid UTF-8. Attach path option values beginning with `-` by using `=`, for example --src-dir=-.",
     override_usage = "syq map [OPTIONS] PATH...\n       syq map [OPTIONS] --srcs-in DIR"
 )]
 struct NativeMapCommand {
+    /// Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local
+    #[arg(long, value_name = "ENDPOINT")]
+    from: Option<String>,
+    /// Include optional output fields (comma-separated or repeatable)
+    #[arg(long, value_enum, value_delimiter = ',', value_name = "FIELD")]
+    include: Vec<crate::native_map::Field>,
+    /// Remote shell command (default: ssh)
+    #[arg(long, value_name = "COMMAND")]
+    rsh: Option<String>,
+    #[command(flatten)]
+    helper: NativeRemoteHelperArgs,
+    #[command(flatten)]
+    s3: crate::s3::Flags,
     #[command(flatten)]
     source: NativeSourceArgs,
     /// Emit the single selected root at PATH, relative to the future destination container; PATH may be nested
@@ -2279,12 +2296,38 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     // to it; the walk joins it back.
     let map_cwd = parsed.source.cwd.take().map(OsStringExt::into_vec);
     let map_root = parsed.source.root.take().map(OsStringExt::into_vec);
-    let mut locations = lower_native_sources(&parsed.source, &matches, None)?;
+    let s3 = crate::s3::Options::parse(
+        parsed.s3,
+        parsed.from.as_deref().filter(|s| s.starts_with("s3://")),
+        None,
+        &matches,
+    )?;
+    let endpoint = if s3.is_some() {
+        None
+    } else {
+        parse_native_endpoint(parsed.from.as_deref())?
+    };
+    if endpoint.is_none()
+        && (parsed.rsh.is_some() || parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap)
+    {
+        bail!("--rsh, --syq-path and --no-bootstrap require an SSH source");
+    }
+    if s3.is_some() && (parsed.source.follow || parsed.source.follow_src) {
+        bail!("follow options require filesystem sources");
+    }
+    if s3.is_none()
+        && parsed
+            .include
+            .contains(&crate::native_map::Field::S3LastModified)
+    {
+        bail!("s3_last_modified requires an S3 source");
+    }
+    let mut locations = lower_native_sources(&parsed.source, &matches, endpoint)?;
     for source in &mut locations {
         if source.selection != SourceSelection::Contents
             && (source.path.starts_with(b"/")
-                || source.path == b"~"
-                || source.path.starts_with(b"~/"))
+                || (s3.is_none() && source.path == b"~")
+                || (s3.is_none() && source.path.starts_with(b"~/")))
         {
             bail!(
                 "named syq map selector {:?} is absolute and cannot be emitted relative to its mapping source base; use -C with a relative selector",
@@ -2333,6 +2376,11 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     args.native_map_cwd = map_cwd;
     args.native_map_root = map_root;
     args.native_map_target = target;
+    args.native_map_include = parsed.include;
+    args.rsh = parsed.rsh;
+    args.syq_path = parsed.helper.syq_path;
+    args.no_bootstrap = parsed.helper.no_bootstrap;
+    args.s3 = s3;
     args.native_follow = parsed.source.follow;
     args.native_follow_src = parsed.source.follow_src;
     Ok(args)

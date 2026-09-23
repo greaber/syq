@@ -786,6 +786,24 @@ class NativeClientTests(unittest.TestCase):
         self.assertIn("--follow-src", self.argv())
         self.assertEqual(stream.cwd, Path.cwd() / "source-root" / "source")
 
+    def test_remote_map_keeps_endpoint_and_base_through_transform(self) -> None:
+        with self.client.map(from_="source", srcs_in="photos", cwd="~/data",
+                             include=["mtime", "kind"], no_bootstrap=True) as stream:
+            transformed = stream.transform(lambda entry: entry)
+            self.assertEqual(transformed.from_, "source")
+            self.assertEqual(transformed.cwd, "~/data/photos")
+            list(transformed)
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("--from") + 1], "source")
+        self.assertIn("--include=mtime", argv)
+        self.assertIn("--include=kind", argv)
+        self.assertIn("--no-bootstrap", argv)
+        mapping = syq.Mapping([syq.MappingEntry("a", "b")], from_="source", cwd="~/data")
+        self.client.cp(mapping=mapping.transform(lambda entry: entry), into="output")
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("--from") + 1], "source")
+        self.assertIn("~/data", argv)
+
     def test_map_cwd_preserves_the_unresolved_source_spelling(self) -> None:
         base = self.root / "base"
         outside = self.root / "outside"
