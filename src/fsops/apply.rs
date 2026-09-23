@@ -322,6 +322,7 @@ pub(super) fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                     Err(error) => return Err(error),
                 }
             }
+            drop(parent);
             match observe_rooted_condition(target, *condition)? {
                 Some(metadata) if metadata.is_dir() => {
                     if metadata.mode & 0o700 != 0o700 {
@@ -527,6 +528,9 @@ pub(super) fn set_meta_rooted(
             ];
             parent.set_times(&times)?;
         }
+        // The final lookup resolves from Root again. Release the reused
+        // parent first so that check does not raise peak descriptor usage.
+        drop(parent);
         return require_rooted_named_identity_known(
             &target.root,
             &target.relative,
@@ -542,6 +546,7 @@ pub(super) fn set_meta_rooted(
         ];
         parent.set_times(&times)?;
     }
+    drop(parent);
     let after = target.root.metadata(&target.relative)?;
     require_rooted_identity(after, condition, &target.label)
 }
