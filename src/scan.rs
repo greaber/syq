@@ -24,7 +24,7 @@ const FIRST_BATCH: usize = 1000;
 const FIRST_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
 const DESCRIPTOR_STAT_THREADS: usize = 8;
 const DESCRIPTOR_STAT_PAR_MIN: usize = 32;
-const DESCRIPTOR_DIRECTORY_FDS: usize = 16;
+const DESCRIPTOR_DIRECTORY_FDS: usize = 8;
 
 /// Per-entry result of the parallel read_dir hook.
 #[derive(Clone, Default, Debug)]
@@ -191,6 +191,7 @@ fn inspect_descriptor_children(
     directory: &File,
     parent: &[u8],
     names: &[PathBytes],
+    parallel: bool,
 ) -> Vec<(PathBytes, Result<(Entry, RootMetadata)>)> {
     let inspect = |name: &PathBytes| {
         let relative = join(parent, name);
@@ -202,7 +203,7 @@ fn inspect_descriptor_children(
         })();
         (relative, result)
     };
-    if names.len() < DESCRIPTOR_STAT_PAR_MIN {
+    if !parallel || names.len() < DESCRIPTOR_STAT_PAR_MIN {
         return names.iter().map(inspect).collect();
     }
     let chunk = names.len().div_ceil(DESCRIPTOR_STAT_THREADS).max(1);
@@ -227,6 +228,7 @@ struct DescriptorDirectory {
     relative: PathBytes,
     expected: RootMetadata,
     opened: Option<File>,
+    names: Option<std::vec::IntoIter<PathBytes>>,
 }
 
 #[cfg(debug_assertions)]
@@ -251,6 +253,125 @@ fn hold_descriptor_directory_for_test(_relative: &[u8]) -> Result<()> {
     Ok(())
 }
 
+struct DirectoryStep {
+    events: ScanChunk,
+    children: Vec<DescriptorDirectory>,
+    remainder: Option<DescriptorDirectory>,
+}
+
+struct DescriptorScan<'a> {
+    root: &'a Root,
+    scan_root: &'a [u8],
+    hold_destination_for_test: bool,
+    ignore: Option<&'a Gitignore>,
+    report_ignored: bool,
+}
+
+impl DescriptorScan<'_> {
+    fn step(
+        &self,
+        mut directory: DescriptorDirectory,
+        retain: usize,
+        parallel_stats: bool,
+    ) -> Result<DirectoryStep> {
+        if directory.names.is_none() && self.hold_destination_for_test {
+            hold_descriptor_directory_for_test(&directory.relative)?;
+        }
+        let rooted_directory = RelativePath::new(&join(self.scan_root, &directory.relative))?;
+        let opened = match directory.opened.take() {
+            Some(opened) => opened,
+            None => self
+                .root
+                .open_directory_verified(&rooted_directory, directory.expected)?,
+        };
+        let mut names = match directory.names.take() {
+            Some(names) => names,
+            None => {
+                let mut names = self.root.read_open_directory(&opened)?;
+                names.sort();
+                names.into_iter()
+            }
+        };
+        let batch: Vec<_> = names.by_ref().take(FIRST_BATCH).collect();
+        let mut events = Vec::with_capacity(batch.len());
+        let mut children = Vec::new();
+        let mut retained = 0;
+        for (name, (relative, result)) in batch.iter().zip(inspect_descriptor_children(
+            self.root,
+            &opened,
+            &directory.relative,
+            &batch,
+            parallel_stats,
+        )) {
+            let (entry, metadata) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    events.push(ScanEvent::Warning(format!(
+                        "scan: cannot stat {}: {error:#}",
+                        String::from_utf8_lossy(&relative)
+                    )));
+                    continue;
+                }
+            };
+            let is_directory = entry.kind == crate::proto::Kind::Dir;
+            if self.ignore.is_some_and(|matcher| {
+                matcher
+                    .matched(
+                        Path::new(std::ffi::OsStr::from_bytes(&relative)),
+                        is_directory,
+                    )
+                    .is_ignore()
+            }) {
+                if self.report_ignored {
+                    events.push(ScanEvent::Ignored(relative));
+                }
+                continue;
+            }
+            events.push(ScanEvent::Entry(entry));
+            if is_directory {
+                let child = if retained < retain {
+                    match self
+                        .root
+                        .open_child_directory_verified(&opened, name, metadata)
+                    {
+                        Ok(child) => {
+                            retained += 1;
+                            Some(child)
+                        }
+                        Err(error) => {
+                            events.push(ScanEvent::Warning(format!(
+                                "scan: {}: {error:#}",
+                                String::from_utf8_lossy(&relative)
+                            )));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                children.push(DescriptorDirectory {
+                    relative,
+                    expected: metadata,
+                    opened: child,
+                    names: None,
+                });
+            }
+        }
+        let remainder = if names.len() == 0 {
+            None
+        } else {
+            directory.opened = Some(opened);
+            directory.names = Some(names);
+            Some(directory)
+        };
+        Ok(DirectoryStep {
+            events,
+            children,
+            remainder,
+        })
+    }
+}
+
 fn produce_descriptor_scan(
     root: Arc<Root>,
     scan_root: PathBytes,
@@ -260,173 +381,85 @@ fn produce_descriptor_scan(
     report_ignored: bool,
     tx: SyncSender<ScanChunk>,
 ) {
+    const DIRECTORY_WORKERS: usize = 8;
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(DIRECTORY_WORKERS)
+            .thread_name(|index| format!("syq-scan-directory-{index}"))
+            .build()
+            .expect("directory scan worker pool")
+    });
+    let scan = DescriptorScan {
+        root: &root,
+        scan_root: &scan_root,
+        hold_destination_for_test,
+        ignore: ignore.as_ref(),
+        report_ignored,
+    };
     let mut chunk = Vec::with_capacity(FIRST_BATCH);
-    let mut entries_sent = 1; // The root entry is already waiting in the consumer.
+    let mut entries_sent = 1;
     let mut entries_in_chunk = 0;
-    let mut retained_directories = 0usize;
+    let mut retained_directories = 0;
     let mut directories = vec![DescriptorDirectory {
         relative: Vec::new(),
         expected: scan_root_metadata,
         opened: None,
+        names: None,
     }];
-    while let Some(directory) = directories.pop() {
-        if directory.opened.is_some() {
-            retained_directories -= 1;
-        }
-        if hold_destination_for_test {
-            if let Err(error) = hold_descriptor_directory_for_test(&directory.relative) {
-                chunk.push(ScanEvent::Warning(format!(
-                    "scan: {}: {error:#}",
-                    String::from_utf8_lossy(&directory.relative)
-                )));
-                break;
-            }
-        }
-        let rooted_directory = match RelativePath::new(&join(&scan_root, &directory.relative)) {
-            Ok(directory) => directory,
-            Err(error) => {
-                chunk.push(ScanEvent::Warning(format!(
-                    "scan: {}: {error:#}",
-                    String::from_utf8_lossy(&directory.relative)
-                )));
-                break;
-            }
-        };
-        let opened = match directory.opened {
-            Some(opened) => opened,
-            None => match root.open_directory_verified(&rooted_directory, directory.expected) {
-                Ok(opened) => opened,
-                Err(error) => {
-                    chunk.push(ScanEvent::Warning(format!(
-                        "scan: {}: {error:#}",
-                        String::from_utf8_lossy(&directory.relative)
-                    )));
-                    if chunk.len() >= FIRST_BATCH
-                        && !send_scan_chunk(
-                            &tx,
-                            &mut chunk,
-                            &mut entries_sent,
-                            &mut entries_in_chunk,
-                        )
-                    {
-                        return;
-                    }
-                    continue;
+    while !directories.is_empty() {
+        let count = DIRECTORY_WORKERS.min(directories.len());
+        let work: Vec<_> = (0..count).map(|_| directories.pop().unwrap()).collect();
+        retained_directories -= work.iter().filter(|d| d.opened.is_some()).count();
+        let available = DESCRIPTOR_DIRECTORY_FDS.saturating_sub(retained_directories + count);
+        // Tasks return at most one metadata chunk and never wait for the
+        // consumer. A shared pool is therefore safe even when another scan is
+        // backpressured. Indexed collection preserves deterministic output.
+        use rayon::prelude::*;
+        let steps: Vec<_> = pool.install(|| {
+            work.into_par_iter()
+                .enumerate()
+                .map(|(index, directory)| {
+                    let label = directory.relative.clone();
+                    let retain = available / count + usize::from(index < available % count);
+                    scan.step(directory, retain, count == 1).map_err(|error| {
+                        format!("scan: {}: {error:#}", String::from_utf8_lossy(&label))
+                    })
+                })
+                .collect()
+        });
+        let mut children = Vec::new();
+        let mut remainders = Vec::new();
+        for step in steps {
+            let events = match step {
+                Ok(step) => {
+                    children.extend(step.children);
+                    remainders.extend(step.remainder);
+                    step.events
                 }
-            },
-        };
-        let mut names = match root.read_open_directory(&opened) {
-            Ok(names) => names,
-            Err(error) => {
-                chunk.push(ScanEvent::Warning(format!(
-                    "scan: {}: {error:#}",
-                    String::from_utf8_lossy(&directory.relative)
-                )));
+                Err(error) => vec![ScanEvent::Warning(error)],
+            };
+            for event in events {
+                entries_in_chunk += usize::from(matches!(event, ScanEvent::Entry(_)));
+                chunk.push(event);
                 if chunk.len() >= FIRST_BATCH
                     && !send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk)
                 {
                     return;
                 }
-                continue;
-            }
-        };
-        names.sort();
-        let mut child_directories = Vec::new();
-        // Bound both stat work and its result storage. In particular, publish
-        // the first thousand entries without waiting to stat a huge directory.
-        for names in names.chunks(FIRST_BATCH) {
-            for (name, (relative, result)) in names.iter().zip(inspect_descriptor_children(
-                &root,
-                &opened,
-                &directory.relative,
-                names,
-            )) {
-                let (entry, metadata) = match result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        chunk.push(ScanEvent::Warning(format!(
-                            "scan: cannot stat {}: {error:#}",
-                            String::from_utf8_lossy(&relative)
-                        )));
-                        if chunk.len() >= FIRST_BATCH
-                            && !send_scan_chunk(
-                                &tx,
-                                &mut chunk,
-                                &mut entries_sent,
-                                &mut entries_in_chunk,
-                            )
-                        {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-                let is_directory = entry.kind == crate::proto::Kind::Dir;
-                if ignore.as_ref().is_some_and(|matcher| {
-                    matcher
-                        .matched(
-                            Path::new(std::ffi::OsStr::from_bytes(&relative)),
-                            is_directory,
-                        )
-                        .is_ignore()
-                }) {
-                    if report_ignored {
-                        chunk.push(ScanEvent::Ignored(relative));
-                    }
-                    continue;
-                }
-                if is_directory {
-                    child_directories.push((relative.clone(), name.clone(), metadata));
-                }
-                entries_in_chunk += 1;
-                chunk.push(ScanEvent::Entry(entry));
-                let first_batch_ready =
-                    entries_sent < FIRST_BATCH && entries_sent + entries_in_chunk >= FIRST_BATCH;
-                if (first_batch_ready || chunk.len() >= FIRST_BATCH)
-                    && !send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk)
-                {
-                    return;
-                }
             }
         }
-        let mut retained_children = Vec::with_capacity(child_directories.len());
-        for (relative, name, expected) in child_directories {
-            let opened_child = if retained_directories < DESCRIPTOR_DIRECTORY_FDS {
-                match root.open_child_directory_verified(&opened, &name, expected) {
-                    Ok(child) => {
-                        retained_directories += 1;
-                        Some(child)
-                    }
-                    Err(error) => {
-                        chunk.push(ScanEvent::Warning(format!(
-                            "scan: {}: {error:#}",
-                            String::from_utf8_lossy(&relative)
-                        )));
-                        if chunk.len() >= FIRST_BATCH
-                            && !send_scan_chunk(
-                                &tx,
-                                &mut chunk,
-                                &mut entries_sent,
-                                &mut entries_in_chunk,
-                            )
-                        {
-                            return;
-                        }
-                        continue;
-                    }
-                }
-            } else {
-                None
-            };
-            retained_children.push(DescriptorDirectory {
-                relative,
-                expected,
-                opened: opened_child,
-            });
-        }
-        // Reverse before pushing so byte-sorted, parent-before-child order is retained.
-        retained_children.reverse();
-        directories.extend(retained_children);
+        retained_directories += children
+            .iter()
+            .chain(&remainders)
+            .filter(|d| d.opened.is_some())
+            .count();
+        // Finish already-open large directories before opening further ones.
+        // This bounds the number of directory name lists held across steps.
+        children.reverse();
+        directories.extend(children);
+        remainders.reverse();
+        directories.extend(remainders);
     }
     let _ = send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk);
 }
@@ -908,6 +941,153 @@ mod tests {
         );
         assert!(ignored.is_empty());
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn descriptor_scan_parallel_directories_keep_parents_and_prune_ignored_trees() {
+        let temp = crate::test_support::tempdir().unwrap();
+        for index in 0..24 {
+            let directory = temp.path().join(format!("d{index:02}"));
+            fs::create_dir_all(directory.join("keep/deeper")).unwrap();
+            fs::create_dir_all(directory.join("skip/hidden")).unwrap();
+            fs::write(directory.join("keep/deeper/file"), b"payload").unwrap();
+            fs::write(directory.join("skip/hidden/file"), b"excluded").unwrap();
+        }
+        let root = Arc::new(Root::from_directory(File::open(temp.path()).unwrap()).unwrap());
+        let mut scans = Vec::new();
+        for _ in 0..2 {
+            let mut paths = Vec::new();
+            let mut ignored = Vec::new();
+            let mut warnings = Vec::new();
+            scan_descriptor(
+                root.clone(),
+                b"",
+                None,
+                false,
+                false,
+                &["skip/".into()],
+                true,
+                &mut |batch| {
+                    paths.extend(batch.into_iter().map(|entry| entry.path));
+                    Ok(())
+                },
+                &mut |batch| {
+                    ignored.extend(batch);
+                    Ok(())
+                },
+                &mut |warning| warnings.push(warning),
+            )
+            .unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(ignored.len(), 24);
+            let mut seen = std::collections::HashSet::new();
+            for path in &paths {
+                if !path.is_empty() {
+                    let parent = path
+                        .iter()
+                        .rposition(|byte| *byte == b'/')
+                        .map_or(&b""[..], |slash| &path[..slash]);
+                    assert!(
+                        seen.contains(parent),
+                        "child appeared before parent: {path:?}"
+                    );
+                }
+                assert!(seen.insert(path.clone()), "duplicate entry: {path:?}");
+            }
+            assert_eq!(paths.len(), 1 + 24 * 4);
+            assert!(!paths
+                .iter()
+                .any(|path| path.windows(4).any(|part| part == b"skip")));
+            scans.push((paths, ignored));
+        }
+        assert_eq!(scans[0], scans[1]);
+    }
+
+    #[test]
+    fn descriptor_scan_joins_parallel_producers_when_consumer_stops() {
+        let temp = crate::test_support::tempdir().unwrap();
+        for index in 0..12 {
+            let directory = temp.path().join(format!("d{index:02}"));
+            fs::create_dir(&directory).unwrap();
+            for file in 0..1200 {
+                fs::write(directory.join(format!("f{file:04}")), b"").unwrap();
+            }
+        }
+        let root = Arc::new(Root::from_directory(File::open(temp.path()).unwrap()).unwrap());
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = scan_descriptor(
+                root,
+                b"",
+                None,
+                false,
+                false,
+                &[],
+                false,
+                &mut |_| anyhow::bail!("stop scan"),
+                &mut |_| Ok(()),
+                &mut |_| {},
+            );
+            tx.send(result.map_err(|error| error.to_string())).unwrap();
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("scan producers did not stop after consumer error");
+        assert_eq!(result.unwrap_err(), "stop scan");
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_descriptor_scans_finish_with_backpressured_directory_results() {
+        let temp = crate::test_support::tempdir().unwrap();
+        for index in 0..16 {
+            let directory = temp.path().join(format!("d{index:02}"));
+            fs::create_dir(&directory).unwrap();
+            for file in 0..1100 {
+                fs::write(directory.join(format!("f{file:04}")), b"").unwrap();
+            }
+        }
+        let root = Arc::new(Root::from_directory(File::open(temp.path()).unwrap()).unwrap());
+        let (tx, rx) = mpsc::channel();
+        let mut threads = Vec::new();
+        for _ in 0..3 {
+            let root = root.clone();
+            let tx = tx.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut count = 0;
+                let mut warnings = Vec::new();
+                let result = scan_descriptor(
+                    root,
+                    b"",
+                    None,
+                    false,
+                    false,
+                    &[],
+                    false,
+                    &mut |batch| {
+                        count += batch.len();
+                        std::thread::sleep(Duration::from_millis(2));
+                        Ok(())
+                    },
+                    &mut |_| Ok(()),
+                    &mut |warning| warnings.push(warning),
+                );
+                tx.send((result.map_err(|error| error.to_string()), count, warnings))
+                    .unwrap();
+            }));
+        }
+        drop(tx);
+        for _ in 0..3 {
+            let (result, count, warnings) = rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("parallel scans stalled under backpressure");
+            result.unwrap();
+            assert_eq!(count, 1 + 16 * 1101);
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
     }
 
     #[test]
