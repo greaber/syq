@@ -134,6 +134,7 @@ pub struct Opts {
     pub links: bool,
     pub perms: bool,
     pub hardlinks: bool,
+    pub sparse: bool,
     pub inode_preservation: crate::inode_metadata::Selection,
     hardlink_completions: Mutex<std::collections::HashMap<usize, Option<(u64, u64)>>>,
     pub devices: bool,
@@ -407,6 +408,7 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
             crtimes: args.crtimes,
             open_noatime: args.open_noatime || args.atimes > 1,
         },
+        args.sparse,
         false,
     )?;
     Ok(connection)
@@ -415,12 +417,14 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
 fn configure_preservation(
     connection: &mut dyn Conn,
     selection: crate::inode_metadata::Selection,
+    sparse: bool,
     destination: bool,
 ) -> Result<()> {
-    if selection.any() || selection.open_noatime {
+    if selection.any() || selection.open_noatime || sparse {
         ok(
             connection.call(Request::ConfigurePreservation {
                 selection,
+                sparse,
                 destination,
             })?,
             "configure inode metadata preservation",
@@ -536,6 +540,7 @@ fn small_copy_eligible(
         && args.atimes == 0
         && !args.crtimes
         && !args.open_noatime
+        && !args.sparse
         && !args.hardlinks
         && !args.delete
         && !args.update
@@ -1508,6 +1513,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         links: args.links,
         perms: args.perms,
         hardlinks: args.hardlinks,
+        sparse: args.sparse,
         inode_preservation: crate::inode_metadata::Selection {
             acls: args.acls,
             xattrs: args.xattrs,
@@ -1583,7 +1589,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     };
     if opts.inode_preservation.crtimes {
-        configure_preservation(&mut *dst_ctl, opts.inode_preservation, true)?;
+        configure_preservation(&mut *dst_ctl, opts.inode_preservation, opts.sparse, true)?;
     }
     if debug() {
         crate::output::diagnostic!(
@@ -1829,8 +1835,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             continue;
                         }
                     };
-                    configure_preservation(&mut *src, opts.inode_preservation, false)?;
-                    configure_preservation(&mut *dst, opts.inode_preservation, true)?;
+                    configure_preservation(&mut *src, opts.inode_preservation, opts.sparse, false)?;
+                    configure_preservation(&mut *dst, opts.inode_preservation, opts.sparse, true)?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let mut worker = Worker {
                         id,

@@ -75,6 +75,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
 | `--preserve <FEATURE>` | Preserve selected filesystem metadata or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- times: Preserve modification times (already the default for named destinations)<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve Linux POSIX ACLs and permission bits<br>- xattrs: Preserve Linux extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination |
 | `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
+| `--sparse` | Turn written zero ranges into sparse holes |
 
 <a id="integrity-checking"></a>
 

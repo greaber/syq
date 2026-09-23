@@ -4629,3 +4629,78 @@ fn registered_fifo_keeps_identity_checks_without_connecting_a_writer() {
         "worker accepted a replaced FIFO: {response:?}"
     );
 }
+
+#[test]
+fn sparse_identity_conditioned_publication_keeps_holes_and_existing_inode() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let target = directory.path().join("target");
+    fs::write(&target, b"old destination").unwrap();
+    fs::hard_link(&target, directory.path().join("alias")).unwrap();
+    let before = fs::metadata(&target).unwrap();
+    let mut operations = destination_ops(directory.path());
+    operations.sparse = true;
+    operations.set_hash_policy(crate::hashing::HashPolicy::default());
+    let copy_id = [47; 16];
+    let mut data = vec![0; 8 * 1024 * 1024 + 79];
+    data[4096..8192].fill(37);
+    operations
+        .prepare(
+            PartialTarget {
+                path: b"target",
+                id: &copy_id,
+                guard: None,
+            },
+            PrepareOptions {
+                size: data.len() as u64,
+                inplace: false,
+                mode: 0o600,
+                attempt: 0,
+                create_if_missing: true,
+            },
+        )
+        .unwrap();
+    operations
+        .write_range(
+            PartialTarget {
+                path: b"target",
+                id: &copy_id,
+                guard: None,
+            },
+            false,
+            0,
+            0,
+            [0; 32],
+            &data,
+        )
+        .unwrap();
+    operations
+        .finalize(
+            b"target",
+            false,
+            &copy_id,
+            &Meta {
+                inode_metadata: None,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            0,
+            TargetMutation {
+                condition: TargetCondition::Matches {
+                    dev: before.dev(),
+                    ino: before.ino(),
+                },
+                guard: None,
+            },
+        )
+        .unwrap();
+    File::open(&target).unwrap().sync_all().unwrap();
+    let after = fs::metadata(&target).unwrap();
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(after.len(), data.len() as u64);
+    assert!(after.blocks() * 512 < after.len() / 4);
+    assert_eq!(fs::read(&target).unwrap(), data);
+    assert_eq!(fs::read(directory.path().join("alias")).unwrap(), data);
+}

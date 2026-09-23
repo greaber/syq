@@ -908,6 +908,7 @@ fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
             && archive.atimes == 0
             && !archive.crtimes
             && !archive.open_noatime
+            && !archive.sparse
     );
     let mut acls = Args::try_parse_from(["syq", "-A", "source", "destination"]).unwrap();
     acls.normalize();
@@ -915,6 +916,7 @@ fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
     let native = parse_native_copy(&argv(&[
         "--preserve=hardlinks,acls,xattrs,atimes,crtimes",
         "--open-noatime",
+        "--sparse",
         "source",
         "--into",
         "destination",
@@ -928,6 +930,7 @@ fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
             && native.atimes == 1
             && native.crtimes
             && native.open_noatime
+            && native.sparse
     );
     for option in [
         "--preserve=acls",
@@ -935,6 +938,7 @@ fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
         "--preserve=atimes",
         "--preserve=crtimes",
         "--open-noatime",
+        "--sparse",
     ] {
         for route in [
             vec![option, "--src-fd=0", "--as", "destination"],
@@ -944,7 +948,8 @@ fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
             let message = error.to_string();
             assert!(
                 message.contains("named filesystem")
-                    || (option == "--open-noatime" && message.contains("not supported")),
+                    || (matches!(option, "--open-noatime" | "--sparse")
+                        && message.contains("not supported")),
                 "{error:#}"
             );
         }

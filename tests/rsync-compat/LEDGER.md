@@ -12,8 +12,8 @@ Configured command prefix: `syq rsync`.
 | Classification | Tests |
 |---|---:|
 | conformance | 17 |
-| adapted | 26 |
-| unsupported | 125 |
+| adapted | 27 |
+| unsupported | 124 |
 | out-of-scope | 183 |
 | unassessed | 0 |
 
@@ -62,6 +62,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | security | `symlink-race-relative-dest` | pass | Compatible | unmodified upstream | platform=linux,macos; run-as=root; root; a second uid; symlinks | The receiver refuses an attacker-owned symlink in an operator-named relative destination path, retains the selected directory, and continues to follow a root-owned administrative link. |
 | security | `symlink-race-source` | pass | Compatible | unmodified upstream | platform=linux,macos; symlinks; C compiler; atomic or three-rename path swapping | A raced source parent cannot make SYQ read file contents from outside the source tree. |
 | source-mapping | `duplicates` | pass | Compatible | unmodified upstream | platform=linux,macos; symlinks | Exactly repeated source operands are scanned and copied once while retaining multi-source destination placement. |
+| sparse | `sparse` | pass | Compatible | invocation adaptation (sparse-syq-cli) | platform=linux,macos; sparse filesystem | Keep all upstream byte/allocation assertions; omit --no-sparse because sparse mode is already off by default. |
 | special-files | `nested-socket-specials` | pass | Compatible | unmodified upstream | platform=linux,macos; Unix-domain sockets | Archive mode handles a nested socket without losing ordinary files; macOS reports and skips the socket because it has no confined socket-node creation primitive. |
 | symlinks | `links` | pass | Compatible | subset adaptation (links-preserve-subset) | platform=linux,macos; symlinks | -l preserves both file and directory symlinks several levels deep; unsupported -L and -k cases are omitted. |
 | symlinks | `symlink-ignore` | pass | Compatible | unmodified upstream | platform=linux,macos; symlinks | Without -l/-L/-a, omit symlinks while copying referent files. |
@@ -198,7 +199,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `safe-links-unsafe-def` | `unsupported-transfer-mode` |
 | `sender-remove-source-relative-anchor` | `unsupported-relative` |
 | `sender-remove-source-root-anchor` | `unsupported-relative` |
-| `sparse` | `unsupported-transfer-mode` |
 | `stop-time` | `unsupported-transfer-mode` |
 | `symlink-dest-backupdir` | `unsupported-alt-dest` |
 | `symlink-dirlink-basis` | `unsupported-transfer-mode` |

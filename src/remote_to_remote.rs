@@ -990,6 +990,9 @@ fn run_remote(
     if args.xattrs {
         remote.push("--preserve=xattrs".into());
     }
+    if args.sparse {
+        remote.push("--sparse".into());
+    }
     if args.open_noatime || args.atimes > 1 {
         remote.push("--open-noatime".into());
     }

@@ -1009,6 +1009,7 @@ pub enum WireRequest<Data> {
     BindStream(Option<(DescriptorTicket, crate::descriptor_copy::Settings)>),
     ConfigurePreservation {
         selection: crate::inode_metadata::Selection,
+        sparse: bool,
         destination: bool,
     },
 }

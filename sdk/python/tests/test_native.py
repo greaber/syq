@@ -296,6 +296,7 @@ class NativeClientTests(unittest.TestCase):
             ignore_from="ignore.txt",
             preserve=["times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes"],
             open_noatime=True,
+            sparse=True,
             inplace=True,
             on_event=events.append,
         )
@@ -325,6 +326,7 @@ class NativeClientTests(unittest.TestCase):
             "--receiver-receipt", "--ignore", "--ignore-from",
             "--preserve", "times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes",
             "--open-noatime",
+            "--sparse",
             "--inplace",
         ):
             self.assertIn(expected, argv)

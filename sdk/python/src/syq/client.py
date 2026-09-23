@@ -631,6 +631,7 @@ def _copy_arguments(
     ignore_from: Selector | None,
     preserve: str | Iterable[str] | None,
     open_noatime: bool,
+    sparse: bool,
     inplace: bool,
     max_delete: int | None,
     integrity_checking: str | None = None,
@@ -761,6 +762,8 @@ def _copy_arguments(
             argv.extend(("--preserve", attribute))
     if open_noatime:
         argv.append("--open-noatime")
+    if sparse:
+        argv.append("--sparse")
     if inplace:
         argv.append("--inplace")
     max_delete = _nonnegative_integer(max_delete, option="--max-delete")
@@ -1243,6 +1246,7 @@ class Client:
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
         open_noatime: bool = False,
+        sparse: bool = False,
         inplace: bool = False,
         max_delete: int | None = None,
         on_event: Callable[[AutomationEvent], object] | None = None,
@@ -1303,6 +1307,7 @@ class Client:
             ignore_from=ignore_from,
             preserve=preserve,
             open_noatime=open_noatime,
+            sparse=sparse,
             inplace=inplace,
             max_delete=max_delete,
             allow_missing_placement=mapping is not None and not isinstance(mapping, (str, bytes, os.PathLike)),
@@ -1515,6 +1520,7 @@ class Client:
             ignore_from=None,
             preserve=None,
             open_noatime=False,
+            sparse=False,
             inplace=False,
             max_delete=None,
         )

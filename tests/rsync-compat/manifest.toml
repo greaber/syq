@@ -584,3 +584,16 @@ platforms = ["macos"]
 tags = ["local", "metadata", "birth-times"]
 requirements = ["settable birth times"]
 note = "Preserve the upstream file and directory birth-time assertions; omit only the rsync-specific -VV capability probe."
+
+[[tests]]
+name = "sparse"
+classification = "adapted"
+adaptation = "sparse-syq-cli"
+adaptation_kind = "invocation"
+area = "sparse"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux", "macos"]
+tags = ["local", "sparse"]
+requirements = ["sparse filesystem"]
+note = "Keep all upstream byte/allocation assertions; omit --no-sparse because sparse mode is already off by default."

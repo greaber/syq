@@ -49,6 +49,7 @@
         "ignore-from",
         "preserve",
         "open-noatime",
+        "sparse",
         "inplace",
         "s3-endpoint",
         "s3-region",

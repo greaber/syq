@@ -37,7 +37,8 @@ syq's comparison and reuse block size; see the [tuning table](tuning.md#transfer
 for its default and allowed range. Values outside that range are rejected.
 
 `-H` preserves hardlinks between selected regular files. Linux copies also support
-`-A` for POSIX ACLs and `-X` for extended attributes. See the
+`-A` for POSIX ACLs and `-X` for extended attributes. `-S` turns written zero
+ranges into sparse holes. See the
 [preservation rules and limits](reference.md#preserve-metadata).
 
 ## Unsupported features
@@ -45,7 +46,6 @@ for its default and allowed range. Values outside that range are rejected.
 | Feature | Options or syntax |
 |---|---|
 | Rsync filter rules | `--exclude`, `--include`, `--filter` |
-| Sparse files | `-S` |
 | Backup and alternate destination trees | `--backup`, `--backup-dir`, `--suffix`, `--link-dest`, `--compare-dest`, `--copy-dest` |
 | Following descendant links | `-L`, `--copy-links`, `--copy-unsafe-links`, `-k`, `--copy-dirlinks`, `-K`, `--keep-dirlinks` |
 | Link filtering or rewriting | `--safe-links`, `--munge-links` |

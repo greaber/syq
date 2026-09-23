@@ -1,0 +1,12 @@
+diff --git a/testsuite/sparse_test.py b/testsuite/sparse_test.py
+--- a/testsuite/sparse_test.py
++++ b/testsuite/sparse_test.py
+@@ -58,7 +58,7 @@
+ 
+ # --- a plain copy reproduces the content too (allocation is FS-defined) ------
+ rmtree(TODIR)
+-run_rsync('-a', '--no-sparse', f'{src}/', f'{TODIR}/')
++run_rsync('-a', f'{src}/', f'{TODIR}/')
+ assert_same(TODIR / deep, src / deep, label='no-sparse content')
+ 
+ print("sparse: -S preserves a deep hole; content correct with and without it")

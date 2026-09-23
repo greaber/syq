@@ -383,8 +383,23 @@ times. The source filesystem must report birth times and the destination must
 be macOS with a filesystem that permits setting them. Linux destinations reject
 this option before copying. It supports the same named filesystem routes and
 entry types as access-time preservation. Neither `-a` nor native defaults select
-it. Inode change time (`ctime`) and sparse allocation are not preserved by these
-options.
+it. Inode change time (`ctime`) cannot normally be restored.
+
+Use `--sparse` (rsync `-S`) to turn written zero ranges into holes on local or
+ordinary SSH filesystem copies. It applies to regular files, independently of
+metadata options, and is not included in `-a` or native defaults. It preserves
+bytes and length, not an exact source extent layout. Eligible local clones still
+use filesystem cloning; other writes skip zeros or clear old blocks into holes.
+The destination filesystem must support sparse files; ranged, resumed, and
+in-place writes also require hole punching. A failed hole operation makes the
+copy unsuccessful. Filesystem allocation units can limit the space reclaimed by
+in-place hole punches, especially with small comparison blocks. Unchanged files
+and reused blocks are not rewritten just to change their allocation. Descriptors, streams, S3, and command-restricted or
+receiving destinations reject this option.
+
+Sparse mode avoids full-size preallocation. Its fresh-destination capacity check
+still checks available inodes, but cannot predict required physical bytes from
+logical sizes; allocation can fail later if the destination fills up.
 
 ## Symlinks
 

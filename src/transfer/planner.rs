@@ -434,6 +434,7 @@ impl Planner<'_> {
         };
         Ok(Some(FreshCapacityAssessment {
             logical_bytes: plan.logical_bytes,
+            check_bytes: !self.opts.sparse,
             objects: plan.objects,
             available_bytes: info.available_bytes,
             available_inodes: info.available_inodes,
