@@ -79,14 +79,14 @@ fn automatic_worker_ceiling_does_not_reserve_hypothetical_descriptors() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn automatic_workers_can_start_above_64_from_the_cache() {
+fn legacy_saved_counts_are_ignored_and_left_untouched() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     let data = prng(5 * 1024 * 1024 + 123, 806);
     for file in ["one", "two"] {
         write(&t.path(&format!("source/{file}")), &data);
     }
-    for (label, limit, expected) in [("default", None, 80), ("capped", Some(72), 72)] {
+    for (label, limit, expected) in [("default", None, 16), ("capped", Some(72), 16)] {
         write(
             &t.path("tuning.json"),
             br#"{"paths":{"local>host|tcp":80}}"#,
@@ -134,14 +134,17 @@ fn automatic_workers_can_start_above_64_from_the_cache() {
             .run()
             .unwrap();
         assert_output_ok(&output);
-        assert!(
-            stderr_of(&output).contains(&format!(
-                "starting with {expected} connections remembered for this path"
-            )),
-            "{output:?}"
+        assert_eq!(
+            read(&t.path("tuning.json")),
+            br#"{"paths":{"local>host|tcp":80}}"#
         );
         let history =
             rusqlite::Connection::open(t.path(&format!("history-{label}.sqlite"))).unwrap();
+        let initial: u32 = history.query_row(
+            "SELECT json_extract(data,'$.data.workers') FROM events WHERE json_extract(data,'$.kind')='starting_count'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(initial, expected);
         let doubling: bool = history.query_row(
             "SELECT json_extract(data,'$.data.policy.startup_doubling') FROM events WHERE json_extract(data,'$.kind')='policy_start' ORDER BY sequence LIMIT 1",
             [], |row| row.get(0),
@@ -159,7 +162,7 @@ fn automatic_workers_can_start_above_64_from_the_cache() {
             .filter(|line| line.starts_with("connected "))
             .map(|line| line.split_whitespace().nth(1).unwrap().parse().unwrap())
             .collect();
-        assert!(ids.iter().any(|&id| id >= 64), "{label}: {observed}");
+        assert!(!ids.is_empty(), "{label}: {observed}");
         if let Some(limit) = limit {
             assert!(ids.iter().all(|&id| id < limit), "{label}: {observed}");
         }
@@ -1729,7 +1732,7 @@ fn disabling_tuning_cache_also_disables_history() {
 }
 
 #[test]
-fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
+fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() {
     let t = Tmp::new();
     // Exceed both Linux's 64 KiB and macOS's default 4 MiB batching
     // thresholds so the three-worker hint is also the actual starting count.
@@ -1768,12 +1771,24 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
         .query_row("SELECT source_fs FROM runs LIMIT 1", [], |row| row.get(0))
         .unwrap();
     assert!(fs.is_some(), "test filesystem did not provide an identity");
-    db.execute("UPDATE runs SET eligible=1,workers=3", [])
+    // Saved recommendations are misleading; only measurement totals count.
+    db.execute("UPDATE runs SET eligible=1,workers=99", [])
         .unwrap();
+    let mut totals = serde_json::json!({"observations":{"6":[250.0,5.0,2]},"consistent":true,"incompatible":false});
+    let mut seed_samples = |workers: usize| {
+        let rate = if workers == 2 { 99.0 } else { 100.0 };
+        totals["observations"][workers.to_string()] = serde_json::json!([rate * 5.0, 5.0, 2]);
+        db.execute(
+            "UPDATE runs SET eligible=2,summary=json_set(summary,'$.measurement_totals',json(?1),'$.measured_worker_counts',?2) WHERE id=1",
+            rusqlite::params![totals.to_string(),totals["observations"].as_object().unwrap().len() as i64],
+        )
+        .unwrap();
+    };
+    seed_samples(3);
     let copy_with_hint = |name: &str, controls: &[&str]| {
         // Even these small copies can complete a tuning comparison on a slow
         // host. Keep later results from superseding the seeded run under test.
-        db.execute("UPDATE runs SET eligible=0 WHERE id!=1", [])
+        db.execute("UPDATE runs SET lost=1 WHERE id!=1", [])
             .unwrap();
         copy(name, controls)
     };
@@ -1794,6 +1809,17 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
         &["--resource-limits", "workers=2"],
     ));
     assert!(startup_doubling(3));
+    let capped_incompatible: bool = db
+        .query_row(
+            "SELECT json_extract(summary,'$.measurement_totals.incompatible') FROM runs WHERE id=3",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !capped_incompatible,
+        "caps alone do not invalidate comparisons"
+    );
     let event: String = db
         .query_row(
             "SELECT data FROM events WHERE run=3 AND json_extract(data,'$.kind')='starting_count'",
@@ -1817,12 +1843,8 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     let event: serde_json::Value = serde_json::from_str(&event).unwrap();
     assert_eq!(event["data"]["workers"], 1);
     assert_eq!(event["data"]["reason"], "explicit");
-    // The same count becomes suitable for fine probes only with plateau evidence.
-    db.execute(
-        "UPDATE runs SET summary=json_set(summary,'$.discovery_complete',json('true')) WHERE id=1",
-        [],
-    )
-    .unwrap();
+    // Additional observations, not a saved discovery decision, establish a plateau.
+    seed_samples(2);
     assert_output_ok(&copy_with_hint("confirmed", &[]));
     let workers: i64 = db
         .query_row(
@@ -2113,4 +2135,26 @@ fn whole_file_progress_reaches_tuner_before_completion() {
             .unwrap();
         assert_eq!(bytes, 16 << 20, "progress was credited twice");
     }
+}
+
+/// Seed measurement totals under the context established by a real
+/// command. Tests must not depend on the implementation of opaque route tokens.
+pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) {
+    let db = rusqlite::Connection::open(cache.with_extension("history-v1.sqlite")).unwrap();
+    let id: i64 = db
+        .query_row("SELECT max(id) FROM runs", [], |r| r.get(0))
+        .unwrap();
+    db.execute("DELETE FROM events WHERE run=?1", [id]).unwrap();
+    db.execute(
+        "UPDATE runs SET status='success',eligible=2,workers=NULL,lost=0 WHERE id=?1",
+        [id],
+    )
+    .unwrap();
+    let totals = serde_json::json!({"observations":{workers.to_string():[500.0,5.0,2],(workers+1).to_string():[250.0,5.0,2]},
+        "consistent":true,"incompatible":false});
+    db.execute(
+        "UPDATE runs SET summary=json_set(summary,'$.measurement_totals',json(?1),'$.measured_worker_counts',2) WHERE id=?2",
+        rusqlite::params![totals.to_string(), id],
+    )
+    .unwrap();
 }

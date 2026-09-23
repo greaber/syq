@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod command;
+mod inference;
 #[cfg(test)]
 mod tests;
 pub(crate) use command::{command_for_help, run};
@@ -33,6 +34,7 @@ struct Writer {
     budget: u64,
     finished: bool,
     recommendation: Option<(usize, bool)>,
+    measurements: inference::RunEvidence,
     salt: [u8; 32],
 }
 
@@ -231,6 +233,7 @@ impl Recorder {
             budget,
             finished: false,
             recommendation: None,
+            measurements: Default::default(),
             salt,
         })));
         recorder.event("start", details);
@@ -289,9 +292,10 @@ impl Recorder {
         let sequence = state.sequence;
         state.sequence += 1;
         if state.pending.len() < MAX_PENDING {
-            state
-                .pending
-                .push(json!({"sequence":sequence,"elapsed_us":elapsed_us,"kind":kind,"data":data}));
+            let event =
+                json!({"sequence":sequence,"elapsed_us":elapsed_us,"kind":kind,"data":data});
+            state.measurements.push(&event);
+            state.pending.push(event);
         } else {
             state.lost += 1;
         }
@@ -316,11 +320,20 @@ impl Recorder {
         }
     }
 
+    pub(crate) fn starting_count(&self, key: &ContextKey, allow_route: bool) -> Option<Hint> {
+        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        inference::starting_count(&state.db, key, allow_route)
+            .ok()
+            .flatten()
+    }
+
+    #[cfg(test)]
     pub(crate) fn hint(&self, key: &ContextKey, allow_route: bool) -> Option<Hint> {
         let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         select_hint(&state.db, key, allow_route).ok().flatten()
     }
 
+    #[cfg(test)]
     pub(crate) fn recommend(&self, workers: usize, discovery_complete: bool) {
         self.0
             .lock()
@@ -364,6 +377,7 @@ impl Recorder {
     }
 }
 
+#[cfg(test)]
 fn select_hint(db: &Connection, key: &ContextKey, allow_route: bool) -> Result<Option<Hint>> {
     if let (Some(src), Some(dst)) = (&key.source_filesystem, &key.destination_filesystem) {
         let hint = db.query_row("SELECT id,workers,summary FROM runs WHERE route=?1 AND mode=?2 AND source_fs=?3 AND destination_fs=?4 AND status='success' AND eligible=1 AND workers>0 ORDER BY id DESC LIMIT 1",
@@ -436,8 +450,20 @@ impl Writer {
         success: bool,
         eligible: bool,
         workers: Option<usize>,
-        summary: Value,
+        mut summary: Value,
     ) -> Result<()> {
+        summary["measured_worker_counts"] = json!(self.measurements.measured_counts());
+        summary["measurement_totals"] = serde_json::to_value(&self.measurements)?;
+        let summary = serde_json::to_string(&summary)?;
+        let eligibility = if success && self.lost == 0 {
+            if summary.len() <= inference::MAX_SUMMARY && self.measurements.reusable() {
+                inference::MEASUREMENTS
+            } else {
+                i64::from(eligible && workers.is_some())
+            }
+        } else {
+            0
+        };
         // Pay at most one small lock wait for the entire final save. Once the
         // immediate transaction owns the writer lock, samples, context and the
         // recommendation commit together without per-statement busy waits.
@@ -453,9 +479,9 @@ impl Writer {
             "UPDATE runs SET status=?1,eligible=?2,workers=?3,summary=?4,lost=?5 WHERE id=?6",
             params![
                 if success { "success" } else { "failed" },
-                success && eligible && self.lost == 0 && workers.is_some(),
+                eligibility,
                 workers.map(|n| n as u32),
-                serde_json::to_string(&summary)?,
+                summary,
                 self.lost,
                 self.id
             ],

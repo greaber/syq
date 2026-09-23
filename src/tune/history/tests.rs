@@ -1,6 +1,6 @@
 use super::*;
 
-fn recorder(path: &Path) -> Recorder {
+pub(super) fn recorder(path: &Path) -> Recorder {
     Recorder::at(
         path,
         Instant::now(),
@@ -9,7 +9,7 @@ fn recorder(path: &Path) -> Recorder {
     )
     .unwrap()
 }
-fn key(destination: &str) -> ContextKey {
+pub(super) fn key(destination: &str) -> ContextKey {
     ContextKey {
         route: "route".into(),
         source_filesystem: Some("source".into()),
@@ -328,6 +328,27 @@ fn decisions_include_comparison_evidence_and_unapplied_candidates() {
 }
 
 #[test]
+fn opening_existing_history_needs_no_writer_lock() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let db = open(&path).unwrap();
+    // A released history has only the original indexes. Keep another writer
+    // active: opening it must not attempt a schema change over the old runs.
+    db.execute_batch(
+        "DROP INDEX IF EXISTS measured_filesystems;
+        DROP INDEX IF EXISTS measured_routes;
+        BEGIN IMMEDIATE;",
+    )
+    .unwrap();
+    let opened = open(&path);
+    db.execute_batch("ROLLBACK").unwrap();
+    assert!(
+        opened.is_ok(),
+        "opening history needed a write lock: {opened:?}"
+    );
+}
+
+#[test]
 fn concurrent_initialization_shares_one_identity_key() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
@@ -535,8 +556,8 @@ fn trace_records_inconclusive_upward_hold_without_claiming_a_plateau() {
     let end = events.last().unwrap();
     assert_eq!(end["data"]["completed_comparison"], true);
     assert_eq!(end["data"]["last_accepted"], 16);
-    assert_eq!(end["data"]["recommended"], 8);
-    assert_eq!(end["data"]["discovery_complete"], false);
+    assert!(end["data"].get("recommended").is_none());
+    assert!(end["data"].get("discovery_complete").is_none());
 }
 
 #[test]
@@ -637,5 +658,192 @@ fn network_scoped_hints_separate_known_networks_and_preserve_unknown_fallback() 
     assert_eq!(
         next.hint(&network_key(Some("home")), true).unwrap().workers,
         8
+    );
+}
+
+#[test]
+fn trace_clock_units_match_the_driver() {
+    for elapsed in [false, true] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let writer = recorder(&path);
+        let mut policy = super::super::Policy::new(8, 1, 64);
+        if elapsed {
+            policy.advance_time(Duration::ZERO, super::super::SAMPLE);
+        }
+        let trace =
+            super::super::trace::Trace::new(Some(writer.clone()), &policy, super::super::SAMPLE);
+        trace.end(&policy, false);
+        let events =
+            command::read_events(&open(&path).unwrap(), writer.0.lock().unwrap().id).unwrap();
+        let start = &events.iter().find(|e| e["kind"] == "policy_start").unwrap()["data"];
+        assert_eq!(
+            start["clock_unit"],
+            if elapsed {
+                "elapsed_sample_intervals"
+            } else {
+                "accepted_measurements"
+            }
+        );
+        assert_eq!(
+            start["upward_max_wait_ms"],
+            if elapsed { json!(30000) } else { Value::Null }
+        );
+    }
+}
+
+#[test]
+fn driver_excludes_draining_writers_and_the_first_interval_after_drain() {
+    use crate::tune::{Gate, Meter, Policy, State, WholeFile};
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    struct Progress {
+        history: Recorder,
+        sched: Arc<crate::sched::Sched>,
+        start: Instant,
+        excess: Mutex<Option<WholeFile>>,
+        drained: AtomicBool,
+    }
+    impl Meter for Progress {
+        fn history(&self) -> Option<Recorder> {
+            Some(self.history.clone())
+        }
+        fn files(&self) -> u64 {
+            0
+        }
+        fn set_active(&self, _: usize) {}
+        fn bytes(&self) -> u64 {
+            let elapsed = self.start.elapsed().as_secs_f64();
+            if elapsed >= 3.0 && !self.drained.swap(true, Relaxed) {
+                self.excess.lock().unwrap().take();
+            }
+            if elapsed >= 6.5 {
+                self.sched.abort();
+            }
+            (elapsed * 1_000_000.0) as u64
+        }
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let history = recorder(&path);
+    let sched = Arc::new(crate::sched::Sched::new(4 << 20, 32 << 20));
+    sched.push_file(crate::sched::tests::test_job(b"pending", 1 << 30));
+    sched.scan_done();
+    let gate = Gate::new(4);
+    for id in 0..4 {
+        gate.mark_ready(id);
+    }
+    let excess = gate.whole_file(3);
+    gate.set_active(2);
+    let mut policy = Policy::new(2, 1, 4);
+    policy.state = State::Explore {
+        from: 4,
+        base: 100_000.0,
+        direction: crate::tune::Direction::Down,
+    };
+    let progress = Arc::new(Progress {
+        history: history.clone(),
+        sched: sched.clone(),
+        start: Instant::now(),
+        excess: Mutex::new(Some(excess)),
+        drained: AtomicBool::new(false),
+    });
+    crate::tune::run(policy, gate, sched, progress, |_| {
+        panic!("workers already ready")
+    });
+    history.finish(true, false, None, json!({}));
+    let db = Connection::open(path).unwrap();
+    let events: Vec<Value> = db
+        .prepare("SELECT data FROM events ORDER BY sequence")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+        .collect();
+    let observations: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "observation")
+        .collect();
+    let first_settled = observations
+        .iter()
+        .position(|e| e["data"]["settled"] == true)
+        .unwrap();
+    assert!(first_settled >= 2);
+    assert!(observations[..=first_settled]
+        .iter()
+        .all(|e| e["data"]["usable"] == false));
+    assert!(observations[first_settled + 1..]
+        .iter()
+        .any(|e| e["data"]["usable"] == true));
+    let first_clean_id = observations[first_settled + 1]["data"]["observation"]
+        .as_u64()
+        .unwrap();
+    let decisions: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "sequential_evidence")
+        .collect();
+    assert!(
+        !decisions.is_empty(),
+        "clean observations must eventually permit a decision"
+    );
+    for decision in decisions {
+        let data = &decision["data"];
+        let end = data["ending_observation"].as_u64().unwrap();
+        let count = data["score"]["intervals"].as_u64().unwrap();
+        assert!(
+            end + 1 - count >= first_clean_id,
+            "decision used draining-writer evidence"
+        );
+    }
+}
+
+#[test]
+fn rejected_counter_interval_does_not_discard_the_next_clean_interval() {
+    use crate::tune::{Gate, Meter, Policy};
+    struct Progress {
+        history: Recorder,
+        sched: Arc<crate::sched::Sched>,
+        start: Instant,
+    }
+    impl Meter for Progress {
+        fn history(&self) -> Option<Recorder> {
+            Some(self.history.clone())
+        }
+        fn files(&self) -> u64 {
+            0
+        }
+        fn set_active(&self, _: usize) {}
+        fn bytes(&self) -> u64 {
+            let elapsed = self.start.elapsed().as_secs_f64();
+            if elapsed >= 5.5 {
+                self.sched.abort();
+            }
+            // A failed whole-file operation retracts its provisional credit.
+            (elapsed * 100_000.0) as u64 + if elapsed < 1.0 { 1_000_000 } else { 0 }
+        }
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let history = recorder(&path);
+    let sched = Arc::new(crate::sched::Sched::new(4 << 20, 32 << 20));
+    sched.push_file(crate::sched::tests::test_job(b"pending", 1 << 30));
+    sched.scan_done();
+    let gate = Gate::new(1);
+    gate.mark_ready(0);
+    let progress = Arc::new(Progress {
+        history: history.clone(),
+        sched: sched.clone(),
+        start: Instant::now(),
+    });
+    crate::tune::run(Policy::new(1, 1, 1), gate, sched, progress, |_| {
+        panic!("no new workers")
+    });
+    history.finish(true, false, None, json!({}));
+    let db = Connection::open(path).unwrap();
+    let statuses: Vec<String> = db.prepare("SELECT json_extract(data,'$.data.disposition') FROM events WHERE json_extract(data,'$.kind')='sample' ORDER BY sequence").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(statuses[0], "counter_regressed");
+    assert_eq!(
+        statuses[1], "warmup_excluded",
+        "clean interval must reach the sampler: {statuses:?}"
     );
 }

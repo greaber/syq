@@ -199,7 +199,7 @@ pub(super) fn read_run(db: &Connection, id: i64) -> Result<Value> {
                     r.get::<_, Option<u32>>(4)?,
                     r.get::<_, Option<String>>(5)?,
                     r.get::<_, i64>(6)?,
-                    r.get::<_, bool>(7)?,
+                    r.get::<_, i64>(7)? == 1,
                 ))
             },
         )

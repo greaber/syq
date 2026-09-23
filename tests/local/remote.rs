@@ -825,7 +825,7 @@ fn automatic_ssh_restores_workers_for_a_single_file_partial() {
         .run()
         .unwrap();
     assert_output_ok(&out);
-    assert!(stderr_of(&out).contains("starting with 8 connections remembered for this path"));
+    assert!(!stderr_of(&out).contains("connections remembered for this path"));
     assert_eq!(read(&t.path("dest/file")), content);
     assert!(partial.exists());
     let connected = fs::read_to_string(events)
@@ -1389,15 +1389,10 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
                     "{out:?}"
                 );
             }
-            if route != "local" && network != "other-network" {
-                let start = if network.is_empty() { 96 } else { remembered }.min(limit);
-                assert!(
-                    stderr_of(&out).contains(&format!(
-                        "starting with {start} connections remembered for this path"
-                    )),
-                    "{out:?}"
-                );
-            }
+            assert!(
+                !stderr_of(&out).contains("connections remembered for this path"),
+                "{out:?}"
+            );
             assert_eq!(read(&t.path(&label)), data);
             let observed = fs::read_to_string(&events).unwrap();
             let connected: Vec<_> = observed
