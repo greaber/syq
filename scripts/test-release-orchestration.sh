@@ -3,6 +3,9 @@
 # reporting.
 set -euo pipefail
 
+# Scope fixtures below supply their own events and overrides.
+unset SYQ_TEST_CHANGED_PATHS_FILE SYQ_CI_SCOPE_COMMIT SYQ_CI_DOCUMENTATION_ONLY
+
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 grep -F 'rust,sdks,macos,linux-arm64,conformance' \
   "$script_dir/../.github/workflows/release.yml" >/dev/null
@@ -333,7 +336,13 @@ expect_failure 'is not checked out' env \
 
 # Exercise dispatch identity, stale ref recovery, and exact-commit SDK gating.
 "$script_dir/test-generated-sdk-post-merge-ci.sh"
-python3 "$script_dir/test-release-test-inputs.py"
+# Exercise the nested fixtures under the environment that exposed the leak.
+# No GitHub token should be needed: all API interactions are fixture-owned.
+printf '%s\n' '{"schedule":"17 2 * * *"}' >"$work/nightly-event.json"
+GITHUB_EVENT_PATH="$work/nightly-event.json" GITHUB_EVENT_NAME=schedule \
+GITHUB_REPOSITORY=example/repo GITHUB_REF_NAME=master \
+GITHUB_WORKFLOW_REF=example/repo/.github/workflows/ci.yml@refs/heads/master \
+  python3 "$script_dir/test-release-test-inputs.py"
 
 # Build a clean disposable canonical checkout and serve every GitHub/registry
 # response from fixtures. The preflight must not create a tag or publication.
