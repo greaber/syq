@@ -12,8 +12,8 @@ Configured command prefix: `syq rsync`.
 | Classification | Tests |
 |---|---:|
 | conformance | 18 |
-| adapted | 29 |
-| unsupported | 120 |
+| adapted | 32 |
+| unsupported | 117 |
 | out-of-scope | 184 |
 | unassessed | 0 |
 
@@ -38,6 +38,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | file-selection | `files-from-depth` | pass | Compatible | subset adaptation (files-from-split) | platform=linux,macos | Deep line- and NUL-delimited --files-from selection agree; comment handling and unsupported filter-list cases are reported separately or omitted. |
 | file-selection | `files-from-path-clamp` | fail | Policy open | unmodified upstream | platform=linux,macos | SYQ rejects parent components instead of clamping them at the source root. |
 | file-selection | `size-filter` | pass | Compatible | unmodified upstream | platform=linux,macos | Apply --min-size and --max-size throughout a deep tree. |
+| hardlinks | `hardlinks` | pass | Compatible | subset adaptation (hardlinks-core-subset) | platform=linux,macos; hardlinks | Local fresh copies, delta updates, aliases across scan batches, and single-file/directory operands. Omit rsync debug/itemized output, alternate destinations and their checksum subcase; use a local invocation for the cross-batch case and force the range-copy path for the update. Retain all assertions within the selected cases. |
 | hardlinks | `hardlinks-deep` | pass | Compatible | unmodified upstream | platform=linux,macos; hard links | -H preserves cross-directory regular-file links; without -H, the destination names use independent inodes. |
 | metadata | `chgrp` | pass | Compatible | unmodified upstream | platform=linux,macos; POSIX groups; chgrp | Preserve a supplementary group with -g. |
 | metadata | `chown` | pass | Compatible | subset adaptation (chown-syq-cli) | platform=linux,macos; run-as=root; root; chown | Archive mode preserves varied numeric owners and groups on files and directories at depth; rsync-only --super and -H are removed. |
@@ -71,7 +72,9 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | symlinks | `symlink-ignore` | pass | Compatible | unmodified upstream | platform=linux,macos; symlinks | Without -l/-L/-a, omit symlinks while copying referent files. |
 | symlinks | `unsafe-links` | pass | Compatible | subset adaptation (unsafe-links-default) | platform=linux,macos; symlinks | Default -a preserves both in-tree and lexically escaping symlinks without following them; unsupported copy-links variants are omitted. |
 | update | `update` | pass | Compatible | subset adaptation (update-supported-subset) | platform=linux,macos; symlinks | -u skips a newer deep destination, updates an older one, and still replaces a type mismatch. |
+| xattrs | `xattrs` | pass | Compatible | subset adaptation (xattrs-core-subset) | platform=linux; Python xattr support; user xattr filesystem | Copy and reconcile user xattrs on files and directories, including an unchanged-content file and removal of stale values. Keep the initial upstream copy and full xattr comparison; omit alternate destinations, fake-super and their dependent cases. Replace the rsync capability probe and omit namespace filters and --super unnecessary for these user.* fixtures. |
 | xattrs | `xattrs-depth` | pass | Compatible | invocation adaptation (xattrs-depth-syq-cli) | platform=linux; Python xattr support; user xattr filesystem | User xattrs at every tree depth; replace the rsync capability probe and omit namespace filters and --super unnecessary for this user.* fixture. |
+| xattrs | `xattrs-hlink` | pass | Compatible | subset adaptation (xattrs-core-subset) | platform=linux; hardlinks; Python xattr support; user xattr filesystem | The same xattr copy/reconciliation assertions with -H and an additional hardlink. Keep the initial upstream copy and full xattr comparison; omit alternate destinations, fake-super and their dependent cases. Replace the rsync capability probe and omit namespace filters and --super unnecessary for these user.* fixtures. |
 
 ## Exclusion reasons
 
@@ -144,7 +147,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `filter-merge-symlink` | `unsupported-filters` |
 | `fuzzy` | `unsupported-transfer-mode` |
 | `fuzzy-basis` | `unsupported-transfer-mode` |
-| `hardlinks` | `unsupported-hardlinks` |
 | `itemize` | `unsupported-transfer-mode` |
 | `keep-dirlinks-rule` | `unsupported-transfer-mode` |
 | `keep-dirlinks-symlinked-dest` | `unsupported-transfer-mode` |
@@ -212,8 +214,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `write-batch-filter-injection` | `unsupported-batch` |
 | `write-batch-quoting` | `unsupported-batch` |
 | `xattr-wire-cap` | `unsupported-xattrs` |
-| `xattrs` | `unsupported-xattrs` |
-| `xattrs-hlink` | `unsupported-xattrs` |
 
 ## Rsync-specific internals, protocol, and services
 

@@ -339,6 +339,28 @@ impl FsOps {
             // An interrupted non-inplace run must not strand this job's
             // adjacent sidecar when the retry switches to --inplace.
             let _ = with_rooted_partial(&target, copy_id, |partial, _| target.root.unlink(partial));
+            if self
+                .held_basis
+                .as_ref()
+                .is_some_and(|held| held.location == target.location() && held.copy_id == *copy_id)
+            {
+                // The coordinator reuses hashes from this inode. Never resize
+                // or write a replacement name using that earlier comparison.
+                let held = self.held_basis.take().unwrap();
+                let metadata = held.file.metadata()?;
+                let file = target.root.open_regular_read_write(&target.relative)?;
+                require_open_target(
+                    &file,
+                    &target.label,
+                    TargetCondition::Matches {
+                        dev: metadata.dev(),
+                        ino: metadata.ino(),
+                    },
+                )?;
+                self.set_copy_length(&file, size)?;
+                self.cache_file(target.location(), attempt, false, file);
+                return Ok(Preparation::default());
+            }
             for _ in 0..8 {
                 match target.root.metadata_optional(&target.relative)? {
                     Some(metadata) if metadata.is_file() => {
@@ -1097,6 +1119,13 @@ impl FsOps {
             drop(prepared);
             self.set_copy_length(&d, size)?;
         }
+        if inplace {
+            // Creation can return a writable descriptor for a read-only mode.
+            // Keep it for the immediately following Finalize: reopening the
+            // completed file for writing would fail. Finalize removes every
+            // attempt for this path, so CopyLocal needs no wire attempt field.
+            self.cache_file(target.location(), 0, false, d);
+        }
         _copy.bytes(size);
         Ok(CopyLocalOutcome::Copied)
     }
@@ -1130,7 +1159,7 @@ impl FsOps {
         if outcome == CopyLocalOutcome::Copied {
             _copy.bytes(size);
         }
-        // Like Linux offload, leave no writer-cache entry. CopyLocal has no
+        // Like staged Linux offload, leave no writer-cache entry. CopyLocal has no
         // attempt field; finalize opens and checks the named partial normally.
         Ok(outcome)
     }

@@ -633,3 +633,42 @@ platforms = ["linux"]
 tags = ["local", "metadata", "acls"]
 requirements = ["setfacl", "getfacl", "POSIX ACL filesystem"]
 note = "Replace stale destination ACL grants on a directory without owner-read permission, including when source directory listing fails. Omit only the rsync-specific -VV capability probe."
+
+[[tests]]
+name = "hardlinks"
+classification = "adapted"
+adaptation = "hardlinks-core-subset"
+adaptation_kind = "subset"
+area = "hardlinks"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux", "macos"]
+tags = ["local", "metadata", "hardlinks"]
+requirements = ["hardlinks"]
+note = "Local fresh copies, delta updates, aliases across scan batches, and single-file/directory operands. Omit rsync debug/itemized output, alternate destinations and their checksum subcase; use a local invocation for the cross-batch case and force the range-copy path for the update. Retain all assertions within the selected cases."
+
+[[tests]]
+name = "xattrs"
+classification = "adapted"
+adaptation = "xattrs-core-subset"
+adaptation_kind = "subset"
+area = "xattrs"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "xattrs"]
+requirements = ["Python xattr support", "user xattr filesystem"]
+note = "Copy and reconcile user xattrs on files and directories, including an unchanged-content file and removal of stale values. Keep the initial upstream copy and full xattr comparison; omit alternate destinations, fake-super and their dependent cases. Replace the rsync capability probe and omit namespace filters and --super unnecessary for these user.* fixtures."
+
+[[tests]]
+name = "xattrs-hlink"
+classification = "adapted"
+adaptation = "xattrs-core-subset"
+adaptation_kind = "subset"
+area = "xattrs"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "hardlinks"]
+requirements = ["hardlinks", "Python xattr support", "user xattr filesystem"]
+note = "The same xattr copy/reconciliation assertions with -H and an additional hardlink. Keep the initial upstream copy and full xattr comparison; omit alternate destinations, fake-super and their dependent cases. Replace the rsync capability probe and omit namespace filters and --super unnecessary for these user.* fixtures."
