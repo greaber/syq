@@ -1253,6 +1253,14 @@ impl Planner<'_> {
         let Some(mut buffered) = self.buffer.take() else {
             return Ok(());
         };
+        if self.opts.hardlinks && self.opts.inode_preservation.acls {
+            super::hardlinks::validate_macos_acls(buffered.iter().flat_map(|m| &m.others).filter(
+                |p| {
+                    self.opts.max_size.is_none_or(|max| p.e.size <= max)
+                        && self.opts.min_size.is_none_or(|min| p.e.size >= min)
+                },
+            ))?;
+        }
         // Every claimant of each contested destination, as a group: the first
         // (from dst_seen) plus all the contested ones. The group is fine only
         // if at most one *distinct* file among them is not the destination

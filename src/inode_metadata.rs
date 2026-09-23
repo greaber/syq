@@ -59,6 +59,16 @@ pub(crate) struct MacAcl {
     pub entries: Vec<MacAce>,
 }
 
+impl MacAcl {
+    pub(crate) fn has_deletion_denial(&self) -> bool {
+        // Darwin ACL_EXTENDED_DENY, ACL_DELETE and ACL_ENTRY_ONLY_INHERIT.
+        // This is a structural support boundary, not a principal/ACL evaluator.
+        self.entries.iter().any(|entry| {
+            entry.tag == 2 && entry.permissions & (1 << 4) != 0 && entry.flags & (1 << 8) == 0
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MacAce {
     pub principal: [u8; 16],

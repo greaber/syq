@@ -330,6 +330,10 @@ allow/deny entries, UUID principals and inheritance flags, removing destination
 entries absent from the source. It does not translate principal names or UUIDs
 between hosts. Both endpoints must use the same ACL model; Linux↔macOS ACL
 conversion is rejected before destination setup.
+Selecting multiple hardlink names with a macOS ACL containing a deletion-denying
+entry is rejected before copying: that ACL prevents publishing the additional
+names. Copy those names independently without `-H` to preserve their ACLs.
+Copying just one selected name remains supported, including with `-H`.
 
 Xattr preservation copies names and binary values, including empty values,
 and removes destination-only attributes within the selected namespace scope.

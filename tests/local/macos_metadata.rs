@@ -333,28 +333,73 @@ fn an_acl_denying_deletion_can_be_published() {
 }
 
 #[test]
-fn hardlinks_with_deletion_denial_can_be_published() {
+fn hardlinks_with_deletion_denial_are_rejected_before_copying() {
     let t = Tmp::new();
     write(&t.path("src/one"), b"protected content");
     fs::hard_link(t.path("src/one"), t.path("src/two")).unwrap();
     chmod(&t.path("src/one"), &["+a", "everyone deny delete"]);
     let expected = acl(&t.path("src/one"));
-    let output = compat_command()
-        .args(["-aHA", &t.s("src/"), &t.s("dst")])
+    chmod(&t.path("src/one"), &["-N"]);
+    for options in [&["-aHA"][..], &["-naHA"], &["-aHA", "--inplace"]] {
+        write(&t.path("existing/one"), b"old one");
+        write(&t.path("existing/two"), b"old two");
+        for destination in ["fresh", "existing"] {
+            chmod(&t.path("src/one"), &["+a", "everyone deny delete"]);
+            let output = compat_command()
+                .args(options)
+                .args([&t.s("src/"), &t.s(destination)])
+                .run()
+                .unwrap();
+            let source_acl = acl(&t.path("src/one"));
+            chmod(&t.path("src/one"), &["-N"]);
+            // Clear unexpected copied ACLs before assertions so a regression
+            // cannot leave deletion-protected fixtures on the runner.
+            for name in ["one", "two"] {
+                let path = t.path(&format!("{destination}/{name}"));
+                if path.exists() {
+                    chmod(&path, &["-N"]);
+                }
+            }
+            assert_eq!(source_acl, expected);
+            assert!(!output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("cannot preserve hardlinks with a macOS ACL that denies deletion"),
+                "{output:?}"
+            );
+        }
+        assert!(!t.path("fresh").exists());
+        assert_eq!(read(&t.path("existing/one")), b"old one");
+        assert_eq!(read(&t.path("existing/two")), b"old two");
+    }
+    // One selected name is safe, even if the inode has other source names.
+    chmod(&t.path("src/one"), &["+a", "everyone deny delete"]);
+    let single = compat_command()
+        .args(["-aHA", &t.s("src/one"), &t.s("single")])
         .run()
         .unwrap();
-    let copied = t.path("dst/one").exists().then(|| acl(&t.path("dst/one")));
+    let single_acl = t.path("single").exists().then(|| acl(&t.path("single")));
+    let independent = compat_command()
+        .args(["-aA", &t.s("src/"), &t.s("independent")])
+        .run()
+        .unwrap();
+    let independent_acls: Vec<_> = ["one", "two"]
+        .map(|name| t.path(&format!("independent/{name}")))
+        .iter()
+        .map(|path| path.exists().then(|| acl(path)))
+        .collect();
     chmod(&t.path("src/one"), &["-N"]);
-    // Clearing the representative also clears any temporary follower alias.
-    for name in ["dst/one", "dst/two"] {
+    for name in ["single", "independent/one", "independent/two"] {
         if t.path(name).exists() {
             chmod(&t.path(name), &["-N"]);
         }
     }
-    assert_output_ok(&output);
-    assert_eq!(copied, Some(expected));
-    assert_eq!(
-        fs::metadata(t.path("dst/one")).unwrap().ino(),
-        fs::metadata(t.path("dst/two")).unwrap().ino()
+    assert_output_ok(&single);
+    assert_eq!(single_acl, Some(expected.clone()));
+    assert_output_ok(&independent);
+    assert_eq!(independent_acls, vec![Some(expected); 2]);
+    assert_ne!(
+        fs::metadata(t.path("independent/one")).unwrap().ino(),
+        fs::metadata(t.path("independent/two")).unwrap().ino()
     );
 }
