@@ -110,19 +110,39 @@ mod platform {
     fn missing(e: &io::Error) -> bool {
         matches!(e.raw_os_error(), Some(libc::ENODATA | libc::ENOTSUP))
     }
+    // Most listings and ACL values are tiny. Avoid allocating and zeroing the
+    // Linux maximum for every lookup; retry large values at the fixed limit.
+    fn read_bytes(mut read: impl FnMut(*mut libc::c_void, usize) -> isize) -> io::Result<Vec<u8>> {
+        let mut small = [0u8; 256];
+        let count = read(small.as_mut_ptr().cast(), small.len());
+        if count >= 0 {
+            return Ok(small[..count as usize].to_vec());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ERANGE) {
+            return Err(error);
+        }
+        let mut bytes = Vec::<u8>::with_capacity(ATTRIBUTE_LIMIT);
+        let count = read(bytes.as_mut_ptr().cast(), ATTRIBUTE_LIMIT);
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: listxattr/getxattr initialize exactly the returned byte count
+        // on success, bounded by the supplied buffer length.
+        unsafe { bytes.set_len(count as usize) };
+        // Captured values live in the scan plan; retain only their actual size.
+        bytes.shrink_to_fit();
+        Ok(bytes)
+    }
     fn names(file: &File) -> Result<Vec<Vec<u8>>> {
         let path = handle(file);
-        let mut bytes = vec![0; ATTRIBUTE_LIMIT];
-        let count =
-            unsafe { libc::listxattr(path.as_ptr(), bytes.as_mut_ptr().cast(), bytes.len()) };
-        if count < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ENOTSUP) {
-                return Ok(Vec::new());
-            }
-            return Err(error).context("list extended attributes");
-        }
-        bytes.truncate(count as usize);
+        let bytes = match read_bytes(|buffer, len| unsafe {
+            libc::listxattr(path.as_ptr(), buffer.cast(), len)
+        }) {
+            Ok(bytes) => bytes,
+            Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("list extended attributes"),
+        };
         let mut names = bytes
             .split(|b| *b == 0)
             .filter(|n| !n.is_empty())
@@ -134,27 +154,13 @@ mod platform {
     fn get(file: &File, name: &[u8]) -> Result<Option<Vec<u8>>> {
         let path = handle(file);
         let name = CString::new(name)?;
-        let mut value = vec![0; ATTRIBUTE_LIMIT];
-        let count = unsafe {
-            libc::getxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                value.as_mut_ptr().cast(),
-                value.len(),
-            )
-        };
-        if count < 0 {
-            let error = io::Error::last_os_error();
-            if missing(&error) {
-                return Ok(None);
-            }
-            return Err(error).with_context(|| format!("read attribute {:?}", name));
+        match read_bytes(|buffer, len| unsafe {
+            libc::getxattr(path.as_ptr(), name.as_ptr(), buffer, len)
+        }) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if missing(&error) => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("read attribute {:?}", name)),
         }
-        value.truncate(count as usize);
-        // These values live in the scan plan. Do not retain a 64 KiB read
-        // buffer for every tiny ACL or attribute on a large source tree.
-        value.shrink_to_fit();
-        Ok(Some(value))
     }
     fn set(file: &File, name: &[u8], value: Option<&[u8]>) -> Result<()> {
         // Avoid changing ctime or invoking security hooks for identical values.
@@ -197,8 +203,12 @@ mod platform {
         }
         let acls = if selection.acls && !before.file_type().is_symlink() {
             Some(PosixAcls {
-                access: get(file, ACCESS)?,
-                default: if before.is_dir() {
+                access: if attribute_names.iter().any(|name| name == ACCESS) {
+                    get(file, ACCESS)?
+                } else {
+                    None
+                },
+                default: if before.is_dir() && attribute_names.iter().any(|name| name == DEFAULT) {
                     get(file, DEFAULT)?
                 } else {
                     None
