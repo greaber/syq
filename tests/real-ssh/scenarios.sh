@@ -961,7 +961,7 @@ ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" 
 
 printf 'case: expression selection on source, destination, and local coordinators\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/expressions/sub; printf selected > /tmp/syq-real-ssh/expressions/sub/keep; printf x > /tmp/syq-real-ssh/expressions/sub/tiny'
-for coordinator in source destination local; do
+for coordinator in src dst local; do
     syq cp --from source --srcs-in /tmp/syq-real-ssh/expressions \
         --to destination --into "/tmp/syq-real-ssh/expressions-$coordinator" \
         --coordinate-at "$coordinator" --no-progress \
