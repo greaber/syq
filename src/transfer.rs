@@ -2555,14 +2555,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let tuning_key = (autotune && args.tuning_options.is_none())
             .then(|| tune::network_path_key(&src_ep, &dst_ep))
             .flatten();
-        let remembered_start = tuning_key
-            .as_deref()
-            .and_then(tune::cached)
-            .map(|remembered| remembered.min(args.automatic_worker_limit()));
-        if let Some(remembered) = remembered_start {
-            args.connections = remembered;
-            gate.set_active(remembered);
-        }
         let mut selected_history = None;
         if let Some(history) = progress.tuning_history.get() {
             let key = tune::history::context_key(
@@ -2587,15 +2579,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 "destination_type":destination_filesystem.as_ref().map(|fs|&fs.kind)}),
             );
             let hint = (autotune && args.tuning_options.is_none())
-                .then(|| history.hint(&key, src_ep.is_remote() || dst_ep.is_remote()))
+                .then(|| history.starting_count(&key, src_ep.is_remote() || dst_ep.is_remote()))
                 .flatten();
             if let Some(hint) = &hint {
                 args.connections = hint.workers.min(args.automatic_worker_limit());
                 gate.set_active(args.connections);
             }
             history.event("starting_count", serde_json::json!({"workers":args.connections,
-                "reason":if hint.is_some() {"history"} else if remembered_start.is_some() {"legacy_cache"} else if autotune {"default"} else {"explicit"},
-                "hint":hint,"legacy_workers":remembered_start}));
+                "reason":if hint.is_some() {"history"} else if autotune {"default"} else {"explicit"},
+                "hint":hint}));
             selected_history = hint;
             *history_context.borrow_mut() = Some(key);
         }
@@ -2616,10 +2608,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     args.connections,
                     hint.run,
                     hint.matched
-                );
-            } else if let Some(remembered) = remembered_start {
-                crate::output::diagnostic!(
-                    "syq: auto-tuning: starting with {remembered} connections remembered for this path"
                 );
             }
         }
@@ -2831,7 +2819,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if transport_setup.is_none() {
         transport_setup = Some(finish_transport_setup(&mut args)?);
     }
-    let (all_remote_endpoints_use_tcp, tuning_key, refine_start) =
+    let (all_remote_endpoints_use_tcp, _tuning_key, refine_start) =
         transport_setup.expect("transport setup completed before releasing planned work");
     // The complete buffered scan lets small trees keep the same bounded
     // starting count as normal scheduling. Open TCP workers while the control
@@ -3342,54 +3330,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         deletions_blocked,
     };
 
-    if !aborted
-        && errors == 0
-        && !opts.dry_run
-        && scan_err.is_none()
-        && !collision
-        // A capped run can use an unrestricted hint, but cannot replace it.
-        && args
-            .resource_limits
-            .as_ref()
-            .is_none_or(|limits| limits.workers.is_none())
-    {
-        if let Some(policy) = tuned.as_ref().filter(|policy| policy.measured()) {
-            if args.tuning_options.is_none() {
-                if let (Some(history), Some(initial)) = (
-                    progress.tuning_history.get(),
-                    history_context.borrow().as_ref(),
-                ) {
-                    let final_key = tune::history::context_key(
-                        history,
-                        &src_ep,
-                        &dst_ep,
-                        source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
-                        destination_filesystem
-                            .as_ref()
-                            .map(|fs| fs.identity.as_str()),
-                        initial.mode.clone(),
-                    );
-                    if initial.route == final_key.route {
-                        history.recommend(policy.recommended(), policy.discovery_complete());
-                    }
-                }
-            }
-            // A TCP failure affects later connections but leaves earlier TCP
-            // workers alive, so a changed key means the measurements may mix
-            // transports. Such a run is useful live evidence but not a safe
-            // hint for either future pure path. A changed network context also
-            // invalidates the starting key.
-            if let Some(initial_key) = tuning_key.as_deref() {
-                let final_key = tune::network_path_key(&src_ep, &dst_ep);
-                if final_key.as_deref() == Some(initial_key) {
-                    tune::remember(initial_key, policy.recommended());
-                } else if debug() {
-                    crate::output::diagnostic!(
-                        "syq: auto-tuning: transport or network context changed during transfer; not updating cache"
-                    );
-                }
-            }
-        }
+    if let (Some(history), Some(initial)) = (
+        progress.tuning_history.get(),
+        history_context.borrow().as_ref(),
+    ) {
+        let final_key = tune::history::context_key(
+            history,
+            &src_ep,
+            &dst_ep,
+            source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
+            destination_filesystem
+                .as_ref()
+                .map(|fs| fs.identity.as_str()),
+            initial.mode.clone(),
+        );
+        history.event(
+            "learning_context",
+            serde_json::json!({
+                "consistent":initial.route == final_key.route,
+                "automatic":autotune && args.tuning_options.is_none()
+            }),
+        );
     }
 
     let elapsed = progress.start.elapsed().as_secs_f64();

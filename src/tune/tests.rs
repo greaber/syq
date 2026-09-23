@@ -148,18 +148,13 @@ fn uncached_start_doubles_until_the_ceiling_then_stops_coarse_search() {
 }
 
 #[test]
-fn unsuccessful_doubling_refines_immediately_then_uses_normal_backoff() {
+fn failed_doubling_restores_the_known_good_count_before_another_experiment() {
     let mut p = Policy::new(8, MIN, 64);
-    measure(&mut p, 80.0); // 8 -> 16
-    measure(&mut p, 160.0); // 16 -> 32
-    measure(&mut p, 150.0); // 32 hurt: try the 16..32 midpoint now
-    assert_eq!(p.n, 24);
+    measure(&mut p, 80.0);
+    measure(&mut p, 160.0);
+    measure(&mut p, 150.0);
+    assert_eq!(p.n, 16);
     assert_eq!(p.settled(), 16);
-    assert!(!p.startup_doubling);
-    measure(&mut p, 200.0); // 24 paid: refine the remaining 24..32 bracket
-    assert_eq!(p.n, 28);
-    measure(&mut p, 180.0); // 28 clearly hurts: return to 24 and wait
-    assert_eq!(p.n, 24);
     assert!(matches!(p.state, State::Hold));
     assert!(p.due[Direction::Up.index()] > p.tick);
 }
@@ -279,7 +274,7 @@ fn doubling_a_weak_start_reaches_the_plateau_before_premature_refinement() {
     let weak = measurements_to_plateau(Policy::new(8, MIN, 128));
     let premature_refinement = measurements_to_plateau(Policy::refine(8, MIN, 128));
     assert_eq!(weak, 4);
-    assert_eq!(premature_refinement, 9);
+    assert_eq!(premature_refinement, 5);
     assert_eq!(measurements_to_plateau(Policy::refine(64, MIN, 128)), 1);
 }
 
@@ -343,7 +338,7 @@ fn cached_successful_direction_continues_to_the_plateau() {
         measure(&mut p, rate);
         reached_full_rate |= p.settled() >= 32;
     }
-    assert_eq!(&p.history[..6], &[8, 10, 13, 17, 22, 29]);
+    assert_eq!(&p.history[..5], &[8, 10, 20, 40, 64]);
     assert!(reached_full_rate, "history {:?}", p.history);
 }
 
@@ -1002,7 +997,7 @@ fn downward_gain_requirement_preserves_clear_upward_loss_rollback() {
     measure(&mut policy, 100.0);
     measure(&mut policy, 94.0);
     assert_eq!(policy.n, 8);
-    for (score, keep_smaller) in [(101.0, true), (100.0, false), (95.0, false)] {
+    for (score, keep_smaller) in [(106.0, true), (101.0, false), (100.0, false), (95.0, false)] {
         let mut policy = Policy::refine(16, 1, 64);
         policy.record(16, 100.0);
         assert!(policy.begin(Direction::Down, 100.0));
@@ -1058,7 +1053,7 @@ fn recommendation_changes_only_with_justified_growth_or_reduction() {
     assert!(policy.begin(Direction::Down, 200.0));
     policy.activated();
     assert_eq!(policy.n, 24);
-    measure(&mut policy, 201.0);
+    measure(&mut policy, 220.0);
     assert_eq!(policy.settled(), 24);
     assert_eq!(policy.recommended(), 16); // Partial rollback must not save 24.
                                           // Allow earlier, slower lower-count measurements to age before retrying.
@@ -1066,7 +1061,7 @@ fn recommendation_changes_only_with_justified_growth_or_reduction() {
         if policy.settled() < 16 {
             break;
         }
-        let score = 300.0 - policy.n as f64;
+        let score = 1000.0 / policy.n as f64;
         measure(&mut policy, score);
     }
     assert!(policy.recommended() < 16);
@@ -1119,7 +1114,7 @@ fn floor_does_not_prevent_downward_recovery_after_growing() {
 
 #[test]
 fn downward_probe_requires_a_measured_speed_increase() {
-    for score in [94.0, 95.0, 99.0, 100.0, 100.001, 101.0] {
+    for score in [94.0, 95.0, 99.0, 100.0, 100.001, 101.0, 106.0] {
         let mut policy = Policy::refine(32, MIN, MAX);
         policy.record(32, 100.0);
         assert!(policy.begin(Direction::Down, 100.0));
@@ -1128,7 +1123,7 @@ fn downward_probe_requires_a_measured_speed_increase() {
         measure(&mut policy, score);
         assert_eq!(
             policy.settled(),
-            if score > 100.0 { lower } else { 32 },
+            if score * 0.95 > 100.0 { lower } else { 32 },
             "score={score}"
         );
         assert_eq!(policy.recommended(), policy.settled());
@@ -1225,4 +1220,64 @@ fn whole_file_reductions_wait_for_excess_writers_to_finish() {
     // Work in the retained configuration does not delay its own measurement.
     drop(kept);
     assert!(!gate.whole_files_draining(2));
+}
+
+#[test]
+fn ready_rollback_runs_even_when_there_is_no_work_for_another_probe() {
+    struct StopOnRestore(Arc<Sched>);
+    impl Meter for StopOnRestore {
+        fn bytes(&self) -> u64 {
+            0
+        }
+        fn files(&self) -> u64 {
+            0
+        }
+        fn set_active(&self, n: usize) {
+            if n == 16 {
+                self.0.abort();
+            }
+        }
+    }
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    let mut policy = Policy::new(8, 1, 64);
+    policy.n = 16;
+    policy.state = State::Hold;
+    let gate = Gate::new(8);
+    for id in gate.begin_warming(16) {
+        gate.mark_ready(id);
+    }
+    let deadline_sched = sched.clone();
+    let timeout = std::thread::spawn(move || {
+        for _ in 0..20 {
+            if deadline_sched.is_aborted() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        deadline_sched.abort();
+    });
+    let result = run(
+        policy,
+        gate,
+        sched.clone(),
+        Arc::new(StopOnRestore(sched)),
+        |_| panic!("rollback connections were already ready"),
+    );
+    timeout.join().unwrap();
+    assert_eq!(result.active(), 16);
+}
+
+#[test]
+fn elapsed_time_expires_backoff_without_accepted_measurements() {
+    let mut policy = Policy::refine(8, 1, 64);
+    measure(&mut policy, 100.0);
+    measure(&mut policy, 100.0);
+    policy.fails[Direction::Up.index()] = 20;
+    policy.due[Direction::Up.index()] = policy.tick + policy.retry_after(Direction::Up);
+    let due = policy.due[Direction::Up.index()];
+    assert!(due - policy.tick <= 12);
+    policy.advance_time(SAMPLE * due as u32, SAMPLE);
+    let before = policy.n;
+    policy.observe(100.0);
+    assert!(policy.n > before);
 }

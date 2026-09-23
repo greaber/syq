@@ -83,11 +83,13 @@ pagination at the original prefix.
 
 ## Remembered connection counts
 
-Syq remembers useful starting worker counts from successful filesystem copies
-and continues adjusting as the next copy runs. History is matched to the route,
-filesystems, transport, and copy settings when that information is available.
-A remembered count is a starting point, not a fixed limit or a promise of the
-best speed for a different workload.
+Syq chooses starting worker counts from measurements recorded by successful
+filesystem copies, then continues adjusting while copying. It matches history
+to the route, filesystems, transport, and copy settings when available. Starting
+choices are computed when a copy begins; earlier saved recommendations are not
+used. Short copies can contribute measurements without completing a tuning
+comparison. A starting choice is not a fixed limit or a promise of the best
+speed for a different workload.
 
 On macOS and Linux, remote-copy hints also distinguish local networks using
 available default-router hardware addresses, without requesting Wi-Fi location
@@ -97,15 +99,15 @@ IPv4 routers; macOS also reads IPv6 routers. If the network cannot be identified
 syq uses its existing route and filesystem matches. Hints without network
 context remain available for that fallback; a known network starts its own
 history. Local-copy hints are unchanged. A change of transport or observed
-network context during a copy prevents saving a new hint for its initial path.
+network context during a copy prevents reusing its measurements for the initial path.
 
-`--performance-tuning` bypasses remembered counts and does not save a new
-recommendation. `--resource-limits workers=N` caps the starting count while
-leaving recommendations unchanged.
+`--performance-tuning` bypasses automatic starting choices.
+`--resource-limits workers=N` caps the starting count and subsequent exploration.
 
-The older cache remains at `~/.cache/syq/tuning.json`, in its existing format.
-`SYQ_TUNING_CACHE` names another file; an empty value disables both this cache
-and the history below. `XDG_CACHE_HOME` changes their parent directory.
+The older `~/.cache/syq/tuning.json` file is left untouched for older binaries;
+its saved counts are no longer read or updated. `SYQ_TUNING_CACHE` still sets
+the base path for history; an empty value disables history and learning.
+`XDG_CACHE_HOME` changes the default parent directory.
 
 Syq can keep idle connections ready for later tuning changes. These connections
 and their helper processes still use resources, so the active worker count is
@@ -152,8 +154,7 @@ machine running the coordinator; run the inspection commands there.
 The default file is `~/.cache/syq/tuning.history-v1.sqlite`. When
 `SYQ_TUNING_CACHE` selects another file, the history uses that name with its
 extension replaced by `.history-v1.sqlite`. `SYQ_TUNING_HISTORY` selects an
-independent history file; an empty value disables history and its startup hints
-while leaving the older cache available. New database files are private to the
+independent history file; an empty value disables history and learning. New database files are private to the
 user. SQLite may create adjacent `-wal` and `-shm` files while in use.
 
 `SYQ_TUNING_HISTORY_SIZE` sets how much history to keep, default `128M`, minimum
@@ -161,8 +162,8 @@ user. SQLite may create adjacent `-wal` and `-shm` files while in use.
 
 Recording is best effort: an interrupted transfer or a storage error can leave
 gaps in the history. Copies still proceed when history cannot be saved.
-Clearing history also removes its startup hints; it leaves the older
-connection-count cache intact.
+Clearing history removes the measurements used for startup choices; it leaves
+the older connection-count cache intact.
 
 ## Filesystem tuning examples
 

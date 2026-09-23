@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it() {
+fn measured_history_seeds_auto_tuning_and_fixed_counts_preserve_legacy_cache() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     let cache = t.path("tuning.json");
@@ -42,11 +42,13 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
     };
     write(&t.path("src"), b"remembered start");
 
+    assert_output_ok(&run("seed", None, false));
+    tuning::seed_start_from_last_run(&cache, 1);
     let automatic = run("auto", None, false);
     assert_output_ok(&automatic);
     assert!(
         String::from_utf8_lossy(&automatic.stderr)
-            .contains("starting with 1 connections remembered for this path"),
+            .contains("starting with 1 connections from transfer"),
         "{}",
         String::from_utf8_lossy(&automatic.stderr)
     );
@@ -57,11 +59,13 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
         String::from_utf8_lossy(&automatic.stdout)
     );
 
+    assert_output_ok(&run("limited-seed", None, true));
+    tuning::seed_start_from_last_run(&cache, 1);
     let limited = run("limited", None, true);
     assert_output_ok(&limited);
     assert!(
         String::from_utf8_lossy(&limited.stderr)
-            .contains("starting with 1 connections remembered for this path"),
+            .contains("starting with 1 connections from transfer"),
         "{}",
         String::from_utf8_lossy(&limited.stderr)
     );

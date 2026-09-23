@@ -24,6 +24,8 @@ impl Trace {
             "maximum_samples":MAX_SAMPLES,"near_best_tolerance":NEAR_BEST_TOLERANCE,
             "step":STEP,"startup_step":STARTUP_STEP,"file_credit":FILE_CREDIT,"probe_every":PROBE_EVERY,
             "probe_backoff_max":PROBE_BACKOFF_MAX,"evidence_max_age":EVIDENCE_MAX_AGE,
+            "clock_unit":"elapsed_sample_intervals","upward_max_wait_ms":interval.as_millis()*12,
+            "downward_max_wait_ms":interval.as_millis()*24,"observation_ms":interval.as_millis().min(500),
             "collapse_fraction":0.5,"collapse_samples":2}));
         trace
     }
@@ -105,7 +107,7 @@ impl Trace {
         self.event(
             "decision",
             json!({"reason":reason,"trigger":trigger,"score":score,
-            "sample_ids":self.recent_samples,"before":before,"after":snapshot(policy),
+            "sample_ids":if trigger == "sequential_evidence" { Vec::new() } else {self.recent_samples.iter().copied().collect::<Vec<_>>()},"before":before,"after":snapshot(policy),
             "active":policy.active(),"requested":policy.n}),
         );
     }
@@ -166,7 +168,7 @@ impl Trace {
 
 fn snapshot(policy: &Policy) -> Value {
     json!({"requested":policy.n,"active":policy.active,"min":policy.min,"max":(policy.max != usize::MAX).then_some(policy.max),
-        "recommended":policy.recommended(),"startup_doubling":policy.startup_doubling,"state":policy.state,"points":policy.points,"measurement":policy.tick,
+        "recommended":policy.recommended(),"startup_doubling":policy.startup_doubling,"state":policy.state,"points":policy.points,"clock":policy.tick,"wall_clock":policy.wall_clock,
         "comparisons":policy.comparisons,"failed_probes":policy.fails,"next_probe":policy.due,
         "recent_best":policy.recent_best(),"historical_near_best_floor":policy.recent_best()*(1.0-NEAR_BEST_TOLERANCE)})
 }

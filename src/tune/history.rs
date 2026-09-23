@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod command;
+mod inference;
 #[cfg(test)]
 mod tests;
 pub(crate) use command::{command_for_help, run};
@@ -316,11 +317,20 @@ impl Recorder {
         }
     }
 
+    pub(crate) fn starting_count(&self, key: &ContextKey, allow_route: bool) -> Option<Hint> {
+        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        inference::starting_count(&state.db, key, allow_route)
+            .ok()
+            .flatten()
+    }
+
+    #[cfg(test)]
     pub(crate) fn hint(&self, key: &ContextKey, allow_route: bool) -> Option<Hint> {
         let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         select_hint(&state.db, key, allow_route).ok().flatten()
     }
 
+    #[cfg(test)]
     pub(crate) fn recommend(&self, workers: usize, discovery_complete: bool) {
         self.0
             .lock()
@@ -364,6 +374,7 @@ impl Recorder {
     }
 }
 
+#[cfg(test)]
 fn select_hint(db: &Connection, key: &ContextKey, allow_route: bool) -> Result<Option<Hint>> {
     if let (Some(src), Some(dst)) = (&key.source_filesystem, &key.destination_filesystem) {
         let hint = db.query_row("SELECT id,workers,summary FROM runs WHERE route=?1 AND mode=?2 AND source_fs=?3 AND destination_fs=?4 AND status='success' AND eligible=1 AND workers>0 ORDER BY id DESC LIMIT 1",

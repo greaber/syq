@@ -1,6 +1,6 @@
 use super::*;
 
-fn recorder(path: &Path) -> Recorder {
+pub(super) fn recorder(path: &Path) -> Recorder {
     Recorder::at(
         path,
         Instant::now(),
@@ -9,7 +9,7 @@ fn recorder(path: &Path) -> Recorder {
     )
     .unwrap()
 }
-fn key(destination: &str) -> ContextKey {
+pub(super) fn key(destination: &str) -> ContextKey {
     ContextKey {
         route: "route".into(),
         source_filesystem: Some("source".into()),

@@ -1,18 +1,14 @@
 //! Automatic tuning of the number of parallel workers / connections.
 //!
-//! When `-j` is not given, syq starts with a modest (or previously learned)
-//! count and measures. Progress (bytes, plus a small credit per completed
-//! file so small-file transfers count too) is sampled every few seconds; a
-//! worker count has been *measured* once the rate has stopped changing. A
-//! fresh start doubles while upward moves pay, then refines the measured
-//! bounds. Strongly matched plateau hints use smaller steps. An inconclusive
-//! increase keeps the larger count but pauses growth; a clearly worse move
-//! returns to the last good count and leaves a measured bound that later
-//! probes can refine one integer at a time. Independent per-direction aging
-//! and backoff decide when evidence is stale enough to probe again; when both
-//! directions are equally informative, upward wins the tie because transfer
-//! curves are usually concave or saturating and an extra connection therefore
-//! tends to have lower throughput regret than removing a useful one.
+//! Startup settings are inferred from recorded measurements when a transfer
+//! begins. Progress observations every 500 ms support sequential comparisons:
+//! clear gains and losses can be acted on without waiting for a plateau. The
+//! slower sampler supplies a baseline and resolves ambiguous comparisons.
+//! A fresh start doubles; strong gains restore doubling after a historical
+//! plateau proves obsolete. Failed experiments restore the previous count.
+//! Elapsed time bounds directional backoff (30 s up, 60 s down), independently
+//! of how many measurements stabilize. Upward wins ties; small inconclusive
+//! increases stay active while uncertain reductions restore the higher count.
 //!
 //! Candidate workers are connected while the current count remains active.
 //! They become active only when the whole candidate set is ready. Connected
@@ -26,17 +22,24 @@
 //! the decision state machine; both are pure and unit tested. [`Gate`] is the
 //! shared switch the workers consult; [`run`] is the driver.
 
+mod evidence;
 pub(crate) mod history;
 mod network;
 pub(crate) mod trace;
 
 use crate::conn::{DataTransport, Endpoint};
 use crate::sched::Sched;
-use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use serde::Deserialize;
+use serde::Serialize;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::io::Write;
+#[cfg(test)]
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -67,10 +70,8 @@ pub const STEP: f64 = 1.3;
 /// inconclusive increase within this tolerance of its own baseline keeps the
 /// larger count without continuing growth. Reductions require a measured gain.
 const NEAR_BEST_TOLERANCE: f64 = 0.05;
-/// Measurements in the hold phase between probes. Each failed probe in a
-/// direction doubles only that direction's wait (up to
-/// 2^PROBE_BACKOFF_MAX times), so a sharp knee — a disk that collapses one
-/// step up — isn't paid for every few measurements forever.
+/// Sampling intervals between probes. Directional backoff is bounded in
+/// elapsed time by retry_after; rejected observations still advance deadlines.
 const PROBE_EVERY: usize = 6;
 const PROBE_BACKOFF_MAX: u32 = 3;
 /// Old high-water measurements must not permanently prevent adaptation when
@@ -129,6 +130,7 @@ fn required_remaining_activity(rate: Option<f64>, workers: usize, sample: Durati
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg(test)]
 struct TuningCache {
     /// Legacy path+transport → last settled count. Keep the released format;
     /// filesystem-specific evidence lives in the separate history store.
@@ -205,6 +207,7 @@ fn cache_path() -> Option<PathBuf> {
         .map(|root| root.join("syq/tuning.json"))
 }
 
+#[cfg(test)]
 fn lock_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
     let lock_path = path.with_extension("json.lock");
     use std::os::unix::fs::OpenOptionsExt;
@@ -232,6 +235,7 @@ fn lock_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
     Ok(lock)
 }
 
+#[cfg(test)]
 fn read_cache(path: &Path) -> TuningCache {
     std::fs::read(path)
         .ok()
@@ -239,6 +243,7 @@ fn read_cache(path: &Path) -> TuningCache {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn cached_at(path: &Path, key: &str) -> Option<usize> {
     // The cache is replaced by rename, so a read without the lock still sees
     // a complete file. Not being able to create the lock, as on a read-only
@@ -247,6 +252,7 @@ fn cached_at(path: &Path, key: &str) -> Option<usize> {
     read_cache(path).paths.get(key).copied().map(|n| n.max(MIN))
 }
 
+#[cfg(test)]
 fn remember_at(path: &Path, key: &str, connections: usize) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -271,21 +277,6 @@ fn remember_at(path: &Path, key: &str, connections: usize) -> std::io::Result<()
     file.sync_all()?;
     std::fs::rename(temporary, path)?;
     Ok(())
-}
-
-pub fn cached(key: &str) -> Option<usize> {
-    cached_at(&cache_path()?, key)
-}
-
-pub fn remember(key: &str, connections: usize) {
-    let Some(path) = cache_path() else {
-        return;
-    };
-    if let Err(error) = remember_at(&path, key, connections) {
-        if crate::output::debug() {
-            crate::output::diagnostic!("syq: tuning cache {}: {error}", path.display());
-        }
-    }
 }
 
 /// Next count up / down by `factor`, always moving by at least one.
@@ -409,7 +400,7 @@ pub struct Policy {
     /// Highest count that was actually activated, not merely requested.
     pub peak: usize,
     active: usize,
-    /// Starting count justified for future copies, excluding inconclusive increases.
+    /// Best accepted count for live diagnostics; never a persisted startup choice.
     recommended: usize,
     /// Initial discovery doubles unless closely matched evidence supports refinement.
     startup_doubling: bool,
@@ -420,6 +411,8 @@ pub struct Policy {
     /// Stable-measurement number when each direction may next be probed.
     due: [usize; 2],
     tick: usize,
+    wall_clock: bool,
+    last_observation: Option<(usize, f64)>,
     comparisons: usize,
     /// Counts actually activated, for --stats / debug.
     pub history: Vec<usize>,
@@ -441,6 +434,8 @@ impl Policy {
             fails: [0, 0],
             due: [PROBE_EVERY, PROBE_EVERY],
             tick: 0,
+            wall_clock: false,
+            last_observation: None,
             comparisons: 0,
             history: vec![n],
         }
@@ -462,8 +457,7 @@ impl Policy {
         }
     }
 
-    /// Count to save for future copies. Keeping an inconclusive increase live
-    /// does not justify making that increase the next copy's starting point.
+    /// Best accepted count for diagnostics. Startup inference uses observations.
     pub fn recommended(&self) -> usize {
         self.recommended
     }
@@ -543,11 +537,15 @@ impl Policy {
             } else {
                 sampler.earliest_score_in(sample, elapsed)
             };
-            let until = first_score.saturating_add(
-                sample
-                    .saturating_mul(2)
-                    .saturating_mul(u32::try_from(ticks.saturating_sub(1)).unwrap_or(u32::MAX)),
-            );
+            let until = if self.wall_clock {
+                first_score.max(sample.saturating_mul(u32::try_from(ticks).unwrap_or(u32::MAX)))
+            } else {
+                first_score.saturating_add(
+                    sample
+                        .saturating_mul(2)
+                        .saturating_mul(u32::try_from(ticks.saturating_sub(1)).unwrap_or(u32::MAX)),
+                )
+            };
             if speculate && until <= lead {
                 plan.connect = candidate;
             }
@@ -574,8 +572,7 @@ impl Policy {
         self.active
     }
 
-    /// True only after at least two worker counts were genuinely measured.
-    /// This is the minimum evidence worth persisting as a future start hint.
+    /// Whether the live policy completed a comparison; not a persistence gate.
     pub fn measured(&self) -> bool {
         self.comparisons > 0
     }
@@ -681,7 +678,17 @@ impl Policy {
 
     fn retry_after(&self, direction: Direction) -> usize {
         let backoff = self.fails[direction.index()].min(PROBE_BACKOFF_MAX);
-        PROBE_EVERY << backoff
+        (PROBE_EVERY << backoff).min(match direction {
+            Direction::Up => 12,
+            Direction::Down => 24,
+        })
+    }
+
+    /// Deadlines and evidence age advance even when observations are noisy or
+    /// excluded. The interval also permits accelerated driver tests.
+    fn advance_time(&mut self, elapsed: Duration, interval: Duration) {
+        self.wall_clock = true;
+        self.tick = (elapsed.as_secs_f64() / interval.as_secs_f64()) as usize;
     }
 
     fn record(&mut self, n: usize, score: f64) {
@@ -718,7 +725,17 @@ impl Policy {
                     if self.n - lower > 1 {
                         return lower + (self.n - lower) / 2;
                     }
-                    if self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE
+                    let current = self.points.get(&self.n).map_or(0.0, |p| p.score);
+                    if current > 0.0
+                        && point.score >= current * (1.0 - NEAR_BEST_TOLERANCE)
+                        && point.score * (1.0 - NEAR_BEST_TOLERANCE) <= current
+                    {
+                        // An adjacent count with an ambiguous result is not a
+                        // barrier to a more informative, wider experiment.
+                        return step_down(lower).max(self.min);
+                    }
+                    if !self.wall_clock
+                        && self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE
                         && point.score < self.recent_best() * (1.0 - NEAR_BEST_TOLERANCE)
                     {
                         return self.n;
@@ -744,7 +761,8 @@ impl Policy {
                     }
                     let current = self.points.get(&self.n).map_or(0.0, |point| point.score);
                     let best = self.recent_best().max(point.score);
-                    if self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE
+                    if !self.wall_clock
+                        && self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE
                         && current >= best * (1.0 - NEAR_BEST_TOLERANCE)
                     {
                         return self.n;
@@ -808,7 +826,18 @@ impl Policy {
             self.active, self.n,
             "candidate must be active before measuring"
         );
-        self.tick += 1;
+        if !self.wall_clock {
+            self.tick += 1;
+        }
+        if matches!(self.state, State::Hold)
+            && self.last_observation.is_some_and(|(n, previous)| {
+                n == self.n && previous > 0.0 && (score > previous * 1.2 || score < previous * 0.8)
+            })
+        {
+            self.due = [self.tick; 2];
+            self.points.clear();
+        }
+        self.last_observation = Some((self.n, score));
         self.record(self.n, score);
         match self.state {
             State::Initial => {
@@ -830,7 +859,7 @@ impl Policy {
                     // high-water scores can describe conditions that no longer
                     // apply, even when revisiting them refreshes their age.
                     Direction::Up => base < score * (1.0 - NEAR_BEST_TOLERANCE),
-                    Direction::Down => score > base,
+                    Direction::Down => score * (1.0 - NEAR_BEST_TOLERANCE) > base,
                 };
                 self.comparisons += 1;
                 let idx = direction.index();
@@ -850,6 +879,13 @@ impl Policy {
                     return self.n;
                 }
                 if keep {
+                    // Fresh gains override a historical plateau. Accelerate in
+                    // either direction when the improvement is substantial.
+                    if direction == Direction::Up && score >= base * 1.20 {
+                        self.startup_doubling = true;
+                        self.points
+                            .retain(|n, point| *n <= self.n || point.score > score);
+                    }
                     self.recommended = match direction {
                         Direction::Up => self.n,
                         // A partial reduction of an inconclusive increase is
@@ -863,7 +899,6 @@ impl Policy {
                     // in the same direction, so continue immediately.
                     self.begin(direction, score);
                 } else {
-                    let refine_startup = self.startup_doubling;
                     self.startup_doubling = false;
                     self.fails[idx] += 1;
                     self.due[idx] = self.tick + self.retry_after(direction);
@@ -872,12 +907,6 @@ impl Policy {
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
                     self.set_candidate(from);
                     self.state = State::Hold;
-                    if refine_startup {
-                        // The failed doubling bounds the useful range. Try
-                        // its midpoint now rather than waiting out backoff
-                        // at a potentially much slower starting count.
-                        self.begin(Direction::Up, base);
-                    }
                 }
             }
         }
@@ -1212,11 +1241,71 @@ pub fn run(
     let sample = sample_interval();
     let poll = Duration::from_millis(250).min(sample);
     let mut last_rate = None;
-    meter.set_active(policy.n);
+    let policy_start = Instant::now();
+    let mut observation_id = 0_u64;
+    let mut observation_start = Instant::now();
+    let mut observation_last = last;
+    let mut observation_workers = active;
+    let mut supplied =
+        sched.tuning_work(active, 0, FILE_CREDIT).parallel && gate.ready_through(active);
+    let mut interval_usable = true;
+    let mut evidence = evidence::Evidence::default();
+    meter.set_active(active);
     loop {
         sched.wait_for_tuning(poll);
+        policy.advance_time(policy_start.elapsed(), sample);
         if sched.is_aborted() || sched.finished() {
             break;
+        }
+
+        // Retain fine-grained counters; consumers can construct overlapping
+        // windows without pretending those windows are independent samples.
+        if observation_start.elapsed() >= Duration::from_millis(500).min(sample) {
+            let now = (meter.bytes(), meter.files());
+            let seconds = observation_start.elapsed().as_secs_f64();
+            let work = sched.tuning_work(active, 0, FILE_CREDIT);
+            let usable = observation_workers == active
+                && supplied
+                && work.parallel
+                && gate.ready_through(active)
+                && activity_rate(observation_last, now, seconds).is_some();
+            let rate = activity_rate(observation_last, now, seconds);
+            observation_id += 1;
+            trace.event(
+                "observation",
+                serde_json::json!({
+                    "observation":observation_id,"seconds":seconds,"cumulative_bytes":now.0,"cumulative_files":now.1,
+                    "bytes":now.0.checked_sub(observation_last.0),
+                    "files":now.1.checked_sub(observation_last.1),"rate":rate,
+                    "active":active,"usable":usable,"work":work
+                }),
+            );
+            interval_usable &= usable;
+            observation_start = Instant::now();
+            observation_last = now;
+            observation_workers = active;
+            supplied = work.parallel && gate.ready_through(active);
+            if usable && active == policy.n {
+                if let (Some(rate), Some(base)) = (rate, policy.probe_base()) {
+                    if let Some(score) = evidence.push(rate, seconds, base) {
+                        trace.event(
+                            "sequential_evidence",
+                            serde_json::json!({"score":score,
+                            "ending_observation":observation_id,"baseline":base,"active":active}),
+                        );
+                        last_rate = Some(score.rate);
+                        trace.observe(&mut policy, score.rate, "sequential_evidence");
+                        evidence.clear();
+                        sampler.reset();
+                        last = now;
+                        sample_start = Instant::now();
+                        interval_usable = true;
+                        continue;
+                    }
+                }
+            } else {
+                evidence.clear();
+            }
         }
 
         // A same-machine single-file copy starts with one cheap kernel copy
@@ -1308,6 +1397,12 @@ pub fn run(
             policy.activated();
             trace.transition(&policy, "decrease_activated");
             meter.set_active(active);
+            observation_workers = active;
+            observation_last = (meter.bytes(), meter.files());
+            observation_start = Instant::now();
+            supplied = sched.tuning_work(active, 0, FILE_CREDIT).parallel;
+            interval_usable = true;
+            evidence.clear();
             sampler.reset();
             collapse_samples = 0;
             last = (meter.bytes(), meter.files());
@@ -1321,7 +1416,9 @@ pub fn run(
             continue;
         }
         if policy.n > active {
-            if !trace.enough_work(&sched, policy.n, last_rate, sample) {
+            if matches!(policy.state, State::Explore { .. })
+                && !trace.enough_work(&sched, policy.n, last_rate, sample)
+            {
                 trace.cancel(
                     &mut policy,
                     "insufficient_remaining_work",
@@ -1360,6 +1457,12 @@ pub fn run(
                 policy.activated();
                 trace.transition(&policy, "candidate_ready");
                 meter.set_active(active);
+                observation_workers = active;
+                observation_last = (meter.bytes(), meter.files());
+                observation_start = Instant::now();
+                supplied = sched.tuning_work(active, 0, FILE_CREDIT).parallel;
+                interval_usable = true;
+                evidence.clear();
                 sampler.reset();
                 collapse_samples = 0;
                 last = (meter.bytes(), meter.files());
@@ -1492,21 +1595,20 @@ pub fn run(
         let sample_previous = last;
         last = now;
         last_rate = Some(rate);
-        // Estimate the time left at the rate just observed. In the tail, idle
-        // workers say nothing; unlike a fixed byte threshold this remains
-        // useful on both very slow and very fast paths.
-        if !trace.enough_work(&sched, active, last_rate, sample) {
+        // Completed evidence is judged by work availability during the
+        // interval, never by time left for another experiment.
+        if !std::mem::replace(&mut interval_usable, true) {
             trace.sample(
                 sample_previous,
                 now,
                 secs,
                 &policy,
                 &gate,
-                "insufficient_remaining_work",
+                "work_limited",
                 None,
             );
-            trace.waiting("insufficient_remaining_work", &policy);
             sampler.reset();
+            evidence.clear();
             collapse_samples = 0;
             continue;
         }
