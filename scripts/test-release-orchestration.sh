@@ -729,7 +729,8 @@ python3 "$script_dir/test-find-release-build.py"
 
 echo 'release orchestration tests passed'
 
-python3 "$script_dir/test-nightly-ci.py"
+SYQ_TEST_CHANGED_PATHS_FILE=/nonexistent-inherited-path SYQ_CI_SCOPE_COMMIT=invalid \
+SYQ_CI_DOCUMENTATION_ONLY=true FAIL_API=1 python3 "$script_dir/test-nightly-ci.py"
 
 printf '%s\n' tests/local/transfer.rs >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
