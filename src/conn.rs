@@ -134,6 +134,18 @@ pub trait Conn: Send {
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()>;
+    /// Stream descendants of disjoint selections relative to one registered base.
+    /// Return false without invoking callbacks when this endpoint needs the
+    /// ordinary per-selection scan path. Selected roots are already planned.
+    fn scan_selected(
+        &mut self,
+        _source: &RegisteredPath,
+        _selections: &[PathBytes],
+        _sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _warn: &mut dyn FnMut(String),
+    ) -> Result<bool> {
+        Ok(false)
+    }
     #[allow(clippy::too_many_arguments)]
     fn native_remove(
         &mut self,

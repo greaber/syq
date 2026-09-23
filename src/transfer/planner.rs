@@ -29,6 +29,10 @@ pub(super) struct Planner<'a> {
     /// The local destination was missing or empty at preflight. Its root may
     /// still have metadata to preserve; only descendants are known absent.
     pub(super) destination_children_known_missing: bool,
+    /// Exact prefix of an already-installed local Linux destination root.
+    /// Its initial sidecar names need no filesystem query or receiver turn.
+    #[cfg(target_os = "linux")]
+    pub(super) local_sidecar_prefix: Option<PathBytes>,
     /// Mapped payload paths that look like current sidecars, and every
     /// sidecar path the current job may use. Their intersection is unsafe.
     /// Ordinary payload names cannot collide and do not need to stay in RAM.
@@ -742,6 +746,58 @@ impl Planner<'_> {
             }
             self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
             self.handle_batch(batch, src_root, b"", dst_root)?;
+            if subtrees.len() > 1 {
+                let selected: HashSet<&[u8]> = subtrees.iter().map(Vec::as_slice).collect();
+                let disjoint = subtrees.iter().all(|rel| {
+                    ancestors(rel)
+                        .iter()
+                        .all(|ancestor| !selected.contains(ancestor.as_slice()))
+                });
+                if disjoint {
+                    subtrees.retain(|rel| {
+                        !ancestors(rel)
+                            .iter()
+                            .any(|a| completed_subtrees.contains(a))
+                    });
+                    let progress = self.progress;
+                    let warned = std::cell::Cell::new(false);
+                    let source = self
+                        .active_source
+                        .as_ref()
+                        .context("registered source reference was not initialized")?
+                        .clone();
+                    let scanned = src.scan_selected(
+                        &source,
+                        &subtrees,
+                        &mut |batch| {
+                            let batch: Vec<_> = batch
+                                .into_iter()
+                                .filter(|e| {
+                                    if emitted.contains_key(&e.path) {
+                                        false
+                                    } else {
+                                        emitted.insert(e.path.clone(), e.kind);
+                                        true
+                                    }
+                                })
+                                .collect();
+                            self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+                            self.handle_batch(batch, src_root, b"", dst_root)
+                        },
+                        &mut |w| {
+                            warned.set(true);
+                            progress.error(&format!("syq: {w}"));
+                        },
+                    );
+                    self.scan_warned |= warned.get();
+                    if scanned? {
+                        if !self.scan_warned {
+                            completed_subtrees.extend(subtrees);
+                        }
+                        continue;
+                    }
+                }
+            }
             for rel in subtrees {
                 if ancestors(&rel)
                     .iter()
@@ -3301,6 +3357,10 @@ impl Planner<'_> {
         &mut self,
         paths: Vec<PathBytes>,
     ) -> Result<Vec<std::result::Result<PathBytes, String>>> {
+        #[cfg(target_os = "linux")]
+        if let Some(prefix) = &self.local_sidecar_prefix {
+            return crate::fsops::initial_rooted_partial_paths(prefix, &paths, &self.opts.copy_id);
+        }
         match ok(
             self.dst.call(Request::PartialPaths {
                 paths,

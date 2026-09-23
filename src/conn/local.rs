@@ -288,6 +288,29 @@ impl Conn for LocalConn {
         )
     }
 
+    fn scan_selected(
+        &mut self,
+        source: &RegisteredPath,
+        selections: &[PathBytes],
+        sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        warn: &mut dyn FnMut(String),
+    ) -> Result<bool> {
+        let Some(source) = self.ops.source_scan_root(Some(source))? else {
+            return Ok(false);
+        };
+        if source.expected_leaf.is_some() {
+            return Ok(false);
+        }
+        crate::scan::scan_descriptor_selected(
+            source.root,
+            &source.relative,
+            selections,
+            sink,
+            warn,
+        )?;
+        Ok(true)
+    }
+
     fn native_remove(
         &mut self,
         cwd: Option<&[u8]>,

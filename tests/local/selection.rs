@@ -984,6 +984,81 @@ fn files_from_copies_listed_paths_with_their_parents() {
 }
 
 #[test]
+fn files_from_unreadable_selection_does_not_hide_an_independent_tree() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    write(
+        &t.path("src/blocked/file"),
+        b"not readable through enumeration",
+    );
+    write(&t.path("src/good/file"), b"readable");
+    write(&t.path("list"), b"blocked\ngood\n");
+    fs::set_permissions(t.path("src/blocked"), fs::Permissions::from_mode(0o111)).unwrap();
+    let output = syq(&[
+        "-rt",
+        "--files-from",
+        &t.s("list"),
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
+    fs::set_permissions(t.path("src/blocked"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert_eq!(read(&t.path("dst/good/file")), b"readable");
+    assert!(!t.path("dst/blocked/file").exists());
+}
+
+#[test]
+fn files_from_disjoint_trees_preserve_contents_and_directory_metadata() {
+    let t = Tmp::new();
+    let mut selections = String::new();
+    for i in 0..10 {
+        let top = format!("tree{i}");
+        selections.push_str(&format!("{top}\n"));
+        for j in 0..200 {
+            write(
+                &t.path(&format!("src/{top}/nested/f{j}")),
+                format!("{i}:{j}").as_bytes(),
+            );
+        }
+        std::os::unix::fs::symlink("nested/f0", t.path(&format!("src/{top}/link"))).unwrap();
+        for rel in [&top, &format!("{top}/nested")] {
+            let path = t.path(&format!("src/{rel}"));
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).unwrap();
+            set_mtime(&path, 1_700_000_000 + i);
+        }
+    }
+    write(&t.path("src/unselected/file"), b"leave out");
+    write(&t.path("list"), selections.as_bytes());
+    run_ok(&[
+        "-rlpt",
+        "--files-from",
+        &t.s("list"),
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
+    assert!(!t.path("dst/unselected").exists());
+    for i in 0..10 {
+        for j in 0..200 {
+            assert_eq!(
+                read(&t.path(&format!("dst/tree{i}/nested/f{j}"))),
+                format!("{i}:{j}").as_bytes()
+            );
+        }
+        assert_eq!(
+            fs::read_link(t.path(&format!("dst/tree{i}/link"))).unwrap(),
+            Path::new("nested/f0")
+        );
+        for rel in [format!("tree{i}"), format!("tree{i}/nested")] {
+            let metadata = fs::metadata(t.path(&format!("dst/{rel}"))).unwrap();
+            assert_eq!(metadata.mode() & 0o777, 0o750);
+            assert_eq!(metadata.mtime(), 1_700_000_000 + i);
+        }
+    }
+}
+
+#[test]
 fn files_from_recursive_overlaps_preserve_the_selected_union() {
     for list in [
         "a\na/sub\nab\n".to_owned(),

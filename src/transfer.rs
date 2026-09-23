@@ -2676,6 +2676,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),
+        #[cfg(target_os = "linux")]
+        local_sidecar_prefix: (opts.same_host
+            && !opts.restricted_receiver
+            && destination_anchor.get().is_some())
+        .then(|| request_prefix.clone()),
         payload_paths: std::collections::HashMap::new(),
         sidecar_paths: std::collections::HashMap::new(),
         unusable_files: std::collections::HashSet::new(),

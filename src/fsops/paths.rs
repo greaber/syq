@@ -299,3 +299,71 @@ pub fn normalize(p: &Path) -> PathBuf {
     }
     out
 }
+
+/// Apply the installed destination prefix without changing its spelling.
+pub(crate) fn destination_relative_to(prefix: &[u8], path: &[u8]) -> Result<PathBytes> {
+    let relative = if prefix == b"." {
+        if path == b"." {
+            b"".as_slice()
+        } else if path.starts_with(b"/") {
+            bail!("destination path is outside the retained root");
+        } else {
+            path.strip_prefix(b"./").unwrap_or(path)
+        }
+    } else if path == prefix {
+        b"".as_slice()
+    } else if prefix == b"/" {
+        path.strip_prefix(b"/")
+            .context("destination path is outside the retained root")?
+    } else {
+        path.strip_prefix(prefix)
+            .and_then(|suffix| suffix.strip_prefix(b"/"))
+            .context("destination path is outside the retained root")?
+    };
+    if relative.starts_with(b"/")
+        || relative.contains(&0)
+        || relative.split(|byte| *byte == b'/').any(|component| {
+            !relative.is_empty()
+                && (component.is_empty() || component == b"." || component == b"..")
+        })
+    {
+        bail!("destination path contains an unsafe relative component");
+    }
+    Ok(relative.to_vec())
+}
+
+/// Linux rooted receivers start with the same filename limit for every leaf.
+/// Compute their name-only reply without a receiver round trip; callers must
+/// already have an installed local destination root and its exact prefix.
+#[cfg(target_os = "linux")]
+pub(crate) fn initial_rooted_partial_paths(
+    prefix: &[u8],
+    paths: &[PathBytes],
+    copy_id: &CopyId,
+) -> Result<Vec<std::result::Result<PathBytes, String>>> {
+    // The receiver validates the complete request before deriving any names.
+    let relative = paths
+        .iter()
+        .map(|path| destination_relative_to(prefix, path))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(relative
+        .into_iter()
+        .map(|relative| {
+            (|| -> Result<PathBytes> {
+                let requested = Path::new(OsStr::from_bytes(&relative));
+                let parent = requested
+                    .parent()
+                    .context("operation requires a descendant path")?;
+                let logical = join(prefix, &relative);
+                let resolved = partial_path_with_name_max(
+                    Path::new(OsStr::from_bytes(&logical)),
+                    copy_id,
+                    COMMON_NAME_MAX,
+                )?;
+                let name = resolved.file_name().expect("partial always has a name");
+                Ok(join(prefix, &path_bytes(&parent.join(name))))
+            })()
+            .map_err(|error| format!("{error:#}"))
+        })
+        .collect())
+}

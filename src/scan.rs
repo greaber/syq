@@ -375,7 +375,7 @@ impl DescriptorScan<'_> {
 fn produce_descriptor_scan(
     root: Arc<Root>,
     scan_root: PathBytes,
-    scan_root_metadata: RootMetadata,
+    mut directories: Vec<DescriptorDirectory>,
     hold_destination_for_test: bool,
     ignore: Option<Gitignore>,
     report_ignored: bool,
@@ -401,12 +401,6 @@ fn produce_descriptor_scan(
     let mut entries_sent = 1;
     let mut entries_in_chunk = 0;
     let mut retained_directories = 0;
-    let mut directories = vec![DescriptorDirectory {
-        relative: Vec::new(),
-        expected: scan_root_metadata,
-        opened: None,
-        names: None,
-    }];
     while !directories.is_empty() {
         let count = DIRECTORY_WORKERS.min(directories.len());
         let work: Vec<_> = (0..count).map(|_| directories.pop().unwrap()).collect();
@@ -635,7 +629,12 @@ pub(crate) fn scan_descriptor(
             produce_descriptor_scan(
                 root,
                 scan_root,
-                metadata,
+                vec![DescriptorDirectory {
+                    relative: Vec::new(),
+                    expected: metadata,
+                    opened: None,
+                    names: None,
+                }],
                 hold_destination_for_test,
                 matcher,
                 report_ignored,
@@ -663,6 +662,59 @@ pub(crate) fn scan_descriptor(
     }
     if !ignored_batch.is_empty() {
         ignored(ignored_batch)?;
+    }
+    Ok(())
+}
+
+/// Walk disjoint selections together, returning paths relative to their common base.
+pub(crate) fn scan_descriptor_selected(
+    root: Arc<Root>,
+    scan_root: &[u8],
+    selections: &[PathBytes],
+    sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+    warn: &mut dyn FnMut(String),
+) -> Result<()> {
+    let mut directories = Vec::with_capacity(selections.len());
+    for relative in selections {
+        let metadata = root.metadata(&RelativePath::new(&join(scan_root, relative))?)?;
+        if metadata.is_dir() {
+            directories.push(DescriptorDirectory {
+                relative: relative.clone(),
+                expected: metadata,
+                opened: None,
+                names: None,
+            });
+        }
+    }
+    directories.reverse();
+    let (tx, rx) = mpsc::sync_channel(BATCH / FIRST_BATCH);
+    let scan_root = scan_root.to_vec();
+    let scan_started = Instant::now();
+    let producer = std::thread::Builder::new()
+        .name("syq-descriptor-scan-producer".into())
+        .spawn(move || {
+            produce_descriptor_scan(root, scan_root, directories, false, None, false, tx)
+        })
+        .context("start selected descriptor scan producer")?;
+    let mut batch = Vec::with_capacity(FIRST_BATCH);
+    let mut ignored_batch = Vec::new();
+    let received = receive_scan(
+        &rx,
+        scan_started,
+        &mut batch,
+        &mut ignored_batch,
+        sink,
+        &mut |_| Ok(()),
+        warn,
+    );
+    drop(rx);
+    let panicked = producer.join().is_err();
+    received?;
+    if panicked {
+        anyhow::bail!("selected descriptor scan producer panicked");
+    }
+    if !batch.is_empty() {
+        sink(batch)?;
     }
     Ok(())
 }

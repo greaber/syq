@@ -1699,34 +1699,7 @@ impl FsOps {
         let Some(prefix) = self.destination_prefix.as_deref() else {
             return Ok(path.to_vec());
         };
-        let relative = if prefix == b"." {
-            if path == b"." {
-                b"".as_slice()
-            } else if path.starts_with(b"/") {
-                bail!("destination path is outside the retained root");
-            } else {
-                path.strip_prefix(b"./").unwrap_or(path)
-            }
-        } else if path == prefix {
-            b"".as_slice()
-        } else if prefix == b"/" {
-            path.strip_prefix(b"/")
-                .context("destination path is outside the retained root")?
-        } else {
-            path.strip_prefix(prefix)
-                .and_then(|suffix| suffix.strip_prefix(b"/"))
-                .context("destination path is outside the retained root")?
-        };
-        if relative.starts_with(b"/")
-            || relative.contains(&0)
-            || relative.split(|byte| *byte == b'/').any(|component| {
-                !relative.is_empty()
-                    && (component.is_empty() || component == b"." || component == b"..")
-            })
-        {
-            bail!("destination path contains an unsafe relative component");
-        }
-        Ok(relative.to_vec())
+        destination_relative_to(prefix, path)
     }
 
     fn destination_full(&self, relative: &[u8]) -> PathBytes {
