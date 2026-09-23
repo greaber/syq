@@ -2170,7 +2170,7 @@ impl RestrictedAuthority {
             } => {
                 self.check_observation_path(path)?;
                 if let Some(authorized) = self.expected_hash(path)? {
-                    if *expected != authorized {
+                    if *expected != crate::hashing::ExpectedHashes::Single(authorized) {
                         bail!("expected hash differs from the authorized copy");
                     }
                 }
@@ -2384,7 +2384,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                *expected_hash = self.expected_hash(path)?;
+                *expected_hash = self.expected_hash(path)?.map(Into::into);
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
@@ -2484,7 +2484,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                *expected_hash = self.expected_hash(path)?;
+                *expected_hash = self.expected_hash(path)?.map(Into::into);
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file finalization does not match the signed publication policy");
                 }
