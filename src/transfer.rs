@@ -49,6 +49,8 @@ const FAST_BATCH_FILES: usize = 2048;
 // Keep the startup worker budget independent of the larger batch ceiling.
 // Larger batches must not leave small trees with fewer transfer workers.
 const STARTUP_BATCH_FILES: usize = 128;
+// Let small scans finish before choosing their bounded worker count.
+const STREAMING_START_FILES: usize = 4 * STARTUP_BATCH_FILES;
 // Source requests carry both display paths and registered references. Leave
 // room for framing within the metadata protocol's 8 MiB limit, even when a
 // large batch contains long paths rather than substantial file data.
@@ -2220,7 +2222,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .as_ref()
         .and_then(|info| info.filesystem.clone());
     let fresh_capacity = initial_destination_filesystem.and_then(|info| {
-        fresh_destination.then_some(FreshCapacityPlan {
+        (fresh_destination && args.dry_run).then_some(FreshCapacityPlan {
             device: info.device,
             target: exact_capacity_target,
             root_existed: dst_root_entry.is_some(),
@@ -2229,8 +2231,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             overflowed: false,
         })
     });
-    let defer_destination_mutations =
-        multiple_distinct_sources || (fresh_capacity.is_some() && !args.dry_run);
+    let defer_destination_mutations = multiple_distinct_sources;
     // Native new/existing forms are intentionally only the lightweight
     // pathname checks above. Once they pass, use the ordinary engine's target
     // conditions and publication behavior; this adapter does not add an
@@ -2403,9 +2404,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     // Create a missing directory destination — never in the read-only modes,
-    // and never under --existing. With several sources, or while a fresh-target
-    // capacity check is pending, this waits until the complete scan has passed
-    // its namespace and capacity preflights.
+    // and never under --existing. With several sources, wait until the complete
+    // scan has passed its final-destination conflict checks.
     let create_root = dst_root_entry.is_none() && dst_is_dir && !args.dry_run && !args.existing;
     let dry_run_creates_root =
         args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
@@ -2637,7 +2637,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         Some(finish_transport_setup(&mut args)?)
     };
-    let mut workers_started = false;
+    let workers_started = std::cell::Cell::new(false);
     if transport_setup.as_ref().is_some_and(|(tcp, _, _)| *tcp)
         && destination_tree_known_missing
         && !opts.dry_run
@@ -2653,10 +2653,50 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections,
             transport_setup.as_ref().and_then(|(_, _, refine)| *refine),
         );
-        workers_started = true;
+        workers_started.set(true);
     }
 
     let ticker = progress.spawn_ticker();
+
+    // Small trees keep the scan-complete startup decision (including the
+    // single-file receiver offload). Larger trees can overlap all three stages.
+    let streaming_ready =
+        !defer_destination_mutations && !opts.dry_run && transport_setup.is_some();
+    let streaming_connections = args.connections;
+    let streaming_refine = transport_setup.as_ref().and_then(|(_, _, refine)| *refine);
+    let streaming_worker_hint = std::cell::Cell::new(0);
+    let start_streaming = || {
+        if !streaming_ready
+            || sched.is_aborted()
+            || (destination_anchor_required && destination_anchor.get().is_none())
+        {
+            return;
+        }
+        let files = progress.files_total.load(Relaxed) as usize;
+        let bytes = progress.bytes_total.load(Relaxed);
+        if files < STREAMING_START_FILES {
+            return;
+        }
+        let initial = if autotune {
+            initial_fast_workers(
+                streaming_connections,
+                files,
+                bytes,
+                opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
+                opts.tuning.batch_bytes(),
+            )
+        } else {
+            streaming_connections
+        };
+        if !workers_started.get() {
+            spawn_workers(initial, streaming_refine);
+            workers_started.set(true);
+        } else if autotune && initial > streaming_worker_hint.get() {
+            sched.request_worker_count(initial);
+        }
+        streaming_worker_hint.set(initial);
+        sched.release_preflighted_work();
+    };
 
     let mut st = Planner {
         dst: &mut *dst_ctl,
@@ -2676,15 +2716,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),
-        #[cfg(target_os = "linux")]
-        local_sidecar_prefix: (opts.same_host
-            && !opts.restricted_receiver
-            && destination_anchor.get().is_some())
-        .then(|| request_prefix.clone()),
-        payload_paths: std::collections::HashMap::new(),
-        sidecar_paths: std::collections::HashMap::new(),
-        unusable_files: std::collections::HashSet::new(),
-        deferred_payloads: Vec::new(),
+        start_streaming: &start_streaming,
         source_partials: 0,
         collision: false,
         deferred: Vec::new(),
@@ -2746,7 +2778,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     let mut scan_err = None;
     let mut fresh_capacity_assessment = None;
-    let mut fresh_capacity_shortage = None;
     let mut dry_run_mappings = Vec::with_capacity(srcs.len());
     if let Some((mapping_entries, explicit_parents)) = mapping_entries {
         let src = &srcs[0];
@@ -2846,66 +2877,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     let (all_remote_endpoints_use_tcp, tuning_key, refine_start) =
         transport_setup.expect("transport setup completed before releasing planned work");
-    // The complete buffered scan lets small trees keep the same bounded
-    // starting count as normal scheduling. Open TCP workers while the control
-    // connection rechecks capacity and inspects the destination; no jobs are
-    // released until those preflights pass. A failed preflight aborts the idle
-    // workers through the same scheduler path as any other planning failure.
-    if scan_err.is_none()
-        && !st.collision
-        && !workers_started
-        && dst_ep.is_remote()
-        && !opts.same_host
-        && all_remote_endpoints_use_tcp
-        && destination_anchor.get().is_some()
-        && st
-            .fresh_capacity
-            .as_ref()
-            .is_some_and(|plan| plan.root_existed)
-        && !opts.dry_run
-        && !opts.inplace
-        && !opts.checksum
-        && !opts.update
-        && !opts.ignore_existing
-        && !opts.tuning.force_ranges()
-        && bwlimit.is_none()
-    {
-        let (files, bytes, all_small) =
-            st.buffered_file_population(fast_file_size_limit(&opts, bwlimit.as_deref()));
-        if files > 0 && all_small {
-            spawn_workers(
-                initial_fast_workers(
-                    args.connections,
-                    files,
-                    bytes,
-                    opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
-                    opts.tuning.batch_bytes(),
-                ),
-                refine_start,
-            );
-            workers_started = true;
-        }
-    }
     if scan_err.is_none() && !st.collision {
         match st.assess_fresh_capacity() {
-            Ok(assessment) => {
-                fresh_capacity_assessment = assessment;
-                fresh_capacity_shortage = assessment.filter(|value| !value.sufficient());
-                if let Some(assessment) = fresh_capacity_shortage.filter(|_| !args.dry_run) {
-                    scan_err = Some(fresh_capacity_error(assessment));
-                }
-            }
+            Ok(assessment) => fresh_capacity_assessment = assessment,
             Err(error) => scan_err = Some(error),
         }
     }
     if scan_err.is_none() && !st.collision {
-        // The complete source population has passed namespace and capacity
-        // checks. A local tree can now copy earlier batches while subsequent
-        // batches prepare their directories and destination metadata. Preserve
-        // the single-file offload path and the existing bounded small-tree start.
+        // Multiple sources still settle final-path conflicts before writing.
+        // Once settled, overlap replay with copying just as for a single scan.
         let local_start = if opts.same_host
-            && st.fresh_capacity.is_some()
-            && !workers_started
+            && fresh_destination
+            && !workers_started.get()
             && !opts.dry_run
             && !opts.inplace
             && !opts.checksum
@@ -2933,22 +2916,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         };
         if let Err(error) = st.replay_buffered(|| {
             if let Some(initial) = local_start {
-                // replay_buffered establishes a missing destination root before
-                // this callback; workers only receive its retained authority.
                 spawn_workers(initial, refine_start);
-                workers_started = true;
+                workers_started.set(true);
                 sched.release_preflighted_work();
             }
         }) {
             scan_err = Some(error);
-        }
-    }
-    // A dry run still completes its virtual replay so the summary remains a
-    // truthful plan, then reports the same capacity refusal a real run would
-    // hit. No destination operation occurs during that replay.
-    if scan_err.is_none() && args.dry_run {
-        if let Some(assessment) = fresh_capacity_shortage {
-            scan_err = Some(fresh_capacity_error(assessment));
         }
     }
     if debug() {
@@ -3052,7 +3025,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         spec.set_ssh_multiplexing(true);
                     }
                 }
-                if !workers_started {
+                if !workers_started.get() {
                     // A same-machine file normally completes wholly inside one
                     // small-file or receiver-side copy request (copy_file_range,
                     // or an eligible sequential userspace fallback). Starting
@@ -3407,8 +3380,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
-    let capacity_only_dry_run_abort = opts.dry_run && fresh_capacity_shortage.is_some();
-    if !args.quiet && (!aborted || capacity_only_dry_run_abort) && !args.suppress_summary {
+    if !args.quiet && !aborted && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
                 crate::output::human_stdout!(
@@ -3448,7 +3420,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     print_benchmark_observations(&opts);
     // --stats is additional human output, not the summary line the local
     // attested settlement re-renders; a delegated coordinator keeps it.
-    if !args.quiet && (!aborted || capacity_only_dry_run_abort) && args.stats {
+    if !args.quiet && !aborted && args.stats {
         let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
             if opts.dry_run {
                 (
@@ -4254,34 +4226,12 @@ fn selected_route(src: &Endpoint, dst: &Endpoint, args: &Args) -> String {
 
 #[derive(Clone)]
 struct FreshCapacityPlan {
+    root_existed: bool,
     device: u64,
     target: Option<DestinationFilesystemTarget>,
-    root_existed: bool,
     logical_bytes: u64,
     objects: u64,
     overflowed: bool,
-}
-
-fn fresh_capacity_error(capacity: FreshCapacityAssessment) -> anyhow::Error {
-    let mut shortages = Vec::new();
-    if capacity.byte_shortage() {
-        shortages.push(format!(
-            "{} of logical file data is required but only {} is available",
-            human(capacity.logical_bytes),
-            human(capacity.available_bytes)
-        ));
-    }
-    if capacity.inode_shortage() {
-        shortages.push(format!(
-            "{} destination objects are required but only {} inodes are available",
-            commas(capacity.objects),
-            commas(capacity.available_inodes.unwrap_or_default())
-        ));
-    }
-    anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOSPC)).context(format!(
-        "fresh destination capacity preflight failed: {}",
-        shortages.join("; ")
-    ))
 }
 
 #[cfg(test)]

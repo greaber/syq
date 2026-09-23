@@ -825,34 +825,6 @@ impl FsOps {
                 })
             })
             .collect();
-        // The engine's fresh-destination capacity preflight, on the retained
-        // selection. An exact target whose leaf is absent is fresh; a
-        // directory is fresh only while it is empty. A filesystem that cannot
-        // report its capacity is no reason to refuse, as for the engine.
-        let exact = request.identity.dst_leaf.is_some();
-        self.operator_selection = Some(selection);
-        let info = self.destination_filesystem_info(!exact, None).ok();
-        let fresh = (exact && destinations[0].is_none())
-            || info.as_ref().is_some_and(|info| info.empty == Some(true));
-        if let Some(info) = info.filter(|_| fresh) {
-            let assessment = crate::copy_policy::FreshCapacityAssessment {
-                logical_bytes: total,
-                objects: request.files.len() as u64,
-                available_bytes: info.available_bytes,
-                available_inodes: info.available_inodes,
-            };
-            if !assessment.sufficient() {
-                self.operator_selection = None;
-                return Ok(Response::SmallFilesCopied(SmallCopyResponse {
-                    anchor,
-                    outcome: SmallCopyOutcome::CapacityShort,
-                }));
-            }
-        }
-        let selection = self
-            .operator_selection
-            .take()
-            .expect("selection retained for the capacity preflight");
         let ticket = self.descriptor_session.register(selection.directory)?;
         let directory = self.descriptor_session.acquire(&ticket)?;
         self.install_destination(directory, &request.request_prefix)?;

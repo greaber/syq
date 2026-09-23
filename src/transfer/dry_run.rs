@@ -154,7 +154,7 @@ pub(super) fn print_dry_run_summary(
             },
         );
         crate::output::human_stdout!(
-            "  capacity: {} logical data required; {} available; {inode_detail} ({})",
+            "  capacity: {} logical data required; {} available; {inode_detail} ({}; estimate only)",
             human(capacity.logical_bytes),
             human(capacity.available_bytes),
             if capacity.sufficient() {

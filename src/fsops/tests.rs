@@ -4531,25 +4531,6 @@ fn process_umask_matches_file_creation() {
 }
 
 #[test]
-fn partial_collision_reservation_covers_shortened_names() {
-    let path = PathBuf::from("parent").join("x".repeat(255));
-    let id = [9; 16];
-    let full = partial_path_with_name_max(&path, &id, 255).unwrap();
-    let key = partial_reservation_key(full.as_os_str().as_bytes());
-    for limit in [255, 143, 100, 26, 25] {
-        let partial = partial_path_with_name_max(&path, &id, limit).unwrap();
-        assert_eq!(partial_reservation_key(partial.as_os_str().as_bytes()), key);
-    }
-    let other = Path::new("other").join(full.file_name().unwrap());
-    assert_ne!(partial_reservation_key(other.as_os_str().as_bytes()), key);
-    let other_id = partial_path_with_name_max(&path, &[8; 16], 255).unwrap();
-    assert_ne!(
-        partial_reservation_key(other_id.as_os_str().as_bytes()),
-        key
-    );
-}
-
-#[test]
 fn registered_fifo_keeps_identity_checks_without_connecting_a_writer() {
     let temporary = crate::test_support::tempdir().unwrap();
     let fifo = temporary.path().join("pipe");
@@ -4612,62 +4593,4 @@ fn registered_fifo_keeps_identity_checks_without_connecting_a_writer() {
         matches!(response, Response::EndpointError(_)),
         "worker accepted a replaced FIFO: {response:?}"
     );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn initial_local_sidecar_names_match_the_installed_receiver() {
-    let temporary = crate::test_support::tempdir().unwrap();
-    let id = [17; 16];
-    for prefix in [
-        b".".as_slice(),
-        b"dest",
-        b"./dest",
-        b"/",
-        b"/logical/dest",
-        b"~",
-    ] {
-        let mut operations = FsOps::new();
-        operations
-            .install_destination(File::open(temporary.path()).unwrap(), prefix)
-            .unwrap();
-        let mut relative = vec![
-            b"".to_vec(),
-            b"file".to_vec(),
-            b"nested/file".to_vec(),
-            b"raw-\xff".to_vec(),
-            b"dir with spaces/file".to_vec(),
-            vec![b'x'; 255],
-            "é".repeat(127).into_bytes(),
-        ];
-        let deep = format!("{}x", "directory/".repeat(libc::PATH_MAX as usize / 10));
-        relative.push(deep.into_bytes());
-        let paths: Vec<_> = relative.iter().map(|path| join(prefix, path)).collect();
-        let expected = operations.handle(&Request::PartialPaths {
-            paths: paths.clone(),
-            copy_id: id,
-            guard: None,
-        });
-        let Response::PathResults(expected) = expected else {
-            panic!("unexpected receiver response: {expected:?}");
-        };
-        assert_eq!(
-            initial_rooted_partial_paths(prefix, &paths, &id).unwrap(),
-            expected,
-            "prefix={prefix:?}"
-        );
-        for bad in [b"../outside".as_slice(), b"double//leaf", b"nul\0leaf"] {
-            let paths = vec![join(prefix, b"good"), join(prefix, bad)];
-            let expected = operations.handle(&Request::PartialPaths {
-                paths: paths.clone(),
-                copy_id: id,
-                guard: None,
-            });
-            let Response::EndpointError(expected) = expected else {
-                panic!("unexpected unsafe-request response: {expected:?}");
-            };
-            let actual = initial_rooted_partial_paths(prefix, &paths, &id).unwrap_err();
-            assert_eq!(wire_error(&actual), expected);
-        }
-    }
 }

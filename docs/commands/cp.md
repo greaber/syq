@@ -201,11 +201,14 @@ replace an entry safely; the old entry is kept.
 
 ## Capacity checks
 
-For missing or empty filesystem destinations, syq checks available bytes and
-capacity for new files when the filesystem reports them. A clear shortage
-fails before copying. Updates to populated destinations do not use this whole-copy
-estimate: existing data may be reused or replaced. Allocation errors still
-fail the affected copy.
+Syq can copy files while it scans the source. If scanning or copying fails,
+completed files remain and the command reports failure. Retrying can reuse
+completed files and resumable partials.
+
+A dry run estimates available bytes and capacity for new files at missing or
+empty filesystem destinations. This estimate is advisory: it reserves no space
+and does not account for every filesystem allocation or concurrent writer.
+Actual allocation errors fail the affected copy.
 
 ## Metadata details
 

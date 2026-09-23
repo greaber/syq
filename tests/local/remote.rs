@@ -1486,7 +1486,7 @@ fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn buffered_remote_scan_overlaps_tcp_setup() {
+fn streaming_remote_scan_starts_after_transport_setup() {
     for (case, existing, tcp, detached, reachable, require_tcp) in [
         ("empty", true, true, false, true, true),
         ("missing", false, true, false, true, true),
@@ -1549,18 +1549,14 @@ fn buffered_remote_scan_overlaps_tcp_setup() {
         if require_tcp && !reachable {
             assert!(!output.status.success(), "{case}");
             assert!(stderr_of(&output).contains("TCP data transport required by test"));
-            assert_eq!(fs::read_to_string(events).unwrap(), "scan_complete\n");
+            assert!(!events.exists());
             assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
             continue;
         }
         assert!(output.status.success(), "{case}: {}", stderr_of(&output));
         assert_eq!(
             fs::read_to_string(events).unwrap(),
-            if existing && tcp && !detached {
-                "scan_complete\ntransport_ready\n"
-            } else {
-                "transport_ready\nscan_complete\n"
-            },
+            "transport_ready\nscan_complete\n",
             "{case}"
         );
         for i in 0..3 {

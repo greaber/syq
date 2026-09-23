@@ -1425,7 +1425,7 @@ fn impossible_sidecar_name_fails_one_file_and_continues() {
 
         assert_eq!(output.status.code(), Some(23));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("cannot create a safe sidecar"), "{stderr}");
+        assert!(stderr.contains("cannot create a partial"), "{stderr}");
         assert_eq!(read(&t.path("dst/good")), b"copied");
         assert!(!t.path("dst").join(deep).join("x").exists());
     }

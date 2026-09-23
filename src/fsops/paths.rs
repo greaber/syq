@@ -237,21 +237,6 @@ pub fn is_recovery_name(name: &OsStr) -> bool {
     decimal(fields.next()) && decimal(fields.next()) && fields.next().is_none()
 }
 
-/// Identify a temporary-name reservation independently of its readable prefix.
-/// The opaque suffix already includes the complete destination spelling and
-/// copy identity. Reserving it covers every shorter spelling after a rejected
-/// filename without another filesystem lookup during collision preflight.
-pub(crate) fn partial_reservation_key(path: &[u8]) -> Vec<u8> {
-    let parent_end = path
-        .iter()
-        .rposition(|&byte| byte == b'/')
-        .map_or(0, |at| at + 1);
-    debug_assert!(is_partial_name(OsStr::from_bytes(&path[parent_end..])));
-    let mut key = path[..parent_end].to_vec();
-    key.extend_from_slice(&path[path.len() - 16..]);
-    key
-}
-
 pub fn is_partial_name(name: &OsStr) -> bool {
     let name = name.as_bytes();
     name.starts_with(b".")
@@ -330,40 +315,4 @@ pub(crate) fn destination_relative_to(prefix: &[u8], path: &[u8]) -> Result<Path
         bail!("destination path contains an unsafe relative component");
     }
     Ok(relative.to_vec())
-}
-
-/// Linux rooted receivers start with the same filename limit for every leaf.
-/// Compute their name-only reply without a receiver round trip; callers must
-/// already have an installed local destination root and its exact prefix.
-#[cfg(target_os = "linux")]
-pub(crate) fn initial_rooted_partial_paths(
-    prefix: &[u8],
-    paths: &[PathBytes],
-    copy_id: &CopyId,
-) -> Result<Vec<std::result::Result<PathBytes, String>>> {
-    // The receiver validates the complete request before deriving any names.
-    let relative = paths
-        .iter()
-        .map(|path| destination_relative_to(prefix, path))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(relative
-        .into_iter()
-        .map(|relative| {
-            (|| -> Result<PathBytes> {
-                let requested = Path::new(OsStr::from_bytes(&relative));
-                let parent = requested
-                    .parent()
-                    .context("operation requires a descendant path")?;
-                let logical = join(prefix, &relative);
-                let resolved = partial_path_with_name_max(
-                    Path::new(OsStr::from_bytes(&logical)),
-                    copy_id,
-                    COMMON_NAME_MAX,
-                )?;
-                let name = resolved.file_name().expect("partial always has a name");
-                Ok(join(prefix, &path_bytes(&parent.join(name))))
-            })()
-            .map_err(|error| format!("{error:#}"))
-        })
-        .collect())
 }
