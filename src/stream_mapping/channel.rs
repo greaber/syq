@@ -46,8 +46,7 @@ impl Channel {
         let channel = Self(Mutex::new(socket));
         channel.send(Message::Hello { version: VERSION }, &[])?;
         let mut socket = channel.0.lock().unwrap();
-        let (marker, descriptors) =
-            crate::descriptor_broker::receive_message(socket.as_raw_fd(), 1)?;
+        let (marker, descriptors) = crate::descriptor_broker::receive_message(&socket, 1)?;
         ensure!(
             marker == b"S" && descriptors.is_empty(),
             "invalid stream mapping handshake"
