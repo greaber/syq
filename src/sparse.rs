@@ -14,6 +14,12 @@ pub(crate) fn write_at(
         .checked_add(data.len() as u64)
         .filter(|end| *end <= i64::MAX as u64)
         .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+    // APFS can fill the gap when a write extends past EOF. Establish and
+    // punch the new zero range before writing its nonzero contents.
+    #[cfg(target_os = "macos")]
+    if offset + data.len() as u64 > file.metadata()?.len() {
+        set_len(file, offset + data.len() as u64)?;
+    }
     let block = block_size(file)?;
     let mut cursor = 0;
     let mut written = 0;
@@ -46,14 +52,25 @@ pub(crate) fn write_at(
     file.write_all_at(&data[written..], offset + written as u64)
 }
 
-/// Grow with a final zero byte on macOS: APFS may allocate the entire added
-/// range when ftruncate extends a file. Writing past EOF leaves a hole instead.
-/// Shrinking still uses ftruncate, and growth cannot overwrite existing data.
+/// APFS can allocate zero-filled ranges on growth, including writes past EOF.
+/// Punch newly added whole blocks explicitly; preserve the old partial block.
+/// Callers serialize resizing with writes to the same output.
 pub(crate) fn set_len(file: &File, size: u64) -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    if size > file.metadata()?.len() {
-        return file.write_all_at(&[0], size - 1);
+    {
+        let old_size = file.metadata()?.len();
+        file.set_len(size)?;
+        if size > old_size {
+            let block = block_size(file)?;
+            let start = old_size.div_ceil(block) * block;
+            let end = size / block * block;
+            if end > start {
+                punch(file, start, end - start)?;
+            }
+        }
+        Ok(())
     }
+    #[cfg(not(target_os = "macos"))]
     file.set_len(size)
 }
 
