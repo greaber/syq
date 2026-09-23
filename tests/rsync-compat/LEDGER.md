@@ -11,8 +11,8 @@ Configured command prefix: `syq rsync`.
 
 | Classification | Tests |
 |---|---:|
-| conformance | 16 |
-| adapted | 22 |
+| conformance | 17 |
+| adapted | 21 |
 | unsupported | 130 |
 | out-of-scope | 183 |
 | unassessed | 0 |
@@ -31,7 +31,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | file-selection | `files-from-depth` | pass | Compatible | subset adaptation (files-from-split) | platform=linux,macos | Deep line- and NUL-delimited --files-from selection agree; comment handling and unsupported filter-list cases are reported separately or omitted. |
 | file-selection | `files-from-path-clamp` | fail | Policy open | unmodified upstream | platform=linux,macos | SYQ rejects parent components instead of clamping them at the source root. |
 | file-selection | `size-filter` | pass | Compatible | unmodified upstream | platform=linux,macos | Apply --min-size and --max-size throughout a deep tree. |
-| hardlinks | `hardlinks-deep` | pass | Compatible | subset adaptation (hardlink-default) | platform=linux,macos; hard links | Without -H, two cross-directory source names for one inode become independent destination files; unsupported hard-link preservation is omitted. |
+| hardlinks | `hardlinks-deep` | pass | Compatible | unmodified upstream | platform=linux,macos; hard links | -H preserves cross-directory regular-file links; without -H, the destination names use independent inodes. |
 | metadata | `chgrp` | pass | Compatible | unmodified upstream | platform=linux,macos; POSIX groups; chgrp | Preserve a supplementary group with -g. |
 | metadata | `chown` | pass | Compatible | subset adaptation (chown-syq-cli) | platform=linux,macos; run-as=root; root; chown | Archive mode preserves varied numeric owners and groups on files and directories at depth; rsync-only --super and -H are removed. |
 | metadata | `dir-sgid` | pass | Compatible | unmodified upstream | platform=linux; POSIX modes | Honor setgid inheritance when creating destination directories. |
@@ -76,7 +76,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `unsupported-alt-dest` | Requires rsync backup, link-dest, compare-dest, copy-dest, or alternate-basis behavior, which SYQ does not implement. |
 | `unsupported-batch` | Requires rsync batch-file behavior, which SYQ does not implement. |
 | `unsupported-filters` | Requires rsync's filter language; SYQ currently exposes gitignore-style filters instead. |
-| `unsupported-hardlinks` | Requires hard-link preservation, which SYQ does not implement. |
+| `unsupported-hardlinks` | Requires non-regular hardlinks or additional rsync hardlink options (alternate destinations and debug output). |
 | `unsupported-metadata` | Requires an rsync metadata option that SYQ does not implement yet. |
 | `unsupported-relative` | Requires rsync --relative/-R behavior, which SYQ does not implement. |
 | `unsupported-transfer-mode` | Requires an rsync transfer mode or output option that SYQ does not implement. |

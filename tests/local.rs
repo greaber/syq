@@ -967,6 +967,8 @@ mod copy;
 mod data_safety;
 #[path = "local/fifo.rs"]
 mod fifo;
+#[path = "local/hardlinks.rs"]
+mod hardlinks;
 #[path = "local/hashing.rs"]
 mod hashing;
 #[path = "local/local_copy_selection.rs"]

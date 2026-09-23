@@ -223,7 +223,7 @@ fn expected_hash_failure_preserves_existing_destination() {
         mtime: 0,
         mtime_nsec: 0,
     };
-    let expected = Digest::hash_bytes(HashAlgorithm::Md5, b"bad");
+    let expected = Digest::hash_bytes(HashAlgorithm::Md5, b"bad").into();
     assert!(operations
         .finalize_expected(
             Some(&expected),
@@ -239,7 +239,7 @@ fn expected_hash_failure_preserves_existing_destination() {
         )
         .is_err());
     assert_eq!(fs::read(&target).unwrap(), b"old");
-    let expected = Digest::hash_bytes(HashAlgorithm::Md5, b"new");
+    let expected = Digest::hash_bytes(HashAlgorithm::Md5, b"new").into();
     operations
         .finalize_expected(
             Some(&expected),

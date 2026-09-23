@@ -224,6 +224,7 @@ fn pipeline_worker(
         hash_policy: Default::default(),
         mapping_metadata: Default::default(),
         mapping_expected_hashes: Default::default(),
+        hardlink_expected_hashes: Default::default(),
         block: 512,
         tuning: crate::transfer_tuning::TransferTuning {
             copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
@@ -235,6 +236,8 @@ fn pipeline_worker(
         recursive: true,
         links: false,
         perms: false,
+        hardlinks: false,
+        hardlink_completions: Mutex::new(Default::default()),
         devices: false,
         checksum: false,
         precise_mtime: true,
@@ -699,7 +702,7 @@ fn whole_file_groups_overlap_and_drain_both_endpoint_windows() {
                 );
                 if !worker.transport_dead() {
                     assert!(
-                        results[..2].iter().all(|r| matches!(r, Some(Ok(())))),
+                        results[..2].iter().all(|r| matches!(r, Some(Ok(_)))),
                         "earlier acknowledged files survive {failure}: {results:?}"
                     );
                     assert!(
@@ -1133,7 +1136,7 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
         worker
             .transfer_small_batches(&jobs, (0..8).map(|i| i..i + 1), &mut results)
             .unwrap();
-        assert!(results.iter().all(|r| matches!(r, Some(Ok(())))));
+        assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
         assert_eq!(src.lock().unwrap().sent_at_receive, expected);
     }
 }
@@ -1157,7 +1160,7 @@ fn empty_file_groups_need_no_source_reads() {
     worker
         .transfer_small_batches(&jobs, std::iter::once(0..2), &mut results)
         .unwrap();
-    assert!(results.iter().all(|r| matches!(r, Some(Ok(())))));
+    assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
     assert!(src.lock().unwrap().requests.is_empty());
     let destination = dst.lock().unwrap();
     let [Request::PutSmallBatch(puts)] = destination.requests.as_slice() else {

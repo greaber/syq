@@ -32,6 +32,7 @@ use std::sync::Mutex;
 
 mod diagnostics;
 mod dry_run;
+mod hardlinks;
 mod planner;
 mod worker;
 
@@ -119,6 +120,10 @@ pub struct Opts {
     pub hash_policy: crate::hashing::HashPolicy,
     pub mapping_metadata: std::collections::HashMap<PathBytes, crate::mapping::Metadata>,
     pub mapping_expected_hashes: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
+    // Installed only for mapping assertions on hardlinked files, before those
+    // representatives enter the queue. Ordinary files keep their original path.
+    hardlink_expected_hashes:
+        std::sync::OnceLock<std::collections::HashMap<PathBytes, crate::hashing::ExpectedHashes>>,
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
@@ -128,6 +133,8 @@ pub struct Opts {
     pub recursive: bool,
     pub links: bool,
     pub perms: bool,
+    pub hardlinks: bool,
+    hardlink_completions: Mutex<std::collections::HashMap<usize, Option<(u64, u64)>>>,
     pub devices: bool,
     pub checksum: bool,
     pub precise_mtime: bool,
@@ -232,6 +239,29 @@ impl Opts {
     fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
         self.mapping_expected_hashes.get(path)
     }
+    fn group_expected(
+        &self,
+        job: &crate::sched::FileJobData,
+    ) -> Option<&crate::hashing::ExpectedHashes> {
+        if !self.hardlinks {
+            return None;
+        }
+        self.hardlink_expected_hashes.get()?.get(&job.rel_bytes)
+    }
+
+    fn expected_hashes_for(
+        &self,
+        job: &crate::sched::FileJobData,
+    ) -> Option<crate::hashing::ExpectedHashes> {
+        self.group_expected(job)
+            .cloned()
+            .or_else(|| self.expected_for(&job.rel_bytes).cloned().map(Into::into))
+    }
+
+    fn has_expected_for(&self, job: &crate::sched::FileJobData) -> bool {
+        self.group_expected(job).is_some() || self.expected_for(&job.rel_bytes).is_some()
+    }
+
     fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
         crate::copy_policy::CopyPolicy {
             same_host: self.same_host,
@@ -464,6 +494,7 @@ fn small_copy_eligible(
         && args.restricted_grant.is_none()
         && !args.dry_run
         && !args.inplace
+        && !args.hardlinks
         && !args.delete
         && !args.update
         && !args.checksum
@@ -1409,6 +1440,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .collect()
             })
             .unwrap_or_default(),
+        hardlink_expected_hashes: Default::default(),
         mapping_expected_hashes: mapping_entries
             .as_ref()
             .map(|(entries, _)| {
@@ -1433,6 +1465,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         recursive: args.recursive,
         links: args.links,
         perms: args.perms,
+        hardlinks: args.hardlinks,
+        hardlink_completions: Mutex::new(Default::default()),
         devices: args.devices,
         checksum: args.checksum,
         precise_mtime: !matches!(args.placement, Placement::Rsync),
@@ -2227,10 +2261,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             logical_bytes: 0,
             objects: 0,
             overflowed: false,
+            hardlink_inodes: Default::default(),
         })
     });
     let defer_destination_mutations =
-        multiple_distinct_sources || (fresh_capacity.is_some() && !args.dry_run);
+        args.hardlinks || multiple_distinct_sources || (fresh_capacity.is_some() && !args.dry_run);
     // Native new/existing forms are intentionally only the lightweight
     // pathname checks above. Once they pass, use the ordinary engine's target
     // conditions and publication behavior; this adapter does not add an
@@ -2729,6 +2764,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             changes
         },
         active_source: None,
+        hardlinks: Default::default(),
     };
 
     let mut scan_err = None;
@@ -2890,7 +2926,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // checks. A local tree can now copy earlier batches while subsequent
         // batches prepare their directories and destination metadata. Preserve
         // the single-file offload path and the existing bounded small-tree start.
+        // Hardlink groups are validated across replay batches; their payloads
+        // must wait until every eligible alias's metadata has been checked.
         let local_start = if opts.same_host
+            && !opts.hardlinks
             && st.fresh_capacity.is_some()
             && !workers_started
             && !opts.dry_run
@@ -3150,6 +3189,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let aborted = sched.is_aborted();
     if opts.dry_run {
         st.flush_dry_directory_traces();
+    }
+    if !aborted && scan_err.is_none() && !collision {
+        if let Err(error) = st.complete_hardlinks(&mut *src_ctl) {
+            progress.error(&format!("syq: hardlink preservation: {error:#}"));
+        }
     }
     sched.clear_finished_work();
     let mut deleted = 0u64;
@@ -4247,6 +4291,7 @@ struct FreshCapacityPlan {
     logical_bytes: u64,
     objects: u64,
     overflowed: bool,
+    hardlink_inodes: std::collections::HashSet<(u64, u64)>,
 }
 
 fn fresh_capacity_error(capacity: FreshCapacityAssessment) -> anyhow::Error {

@@ -353,6 +353,32 @@ syq persist receive on --name laptop --root "$receive_root"
 syq persist receive remove "$(hostname)"
 syq persist receive wait source --timeout 30
 ssh source 'syq persist destinations wait laptop --timeout 30'
+printf 'case: hardlinks survive SSH and TCP copies, updates, reruns, and pulls\n'
+python3 - <<'PY_HARDLINKS'
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+with tempfile.TemporaryDirectory(prefix='syq-hardlinks-') as scratch:
+    source = Path(scratch) / 'source'
+    source.mkdir()
+    (source / 'a').write_bytes(b'first')
+    os.link(source / 'a', source / 'b')
+    for label, transport in [('ssh', ['--no-tcp']), ('tcp', [])]:
+        destination = '/tmp/syq-real-ssh/hardlinks-' + label
+        command = ['syq', 'cp', '--preserve=hardlinks', '--srcs-in', str(source), '--to', 'destination', '--into', destination, *transport]
+        subprocess.run(command, check=True, timeout=30)
+        subprocess.run(command, check=True, timeout=30)
+        (source / 'a').write_bytes(b'changed payload')
+        subprocess.run([*command, '--inplace'], check=True, timeout=30)
+        pull = Path(scratch) / label
+        subprocess.run(['syq', 'cp', '--preserve=hardlinks', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30)
+        assert (pull / 'a').read_bytes() == b'changed payload'
+        assert (pull / 'b').read_bytes() == b'changed payload'
+        assert (pull / 'a').stat().st_ino == (pull / 'b').stat().st_ino
+PY_HARDLINKS
+
 printf 'case: return copies await local approval and denial leaves no destination\n'
 timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as denied' &
 return_copy_pid=$!

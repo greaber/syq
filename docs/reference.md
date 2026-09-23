@@ -289,11 +289,34 @@ syq cp --preserve=permissions,ownership project --into backup
 | `--preserve=permissions` | `-p` |
 | `--preserve=ownership` | `-o -g --numeric-ids` |
 | `--preserve=specials` | `-D` (devices and special files) |
+| `--preserve=hardlinks` | `-H` (regular files) |
 
 Setting ownership requires suitable destination permissions. Syq does not
-preserve hard links, ACLs, or extended attributes. See the
+preserve ACLs or extended attributes. See the
 [rsync option definitions](https://download.samba.org/pub/rsync/rsync.1#opt--perms)
 and [metadata details](commands/cp.md#metadata-details).
+
+With `--preserve=hardlinks`, selected names for the same source regular file
+share one destination inode. This works for local and ordinary SSH copies,
+including updates, reruns, and `--inplace`. Only names eligible under the
+overwrite policy join the group; links outside the selected sources are not
+reconstructed. Existing extra destination links are not necessarily split.
+With `--inplace`, writes still affect every existing name for that destination
+inode, including names outside the copy.
+
+Hardlink preservation scans all selected sources before changing the destination.
+Large trees therefore take longer to start copying and require memory for the
+complete file list.
+
+A group transfers one payload. Creating another name is reported as a successful
+file operation with zero transferred bytes. Conflicting per-path metadata fails
+the copy. Every supplied expected hash must match the shared contents: omitted
+hashes impose no requirement, identical hashes are checked once, and different
+algorithms are checked together in one read. Different values for the same
+algorithm are rejected before copying the group. Hardlinks across destination
+filesystems fail visibly. Multiply linked symlinks and special files are currently unsupported,
+as are hardlink requests with descriptors, streams, S3, and command-restricted
+or receiving destinations. `-a` retains its existing meaning; add `-H` explicitly.
 
 ## Symlinks
 

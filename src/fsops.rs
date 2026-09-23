@@ -1846,10 +1846,14 @@ impl FsOps {
             Request::Apply { ops, guard } => {
                 if guard.is_none() {
                     for op in ops {
+                        if let Op::Hardlink { source, .. } = op {
+                            map(source)?;
+                        }
                         let path = match op {
                             Op::Mkdir { path, .. }
                             | Op::Symlink { path, .. }
                             | Op::Mknod { path, .. }
+                            | Op::Hardlink { path, .. }
                             | Op::SetMeta { path, .. }
                             | Op::SetFileMetaIfSame { path, .. }
                             | Op::Remove { path }

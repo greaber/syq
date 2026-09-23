@@ -179,6 +179,8 @@ pub struct Entry {
     /// Device and inode, for detecting src==dst (same file / hardlink / alias).
     pub dev: u64,
     pub ino: u64,
+    /// Source link count; group state is needed only for multiply linked inodes.
+    pub nlink: u64,
     /// Status-change time completes the identity fingerprint used to detect an
     /// unlink/recreate race that happens to reuse the same inode number.
     pub ctime: i64,
@@ -343,6 +345,9 @@ pub mod flags {
     /// These modifiers require the corresponding OWNER/GROUP flag and authority.
     pub const REQUIRE_OWNER: u8 = 32;
     pub const REQUIRE_GROUP: u8 = 64;
+    /// Return the identity of the held, completed inode for hardlink followers.
+    /// This changes only the reply; restricted grants do not authorize it.
+    pub const REPORT_IDENTITY: u8 = 128;
 }
 
 /// Best-effort kernel counters for one end of a TCP data socket. `None` means
@@ -412,6 +417,13 @@ pub enum Op {
         condition: TargetCondition,
         meta: Meta,
         flags: u8,
+    },
+    /// Publish another name for a validated regular-file representative.
+    Hardlink {
+        path: PathBytes,
+        source: PathBytes,
+        dev: u64,
+        ino: u64,
     },
     /// Remove whatever currently occupies the path, recursively when it is a
     /// directory. Planned deletion uses Unlink/Rmdir instead.
@@ -792,7 +804,7 @@ pub enum WireRequest<Data> {
     /// renamed over the final path meanwhile, its complete file remains the
     /// winner and this only touches the now-unlinked old inode.
     FinishBasis {
-        expected_hash: Option<crate::hashing::Digest>,
+        expected_hash: Option<crate::hashing::ExpectedHashes>,
         path: PathBytes,
         copy_id: CopyId,
         meta: Meta,
@@ -865,7 +877,7 @@ pub enum WireRequest<Data> {
         guard: Option<ContainerGuard>,
     },
     Finalize {
-        expected_hash: Option<crate::hashing::Digest>,
+        expected_hash: Option<crate::hashing::ExpectedHashes>,
         path: PathBytes,
         inplace: bool,
         copy_id: CopyId,
@@ -949,7 +961,7 @@ pub enum WireRequest<Data> {
     ConfigureHashing(crate::hashing::HashPolicy),
     ValidateDigest {
         path: PathBytes,
-        expected: crate::hashing::Digest,
+        expected: crate::hashing::ExpectedHashes,
         guard: Option<ContainerGuard>,
     },
     DescriptorCopy(crate::descriptor_copy::Operation),
@@ -1205,6 +1217,11 @@ pub enum Response {
     /// Cumulative bytes written by the current CopyLocal request. This is
     /// progress only; a terminal response still determines success.
     CopyLocalProgress(u64),
+    Published {
+        dev: u64,
+        ino: u64,
+    },
+    PublishedBatch(Vec<std::result::Result<Option<(u64, u64)>, WireError>>),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

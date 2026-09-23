@@ -169,6 +169,9 @@ pub(crate) fn copy(args: &mut crate::cli::Args) -> Result<()> {
     }
     let selection = select_copy(args)?;
     if let Some(selection) = &selection {
+        if args.hardlinks {
+            bail!("hardlink preservation is not supported by named or receiving destinations");
+        }
         maybe_exec(selection)?;
     } else if ACCEPTED.get().is_some() {
         bail!("return route disappeared during handoff; retry the command");

@@ -157,7 +157,7 @@ git-set-file-times-python-compat-regression	out-of-scope	rsync-internal
 growing-file	adapted	-
 hands	adapted	-
 hardlinks	unsupported	unsupported-hardlinks
-hardlinks-deep	adapted	-
+hardlinks-deep	conformance	-
 hashsearch-chain	out-of-scope	rsync-internal
 hashtable-overflow	out-of-scope	rsync-internal
 highfd-hang	conformance	-

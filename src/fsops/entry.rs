@@ -42,6 +42,7 @@ pub fn entry_from_meta(rel: PathBytes, full: &Path, md: &fs::Metadata) -> Entry 
         dev: md.dev(),
         ino: md.ino(),
         ctime: md.ctime(),
+        nlink: md.nlink(),
         ctime_nsec: md.ctime_nsec() as u32,
         link,
     }
@@ -164,6 +165,7 @@ pub(super) fn entry_from_root_metadata(
         dev: metadata.dev,
         ino: metadata.ino,
         ctime: metadata.ctime,
+        nlink: metadata.nlink,
         ctime_nsec: metadata.ctime_nsec,
         link,
     }

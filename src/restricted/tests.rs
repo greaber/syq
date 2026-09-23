@@ -1244,7 +1244,9 @@ fn op_condition(request: &Request) -> proto::TargetCondition {
         | Op::Mknod { condition, .. }
         | Op::SetMeta { condition, .. }
         | Op::SetFileMetaIfSame { condition, .. } => *condition,
-        Op::Remove { .. } | Op::Rmdir { .. } | Op::Unlink { .. } => unreachable!(),
+        Op::Hardlink { .. } | Op::Remove { .. } | Op::Rmdir { .. } | Op::Unlink { .. } => {
+            unreachable!()
+        }
     }
 }
 
@@ -3893,7 +3895,7 @@ fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
     };
     authority.authorize(&mut finish, false).unwrap();
     assert!(
-        matches!(finish, Request::FinishBasis { expected_hash: Some(ref value), .. } if *value == expected)
+        matches!(finish, Request::FinishBasis { expected_hash: Some(ref value), .. } if *value == crate::hashing::ExpectedHashes::Single(expected))
     );
     assert!(authority.authorize(&mut small_put(&target), false).is_err());
 }
@@ -4573,4 +4575,29 @@ fn restricted_authority_rejects_caller_source_registration() {
             .to_string()
             .contains("source references are not valid"));
     }
+}
+
+#[test]
+fn existing_signed_grants_never_authorize_hardlink_creation() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let mut request = Request::Apply {
+        ops: vec![Op::Hardlink {
+            path: path_bytes(&root.join("target")),
+            source: path_bytes(&root.join("source")),
+            dev: 1,
+            ino: 2,
+        }],
+        guard: None,
+    };
+    let error = authority.authorize(&mut request, false).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("hardlink creation is not authorized"),
+        "{error:#}"
+    );
+    assert!(!root.join("target").exists());
 }
