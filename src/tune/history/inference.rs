@@ -25,7 +25,6 @@ pub(super) fn starting_count(
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let local_copy = key.source_transport == "Local" && key.destination_transport == "Local";
         let mut choices = Vec::new();
         for (rank, (run, when)) in runs.into_iter().enumerate() {
             let mut events =
@@ -37,26 +36,13 @@ pub(super) fn starting_count(
                     evidence.push(&event);
                 }
             }
-            let corrected = evidence.corrected_local_progress;
             if let Some((workers, refine)) = evidence.finish() {
                 let age = day().saturating_sub(when).max(0) as f64;
                 let weight = 2.0_f64.powf(-age / 7.0) / (rank + 1) as f64;
                 if weight > 0.0 {
-                    choices.push((
-                        workers,
-                        weight,
-                        run,
-                        refine && (!local_copy || corrected),
-                        corrected,
-                    ));
+                    choices.push((workers, weight, run, refine));
                 }
             }
-        }
-        // Before policy 8, whole-file local copies reported completion bursts
-        // and could attribute draining writers to a reduced count. Keep this
-        // history as a fallback, without letting it outvote corrected evidence.
-        if local_copy && choices.iter().any(|c| c.4) {
-            choices.retain(|c| c.4);
         }
         // Each transfer contributes once; a long run's correlated intervals do
         // not outvote multiple independent runs. Compare relative rates within
@@ -64,7 +50,7 @@ pub(super) fn starting_count(
         choices.sort_by_key(|c| c.0);
         let half = choices.iter().map(|c| c.1).sum::<f64>() * 0.5;
         let mut cumulative = 0.0;
-        for (workers, weight, run, refine, _) in choices {
+        for (workers, weight, run, refine) in choices {
             cumulative += weight;
             if cumulative > half {
                 return Ok(Some(Hint {
@@ -81,21 +67,13 @@ pub(super) fn starting_count(
 
 #[derive(Default)]
 struct RunEvidence {
-    legacy: BTreeMap<usize, (f64, f64, usize)>,
     observations: BTreeMap<usize, (f64, f64, usize)>,
-    modern: bool,
     consistent: bool,
     incompatible: bool,
-    corrected_local_progress: bool,
 }
 
 impl RunEvidence {
     fn push(&mut self, event: &Value) {
-        if event["kind"] == "start" || event["kind"] == "policy_start" {
-            self.corrected_local_progress |= event["data"]["policy_version"]
-                .as_u64()
-                .is_some_and(|version| version >= 8);
-        }
         if event["kind"] == "start" {
             self.incompatible |= event["data"]["automatic"] == false
                 || event["data"]
@@ -106,47 +84,15 @@ impl RunEvidence {
             self.consistent =
                 event["data"]["consistent"] == true && event["data"]["automatic"] == true;
         }
-        let modern = event["kind"] == "observation";
-        if !modern && event["kind"] != "sample" {
+        if event["kind"] != "observation" {
             return;
         }
-        self.modern |= modern;
-        let points = if modern {
-            &mut self.observations
-        } else {
-            &mut self.legacy
-        };
         let data = &event["data"];
         let Some(n) = data["active"].as_u64().filter(|n| *n > 0 && *n <= 65536) else {
             return;
         };
-        if modern {
-            if data["usable"] != true {
-                return;
-            }
-        } else {
-            if data["ready"].as_u64().unwrap_or(0) < n || data["failed"].as_u64().unwrap_or(0) != 0
-            {
-                return;
-            }
-            if !matches!(
-                data["disposition"].as_str(),
-                Some(
-                    "stable"
-                        | "collecting"
-                        | "sample_limit"
-                        | "warmup_excluded"
-                        | "insufficient_remaining_work"
-                        | "collapse_guard"
-                )
-            ) {
-                return;
-            }
-            // Old tail records can still be useful, but don't credit an
-            // interval ending with demonstrated insufficient parallel work.
-            if data["last_work_check"][1]["parallel"] == false {
-                return;
-            }
+        if data["usable"] != true {
+            return;
         }
         let Some(seconds) = data["seconds"]
             .as_f64()
@@ -157,23 +103,18 @@ impl RunEvidence {
         let Some(rate) = data["rate"].as_f64().filter(|v| v.is_finite() && *v >= 0.0) else {
             return;
         };
-        let point = points.entry(n as usize).or_default();
+        let point = self.observations.entry(n as usize).or_default();
         point.0 += rate * seconds;
         point.1 += seconds;
         point.2 += 1;
     }
 
     fn finish(self) -> Option<(usize, bool)> {
-        if self.incompatible || (self.modern && !self.consistent) {
+        if self.incompatible || !self.consistent {
             return None;
         }
-        let points = if self.modern {
-            self.observations
-        } else {
-            self.legacy
-        };
-
-        let points: Vec<_> = points
+        let points: Vec<_> = self
+            .observations
             .into_iter()
             .filter(|(_, (_, seconds, count))| *seconds >= 2.5 && *count >= 2)
             .map(|(n, (activity, seconds, _))| (n, activity / seconds))
@@ -212,57 +153,20 @@ fn infer_run(events: &[Value]) -> Option<(usize, bool)> {
 mod tests {
     use super::*;
 
-    fn sample(n: usize, rate: f64, disposition: &str) -> Value {
-        json!({"kind":"sample","data":{"active":n,"ready":n,"failed":0,
-            "seconds":2.5,"rate":rate,"disposition":disposition}})
+    fn context() -> Value {
+        json!({"kind":"learning_context","data":{"consistent":true,"automatic":true}})
+    }
+
+    fn observation(n: usize, rate: f64, usable: bool) -> Value {
+        json!({"kind":"observation","data":{"active":n,
+            "seconds":2.5,"rate":rate,"usable":usable}})
     }
 
     #[test]
-    fn corrected_local_history_takes_precedence_but_old_history_remains_a_fallback() {
-        let temp = crate::test_support::tempdir().unwrap();
-        let path = temp.path().join("history.sqlite");
-        let mut key = super::super::tests::key("local");
-        key.source_transport = "Local".into();
-        key.destination_transport = "Local".into();
-        let add_run = |version, worker, usable| {
-            let writer = super::super::tests::recorder(&path);
-            writer.context(&key);
-            writer.event("policy_start", json!({"policy_version":version}));
-            for n in [worker, worker * 2] {
-                for _ in 0..2 {
-                    writer.event(
-                        "sample",
-                        sample(
-                            n,
-                            100.0,
-                            if usable {
-                                "stable"
-                            } else {
-                                "active_workers_settling"
-                            },
-                        )["data"]
-                            .clone(),
-                    );
-                }
-            }
-            writer.finish(true, false, None, json!({}));
-            writer
-        };
-        let old = add_run(7, 16, true);
-        let hint = old.starting_count(&key, false).unwrap();
-        assert_eq!(hint.workers, 16);
-        assert!(
-            !hint.refine,
-            "old reporting must not slow initial exploration"
-        );
-        let empty = add_run(8, 4, false);
-        assert_eq!(empty.starting_count(&key, false).unwrap().workers, 16);
-        add_run(8, 4, true);
-        // Even newer old-binary runs cannot displace corrected evidence.
-        let latest = add_run(7, 16, true);
-        let hint = latest.starting_count(&key, false).unwrap();
-        assert_eq!(hint.workers, 4);
-        assert!(hint.refine);
+    fn legacy_samples_do_not_seed_starting_counts() {
+        let old = json!({"kind":"sample","data":{"active":16,"ready":16,"failed":0,
+            "seconds":2.5,"rate":100.0,"disposition":"stable"}});
+        assert_eq!(infer_run(&[context(), old.clone(), old]), None);
     }
 
     #[test]
@@ -271,8 +175,9 @@ mod tests {
             json!({"kind":"start","data":{
                 "automatic":true,"overrides":"Some(TuningOptions { request_size: Some(1024) })"
             }}),
-            sample(8, 100.0, "stable"),
-            sample(8, 100.0, "stable"),
+            observation(8, 100.0, true),
+            observation(8, 100.0, true),
+            context(),
         ];
         assert_eq!(infer_run(&events), None);
         events[0]["data"]["overrides"] = json!("None");
@@ -284,34 +189,40 @@ mod tests {
     #[test]
     fn flat_measurements_do_not_ratchet_starting_counts_upward() {
         let events = vec![
-            sample(8, 100.0, "stable"),
-            sample(8, 100.0, "stable"),
-            sample(16, 100.0, "stable"),
-            sample(16, 100.0, "stable"),
+            context(),
+            observation(8, 100.0, true),
+            observation(8, 100.0, true),
+            observation(16, 100.0, true),
+            observation(16, 100.0, true),
         ];
         assert_eq!(infer_run(&events), Some((8, true)));
     }
 
     #[test]
-    fn released_samples_learn_rising_gain_without_a_saved_recommendation() {
+    fn observations_learn_rising_gain_without_a_saved_recommendation() {
         let events = vec![
-            sample(8, 100.0, "collecting"),
-            sample(8, 100.0, "stable"),
-            sample(16, 125.0, "insufficient_remaining_work"),
-            sample(16, 156.25, "insufficient_remaining_work"),
-            sample(16, 195.3125, "insufficient_remaining_work"),
+            context(),
+            observation(8, 100.0, true),
+            observation(8, 100.0, true),
+            observation(16, 125.0, true),
+            observation(16, 156.25, true),
+            observation(16, 195.3125, true),
         ];
         assert_eq!(infer_run(&events), Some((16, false)));
     }
 
     #[test]
     fn work_limited_and_setup_intervals_do_not_establish_a_winner() {
-        let mut events = vec![sample(8, 100.0, "collecting"), sample(8, 100.0, "stable")];
+        let mut events = vec![
+            context(),
+            observation(8, 100.0, true),
+            observation(8, 100.0, true),
+        ];
         for _ in 0..3 {
-            let mut e = sample(16, 200.0, "insufficient_remaining_work");
-            e["data"]["last_work_check"] = json!([0,{"parallel":false}]);
+            let mut e = observation(16, 200.0, true);
+            e["data"]["usable"] = json!(false);
             events.push(e);
-            events.push(sample(32, 400.0, "active_workers_connecting"));
+            events.push(observation(32, 400.0, false));
         }
         assert_eq!(infer_run(&events), Some((8, false)));
     }
@@ -340,18 +251,20 @@ mod tests {
         for scale in [1.0, 10.0, 100.0] {
             let writer = super::super::tests::recorder(&path);
             writer.context(&key);
+            writer.event("learning_context", context()["data"].clone());
             for (n, rate) in [(8, scale), (32, scale * 2.0)] {
                 for _ in 0..2 {
-                    writer.event("sample", sample(n, rate, "stable")["data"].clone());
+                    writer.event("observation", observation(n, rate, true)["data"].clone());
                 }
             }
             writer.finish(true, false, None, json!({}));
         }
         let writer = super::super::tests::recorder(&path);
         writer.context(&key);
+        writer.event("learning_context", context()["data"].clone());
         for (n, rate) in [(8, 1000.0), (32, 900.0)] {
             for _ in 0..2 {
-                writer.event("sample", sample(n, rate, "stable")["data"].clone());
+                writer.event("observation", observation(n, rate, true)["data"].clone());
             }
         }
         writer.finish(true, false, None, json!({}));
@@ -365,10 +278,11 @@ mod tests {
         let key = super::super::tests::key("a");
         let writer = super::super::tests::recorder(&path);
         writer.context(&key);
+        writer.event("learning_context", context()["data"].clone());
         for n in [8, 16] {
             for _ in 0..2 {
-                let e = sample(n, n as f64, "insufficient_remaining_work");
-                writer.event("sample", e["data"].clone());
+                let e = observation(n, n as f64, true);
+                writer.event("observation", e["data"].clone());
             }
         }
         writer.finish(true, false, None, json!({}));

@@ -1771,7 +1771,7 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
         .query_row("SELECT source_fs FROM runs LIMIT 1", [], |row| row.get(0))
         .unwrap();
     assert!(fs.is_some(), "test filesystem did not provide an identity");
-    // Keep the released sample format: saved recommendations are deliberately
+    // Seed observation records: saved recommendations are deliberately
     // misleading and must not determine the starting count.
     db.execute("UPDATE runs SET eligible=1,workers=99", [])
         .unwrap();
@@ -1782,9 +1782,9 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
     .unwrap();
     let seed_samples = |workers: usize, sequence: i64| {
         for index in 0..2 {
-            let event = serde_json::json!({"kind":"sample","data":{
+            let event = serde_json::json!({"kind":"observation","data":{
                 "active":workers,"ready":workers,"failed":0,"seconds":2.5,
-                "rate":if workers == 2 {99.0} else {100.0},"disposition":"insufficient_remaining_work"
+                "rate":if workers == 2 {99.0} else {100.0},"usable":true
             }});
             db.execute(
                 "INSERT INTO events VALUES(1,?1,0,?2)",
@@ -2135,7 +2135,7 @@ fn whole_file_progress_reaches_tuner_before_completion() {
     }
 }
 
-/// Seed released-format measurements under the context established by a real
+/// Seed observations under the context established by a real
 /// command. Tests must not depend on the implementation of opaque route tokens.
 pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) {
     let db = rusqlite::Connection::open(cache.with_extension("history-v1.sqlite")).unwrap();
@@ -2148,10 +2148,17 @@ pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) 
         [id],
     )
     .unwrap();
+    let context = serde_json::json!({"kind":"learning_context","data":{
+        "consistent":true,"automatic":true}});
+    db.execute(
+        "INSERT INTO events VALUES(?1,2,0,?2)",
+        rusqlite::params![id, context.to_string()],
+    )
+    .unwrap();
     for sequence in 0..2 {
-        let event = serde_json::json!({"kind":"sample","data":{
+        let event = serde_json::json!({"kind":"observation","data":{
             "active":workers,"ready":workers,"failed":0,"seconds":2.5,
-            "rate":100.0,"disposition":"insufficient_remaining_work"
+            "rate":100.0,"usable":true
         }});
         db.execute(
             "INSERT INTO events VALUES(?1,?2,0,?3)",
