@@ -156,7 +156,7 @@ fuzzy-basis	unsupported	unsupported-transfer-mode
 git-set-file-times-python-compat-regression	out-of-scope	rsync-internal
 growing-file	adapted	-
 hands	adapted	-
-hardlinks	unsupported	unsupported-hardlinks
+hardlinks	adapted	-
 hardlinks-deep	conformance	-
 hashsearch-chain	out-of-scope	rsync-internal
 hashtable-overflow	out-of-scope	rsync-internal
@@ -348,7 +348,7 @@ wildmatch	out-of-scope	rsync-internal
 write-batch-filter-injection	unsupported	unsupported-batch
 write-batch-quoting	unsupported	unsupported-batch
 xattr-wire-cap	unsupported	unsupported-xattrs
-xattrs	unsupported	unsupported-xattrs
+xattrs	adapted	-
 xattrs-depth	adapted	-
-xattrs-hlink	unsupported	unsupported-xattrs
+xattrs-hlink	adapted	-
 xrsync	out-of-scope	rsync-wire

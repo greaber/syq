@@ -2390,3 +2390,77 @@ fn rejected_telemetry_subscription_does_not_fail_remote_copy() {
         );
     }
 }
+
+#[test]
+fn checksum_inplace_compares_before_writing_over_ssh_and_tcp() {
+    for tcp in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        t.expose_remote_syq();
+        let data = prng(3 * 65536 + 17, 96);
+        let mut changed = data.clone();
+        changed[65536] ^= 1;
+        let mut longer = data.clone();
+        longer.extend_from_slice(b"remove this suffix");
+        let cases = [
+            ("readonly", data.clone(), data.clone()),
+            ("changed", data.clone(), changed),
+            ("shorter", data.clone(), data[..65536].to_vec()),
+            ("longer", data.clone(), longer),
+            ("new-data", data.clone(), vec![]),
+            ("truncate", vec![], data.clone()),
+            ("empty", vec![], vec![]),
+        ];
+        let mut identities = Vec::new();
+        for (name, source, destination) in &cases {
+            write(&t.path(&format!("src/{name}")), source);
+            write(&t.path(&format!("dst/{name}")), destination);
+            for directory in ["src", "dst"] {
+                let path = t.path(&format!("{directory}/{name}"));
+                if *name == "readonly" {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+                }
+                set_mtime(&path, 1_577_934_245);
+            }
+            identities.push(fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino());
+        }
+        for _ in 0..2 {
+            let mut command = compat_command();
+            command
+                .arg("-e")
+                .arg(&rsh)
+                .args([
+                    "-ac",
+                    "--inplace",
+                    "--syq-no-bootstrap",
+                    "--block-size=64K",
+                    "--performance-tuning=workers=4",
+                    "--no-progress",
+                ])
+                .arg(t.s("src/"))
+                .arg(format!("127.0.0.1:{}/", t.s("dst")))
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env("XDG_CONFIG_HOME", t.path("config"))
+                .env("XDG_CACHE_HOME", t.path("cache"));
+            if tcp {
+                command
+                    .args(["--syq-tcp-plain", "--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
+                    .env("SYQ_TEST_REQUIRE_TCP", "1");
+            } else {
+                command.arg("--syq-no-tcp");
+            }
+            assert_output_ok(&command.run().unwrap());
+            for ((name, source, _), inode) in cases.iter().zip(&identities) {
+                let destination = t.path(&format!("dst/{name}"));
+                assert_eq!(&read(&destination), source, "{name}, tcp={tcp}");
+                assert_eq!(fs::metadata(&destination).unwrap().ino(), *inode);
+            }
+            assert_eq!(
+                fs::metadata(t.path("dst/readonly")).unwrap().mode() & 0o7777,
+                0o400
+            );
+        }
+    }
+}

@@ -4743,3 +4743,60 @@ fn acl_resume_replaces_previously_readable_staging_inodes() {
         assert_eq!(fs::read(&path).unwrap(), b"protected payload");
     }
 }
+
+#[test]
+fn inplace_prepare_rejects_replaced_hashed_basis_before_mutation() {
+    for replacement in ["file", "symlink", "missing"] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        fs::write(root.join("file"), b"hashed contents").unwrap();
+        fs::write(root.join("outside"), b"untouched").unwrap();
+        let mut ops = FsOps::new();
+        ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
+        ops.destination_prefix = Some(path_bytes(root));
+        let copy_id = [91; 16];
+        ops.hash_and_hold(
+            b"file",
+            &copy_id,
+            MIN_HASH_BLOCK_BYTES,
+            14,
+            TargetCondition::Any,
+            None,
+        )
+        .unwrap();
+        fs::rename(root.join("file"), root.join("original")).unwrap();
+        match replacement {
+            "file" => fs::write(root.join("file"), b"replacement contents").unwrap(),
+            "symlink" => symlink("outside", root.join("file")).unwrap(),
+            _ => {}
+        }
+        let result = ops.prepare(
+            PartialTarget {
+                path: b"file",
+                id: &copy_id,
+                guard: None,
+            },
+            PrepareOptions {
+                size: 0,
+                inplace: true,
+                mode: 0o600,
+                attempt: 0,
+                create_if_missing: true,
+            },
+        );
+        assert!(result.is_err(), "accepted {replacement} replacement");
+        assert_eq!(fs::read(root.join("original")).unwrap(), b"hashed contents");
+        assert_eq!(fs::read(root.join("outside")).unwrap(), b"untouched");
+        match replacement {
+            "file" => assert_eq!(
+                fs::read(root.join("file")).unwrap(),
+                b"replacement contents"
+            ),
+            "symlink" => assert_eq!(
+                fs::read_link(root.join("file")).unwrap(),
+                Path::new("outside")
+            ),
+            _ => assert!(!root.join("file").exists()),
+        }
+    }
+}

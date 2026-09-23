@@ -494,3 +494,88 @@ fn xattrs_preserve_long_listings_and_large_and_empty_values() {
     assert_eq!(attr(&t.path("destination"), "user.large"), None);
     assert_eq!(attr(&t.path("destination"), "user.empty"), Some(Vec::new()));
 }
+
+#[test]
+fn archival_reruns_repair_hardlinks_inside_readonly_directories() {
+    for options in [
+        vec![],
+        vec!["--performance-tuning=copy-path=ranges"],
+        vec!["--inplace"],
+    ] {
+        let t = Tmp::new();
+        let data = prng(2 << 20, 93);
+        write(&t.path("src/left/a"), &data);
+        fs::create_dir_all(t.path("src/right")).unwrap();
+        for name in ["right/b", "alias"] {
+            fs::hard_link(t.path("src/left/a"), t.path(&format!("src/{name}"))).unwrap();
+        }
+        let source = t.path("src/left/a");
+        set_attr(&source, "user.binary", b"initial");
+        set_attr(&source, "user.empty", b"");
+        set_attr(&source, "system.posix_acl_access", &acl(6, 4));
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o400)).unwrap();
+        for name in ["left", "right"] {
+            let path = t.path(&format!("src/{name}"));
+            set_attr(&path, "system.posix_acl_default", &acl(4, 4));
+            fs::set_permissions(path, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let from = t.s("src/");
+        let to = t.s("dst/");
+        let mut args = vec!["-aHAX", "--performance-tuning=workers=4"];
+        args.extend(options);
+        args.extend([from.as_str(), to.as_str()]);
+        for phase in 0..4 {
+            match phase {
+                1 => {
+                    // Change only metadata on a read-only hardlink group.
+                    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+                    set_attr(&source, "user.binary", b"metadata-only update");
+                    remove_attr(&source, "user.empty");
+                    fs::set_permissions(&source, fs::Permissions::from_mode(0o400)).unwrap();
+                    for name in ["left", "right"] {
+                        remove_attr(&t.path(&format!("src/{name}")), "system.posix_acl_default");
+                    }
+                }
+                2 => {
+                    // Repair both a damaged representative and a missing alias,
+                    // reopening destination parents only for the update.
+                    let destination = t.path("dst/left/a");
+                    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::write(&destination, b"damaged contents").unwrap();
+                    set_attr(&destination, "user.stale", b"remove me");
+                    // Like rsync, --inplace needs permission to write an
+                    // existing inode; ordinary staged replacement does not.
+                    if !args.contains(&"--inplace") {
+                        fs::set_permissions(&destination, fs::Permissions::from_mode(0o400))
+                            .unwrap();
+                    }
+                    fs::set_permissions(t.path("dst/right"), fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    fs::remove_file(t.path("dst/right/b")).unwrap();
+                    fs::set_permissions(t.path("dst/right"), fs::Permissions::from_mode(0o500))
+                        .unwrap();
+                }
+                3 => args.insert(0, "--checksum"),
+                _ => {}
+            }
+            run_ok(&args);
+            let expected_inode = fs::metadata(t.path("dst/left/a")).unwrap().ino();
+            for name in ["left/a", "right/b", "alias"] {
+                let destination = t.path(&format!("dst/{name}"));
+                assert_eq!(read(&destination), data, "phase {phase}: {name}");
+                assert_eq!(fs::metadata(&destination).unwrap().ino(), expected_inode);
+                verify_metadata(&source, &destination);
+                assert_eq!(attr(&destination, "user.stale"), None);
+            }
+            for name in ["left", "right"] {
+                let source = t.path(&format!("src/{name}"));
+                let destination = t.path(&format!("dst/{name}"));
+                verify_metadata(&source, &destination);
+                assert_eq!(
+                    attr(&source, "system.posix_acl_default"),
+                    attr(&destination, "system.posix_acl_default")
+                );
+            }
+        }
+    }
+}
