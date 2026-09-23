@@ -176,6 +176,10 @@ fn native_acl_and_xattrs_cover_clones_ranges_hardlinks_and_reconciliation() {
         );
         fs::set_permissions(t.path("src/small"), fs::Permissions::from_mode(0o640)).unwrap();
         fs::set_permissions(t.path("dst/small"), fs::Permissions::from_mode(0o640)).unwrap();
+        // In-place copies require writable destinations, including unchanged
+        // representatives opened for range comparison. Final metadata restores
+        // the source's read-only mode on this shared destination inode.
+        fs::set_permissions(t.path("dst/alias"), fs::Permissions::from_mode(0o640)).unwrap();
         write(&t.path("src/small"), b"changed bytes");
         run_ok(&["-aHAXc", "--inplace", &from, &to]);
         assert_eq!(read(&t.path("dst/small")), b"changed bytes");
