@@ -924,3 +924,28 @@ fn small_batches_keep_siblings_and_requeue_preserves_directory() {
     sched.ranges_ready(6, Vec::new());
     assert!(matches!(sched.next(), Item::Exit));
 }
+
+#[test]
+fn nearby_batches_fill_across_directories_without_skipping_siblings() {
+    let sched = Sched::new(64, 128);
+    for parent in ["a", "b"] {
+        for i in 0..3 {
+            sched.push_file(test_job(format!("{parent}/{i}").as_bytes(), 128));
+        }
+    }
+    sched.scan_done();
+    let Item::File(first) = sched.next() else {
+        panic!("missing first file")
+    };
+    assert_eq!(first, 0);
+    let rest = sched.take_small_near(first, 128, 5, 5 * 128);
+    assert_eq!(rest.len(), 5);
+    assert!(rest[..2].iter().all(|&idx| idx < 3));
+    assert!(rest[2..].iter().all(|&idx| idx >= 3));
+    let mut seen = HashSet::new();
+    for idx in std::iter::once(first).chain(rest) {
+        assert!(seen.insert(idx));
+        sched.ranges_ready(idx, Vec::new());
+    }
+    assert!(matches!(sched.next(), Item::Exit));
+}

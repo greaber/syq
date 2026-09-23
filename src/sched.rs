@@ -932,10 +932,15 @@ impl Sched {
         max_bytes: u64,
     ) -> Vec<usize> {
         let mut g = self.inner.lock().unwrap();
-        let group = first.map(|idx| g.files.group_of[idx]);
+        let mut group = first.map(|idx| g.files.group_of[idx]);
         let mut out = Vec::new();
         let mut bytes = 0u64;
         while out.len() < max_n {
+            // Exhaust nearby siblings before moving on, but do not turn a
+            // tree of singleton directories into one-file network requests.
+            if group.is_some_and(|group| g.files.groups[group].is_empty()) {
+                group = g.files.heads.last().map(|(_, group)| *group);
+            }
             let next = match group {
                 Some(group) => g.files.groups[group].peek(),
                 None => g.files.peek(),
