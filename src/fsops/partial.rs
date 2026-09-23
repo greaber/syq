@@ -27,6 +27,31 @@ impl FsOps {
         Ok(Response::PartialSize(partial_size))
     }
 
+    fn create_partial_rooted(
+        &self,
+        root: &Root,
+        relative: &RelativePath,
+        mode: u32,
+    ) -> Result<File> {
+        #[cfg(target_os = "macos")]
+        if self.inode_preservation.acls {
+            return root.create_private_file(relative);
+        }
+        root.create_file(relative, mode)
+    }
+
+    fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        if self.inode_preservation.acls {
+            // A previously public inode may have readers with open descriptors.
+            // Do not write further protected data through that inode on resume.
+            return Ok(file.metadata()?.mode() & 0o077 == 0
+                && crate::inode_metadata::staging_acl_is_empty(file)?);
+        }
+        let _ = file;
+        Ok(true)
+    }
+
     pub(super) fn open_private_partial_rooted(
         &mut self,
         root: &Root,
@@ -38,7 +63,7 @@ impl FsOps {
         self.uncache_rooted(root, relative);
         let mut repaired_permissions = false;
         if create_if_missing {
-            match root.create_file(relative, create_mode) {
+            match self.create_partial_rooted(root, relative, create_mode) {
                 Ok(file) => return Ok(Some((file, None))),
                 Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
                 Err(error) => return Err(error),
@@ -56,6 +81,17 @@ impl FsOps {
                                 || opened.dev() != named.dev
                                 || opened.ino() != named.ino
                             {
+                                continue;
+                            }
+                            if !self.reusable_partial_permissions(&file)? {
+                                drop(file);
+                                discard_safe_rooted_partial_if_same(
+                                    root,
+                                    relative,
+                                    opened.dev(),
+                                    opened.ino(),
+                                    label,
+                                )?;
                                 continue;
                             }
                             if opened.mode() & 0o7777 != 0o600 {
@@ -129,6 +165,17 @@ impl FsOps {
                                 continue;
                             }
                             require_rooted_metadata(&handle, metadata, label)?;
+                            if !self.reusable_partial_permissions(&handle)? {
+                                drop(handle);
+                                discard_safe_rooted_partial_if_same(
+                                    root,
+                                    relative,
+                                    metadata.dev,
+                                    metadata.ino,
+                                    label,
+                                )?;
+                                continue;
+                            }
                             let repair = (|| -> Result<()> {
                                 fail_partial_chmod_for_test()?;
                                 set_mode_handle(&handle, 0o600)?;
@@ -160,7 +207,7 @@ impl FsOps {
                 Some(_) if !create_if_missing => return Ok(None),
                 Some(_) => root.unlink(relative)?,
                 None if !create_if_missing => return Ok(None),
-                None => match root.create_file(relative, create_mode) {
+                None => match self.create_partial_rooted(root, relative, create_mode) {
                     Ok(file) => return Ok(Some((file, None))),
                     Err(error)
                         if error

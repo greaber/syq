@@ -544,3 +544,61 @@ fn acl_restoration_failure_cannot_be_accepted_as_a_content_match() {
         );
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn acl_resume_replaces_previously_readable_staging_inodes() {
+    use std::io::Read;
+    for inherited_acl in [false, true] {
+        let t = Tmp::new();
+        let bytes = prng(32 * 1024, 920);
+        write(&t.path("source"), &bytes);
+        chmod(&t.path("source"), &["+a", "user:nobody deny read"]);
+        fs::create_dir(t.path("destination")).unwrap();
+        let ready = t.path("ready");
+        let continuation = t.path("continue");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args([
+                "cp",
+                "--preserve=acls",
+                "--no-progress",
+                &t.s("source"),
+                "--as",
+                &t.s("destination/file"),
+            ])
+            .env("SYQ_TEST_SMALL_STAGE_READY_FILE", &ready)
+            .env("SYQ_TEST_SMALL_STAGE_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.start().unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "initial ACL stage");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let stages = partial_files(&t.path("destination"));
+        assert_eq!(stages.len(), 1);
+        // Model a partial from a previous binary. An existing reader must not
+        // gain access to the new copy by retaining an fd across permission repair.
+        if inherited_acl {
+            chmod(&stages[0], &["+a", "everyone allow read"]);
+        } else {
+            fs::set_permissions(&stages[0], fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let mut old_reader = fs::File::open(&stages[0]).unwrap();
+        let old_inode = old_reader.metadata().unwrap().ino();
+        fs::remove_file(&ready).unwrap();
+        let mut child = command.start().unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "resumed ACL stage");
+        let stages = partial_files(&t.path("destination"));
+        assert_eq!(stages.len(), 1);
+        let new_inode = fs::metadata(&stages[0]).unwrap().ino();
+        release_confinement_barrier(&continuation);
+        assert_output_ok(&child.wait_with_output().unwrap());
+        let mut exposed = Vec::new();
+        old_reader.read_to_end(&mut exposed).unwrap();
+        assert_ne!(old_inode, new_inode);
+        assert!(exposed.is_empty(), "old reader saw protected copy contents");
+        assert_eq!(read(&t.path("destination/file")), bytes);
+        assert_eq!(acl(&t.path("source")), acl(&t.path("destination/file")));
+    }
+}

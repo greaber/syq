@@ -44,6 +44,8 @@ use std::io;
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -415,6 +417,89 @@ impl Root {
         clear_nonblocking(&file)
             .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
         Ok(file)
+    }
+
+    /// Create an ACL-copy sidecar without ever exposing a readable file through
+    /// an inherited ACL. Clearing an ACL after file creation would leave a window
+    /// in which another account could open it and retain access to later writes.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn create_private_file(&self, path: &RelativePath) -> Result<File> {
+        let parent = self.resolve_parent(path)?;
+        match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
+            Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists).into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let temporary = create_temporary(&parent, |fd, name| {
+            retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) })
+        })?;
+        let leaf = c"data";
+        let mut held_directory = None;
+        let result = (|| -> Result<File> {
+            // Event-only access lets the owner repair an empty directory even
+            // when umask removed search permission. Descendant creation below
+            // still requires search access after its permissions are restored.
+            let directory = open_at(
+                parent.directory.as_raw_fd(),
+                &temporary,
+                libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )?;
+            let metadata = directory.metadata()?;
+            anyhow::ensure!(
+                metadata.uid() == unsafe { libc::geteuid() },
+                "staging directory owner changed"
+            );
+            held_directory = Some(directory);
+            let directory = held_directory.as_ref().unwrap();
+            // Preserve the destination parent's setgid inheritance.
+            let mode = 0o700 | (metadata.mode() & 0o2000);
+            crate::inode_metadata::make_staging_private(directory, mode)?;
+            anyhow::ensure!(
+                directory.metadata()?.mode() & 0o777 == 0o700
+                    && crate::inode_metadata::staging_acl_is_empty(directory)?,
+                "filesystem cannot make an ACL staging directory private"
+            );
+            // No file exists until the directory is private. Holding a directory
+            // fd from before the ACL change does not bypass child search checks.
+            let file = open_at(
+                directory.as_raw_fd(),
+                leaf,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            retry_zero(|| unsafe {
+                libc::renameatx_np(
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            })?;
+            Ok(file)
+        })();
+        let cleanup = (|| -> Result<()> {
+            if result.is_err() {
+                if let Some(directory) = held_directory.as_ref() {
+                    match unlink_at(directory.as_raw_fd(), leaf, 0) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error).context("remove unpublished ACL stage"),
+                    }
+                }
+            }
+            unlink_at(parent.directory.as_raw_fd(), &temporary, libc::AT_REMOVEDIR)
+                .context("remove private ACL staging directory")
+        })();
+        match (result, cleanup) {
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("ACL staging cleanup failed: {cleanup:#}")))
+            }
+            (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+            (Ok(file), Ok(())) => Ok(file),
+        }
     }
 
     /// Clone data into a new private sidecar, removing copied xattrs and user

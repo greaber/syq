@@ -441,6 +441,17 @@ pub(crate) fn apply_before_publication(
     apply_inner(file, metadata, mode, true)
 }
 
+/// A staging inode cannot inherit access grants from its destination parent.
+#[cfg(target_os = "macos")]
+pub(crate) fn make_staging_private(file: &File, mode: u32) -> Result<()> {
+    macos_acl::apply_with_mode(file, &MacAcl::default(), mode)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn staging_acl_is_empty(file: &File) -> Result<bool> {
+    Ok(macos_acl::read(file)?.entries.is_empty())
+}
+
 pub(crate) fn finish_publication(
     file: &File,
     metadata: Option<&InodeMetadata>,

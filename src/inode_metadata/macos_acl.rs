@@ -7,6 +7,10 @@ use std::{ffi::c_void, fs::File, io, os::fd::AsRawFd, ptr};
 
 type Acl = *mut c_void;
 const EXTENDED: libc::c_int = 0x100;
+// filesec_property_t in Apple's public <sys/fcntl.h>:
+// https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/fcntl.h
+const FILESEC_MODE: libc::c_int = 4;
+const FILESEC_ACL: libc::c_int = 5;
 const MAX_ENTRIES: usize = 128;
 const ACL_FLAGS: u32 = 1 | (1 << 17);
 const ENTRY_FLAGS: u32 = 0x1f0;
@@ -205,11 +209,17 @@ pub(super) fn apply_with_mode(file: &File, value: &MacAcl, mode: u32) -> Result<
     let security = Security(raw);
     let mode = (mode & 0o7777) as libc::mode_t;
     checked(
-        unsafe { filesec_set_property(security.0, 4, (&mode as *const libc::mode_t).cast()) },
+        unsafe {
+            filesec_set_property(
+                security.0,
+                FILESEC_MODE,
+                (&mode as *const libc::mode_t).cast(),
+            )
+        },
         "set final macOS mode",
     )?;
     checked(
-        unsafe { filesec_set_property(security.0, 5, (&acl.0 as *const Acl).cast()) },
+        unsafe { filesec_set_property(security.0, FILESEC_ACL, (&acl.0 as *const Acl).cast()) },
         "set final macOS ACL",
     )?;
     checked(
