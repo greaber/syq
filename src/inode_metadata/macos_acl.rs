@@ -166,6 +166,10 @@ pub(super) fn apply(file: &File, value: &MacAcl) -> Result<()> {
 // Publish mode and ACL together: neither a mode-only nor an ACL-only update
 // may temporarily grant access denied by the final combination.
 pub(super) fn apply_with_mode(file: &File, value: &MacAcl, mode: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if file.metadata()?.mode() & 0o7777 == mode & 0o7777 && &read(file)? == value {
+        return Ok(());
+    }
     let acl = build(value)?;
     struct Security(*mut c_void);
     impl Drop for Security {
@@ -191,7 +195,7 @@ pub(super) fn apply_with_mode(file: &File, value: &MacAcl, mode: u32) -> Result<
     )?;
     checked(
         unsafe { fchmodx_np(file.as_raw_fd(), security.0) },
-        "restore macOS mode and ACL on published inode",
+        "restore macOS mode and ACL on held inode",
     )
 }
 

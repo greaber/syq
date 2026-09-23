@@ -566,8 +566,11 @@ fn apply_inner(
     if let Some(acl) = &metadata.macos_acl {
         if before_publication {
             macos_acl::apply_with_mode(file, &MacAcl::default(), 0)?;
-        } else {
+        } else if file.metadata()?.file_type().is_symlink() {
+            // Permission preservation does not change symlink modes.
             macos_acl::apply(file, acl)?;
+        } else {
+            macos_acl::apply_with_mode(file, acl, mode)?;
         }
     }
     Ok(())

@@ -2494,7 +2494,14 @@ fn set_meta_file_inner(
         apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
             std::os::unix::fs::fchown(f, uid, gid)
         })?;
-    if flags & flags::MODE_MASK != 0 {
+    // macOS mode and ACL must change together. Keep the private staging
+    // permissions until publication instead of opening a mode-only window.
+    let atomic_acl_mode = cfg!(target_os = "macos")
+        && meta
+            .inode_metadata
+            .as_ref()
+            .is_some_and(|m| m.macos_acl.is_some());
+    if flags & flags::MODE_MASK != 0 && !atomic_acl_mode {
         // On network filesystems every setattr is a round trip; skip it when
         // the mode is already right (but always run it after a chown that could
         // have cleared setuid/setgid bits we need to restore).
