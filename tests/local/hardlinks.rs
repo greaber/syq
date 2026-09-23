@@ -262,7 +262,13 @@ fn hardlink_representatives_keep_the_local_copy_path() {
     fs::set_permissions(t.path("src/a"), fs::Permissions::from_mode(0o440)).unwrap();
     set_mtime(&t.path("src/a"), 1_600_000_000);
     let output = compat_command()
-        .args(["-aH", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .args([
+            "-aH",
+            "--no-progress",
+            "--performance-tuning=batch-bytes=64K",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_FAIL_READ_RANGE", "1")
         .run()
