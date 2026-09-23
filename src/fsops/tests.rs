@@ -4594,3 +4594,44 @@ fn registered_fifo_keeps_identity_checks_without_connecting_a_writer() {
         "worker accepted a replaced FIFO: {response:?}"
     );
 }
+
+#[test]
+fn metadata_parent_reuse_keeps_final_ancestor_replacement_check() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let outside = crate::test_support::tempdir().unwrap();
+    fs::create_dir(tree.path().join("parent")).unwrap();
+    fs::write(tree.path().join("parent/leaf"), b"selected").unwrap();
+    fs::write(outside.path().join("leaf"), b"outside").unwrap();
+    let sentinel = fs::metadata(outside.path().join("leaf")).unwrap();
+    let root = Root::open(tree.path()).unwrap();
+    let path = RelativePath::new(b"parent/leaf").unwrap();
+    let parent = root.resolve_parent(&path).unwrap();
+    let handle = parent.open_metadata().unwrap();
+    let opened = handle.metadata().unwrap();
+    fs::rename(tree.path().join("parent"), tree.path().join("held")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), tree.path().join("parent")).unwrap();
+    parent
+        .set_times(&[
+            timespec(0, libc::UTIME_OMIT as u32),
+            timespec(1_600_000_000, 0),
+        ])
+        .unwrap();
+    assert_eq!(
+        fs::metadata(tree.path().join("held/leaf")).unwrap().mtime(),
+        1_600_000_000
+    );
+    assert!(require_rooted_named_identity_known(
+        &root,
+        &path,
+        &tree.path().join("parent/leaf"),
+        &opened,
+        TargetCondition::Any
+    )
+    .is_err());
+    let after = fs::metadata(outside.path().join("leaf")).unwrap();
+    assert_eq!(
+        (after.ino(), after.mtime(), after.mtime_nsec()),
+        (sentinel.ino(), sentinel.mtime(), sentinel.mtime_nsec())
+    );
+    assert_eq!(fs::read(outside.path().join("leaf")).unwrap(), b"outside");
+}

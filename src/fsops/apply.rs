@@ -303,11 +303,13 @@ pub(super) fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                 }
                 return Ok(());
             }
-            if target.create_missing_parents {
-                root.create_missing_parents(path, 0o777)?;
-            }
+            let parent = if target.create_missing_parents {
+                root.resolve_parent_creating(path, 0o777)?
+            } else {
+                root.resolve_parent(path)?
+            };
             if matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
-                match root.create_directory(path, (*mode & 0o7777) | 0o700) {
+                match parent.create_directory((*mode & 0o7777) | 0o700) {
                     Ok(()) => return Ok(()),
                     Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
                         if *condition == TargetCondition::Absent {
@@ -485,7 +487,8 @@ pub(super) fn set_meta_rooted(
             condition,
         );
     }
-    let metadata = target.root.metadata(&target.relative)?;
+    let parent = target.root.resolve_parent(&target.relative)?;
+    let metadata = parent.metadata()?;
     require_rooted_condition(metadata, condition, &target.label)?;
     let is_link = metadata.is_symlink();
     let owner_differs = (flags & flags::OWNER != 0
@@ -501,10 +504,10 @@ pub(super) fn set_meta_rooted(
     }
     if is_link {
         apply_owner_if_changed(flags, meta, metadata.uid, metadata.gid, |uid, gid| {
-            target.root.chown(&target.relative, uid, gid)
+            parent.chown(uid, gid)
         })?;
     } else {
-        let handle = target.root.open_metadata(&target.relative)?;
+        let handle = parent.open_metadata()?;
         let opened = handle.metadata()?;
         if opened.dev() != metadata.dev || opened.ino() != metadata.ino {
             bail!(
@@ -522,7 +525,7 @@ pub(super) fn set_meta_rooted(
                 timespec(0, libc::UTIME_OMIT as u32),
                 timespec(meta.mtime, meta.mtime_nsec),
             ];
-            target.root.set_times(&target.relative, &times)?;
+            parent.set_times(&times)?;
         }
         return require_rooted_named_identity_known(
             &target.root,
@@ -537,7 +540,7 @@ pub(super) fn set_meta_rooted(
             timespec(0, libc::UTIME_OMIT as u32),
             timespec(meta.mtime, meta.mtime_nsec),
         ];
-        target.root.set_times(&target.relative, &times)?;
+        parent.set_times(&times)?;
     }
     let after = target.root.metadata(&target.relative)?;
     require_rooted_identity(after, condition, &target.label)
