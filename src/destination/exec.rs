@@ -67,6 +67,7 @@ enum Event {
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let matches = command_for_help().try_get_matches_from(argv)?;
     let command = ExecCommand::from_arg_matches(&matches)?;
+    crate::fsops::reserve_startup_descriptors();
     let name = command
         .on
         .strip_prefix('@')

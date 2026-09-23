@@ -46,6 +46,7 @@ pub(crate) fn run(args: &[OsString]) -> Result<i32> {
         }
     };
     let command = Command::from_arg_matches(&matches)?;
+    crate::fsops::reserve_startup_descriptors();
     let pattern = Pattern::parse(&command.path)?;
     let mut options = super::Options {
         bucket: pattern.bucket.clone(),
