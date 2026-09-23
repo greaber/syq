@@ -383,8 +383,9 @@ bytes and length, not an exact source extent layout. Eligible local clones still
 use filesystem cloning; other writes skip zeros or clear old blocks into holes.
 The destination filesystem must support sparse files; ranged, resumed, and
 in-place writes also require hole punching. A failed hole operation makes the
-copy unsuccessful. Unchanged files and reused blocks are not rewritten just to
-change their allocation. Descriptors, streams, S3, and command-restricted or
+copy unsuccessful. Filesystem allocation units can limit the space reclaimed by
+in-place hole punches, especially with small comparison blocks. Unchanged files
+and reused blocks are not rewritten just to change their allocation. Descriptors, streams, S3, and command-restricted or
 receiving destinations reject this option.
 
 Sparse mode avoids full-size preallocation. Its fresh-destination capacity check

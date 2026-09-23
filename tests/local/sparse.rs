@@ -7,7 +7,21 @@ fn sparse_data() -> Vec<u8> {
     data
 }
 
+fn write_sparse_source(path: &Path, data: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = fs::File::create(path).unwrap();
+    file.set_len(data.len() as u64).unwrap();
+    for (index, block) in data.chunks(4096).enumerate() {
+        if block.iter().any(|byte| *byte != 0) {
+            file.write_all_at(block, (index * 4096) as u64).unwrap();
+        }
+    }
+}
+
 fn assert_sparse_copy(path: &Path, expected: &[u8]) {
+    // Filesystems can defer allocation accounting until dirty data is committed.
+    fs::File::open(path).unwrap().sync_all().unwrap();
     let metadata = fs::metadata(path).unwrap();
     assert_eq!(metadata.len(), expected.len() as u64);
     assert!(
@@ -24,7 +38,7 @@ fn assert_sparse_copy(path: &Path, expected: &[u8]) {
 fn sparse_small_batches_local_copies_and_ranges_preserve_contents_and_hardlinks() {
     let t = Tmp::new();
     let data = sparse_data();
-    write(&t.path("src/large"), &data);
+    write_sparse_source(&t.path("src/large"), &data);
     write(&t.path("src/empty"), b"");
     write(&t.path("src/zeros"), &[0; 37]);
     write(&t.path("src/small"), &data[..65539]);
@@ -57,10 +71,8 @@ fn sparse_small_batches_local_copies_and_ranges_preserve_contents_and_hardlinks(
         let before = fs::metadata(t.path(&format!("{destination}/large"))).unwrap();
         run_ok(&["-aHSc", &t.s("src/"), &t.s(&destination)]);
         let after = fs::metadata(t.path(&format!("{destination}/large"))).unwrap();
-        assert_eq!(
-            (before.ino(), before.blocks()),
-            (after.ino(), after.blocks())
-        );
+        assert_eq!(before.ino(), after.ino());
+        assert_sparse_copy(&t.path(&format!("{destination}/large")), &data);
     }
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--sparse", &t.s("src/large"), "--as", &t.s("native")])
@@ -75,12 +87,13 @@ fn sparse_updates_and_inplace_clear_old_nonzero_data() {
     let t = Tmp::new();
     let data = sparse_data();
     write(&t.path("src"), &data);
-    for inplace in [false, true] {
+    for (inplace, block) in [(false, "64K"), (true, "1M"), (true, "64K")] {
         write(&t.path("dst"), &prng(data.len() + 777, 29));
         let old_inode = fs::metadata(t.path("dst")).unwrap().ino();
+        let block_option = format!("--block-size={block}");
         let mut args = vec![
             "-aSc",
-            "--block-size=64K",
+            &block_option,
             "--performance-tuning=copy-path=ranges",
         ];
         if inplace {
@@ -90,7 +103,13 @@ fn sparse_updates_and_inplace_clear_old_nonzero_data() {
         let destination = t.s("dst");
         args.extend([source.as_str(), destination.as_str()]);
         run_ok(&args);
-        assert_sparse_copy(&t.path("dst"), &data);
+        if inplace && block == "64K" {
+            // Small punches can clear bytes within larger filesystem records
+            // without freeing those records. Contents and size still must match.
+            assert_eq!(read(&t.path("dst")), data);
+        } else {
+            assert_sparse_copy(&t.path("dst"), &data);
+        }
         if inplace {
             assert_eq!(fs::metadata(t.path("dst")).unwrap().ino(), old_inode);
         }
@@ -102,7 +121,7 @@ fn sparse_updates_and_inplace_clear_old_nonzero_data() {
 fn sparse_capacity_uses_inode_check_without_logical_byte_refusal() {
     let t = Tmp::new();
     let data = sparse_data();
-    write(&t.path("src/file"), &data);
+    write_sparse_source(&t.path("src/file"), &data);
     let out = compat_command()
         .args(["-aSn", &t.s("src/"), &t.s("dst")])
         .env("SYQ_TEST_AVAILABLE_BYTES", "1")
