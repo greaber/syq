@@ -108,7 +108,14 @@ HOME="$SYQ_TEST_REMOTE_HOME" exec /bin/sh -c "$1"
             print(f'{args.shell}: checking remote destination insertion', flush=True)
             send(b'syq cp --src AGENTS.md --to j5 --into go/\t')
             output = send(b'\n')
-            assert b'ARG=<go/remote-only/>' in output, output
+            # Remote completion may still be running when Enter is queued.
+            # Wait for the command's result instead of assuming it fits in the
+            # half-second receive window used for ordinary keystrokes.
+            deadline = time.monotonic() + 10
+            while b'ARG=<go/remote-only/>' not in output:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(f'remote insertion timed out: {bytes(transcript)!r}')
+                output += receive()
             assert b'local-only' not in output, output
             print(f'{args.shell}: detailed display and path-only insertion passed', flush=True)
         finally:

@@ -936,7 +936,10 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 ))?,
             },
             mut other => {
-                let resp = ops.handle_in_place(&mut other);
+                let resp = ops.handle_with_copy_progress(&mut other, &mut |bytes| {
+                    w.write_msg(&Response::CopyLocalProgress(bytes))?;
+                    Ok(())
+                });
                 if let (Some(authority), Some(settlement)) = (&authority, settlement) {
                     authority.settle(settlement, &resp);
                 }

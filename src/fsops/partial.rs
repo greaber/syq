@@ -749,7 +749,7 @@ impl FsOps {
         &mut self,
         source: &RegisteredPath,
         dst: &[u8],
-        policy: CopyLocalPolicy,
+        policy: CopyLocalPolicy<'_>,
         copy_id: &CopyId,
         size: u64,
         mode: u32,
@@ -761,7 +761,9 @@ impl FsOps {
             inplace,
             allow_sequential_nfs_fallback,
             allow_sequential_local_fallback,
+            progress,
         } = policy;
+        let mut progress = CopyProgress::new(progress, size);
         let (s, source_metadata, target) = self.prepare_local_copy(source, dst)?;
         let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
         // Advisory sequential readahead for the kernel copy on Linux.
@@ -970,6 +972,8 @@ impl FsOps {
                     if read_ahead.is_some() {
                         remaining.min(crate::read_ahead::BLOCK) as usize
                     } else {
+                        // Preserve server-side copy offload as one operation.
+                        // Progress follows its successful return, like a clone.
                         remaining as usize
                     },
                     0,
@@ -1023,6 +1027,7 @@ impl FsOps {
                 bail!("source shortened while copying {}", source_label.display());
             }
             remaining -= n as u64;
+            progress.advance(size - remaining)?;
             if let Some(read_ahead) = &mut read_ahead {
                 let prepare = if read_ahead.needs_observation() {
                     let current = crate::read_ahead::Activity::sample();
@@ -1073,6 +1078,7 @@ impl FsOps {
                     destination.write_all(&buffer[..n])
                 }
                 .with_context(|| format!("write {}", target_label.display()))?;
+                progress.advance(size - remaining + n as u64)?;
                 #[cfg(debug_assertions)]
                 if remaining == size {
                     test_race_barrier(
@@ -1100,7 +1106,7 @@ impl FsOps {
         &mut self,
         source: &RegisteredPath,
         dst: &[u8],
-        policy: CopyLocalPolicy,
+        policy: CopyLocalPolicy<'_>,
         copy_id: &CopyId,
         size: u64,
         _mode: u32,
@@ -1134,7 +1140,7 @@ impl FsOps {
         &mut self,
         _source: &RegisteredPath,
         _dst: &[u8],
-        _policy: CopyLocalPolicy,
+        _policy: CopyLocalPolicy<'_>,
         _copy_id: &CopyId,
         _size: u64,
         _mode: u32,
@@ -1785,6 +1791,14 @@ impl FsOps {
     /// Dispatch a single-response request, rewriting its paths in place.
     /// The caller must not dispatch the mapped request again.
     pub fn handle_in_place(&mut self, req: &mut Request) -> Response {
+        self.handle_with_copy_progress(req, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn handle_with_copy_progress(
+        &mut self,
+        req: &mut Request,
+        progress: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Response {
         let _handling = self
             .operation
             .span(crate::transfer_observations::Stage::Handling);
@@ -2092,6 +2106,7 @@ impl FsOps {
                         inplace: *inplace,
                         allow_sequential_nfs_fallback: *allow_sequential_nfs_fallback,
                         allow_sequential_local_fallback: *allow_sequential_local_fallback,
+                        progress,
                     },
                     copy_id,
                     *size,
@@ -2647,5 +2662,38 @@ fn publication_response(identity: Option<(u64, u64)>) -> Response {
     match identity {
         Some((dev, ino)) => Response::Published { dev, ino },
         None => Response::Ok,
+    }
+}
+
+/// Report the first partial write promptly, then at most every 100 ms. The
+/// terminal response credits the remainder without a redundant progress frame.
+#[cfg(target_os = "linux")]
+struct CopyProgress<'a> {
+    emit: &'a mut dyn FnMut(u64) -> Result<()>,
+    reported: u64,
+    size: u64,
+    last: std::time::Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> CopyProgress<'a> {
+    fn new(emit: &'a mut dyn FnMut(u64) -> Result<()>, size: u64) -> Self {
+        Self {
+            emit,
+            reported: 0,
+            size,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn advance(&mut self, total: u64) -> Result<()> {
+        if total < self.size
+            && (self.reported == 0 || self.last.elapsed() >= std::time::Duration::from_millis(100))
+        {
+            (self.emit)(total)?;
+            self.reported = total;
+            self.last = std::time::Instant::now();
+        }
+        Ok(())
     }
 }

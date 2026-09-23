@@ -73,6 +73,21 @@ pub trait Conn: Send {
         self.send(Request::StopReadStream)?;
         crate::streaming::drain_reads(|| self.recv())
     }
+    /// CopyLocal can report writes before its terminal response. All replies
+    /// belong to this one synchronous operation, never to the next request.
+    fn copy_local(
+        &mut self,
+        req: Request,
+        progress: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Response> {
+        self.send(req)?;
+        loop {
+            match self.recv()? {
+                Response::CopyLocalProgress(bytes) => progress(bytes)?,
+                terminal => return Ok(terminal),
+            }
+        }
+    }
     fn call(&mut self, req: Request) -> Result<Response> {
         let expected = match &req {
             Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
