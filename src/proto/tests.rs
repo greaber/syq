@@ -800,3 +800,17 @@ fn zstd_known_unknown_and_concatenated_sizes_preserve_decoding_and_limits() {
             .is_err());
     }
 }
+
+#[test]
+fn released_v071_preamble_rejects_copy_progress_before_decoding() {
+    // Literal released preamble, not regenerated with today's encoder. The
+    // exact build boundary precedes any new CopyLocalProgress response.
+    const V071: &[u8] = b"SYQWIRE\0\0\x06v0.7.1";
+    if crate::identity::build() != "v0.7.1" {
+        let error = FrameReader::new(V071).read_msg::<Response>().unwrap_err();
+        assert!(
+            error.to_string().contains("build identity mismatch"),
+            "{error}"
+        );
+    }
+}
