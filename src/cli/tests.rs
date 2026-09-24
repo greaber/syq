@@ -988,3 +988,34 @@ fn native_mtime_preservation_is_default_and_last_explicit_setting_wins() {
         .is_err());
     }
 }
+
+#[test]
+fn block_reuse_is_a_native_filesystem_control() {
+    let args = parse_native_copy(
+        &[
+            "source",
+            "--as",
+            "destination",
+            "--performance-tuning=block-reuse=off",
+        ]
+        .map(OsString::from),
+    )
+    .unwrap();
+    assert!(!args.tuning_options.unwrap().reuse_blocks());
+    let error = parse_native_copy(
+        &[
+            "source",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "object",
+            "--performance-tuning=block-reuse=off",
+        ]
+        .map(OsString::from),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("filesystem performance tuning"),
+        "{error}"
+    );
+}

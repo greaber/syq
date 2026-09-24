@@ -24,6 +24,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | Key | Default | Accepted values |
 |---|---|---|
 | `workers` | Automatic | 1 through 65536 filesystem workers; route-specific receiver limits also apply |
+| `block-reuse` | `auto` | `auto` or `off`; filesystem copies only |
 | `comparison-block-size` | 4 MiB | 64 KiB through 64 MiB; filesystem copies only |
 | `request-size` | Hash block size (normally 4 MiB) for ordinary requests; at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
@@ -167,6 +168,33 @@ Clearing history resets remembered starting counts.
 Use disposable destinations when comparing settings. Larger requests and deeper
 pipelines can increase memory use. `copy-path=ranges` disables small-file batches
 and whole-file shortcuts, including local kernel copying and APFS cloning.
+
+### Compare block reuse with full replacement
+
+`block-reuse=off` rewrites every byte of files selected for copying without
+comparing or reusing blocks from the destination or interrupted copies. This can
+help when comparison reads are expensive or few blocks match, including copies
+to or from an NFS mount. It applies to filesystem copies on Linux and macOS,
+including remote filesystem paths; S3 and descriptor copies do not accept it.
+`auto` keeps the normal policy, which can already select whole-file shortcuts.
+
+```sh
+syq cp --srcs-in source --into destination \
+  --performance-tuning block-reuse=off
+```
+
+Size/time quick checks still skip completed files. Explicit `--hash` (or rsync
+`--checksum`) still compares contents; when copying is required, all bytes are
+rewritten. Expected hashes, payload checks and publication-recovery checks stay
+in effect. Interrupted files restart from the beginning with `off`; turning it
+back to `auto` allows normal block reuse again.
+
+This setting does not select a sequential writer. To isolate comparison and
+reuse costs while keeping range transfers, compare `copy-path=ranges` with
+`copy-path=ranges,block-reuse=off`. Restore the same initial destination before
+each run and keep worker counts, request sizes and cache preparation identical.
+Leave `--inplace` unchanged too: normal staging must populate a new file, whereas
+in-place updates can leave matching destination ranges untouched.
 
 ### Scattered edits in existing files
 

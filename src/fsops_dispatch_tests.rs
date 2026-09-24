@@ -294,6 +294,7 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
         mode: 0o600,
         attempt: 0,
         create_if_missing: false,
+        reuse_blocks: true,
         guard: None,
     });
     assert!(matches!(reply, Response::Prepared(_)), "{reply:?}");

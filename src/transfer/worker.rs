@@ -854,7 +854,9 @@ impl Worker {
             // destination. A matching read-only file needs only metadata work.
             // Prepare binds any writes to this held inode, and the comparison
             // below is reused rather than hashing the contents a second time.
-            let inplace_ranges = if inplace && final_is_file {
+            let reuse_blocks = self.opts.tuning.reuse_blocks();
+            let inplace_ranges = if inplace && final_is_file && (reuse_blocks || self.opts.checksum)
+            {
                 let diff = self.diff_final_and_hold(&job)?;
                 if diff.ranges.is_empty() && diff.held_len == Some(size) {
                     self.finish_matched_basis(idx, &job)?;
@@ -868,28 +870,36 @@ impl Worker {
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
             // absent until the content comparison shows a difference.
-            let prepared = match ok(
-                self.dst.call(Request::Prepare {
-                    path: job.dst.clone(),
-                    size,
-                    inplace,
-                    copy_id: self.copy_id(),
-                    mode: self.create_mode(&job),
-                    attempt: job.attempt,
-                    create_if_missing: inplace || !final_is_file,
-                    guard: job.container_guard.clone(),
-                })?,
-                "prepare",
-            )? {
-                Response::Prepared(prepared) => prepared,
-                other => bail!("unexpected response {other:?}"),
-            };
+            let prepared = self.prepare_file(
+                &job,
+                inplace || !final_is_file || (!reuse_blocks && !self.opts.checksum),
+            )?;
 
             if prepared.partial_size.is_some() || prepared.has_candidates || final_is_file {
                 self.sched.request_direct_fallback();
             }
             if inplace {
-                return Ok((inplace_ranges.unwrap_or_else(full), true));
+                let ranges = if reuse_blocks {
+                    inplace_ranges.unwrap_or_else(full)
+                } else {
+                    full()
+                };
+                return Ok((ranges, true));
+            }
+            if !reuse_blocks {
+                // Explicit content comparison still decides whether a final file
+                // is already correct. Never use its matching blocks as donors.
+                // An existing partial is our output to replace in full, including
+                // on retries; it must still be finalized and consumed.
+                if self.opts.checksum && final_is_file && prepared.partial_size.is_none() {
+                    let diff = self.diff_final_and_hold(&job)?;
+                    if diff.ranges.is_empty() && diff.held_len == Some(size) {
+                        self.finish_matched_basis(idx, &job)?;
+                        return Ok((vec![], false));
+                    }
+                    self.prepare_file(&job, true)?;
+                }
+                return Ok((full(), true));
             }
             // A retry's own output must be finished (and thus consumed), even
             // if another copy has meanwhile published identical final bytes.
@@ -1161,6 +1171,30 @@ impl Worker {
             block,
             size,
         ))
+    }
+
+    fn prepare_file(
+        &mut self,
+        job: &WorkerJob,
+        create_if_missing: bool,
+    ) -> Result<crate::proto::Preparation> {
+        match ok(
+            self.dst.call(Request::Prepare {
+                path: job.dst.clone(),
+                size: job.entry.size,
+                inplace: job.inplace,
+                copy_id: self.copy_id(),
+                mode: self.create_mode(job),
+                attempt: job.attempt,
+                create_if_missing,
+                reuse_blocks: self.opts.tuning.reuse_blocks(),
+                guard: job.container_guard.clone(),
+            })?,
+            "prepare",
+        )? {
+            Response::Prepared(prepared) => Ok(prepared),
+            other => bail!("unexpected response {other:?}"),
+        }
     }
 
     pub(super) fn seed_request(

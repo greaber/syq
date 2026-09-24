@@ -240,7 +240,9 @@ Ignored paths are also protected from pruning.
 
 Rerun the same command. Syq skips completed files and can reuse matching parts
 of interrupted files. It assembles each updated file beside the destination
-and replaces the destination when complete.
+and replaces the destination when complete. With
+[`--performance-tuning block-reuse=off`](tuning.md#compare-block-reuse-with-full-replacement),
+interrupted files restart from the beginning instead.
 
 Partial files may remain after a successful retry. To remove them:
 

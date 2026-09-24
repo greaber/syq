@@ -1008,3 +1008,6 @@ mod macos_metadata;
 
 #[path = "local/expressions.rs"]
 mod expressions;
+
+#[path = "local/block_reuse.rs"]
+mod block_reuse;

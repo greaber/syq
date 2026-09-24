@@ -569,6 +569,7 @@ struct PrepareOptions {
     mode: u32,
     attempt: u32,
     create_if_missing: bool,
+    reuse_blocks: bool,
 }
 
 struct HashOptions {
