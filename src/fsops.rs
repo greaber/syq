@@ -1515,6 +1515,7 @@ impl FsOps {
             | Request::StatMany { guard, .. }
             | Request::PartialPaths { guard, .. }
             | Request::PruneLookup { guard, .. }
+            | Request::DefaultPermissions { guard, .. }
             | Request::Apply { guard, .. }
             | Request::PlanBatch { guard, .. }
             | Request::ProbePartial { guard, .. }
@@ -1832,7 +1833,8 @@ impl FsOps {
             }
             Request::StatMany { paths, guard, .. }
             | Request::PartialPaths { paths, guard, .. }
-            | Request::PruneLookup { paths, guard } => {
+            | Request::PruneLookup { paths, guard }
+            | Request::DefaultPermissions { paths, guard } => {
                 if guard.is_none() {
                     for path in paths {
                         map(path)?;

@@ -1049,7 +1049,10 @@ impl Worker {
         }
         match job.dst_entry.as_ref().filter(|d| d.kind == Kind::File) {
             Some(d) if !self.opts.perms => d.mode & 0o7777,
-            _ => fresh_file_mode(&self.opts, &job.entry),
+            _ => job
+                .creation_mode
+                .map(u32::from)
+                .unwrap_or_else(|| fresh_file_mode(&self.opts, &job.entry)),
         }
     }
 

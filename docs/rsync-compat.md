@@ -30,6 +30,11 @@ Use `-c` to compare contents when size and timestamp match; source timestamps
 are preserved, so ordinary clock skew does not require the source timestamp
 to be newer.
 
+Without `-p`, existing files keep their destination permissions. On Linux, new
+files use the source permission bits limited by the destination parent's default
+ACL, or by the receiving process's umask when that parent has no default ACL.
+Use `-p` to preserve source permissions and `-A` to preserve source ACLs.
+
 Syq uses numeric IDs and always keeps partial files, so `--numeric-ids` and
 `--partial` are accepted no-ops. `-P` enables progress. Compression is on by
 default; `-z` does not enable anything extra. `-B` / `--block-size` changes

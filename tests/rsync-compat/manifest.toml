@@ -614,12 +614,12 @@ classification = "adapted"
 adaptation = "acls-default-syq-cli"
 adaptation_kind = "invocation"
 area = "acls"
-position = "policy-open"
-baseline = "fail"
+position = "compatible"
+baseline = "pass"
 platforms = ["linux"]
 tags = ["local", "metadata", "acls"]
 requirements = ["setfacl", "getfacl", "POSIX ACL filesystem"]
-note = "Without -A or -p, rsync derives a new destination container's permissions from its parent default ACL. SYQ currently creates that container as 0755; the upstream assertion remains unchanged. Omit only the rsync-specific -VV capability probe."
+note = "Without -A or -p, new destination containers and files follow the destination parent default ACL, or umask when no default ACL exists. Omit only the rsync-specific -VV capability probe."
 
 [[tests]]
 name = "acls-unpinnable"

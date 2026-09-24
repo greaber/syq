@@ -2019,6 +2019,19 @@ impl FsOps {
             } => self
                 .destination_filesystem_info(*check_empty, target.as_ref())
                 .map(Response::DestinationFilesystemInfo),
+            Request::DefaultPermissions { paths, guard } => paths
+                .iter()
+                .map(|path| {
+                    let target = self.destination_mutation_target(path, guard.as_ref())?;
+                    let directory = target.root.open_metadata(&target.relative)?;
+                    anyhow::ensure!(
+                        directory.metadata()?.is_dir(),
+                        "creation parent is not a directory"
+                    );
+                    crate::inode_metadata::default_permissions(&directory)
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Response::DefaultPermissions),
             Request::PruneLookup { paths, guard } => self
                 .prune_lookup(paths, guard.as_ref())
                 .map(Response::Stats),

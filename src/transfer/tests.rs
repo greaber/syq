@@ -236,6 +236,7 @@ fn pipeline_worker(
         recursive: true,
         links: false,
         perms: false,
+        rsync_creation: false,
         hardlinks: false,
         sparse: false,
         inode_preservation: Default::default(),
