@@ -116,6 +116,14 @@ copying every byte. You can also copy to or from a mounted NFS directory using
 its local path. See [Check local storage placement](server-tuning.md#check-local-storage-placement)
 for how the source and destination filesystems affect performance.
 
+On Linux, copying multiple files from NFS to local storage can copy each changed
+file whole, with workers handling different files in parallel. This avoids block
+comparison and transport overhead, but does not reuse unchanged blocks within
+those files. Single-file copies retain parallel range reads when filesystem
+copying is unavailable. A batch dominated by one large file can lose range
+parallelism on that file. To compare the range path for uneven batches or
+updates, use `--performance-tuning copy-path=ranges`.
+
 Reported bytes count the file's size even when cloning avoids physical I/O,
 so the displayed rate can exceed disk throughput.
 

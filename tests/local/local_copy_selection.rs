@@ -164,6 +164,7 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+        .env("SYQ_TEST_COPY_LOCAL_SOURCE_NFS", "1")
         .env("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE", "1")
         .run()
         .unwrap();
@@ -199,6 +200,7 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+        .env("SYQ_TEST_COPY_LOCAL_SOURCE_NFS", "1")
         .run()
         .unwrap();
     assert_output_ok(&out);
@@ -1146,5 +1148,85 @@ fn macos_clone_normalizes_staging_permissions_under_restrictive_umasks() {
         assert_eq!(read(&t.path("dst")), data);
         assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o640);
         assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2, "umask {mask:o}");
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn nfs_read_batch_copies_fresh_and_updated_files_without_ranges() {
+    for existing in [false, true] {
+        let t = Tmp::new();
+        for index in 0..4 {
+            let name = format!("file{index}");
+            let contents = prng(5 << 20, index);
+            write(&t.path(&format!("src/{name}")), &contents);
+            if existing {
+                let mut old = contents;
+                old[..4096].fill(b'x');
+                write(&t.path(&format!("dst/{name}")), &old);
+                set_mtime(&t.path(&format!("dst/{name}")), 1);
+            }
+        }
+        let out = compat_command()
+            .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_COPY_AFTER_PLANNING", "1")
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+            .env("SYQ_TEST_COPY_LOCAL_SOURCE_NFS", "1")
+            .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_same_tree(&t.path("src"), &t.path("dst"));
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["local_whole_files"], 4, "{out:?}");
+        assert_eq!(observed["range_requests"], 0);
+        assert!(partial_files(&t.0).is_empty());
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn nfs_read_keeps_range_policy_exclusions() {
+    let cases: &[(&[&str], Option<&str>, &str, usize)] = &[
+        (&[], None, "local", 1),
+        (&[], Some("SYQ_TEST_COPY_LOCAL_NFS"), "local", 2),
+        (&[], Some("SYQ_TEST_COPY_LOCAL_NFS_SYNC"), "local", 2),
+        (&[], None, "unsupported", 2),
+        (&["--checksum"], None, "local", 2),
+        (&["--resource-limits=bandwidth=1G"], None, "local", 2),
+        (&["--performance-tuning=copy-path=ranges"], None, "local", 2),
+    ];
+    for (args, extra_env, filesystem, count) in cases {
+        let t = Tmp::new();
+        for index in 0..*count {
+            write(
+                &t.path(&format!("src/file{index}")),
+                &prng(5 << 20, index as u64),
+            );
+        }
+        let mut command = compat_command();
+        command
+            .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+            .args(*args)
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_COPY_AFTER_PLANNING", "1")
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", filesystem)
+            .env("SYQ_TEST_COPY_LOCAL_SOURCE_NFS", "1");
+        if let Some(name) = extra_env {
+            command.env(name, "1");
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        assert_same_tree(&t.path("src"), &t.path("dst"));
+        let observed = tuning_observed(&out);
+        assert_eq!(
+            observed["local_whole_files"], 0,
+            "{args:?} {extra_env:?}: {out:?}"
+        );
+        assert!(observed["range_requests"].as_u64().unwrap() > 0, "{out:?}");
+        assert!(partial_files(&t.0).is_empty());
     }
 }
