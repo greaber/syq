@@ -301,6 +301,26 @@ impl Engine {
         };
         let (source, existing) = tokio::try_join!(source, destination)?;
         let (source, source_head) = source.context("S3 copy source disappeared")?;
+        if self.args.expressions.active() {
+            let source_file = source.expression_file();
+            if !self
+                .args
+                .expressions
+                .selects(&source_file, job.expression_path.as_bytes())?
+                || !self.args.expressions.permits(
+                    &source_file,
+                    job.expression_path.as_bytes(),
+                    &existing
+                        .as_ref()
+                        .map(|(o, _)| o.expression_file())
+                        .unwrap_or_default(),
+                    job.expression_destination_path.as_bytes(),
+                )?
+            {
+                return Ok(CopyPreparation::Skipped);
+            }
+        }
+
         let mut desired_head = source_head.clone();
         let explicit = job.metadata.unwrap_or_default();
         explicit.validate_kind(match source.kind() {

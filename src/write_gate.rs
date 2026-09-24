@@ -85,14 +85,18 @@ impl CachedFile {
         Ok(self.gate.get_or_init(|| gate))
     }
 
-    pub(crate) fn write_range_at(&self, data: &[u8], offset: u64) -> io::Result<()> {
+    pub(crate) fn write_range_at(&self, data: &[u8], offset: u64, sparse: bool) -> io::Result<()> {
         // Tests exercise serialization on every Unix host; production enables it
         // only on Linux, where its performance has been measured.
         #[cfg(any(target_os = "linux", test))]
         let gate = self.write_gate()?;
         #[cfg(any(target_os = "linux", test))]
         let _writer = gate.lock().unwrap();
-        self.file.write_all_at(data, offset)
+        if sparse {
+            crate::sparse::write_at(&self.file, data, offset, true)
+        } else {
+            self.file.write_all_at(data, offset)
+        }
     }
 }
 
@@ -155,7 +159,7 @@ mod tests {
         let path = dir.path().join("file");
         let alias = dir.path().join("alias");
         let original = CachedFile::new(File::create(&path).unwrap());
-        original.write_range_at(b"old", 0).unwrap();
+        original.write_range_at(b"old", 0, false).unwrap();
         let gate = Arc::downgrade(original.write_gate().unwrap());
         std::fs::hard_link(&path, &alias).unwrap();
         let other = CachedFile::new(File::options().write(true).open(&alias).unwrap());
@@ -170,8 +174,8 @@ mod tests {
             original.write_gate().unwrap(),
             replacement.write_gate().unwrap()
         ));
-        original.write_range_at(b"OLD", 0).unwrap();
-        replacement.write_range_at(b"new", 0).unwrap();
+        original.write_range_at(b"OLD", 0, false).unwrap();
+        replacement.write_range_at(b"new", 0, false).unwrap();
         assert_eq!(std::fs::read(&alias).unwrap(), b"OLD");
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
 
@@ -198,11 +202,11 @@ mod tests {
         assert!(!Arc::ptr_eq(first_gate, second_gate));
         {
             let _held = first_gate.lock().unwrap();
-            second.write_range_at(b"independent", 0).unwrap();
+            second.write_range_at(b"independent", 0, false).unwrap();
         }
         let read_only = CachedFile::new(File::open(path).unwrap());
-        assert!(read_only.write_range_at(b"fail", 0).is_err());
+        assert!(read_only.write_range_at(b"fail", 0, false).is_err());
         assert!(first_gate.try_lock().is_ok());
-        first.write_range_at(b"ok", 0).unwrap();
+        first.write_range_at(b"ok", 0, false).unwrap();
     }
 }

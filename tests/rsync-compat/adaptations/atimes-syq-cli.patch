@@ -1,0 +1,12 @@
+--- a/testsuite/atimes_test.py
++++ b/testsuite/atimes_test.py
+@@ -12,9 +12,6 @@
+ from rsyncfns import FROMDIR, TODIR, checkit, run_rsync, test_skipped
+ 
+ 
+-vv = run_rsync('-VV', check=True, capture_output=True)
+-if '"atimes": true' not in vv.stdout:
+-    test_skipped("Rsync is configured without atimes support")
+ 
+ FROMDIR.mkdir(parents=True, exist_ok=True)
+ foo = FROMDIR / 'foo'

@@ -5,6 +5,7 @@ pub(super) fn op_path(op: &Op) -> &[u8] {
         Op::Mkdir { path, .. }
         | Op::Symlink { path, .. }
         | Op::Mknod { path, .. }
+        | Op::Hardlink { path, .. }
         | Op::SetMeta { path, .. }
         | Op::SetFileMetaIfSame { path, .. }
         | Op::Remove { path }
@@ -56,6 +57,22 @@ pub(super) fn apply_one(
     }
     if let Some(guard) = guard {
         let target = guarded_target(op_path(op), guard)?;
+        if let Op::Hardlink {
+            path,
+            source,
+            dev,
+            ino,
+        } = op
+        {
+            let source = guarded_target(source, guard)?;
+            let operation = Op::Hardlink {
+                path: path.clone(),
+                source: source.relative.to_path_buf().into_os_string().into_vec(),
+                dev: *dev,
+                ino: *ino,
+            };
+            return apply_one_rooted(&operation, &target.as_rooted());
+        }
         return apply_one_rooted(op, &target.as_rooted());
     }
     let Some(target) = registered_target else {
@@ -406,6 +423,9 @@ pub(super) fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                 None => root.create_node(path, *mode, *rdev),
             }
         }
+        Op::Hardlink {
+            source, dev, ino, ..
+        } => root.publish_hardlink(&RelativePath::new(source)?, path, (*dev, *ino)),
         Op::SetMeta {
             meta,
             flags,
@@ -467,7 +487,6 @@ pub(super) fn set_meta_rooted(
         require_rooted_metadata(&handle, metadata, &target.label)?;
         let opened = handle.metadata()?;
         require_open_target_known(&opened, &target.label, condition)?;
-        set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
         if flags & flags::TIMES != 0
             && (metadata.mtime != meta.mtime || metadata.mtime_nsec != meta.mtime_nsec)
         {
@@ -477,6 +496,9 @@ pub(super) fn set_meta_rooted(
             ];
             target.root.set_times(&target.relative, &times)?;
         }
+        // Birth time follows mtime: macOS may lower birth time when setting
+        // an older modification time.
+        set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
         return require_rooted_named_identity_known(
             &target.root,
             &target.relative,
@@ -496,13 +518,31 @@ pub(super) fn set_meta_rooted(
         flags & flags::MODE_MASK != 0 && !is_link && metadata.mode & 0o7777 != meta.mode & 0o7777;
     let time_differs = flags & flags::TIMES != 0
         && (metadata.mtime != meta.mtime || metadata.mtime_nsec != meta.mtime_nsec);
-    if !owner_differs && !mode_differs && !time_differs {
+    if !owner_differs && !mode_differs && !time_differs && meta.inode_metadata.is_none() {
         return Ok(());
     }
     if is_link {
+        let handle = meta
+            .inode_metadata
+            .as_ref()
+            .map(|_| target.root.open_metadata(&target.relative))
+            .transpose()?;
+        if let Some(handle) = &handle {
+            require_rooted_metadata(handle, metadata, &target.label)?;
+        }
         apply_owner_if_changed(flags, meta, metadata.uid, metadata.gid, |uid, gid| {
             target.root.chown(&target.relative, uid, gid)
         })?;
+        if time_differs {
+            let times = [
+                timespec(0, libc::UTIME_OMIT as u32),
+                timespec(meta.mtime, meta.mtime_nsec),
+            ];
+            target.root.set_times(&target.relative, &times)?;
+        }
+        if let Some(handle) = &handle {
+            crate::inode_metadata::apply(handle, meta.inode_metadata.as_deref(), meta.mode)?;
+        }
     } else {
         let handle = target.root.open_metadata(&target.relative)?;
         let opened = handle.metadata()?;
@@ -516,7 +556,6 @@ pub(super) fn set_meta_rooted(
         // Timestamp mutation is performed separately with no-follow
         // descriptor-relative semantics. All other metadata is applied to
         // the stable opened inode, so a raced leaf symlink cannot redirect it.
-        set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
         if time_differs {
             let times = [
                 timespec(0, libc::UTIME_OMIT as u32),
@@ -524,6 +563,9 @@ pub(super) fn set_meta_rooted(
             ];
             target.root.set_times(&target.relative, &times)?;
         }
+        // Birth time follows mtime: macOS may lower birth time when setting
+        // an older modification time.
+        set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
         return require_rooted_named_identity_known(
             &target.root,
             &target.relative,
@@ -531,13 +573,6 @@ pub(super) fn set_meta_rooted(
             &opened,
             condition,
         );
-    }
-    if time_differs {
-        let times = [
-            timespec(0, libc::UTIME_OMIT as u32),
-            timespec(meta.mtime, meta.mtime_nsec),
-        ];
-        target.root.set_times(&target.relative, &times)?;
     }
     let after = target.root.metadata(&target.relative)?;
     require_rooted_identity(after, condition, &target.label)
@@ -827,7 +862,7 @@ pub(super) fn set_meta_handle_known(
     if flags & flags::TIMES != 0 {
         bail!("metadata-only O_PATH repair does not support timestamp changes");
     }
-    Ok(())
+    crate::inode_metadata::apply(file, meta.inode_metadata.as_deref(), meta.mode)
 }
 
 #[cfg(target_os = "linux")]

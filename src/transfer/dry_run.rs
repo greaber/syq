@@ -153,16 +153,25 @@ pub(super) fn print_dry_run_summary(
                 )
             },
         );
-        crate::output::human_stdout!(
-            "  capacity: {} logical data required; {} available; {inode_detail} ({})",
-            human(capacity.logical_bytes),
-            human(capacity.available_bytes),
-            if capacity.sufficient() {
-                "appears sufficient"
-            } else {
-                "insufficient"
-            }
-        );
+        if !capacity.check_bytes {
+            crate::output::human_stdout!(
+                "  capacity: {} logical data; sparse allocation size unknown; {} available; {inode_detail} ({})",
+                human(capacity.logical_bytes),
+                human(capacity.available_bytes),
+                if capacity.inode_shortage() { "insufficient inodes" } else { "byte capacity not preflighted" }
+            );
+        } else {
+            crate::output::human_stdout!(
+                "  capacity: {} logical data required; {} available; {inode_detail} ({})",
+                human(capacity.logical_bytes),
+                human(capacity.available_bytes),
+                if capacity.sufficient() {
+                    "appears sufficient"
+                } else {
+                    "insufficient"
+                }
+            );
+        }
     }
 
     let ignored = progress.paths_ignored.load(Relaxed);

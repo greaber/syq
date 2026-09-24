@@ -16,15 +16,14 @@ rsync-internal = "Exercises rsync's implementation, build, helper programs, or t
 rsync-wire = "Exercises rsync's sender/receiver protocol or a malicious/legacy rsync peer; SYQ intentionally speaks a different protocol."
 rsync-daemon = "Exercises rsync daemon configuration, modules, authentication, or daemon transport; SYQ has no rsync daemon mode."
 rrsync = "Exercises rrsync, rsync's restricted-command wrapper, rather than the copy command's filesystem semantics."
-unsupported-acls = "Requires rsync ACL behavior, which SYQ does not implement."
 unsupported-alt-dest = "Requires rsync backup, link-dest, compare-dest, copy-dest, or alternate-basis behavior, which SYQ does not implement."
 unsupported-batch = "Requires rsync batch-file behavior, which SYQ does not implement."
 unsupported-filters = "Requires rsync's filter language; SYQ currently exposes gitignore-style filters instead."
-unsupported-hardlinks = "Requires hard-link preservation, which SYQ does not implement."
+unsupported-hardlinks = "Requires non-regular hardlinks or additional rsync hardlink options (alternate destinations and debug output)."
 unsupported-metadata = "Requires an rsync metadata option that SYQ does not implement yet."
 unsupported-relative = "Requires rsync --relative/-R behavior, which SYQ does not implement."
 unsupported-transfer-mode = "Requires an rsync transfer mode or output option that SYQ does not implement."
-unsupported-xattrs = "Requires extended-attribute behavior, which SYQ does not implement."
+unsupported-xattrs = "Requires rsync-specific xattr filters, fake-super, protocol behavior, or fixtures not yet classified for SYQ."
 
 [[tests]]
 name = "chgrp"
@@ -228,16 +227,14 @@ note = "--inplace retains the destination inode while the default atomic path re
 
 [[tests]]
 name = "longdir"
-classification = "adapted"
-adaptation = "longdir-no-hardlinks"
-adaptation_kind = "subset"
+classification = "conformance"
 area = "paths"
 position = "compatible"
 baseline = "pass"
 platforms = ["linux", "macos"]
 tags = ["local", "paths", "long-names"]
 requirements = ["long path components"]
-note = "Copy and delete within a tree containing three 175-character path components."
+note = "Copy and delete with hardlink preservation within a tree containing three 175-character path components, using the unchanged upstream test."
 
 [[tests]]
 name = "metadata-depth"
@@ -458,16 +455,14 @@ note = "The canonical rich-tree test covers initial copy, one-file repair, a lon
 
 [[tests]]
 name = "hardlinks-deep"
-classification = "adapted"
-adaptation = "hardlink-default"
-adaptation_kind = "subset"
+classification = "conformance"
 area = "hardlinks"
 position = "compatible"
 baseline = "pass"
 platforms = ["linux", "macos"]
 tags = ["local", "hardlinks", "depth"]
 requirements = ["hard links"]
-note = "Without -H, two cross-directory source names for one inode become independent destination files; unsupported hard-link preservation is omitted."
+note = "-H preserves cross-directory regular-file links; without -H, the destination names use independent inodes."
 
 [[tests]]
 name = "links"
@@ -521,3 +516,159 @@ platforms = ["linux", "macos"]
 tags = ["local", "symlinks", "path-escape"]
 requirements = ["symlinks"]
 note = "Default -a preserves both in-tree and lexically escaping symlinks without following them; unsupported copy-links variants are omitted."
+
+[[tests]]
+name = "acls-depth"
+classification = "adapted"
+adaptation = "acls-depth-syq-cli"
+adaptation_kind = "invocation"
+area = "acls"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "depth"]
+requirements = ["setfacl", "getfacl", "POSIX ACL filesystem"]
+note = "POSIX named-user ACLs at every tree depth; omit the rsync-specific -VV capability probe."
+
+[[tests]]
+name = "xattrs-depth"
+classification = "adapted"
+adaptation = "xattrs-depth-syq-cli"
+adaptation_kind = "invocation"
+area = "xattrs"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "depth"]
+requirements = ["Python xattr support", "user xattr filesystem"]
+note = "User xattrs at every tree depth; replace the rsync capability probe and omit namespace filters and --super unnecessary for this user.* fixture."
+
+[[tests]]
+name = "atimes"
+classification = "adapted"
+adaptation = "atimes-syq-cli"
+adaptation_kind = "invocation"
+area = "atimes"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux", "macos"]
+tags = ["local", "metadata", "access-times"]
+requirements = ["access-time support"]
+note = "Preserve the upstream access-time assertions; omit only the rsync-specific -VV capability probe."
+
+[[tests]]
+name = "open-noatime"
+classification = "adapted"
+adaptation = "open-noatime-syq-cli"
+adaptation_kind = "invocation"
+area = "atimes"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "access-times"]
+requirements = ["access-time support"]
+note = "Preserve the upstream access-time assertions; omit only the rsync-specific -VV capability probe."
+
+[[tests]]
+name = "crtimes"
+classification = "adapted"
+adaptation = "crtimes-syq-cli"
+adaptation_kind = "invocation"
+area = "crtimes"
+position = "compatible"
+baseline = "pass"
+platforms = ["macos"]
+tags = ["local", "metadata", "birth-times"]
+requirements = ["settable birth times"]
+note = "Preserve the upstream file and directory birth-time assertions; omit only the rsync-specific -VV capability probe."
+
+[[tests]]
+name = "sparse"
+classification = "adapted"
+adaptation = "sparse-syq-cli"
+adaptation_kind = "invocation"
+area = "sparse"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux", "macos"]
+tags = ["local", "sparse"]
+requirements = ["sparse filesystem"]
+note = "Keep all upstream byte/allocation assertions; omit --no-sparse because sparse mode is already off by default."
+
+[[tests]]
+name = "acls"
+classification = "adapted"
+adaptation = "acls-syq-cli"
+adaptation_kind = "invocation"
+area = "acls"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "acls"]
+requirements = ["setfacl", "getfacl", "POSIX ACL filesystem"]
+note = "Compare named-user and named-group ACLs on files and directories after an archive copy; omit only the rsync-specific -VV capability probe."
+
+[[tests]]
+name = "acls-default"
+classification = "adapted"
+adaptation = "acls-default-syq-cli"
+adaptation_kind = "invocation"
+area = "acls"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "acls"]
+requirements = ["setfacl", "getfacl", "POSIX ACL filesystem"]
+note = "Without -A or -p, new destination containers and files follow the destination parent default ACL, or umask when no default ACL exists. Omit only the rsync-specific -VV capability probe."
+
+[[tests]]
+name = "acls-unpinnable"
+classification = "adapted"
+adaptation = "acls-unpinnable-syq-cli"
+adaptation_kind = "invocation"
+area = "acls"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "acls"]
+requirements = ["setfacl", "getfacl", "POSIX ACL filesystem"]
+note = "Replace stale destination ACL grants on a directory without owner-read permission, including when source directory listing fails. Omit only the rsync-specific -VV capability probe."
+
+[[tests]]
+name = "hardlinks"
+classification = "adapted"
+adaptation = "hardlinks-core-subset"
+adaptation_kind = "subset"
+area = "hardlinks"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux", "macos"]
+tags = ["local", "metadata", "hardlinks"]
+requirements = ["hardlinks"]
+note = "Local fresh copies, delta updates, aliases across scan batches, and single-file/directory operands. Omit rsync debug/itemized output, alternate destinations and their checksum subcase; use a local invocation for the cross-batch case and force the range-copy path for the update. Retain all assertions within the selected cases."
+
+[[tests]]
+name = "xattrs"
+classification = "adapted"
+adaptation = "xattrs-core-subset"
+adaptation_kind = "subset"
+area = "xattrs"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "xattrs"]
+requirements = ["Python xattr support", "user xattr filesystem"]
+note = "Copy and reconcile user xattrs on files and directories, including an unchanged-content file and removal of stale values. Keep the initial upstream copy and full xattr comparison; omit alternate destinations, fake-super and their dependent cases. Replace the rsync capability probe and omit namespace filters and --super unnecessary for these user.* fixtures."
+
+[[tests]]
+name = "xattrs-hlink"
+classification = "adapted"
+adaptation = "xattrs-core-subset"
+adaptation_kind = "subset"
+area = "xattrs"
+position = "compatible"
+baseline = "pass"
+platforms = ["linux"]
+tags = ["local", "metadata", "hardlinks"]
+requirements = ["hardlinks", "Python xattr support", "user xattr filesystem"]
+note = "The same xattr copy/reconciliation assertions with -H and an additional hardlink. Keep the initial upstream copy and full xattr comparison; omit alternate destinations, fake-super and their dependent cases. Replace the rsync capability probe and omit namespace filters and --super unnecessary for these user.* fixtures."

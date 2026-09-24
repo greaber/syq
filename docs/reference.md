@@ -109,8 +109,10 @@ for example when comparing its effect on CPU use and copy speed.
 ## Progress
 
 Syq shows a progress bar in a terminal, with elapsed time, speed, and an
-estimated finish time. The final summary reports copied and skipped files
-and any errors. Add `-v` to list copied paths.
+estimated finish time. Buffered local copies report progress while a large file
+is still being copied; filesystem clones and copy offloads report when the
+operation completes. The final summary reports copied and skipped files and any
+errors. Add `-v` to list copied paths.
 
 Use `--progress` to show the bar when output is redirected, or `--no-progress`
 to hide it. For connection details and ways to investigate performance, see
@@ -189,6 +191,21 @@ syq cp --prune --srcs-in build --into backup
 
 See [Pruning](commands/cp.md#pruning) for restrictions and files kept for recovery.
 
+## Select files by metadata
+
+Use `--where` to select source entries and `--copy-if` to decide which
+source/destination pairs may be updated:
+
+```sh
+syq cp --srcs-in project --into backup \
+  --where 'src.kind = "file" and src.size >= 1MiB' \
+  --copy-if 'not dst.exists or src.mtime > dst.mtime'
+```
+
+Directories remain traversable so matching descendants can be found. Excluded
+source entries protect their destination counterparts from pruning. See
+[expressions](expressions.md) for fields, operators, and directory behavior.
+
 ## Ignoring paths
 
 ```sh
@@ -266,6 +283,10 @@ syq cp --inplace large-file --to server --into /backup
 This avoids the disk space for a second full copy and can reduce disk I/O.
 However, readers can see a mixture of old and new contents during the copy or
 after an interruption. Writes through a hard link also affect its other names.
+Changing an existing file’s contents requires write permission; an unchanged
+read-only file can still be checked with `--hash`. New files keep owner-write
+permission until the copy succeeds and applies their final permissions; an
+interrupted copy can leave that write permission in place.
 See [Update policies](commands/cp.md#update-policies) before combining
 in-place writes with other copy policies.
 
@@ -287,11 +308,138 @@ syq cp --preserve=permissions,ownership project --into backup
 | `--preserve=permissions` | `-p` |
 | `--preserve=ownership` | `-o -g --numeric-ids` |
 | `--preserve=specials` | `-D` (devices and special files) |
+| `--preserve=hardlinks` | `-H` (regular files) |
+| `--preserve=acls` | `-A` (native ACLs; implies permissions) |
+| `--preserve=xattrs` | `-X` (extended attributes) |
+| `--preserve=atimes` | `-U` (access times) |
+| `--preserve=crtimes` | `-N` (birth times; macOS destination) |
 
-Setting ownership requires suitable destination permissions. Syq does not
-preserve hard links, ACLs, or extended attributes. See the
+Setting ownership requires suitable destination permissions. See the
 [rsync option definitions](https://download.samba.org/pub/rsync/rsync.1#opt--perms)
 and [metadata details](commands/cp.md#metadata-details).
+
+With `--preserve=hardlinks`, selected names for the same source regular file
+share one destination inode. This works for local and ordinary SSH copies,
+including updates, reruns, and `--inplace`. Only names eligible under the
+overwrite policy join the group; links outside the selected sources are not
+reconstructed. Existing extra destination links are not necessarily split.
+With `--inplace`, writes still affect every existing name for that destination
+inode, including names outside the copy.
+
+Hardlink preservation scans all selected sources before changing the destination.
+Large trees therefore take longer to start copying and require memory for the
+complete file list.
+
+A group transfers one payload. Creating another name is reported as a successful
+file operation with zero transferred bytes. Conflicting per-path metadata fails
+the copy. Every supplied expected hash must match the shared contents: omitted
+hashes impose no requirement, identical hashes are checked once, and different
+algorithms are checked together in one read. Different values for the same
+algorithm are rejected before copying the group. Hardlinks across destination
+filesystems fail visibly. Multiply linked symlinks and special files are currently unsupported,
+as are hardlink requests with descriptors, streams, S3, and command-restricted
+or receiving destinations. `-a` retains its existing meaning; add `-H` explicitly.
+
+Add ACLs and xattrs for filesystem archival copies on Linux or macOS:
+
+```sh
+syq cp --preserve=permissions,ownership,specials,hardlinks,acls,xattrs --srcs-in source --into backup
+# The rsync-compatible spelling:
+syq rsync -aHAX --numeric-ids source/ backup/
+```
+
+On Linux, ACL preservation copies POSIX access ACLs and directory default ACLs using
+numeric IDs. It also preserves permissions. It removes destination named ACL
+entries or default ACLs absent from the source, including on unchanged files.
+A mapping's explicit mode changes the access ACL's owner, mask (or group), and
+other permissions as `chmod` does. POSIX ACLs do not apply to Linux symlinks;
+NFSv4 ACL conversion is unsupported. On macOS, it copies the native ordered
+allow/deny entries, UUID principals and inheritance flags, removing destination
+entries absent from the source. It does not translate principal names or UUIDs
+between hosts. Both endpoints must use the same ACL model; Linux↔macOS ACL
+conversion is rejected before destination setup.
+Selecting multiple hardlink names with a macOS ACL containing a deletion-denying
+entry is rejected before copying: that ACL prevents publishing the additional
+names. Copy those names independently without `-H` to preserve their ACLs.
+Copying just one selected name remains supported, including with `-H`.
+
+Xattr preservation copies names and binary values, including empty values,
+and removes destination-only attributes within the selected namespace scope.
+A nonroot Linux source selects `user.*`; a root Linux source selects all namespaces except
+`system.*`, including `security.selinux` and `security.capability`. ACL attributes
+are handled only by ACL preservation. Excluded namespaces remain untouched.
+Reading or applying a selected attribute can require privileges; failures make
+the copy unsuccessful. Each inode's selected ACLs and xattrs must fit within
+4 MiB, and individual names and values must fit the destination platform's limits.
+
+On macOS, xattrs include Finder information, resource forks and application
+attributes. ACL storage and filesystem compression attributes are excluded;
+compressed contents are copied as logical bytes. Changing a user resource fork
+on an existing compressed destination is rejected; copy to an uncompressed
+destination for that case. Across Linux and macOS, Linux `user.NAME` corresponds
+to macOS `NAME`. Other Linux namespaces cannot be copied to macOS and are
+rejected. On macOS-to-macOS copies, names are preserved literally.
+
+| Linux entry type | Hardlinks (`-H`) | ACLs (`-A`) | Xattrs (`-X`) |
+|---|---|---|---|
+| Regular file | Selected source group | Access ACL | Selected namespaces |
+| Directory | Not applicable | Access and default ACL | Selected namespaces |
+| Symlink | Non-regular groups rejected | Not applicable | Attributes on the link itself, where supported |
+| FIFO, device, socket | Non-regular groups rejected | Access ACL, where supported | Selected namespaces, where supported |
+
+Copying special files also requires `--preserve=specials` or `-D` (included in
+`-a`), and creating devices requires suitable privileges. Filesystem restrictions
+on particular attribute namespaces still apply.
+
+ACLs and xattrs work for local and ordinary SSH filesystem copies, including
+updates, unchanged-content reruns, and `--inplace`. macOS also supports native
+metadata on directories, symlinks and copied special nodes where the filesystem
+permits it.
+Descriptors, stream mappings, S3, and command-restricted or receiving destinations
+reject these options. Existing descriptor-backed regular-file copies support
+only their original time, permission, and ownership options. Neither `-a` nor
+native copy defaults select ACLs, xattrs, hardlinks, or access times.
+
+These options do not preserve filesystem flags such as immutable or append-only,
+restore ctime or inode numbers, or create rsync `--fake-super` backup records.
+
+Use `--preserve=atimes` (rsync `-U`/`--atimes`) to restore access times captured
+before reading the source. It covers regular files, directories, links themselves,
+and copied special nodes on local and ordinary SSH filesystem copies. Linux
+requires kernel 5.8 or later; macOS support depends on the filesystem. Restoration
+runs after content checks and copying, including metadata-only updates and reruns.
+Reading copied files afterward can change their access times again. Descriptors,
+streams, S3, and command-restricted or receiving destinations reject this option.
+
+`--open-noatime` requests file reads without updating access times. Repeating
+`-U` (`-UU`) enables it too. Linux permits this for a file's owner or a process
+with suitable privileges. If unavailable, syq warns and continues; this option
+does not promise unchanged source access times, including directory scans and
+symlink reads. Destination access-time preservation remains independently selected
+and restoration errors make the copy unsuccessful.
+
+Use `--preserve=crtimes` (rsync `-N`/`--crtimes`) to preserve birth (creation)
+times. The source filesystem must report birth times and the destination must
+be macOS with a filesystem that permits setting them. Linux destinations reject
+this option before copying. It supports the same named filesystem routes and
+entry types as access-time preservation. Neither `-a` nor native defaults select
+it. Inode change time (`ctime`) cannot normally be restored.
+
+Use `--sparse` (rsync `-S`) to turn written zero ranges into holes on local or
+ordinary SSH filesystem copies. It applies to regular files, independently of
+metadata options, and is not included in `-a` or native defaults. It preserves
+bytes and length, not an exact source extent layout. Eligible local clones still
+use filesystem cloning; other writes skip zeros or clear old blocks into holes.
+The destination filesystem must support sparse files; ranged, resumed, and
+in-place writes also require hole punching. A failed hole operation makes the
+copy unsuccessful. Filesystem allocation units can limit the space reclaimed by
+in-place hole punches, especially with small comparison blocks. Unchanged files
+and reused blocks are not rewritten just to change their allocation. Descriptors, streams, S3, and command-restricted or
+receiving destinations reject this option.
+
+Sparse mode avoids full-size preallocation. Its fresh-destination capacity check
+still checks available inodes, but cannot predict required physical bytes from
+logical sizes; allocation can fail later if the destination fills up.
 
 ## Symlinks
 

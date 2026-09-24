@@ -967,6 +967,8 @@ mod copy;
 mod data_safety;
 #[path = "local/fifo.rs"]
 mod fifo;
+#[path = "local/hardlinks.rs"]
+mod hardlinks;
 #[path = "local/hashing.rs"]
 mod hashing;
 #[path = "local/local_copy_selection.rs"]
@@ -991,5 +993,18 @@ mod resume;
 mod rm;
 #[path = "local/selection.rs"]
 mod selection;
+#[path = "local/sparse.rs"]
+mod sparse;
 #[path = "local/tuning.rs"]
 mod tuning;
+
+#[cfg(target_os = "linux")]
+#[path = "local/inode_metadata.rs"]
+mod inode_metadata;
+
+#[cfg(target_os = "macos")]
+#[path = "local/macos_metadata.rs"]
+mod macos_metadata;
+
+#[path = "local/expressions.rs"]
+mod expressions;

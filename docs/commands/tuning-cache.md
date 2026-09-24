@@ -27,8 +27,8 @@ syq tuning-cache <COMMAND>
 
 ## syq tuning-cache list
 
-List recent transfers, newest first. The worker column shows the count saved
-as a startup hint; `?` means the transfer did not supply a recommendation.
+List recent transfers, newest first. The worker column contains saved counts
+from older records; new transfers show `?`.
 
 <!-- CLI: tuning-cache list -->
 ```text

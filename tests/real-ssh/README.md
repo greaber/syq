@@ -33,6 +33,16 @@ checks:
 scripts/test-real-ssh.sh --suite storage
 ```
 
+To check metadata reconciliation and interrupted or failed copies over SSH and
+TCP, without running the other scenarios:
+
+```sh
+scripts/test-real-ssh.sh --suite metadata
+```
+
+These checks inspect remote contents, modes, ownership, timestamps, ACLs,
+xattrs, and hardlink relationships directly after recovery.
+
 The host runner requires Bash 4 or newer. In particular, the Bash 3.2 shipped
 with macOS is not supported; install a current Bash and invoke the script with
 it when running the lab on macOS.

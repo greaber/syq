@@ -424,6 +424,7 @@ fn is_blake3(algorithm: &crate::hashing::HashAlgorithm) -> bool {
 impl Metadata {
     pub(super) fn override_with(&mut self, metadata: &crate::mapping::Metadata) {
         let mut meta = crate::proto::Meta {
+            inode_metadata: None,
             mode: self.mode,
             uid: self.uid,
             gid: self.gid,
@@ -533,6 +534,26 @@ pub(super) fn is_directory_marker(key: &str, size: u64) -> bool {
 }
 
 impl Object {
+    pub(super) fn expression_file(&self) -> crate::expression::File {
+        crate::expression::File {
+            exists: true,
+            kind: Some(match self.kind() {
+                ObjectKind::File => crate::proto::Kind::File,
+                ObjectKind::Dir => crate::proto::Kind::Dir,
+                ObjectKind::Symlink => crate::proto::Kind::Symlink,
+            }),
+            size: Some(self.size),
+            mtime: Some(
+                self.metadata
+                    .as_ref()
+                    .map_or((self.mtime, 0), |m| (m.mtime, m.nsec)),
+            ),
+            mode: self.metadata.as_ref().map(|m| m.mode & 0o7777),
+            uid: self.metadata.as_ref().map(|m| m.uid),
+            gid: self.metadata.as_ref().map(|m| m.gid),
+            ..Default::default()
+        }
+    }
     pub fn kind(&self) -> ObjectKind {
         self.metadata.as_ref().map_or(
             if is_directory_marker(&self.key, self.size) {

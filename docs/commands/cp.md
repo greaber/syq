@@ -35,6 +35,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--src-non-dirs <PATH>...` | Select several named non-directory source objects |
 | `--src-dirs <DIR>...` | Select several named source directories |
 | `--srcs <PATH>...` | Select several named source objects |
+| `--where <EXPR>` | Select non-directory source entries with a typed expression; directories follow normal copy rules |
 | `--ignore <PATTERN>` | Skip paths matching a gitignore-style pattern (repeatable) |
 | `--ignore-from <FILE>` | Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order) |
 | `[PATH]...` | Named source objects (shorthand for --src) |
@@ -62,6 +63,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--only-new` | Copy entries found missing; keep metadata of entries found present; adding children requires write access |
+| `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
 | `--max-delete <N>` | With --prune, refuse all removals if more than N are planned |
@@ -73,7 +75,9 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow` | Follow symlinks in all directly supplied filesystem paths |
 | `--follow-src` | Follow symlinks in directly supplied source paths |
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
-| `--preserve <FEATURE>` | Preserve times, permissions or ownership, or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- times: Preserve modification times (already the default for named destinations)<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files |
+| `--preserve <FEATURE>` | Preserve selected filesystem metadata or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- times: Preserve modification times (already the default for named destinations)<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination |
+| `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
+| `--sparse` | Turn written zero ranges into sparse holes |
 
 <a id="integrity-checking"></a>
 

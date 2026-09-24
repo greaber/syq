@@ -44,6 +44,8 @@ use std::io;
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,6 +82,7 @@ pub(crate) struct RootMetadata {
     pub(crate) len: u64,
     pub(crate) mtime: i64,
     pub(crate) mtime_nsec: u32,
+    pub(crate) atime: crate::inode_metadata::Timestamp,
     pub(crate) ctime: i64,
     pub(crate) ctime_nsec: u32,
     pub(crate) uid: u32,
@@ -338,11 +341,10 @@ impl Root {
         let flags =
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
         #[cfg(target_os = "macos")]
-        let flags = libc::O_EVTONLY
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | libc::O_NOCTTY
-            | libc::O_CLOEXEC;
+        // O_SYMLINK opens the link itself. O_NOFOLLOW takes precedence on
+        // macOS and would reject that link instead.
+        let flags =
+            libc::O_EVTONLY | libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let flags =
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
@@ -415,6 +417,89 @@ impl Root {
         clear_nonblocking(&file)
             .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
         Ok(file)
+    }
+
+    /// Create an ACL-copy sidecar without ever exposing a readable file through
+    /// an inherited ACL. Clearing an ACL after file creation would leave a window
+    /// in which another account could open it and retain access to later writes.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn create_private_file(&self, path: &RelativePath) -> Result<File> {
+        let parent = self.resolve_parent(path)?;
+        match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
+            Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists).into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let temporary = create_temporary(&parent, |fd, name| {
+            retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) })
+        })?;
+        let leaf = c"data";
+        let mut held_directory = None;
+        let result = (|| -> Result<File> {
+            // Event-only access lets the owner repair an empty directory even
+            // when umask removed search permission. Descendant creation below
+            // still requires search access after its permissions are restored.
+            let directory = open_at(
+                parent.directory.as_raw_fd(),
+                &temporary,
+                libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )?;
+            let metadata = directory.metadata()?;
+            anyhow::ensure!(
+                metadata.uid() == unsafe { libc::geteuid() },
+                "staging directory owner changed"
+            );
+            held_directory = Some(directory);
+            let directory = held_directory.as_ref().unwrap();
+            // Preserve the destination parent's setgid inheritance.
+            let mode = 0o700 | (metadata.mode() & 0o2000);
+            crate::inode_metadata::make_staging_private(directory, mode)?;
+            anyhow::ensure!(
+                directory.metadata()?.mode() & 0o777 == 0o700
+                    && crate::inode_metadata::staging_acl_is_empty(directory)?,
+                "filesystem cannot make an ACL staging directory private"
+            );
+            // No file exists until the directory is private. Holding a directory
+            // fd from before the ACL change does not bypass child search checks.
+            let file = open_at(
+                directory.as_raw_fd(),
+                leaf,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            retry_zero(|| unsafe {
+                libc::renameatx_np(
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            })?;
+            Ok(file)
+        })();
+        let cleanup = (|| -> Result<()> {
+            if result.is_err() {
+                if let Some(directory) = held_directory.as_ref() {
+                    match unlink_at(directory.as_raw_fd(), leaf, 0) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error).context("remove unpublished ACL stage"),
+                    }
+                }
+            }
+            unlink_at(parent.directory.as_raw_fd(), &temporary, libc::AT_REMOVEDIR)
+                .context("remove private ACL staging directory")
+        })();
+        match (result, cleanup) {
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("ACL staging cleanup failed: {cleanup:#}")))
+            }
+            (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+            (Ok(file), Ok(())) => Ok(file),
+        }
     }
 
     /// Clone data into a new private sidecar, removing copied xattrs and user
@@ -1183,6 +1268,87 @@ impl Root {
         })
     }
 
+    /// Link a representative through a held object, then publish its new name.
+    /// This deliberately does not use the single-link staging-file helpers.
+    pub(crate) fn publish_hardlink(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+        identity: (u64, u64),
+    ) -> Result<()> {
+        let file = self.open_metadata(source)?;
+        let opened = root_metadata_from_std(&file.metadata()?)?;
+        if !opened.is_file() || (opened.dev, opened.ino) != identity {
+            bail!(
+                "hardlink representative {} changed before publication",
+                source.label()
+            );
+        }
+        let parent = self.resolve_parent(target)?;
+        match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
+            Ok(existing) if (existing.dev, existing.ino) == identity => return Ok(()),
+            Ok(existing) if existing.is_dir() => {
+                bail!("hardlink destination {} is a directory", target.label())
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(target_os = "linux")]
+        let source_name = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        #[cfg(not(target_os = "linux"))]
+        let source_parent = self.resolve_parent(source)?;
+        #[cfg(any(target_os = "linux", test))]
+        let _permit = self.mutation_permit(target)?;
+        let temporary = create_temporary(&parent, |fd, name| {
+            #[cfg(target_os = "linux")]
+            let result = retry_zero(|| unsafe {
+                libc::linkat(
+                    libc::AT_FDCWD,
+                    source_name.as_ptr(),
+                    fd,
+                    name.as_ptr(),
+                    libc::AT_SYMLINK_FOLLOW,
+                )
+            });
+            #[cfg(not(target_os = "linux"))]
+            let result = retry_zero(|| unsafe {
+                libc::linkat(
+                    source_parent.directory.as_raw_fd(),
+                    source_parent.leaf.as_ptr(),
+                    fd,
+                    name.as_ptr(),
+                    0,
+                )
+            });
+            result
+        })?;
+        let result = (|| {
+            // On platforms without fd-relative link creation, a raced source
+            // name can create a different temporary inode. Never publish it.
+            let linked = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
+            if !linked.is_file() || (linked.dev, linked.ino) != identity {
+                bail!(
+                    "hardlink representative {} changed while linking",
+                    source.label()
+                );
+            }
+            retry_zero(|| unsafe {
+                libc::renameat(
+                    parent.directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                )
+            })
+            .with_context(|| format!("publish hardlink {}", target.label()))
+        })();
+        if result.is_err() {
+            let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
+        }
+        result
+    }
+
     /// Atomically publish a staged regular file with ordinary rename
     /// replacement semantics. Both parents are retained before the rename, so
     /// a concurrent ancestor replacement cannot redirect either side. A later
@@ -1847,6 +2013,10 @@ fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
         len: stat.st_size as u64,
         mtime: stat_mtime(&stat),
         mtime_nsec: stat_mtime_nsec(&stat),
+        atime: crate::inode_metadata::Timestamp {
+            seconds: stat.st_atime,
+            nanoseconds: stat.st_atime_nsec as u32,
+        },
         ctime: stat_ctime(&stat),
         ctime_nsec: stat_ctime_nsec(&stat),
         uid: stat.st_uid,
@@ -1864,6 +2034,10 @@ pub(crate) fn root_metadata_from_std(metadata: &std::fs::Metadata) -> Result<Roo
         len: metadata.len(),
         mtime: metadata.mtime(),
         mtime_nsec: u32::try_from(metadata.mtime_nsec()).context("negative mtime nanoseconds")?,
+        atime: crate::inode_metadata::Timestamp {
+            seconds: metadata.atime(),
+            nanoseconds: metadata.atime_nsec() as u32,
+        },
         ctime: metadata.ctime(),
         ctime_nsec: u32::try_from(metadata.ctime_nsec()).context("negative ctime nanoseconds")?,
         uid: metadata.uid(),

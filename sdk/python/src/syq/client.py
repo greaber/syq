@@ -19,7 +19,9 @@ from typing import BinaryIO
 
 from ._streams import StreamReader, StreamWriter
 from ._defaults import CLIENT_DEFAULT, Timeout, resolve_timeout
-from ._mapping import Mapping as FileMapping, _source_options
+from ._mapping import (
+    _Connection, _connection_options, Mapping as FileMapping, _source_options,
+)
 from ._paths import PathArgument, _map_stream_cwd
 from .managed import managed_executable
 from .bundled import bundled_executable
@@ -561,6 +563,24 @@ def _positive_integer(value: int | None, *, option: str) -> int | None:
     return value
 
 
+def _map_options(argv: list[Argument], *, include: Iterable[str] | None,
+                 rsh: str | None, syq_path: str | os.PathLike[str] | None,
+                 no_bootstrap: bool) -> None:
+    if include is not None:
+        if isinstance(include, (str, bytes)):
+            raise SyqInvocationError("include must be an iterable of field names")
+        for field in include:
+            if field not in {"kind", "size", "mtime", "s3_last_modified"}:
+                raise SyqInvocationError(f"unknown mapping field: {field!r}")
+            argv.append("--include=" + field)
+    if rsh is not None:
+        argv.append("--rsh=" + _text_arg(rsh, label="rsh"))
+    if syq_path is not None:
+        argv.append("--syq-path=" + _text_arg(syq_path, label="syq_path"))
+    if no_bootstrap:
+        argv.append("--no-bootstrap")
+
+
 def _s3_arguments(
     argv: list[Argument], endpoint: str | None, region: str | None,
     profile: str | None, headers: Iterable[str] | None,
@@ -630,12 +650,18 @@ def _copy_arguments(
     ignore: IgnoreSelector | None,
     ignore_from: Selector | None,
     preserve: str | Iterable[str] | None,
+    open_noatime: bool,
+    sparse: bool,
     inplace: bool,
     max_delete: int | None,
     integrity_checking: str | None = None,
     allow_missing_placement: bool = False,
+    where: str | None = None,
+    copy_if: str | None = None,
 ) -> tuple[list[Argument], int, int]:
     argv: list[Argument] = [command]
+    _append_text(argv, "--where", where)
+    _append_text(argv, "--copy-if", copy_if)
     source_count = 0
     contents_count = 0
     for index, source in enumerate(sources):
@@ -753,11 +779,15 @@ def _copy_arguments(
     if preserve is not None:
         attributes = (preserve,) if isinstance(preserve, str) else tuple(preserve)
         for attribute in attributes:
-            if attribute not in {"times", "permissions", "ownership", "specials"}:
+            if attribute not in {"times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes", "crtimes"}:
                 raise SyqInvocationError(
-                    "--preserve must contain times, permissions, ownership, or specials"
+                    "--preserve must contain times, permissions, ownership, specials, hardlinks, acls, xattrs, atimes, or crtimes"
                 )
             argv.extend(("--preserve", attribute))
+    if open_noatime:
+        argv.append("--open-noatime")
+    if sparse:
+        argv.append("--sparse")
     if inplace:
         argv.append("--inplace")
     max_delete = _nonnegative_integer(max_delete, option="--max-delete")
@@ -894,11 +924,13 @@ class MapStream(FileMapping):
 
     def __init__(
         self, process: _LineProcess, cwd: PathArgument, *,
-        confined: bool = False, follow_src: bool = False,
+        confined: bool = False, follow_src: bool = False, from_: str | None = None,
+        connection: _Connection = _Connection(),
     ) -> None:
         super().__init__(
             (), cwd=None if confined else cwd,
-            root=cwd if confined else None, follow_src=follow_src,
+            root=cwd if confined else None, follow_src=follow_src, from_=from_,
+            **connection.arguments(),
         )
         self._process = process
         self._complete = False
@@ -1215,6 +1247,8 @@ class Client:
         only_new: bool = False,
         only_existing: bool = False,
         skip_newer: bool = False,
+        where: str | None = None,
+        copy_if: str | None = None,
         no_compress: bool = False,
         resource_limits: str | None = None,
         performance_tuning: str | None = None,
@@ -1239,12 +1273,20 @@ class Client:
         ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
+        open_noatime: bool = False,
+        sparse: bool = False,
         inplace: bool = False,
         max_delete: int | None = None,
         on_event: Callable[[AutomationEvent], object] | None = None,
         timeout: Timeout = CLIENT_DEFAULT,
         check: bool = True,
     ) -> CpResult:
+        connection = _connection_options(mapping, _Connection(
+            rsh, syq_path, no_bootstrap, s3_endpoint, s3_region, s3_profile, s3_header,
+        ))
+        from_, cwd, root, follow_src = _source_options(
+            mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
+        )
         if (
             from_ is not None
             and to is not None
@@ -1258,9 +1300,6 @@ class Client:
                 "a remote-to-remote dry run cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
-        cwd, root, follow_src = _source_options(
-            mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
-        )
         results = _prepare_results_file(results)
         argv, source_count, source_end = _copy_arguments(
             "cp",
@@ -1289,6 +1328,8 @@ class Client:
             only_new=only_new,
             only_existing=only_existing,
             skip_newer=skip_newer,
+            where=where,
+            copy_if=copy_if,
             no_compress=no_compress,
             resource_limits=resource_limits,
             performance_tuning=performance_tuning,
@@ -1298,20 +1339,23 @@ class Client:
             ignore=ignore,
             ignore_from=ignore_from,
             preserve=preserve,
+            open_noatime=open_noatime,
+            sparse=sparse,
             inplace=inplace,
             max_delete=max_delete,
             allow_missing_placement=mapping is not None and not isinstance(mapping, (str, bytes, os.PathLike)),
         )
-        _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
+        _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
+                      connection.s3_profile, connection.s3_header)
         if auth_from is not None:
             argv.extend(("--auth-from", _text_arg(auth_from, label="auth_from")))
         _append_remote_arguments(
             argv,
             coordinate_at=coordinate_at,
-            rsh=rsh,
+            rsh=connection.rsh,
             pscope=pscope,
-            syq_path=syq_path,
-            no_bootstrap=no_bootstrap,
+            syq_path=connection.syq_path,
+            no_bootstrap=connection.no_bootstrap,
             tcp_plain=tcp_plain,
             no_tcp=no_tcp,
             tcp_ports=tcp_ports,
@@ -1461,6 +1505,15 @@ class Client:
         srcs_in: Selector | None = None,
         src_non_dir: Selector | None = None,
         src_dir: Selector | None = None,
+        from_: str | None = None,
+        include: Iterable[str] | None = None,
+        rsh: str | None = None,
+        syq_path: str | os.PathLike[str] | None = None,
+        no_bootstrap: bool = False,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow: bool = False,
@@ -1481,7 +1534,7 @@ class Client:
             srcs_in=srcs_in_values,
             src_non_dir=src_non_dir_values,
             src_dir=src_dir_values,
-            from_=None,
+            from_=from_,
             cwd=cwd,
             root=root,
             follow=follow,
@@ -1509,9 +1562,17 @@ class Client:
             ignore=None,
             ignore_from=None,
             preserve=None,
+            open_noatime=False,
+            sparse=False,
             inplace=False,
             max_delete=None,
         )
+        connection = _Connection(rsh, syq_path, no_bootstrap,
+                                 s3_endpoint, s3_region, s3_profile, s3_header)
+        _map_options(argv, include=include, rsh=connection.rsh, syq_path=connection.syq_path,
+                     no_bootstrap=connection.no_bootstrap)
+        _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
+                      connection.s3_profile, connection.s3_header)
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
         command = (self._executable_value(), *argv)
@@ -1527,7 +1588,7 @@ class Client:
             self.process_cwd,
             self.env,
             selected_base,
-            contents_selector,
+            contents_selector, from_,
         )
         return MapStream(
             _LineProcess(
@@ -1538,5 +1599,5 @@ class Client:
             ),
             effective_cwd,
             confined=root is not None,
-            follow_src=follow or follow_src,
+            follow_src=follow or follow_src, from_=from_, connection=connection,
         )

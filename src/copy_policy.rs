@@ -45,6 +45,7 @@ impl CopyPolicy {
 #[derive(Clone, Copy)]
 pub(crate) struct FreshCapacityAssessment {
     pub(crate) logical_bytes: u64,
+    pub(crate) check_bytes: bool,
     pub(crate) objects: u64,
     pub(crate) available_bytes: u64,
     pub(crate) available_inodes: Option<u64>,
@@ -52,7 +53,7 @@ pub(crate) struct FreshCapacityAssessment {
 
 impl FreshCapacityAssessment {
     pub(crate) fn byte_shortage(self) -> bool {
-        self.logical_bytes > self.available_bytes
+        self.check_bytes && self.logical_bytes > self.available_bytes
     }
 
     pub(crate) fn inode_shortage(self) -> bool {

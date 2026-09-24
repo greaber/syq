@@ -27,6 +27,45 @@ impl FsOps {
         Ok(Response::PartialSize(partial_size))
     }
 
+    fn create_partial_rooted(
+        &self,
+        root: &Root,
+        relative: &RelativePath,
+        mode: u32,
+    ) -> Result<File> {
+        #[cfg(target_os = "macos")]
+        if self.inode_preservation.acls {
+            return root.create_private_file(relative);
+        }
+        root.create_file(relative, mode)
+    }
+
+    fn create_inplace_file(root: &Root, relative: &RelativePath, mode: u32) -> Result<File> {
+        // Other range workers, or Prepare after a CopyLocal fallback, must
+        // reopen this new inode for writing. Finalize applies the requested
+        // mode after every writer is done. Never chmod an existing destination
+        // here: its write permissions still decide whether an update is allowed.
+        let file = root.create_file(relative, mode | 0o200)?;
+        let permissions = file.metadata()?.permissions();
+        if permissions.mode() & 0o200 == 0 {
+            // A umask or inherited default ACL can remove even owner write.
+            file.set_permissions(fs::Permissions::from_mode(permissions.mode() | 0o200))?;
+        }
+        Ok(file)
+    }
+
+    fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        if self.inode_preservation.acls {
+            // A previously public inode may have readers with open descriptors.
+            // Do not write further protected data through that inode on resume.
+            return Ok(file.metadata()?.mode() & 0o077 == 0
+                && crate::inode_metadata::staging_acl_is_empty(file)?);
+        }
+        let _ = file;
+        Ok(true)
+    }
+
     pub(super) fn open_private_partial_rooted(
         &mut self,
         root: &Root,
@@ -38,7 +77,7 @@ impl FsOps {
         self.uncache_rooted(root, relative);
         let mut repaired_permissions = false;
         if create_if_missing {
-            match root.create_file(relative, create_mode) {
+            match self.create_partial_rooted(root, relative, create_mode) {
                 Ok(file) => return Ok(Some((file, None))),
                 Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
                 Err(error) => return Err(error),
@@ -56,6 +95,17 @@ impl FsOps {
                                 || opened.dev() != named.dev
                                 || opened.ino() != named.ino
                             {
+                                continue;
+                            }
+                            if !self.reusable_partial_permissions(&file)? {
+                                drop(file);
+                                discard_safe_rooted_partial_if_same(
+                                    root,
+                                    relative,
+                                    opened.dev(),
+                                    opened.ino(),
+                                    label,
+                                )?;
                                 continue;
                             }
                             if opened.mode() & 0o7777 != 0o600 {
@@ -129,6 +179,17 @@ impl FsOps {
                                 continue;
                             }
                             require_rooted_metadata(&handle, metadata, label)?;
+                            if !self.reusable_partial_permissions(&handle)? {
+                                drop(handle);
+                                discard_safe_rooted_partial_if_same(
+                                    root,
+                                    relative,
+                                    metadata.dev,
+                                    metadata.ino,
+                                    label,
+                                )?;
+                                continue;
+                            }
                             let repair = (|| -> Result<()> {
                                 fail_partial_chmod_for_test()?;
                                 set_mode_handle(&handle, 0o600)?;
@@ -160,7 +221,7 @@ impl FsOps {
                 Some(_) if !create_if_missing => return Ok(None),
                 Some(_) => root.unlink(relative)?,
                 None if !create_if_missing => return Ok(None),
-                None => match root.create_file(relative, create_mode) {
+                None => match self.create_partial_rooted(root, relative, create_mode) {
                     Ok(file) => return Ok(Some((file, None))),
                     Err(error)
                         if error
@@ -229,7 +290,18 @@ impl FsOps {
             .collect()
     }
 
+    fn set_copy_length(&self, file: &File, size: u64) -> io::Result<()> {
+        if self.sparse {
+            crate::sparse::set_len(file, size)
+        } else {
+            file.set_len(size)
+        }
+    }
+
     pub(super) fn preallocate_new_partial(&mut self, file: &File, size: u64) -> Result<()> {
+        if self.sparse {
+            return crate::sparse::set_len(file, size).context("set sparse partial length");
+        }
         #[cfg(target_os = "linux")]
         {
             let dev = file.metadata()?.dev();
@@ -281,6 +353,28 @@ impl FsOps {
             // An interrupted non-inplace run must not strand this job's
             // adjacent sidecar when the retry switches to --inplace.
             let _ = with_rooted_partial(&target, copy_id, |partial, _| target.root.unlink(partial));
+            if self
+                .held_basis
+                .as_ref()
+                .is_some_and(|held| held.location == target.location() && held.copy_id == *copy_id)
+            {
+                // The coordinator reuses hashes from this inode. Never resize
+                // or write a replacement name using that earlier comparison.
+                let held = self.held_basis.take().unwrap();
+                let metadata = held.file.metadata()?;
+                let file = target.root.open_regular_read_write(&target.relative)?;
+                require_open_target(
+                    &file,
+                    &target.label,
+                    TargetCondition::Matches {
+                        dev: metadata.dev(),
+                        ino: metadata.ino(),
+                    },
+                )?;
+                self.set_copy_length(&file, size)?;
+                self.cache_file(target.location(), attempt, false, file);
+                return Ok(Preparation::default());
+            }
             for _ in 0..8 {
                 match target.root.metadata_optional(&target.relative)? {
                     Some(metadata) if metadata.is_file() => {
@@ -289,7 +383,7 @@ impl FsOps {
                         // as range writes.
                         let file = target.root.open_regular_read_write(&target.relative)?;
                         require_rooted_metadata(&file, metadata, &target.label)?;
-                        file.set_len(size).with_context(|| {
+                        self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
                         })?;
                         self.cache_file(target.location(), attempt, false, file);
@@ -299,9 +393,9 @@ impl FsOps {
                         bail!("destination {} is a directory", target.label.display())
                     }
                     Some(_) => target.root.unlink(&target.relative)?,
-                    None => match target.root.create_file(&target.relative, mode) {
+                    None => match Self::create_inplace_file(&target.root, &target.relative, mode) {
                         Ok(file) => {
-                            file.set_len(size).with_context(|| {
+                            self.set_copy_length(&file, size).with_context(|| {
                                 format!("resize confined file {}", target.label.display())
                             })?;
                             self.cache_file(target.location(), attempt, false, file);
@@ -338,7 +432,7 @@ impl FsOps {
         };
         if let Some(old_size) = basis_size {
             if old_size > size {
-                file.set_len(size)?;
+                self.set_copy_length(&file, size)?;
             }
         } else {
             self.preallocate_new_partial(&file, size)?;
@@ -448,7 +542,7 @@ impl FsOps {
         flags: u8,
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
-    ) -> Result<()> {
+    ) -> Result<Option<(u64, u64)>> {
         let (held, target) = self.take_held_basis(path, copy_id, guard)?;
         require_open_target(&held.file, &held.label, condition)?;
         set_meta_file(&held.file, meta, flags)
@@ -475,7 +569,7 @@ impl FsOps {
                 condition,
             )?;
         }
-        Ok(())
+        published_identity(&held.file, flags)
     }
 
     pub(super) fn seed_basis(
@@ -608,16 +702,19 @@ impl FsOps {
                             "SYQ_TEST_REUSE_CONTINUE_FILE",
                             "reuse buffered bytes",
                         )?;
-                        output
-                            .write_all_at(bytes, off)
-                            .context("write reused block")?;
+                        if self.sparse {
+                            crate::sparse::write_at(&output, bytes, off, false)
+                        } else {
+                            output.write_all_at(bytes, off)
+                        }
+                        .context("write reused block")?;
                     }
                     hashes.push(hash);
                 }
             }
         }
         if output.metadata()?.len() != len {
-            output.set_len(len)?;
+            self.set_copy_length(&output, len)?;
         }
         self.cache_file(location, attempt, true, output);
         Ok(SeededBasis {
@@ -636,7 +733,7 @@ impl FsOps {
             .registered_source_target(source)
             .context("resolve registered local-copy source")?;
         let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
-        let s = open_registered_source(&source_target)
+        let s = open_registered_source(&source_target, self.inode_preservation.open_noatime)
             .with_context(|| format!("open registered source {}", source_label.display()))?;
         let destination_root = self
             .destination_root
@@ -688,7 +785,7 @@ impl FsOps {
         &mut self,
         source: &RegisteredPath,
         dst: &[u8],
-        policy: CopyLocalPolicy,
+        policy: CopyLocalPolicy<'_>,
         copy_id: &CopyId,
         size: u64,
         mode: u32,
@@ -700,7 +797,9 @@ impl FsOps {
             inplace,
             allow_sequential_nfs_fallback,
             allow_sequential_local_fallback,
+            progress,
         } = policy;
+        let mut progress = CopyProgress::new(progress, size);
         let (s, source_metadata, target) = self.prepare_local_copy(source, dst)?;
         let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
         // Advisory sequential readahead for the kernel copy on Linux.
@@ -738,17 +837,19 @@ impl FsOps {
                         bail!("destination {} is a directory", target_label.display())
                     }
                     Some(_) => destination_root.unlink(&target_relative)?,
-                    None => match destination_root.create_file(&target_relative, mode) {
-                        Ok(file) => {
-                            opened = Some(file);
-                            break;
+                    None => {
+                        match Self::create_inplace_file(&destination_root, &target_relative, mode) {
+                            Ok(file) => {
+                                opened = Some(file);
+                                break;
+                            }
+                            Err(error)
+                                if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                                    error.kind() == io::ErrorKind::AlreadyExists
+                                }) => {}
+                            Err(error) => return Err(error),
                         }
-                        Err(error)
-                            if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                                error.kind() == io::ErrorKind::AlreadyExists
-                            }) => {}
-                        Err(error) => return Err(error),
-                    },
+                    }
                 }
             }
             opened.with_context(|| {
@@ -825,8 +926,10 @@ impl FsOps {
             && destination_fs.is_nfs
             && !destination_fs.synchronous;
         // Local files keep parallelism across files without paying transport
-        // and per-range hashing costs. Do not widen the NFS exception above.
-        let use_userspace_fallback = use_sequential_nfs_fallback
+        // and per-range hashing costs. Explicit sparse mode also needs a buffered
+        // writer when cloning cannot preserve its allocation.
+        let use_userspace_fallback = self.sparse
+            || use_sequential_nfs_fallback
             || (allow_sequential_local_fallback
                 && source_fs.local_userspace_copy
                 && destination_fs.local_userspace_copy
@@ -882,7 +985,13 @@ impl FsOps {
             && !destination_fs.is_nfs
             && !destination_fs.synchronous
             && !userspace_fallback;
-        let cloned = local_read_ahead && crate::local_copy::try_clone(&s, &d, size);
+        // copy_file_range can clone on filesystems outside the measured
+        // read-ahead set too. Sparse mode cannot use its byte-copy fallback,
+        // which can fill holes, so try an explicit clone before scanning zeros.
+        let cloned = (local_read_ahead || self.sparse)
+            && !userspace_fallback
+            && crate::local_copy::try_clone(&s, &d, size);
+        userspace_fallback |= self.sparse && !cloned;
         let preparation = &mut self.read_ahead;
         let mut read_ahead = (local_read_ahead && !cloned).then(|| preparation.range(&s, 0..size));
         let mut source_offset: libc::off64_t = 0;
@@ -901,6 +1010,8 @@ impl FsOps {
                     if read_ahead.is_some() {
                         remaining.min(crate::read_ahead::BLOCK) as usize
                     } else {
+                        // Preserve server-side copy offload as one operation.
+                        // Progress follows its successful return, like a clone.
                         remaining as usize
                     },
                     0,
@@ -954,6 +1065,7 @@ impl FsOps {
                 bail!("source shortened while copying {}", source_label.display());
             }
             remaining -= n as u64;
+            progress.advance(size - remaining)?;
             if let Some(read_ahead) = &mut read_ahead {
                 let prepare = if read_ahead.needs_observation() {
                     let current = crate::read_ahead::Activity::sample();
@@ -998,9 +1110,13 @@ impl FsOps {
                 let prepare = before.is_some_and(|before| {
                     crate::read_ahead::Activity::sample().read_wait_since(before)
                 });
-                destination
-                    .write_all(&buffer[..n])
-                    .with_context(|| format!("write {}", target_label.display()))?;
+                if self.sparse {
+                    crate::sparse::write_at(&d, &buffer[..n], size - remaining, false)
+                } else {
+                    destination.write_all(&buffer[..n])
+                }
+                .with_context(|| format!("write {}", target_label.display()))?;
+                progress.advance(size - remaining + n as u64)?;
                 #[cfg(debug_assertions)]
                 if remaining == size {
                     test_race_barrier(
@@ -1016,7 +1132,15 @@ impl FsOps {
                 remaining -= n as u64;
                 prepared.advance(size - remaining, prepare);
             }
-            d.set_len(size)?;
+            drop(prepared);
+            self.set_copy_length(&d, size)?;
+        }
+        if inplace {
+            // Creation can return a writable descriptor for a read-only mode.
+            // Keep it for the immediately following Finalize: reopening the
+            // completed file for writing would fail. Finalize removes every
+            // attempt for this path, so CopyLocal needs no wire attempt field.
+            self.cache_file(target.location(), 0, false, d);
         }
         _copy.bytes(size);
         Ok(CopyLocalOutcome::Copied)
@@ -1027,7 +1151,7 @@ impl FsOps {
         &mut self,
         source: &RegisteredPath,
         dst: &[u8],
-        policy: CopyLocalPolicy,
+        policy: CopyLocalPolicy<'_>,
         copy_id: &CopyId,
         size: u64,
         _mode: u32,
@@ -1051,7 +1175,7 @@ impl FsOps {
         if outcome == CopyLocalOutcome::Copied {
             _copy.bytes(size);
         }
-        // Like Linux offload, leave no writer-cache entry. CopyLocal has no
+        // Like staged Linux offload, leave no writer-cache entry. CopyLocal has no
         // attempt field; finalize opens and checks the named partial normally.
         Ok(outcome)
     }
@@ -1061,7 +1185,7 @@ impl FsOps {
         &mut self,
         _source: &RegisteredPath,
         _dst: &[u8],
-        _policy: CopyLocalPolicy,
+        _policy: CopyLocalPolicy<'_>,
         _copy_id: &CopyId,
         _size: u64,
         _mode: u32,
@@ -1072,7 +1196,7 @@ impl FsOps {
     /// Write a whole small file through its private partial and atomically
     /// rename it into place. Keeping this as one request preserves pipelining;
     /// unlike an in-place write, no partial final-named file is ever visible.
-    pub(super) fn put_small(&mut self, put: &SmallPut) -> Result<()> {
+    pub(super) fn put_small(&mut self, put: &SmallPut) -> Result<Option<(u64, u64)>> {
         let target = PartialTarget {
             path: &put.path,
             id: &put.copy_id,
@@ -1140,7 +1264,7 @@ impl FsOps {
                     })?
                 }
             };
-            observed_write(&self.operation, &file, data, 0)
+            observed_write(&self.operation, &file, data, 0, self.sparse)
                 .with_context(|| format!("write {}", rooted.label.display()))?;
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", rooted.label.display()))?;
@@ -1156,7 +1280,7 @@ impl FsOps {
                     condition,
                 )?;
             }
-            return Ok(());
+            return published_identity(&file, flags);
         }
         if target.guard.is_none()
             && matches!(
@@ -1170,7 +1294,7 @@ impl FsOps {
             let file = rooted.root.open_regular_write(&rooted.relative, false)?;
             require_open_target(&file, &rooted.label, condition)?;
             file.set_len(0)?;
-            observed_write(&self.operation, &file, data, 0)
+            observed_write(&self.operation, &file, data, 0, self.sparse)
                 .with_context(|| format!("write existing {}", rooted.label.display()))?;
             file.set_len(data.len() as u64)?;
             set_meta_file(&file, meta, flags)
@@ -1182,7 +1306,7 @@ impl FsOps {
                 &file,
                 condition,
             )?;
-            return Ok(());
+            return published_identity(&file, flags);
         }
 
         // New/replace small files, and the existing guarded-receiver
@@ -1193,12 +1317,18 @@ impl FsOps {
                 self.open_private_partial_rooted(&rooted.root, relative, label, true, staged_mode)
             })?;
         let (file, basis_size) = opened.context("sidecar creation was requested")?;
+        #[cfg(debug_assertions)]
+        test_race_barrier(
+            "SYQ_TEST_SMALL_STAGE_READY_FILE",
+            "SYQ_TEST_SMALL_STAGE_CONTINUE_FILE",
+            "small-file stage before data",
+        )?;
         if basis_size.is_some() {
             file.set_len(0)?;
         }
-        observed_write(&self.operation, &file, data, 0)
+        observed_write(&self.operation, &file, data, 0, self.sparse)
             .with_context(|| format!("write {}", label.display()))?;
-        set_meta_file(&file, meta, flags)
+        set_meta_file_for_publication(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
         // `publish_partial_rooted` re-checks the staged name against the
         // open descriptor immediately before the rename, so no separate
@@ -1206,7 +1336,12 @@ impl FsOps {
         #[cfg(debug_assertions)]
         fail_put_small_before_rename_for_test(&rooted.label)?;
         publish_partial_rooted(&rooted.root, &relative, &rooted.relative, &file, condition)?;
-        Ok(())
+        crate::inode_metadata::finish_publication(
+            &file,
+            meta.inode_metadata.as_deref(),
+            meta.mode,
+        )?;
+        published_identity(&file, flags)
     }
 
     pub(super) fn hash_blocks(
@@ -1231,7 +1366,8 @@ impl FsOps {
                 bail!("source block hash is only valid for the final source file");
             }
             if let Some((_, source_target)) = self.source_content_target(target.source)? {
-                let mut file = open_registered_source(&source_target)?;
+                let mut file =
+                    open_registered_source(&source_target, self.inode_preservation.open_noatime)?;
                 return hash_reader_observed(
                     &mut file,
                     block,
@@ -1285,6 +1421,7 @@ impl FsOps {
             )?
             .map(Ok)
             .unwrap_or_else(|| open_existing_regular(&p, false))?;
+        crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
         f.seek(SeekFrom::Start(0))?;
         if which == Which::Partial {
             require_safe_partial(&f, &p)?;
@@ -1405,10 +1542,11 @@ impl FsOps {
             bail!("block hash mismatch on receive @{off}");
         }
         let rooted = self.destination_mutation_target(target.path, target.guard)?;
+        let sparse = self.sparse;
         let mut write = |relative: &RelativePath, label: &Path| {
             let file = self.cached_rooted(label, &rooted.root, relative, attempt, !inplace)?;
             let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
-            let result = file.write_range_at(data, off);
+            let result = file.write_range_at(data, off, sparse);
             if result.is_ok() {
                 writing.bytes(data.len() as u64);
             }
@@ -1426,7 +1564,7 @@ impl FsOps {
     pub(super) fn verify_expected_inode(
         writer: &File,
         reader: &File,
-        expected: &crate::hashing::Digest,
+        expected: &crate::hashing::ExpectedHashes,
     ) -> Result<()> {
         let written = writer.metadata()?;
         let read = reader.metadata()?;
@@ -1438,28 +1576,19 @@ impl FsOps {
 
     pub(super) fn verify_expected_file(
         file: &File,
-        expected: &crate::hashing::Digest,
+        expected: &crate::hashing::ExpectedHashes,
     ) -> Result<()> {
         let mut reader = file;
         reader.seek(SeekFrom::Start(0))?;
-        let mut hasher = expected.algorithm.hasher();
-        let mut buffer = vec![0; 1024 * 1024];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
         expected
-            .verify(&hasher.finalize())
+            .verify_reader(&mut reader)
             .context("expected file digest mismatch")
     }
 
     pub(super) fn validate_expected_path(
         &self,
         path: &[u8],
-        expected: &crate::hashing::Digest,
+        expected: &crate::hashing::ExpectedHashes,
         guard: Option<&ContainerGuard>,
     ) -> Result<()> {
         let file = if let Some(target) = self.rooted_destination_target(path, guard)? {
@@ -1479,8 +1608,8 @@ impl FsOps {
         flags: u8,
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
-        expected: Option<&crate::hashing::Digest>,
-    ) -> Result<()> {
+        expected: Option<&crate::hashing::ExpectedHashes>,
+    ) -> Result<Option<(u64, u64)>> {
         if let Some(expected) = expected {
             Self::verify_expected_file(
                 &self.held_basis.as_ref().context("no retained basis")?.file,
@@ -1499,21 +1628,21 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         mutation: TargetMutation<'_>,
-    ) -> Result<()> {
+    ) -> Result<Option<(u64, u64)>> {
         self.finalize_expected(None, path, inplace, copy_id, meta, flags, mutation)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finalize_expected(
         &mut self,
-        expected: Option<&crate::hashing::Digest>,
+        expected: Option<&crate::hashing::ExpectedHashes>,
         path: &[u8],
         inplace: bool,
         copy_id: &CopyId,
         meta: &Meta,
         flags: u8,
         mutation: TargetMutation<'_>,
-    ) -> Result<()> {
+    ) -> Result<Option<(u64, u64)>> {
         let target = self.destination_mutation_target(path, mutation.guard)?;
         self.finalize_rooted(&target, inplace, copy_id, meta, flags, mutation, expected)
     }
@@ -1527,8 +1656,8 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         mutation: TargetMutation<'_>,
-        expected: Option<&crate::hashing::Digest>,
-    ) -> Result<()> {
+        expected: Option<&crate::hashing::ExpectedHashes>,
+    ) -> Result<Option<(u64, u64)>> {
         let TargetMutation { condition, guard } = mutation;
         let guarded = guard.is_some();
         if inplace {
@@ -1552,7 +1681,7 @@ impl FsOps {
                     condition,
                 )?;
             }
-            return Ok(());
+            return published_identity(&file, flags);
         }
         let (src_relative, src, file) = with_rooted_partial(target, copy_id, |relative, _| {
             self.uncache_rooted(&target.root, relative)
@@ -1592,9 +1721,23 @@ impl FsOps {
             destination.set_len(0)?;
             staged.seek(SeekFrom::Start(0))?;
             destination.seek(SeekFrom::Start(0))?;
-            io::copy(&mut staged, &mut destination)
-                .with_context(|| format!("update existing {}", target.label.display()))?;
-            destination.set_len(size)?;
+            let copy = if self.sparse {
+                let mut buffer = vec![0; 1 << 20];
+                let mut offset = 0;
+                (|| -> io::Result<u64> {
+                    while offset < size {
+                        let want = (size - offset).min(buffer.len() as u64) as usize;
+                        staged.read_exact(&mut buffer[..want])?;
+                        crate::sparse::write_at(&destination, &buffer[..want], offset, false)?;
+                        offset += want as u64;
+                    }
+                    Ok(offset)
+                })()
+            } else {
+                io::copy(&mut staged, &mut destination)
+            };
+            copy.with_context(|| format!("update existing {}", target.label.display()))?;
+            self.set_copy_length(&destination, size)?;
             set_meta_file(&destination, meta, flags)
                 .with_context(|| format!("set metadata {}", target.label.display()))?;
             require_rooted_named_identity(
@@ -1611,10 +1754,10 @@ impl FsOps {
                 staged_metadata.ino(),
                 &src,
             )?;
-            return Ok(());
+            return published_identity(&destination, flags);
         }
 
-        set_meta_file(&file, meta, flags)
+        set_meta_file_for_publication(&file, meta, flags)
             .with_context(|| format!("set metadata {}", src.display()))?;
         require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
         if target
@@ -1631,7 +1774,12 @@ impl FsOps {
             &file,
             condition,
         )?;
-        Ok(())
+        crate::inode_metadata::finish_publication(
+            &file,
+            meta.inode_metadata.as_deref(),
+            meta.mode,
+        )?;
+        published_identity(&file, flags)
     }
 
     pub fn file_hash(
@@ -1647,7 +1795,7 @@ impl FsOps {
                 bail!("source file hash cannot carry a destination guard");
             }
             if let Some((_, target)) = self.source_content_target(source)? {
-                open_registered_source(&target)?
+                open_registered_source(&target, self.inode_preservation.open_noatime)?
             } else {
                 // Explicit rsync --insecure-links compatibility path.
                 open_existing_regular(&resolve(path), false)?
@@ -1660,6 +1808,7 @@ impl FsOps {
         } else {
             open_existing_regular(&resolve(path), false)?
         };
+        crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
         let mut h = self.hash_policy.algorithm.hasher();
         let mut buf = vec![0u8; 1 << 20];
         let mut size = 0u64;
@@ -1687,6 +1836,14 @@ impl FsOps {
     /// Dispatch a single-response request, rewriting its paths in place.
     /// The caller must not dispatch the mapped request again.
     pub fn handle_in_place(&mut self, req: &mut Request) -> Response {
+        self.handle_with_copy_progress(req, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn handle_with_copy_progress(
+        &mut self,
+        req: &mut Request,
+        progress: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Response {
         let _handling = self
             .operation
             .span(crate::transfer_observations::Stage::Handling);
@@ -1732,6 +1889,22 @@ impl FsOps {
                         &self.descriptor_session,
                     )
                 }
+            }
+            Request::ConfigurePreservation {
+                selection,
+                sparse,
+                destination,
+            } => {
+                let validation = if *destination {
+                    selection.validate_destination()
+                } else {
+                    selection.validate()
+                };
+                validation.map(|()| {
+                    self.inode_preservation = *selection;
+                    self.sparse = *sparse;
+                    Response::Ok
+                })
             }
             Request::ConfigureHashing(policy) => {
                 self.hash_policy = *policy;
@@ -1846,6 +2019,19 @@ impl FsOps {
             } => self
                 .destination_filesystem_info(*check_empty, target.as_ref())
                 .map(Response::DestinationFilesystemInfo),
+            Request::DefaultPermissions { paths, guard } => paths
+                .iter()
+                .map(|path| {
+                    let target = self.destination_mutation_target(path, guard.as_ref())?;
+                    let directory = target.root.open_metadata(&target.relative)?;
+                    anyhow::ensure!(
+                        directory.metadata()?.is_dir(),
+                        "creation parent is not a directory"
+                    );
+                    crate::inode_metadata::default_permissions(&directory)
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Response::DefaultPermissions),
             Request::PruneLookup { paths, guard } => self
                 .prune_lookup(paths, guard.as_ref())
                 .map(Response::Stats),
@@ -1939,7 +2125,7 @@ impl FsOps {
                     guard.as_ref(),
                     expected_hash.as_ref(),
                 )
-                .map(|_| Response::Ok),
+                .map(publication_response),
             Request::SeedBasis {
                 path,
                 copy_id,
@@ -1978,6 +2164,7 @@ impl FsOps {
                         inplace: *inplace,
                         allow_sequential_nfs_fallback: *allow_sequential_nfs_fallback,
                         allow_sequential_local_fallback: *allow_sequential_local_fallback,
+                        progress,
                     },
                     copy_id,
                     *size,
@@ -1987,11 +2174,21 @@ impl FsOps {
                     CopyLocalOutcome::Copied => Response::Ok,
                     CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
                 }),
-            Request::PutSmallBatch(puts) => Ok(Response::Applied(
-                puts.iter()
-                    .map(|put| self.put_small(put).err().as_ref().map(wire_error))
-                    .collect(),
-            )),
+            Request::PutSmallBatch(puts) => {
+                if puts.iter().any(|p| p.flags & flags::REPORT_IDENTITY != 0) {
+                    Ok(Response::PublishedBatch(
+                        puts.iter()
+                            .map(|put| self.put_small(put).map_err(|e| wire_error(&e)))
+                            .collect(),
+                    ))
+                } else {
+                    Ok(Response::Applied(
+                        puts.iter()
+                            .map(|put| self.put_small(put).err().as_ref().map(wire_error))
+                            .collect(),
+                    ))
+                }
+            }
             Request::HashBlocks {
                 path,
                 source,
@@ -2102,7 +2299,7 @@ impl FsOps {
                         guard: guard.as_ref(),
                     },
                 )
-                .map(|_| Response::Ok),
+                .map(publication_response),
             Request::FileHash {
                 path,
                 source,
@@ -2123,6 +2320,7 @@ impl FsOps {
             Request::BindStream(_)
             | Request::Hello { .. }
             | Request::Scan { .. }
+            | Request::NativeMap(_)
             | Request::NativeRemove { .. }
             | Request::TransportStats
             | Request::Receipt
@@ -2379,7 +2577,9 @@ pub(super) fn timespec(sec: i64, nsec: u32) -> libc::timespec {
 }
 
 pub(crate) fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
-    if flags & (flags::MODE_MASK | flags::OWNER | flags::GROUP | flags::TIMES) == 0 {
+    if flags & (flags::MODE_MASK | flags::OWNER | flags::GROUP | flags::TIMES) == 0
+        && meta.inode_metadata.is_none()
+    {
         return Ok(());
     }
     let current = f.metadata()?;
@@ -2392,13 +2592,51 @@ pub(super) fn set_meta_file_known(
     flags: u8,
     current: &fs::Metadata,
 ) -> Result<()> {
+    set_meta_file_inner(f, meta, flags, current, false)
+}
+
+fn set_meta_file_for_publication(f: &File, meta: &Meta, flags: u8) -> Result<()> {
+    set_meta_file_inner(f, meta, flags, &f.metadata()?, true)
+}
+
+fn set_meta_file_inner(
+    f: &File,
+    meta: &Meta,
+    flags: u8,
+    current: &fs::Metadata,
+    before_publication: bool,
+) -> Result<()> {
     use std::os::unix::io::AsRawFd;
-    // Owner first: chown clears setuid/setgid, so mode must be set afterwards.
+    // macOS mode and ACL must change together. Keep private staging
+    // permissions until publication instead of opening a mode-only window.
+    let atomic_acl_mode = cfg!(target_os = "macos")
+        && meta
+            .inode_metadata
+            .as_ref()
+            .is_some_and(|m| m.macos_acl.is_some());
+    if before_publication
+        && atomic_acl_mode
+        && flags & flags::OWNER != 0
+        && current.uid() != meta.uid
+    {
+        // The final owner may itself be denied read access by the source ACL.
+        // Do not hand that account the staging inode's owner read permission.
+        f.set_permissions(fs::Permissions::from_mode(0o000))?;
+    }
+    // Owner first: chown clears setuid/setgid, so final mode follows it.
     let owner_changed =
         apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
             std::os::unix::fs::fchown(f, uid, gid)
         })?;
-    if flags & flags::MODE_MASK != 0 {
+    #[cfg(debug_assertions)]
+    if before_publication && atomic_acl_mode && owner_changed {
+        test_race_barrier(
+            "SYQ_TEST_ACL_OWNER_READY_FILE",
+            "SYQ_TEST_ACL_OWNER_CONTINUE_FILE",
+            "ACL stage after ownership change",
+        )?;
+    }
+    if flags & flags::MODE_MASK != 0 && !atomic_acl_mode {
         // On network filesystems every setattr is a round trip; skip it when
         // the mode is already right (but always run it after a chown that could
         // have cleared setuid/setgid bits we need to restore).
@@ -2420,7 +2658,15 @@ pub(super) fn set_meta_file_known(
             return Err(io::Error::last_os_error().into());
         }
     }
-    Ok(())
+    if before_publication {
+        crate::inode_metadata::apply_before_publication(
+            f,
+            meta.inode_metadata.as_deref(),
+            meta.mode,
+        )
+    } else {
+        crate::inode_metadata::apply(f, meta.inode_metadata.as_deref(), meta.mode)
+    }
 }
 
 /// Apply only ownership fields whose requested values differ from the
@@ -2459,5 +2705,54 @@ pub(super) fn apply_owner_if_changed(
             Ok(false)
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+// Read from the completed descriptor, never from its mutable published name.
+fn published_identity(file: &File, flags: u8) -> Result<Option<(u64, u64)>> {
+    if flags & flags::REPORT_IDENTITY == 0 {
+        return Ok(None);
+    }
+    let metadata = file.metadata()?;
+    Ok(Some((metadata.dev(), metadata.ino())))
+}
+
+fn publication_response(identity: Option<(u64, u64)>) -> Response {
+    match identity {
+        Some((dev, ino)) => Response::Published { dev, ino },
+        None => Response::Ok,
+    }
+}
+
+/// Report the first partial write promptly, then at most every 100 ms. The
+/// terminal response credits the remainder without a redundant progress frame.
+#[cfg(target_os = "linux")]
+struct CopyProgress<'a> {
+    emit: &'a mut dyn FnMut(u64) -> Result<()>,
+    reported: u64,
+    size: u64,
+    last: std::time::Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> CopyProgress<'a> {
+    fn new(emit: &'a mut dyn FnMut(u64) -> Result<()>, size: u64) -> Self {
+        Self {
+            emit,
+            reported: 0,
+            size,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn advance(&mut self, total: u64) -> Result<()> {
+        if total < self.size
+            && (self.reported == 0 || self.last.elapsed() >= std::time::Duration::from_millis(100))
+        {
+            (self.emit)(total)?;
+            self.reported = total;
+            self.last = std::time::Instant::now();
+        }
+        Ok(())
     }
 }

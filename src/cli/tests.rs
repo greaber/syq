@@ -896,3 +896,62 @@ fn storage_callbacks_preserve_an_explicit_authorizer() {
     assert_eq!(args.stream_mapping_fd, Some(4));
     assert!(matches!(args.auth_from, super::AuthFrom::Return(ref name) if name == "laptop"));
 }
+
+#[test]
+fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
+    let mut archive = Args::try_parse_from(["syq", "-a", "source", "destination"]).unwrap();
+    archive.normalize();
+    assert!(
+        !archive.hardlinks
+            && !archive.acls
+            && !archive.xattrs
+            && archive.atimes == 0
+            && !archive.crtimes
+            && !archive.open_noatime
+            && !archive.sparse
+    );
+    let mut acls = Args::try_parse_from(["syq", "-A", "source", "destination"]).unwrap();
+    acls.normalize();
+    assert!(acls.acls && acls.perms);
+    let native = parse_native_copy(&argv(&[
+        "--preserve=hardlinks,acls,xattrs,atimes,crtimes",
+        "--open-noatime",
+        "--sparse",
+        "source",
+        "--into",
+        "destination",
+    ]))
+    .unwrap();
+    assert!(
+        native.hardlinks
+            && native.acls
+            && native.xattrs
+            && native.perms
+            && native.atimes == 1
+            && native.crtimes
+            && native.open_noatime
+            && native.sparse
+    );
+    for option in [
+        "--preserve=acls",
+        "--preserve=xattrs",
+        "--preserve=atimes",
+        "--preserve=crtimes",
+        "--open-noatime",
+        "--sparse",
+    ] {
+        for route in [
+            vec![option, "--src-fd=0", "--as", "destination"],
+            vec![option, "source", "--to", "s3://bucket", "--into", "prefix"],
+        ] {
+            let error = parse_native_copy(&argv(&route)).expect_err("route must be refused");
+            let message = error.to_string();
+            assert!(
+                message.contains("named filesystem")
+                    || (matches!(option, "--open-noatime" | "--sparse")
+                        && message.contains("not supported")),
+                "{error:#}"
+            );
+        }
+    }
+}

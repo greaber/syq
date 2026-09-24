@@ -235,7 +235,10 @@ fn native_map_contents_emits_identity_parent_first() {
     write(&t.path("src/Berlin/IMG.JPG"), b"img");
     write(&t.path("src/Notes.TXT"), b"hello");
     std::os::unix::fs::symlink("Notes.TXT", t.path("src/Link.TXT")).unwrap();
-    let lines = map_lines(&syq_map_in(&t.path(""), &["--srcs-in", "src"]));
+    let lines = map_lines(&syq_map_in(
+        &t.path(""),
+        &["--srcs-in", "src", "--include", "kind,size,mtime"],
+    ));
     let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
     assert_eq!(dsts, ["Berlin", "Berlin/IMG.JPG", "Link.TXT", "Notes.TXT"]);
     for v in &lines {
@@ -270,7 +273,7 @@ fn native_map_uses_the_common_source_follow_policy() {
 
     let lines = map_lines(&syq_map_in(
         &t.path(""),
-        &["--follow-src", "--srcs-in", "link"],
+        &["--follow-src", "--srcs-in", "link", "--include", "kind"],
     ));
     assert_eq!(lines.len(), 1);
     assert_eq!(map_path(&lines[0], "src"), "file");
@@ -500,10 +503,6 @@ fn native_map_refusals() {
         &["d1", "--into-new", "z"],
         "unexpected argument '--into-new'",
     );
-    refuse(
-        &["d1", "--from", "remotehost"],
-        "unexpected argument '--from'",
-    );
     refuse(&["d1", "--to", "remotehost"], "unexpected argument '--to'");
     refuse(&["d1", "--ignore", "n"], "unexpected argument '--ignore'");
     refuse(
@@ -513,7 +512,7 @@ fn native_map_refusals() {
 }
 
 #[test]
-fn native_map_exposes_only_manifest_shaping_options() {
+fn native_map_exposes_source_and_manifest_options() {
     let help = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["map", "--help-all"])
         .run()
@@ -526,14 +525,22 @@ fn native_map_exposes_only_manifest_shaping_options() {
         .filter(|line| line.starts_with("  -") || line.starts_with("      --"))
         .collect::<Vec<_>>()
         .join("\n");
-    for option in ["--cwd", "--follow", "--src", "--srcs-in", "--as"] {
+    for option in [
+        "--cwd",
+        "--follow",
+        "--src",
+        "--srcs-in",
+        "--as",
+        "--from",
+        "--include",
+        "--s3-endpoint",
+    ] {
         assert!(
             declarations.contains(option),
             "map help omitted {option}:\n{help}"
         );
     }
     for option in [
-        "--from",
         "--to",
         "--into",
         "--into-new",
@@ -1189,7 +1196,10 @@ fn jq(program: &str, args: &[&str], input: &[u8]) -> Output {
 
 fn run_doc_pipeline(t: &Tmp, page: &str, program: &str, jq_args: &[&str], src: &str, dst: &str) {
     assert_documented(page, jq_args, program);
-    let map_out = syq_map_in(&t.path(""), &["--srcs-in", src]);
+    let map_out = syq_map_in(
+        &t.path(""),
+        &["--srcs-in", src, "--include", "kind,size,mtime"],
+    );
     assert!(map_out.status.success());
     let jq_out = jq(program, jq_args, &map_out.stdout);
     assert!(
@@ -1811,4 +1821,46 @@ fn native_mapping_metadata_rejects_unapplied_ownership() {
             );
         }
     }
+}
+
+#[test]
+fn native_map_omits_optional_fields_and_preserves_nested_named_placement() {
+    let t = Tmp::new();
+    write(&t.path("src/photos/image.jpg"), b"image");
+    let output = syq_map_in(&t.path(""), &["-C", "src", "photos/image.jpg"]);
+    let records = map_lines(&output);
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0],
+        serde_json::json!({
+            "src": {"encoding": "utf-8", "value": "photos/image.jpg"},
+            "dst": {"encoding": "utf-8", "value": "image.jpg"}
+        })
+    );
+    let copied = syq_cp_in(
+        &t.path(""),
+        &["-C", "src", "--mapping", "-", "--into", "dst", "-q"],
+        Some(&output.stdout),
+    );
+    assert!(copied.status.success(), "{}", stderr_of(&copied));
+    assert_eq!(read(&t.path("dst/image.jpg")), b"image");
+    let output = syq_map_in(
+        &t.path(""),
+        &["-C", "src", "photos/image.jpg", "--include", "size"],
+    );
+    let records = map_lines(&output);
+    assert_eq!(records[0]["size"], 5);
+    assert!(records[0].get("mtime").is_none());
+    assert!(records[0].get("kind").is_none());
+    let refused = syq_map_in(
+        &t.path(""),
+        &[
+            "-C",
+            "src",
+            "photos/image.jpg",
+            "--include",
+            "s3_last_modified",
+        ],
+    );
+    assert!(!refused.status.success());
 }

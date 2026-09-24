@@ -79,14 +79,14 @@ fn automatic_worker_ceiling_does_not_reserve_hypothetical_descriptors() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn automatic_workers_can_start_above_64_from_the_cache() {
+fn legacy_saved_counts_are_ignored_and_left_untouched() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     let data = prng(5 * 1024 * 1024 + 123, 806);
     for file in ["one", "two"] {
         write(&t.path(&format!("source/{file}")), &data);
     }
-    for (label, limit, expected) in [("default", None, 80), ("capped", Some(72), 72)] {
+    for (label, limit, expected) in [("default", None, 16), ("capped", Some(72), 16)] {
         write(
             &t.path("tuning.json"),
             br#"{"paths":{"local>host|tcp":80}}"#,
@@ -134,14 +134,17 @@ fn automatic_workers_can_start_above_64_from_the_cache() {
             .run()
             .unwrap();
         assert_output_ok(&output);
-        assert!(
-            stderr_of(&output).contains(&format!(
-                "starting with {expected} connections remembered for this path"
-            )),
-            "{output:?}"
+        assert_eq!(
+            read(&t.path("tuning.json")),
+            br#"{"paths":{"local>host|tcp":80}}"#
         );
         let history =
             rusqlite::Connection::open(t.path(&format!("history-{label}.sqlite"))).unwrap();
+        let initial: u32 = history.query_row(
+            "SELECT json_extract(data,'$.data.workers') FROM events WHERE json_extract(data,'$.kind')='starting_count'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(initial, expected);
         let doubling: bool = history.query_row(
             "SELECT json_extract(data,'$.data.policy.startup_doubling') FROM events WHERE json_extract(data,'$.kind')='policy_start' ORDER BY sequence LIMIT 1",
             [], |row| row.get(0),
@@ -159,7 +162,7 @@ fn automatic_workers_can_start_above_64_from_the_cache() {
             .filter(|line| line.starts_with("connected "))
             .map(|line| line.split_whitespace().nth(1).unwrap().parse().unwrap())
             .collect();
-        assert!(ids.iter().any(|&id| id >= 64), "{label}: {observed}");
+        assert!(!ids.is_empty(), "{label}: {observed}");
         if let Some(limit) = limit {
             assert!(ids.iter().all(|&id| id < limit), "{label}: {observed}");
         }
@@ -1471,6 +1474,7 @@ fn copy_local_disk_exdev_uses_parallel_whole_file_workers() {
         }
         let out = command
             .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_COPY_AFTER_PLANNING", "1")
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
             .env("SYQ_TEST_COPY_LOCAL_FS", "local")
             .run()
@@ -1729,7 +1733,7 @@ fn disabling_tuning_cache_also_disables_history() {
 }
 
 #[test]
-fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
+fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() {
     let t = Tmp::new();
     // Exceed both Linux's 64 KiB and macOS's default 4 MiB batching
     // thresholds so the three-worker hint is also the actual starting count.
@@ -1768,12 +1772,32 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
         .query_row("SELECT source_fs FROM runs LIMIT 1", [], |row| row.get(0))
         .unwrap();
     assert!(fs.is_some(), "test filesystem did not provide an identity");
-    db.execute("UPDATE runs SET eligible=1,workers=3", [])
+    // Saved recommendations are misleading; only ordered measurements count.
+    db.execute("UPDATE runs SET eligible=1,workers=99", [])
         .unwrap();
+    db.execute("DELETE FROM measurements WHERE run=1", [])
+        .unwrap();
+    let mut sequence = 0;
+    let mut seed_samples = |workers: usize| {
+        db.execute("UPDATE runs SET eligible=4 WHERE id=1", [])
+            .unwrap();
+        let rate = if workers == 2 { 99.0 } else { 100.0 };
+        for (n, rate) in [(6, 50.0), (workers, rate)] {
+            for _ in 0..2 {
+                sequence += 1;
+                db.execute(
+                    "INSERT INTO measurements VALUES(1,?1,?2,0,?3,2.5,?4,1)",
+                    rusqlite::params![sequence, sequence * 2500000, n as i64, rate],
+                )
+                .unwrap();
+            }
+        }
+    };
+    seed_samples(3);
     let copy_with_hint = |name: &str, controls: &[&str]| {
         // Even these small copies can complete a tuning comparison on a slow
         // host. Keep later results from superseding the seeded run under test.
-        db.execute("UPDATE runs SET eligible=0 WHERE id!=1", [])
+        db.execute("UPDATE runs SET lost=1 WHERE id!=1", [])
             .unwrap();
         copy(name, controls)
     };
@@ -1817,12 +1841,8 @@ fn tuning_history_uses_filesystem_hint_and_honors_explicit_controls() {
     let event: serde_json::Value = serde_json::from_str(&event).unwrap();
     assert_eq!(event["data"]["workers"], 1);
     assert_eq!(event["data"]["reason"], "explicit");
-    // The same count becomes suitable for fine probes only with plateau evidence.
-    db.execute(
-        "UPDATE runs SET summary=json_set(summary,'$.discovery_complete',json('true')) WHERE id=1",
-        [],
-    )
-    .unwrap();
+    // Additional observations, not a saved discovery decision, establish a plateau.
+    seed_samples(2);
     assert_output_ok(&copy_with_hint("confirmed", &[]));
     let workers: i64 = db
         .query_row(
@@ -2033,4 +2053,116 @@ fn local_unchanged_multiple_sources_do_not_start_workers() {
         assert_output_ok(&output);
     }
     assert!(!t.path("worker-events").exists());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn whole_file_progress_reaches_tuner_before_completion() {
+    // Exercise both the in-process destination and the local --server helper.
+    for (native, userspace) in [(true, true), (false, true), (true, false), (false, false)] {
+        let t = Tmp::new();
+        for n in 0..2 {
+            write(&t.path(&format!("src/{n}")), &prng(8 << 20, n));
+        }
+        let mut command = history_command(&t);
+        if native {
+            command.args(["cp", "--srcs-in", &t.s("src"), "--into", &t.s("dst")]);
+        } else {
+            command.args(["rsync", "-a", &t.s("src/"), &t.s("dst/")]);
+        }
+        let continuation = t.path("continue");
+        if userspace {
+            command.env("SYQ_TEST_COPY_LOCAL_EXDEV", "1");
+        } else {
+            // Exercise copy_file_range even on filesystems that can clone.
+            command.env("SYQ_TEST_LOCAL_READ_AHEAD", "1");
+        }
+        let mut child = command
+            .arg("--no-progress")
+            .env("SYQ_TEST_TUNE_SAMPLE_MS", "50")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+            .env("SYQ_TEST_COPY_LOCAL_WRITTEN_FILE", t.path("ready"))
+            .env("SYQ_TEST_COPY_LOCAL_CONTINUE_FILE", &continuation)
+            .env("SYQ_TEST_OVERLAP_READY", t.path("ready"))
+            .env("SYQ_TEST_OVERLAP_CONTINUE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let mut next_report = std::time::Duration::from_secs(1);
+        let mut observed = false;
+        // Observe a flushed sample while both writers are blocked after 1 MiB.
+        // Release the writers before asserting, even if the evidence is missing.
+        while start.elapsed() < std::time::Duration::from_secs(10) {
+            if let Ok(db) = rusqlite::Connection::open_with_flags(
+                t.path("history.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                observed = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE json_extract(data,'$.kind')='sample' AND json_extract(data,'$.data.cumulative_bytes')=2097152 AND json_extract(data,'$.data.cumulative_files')=0)",
+                    [], |row| row.get::<_, bool>(0),
+                ).unwrap_or(false);
+            }
+            if observed || child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if start.elapsed() >= next_report {
+                eprintln!(
+                    "waiting for in-flight copy progress (native={native}, userspace={userspace}, observed={observed})"
+                );
+                next_report += std::time::Duration::from_secs(1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        write(&continuation, b"continue");
+        let out = child.wait_with_output().unwrap();
+        assert_output_ok(&out);
+        assert!(
+            observed,
+            "no in-flight progress with native={native}, userspace={userspace}: {out:?}"
+        );
+        assert_same_tree(&t.path("src"), &t.path("dst"));
+        let db = rusqlite::Connection::open(t.path("history.sqlite")).unwrap();
+        let bytes: i64 = db
+            .query_row(
+                "SELECT json_extract(summary,'$.bytes') FROM runs",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, 16 << 20, "progress was credited twice");
+    }
+}
+
+/// Seed ordered measurements under the context established by a real
+/// command. Tests must not depend on the implementation of opaque route tokens.
+pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) {
+    let db = rusqlite::Connection::open(cache.with_extension("history-v1.sqlite")).unwrap();
+    let id: i64 = db
+        .query_row("SELECT max(id) FROM runs", [], |r| r.get(0))
+        .unwrap();
+    db.execute("DELETE FROM events WHERE run=?1", [id]).unwrap();
+    db.execute("DELETE FROM measurements WHERE run=?1", [id])
+        .unwrap();
+    db.execute(
+        "UPDATE runs SET status='success',eligible=4,workers=NULL,lost=0 WHERE id=?1",
+        [id],
+    )
+    .unwrap();
+    for (i, (n, rate)) in [
+        (workers, 100.0),
+        (workers, 100.0),
+        (workers + 1, 50.0),
+        (workers + 1, 50.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        db.execute(
+            "INSERT INTO measurements VALUES(?1,?2,?3,0,?4,2.5,?5,1)",
+            rusqlite::params![id, i as i64, (i as i64 + 1) * 2500000, n as i64, rate],
+        )
+        .unwrap();
+    }
 }

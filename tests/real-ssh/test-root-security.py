@@ -4,6 +4,7 @@ import ctypes
 import os
 from pathlib import Path
 import signal
+import struct
 import subprocess
 import tempfile
 import time
@@ -95,6 +96,45 @@ def main():
             run(["syq", "clean-partials", str(root)])
             assert not partial.exists()
             print(f"Foreign-owned partial refused; requested ownership preserved: {interface}", flush=True)
+
+        # Only this disposable root runner may exercise privileged namespaces.
+        archive = root / "archive-source"
+        archive.mkdir()
+        file = archive / "executable"
+        file.write_bytes(b"privileged metadata fixture")
+        os.link(file, archive / "alias")
+        os.chown(file, 1000, 1000)
+        file.chmod(0o6750)
+        capability = struct.pack("<IIIII", 0x02000001, 1 << 10, 0, 0, 0)
+        os.setxattr(file, "security.capability", capability)
+        os.setxattr(file, "user.binary", b"\x00\xffcapability")
+        for options in [[], ["--inplace"], ["--performance-tuning=copy-path=ranges"]]:
+            target = root / ("archive-" + str(len(list(root.glob("archive-*")))))
+            command = ["syq", "rsync", "-aHAX", "--numeric-ids", *options, str(archive) + "/", str(target) + "/"]
+            run(command)
+            run(command)
+            for name in ["executable", "alias"]:
+                copied = target / name
+                assert copied.read_bytes() == file.read_bytes()
+                assert (copied.stat().st_uid, copied.stat().st_gid) == (1000, 1000)
+                assert copied.stat().st_mode & 0o7777 == 0o6750
+                assert os.getxattr(copied, "security.capability") == os.getxattr(file, "security.capability")
+                assert os.getxattr(copied, "user.binary") == b"\x00\xffcapability"
+            assert (target / "executable").stat().st_ino == (target / "alias").stat().st_ino
+        print("Privileged xattrs, ownership and set-ID ordering passed", flush=True)
+
+        # A reader without ownership/CAP_FOWNER must warn and copy normally.
+        root.chmod(0o755)
+        foreign = root / "noatime-foreign"
+        foreign.write_bytes(b"readable by another user")
+        foreign.chmod(0o644)
+        target = root / "noatime-user"
+        target.mkdir()
+        os.chown(target, 1000, 1000)
+        result = run(["runuser", "-u", "syq", "--", "syq", "cp", "--open-noatime", "--preserve=atimes", str(foreign), "--as", str(target / "copied")], capture_output=True, text=True)
+        assert "--open-noatime unavailable" in result.stderr, result.stderr
+        assert (target / "copied").read_bytes() == foreign.read_bytes()
+        print("Nonowner no-atime reads warn and complete", flush=True)
 
         selected = root / "typed-link"
         destination = root / "typed-link-copy"

@@ -32,6 +32,7 @@ use std::sync::Mutex;
 
 mod diagnostics;
 mod dry_run;
+mod hardlinks;
 mod planner;
 mod worker;
 
@@ -116,9 +117,14 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
 }
 
 pub struct Opts {
+    pub expressions: crate::expression::Policy,
     pub hash_policy: crate::hashing::HashPolicy,
     pub mapping_metadata: std::collections::HashMap<PathBytes, crate::mapping::Metadata>,
     pub mapping_expected_hashes: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
+    // Installed only for mapping assertions on hardlinked files, before those
+    // representatives enter the queue. Ordinary files keep their original path.
+    hardlink_expected_hashes:
+        std::sync::OnceLock<std::collections::HashMap<PathBytes, crate::hashing::ExpectedHashes>>,
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
@@ -128,6 +134,11 @@ pub struct Opts {
     pub recursive: bool,
     pub links: bool,
     pub perms: bool,
+    pub rsync_creation: bool,
+    pub hardlinks: bool,
+    pub sparse: bool,
+    pub inode_preservation: crate::inode_metadata::Selection,
+    hardlink_completions: Mutex<std::collections::HashMap<usize, Option<(u64, u64)>>>,
     pub devices: bool,
     pub checksum: bool,
     pub precise_mtime: bool,
@@ -172,6 +183,9 @@ impl Opts {
         let mut meta = source.meta();
         if let Some(metadata) = self.mapping_metadata.get(path) {
             metadata.apply(&mut meta);
+            if let Some(inode) = &mut meta.inode_metadata {
+                inode.resolve_mode(meta.mode);
+            }
         }
         meta
     }
@@ -182,6 +196,11 @@ impl Opts {
                 .mapping_metadata
                 .get(path)
                 .map_or(0, |m| m.apply_flags())
+    }
+
+    fn inode_metadata_differs(&self, path: &[u8], source: &Entry, destination: &Entry) -> bool {
+        source.inode_metadata.is_some()
+            && self.metadata_for(path, source).inode_metadata != destination.inode_metadata
     }
 
     fn metadata_fix_flags(&self, path: &[u8], source: &Entry, destination: &Entry) -> u8 {
@@ -232,6 +251,29 @@ impl Opts {
     fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
         self.mapping_expected_hashes.get(path)
     }
+    fn group_expected(
+        &self,
+        job: &crate::sched::FileJobData,
+    ) -> Option<&crate::hashing::ExpectedHashes> {
+        if !self.hardlinks {
+            return None;
+        }
+        self.hardlink_expected_hashes.get()?.get(&job.rel_bytes)
+    }
+
+    fn expected_hashes_for(
+        &self,
+        job: &crate::sched::FileJobData,
+    ) -> Option<crate::hashing::ExpectedHashes> {
+        self.group_expected(job)
+            .cloned()
+            .or_else(|| self.expected_for(&job.rel_bytes).cloned().map(Into::into))
+    }
+
+    fn has_expected_for(&self, job: &crate::sched::FileJobData) -> bool {
+        self.group_expected(job).is_some() || self.expected_for(&job.rel_bytes).is_some()
+    }
+
     fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
         crate::copy_policy::CopyPolicy {
             same_host: self.same_host,
@@ -359,7 +401,38 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
             transfer_hash_type: args.transfer_hash_type,
         },
     )?;
+    configure_preservation(
+        &mut *connection,
+        crate::inode_metadata::Selection {
+            acls: args.acls,
+            xattrs: args.xattrs,
+            atimes: args.atimes > 0,
+            crtimes: args.crtimes,
+            open_noatime: args.open_noatime || args.atimes > 1,
+        },
+        args.sparse,
+        false,
+    )?;
     Ok(connection)
+}
+
+fn configure_preservation(
+    connection: &mut dyn Conn,
+    selection: crate::inode_metadata::Selection,
+    sparse: bool,
+    destination: bool,
+) -> Result<()> {
+    if selection.any() || selection.open_noatime || sparse {
+        ok(
+            connection.call(Request::ConfigurePreservation {
+                selection,
+                sparse,
+                destination,
+            })?,
+            "configure inode metadata preservation",
+        )?;
+    }
+    Ok(())
 }
 
 fn configure_hashing(connection: &mut dyn Conn, policy: crate::hashing::HashPolicy) -> Result<()> {
@@ -464,6 +537,13 @@ fn small_copy_eligible(
         && args.restricted_grant.is_none()
         && !args.dry_run
         && !args.inplace
+        && !args.acls
+        && !args.xattrs
+        && args.atimes == 0
+        && !args.crtimes
+        && !args.open_noatime
+        && !args.sparse
+        && !args.hardlinks
         && !args.delete
         && !args.update
         && !args.checksum
@@ -473,6 +553,7 @@ fn small_copy_eligible(
         && args.files_from.is_none()
         && args.native_mapping.is_none()
         && args.ignore_lines.is_empty()
+        && !args.expressions.active()
         && args.bwlimit_bytes == 0
         && args.max_size.is_none()
         && args.min_size.is_none()
@@ -1409,6 +1490,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .collect()
             })
             .unwrap_or_default(),
+        hardlink_expected_hashes: Default::default(),
         mapping_expected_hashes: mapping_entries
             .as_ref()
             .map(|(entries, _)| {
@@ -1433,6 +1515,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         recursive: args.recursive,
         links: args.links,
         perms: args.perms,
+        rsync_creation: args.interface == Interface::Rsync,
+        hardlinks: args.hardlinks,
+        sparse: args.sparse,
+        inode_preservation: crate::inode_metadata::Selection {
+            acls: args.acls,
+            xattrs: args.xattrs,
+            atimes: args.atimes > 0,
+            crtimes: args.crtimes,
+            open_noatime: args.open_noatime || args.atimes > 1,
+        },
+        hardlink_completions: Mutex::new(Default::default()),
         devices: args.devices,
         checksum: args.checksum,
         precise_mtime: !matches!(args.placement, Placement::Rsync),
@@ -1451,6 +1544,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         delete: args.delete,
         delete_excluded: args.delete_excluded,
         max_delete: args.max_delete,
+        expressions: args.expressions.clone(),
         update: args.update,
         ignore_existing: args.ignore_existing,
         preserve_existing_directory_metadata: args.only_new_native_entries(),
@@ -1499,6 +1593,31 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     };
+    let platform = |endpoint: &Endpoint| -> Result<String> {
+        match endpoint {
+            Endpoint::Remote(spec) => Ok(spec
+                .diagnostics()
+                .peer
+                .context("handshake did not report metadata platform")?
+                .platform),
+            Endpoint::Local { .. } => Ok(crate::identity::platform()),
+        }
+    };
+    let destination_metadata_platform =
+        if opts.inode_preservation.acls || opts.inode_preservation.xattrs {
+            platform(&dst_ep)?
+        } else {
+            String::new()
+        };
+    if opts.inode_preservation.acls {
+        crate::inode_metadata::validate_acl_platforms(
+            &platform(&src_ep)?,
+            &destination_metadata_platform,
+        )?;
+    }
+    if opts.inode_preservation.crtimes {
+        configure_preservation(&mut *dst_ctl, opts.inode_preservation, opts.sparse, true)?;
+    }
     if debug() {
         crate::output::diagnostic!(
             "syq: control connections up in {:.2}s",
@@ -1707,7 +1826,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                 )?,
                             ))
                         });
-                    let (src, dst) = match conns {
+                    let (mut src, mut dst) = match conns {
                         Ok(conns) => conns,
                         Err(error)
                             if crate::conn::is_tcp_congestion_error(&error)
@@ -1743,6 +1862,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             continue;
                         }
                     };
+                    configure_preservation(&mut *src, opts.inode_preservation, opts.sparse, false)?;
+                    configure_preservation(&mut *dst, opts.inode_preservation, opts.sparse, true)?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let mut worker = Worker {
                         id,
@@ -2227,10 +2348,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             logical_bytes: 0,
             objects: 0,
             overflowed: false,
+            hardlink_inodes: Default::default(),
         })
     });
     let defer_destination_mutations =
-        multiple_distinct_sources || (fresh_capacity.is_some() && !args.dry_run);
+        args.hardlinks || multiple_distinct_sources || (fresh_capacity.is_some() && !args.dry_run);
     // Native new/existing forms are intentionally only the lightweight
     // pathname checks above. Once they pass, use the ordinary engine's target
     // conditions and publication behavior; this adapter does not add an
@@ -2426,7 +2548,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             } else {
                 TargetCondition::Any
             };
-            directory_selection = Some(create_operator_directory(&mut *dst_ctl, condition)?);
+            directory_selection = Some(create_operator_directory(
+                &mut *dst_ctl,
+                condition,
+                opts.rsync_creation,
+            )?);
         }
         if let Some(selection) = directory_selection.take() {
             let anchor = match prepared_anchor.take() {
@@ -2555,14 +2681,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let tuning_key = (autotune && args.tuning_options.is_none())
             .then(|| tune::network_path_key(&src_ep, &dst_ep))
             .flatten();
-        let remembered_start = tuning_key
-            .as_deref()
-            .and_then(tune::cached)
-            .map(|remembered| remembered.min(args.automatic_worker_limit()));
-        if let Some(remembered) = remembered_start {
-            args.connections = remembered;
-            gate.set_active(remembered);
-        }
         let mut selected_history = None;
         if let Some(history) = progress.tuning_history.get() {
             let key = tune::history::context_key(
@@ -2587,15 +2705,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 "destination_type":destination_filesystem.as_ref().map(|fs|&fs.kind)}),
             );
             let hint = (autotune && args.tuning_options.is_none())
-                .then(|| history.hint(&key, src_ep.is_remote() || dst_ep.is_remote()))
+                .then(|| history.starting_count(&key, src_ep.is_remote() || dst_ep.is_remote()))
                 .flatten();
             if let Some(hint) = &hint {
                 args.connections = hint.workers.min(args.automatic_worker_limit());
                 gate.set_active(args.connections);
             }
             history.event("starting_count", serde_json::json!({"workers":args.connections,
-                "reason":if hint.is_some() {"history"} else if remembered_start.is_some() {"legacy_cache"} else if autotune {"default"} else {"explicit"},
-                "hint":hint,"legacy_workers":remembered_start}));
+                "reason":if hint.is_some() {"history"} else if autotune {"default"} else {"explicit"},
+                "hint":hint}));
             selected_history = hint;
             *history_context.borrow_mut() = Some(key);
         }
@@ -2616,10 +2734,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     args.connections,
                     hint.run,
                     hint.matched
-                );
-            } else if let Some(remembered) = remembered_start {
-                crate::output::diagnostic!(
-                    "syq: auto-tuning: starting with {remembered} connections remembered for this path"
                 );
             }
         }
@@ -2659,14 +2773,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let ticker = progress.spawn_ticker();
 
     let mut st = Planner {
+        default_permissions: Default::default(),
         dst: &mut *dst_ctl,
         sched: &sched,
         progress: &progress,
         opts: &opts,
         destination_supports_confined_socket_nodes,
+        destination_metadata_platform,
         destination_tree_known_missing,
         destination_children_known_missing: opts.same_host
             && fresh_destination
+            && opts.expressions.update.is_none()
             && !opts.existing
             && !opts.ignore_existing
             && !opts.update
@@ -2676,6 +2793,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),
+        unselected_dirs: Default::default(),
+        directory_expression_sources: Default::default(),
         payload_paths: std::collections::HashMap::new(),
         sidecar_paths: std::collections::HashMap::new(),
         unusable_files: std::collections::HashSet::new(),
@@ -2737,6 +2856,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             changes
         },
         active_source: None,
+        hardlinks: Default::default(),
     };
 
     let mut scan_err = None;
@@ -2839,7 +2959,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if transport_setup.is_none() {
         transport_setup = Some(finish_transport_setup(&mut args)?);
     }
-    let (all_remote_endpoints_use_tcp, tuning_key, refine_start) =
+    let (all_remote_endpoints_use_tcp, _tuning_key, refine_start) =
         transport_setup.expect("transport setup completed before releasing planned work");
     // The complete buffered scan lets small trees keep the same bounded
     // starting count as normal scheduling. Open TCP workers while the control
@@ -2898,7 +3018,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // checks. A local tree can now copy earlier batches while subsequent
         // batches prepare their directories and destination metadata. Preserve
         // the single-file offload path and the existing bounded small-tree start.
+        // Hardlink groups are validated across replay batches; their payloads
+        // must wait until every eligible alias's metadata has been checked.
         let local_start = if opts.same_host
+            && !opts.hardlinks
             && st.fresh_capacity.is_some()
             && !workers_started
             && !opts.dry_run
@@ -3159,6 +3282,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if opts.dry_run {
         st.flush_dry_directory_traces();
     }
+    if !aborted && scan_err.is_none() && !collision {
+        if let Err(error) = st.complete_hardlinks(&mut *src_ctl) {
+            progress.error(&format!("syq: hardlink preservation: {error:#}"));
+        }
+    }
     sched.clear_finished_work();
     let mut deleted = 0u64;
     let mut delete_plan = if opts.delete {
@@ -3350,54 +3478,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         deletions_blocked,
     };
 
-    if !aborted
-        && errors == 0
-        && !opts.dry_run
-        && scan_err.is_none()
-        && !collision
-        // A capped run can use an unrestricted hint, but cannot replace it.
-        && args
-            .resource_limits
-            .as_ref()
-            .is_none_or(|limits| limits.workers.is_none())
-    {
-        if let Some(policy) = tuned.as_ref().filter(|policy| policy.measured()) {
-            if args.tuning_options.is_none() {
-                if let (Some(history), Some(initial)) = (
-                    progress.tuning_history.get(),
-                    history_context.borrow().as_ref(),
-                ) {
-                    let final_key = tune::history::context_key(
-                        history,
-                        &src_ep,
-                        &dst_ep,
-                        source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
-                        destination_filesystem
-                            .as_ref()
-                            .map(|fs| fs.identity.as_str()),
-                        initial.mode.clone(),
-                    );
-                    if initial.route == final_key.route {
-                        history.recommend(policy.recommended(), policy.discovery_complete());
-                    }
-                }
-            }
-            // A TCP failure affects later connections but leaves earlier TCP
-            // workers alive, so a changed key means the measurements may mix
-            // transports. Such a run is useful live evidence but not a safe
-            // hint for either future pure path. A changed network context also
-            // invalidates the starting key.
-            if let Some(initial_key) = tuning_key.as_deref() {
-                let final_key = tune::network_path_key(&src_ep, &dst_ep);
-                if final_key.as_deref() == Some(initial_key) {
-                    tune::remember(initial_key, policy.recommended());
-                } else if debug() {
-                    crate::output::diagnostic!(
-                        "syq: auto-tuning: transport or network context changed during transfer; not updating cache"
-                    );
-                }
-            }
-        }
+    if let (Some(history), Some(initial)) = (
+        progress.tuning_history.get(),
+        history_context.borrow().as_ref(),
+    ) {
+        let final_key = tune::history::context_key(
+            history,
+            &src_ep,
+            &dst_ep,
+            source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
+            destination_filesystem
+                .as_ref()
+                .map(|fs| fs.identity.as_str()),
+            initial.mode.clone(),
+        );
+        history.event(
+            "learning_context",
+            serde_json::json!({
+                "consistent":initial.route == final_key.route,
+                "automatic":autotune && args.tuning_options.is_none()
+            }),
+        );
     }
 
     let elapsed = progress.start.elapsed().as_secs_f64();
@@ -3511,7 +3612,7 @@ struct RangeReplyMismatch;
 
 impl std::fmt::Display for RangeReplyMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("source range reply violates the protocol")
+        f.write_str("transfer reply violates the protocol")
     }
 }
 
@@ -3570,6 +3671,28 @@ fn stat_many_registered(
     )? {
         Response::Stats(v) => Ok(v),
         other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn default_permissions(
+    conn: &mut dyn Conn,
+    mut paths: Vec<PathBytes>,
+    guard: Option<ContainerGuard>,
+) -> Result<Vec<u32>> {
+    if paths.len() > 1 && paths.iter().map(|p| p.len() + 8).sum::<usize>() > SOURCE_BATCH_PATH_BYTES
+    {
+        let tail = paths.split_off(paths.len() / 2);
+        let mut modes = default_permissions(conn, paths, guard.clone())?;
+        modes.extend(default_permissions(conn, tail, guard)?);
+        return Ok(modes);
+    }
+    let count = paths.len();
+    match ok(
+        conn.call(Request::DefaultPermissions { paths, guard })?,
+        "read destination creation permissions",
+    )? {
+        Response::DefaultPermissions(modes) if modes.len() == count => Ok(modes),
+        other => bail!("unexpected creation permissions response {other:?}"),
     }
 }
 
@@ -3653,6 +3776,7 @@ fn mkdir_root_batches(
         batches.push(vec![Op::SetMeta {
             path: dst_root.to_vec(),
             meta: Meta {
+                inode_metadata: None,
                 mode: 0o755,
                 uid: 0,
                 gid: 0,
@@ -3820,10 +3944,11 @@ fn register_source_roots(
 fn create_operator_directory(
     conn: &mut dyn Conn,
     condition: TargetCondition,
+    rsync_creation: bool,
 ) -> Result<DirectoryAnchor> {
     match ok(
         conn.call(Request::CreateOperatorDirectory {
-            mode: 0o755,
+            mode: if rsync_creation { 0o777 } else { 0o755 },
             require_absent: condition == TargetCondition::Absent,
         })?,
         "create destination directory",
@@ -4134,7 +4259,8 @@ fn special_creation_supported(destination_supports_sockets: bool, kind: Kind) ->
 }
 
 fn metadata_differs(source: &Meta, destination: &Meta, flags: u8) -> bool {
-    (flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777)
+    (source.inode_metadata.is_some() && source.inode_metadata != destination.inode_metadata)
+        || (flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777)
         || (flags & flags::OWNER != 0 && source.uid != destination.uid)
         || (flags & flags::GROUP != 0 && source.gid != destination.gid)
         || (flags & flags::TIMES != 0
@@ -4255,6 +4381,7 @@ struct FreshCapacityPlan {
     logical_bytes: u64,
     objects: u64,
     overflowed: bool,
+    hardlink_inodes: std::collections::HashSet<(u64, u64)>,
 }
 
 fn fresh_capacity_error(capacity: FreshCapacityAssessment) -> anyhow::Error {

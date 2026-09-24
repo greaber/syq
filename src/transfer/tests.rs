@@ -110,7 +110,9 @@ impl Conn for PipelineConn {
         if let Some(latency) = state.latency {
             state.ready.push_back(std::time::Instant::now() + latency);
         }
-        state.max_pending = state.max_pending.max(state.requests.len() - state.received);
+        state.max_pending = state
+            .max_pending
+            .max(state.requests.len().saturating_sub(state.received));
         Ok(())
     }
     fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
@@ -222,6 +224,7 @@ fn pipeline_worker(
         hash_policy: Default::default(),
         mapping_metadata: Default::default(),
         mapping_expected_hashes: Default::default(),
+        hardlink_expected_hashes: Default::default(),
         block: 512,
         tuning: crate::transfer_tuning::TransferTuning {
             copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
@@ -233,6 +236,11 @@ fn pipeline_worker(
         recursive: true,
         links: false,
         perms: false,
+        rsync_creation: false,
+        hardlinks: false,
+        sparse: false,
+        inode_preservation: Default::default(),
+        hardlink_completions: Mutex::new(Default::default()),
         devices: false,
         checksum: false,
         precise_mtime: true,
@@ -251,6 +259,7 @@ fn pipeline_worker(
         delete: false,
         delete_excluded: false,
         max_delete: None,
+        expressions: Default::default(),
         update: false,
         ignore_existing: false,
         preserve_existing_directory_metadata: false,
@@ -697,7 +706,7 @@ fn whole_file_groups_overlap_and_drain_both_endpoint_windows() {
                 );
                 if !worker.transport_dead() {
                     assert!(
-                        results[..2].iter().all(|r| matches!(r, Some(Ok(())))),
+                        results[..2].iter().all(|r| matches!(r, Some(Ok(_)))),
                         "earlier acknowledged files survive {failure}: {results:?}"
                     );
                     assert!(
@@ -1131,7 +1140,7 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
         worker
             .transfer_small_batches(&jobs, (0..8).map(|i| i..i + 1), &mut results)
             .unwrap();
-        assert!(results.iter().all(|r| matches!(r, Some(Ok(())))));
+        assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
         assert_eq!(src.lock().unwrap().sent_at_receive, expected);
     }
 }
@@ -1155,7 +1164,7 @@ fn empty_file_groups_need_no_source_reads() {
     worker
         .transfer_small_batches(&jobs, std::iter::once(0..2), &mut results)
         .unwrap();
-    assert!(results.iter().all(|r| matches!(r, Some(Ok(())))));
+    assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
     assert!(src.lock().unwrap().requests.is_empty());
     let destination = dst.lock().unwrap();
     let [Request::PutSmallBatch(puts)] = destination.requests.as_slice() else {
@@ -1672,6 +1681,7 @@ fn existing_destination_setup_replays_on_v032_receiver() {
 #[test]
 fn fresh_capacity_keeps_a_sixty_four_inode_margin() {
     let assessment = |objects, available_inodes| FreshCapacityAssessment {
+        check_bytes: true,
         logical_bytes: 0,
         objects,
         available_bytes: 0,
@@ -2115,5 +2125,67 @@ fn dry_run_hash_errors_drain_both_endpoints_without_writes() {
                 [Request::FileHash { .. }]
             ));
         }
+    }
+}
+
+#[test]
+fn local_copy_progress_is_live_but_failure_retracts_completion_credit() {
+    for failure in ["none", "error", "disconnect", "regression", "oversize"] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        sched.push_file(pipeline_job(b"source", 4096));
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        let src = Arc::new(Mutex::new(PipelineState::default()));
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        {
+            let mut state = dst.lock().unwrap();
+            state.progress = Some(worker.progress.clone());
+            state.replies.extend([
+                Response::CopyLocalProgress(1024),
+                Response::CopyLocalProgress(match failure {
+                    "regression" => 512,
+                    "oversize" => 4097,
+                    _ => 2048,
+                }),
+                if failure == "error" {
+                    Response::Err("injected copy failure".into())
+                } else {
+                    Response::Ok
+                },
+                Response::Ok, // finalize
+            ]);
+            if failure == "disconnect" {
+                state.fail_receive = Some(3);
+            }
+        }
+        let job = worker.job(0);
+        src.lock()
+            .unwrap()
+            .replies
+            .push_back(Response::Stats(vec![Some(job.entry.clone())]));
+        let result = worker.try_copy_local(0, &job);
+        assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
+        assert_eq!(dst.lock().unwrap().progress_at_receive[1], (1024, 0));
+        assert_eq!(
+            worker.progress.bytes_done.load(Relaxed),
+            if failure == "none" { 4096 } else { 0 }
+        );
+        assert_eq!(
+            job.done.load(Relaxed),
+            if failure == "none" { 4096 } else { 0 }
+        );
+        if matches!(failure, "regression" | "oversize") {
+            assert!(result.unwrap_err().is::<RangeReplyMismatch>());
+        }
+        assert_eq!(
+            dst.lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|r| matches!(r, Request::Finalize { .. }))
+                .count(),
+            usize::from(failure == "none")
+        );
     }
 }

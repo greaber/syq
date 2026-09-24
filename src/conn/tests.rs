@@ -343,29 +343,7 @@ fn remote_vector_replies_must_match_request_counts() {
             ),
         ];
         for (request, response) in cases {
-            let mut bytes = Vec::new();
-            let mut writer = FrameWriter::new(&mut bytes, false);
-            writer.write_msg(&hello_ok()).unwrap();
-            writer.write_msg(&response).unwrap();
-            drop(writer);
-            let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(bytes)), 4);
-            let mut conn = RemoteConn {
-                observation: Default::default(),
-                child: None,
-                w: FrameWriter::new(Box::new(std::io::sink()), false),
-                rx: Some(rx),
-                reader: Some(reader),
-                label: "hostile vector reply".into(),
-                dead: false,
-                rpc_observation: None,
-                write_stream: None,
-                peer: None,
-                tcp_socket: None,
-                named_socket: None,
-                multiplexed_ssh: false,
-                detached: false,
-            };
-            conn = receive_hello(conn, false).unwrap();
+            let mut conn = connection_replaying(&[response]);
             let result = conn.call(request);
             if count == 1 {
                 assert!(result.is_ok());
@@ -1249,6 +1227,9 @@ fn entry(path: &[u8]) -> Entry {
         dev: 0,
         ino: 0,
         ctime: 0,
+        atime: Default::default(),
+        inode_metadata: None,
+        nlink: 1,
         ctime_nsec: 0,
         link: None,
     }
@@ -1980,4 +1961,73 @@ fn overlay_addresses_are_recognized_in_both_families() {
     assert!(!is_overlay_address("fdaa:0:1:a7b::2"));
     assert!(!is_overlay_address("192.168.1.2"));
     assert!(!is_overlay_address("gpu01.example.net"));
+}
+
+fn connection_replaying(responses: &[Response]) -> RemoteConn {
+    let mut bytes = Vec::new();
+    let mut writer = FrameWriter::new(&mut bytes, false);
+    writer.write_msg(&hello_ok()).unwrap();
+    for response in responses {
+        writer.write_msg(response).unwrap();
+    }
+    drop(writer);
+    let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(bytes)), 4);
+    let conn = RemoteConn {
+        observation: Default::default(),
+        child: None,
+        w: FrameWriter::new(Box::new(std::io::sink()), false),
+        rx: Some(rx),
+        reader: Some(reader),
+        label: "hostile vector reply".into(),
+        dead: false,
+        rpc_observation: None,
+        write_stream: None,
+        peer: None,
+        tcp_socket: None,
+        named_socket: None,
+        multiplexed_ssh: false,
+        detached: false,
+    };
+    receive_hello(conn, false).unwrap()
+}
+
+#[test]
+fn fragmented_metadata_replies_preserve_counts_and_errors() {
+    let request = || Request::StatMany {
+        paths: vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()],
+        sources: None,
+        follow: false,
+        guard: None,
+    };
+    let mut conn = connection_replaying(&[
+        Response::StatsMore(vec![None]),
+        Response::StatsMore(vec![None]),
+        Response::Stats(vec![None]),
+    ]);
+    assert!(
+        matches!(conn.call(request()).unwrap(), Response::Stats(entries) if entries.len() == 3)
+    );
+    for replies in [
+        vec![Response::StatsMore(vec![])],
+        vec![Response::StatsMore(vec![None; 3])],
+        vec![
+            Response::StatsMore(vec![None]),
+            Response::Stats(vec![None; 3]),
+        ],
+        vec![Response::StatsMore(vec![None]), Response::Stats(vec![])],
+        vec![Response::StatsMore(vec![None]), Response::Ok],
+        vec![Response::StatsMore(vec![None])],
+    ] {
+        assert!(connection_replaying(&replies).call(request()).is_err());
+    }
+    let mut conn = connection_replaying(&[
+        Response::StatsMore(vec![None]),
+        Response::Err("read ACL failed".into()),
+    ]);
+    assert!(
+        matches!(conn.call(request()).unwrap(), Response::Err(error) if error == "read ACL failed")
+    );
+    assert!(connection_replaying(&[Response::StatsMore(vec![None])])
+        .call(Request::Shutdown)
+        .is_err());
 }

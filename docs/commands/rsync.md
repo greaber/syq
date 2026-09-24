@@ -26,8 +26,15 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-r, --recursive` | Recurse into directories |
 | `-l, --links` | Copy symlinks as symlinks |
 | `--insecure-links` | Follow symlinks in this machine's rsync operator paths regardless of ownership (local only, as in rsync) |
+| `-H, --hard-links` | Preserve hard links between selected regular files |
+| `-A, --acls` | Preserve POSIX access and default ACLs; implies permissions |
+| `-X, --xattrs` | Preserve extended attributes in the selected privilege namespaces |
 | `-p, --perms` | Preserve permissions |
 | `-t, --times` | Preserve modification times |
+| `-U, --atimes...` | Preserve access times; repeat to request source no-atime reads |
+| `-N, --crtimes` | Preserve birth (creation) times; requires a macOS destination |
+| `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
+| `-S, --sparse` | Turn written zero ranges into sparse holes |
 | `-g, --group` | Preserve group |
 | `-o, --owner` | Preserve owner (root only) |
 | `-D` | Preserve device and special files |

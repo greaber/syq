@@ -50,7 +50,7 @@ def main():
     timeout = float(os.environ.get('SYQ_S3_TEST_TIMEOUT', '1800'))
     if timeout <= 0 or not math.isfinite(timeout):
         raise ValueError('SYQ_S3_TEST_TIMEOUT must be positive and finite')
-    groups = [['fast'], ['check', 'selection', 'remove', 'prune',
+    groups = [['fast'], ['check', 'selection', 'expressions', 'remove', 'prune',
                          'fast-provider', 'streams', 'server-copy', 'listing', 'enumeration']]
     children = []
     started = time.monotonic()

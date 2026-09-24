@@ -169,6 +169,16 @@ pub(crate) fn copy(args: &mut crate::cli::Args) -> Result<()> {
     }
     let selection = select_copy(args)?;
     if let Some(selection) = &selection {
+        if args.hardlinks
+            || args.acls
+            || args.xattrs
+            || args.atimes > 0
+            || args.crtimes
+            || args.open_noatime
+            || args.sparse
+        {
+            bail!("hardlink, ACL, xattr, access-time and birth-time preservation, no-atime reads and sparse allocation are not supported by named or receiving destinations");
+        }
         maybe_exec(selection)?;
     } else if ACCEPTED.get().is_some() {
         bail!("return route disappeared during handoff; retry the command");

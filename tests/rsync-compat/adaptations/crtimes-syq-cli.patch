@@ -1,0 +1,12 @@
+--- a/testsuite/crtimes_test.py
++++ b/testsuite/crtimes_test.py
+@@ -12,9 +12,6 @@
+ from rsyncfns import FROMDIR, TODIR, checkit, run_rsync, test_skipped
+ 
+ 
+-vv = run_rsync('-VV', check=True, capture_output=True)
+-if '"crtimes": true' not in vv.stdout:
+-    test_skipped("Rsync is configured without crtimes support")
+ 
+ FROMDIR.mkdir(parents=True, exist_ok=True)
+ (FROMDIR / 'foo').write_text("hiho\n")

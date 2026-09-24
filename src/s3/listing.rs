@@ -46,6 +46,7 @@ pub(crate) fn run(args: &[OsString]) -> Result<i32> {
         }
     };
     let command = Command::from_arg_matches(&matches)?;
+    crate::fsops::reserve_startup_descriptors();
     let pattern = Pattern::parse(&command.path)?;
     let mut options = super::Options {
         bucket: pattern.bucket.clone(),
@@ -103,9 +104,9 @@ pub(crate) fn run(args: &[OsString]) -> Result<i32> {
     Ok(0)
 }
 
-struct S3<'a> {
-    client: aws_sdk_s3::Client,
-    bucket: &'a str,
+pub(super) struct S3<'a> {
+    pub(super) client: aws_sdk_s3::Client,
+    pub(super) bucket: &'a str,
 }
 impl Store for S3<'_> {
     fn ordered(&self) -> bool {

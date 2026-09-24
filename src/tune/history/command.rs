@@ -52,6 +52,7 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<i32> {
             return Ok(code);
         }
     };
+    crate::fsops::reserve_startup_descriptors();
     let path = path().context("tuning persistence is disabled")?;
     if !path.exists() {
         if matches.subcommand_name() == Some("clear") || matches.subcommand_name() == Some("list") {
@@ -198,7 +199,7 @@ pub(super) fn read_run(db: &Connection, id: i64) -> Result<Value> {
                     r.get::<_, Option<u32>>(4)?,
                     r.get::<_, Option<String>>(5)?,
                     r.get::<_, i64>(6)?,
-                    r.get::<_, bool>(7)?,
+                    r.get::<_, i64>(7)? == 1,
                 ))
             },
         )
