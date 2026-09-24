@@ -449,6 +449,7 @@ pub struct FsOps {
     /// One final-file descriptor retained between the hash response and the
     /// controller's decision to repair or accept that exact inode.
     held_basis: Option<HeldBasis>,
+    hashed_source: Option<HashedSource>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
     partial_directory_order: VecDeque<FileLocation>,
     operator_selection: Option<OperatorDirectorySelection>,
@@ -457,6 +458,32 @@ pub struct FsOps {
     allow_unconfined_source_paths: bool,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
+}
+
+// Retain at most one small source file per worker across its ordinary range
+// reads. Larger files keep the bounded block reader; no cross-worker cache.
+const SOURCE_HASH_BUFFER_MAX: u64 = 4 << 20;
+
+struct HashedSource {
+    source: RegisteredPath,
+    attempt: u32,
+    metadata: fs::Metadata,
+    bytes: Vec<u8>,
+}
+
+impl HashedSource {
+    fn same_file_version(&self, file: &File) -> bool {
+        file.metadata().is_ok_and(|now| {
+            let before = &self.metadata;
+            now.dev() == before.dev()
+                && now.ino() == before.ino()
+                && now.len() == before.len()
+                && now.mtime() == before.mtime()
+                && now.mtime_nsec() == before.mtime_nsec()
+                && now.ctime() == before.ctime()
+                && now.ctime_nsec() == before.ctime_nsec()
+        })
+    }
 }
 
 struct HeldBasis {
@@ -632,6 +659,7 @@ impl FsOps {
             fds: HashMap::new(),
             fd_order: Vec::new(),
             held_basis: None,
+            hashed_source: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),
             prepared_small_copy: None,
@@ -2665,21 +2693,41 @@ fn hash_reader_observed(
     actor: Option<&Arc<crate::transfer_observations::Actor>>,
     algorithm: crate::hashing::HashAlgorithm,
 ) -> Result<Vec<ContentDigest>> {
+    hash_reader_buffered(reader, block, len, actor, algorithm, None)
+}
+
+fn hash_reader_buffered(
+    reader: &mut impl Read,
+    block: u64,
+    len: u64,
+    actor: Option<&Arc<crate::transfer_observations::Actor>>,
+    algorithm: crate::hashing::HashAlgorithm,
+    retained: Option<&mut Vec<u8>>,
+) -> Result<Vec<ContentDigest>> {
     if !hash_response_fits(block, len) {
         bail!("hash block size or response count is outside protocol limits");
     }
     let n = usize::try_from(len.div_ceil(block)).context("hash count exceeds this platform")?;
     let mut hashes = Vec::with_capacity(n);
-    let mut buf = vec![0u8; block as usize];
+    let retain_all = retained.is_some();
+    let mut scratch = Vec::new();
+    let buf = retained.unwrap_or(&mut scratch);
+    let buffer_len = if retain_all { len } else { block.min(len) };
+    *buf = vec![0; usize::try_from(buffer_len).context("hash buffer exceeds this platform")?];
     let mut remaining = len;
     while remaining > 0 {
         let want = remaining.min(block) as usize;
+        let start = if retain_all {
+            (len - remaining) as usize
+        } else {
+            0
+        };
         let mut got = 0;
         while got < want {
             let read = {
                 let reading =
                     actor.map(|a| a.span(crate::transfer_observations::Stage::SourceRead));
-                let n = reader.read(&mut buf[got..want])?;
+                let n = reader.read(&mut buf[start + got..start + want])?;
                 if let Some(reading) = reading {
                     reading.bytes(n as u64);
                 }
@@ -2692,9 +2740,10 @@ fn hash_reader_observed(
         }
         {
             let _hash = actor.map(|a| a.span(crate::transfer_observations::Stage::Hashing));
-            hashes.push(algorithm.hash(&buf[..got]));
+            hashes.push(algorithm.hash(&buf[start..start + got]));
         }
         if got < want {
+            buf.truncate(start + got);
             while hashes.len() < n {
                 hashes.push(algorithm.hash(&[]));
             }

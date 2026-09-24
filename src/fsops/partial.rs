@@ -1368,6 +1368,29 @@ impl FsOps {
             if let Some((_, source_target)) = self.source_content_target(target.source)? {
                 let mut file =
                     open_registered_source(&source_target, self.inode_preservation.open_noatime)?;
+                if len > 0 && len <= SOURCE_HASH_BUFFER_MAX {
+                    let metadata = file.metadata().ok();
+                    let mut bytes = Vec::new();
+                    let hashes = hash_reader_buffered(
+                        &mut file,
+                        block,
+                        len,
+                        Some(&self.operation),
+                        self.hash_policy.algorithm,
+                        Some(&mut bytes),
+                    )?;
+                    if bytes.len() as u64 == len {
+                        if let (Some(source), Some(metadata)) = (target.source, metadata) {
+                            self.hashed_source = Some(HashedSource {
+                                source: source.clone(),
+                                attempt,
+                                metadata,
+                                bytes,
+                            });
+                        }
+                    }
+                    return Ok(hashes);
+                }
                 return hash_reader_observed(
                     &mut file,
                     block,
@@ -1459,6 +1482,13 @@ impl FsOps {
         len: u32,
     ) -> Result<Response> {
         let operation = self.operation.clone();
+        let retained = self.hashed_source.take().filter(|held| {
+            source == Some(&held.source)
+                && attempt == held.attempt
+                && off
+                    .checked_add(u64::from(len))
+                    .is_some_and(|end| end <= held.bytes.len() as u64)
+        });
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_READ_RANGE").is_some()
             || std::env::var_os("SYQ_TEST_FAIL_READ_RANGE_NAME")
@@ -1484,19 +1514,34 @@ impl FsOps {
                 // explicit rsync --insecure-links compatibility path.
                 self.cached(&p, attempt)?.file()
             };
-            let mut data = vec![0u8; len as usize];
-            #[cfg(target_os = "linux")]
-            let read = preparation.read_exact_at(f, &mut data, off);
-            #[cfg(not(target_os = "linux"))]
-            let read = {
-                let reading = operation.span(crate::transfer_observations::Stage::SourceRead);
-                let result = f.read_exact_at(&mut data, off);
-                if result.is_ok() {
-                    reading.bytes(u64::from(len));
+            // Resolve and open through the ordinary source authority first.
+            // Replacements, source edits and retries cannot consume old bytes.
+            let data = if let Some(held) = retained.filter(|held| held.same_file_version(f)) {
+                #[cfg(debug_assertions)]
+                record_test_event("SYQ_TEST_HASH_BUFFER_EVENTS", format_args!("reuse {len}"))?;
+                if off == 0 && len as usize == held.bytes.len() {
+                    held.bytes
+                } else {
+                    let data = held.bytes[off as usize..off as usize + len as usize].to_vec();
+                    self.hashed_source = Some(held);
+                    data
                 }
-                result
+            } else {
+                let mut data = vec![0u8; len as usize];
+                #[cfg(target_os = "linux")]
+                let read = preparation.read_exact_at(f, &mut data, off);
+                #[cfg(not(target_os = "linux"))]
+                let read = {
+                    let reading = operation.span(crate::transfer_observations::Stage::SourceRead);
+                    let result = f.read_exact_at(&mut data, off);
+                    if result.is_ok() {
+                        reading.bytes(u64::from(len));
+                    }
+                    result
+                };
+                read.with_context(|| format!("read {} @{off}+{len}", p.display()))?;
+                data
             };
-            read.with_context(|| format!("read {} @{off}+{len}", p.display()))?;
             let hash = {
                 if self.hash_policy.transfer_integrity {
                     let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
@@ -1883,6 +1928,11 @@ impl FsOps {
             )
         {
             return Response::Err("injected block-comparison failure".into());
+        }
+        // A non-read request abandons the source-buffer handoff. A new
+        // HashBlocks may replace it; idle/unchanged files never accumulate.
+        if !matches!(req, Request::ReadRange { .. }) {
+            self.hashed_source = None;
         }
         // HashAndHold's next request must consume the retained descriptor.
         // Any other request means the controller abandoned that comparison

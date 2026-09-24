@@ -1011,3 +1011,5 @@ mod expressions;
 
 #[path = "local/block_reuse.rs"]
 mod block_reuse;
+#[path = "local/hash_buffer_reuse.rs"]
+mod hash_buffer_reuse;
