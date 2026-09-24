@@ -300,3 +300,40 @@ fn remote_defaults_reuse_blocks_for_push_and_pull() {
         assert!(stderr_of(&out).contains("block-reuse=auto (effective on)"));
     }
 }
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn on_keeps_whole_file_copy_for_fresh_files_in_a_mixed_batch() {
+    for fallback in [false, true] {
+        let t = Tmp::new();
+        let source = prng(8 << 20, 838);
+        write(&t.path("src/fresh"), &source);
+        write(&t.path("src/existing"), &source);
+        let mut old = source.clone();
+        old[..4 << 20].fill(b'x');
+        write(&t.path("dst/existing"), &old);
+        set_mtime(&t.path("dst/existing"), 1);
+        let mut cmd = compat_command();
+        cmd.args([
+            "-a",
+            "--syq-no-tcp",
+            "--performance-tuning=workers=1,block-reuse=on",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_DEBUG", "1")
+        // Permit the userspace whole-file fallback even on test filesystems
+        // without kernel offload. Exercise normal offload and forced fallback.
+        .env("SYQ_TEST_COPY_LOCAL_FS", "local");
+        if fallback {
+            cmd.env("SYQ_TEST_COPY_LOCAL_EXDEV", "1");
+        }
+        let out = cmd.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst/fresh")), source);
+        assert_eq!(read(&t.path("dst/existing")), source);
+        assert_eq!(tuning_observed(&out)["local_whole_files"], 1);
+        assert_eq!(tuning_observed(&out)["range_requests"], 1);
+        assert!(partial_files(&t.path("dst")).is_empty());
+    }
+}

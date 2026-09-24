@@ -281,8 +281,7 @@ impl Opts {
             same_host: self.same_host,
             // Payload checks do not disable same-host copy shortcuts.
             checksum: self.checksum,
-            force_ranges: self.tuning.force_ranges()
-                || self.tuning.block_reuse == Some(crate::transfer_tuning::BlockReuse::On),
+            force_ranges: self.tuning.force_ranges(),
             bandwidth_limited,
             receiver_copy_disabled: !cfg!(any(target_os = "linux", target_os = "macos"))
                 || !self.local_copy_fd_budget

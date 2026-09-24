@@ -804,11 +804,22 @@ impl Worker {
         // framing, hashing and scheduling them through the transport.
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
-        if self
-            .opts
-            .copy_policy(self.bwlimit.is_some())
-            .file_operation(job.entry.size, job.container_guard.is_some())
-            == crate::copy_policy::FileOperation::ReceiverCopy
+        // Reuse needs comparison only when there is a final file to compare.
+        // Fresh files can still use the whole-file shortcut with reuse enabled.
+        let compare_existing = job
+            .dst_entry
+            .as_ref()
+            .is_some_and(|entry| entry.kind == Kind::File)
+            && self
+                .opts
+                .tuning
+                .reuse_destination_blocks(self.opts.same_host);
+        if !compare_existing
+            && self
+                .opts
+                .copy_policy(self.bwlimit.is_some())
+                .file_operation(job.entry.size, job.container_guard.is_some())
+                == crate::copy_policy::FileOperation::ReceiverCopy
         {
             match self.try_copy_local(idx, &job) {
                 Ok(true) => {
