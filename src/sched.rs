@@ -425,6 +425,7 @@ impl FileQueue {
         self.pop_group(group)
     }
 
+    #[cfg(test)]
     fn peek(&self) -> Option<&(u64, Reverse<FileOrder>)> {
         self.heads.last().map(|(item, _)| item)
     }
