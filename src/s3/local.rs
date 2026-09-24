@@ -22,6 +22,7 @@ pub(super) struct Source {
     pub meta: RootMetadata,
     pub key: String,
     pub label: Vec<u8>,
+    mapped: bool,
     pub metadata: Option<crate::mapping::Metadata>,
     pub expected_hash: Option<crate::hashing::Digest>,
     // Keep a selected leaf alive so an unlink cannot recycle its inode.
@@ -29,7 +30,11 @@ pub(super) struct Source {
 }
 impl Source {
     pub fn expression_path(&self) -> &[u8] {
-        crate::expression::source_path(&self.label, &self.path)
+        if self.mapped {
+            &self.label
+        } else {
+            crate::expression::source_path(&self.label, &self.path)
+        }
     }
     pub fn expression_file(&self) -> Result<crate::expression::File> {
         let mut file = crate::expression::File::from_root(self.meta);
@@ -262,6 +267,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                     meta,
                     key: destination,
                     label: path,
+                    mapped: args.native_mapping.is_some(),
                     expected_hash,
                     metadata,
                     _pin: None,
@@ -275,6 +281,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                     meta,
                     key: destination,
                     label: path,
+                    mapped: args.native_mapping.is_some(),
                     expected_hash,
                     metadata,
                     _pin: pin.map(Arc::new),

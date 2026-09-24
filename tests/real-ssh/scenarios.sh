@@ -972,6 +972,19 @@ for coordinator in src dst local; do
     ssh destination "test \"\$(cat /tmp/syq-real-ssh/expressions-$coordinator/sub/keep)\" = selected; test ! -e /tmp/syq-real-ssh/expressions-$coordinator/sub/tiny"
 done
 
+printf 'case: restricted expressions preserve container permissions and inheritance\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/expression-modes/new /tmp/syq-real-ssh/expression-modes/old; printf selected > /tmp/syq-real-ssh/expression-modes/new/keep; printf selected > /tmp/syq-real-ssh/expression-modes/old/keep; chmod 710 /tmp/syq-real-ssh/expression-modes/new'
+for preservation in default permissions; do
+    destination=/tmp/syq-real-ssh/expression-modes-$preservation
+    ssh destination "mkdir -p $destination/old; chmod 2775 $destination; chmod 2555 $destination/old"
+    set --
+    if [ "$preservation" = permissions ]; then set -- --preserve=permissions; fi
+    syq cp "$@" --from source --srcs-in /tmp/syq-real-ssh/expression-modes \
+        --to destination --into "$destination" --coordinate-at src --no-progress \
+        --where "src.kind = 'file'" --copy-if true
+    ssh destination "test \"\$(cat $destination/new/keep)\" = selected; test \"\$(cat $destination/old/keep)\" = selected; test \"\$(stat -c %a $destination/new)\" = 2755; test \"\$(stat -c %a $destination/old)\" = 2555"
+done
+
 printf 'case: destination firewall triggers automatic TCP fallback to SSH\n'
 make_tree source /tmp/syq-real-ssh/firewall-source firewall
 syq cp --no-progress --performance-tuning workers=2 --preserve=permissions \

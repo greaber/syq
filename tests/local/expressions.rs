@@ -320,3 +320,133 @@ fn merged_directories_keep_each_sources_expression_result() {
     assert_eq!(read(&t.path("dst/shared/one")), b"one");
     assert_eq!(read(&t.path("dst/shared/two")), b"two");
 }
+
+#[test]
+fn unselected_containers_use_receiver_umask_and_inheritance() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let script = fs::read_to_string(&rsh).unwrap();
+    executable(
+        &rsh,
+        script
+            .replace("#!/bin/sh\n", "#!/bin/sh\numask 077\n")
+            .as_bytes(),
+    );
+    t.expose_remote_syq();
+    write(&t.path("src/nested/keep"), b"selected");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o2775)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--srcs-in",
+            &t.s("src"),
+            "--to",
+            "127.0.0.1",
+            "--into",
+            &t.s("dst"),
+            "--where",
+            "src.kind = 'file'",
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--no-bootstrap",
+            "--no-tcp",
+            "--no-progress",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/nested/keep")), b"selected");
+    assert_eq!(
+        fs::metadata(t.path("dst/nested")).unwrap().mode() & 0o777,
+        0o700
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        fs::metadata(t.path("dst/nested")).unwrap().mode() & 0o2000,
+        0o2000
+    );
+}
+
+#[test]
+fn unselected_readonly_containers_reopen_and_restore_their_modes() {
+    let t = Tmp::new();
+    write(&t.path("src/nested/keep"), b"selected");
+    fs::create_dir_all(t.path("dst/nested")).unwrap();
+    fs::set_permissions(t.path("dst/nested"), fs::Permissions::from_mode(0o555)).unwrap();
+    let output = native_syq(&[
+        "cp",
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+        "--where",
+        "src.kind = 'file'",
+        "--preserve=permissions",
+    ]);
+    let mode = fs::metadata(t.path("dst/nested")).unwrap().mode() & 0o7777;
+    fs::set_permissions(t.path("dst/nested"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_output_ok(&output);
+    assert_eq!(mode, 0o555);
+    assert_eq!(read(&t.path("dst/nested/keep")), b"selected");
+}
+
+#[test]
+fn destination_inspection_errors_are_not_missing_entries() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("permission-denied fixture requires a non-root user");
+        return;
+    }
+    for remote in [false, true] {
+        let t = Tmp::new();
+        fs::create_dir_all(t.path("src/nested")).unwrap();
+        fs::create_dir_all(t.path("dst/nested")).unwrap();
+        std::os::unix::fs::symlink("source-target", t.path("src/nested/link")).unwrap();
+        std::os::unix::fs::symlink("destination-target", t.path("dst/nested/link")).unwrap();
+        fs::set_permissions(t.path("dst/nested"), fs::Permissions::from_mode(0o000)).unwrap();
+        let rsh = fake_rsh(&t);
+        t.expose_remote_syq();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+            "--where",
+            "src.kind = 'symlink'",
+            "--copy-if",
+            "dst.exists",
+            "--only-new",
+            "--no-progress",
+        ]);
+        if remote {
+            command
+                .args([
+                    "--to",
+                    "127.0.0.1",
+                    "--rsh",
+                    rsh.to_str().unwrap(),
+                    "--no-bootstrap",
+                    "--no-tcp",
+                ])
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("XDG_CACHE_HOME", t.path("cache"));
+        }
+        let output = command.run().unwrap();
+        fs::set_permissions(t.path("dst/nested"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            stderr_of(&output).contains("Permission denied"),
+            "{output:?}"
+        );
+        assert_eq!(
+            fs::read_link(t.path("dst/nested/link")).unwrap(),
+            Path::new("destination-target")
+        );
+    }
+}

@@ -826,3 +826,39 @@ fn failed_inode_metadata_is_visible_and_resumes_with_current_metadata() {
         }
     }
 }
+
+#[test]
+fn expressions_keep_unselected_container_attributes() {
+    let t = Tmp::new();
+    write(&t.path("src/new/keep"), b"selected");
+    write(&t.path("src/existing/keep"), b"selected");
+    fs::create_dir_all(t.path("dst/existing")).unwrap();
+    for directory in ["src/new", "src/existing"] {
+        set_attr(&t.path(directory), "user.expression", b"excluded source");
+    }
+    set_attr(&t.path("dst/existing"), "user.expression", b"receiver");
+    fs::set_permissions(t.path("dst/existing"), fs::Permissions::from_mode(0o555)).unwrap();
+    let output = native_syq(&[
+        "cp",
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+        "--where",
+        "src.kind = 'file'",
+        "--copy-if",
+        "true",
+        "--preserve=permissions,xattrs",
+    ]);
+    let mode = fs::metadata(t.path("dst/existing")).unwrap().mode() & 0o7777;
+    fs::set_permissions(t.path("dst/existing"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_output_ok(&output);
+    assert_eq!(mode, 0o555);
+    assert_eq!(attr(&t.path("dst/new"), "user.expression"), None);
+    assert_eq!(
+        attr(&t.path("dst/existing"), "user.expression"),
+        Some(b"receiver".to_vec())
+    );
+    assert_eq!(read(&t.path("dst/new/keep")), b"selected");
+    assert_eq!(read(&t.path("dst/existing/keep")), b"selected");
+}

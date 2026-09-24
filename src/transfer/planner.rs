@@ -2222,10 +2222,7 @@ impl Planner<'_> {
             .filter(|(path, _, _, st)| {
                 let root_must_be_new =
                     self.exact_condition == TargetCondition::Absent && path == &self.dst_root;
-                if (opts.preserve_existing_directory_metadata
-                    || self.unselected_dirs.contains(path))
-                    && existing_dirs.contains(path)
-                {
+                if opts.preserve_existing_directory_metadata && existing_dirs.contains(path) {
                     return false;
                 }
                 root_must_be_new
@@ -2234,7 +2231,7 @@ impl Planner<'_> {
             .map(|(p, _, e, st)| Op::Mkdir {
                 path: p.clone(),
                 mode: if self.unselected_dirs.contains(p) {
-                    0o777 & !opts.umask
+                    0o777
                 } else {
                     e.mode
                 },
@@ -2326,7 +2323,7 @@ impl Planner<'_> {
                 if preexisting && succeeded {
                     // Reopened for writability only; nothing was made.
                     reopened += 1;
-                    if self.implicit_dirs.contains(name) {
+                    if self.implicit_dirs.contains(name) || self.unselected_dirs.contains(name) {
                         reopened_dirs.insert(name.clone());
                     }
                     continue;
@@ -2436,17 +2433,37 @@ impl Planner<'_> {
         let opts = self.opts;
         for (p, dst_rel, e, s) in planned {
             if self.unselected_dirs.contains(p) {
-                if s.is_none() {
-                    let mut meta = e.meta();
-                    meta.mode = 0o777 & !opts.umask;
-                    self.deferred.push((
-                        p.clone(),
-                        meta,
-                        flags::RECEIVER_MODE,
-                        p.iter().filter(|&&c| c == b'/').count(),
-                        self.metadata_condition_for(p),
-                    ));
-                }
+                // Containers keep receiver-created metadata. Only restore a
+                // mode temporarily reopened for their children. A restricted
+                // receiver stages new directories at 0700 and chooses the
+                // final default mode itself, including its umask and setgid.
+                let meta = if reopened_dirs.contains(p) {
+                    let mut meta = s.as_ref().expect("reopened directory was observed").meta();
+                    meta.inode_metadata = None;
+                    meta
+                } else if s.is_none() && opts.restricted_receiver && !opts.perms {
+                    Meta {
+                        mode: 0o777,
+                        uid: 0,
+                        gid: 0,
+                        mtime: 0,
+                        mtime_nsec: 0,
+                        inode_metadata: None,
+                    }
+                } else {
+                    continue;
+                };
+                self.deferred.push((
+                    p.clone(),
+                    meta,
+                    if opts.restricted_receiver && !opts.perms {
+                        flags::RECEIVER_MODE
+                    } else {
+                        flags::MODE
+                    },
+                    p.iter().filter(|&&c| c == b'/').count(),
+                    self.metadata_condition_for(p),
+                ));
                 continue;
             }
             // New implicit parents already have their final modes.
@@ -2667,7 +2684,8 @@ impl Planner<'_> {
         // dry runs may need a depth-by-depth virtual overlay. Keep their stats
         // at the existing application point rather than caching stale or
         // unsafe observations. Sidecar resolution still uses this request.
-        let pre_stat = !self.opts.inode_preservation.any()
+        let pre_stat = self.opts.expressions.update.is_none()
+            && !self.opts.inode_preservation.any()
             && self.opts.dst_remote
             && self.buffer.is_none()
             && !self.opts.dry_run
@@ -3424,7 +3442,58 @@ impl Planner<'_> {
     }
 
     pub(super) fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
-        let entries = stat_many(self.dst, paths, false)?;
+        let entries = if self.opts.expressions.update.is_some() {
+            // This existing endpoint operation distinguishes absence from an
+            // unreadable path, unlike ordinary planning stats. It has the same
+            // destination-observation authority and needs no wire extension.
+            let mut inspected = Vec::with_capacity(paths.len());
+            for chunk in paths.chunks(512) {
+                match ok(
+                    self.dst.call(Request::PruneLookup {
+                        paths: chunk.to_vec(),
+                        guard: self.container_guard.clone(),
+                    })?,
+                    "inspect destination for --copy-if",
+                )? {
+                    Response::Stats(entries) if entries.len() == chunk.len() => {
+                        inspected.extend(entries)
+                    }
+                    other => bail!("unexpected destination inspection response {other:?}"),
+                }
+            }
+            if self.opts.inode_preservation.any() && inspected.iter().any(Option::is_some) {
+                // Strict lookup supplies expression fields. Rich preservation
+                // still uses the existing metadata capture request.
+                let captured = stat_many(self.dst, paths, false)?;
+                anyhow::ensure!(
+                    captured.len() == inspected.len(),
+                    "destination stat count changed"
+                );
+                for (before, after) in inspected.iter().zip(&captured) {
+                    if let Some(before) = before {
+                        anyhow::ensure!(
+                            after.as_ref().is_some_and(|after| (
+                                before.dev,
+                                before.ino,
+                                before.ctime,
+                                before.ctime_nsec
+                            ) == (
+                                after.dev,
+                                after.ino,
+                                after.ctime,
+                                after.ctime_nsec
+                            )),
+                            "destination changed while reading metadata for --copy-if"
+                        );
+                    }
+                }
+                captured
+            } else {
+                inspected
+            }
+        } else {
+            stat_many(self.dst, paths, false)?
+        };
         self.progress
             .observe_destination_devices(entries.iter().flatten());
         Ok(entries)

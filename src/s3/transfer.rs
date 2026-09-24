@@ -1568,22 +1568,41 @@ impl Engine {
                         })
                         .to_owned()
                 };
+                // Directory markers use the same path spelling as filesystem
+                // directories. A mapping keeps its complete source-relative path.
+                let expression_key = if directory {
+                    key.trim_end_matches('/')
+                } else {
+                    &key
+                };
                 let expression_path = if !self.args.expressions.active() {
                     String::new()
-                } else if expression_root.is_empty() {
-                    key.clone()
+                } else if self.args.native_mapping.is_some() {
+                    if base.is_empty() {
+                        expression_key
+                    } else {
+                        expression_key
+                            .strip_prefix(&base)
+                            .and_then(|s| s.strip_prefix('/'))
+                            .context("mapped S3 source is outside its base")?
+                    }
+                    .to_owned()
                 } else {
-                    key.strip_prefix(&format!("{expression_root}/"))
-                        .filter(|path| !path.is_empty())
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| {
-                            expression_root
-                                .trim_end_matches('/')
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or("")
-                                .to_owned()
-                        })
+                    let relative = if expression_root.is_empty() {
+                        expression_key
+                    } else {
+                        expression_key
+                            .strip_prefix(&expression_root)
+                            .and_then(|s| s.strip_prefix('/'))
+                            .unwrap_or("")
+                    };
+                    String::from_utf8(
+                        crate::expression::source_path(
+                            expression_root.as_bytes(),
+                            relative.as_bytes(),
+                        )
+                        .to_vec(),
+                    )?
                 };
                 out.push(Download {
                     expression_path,

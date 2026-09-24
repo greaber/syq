@@ -2,6 +2,7 @@
 """Expression selection and destination conditions in all three S3 directions."""
 from pathlib import Path
 import tempfile
+import json
 import check as checks
 
 
@@ -45,6 +46,31 @@ def check():
         checks.run(['--from', remote, '--srcs-in', renamed, '--into', fresh,
                     '--copy-if', "dst.path = 'nested/keep'"])
         assert (fresh / 'nested/keep').read_bytes() == b'longer source'
+        mapping = root / 'mapping.jsonl'
+        mapping.write_text(json.dumps({'src': {'encoding': 'utf-8', 'value': 'nested/keep'},
+                                       'dst': {'encoding': 'utf-8', 'value': 'mapped'}, 'kind': 'file'}) + '\n')
+        predicate = "src.path = 'nested/keep'"
+        mapped = checks.PREFIX + '/mapped-upload'
+        checks.run(['-C', source, '--mapping', mapping, '--to', remote, '--into', mapped,
+                    '--where', predicate, '--copy-if', predicate])
+        assert checks.request('GET', mapped + '/mapped')[1] == b'longer source'
+        checks.run(['--from', remote, '-C', prefix, '--mapping', mapping, '--into', root / 'mapped-download',
+                    '--where', predicate, '--copy-if', predicate])
+        assert (root / 'mapped-download/mapped').read_bytes() == b'longer source'
+        mapped_copy = checks.PREFIX + '/mapped-copy'
+        checks.run(['--from', remote, '-C', prefix, '--mapping', mapping, '--to', remote, '--into', mapped_copy,
+                    '--where', predicate, '--copy-if', predicate])
+        assert checks.request('GET', mapped_copy + '/mapped')[1] == b'longer source'
+        checks.request('PUT', prefix + '/nested/', b'')
+        marker_copy = checks.PREFIX + '/markers'
+        marker_predicate = "src.kind = 'dir' and src.name = 'nested' and src.path = 'nested'"
+        checks.run(['--from', remote, '--srcs-in', prefix, '--to', remote, '--into', marker_copy,
+                    '--where', marker_predicate])
+        assert set(checks.listing(marker_copy + '/')) == {marker_copy + '/nested/'}
+        checks.run(['--from', remote, '--srcs-in', prefix, '--into', root / 'marker-download',
+                    '--where', marker_predicate])
+        assert (root / 'marker-download/nested').is_dir()
+        assert not (root / 'marker-download/nested/keep').exists()
         # Provider objects have no Unix owner metadata; test null deliberately.
         raw = checks.PREFIX + '/raw'
         checks.request('PUT', raw, b'raw object')

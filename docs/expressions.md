@@ -37,8 +37,17 @@ filesystem destinations they can still be created as containers, including
 empty directories; source directory metadata is applied only when both
 conditions pass. Existing directories that fail a condition keep their
 metadata, apart from the effects of adding or removing children. New containers
-use default permissions. S3 directory-marker objects are copied only when
-selected; keys beneath them are considered independently.
+use the receiver's default permissions, including its umask and inherited
+setgid bit. Existing containers may be made writable while children are copied;
+their previous permissions are then restored. S3 directory-marker objects are copied only when selected; keys beneath them are
+considered independently.
+
+To copy directory metadata while filtering files, select directories explicitly:
+
+```sh
+syq cp --srcs-in photos --into archive --preserve \
+  --where 'src.kind = "dir" or (src.kind = "file" and src.extension = "jpg")'
+```
 
 Use [ignore rules](reference.md#ignoring-paths) to stop traversal of a subtree.
 An expression cannot re-include an ignored path. With `--prune`, excluded
@@ -53,7 +62,9 @@ files already completed can remain.
 Conditions use observed metadata. They are not locks or atomic assertions
 against concurrent changes. `--copy-if` cannot combine with `--inplace`: an
 interrupted write could change destination metadata and make a retry skip an
-incomplete file.
+incomplete file. The early capacity check for a fresh destination is skipped
+with `--copy-if`, since the selected size is not yet known. Running out of space
+still fails the copy, but some files may already have been copied.
 
 For restricted remote copies, expressions are evaluated by the coordinator
 as copy preferences. They do not add receiver-enforced restrictions to a signed
@@ -66,7 +77,7 @@ the selected entry; recursively discovered symlinks are not followed.
 
 | Field | Type and meaning |
 |---|---|
-| `path` | Source path relative to its selected scan root. Destination path relative to the `--into` container or the tree placed with `--as`. A root entry, including a single file placed with `--as`, uses its basename. |
+| `path` | Source path relative to its selected scan root. Destination path relative to the `--into` container or the tree placed with `--as`. A root entry, including a single file placed with `--as`, uses its basename. With `--mapping`, `src.path` is the mapping's source path relative to `-C`. |
 | `name` | Last path component |
 | `extension` | Text after the last dot in `name`, without the dot; empty for extensionless names and a leading dot alone |
 | `exists` | Whether the entry exists; always true for a scanned source |
