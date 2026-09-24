@@ -555,7 +555,6 @@ fn small_copy_eligible(
         && args.files_from.is_none()
         && args.native_mapping.is_none()
         && args.ignore_lines.is_empty()
-        && !args.expressions.active()
         && args.bwlimit_bytes == 0
         && args.max_size.is_none()
         && args.min_size.is_none()
@@ -595,6 +594,8 @@ fn attempt_small_copy(
     }
     let follow = args.follows_native_source_paths();
     let mut entries = Vec::with_capacity(srcs.len());
+    let mut selected_sources = Vec::new();
+    let mut selected_roots = Vec::new();
     let mut total = 0u64;
     for (source, root) in srcs.iter().zip(roots) {
         // A missing or unusable source is the engine's to report.
@@ -608,16 +609,45 @@ fn attempt_small_copy(
         };
         if entry.kind != Kind::File
             || validate_native_source_type(&source.path, source.selection, entry.kind).is_err()
-            || entry.size > SMALL_COPY_MAX_FILE_BYTES
         {
             return Ok(SmallCopy::Declined);
         }
+        let source_file = crate::expression::File::from_entry(&entry);
+        let source_path = crate::expression::source_path(&source.path, b"");
+        let destination_path = if args.placement == Placement::As {
+            dst.basename()
+        } else {
+            source.basename()
+        };
+        if !opts.expressions.selects(&source_file, source_path)?
+            || opts.expressions.permits_known(
+                crate::expression::Facts::Complete(&source_file),
+                source_path,
+                crate::expression::Facts::Unread,
+                &destination_path,
+            )? == Some(false)
+        {
+            continue;
+        }
+        if entry.size > SMALL_COPY_MAX_FILE_BYTES {
+            return Ok(SmallCopy::Declined);
+        }
+        selected_sources.push(source.clone());
+        selected_roots.push(root.clone());
         total += entry.size;
         if total > SMALL_COPY_MAX_TOTAL_BYTES {
             return Ok(SmallCopy::Declined);
         }
         entries.push(entry);
     }
+
+    // An empty selection still uses the planner's destination-placement rules.
+    if entries.is_empty() {
+        return Ok(SmallCopy::Declined);
+    }
+    let excluded = srcs.len() - selected_sources.len();
+    let srcs = selected_sources.as_slice();
+    let roots = selected_roots.as_slice();
 
     // Destination spellings exactly as the planner produces them.
     let operator_dst_root = clean_root(&dst.path);
@@ -712,7 +742,7 @@ fn attempt_small_copy(
     .into_iter();
     let flags = publication_metadata_flags(opts.flags);
     let mut files = Vec::with_capacity(srcs.len());
-    for (entry, (dst_path, _, _)) in entries.iter().zip(&targets) {
+    for ((entry, source), (dst_path, _, _)) in entries.iter().zip(srcs).zip(&targets) {
         let (data, hash) = if entry.size == 0 {
             (Vec::new(), opts.hash_policy.payload_algorithm().hash(&[]))
         } else {
@@ -729,6 +759,12 @@ fn attempt_small_copy(
         meta.mode = fresh_file_mode(opts, entry);
         files.push(SmallCopyFile {
             path: dst_path.clone(),
+            expression_source: args.copy_if.as_ref().map(|_| {
+                (
+                    crate::expression::File::from_entry(entry),
+                    crate::expression::source_path(&source.path, b"").to_vec(),
+                )
+            }),
             data,
             hash,
             meta,
@@ -736,6 +772,10 @@ fn attempt_small_copy(
     }
 
     let request = SmallCopyRequest {
+        copy_if: args
+            .copy_if
+            .clone()
+            .map(|text| (text, opts.expressions.now)),
         directory,
         symlink_policy: opts.operator_symlink_policy,
         request_prefix,
@@ -816,6 +856,7 @@ fn attempt_small_copy(
             t0.elapsed().as_secs_f64()
         );
     }
+    progress.files_excluded.fetch_add(excluded as u64, Relaxed);
     announce_detached_ready()?;
     print_small_copy_diagnostics(args, dst_ep);
 
@@ -826,7 +867,11 @@ fn attempt_small_copy(
         .iter()
         .enumerate()
         .filter_map(|(i, result)| {
-            (result.disposition != SmallCopyDisposition::QuickChecked).then_some(i)
+            matches!(
+                result.disposition,
+                SmallCopyDisposition::Copied | SmallCopyDisposition::ContentMatched
+            )
+            .then_some(i)
         })
         .collect();
     let mut now = if check_source.is_empty() {
@@ -846,6 +891,10 @@ fn attempt_small_copy(
     }
     .into_iter();
     for ((entry, (_, rel_bytes, rel)), result) in entries.iter().zip(&targets).zip(results) {
+        if result.disposition == SmallCopyDisposition::Excluded {
+            progress.files_excluded.fetch_add(1, Relaxed);
+            continue;
+        }
         if result.disposition == SmallCopyDisposition::QuickChecked {
             progress.files_unchanged.fetch_add(1, Relaxed);
             progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
@@ -940,7 +989,7 @@ fn attempt_small_copy(
         dry_run: false,
         files_transferred: progress.files_done.load(Relaxed),
         files_unchanged: progress.files_unchanged.load(Relaxed),
-        files_excluded: 0,
+        files_excluded: progress.files_excluded.load(Relaxed),
         directories_created: 0,
         symlinks_created: 0,
         specials_created: 0,

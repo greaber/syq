@@ -783,6 +783,13 @@ impl FsOps {
             names.push(name);
         }
         let copy_id = request.identity.copy_id;
+        let condition = request
+            .copy_if
+            .as_ref()
+            .map(|(text, _)| {
+                crate::expression::Expression::compile(text, true).context("--copy-if")
+            })
+            .transpose()?;
 
         let (selection, anchor) =
             select_operator_directory(&request.directory, false, request.symlink_policy)?;
@@ -812,22 +819,67 @@ impl FsOps {
                 }
             }
         }
+        // Evaluate against the same observations used for comparison, before
+        // staging any content or repairing any destination metadata.
+        let permitted: Vec<bool> = request
+            .files
+            .iter()
+            .zip(&destinations)
+            .zip(&names)
+            .map(|((file, stat), name)| -> Result<bool> {
+                let Some(expression) = &condition else {
+                    return Ok(true);
+                };
+                let (source, source_path) = file
+                    .expression_source
+                    .as_ref()
+                    .context("small copy condition requires source metadata")?;
+                let destination = stat
+                    .as_ref()
+                    .map(|stat| crate::expression::File {
+                        exists: true,
+                        kind: Some(Kind::File),
+                        size: Some(stat.st_size as u64),
+                        mtime: Some((stat.st_mtime as i64, stat.st_mtime_nsec as u32)),
+                        ctime: Some((stat.st_ctime as i64, stat.st_ctime_nsec as u32)),
+                        mode: Some(stat.st_mode as u32 & 0o7777),
+                        uid: Some(stat.st_uid),
+                        gid: Some(stat.st_gid),
+                        device: Some(stat.st_dev as u64),
+                        inode: Some(stat.st_ino as u64),
+                        nlink: Some(stat.st_nlink as u64),
+                        link_target: None,
+                    })
+                    .unwrap_or_default();
+                expression
+                    .evaluate(
+                        source,
+                        source_path,
+                        &destination,
+                        name,
+                        request.copy_if.as_ref().unwrap().1,
+                    )
+                    .context("--copy-if")
+            })
+            .collect::<Result<_>>()?;
         // This fused path serves native copies: share the planner's inferred
         // destination precision so dispatch does not change the skip decision.
         let mut unchanged: Vec<bool> = request
             .files
             .iter()
             .zip(&destinations)
-            .map(|(file, stat)| {
-                stat.as_ref().is_some_and(|stat| {
-                    request.flags & flags::TIMES != 0
-                        && stat.st_size as u64 == file.data.len() as u64
-                        && stat.st_mtime == file.meta.mtime
-                        && destination_fraction_matches(
-                            file.meta.mtime_nsec,
-                            stat.st_mtime_nsec as u32,
-                        )
-                })
+            .zip(&permitted)
+            .map(|((file, stat), permitted)| {
+                !permitted
+                    || stat.as_ref().is_some_and(|stat| {
+                        request.flags & flags::TIMES != 0
+                            && stat.st_size as u64 == file.data.len() as u64
+                            && stat.st_mtime == file.meta.mtime
+                            && destination_fraction_matches(
+                                file.meta.mtime_nsec,
+                                stat.st_mtime_nsec as u32,
+                            )
+                    })
             })
             .collect();
         let ticket = self.descriptor_session.register(selection.directory)?;
@@ -928,7 +980,14 @@ impl FsOps {
             .zip(destinations)
             .zip(staged)
             .zip(matched_content)
-            .map(|(((file, destination), item), matched_content)| {
+            .enumerate()
+            .map(|(i, (((file, destination), item), matched_content))| {
+                if !permitted[i] {
+                    return SmallCopyFileResult {
+                        disposition: SmallCopyDisposition::Excluded,
+                        error: None,
+                    };
+                }
                 let condition = destination
                     .as_ref()
                     .map_or(TargetCondition::Absent, |stat| TargetCondition::Matches {

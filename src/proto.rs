@@ -804,6 +804,8 @@ pub enum WireRequest<Data> {
         directories: Vec<PathBytes>,
         others: Vec<PathBytes>,
         guard: Option<ContainerGuard>,
+        /// Fail on unreadable entries instead of treating them as absent.
+        strict_metadata: bool,
     },
     /// Return the size of this invocation's partial, if it is a regular file.
     /// The planner has already statted the final path.
@@ -1078,6 +1080,8 @@ pub struct SmallCopyIdentity {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallCopyFile {
     pub path: PathBytes,
+    /// Original source facts and expression path, before publication modes.
+    pub expression_source: Option<(crate::expression::File, PathBytes)>,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
     pub hash: ContentDigest,
@@ -1086,6 +1090,8 @@ pub struct SmallCopyFile {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallCopyRequest {
+    /// Update expression and coordinator's fixed invocation time.
+    pub copy_if: Option<(String, i128)>,
     /// The operator directory: the `--into` directory, or the parent of an
     /// `--as` leaf. It must already exist.
     pub directory: PathBytes,
@@ -1123,6 +1129,8 @@ pub enum SmallCopyDisposition {
     QuickChecked,
     /// Content was read and matched; the source must still be rechecked.
     ContentMatched,
+    /// The destination condition rejected this entry without updating it.
+    Excluded,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

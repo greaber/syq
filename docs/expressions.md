@@ -63,9 +63,7 @@ files already completed can remain.
 Conditions use observed metadata. They are not locks or atomic assertions
 against concurrent changes. `--copy-if` cannot combine with `--inplace`: an
 interrupted write could change destination metadata and make a retry skip an
-incomplete file. The early capacity check for a fresh destination is skipped
-with `--copy-if`, since the selected size is not yet known. Running out of space
-still fails the copy, but some files may already have been copied.
+incomplete file.
 
 For restricted remote copies, expressions are evaluated by the coordinator
 as copy preferences. They do not add receiver-enforced restrictions to a signed

@@ -978,6 +978,7 @@ fn plan_batch_only_stats_leaves_below_ready_directories() {
         directories: vec![path_bytes(directory)],
         others: vec![path_bytes(&leaf)],
         guard: None,
+        strict_metadata: false,
     };
 
     let Response::BatchPlan {
@@ -1356,6 +1357,7 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
     let canonical = dir.path().canonicalize().unwrap();
     let prefix = canonical.as_os_str().as_bytes().to_vec();
     let request = SmallCopyRequest {
+        copy_if: None,
         directory: prefix.clone(),
         symlink_policy: OperatorSymlinkPolicy::Refuse,
         request_prefix: prefix.clone(),
@@ -1367,6 +1369,7 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
         files: ["one", "two"]
             .into_iter()
             .map(|name| SmallCopyFile {
+                expression_source: None,
                 path: join(&prefix, name.as_bytes()),
                 data: name.as_bytes().to_vec(),
                 hash: content_digest(name.as_bytes()),
@@ -1441,6 +1444,7 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
     fs::create_dir(&dir).unwrap();
     let prefix = dir.as_os_str().as_bytes().to_vec();
     let file = |name: &str, data: &[u8]| SmallCopyFile {
+        expression_source: None,
         path: join(&prefix, name.as_bytes()),
         data: data.to_vec(),
         hash: content_digest(data),
@@ -1455,6 +1459,7 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
     };
     let request = |directory: PathBytes, files: Vec<SmallCopyFile>| {
         Request::CopySmallFiles(SmallCopyRequest {
+            copy_if: None,
             directory,
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             request_prefix: prefix.clone(),
@@ -4983,4 +4988,39 @@ fn inplace_prepare_rejects_replaced_hashed_basis_before_mutation() {
             _ => assert!(!root.join("file").exists()),
         }
     }
+}
+
+#[test]
+fn strict_plan_batch_distinguishes_missing_entries_from_read_errors() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let root = tree.path();
+    fs::create_dir(root.join("sub")).unwrap();
+    fs::write(root.join("sub/file"), b"contents").unwrap();
+    let mut ops = FsOps::new();
+    ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
+    let request = Request::PlanBatch {
+        partial_paths: Vec::new(),
+        copy_id: [7; 16],
+        directories: Vec::new(),
+        others: vec![b"missing/child".to_vec(), b"sub/file".to_vec()],
+        guard: None,
+        strict_metadata: true,
+    };
+    let Response::BatchPlan {
+        others: Some(entries),
+        ..
+    } = ops.handle(&request)
+    else {
+        panic!("expected checked metadata");
+    };
+    assert!(entries[0].is_none());
+    assert_eq!(entries[1].as_ref().unwrap().size, 8);
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping permission denial: running as root");
+        return;
+    }
+    fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+    let denied = ops.handle(&request);
+    fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(denied, Response::EndpointError(_)), "{denied:?}");
 }

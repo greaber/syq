@@ -874,6 +874,7 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
         directories: vec![target.clone()],
         others: vec![target.clone()],
         guard: None,
+        strict_metadata: false,
     };
     authority.authorize(&mut plan, false).unwrap();
     let Request::PlanBatch {
