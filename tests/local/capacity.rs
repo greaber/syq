@@ -2,97 +2,38 @@ use super::*;
 
 #[cfg(debug_assertions)]
 #[test]
-fn fresh_missing_destination_refuses_clear_byte_shortage_before_creation() {
+fn fresh_copy_uses_actual_allocations_instead_of_capacity_estimates() {
+    for existing in [false, true] {
+        for exact in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("src/file"), b"payload");
+            if existing {
+                fs::create_dir(t.path("dst")).unwrap();
+            }
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command.args(["cp", &t.s("src")]);
+            command.args([if exact { "--as" } else { "--into" }, &t.s("dst"), "-q"]);
+            let output = command
+                .env("SYQ_TEST_AVAILABLE_BYTES", "0")
+                .env("SYQ_TEST_AVAILABLE_INODES", "0")
+                .run()
+                .unwrap();
+            assert_output_ok(&output);
+            assert_eq!(
+                read(&t.path(if exact { "dst/file" } else { "dst/src/file" })),
+                b"payload"
+            );
+        }
+    }
     let t = Tmp::new();
-    write(&t.path("src/file"), b"payload");
-
+    write(&t.path("source"), b"payload");
     let output = compat_command()
-        .args(["-a", &t.s("src/"), &t.s("dst"), "--no-progress"])
-        .env("SYQ_TEST_AVAILABLE_BYTES", "1")
+        .args(["-a", &t.s("source"), &t.s("missing/parent/file")])
+        .env("SYQ_TEST_AVAILABLE_BYTES", "0")
         .run()
         .unwrap();
-
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("fresh destination capacity preflight failed"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("7 B") && stderr.contains("1 B"), "{stderr}");
-    assert!(
-        !t.path("dst").exists(),
-        "the capacity preflight must precede destination creation"
-    );
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn fresh_exact_destination_refuses_shortage_before_creating_missing_parents() {
-    let t = Tmp::new();
-    write(&t.path("src/file"), b"payload");
-
-    let output = compat_command()
-        .args([
-            "-a",
-            &t.s("src/file"),
-            &t.s("missing/parent/file"),
-            "--no-progress",
-        ])
-        .env("SYQ_TEST_AVAILABLE_BYTES", "1")
-        .run()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("fresh destination capacity preflight failed"));
-    assert!(
-        !t.path("missing").exists(),
-        "the capacity preflight must precede parent creation"
-    );
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn fresh_existing_empty_destination_refuses_clear_byte_shortage_automatically() {
-    let t = Tmp::new();
-    write(&t.path("src/file"), b"payload");
-    fs::create_dir(t.path("dst")).unwrap();
-
-    let output = compat_command()
-        .args(["-a", &t.s("src/"), &t.s("dst"), "--no-progress"])
-        .env("SYQ_TEST_AVAILABLE_BYTES", "1")
-        .run()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("fresh destination capacity preflight failed"),
-        "{stderr}"
-    );
-    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn fresh_exact_existing_empty_directory_refuses_clear_byte_shortage() {
-    let t = Tmp::new();
-    write(&t.path("src/file"), b"payload");
-    fs::create_dir(t.path("dst")).unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["cp", &t.s("src"), "--as-existing", &t.s("dst"), "-q"])
-        .env("SYQ_TEST_AVAILABLE_BYTES", "1")
-        .run()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("fresh destination capacity preflight failed"),
-        "{stderr}"
-    );
-    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("missing/parent/file")), b"payload");
 }
 
 #[cfg(debug_assertions)]
@@ -112,29 +53,6 @@ fn nonempty_destination_skips_the_whole_copy_capacity_estimate() {
     assert_output_ok(&output);
     assert_eq!(read(&t.path("dst/file")), b"payload");
     assert_eq!(read(&t.path("dst/existing")), b"keep");
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn fresh_destination_refuses_clear_inode_shortage() {
-    let t = Tmp::new();
-    write(&t.path("src/file"), b"payload");
-
-    let output = compat_command()
-        .args(["-a", &t.s("src/"), &t.s("dst"), "--no-progress"])
-        .env("SYQ_TEST_AVAILABLE_BYTES", "1048576")
-        .env("SYQ_TEST_AVAILABLE_INODES", "0")
-        .run()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("destination objects are required"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("0 inodes are available"), "{stderr}");
-    assert!(!t.path("dst").exists());
 }
 
 #[cfg(debug_assertions)]
@@ -163,7 +81,7 @@ fn fresh_destination_dry_run_reports_capacity_sanity_check() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn fresh_destination_dry_run_reports_insufficient_capacity() {
+fn fresh_destination_dry_run_reports_insufficient_capacity_as_advisory() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"payload");
 
@@ -173,15 +91,13 @@ fn fresh_destination_dry_run_reports_insufficient_capacity() {
         .run()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_output_ok(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("capacity: 7 B logical data required"),
         "{stdout}"
     );
-    assert!(stdout.contains("(insufficient)"), "{stdout}");
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("fresh destination capacity preflight failed"));
+    assert!(stdout.contains("(insufficient; estimate only)"), "{stdout}");
     assert!(!t.path("dst").exists());
 }
 
@@ -260,5 +176,56 @@ fn copy_local_disk_exdev_preserves_range_controls() {
         let observed = tuning_observed(&out);
         assert_eq!(observed["local_whole_files"], 0);
         assert!(observed["range_requests"].as_u64().unwrap() > 0);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn streaming_capacity_failure_keeps_completed_files_and_reports_abort() {
+    let t = Tmp::new();
+    for index in 0..6000 {
+        write(&t.path(&format!("src/tree/f{index:04}")), b"payload");
+    }
+    std::os::unix::fs::symlink("missing", t.path("src/tree/z-full")).unwrap();
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    write(&t.path("selection"), b"tree\n");
+    let mut child = compat_command()
+        .args([
+            "-rlpt",
+            "--files-from",
+            &t.s("selection"),
+            &t.s("src/"),
+            &t.s("dst/"),
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_PLANNED_BATCH_READY_FILE", &ready)
+        .env("SYQ_TEST_PLANNED_BATCH_CONTINUE_FILE", &continuation)
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "z-full")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "streaming first batch");
+    wait_for_confinement_marker(
+        &mut child,
+        &t.path("dst/tree/f0000"),
+        "completed file before scan ends",
+    );
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(read(&t.path("dst/tree/f0000")), b"payload");
+    assert!(!t.path("dst/tree/z-full").exists());
+    assert!(
+        stderr_of(&output).contains("No space left on device"),
+        "{}",
+        stderr_of(&output)
+    );
+    for entry in fs::read_dir(t.path("dst/tree")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().starts_with('f') {
+            assert_eq!(read(&entry.path()), b"payload");
+        }
     }
 }

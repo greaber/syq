@@ -1254,8 +1254,7 @@ fn small_push_refusals_and_failures_match_the_engine() {
         (operations, terminal)
     };
 
-    // An empty destination directory is fresh, so the capacity preflight
-    // applies; with no space reported, both refuse before writing anything.
+    // Capacity estimates do not block either real-copy implementation.
     for dir in ["cap-fast", "cap-engine"] {
         fs::create_dir_all(t.path(dir)).unwrap();
     }
@@ -1276,26 +1275,14 @@ fn small_push_refusals_and_failures_match_the_engine() {
         &sources,
         &["--into", &t.s("cap-engine")],
     );
-    assert_eq!(fast.status.code(), Some(1));
-    assert_eq!(engine.status.code(), Some(1));
-    for output in [&fast, &engine] {
-        assert!(
-            stderr_of(output).contains("fresh destination capacity preflight failed"),
-            "{}",
-            stderr_of(output)
-        );
-    }
-    assert!(
-        stderr_of(&fast).contains("capacity preflight would refuse"),
-        "{}",
-        stderr_of(&fast)
-    );
+    assert_output_ok(&fast);
+    assert_output_ok(&engine);
     assert_eq!(
         comparable(&fast_records, "cap-fast"),
         comparable(&engine_records, "cap-engine")
     );
     for dir in ["cap-fast", "cap-engine"] {
-        assert!(fs::read_dir(t.path(dir)).unwrap().next().is_none(), "{dir}");
+        assert!(fs::read_dir(t.path(dir)).unwrap().next().is_some(), "{dir}");
     }
 
     // A staging failure publishes no final files; the engine then reports
@@ -1954,10 +1941,10 @@ fn tuning_history_records_tcp_preflight_for_push_and_pull() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn local_copy_runs_while_later_validated_batches_are_still_being_planned() {
+fn local_copy_runs_before_source_scanning_finishes() {
     for existing in [false, true] {
         let t = Tmp::new();
-        for index in 0..4500 {
+        for index in 0..6000 {
             write(&t.path(&format!("src/tree/f{index:04}")), b"payload");
         }
         write(&t.path("selection"), b"tree\n");
@@ -1991,13 +1978,13 @@ fn local_copy_runs_while_later_validated_batches_are_still_being_planned() {
         );
         assert_eq!(read(&t.path("dst/tree/f0000")), b"payload");
         assert!(
-            !t.path("dst/tree/f4499").exists(),
+            !t.path("dst/tree/f5999").exists(),
             "later batch must still be unplanned"
         );
         release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
-        for index in 0..4500 {
+        for index in 0..6000 {
             assert_eq!(read(&t.path(&format!("dst/tree/f{index:04}"))), b"payload");
         }
     }
@@ -2005,7 +1992,7 @@ fn local_copy_runs_while_later_validated_batches_are_still_being_planned() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn local_pipeline_does_not_publish_before_capacity_preflight() {
+fn local_pipeline_does_not_refuse_a_pessimistic_capacity_estimate() {
     let t = Tmp::new();
     for index in 0..4 {
         write(&t.path(&format!("src/tree/f{index}")), b"payload");
@@ -2026,9 +2013,10 @@ fn local_pipeline_does_not_publish_before_capacity_preflight() {
         .env("SYQ_TEST_AVAILABLE_BYTES", "0")
         .run()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr_of(&output).contains("fresh destination capacity preflight failed"));
-    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+    assert_output_ok(&output);
+    for index in 0..4 {
+        assert_eq!(read(&t.path(&format!("dst/tree/f{index}"))), b"payload");
+    }
 }
 
 #[cfg(debug_assertions)]

@@ -437,9 +437,10 @@ in-place hole punches, especially with small comparison blocks. Unchanged files
 and reused blocks are not rewritten just to change their allocation. Descriptors, streams, S3, and command-restricted or
 receiving destinations reject this option.
 
-Sparse mode avoids full-size preallocation. Its fresh-destination capacity check
-still checks available inodes, but cannot predict required physical bytes from
-logical sizes; allocation can fail later if the destination fills up.
+Sparse mode avoids full-size preallocation. Its dry-run capacity estimate reports
+available inodes but cannot predict required physical bytes from logical sizes.
+Capacity estimates are advisory; allocation can fail during a copy if the
+destination fills up, leaving completed files in place and reporting the failure.
 
 ## Symlinks
 

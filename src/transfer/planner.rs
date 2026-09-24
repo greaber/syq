@@ -1,10 +1,5 @@
 use super::*;
 
-pub(super) fn path_has_partial_component(path: &[u8]) -> bool {
-    path.split(|&byte| byte == b'/')
-        .any(|part| is_partial_name(OsStr::from_bytes(part)))
-}
-
 pub(super) struct Planner<'a> {
     /// Bounded parent cache, only for newly created rsync leaves without -p.
     pub(super) default_permissions: std::collections::HashMap<PathBytes, u32>,
@@ -34,18 +29,8 @@ pub(super) struct Planner<'a> {
     /// The local destination was missing or empty at preflight. Its root may
     /// still have metadata to preserve; only descendants are known absent.
     pub(super) destination_children_known_missing: bool,
-    /// Mapped payload paths that look like current sidecars, and every
-    /// sidecar path the current job may use. Their intersection is unsafe.
-    /// Ordinary payload names cannot collide and do not need to stay in RAM.
-    pub(super) payload_paths: std::collections::HashMap<PathBytes, String>,
-    pub(super) sidecar_paths: std::collections::HashMap<PathBytes, String>,
-    /// Files whose destination cannot accommodate a safe sidecar name. They
-    /// fail individually while the rest of the scan and transfer continue.
-    pub(super) unusable_files: std::collections::HashSet<PathBytes>,
-    /// Payload paths inside the sidecar-looking namespace, mapped and claimed
-    /// like everything else but applied only after the collision preflight
-    /// over every source has passed (see finish_planning).
-    pub(super) deferred_payloads: Vec<Mapped>,
+    /// Called after jobs are queued; starts streaming only when useful work exists.
+    pub(super) start_streaming: &'a dyn Fn(),
     pub(super) source_partials: u64,
     pub(super) collision: bool,
     /// (dst path, meta, flags, depth, root condition) for directories,
@@ -94,7 +79,7 @@ pub(super) struct Planner<'a> {
     pub(super) guard_containers: bool,
     /// A missing retained operator directory: (request prefix, creation
     /// condition, whether it is the destination root). Create it only after
-    /// namespace and fresh-capacity preflight. Restricted transfers use the
+    /// final-destination conflict checks. Restricted transfers use the
     /// same slot only for their missing destination root.
     pub(super) create_root: Option<(PathBytes, TargetCondition, bool)>,
     pub(super) destination_anchor: &'a DestinationAnchorSlot,
@@ -362,7 +347,7 @@ impl Deletes {
 
 impl Planner<'_> {
     pub(super) fn record_fresh_entry(&mut self, dst: &[u8], entry: &Entry, new_object: bool) {
-        if !new_object {
+        if !new_object || self.fresh_capacity.is_none() {
             return;
         }
         let included = match entry.kind {
@@ -425,8 +410,7 @@ impl Planner<'_> {
         let Some(plan) = self.fresh_capacity.as_mut() else {
             return Ok(None);
         };
-        // Replay still uses the plan's presence to release preflighted local
-        // work. Keep that marker without retaining or cloning the scan's set.
+        // The completed estimate no longer needs the scan's hardlink set.
         plan.hardlink_inodes = Default::default();
         if plan.overflowed {
             return Err(std::io::Error::from_raw_os_error(libc::ENOSPC)).context(
@@ -634,6 +618,7 @@ impl Planner<'_> {
         // What the planner has been given for each path (Dir or not).
         let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
         let mut recursed: HashSet<PathBytes> = HashSet::new();
+        let mut completed_subtrees: HashSet<PathBytes> = HashSet::new();
         let ancestors = |line: &[u8]| -> Vec<PathBytes> {
             line.iter()
                 .enumerate()
@@ -764,8 +749,71 @@ impl Planner<'_> {
             }
             self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
             self.handle_batch(batch, src_root, b"", dst_root)?;
+            if subtrees.len() > 1 {
+                let selected: HashSet<&[u8]> = subtrees.iter().map(Vec::as_slice).collect();
+                let disjoint = subtrees.iter().all(|rel| {
+                    ancestors(rel)
+                        .iter()
+                        .all(|ancestor| !selected.contains(ancestor.as_slice()))
+                });
+                if disjoint {
+                    subtrees.retain(|rel| {
+                        !ancestors(rel)
+                            .iter()
+                            .any(|a| completed_subtrees.contains(a))
+                    });
+                    let progress = self.progress;
+                    let warned = std::cell::Cell::new(false);
+                    let source = self
+                        .active_source
+                        .as_ref()
+                        .context("registered source reference was not initialized")?
+                        .clone();
+                    let scanned = src.scan_selected(
+                        &source,
+                        &subtrees,
+                        &mut |batch| {
+                            let batch: Vec<_> = batch
+                                .into_iter()
+                                .filter(|e| {
+                                    if emitted.contains_key(&e.path) {
+                                        false
+                                    } else {
+                                        emitted.insert(e.path.clone(), e.kind);
+                                        true
+                                    }
+                                })
+                                .collect();
+                            self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+                            self.handle_batch(batch, src_root, b"", dst_root)
+                        },
+                        &mut |w| {
+                            warned.set(true);
+                            progress.error(&format!("syq: {w}"));
+                        },
+                    );
+                    self.scan_warned |= warned.get();
+                    if scanned? {
+                        if !self.scan_warned {
+                            completed_subtrees.extend(subtrees);
+                        }
+                        continue;
+                    }
+                }
+            }
             for rel in subtrees {
+                if ancestors(&rel)
+                    .iter()
+                    .any(|ancestor| completed_subtrees.contains(ancestor))
+                {
+                    continue;
+                }
                 self.scan_subtree(src, src_root, &rel, dst_root, &mut emitted)?;
+                // A partial walk may miss a readable, explicitly selected
+                // child. After a scan warning, keep walking later selections.
+                if !self.scan_warned {
+                    completed_subtrees.insert(rel);
+                }
             }
         }
         Ok(())
@@ -1056,66 +1104,53 @@ impl Planner<'_> {
         {
             bail!("hardlink preservation currently supports regular files only; the source contains a multiply linked non-regular file");
         }
-        let namespace_files = self.collect_namespace_files(&batch, src_root, sub, dst_root);
-        if !namespace_files.is_empty() {
-            self.sched.anticipate_file_work();
-        }
-        if self.collision {
-            return Ok(());
-        }
-        // Payloads inside the sidecar-looking namespace are mapped and claimed
-        // now, like everything else, but applied only once the preflight over
-        // every source has passed.
-        let mut immediate = Vec::with_capacity(batch.len());
-        let mut deferred = Vec::new();
-        for entry in batch {
-            let dst_rel = join(sub, &entry.path);
-            let reserved_leaf = dst_rel.is_empty()
-                && entry.kind != Kind::Dir
-                && dst_root
+        // Temporary names include a fresh invocation nonce. They are created
+        // exclusively by the receiver, not reserved in a whole-copy index.
+        for entry in &batch {
+            if self.entry_is_payload(entry) {
+                let name = if entry.path.is_empty() {
+                    src_root
+                } else {
+                    &entry.path
+                };
+                if name
                     .rsplit(|&byte| byte == b'/')
                     .next()
-                    .is_some_and(|name| is_partial_name(OsStr::from_bytes(name)));
-            if reserved_leaf || path_has_partial_component(&dst_rel) {
-                deferred.push(entry);
-            } else {
-                immediate.push(entry);
+                    .is_some_and(|name| is_partial_name(OsStr::from_bytes(name)))
+                {
+                    self.source_partials += 1;
+                }
             }
         }
-        let mut mapped = self.map_batch(immediate, src_root, sub, dst_root);
-        self.register_namespace(namespace_files, &mut mapped)?;
+        if batch
+            .iter()
+            .any(|entry| entry.kind == Kind::File && self.entry_is_payload(entry))
+        {
+            self.sched.anticipate_file_work();
+        }
+        let mut mapped = self.map_batch(batch, src_root, sub, dst_root);
         if self.collision {
             return Ok(());
         }
+        self.inspect_destination_batch(&mut mapped)?;
         match &mut self.buffer {
             Some(buf) => buf.push(mapped),
             None => self.apply_mapped(mapped)?,
         }
-        if !deferred.is_empty() {
-            let mapped = self.map_batch(deferred, src_root, sub, dst_root);
-            self.deferred_payloads.push(mapped);
+        (self.start_streaming)();
+        #[cfg(debug_assertions)]
+        if self.progress.files_total.load(Relaxed) >= STREAMING_START_FILES as u64 {
+            crate::fsops::test_race_barrier(
+                "SYQ_TEST_PLANNED_BATCH_READY_FILE",
+                "SYQ_TEST_PLANNED_BATCH_CONTINUE_FILE",
+                "streaming planning batch",
+            )?;
         }
         Ok(())
     }
 
-    /// All sources scanned and the sidecar namespace preflight passed: add
-    /// deferred payloads to the buffer. The caller runs the fresh-target
-    /// capacity check before replaying that buffer. The directory and mapping
-    /// sets released by retire_planning_state remain live through replay,
-    /// because applying buffered entries still consults them.
     pub(super) fn finish_planning(&mut self) -> Result<()> {
-        // Every source has passed the sidecar collision preflight. Applying
-        // buffered entries does not consult these indexes; release them before
-        // the scheduler grows so their allocations can be reused for jobs.
-        self.payload_paths = std::collections::HashMap::new();
-        self.sidecar_paths = std::collections::HashMap::new();
-        let deferred = std::mem::take(&mut self.deferred_payloads);
-        if let Some(buf) = &mut self.buffer {
-            buf.extend(deferred);
-        } else {
-            for m in deferred {
-                self.apply_mapped(m)?;
-            }
+        if self.buffer.is_none() {
             self.retire_planning_state();
         }
         Ok(())
@@ -1138,7 +1173,6 @@ impl Planner<'_> {
         self.mapping_explicit_parents = std::collections::HashSet::new();
         self.blocked_mapping_parents = std::collections::HashSet::new();
         self.blocked_directory_paths = std::collections::HashSet::new();
-        self.unusable_files = std::collections::HashSet::new();
         // Dry-run traces need every directory identity. Live copies only need
         // identities for deferred metadata failures; retire the leaf mappings.
         if self.mapping_mode && !self.opts.dry_run {
@@ -1434,14 +1468,6 @@ impl Planner<'_> {
         before_apply();
         for m in buffered {
             self.apply_mapped(m)?;
-            #[cfg(debug_assertions)]
-            if !self.sched.jobs.lock().unwrap().is_empty() {
-                crate::fsops::test_race_barrier(
-                    "SYQ_TEST_PLANNED_BATCH_READY_FILE",
-                    "SYQ_TEST_PLANNED_BATCH_CONTINUE_FILE",
-                    "buffered planning batch",
-                )?;
-            }
         }
         if !self.collision {
             self.finish_hardlink_planning()?;
@@ -1553,8 +1579,7 @@ impl Planner<'_> {
                         && !((opts.existing || opts.ignore_existing)
                             && self.under_missing_dir(&p.dst, dst_root))
                         && !(p.e.kind == Kind::File
-                            && (self.unusable_files.contains(&p.dst)
-                                || opts.max_size.is_some_and(|m| p.e.size > m)
+                            && (opts.max_size.is_some_and(|m| p.e.size > m)
                                 || opts.min_size.is_some_and(|m| p.e.size < m)))
                         && existing.as_ref().is_none_or(|d| {
                             d.kind != p.e.kind || (p.e.kind != Kind::File && d.rdev != p.e.rdev)
@@ -1671,10 +1696,6 @@ impl Planner<'_> {
             e,
             contested,
         } = leaf;
-        if self.unusable_files.contains(&dst_path) {
-            // register_namespace reported it; nothing can stage here.
-            return;
-        }
         // Never copy a file onto itself (same path, hardlink, or a
         // symlinked alias) — with --inplace that would truncate the
         // source. Only possible when both ends are the same machine.
@@ -2625,169 +2646,67 @@ impl Planner<'_> {
         Ok(())
     }
 
-    pub(super) fn collect_namespace_files(
-        &mut self,
-        batch: &[Entry],
-        src_root: &[u8],
-        sub: &[u8],
-        dst_root: &[u8],
-    ) -> Vec<(PathBytes, String)> {
-        let mut files = Vec::new();
-        for entry in batch {
-            if !self.entry_is_payload(entry) {
-                continue;
-            }
-            let source_name = if entry.path.is_empty() {
-                src_root
-                    .rsplit(|&byte| byte == b'/')
-                    .next()
-                    .unwrap_or(src_root)
-            } else {
-                entry
-                    .path
-                    .rsplit(|&byte| byte == b'/')
-                    .next()
-                    .unwrap_or(&entry.path)
-            };
-            if is_partial_name(OsStr::from_bytes(source_name)) {
-                self.source_partials += 1;
-            }
-            let dst_rel = join(sub, &entry.path);
-            let dst_path = join(dst_root, &dst_rel);
-            let rel = self.rel_name(src_root, sub, &entry.path);
-            let reserved_payload = dst_path
-                .rsplit(|&byte| byte == b'/')
-                .next()
-                .is_some_and(|name| is_partial_name(OsStr::from_bytes(name)));
-            if reserved_payload {
-                let reservation = crate::fsops::partial_reservation_key(&dst_path);
-                if let Some(owner) = self.sidecar_paths.get(&reservation) {
-                    self.progress.error(&format!(
-                        "syq: source payload {rel} maps to {}, which is the reserved sidecar for {owner}",
-                        display(&dst_path)
-                    ));
-                    self.collision = true;
-                }
-                self.payload_paths.entry(reservation).or_insert(rel.clone());
-            }
-            if entry.kind == Kind::File && !self.opts.inplace {
-                files.push((dst_path, rel));
-            }
-        }
-        files
-    }
-
-    pub(super) fn register_namespace(
-        &mut self,
-        files: Vec<(PathBytes, String)>,
-        mapped: &mut Mapped,
-    ) -> Result<()> {
-        if files.is_empty() {
+    fn inspect_destination_batch(&mut self, mapped: &mut Mapped) -> Result<()> {
+        // Keep the remote receiver's combined metadata lookup, but no longer
+        // ask it to compute temporary names for every source file.
+        if self.opts.expressions.update.is_some()
+            || self.opts.inode_preservation.any()
+            || !self.opts.dst_remote
+            || self.buffer.is_some()
+            || self.opts.dry_run
+            || self.destination_tree_known_missing
+            || self.destination_children_known_missing
+            || self.container_guard.is_some()
+        {
             return Ok(());
         }
-        // Several sources are replayed only after every collision check, and
-        // dry runs may need a depth-by-depth virtual overlay. Keep their stats
-        // at the existing application point rather than caching stale or
-        // unsafe observations. Sidecar resolution still uses this request.
-        let pre_stat = self.opts.expressions.update.is_none()
-            && !self.opts.inode_preservation.any()
-            && self.opts.dst_remote
-            && self.buffer.is_none()
-            && !self.opts.dry_run
-            && !self.destination_tree_known_missing
-            && !self.destination_children_known_missing
-            && self.container_guard.is_none();
-        let directories: Vec<PathBytes> = if pre_stat {
-            mapped
-                .dirs
-                .iter()
-                .map(|(path, _, _)| path.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let other_paths: Vec<PathBytes> = if pre_stat {
-            mapped
-                .others
-                .iter()
-                .map(|planned| planned.dst.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        // Sidecar resolution already costs a receiver turn for ordinary file
-        // copies. Include the destination inspection in that same turn; the
-        // receiver omits leaf stats when directory repair must happen first.
-        let partial_paths = files.iter().map(|(path, _)| path.clone()).collect();
-        let (sidecars, dir_stats, other_stats) = if pre_stat {
-            let response = self.dst.call(Request::PlanBatch {
-                partial_paths,
+        let directories: Vec<_> = mapped
+            .dirs
+            .iter()
+            .map(|(path, _, _)| path.clone())
+            .collect();
+        let others: Vec<_> = mapped
+            .others
+            .iter()
+            .map(|planned| planned.dst.clone())
+            .collect();
+        if directories.is_empty() && others.is_empty() {
+            return Ok(());
+        }
+        match ok(
+            self.dst.call(Request::PlanBatch {
+                partial_paths: Vec::new(),
                 copy_id: self.opts.copy_id,
                 directories: directories.clone(),
-                others: other_paths.clone(),
-                guard: self.container_guard.clone(),
-            })?;
-            match ok(response, "plan destination batch")? {
-                Response::BatchPlan {
-                    partial_paths,
-                    directories: dir_stats,
-                    others: other_stats,
-                } if partial_paths.len() == files.len()
-                    && dir_stats.len() == directories.len()
-                    && other_stats
-                        .as_ref()
-                        .is_none_or(|stats| stats.len() == other_paths.len()) =>
-                {
-                    (partial_paths, dir_stats, other_stats)
+                others: others.clone(),
+                guard: None,
+            })?,
+            "plan destination batch",
+        )? {
+            Response::BatchPlan {
+                partial_paths,
+                directories: dir_stats,
+                others: other_stats,
+            } if partial_paths.is_empty()
+                && dir_stats.len() == directories.len()
+                && other_stats
+                    .as_ref()
+                    .is_none_or(|stats| stats.len() == others.len()) =>
+            {
+                self.progress.observe_destination_devices(
+                    dir_stats
+                        .iter()
+                        .flatten()
+                        .chain(other_stats.iter().flatten().flatten()),
+                );
+                mapped.dir_stats = Some(dir_stats);
+                if let Some(stats) = other_stats {
+                    mapped.other_stats = Some(others.into_iter().zip(stats).collect());
                 }
-                other => bail!("unexpected response {other:?}"),
+                Ok(())
             }
-        } else {
-            (self.partial_paths(partial_paths)?, Vec::new(), None)
-        };
-        if pre_stat {
-            self.progress.observe_destination_devices(
-                dir_stats
-                    .iter()
-                    .flatten()
-                    .chain(other_stats.iter().flatten().flatten()),
-            );
-            mapped.dir_stats = Some(dir_stats);
-            if let Some(stats) = other_stats {
-                mapped.other_stats = Some(other_paths.into_iter().zip(stats).collect());
-            }
+            other => bail!("unexpected response {other:?}"),
         }
-        for ((dst_path, file_rel), sidecar) in files.into_iter().zip(sidecars) {
-            let sidecar = match sidecar {
-                Ok(sidecar) => sidecar,
-                Err(error) => {
-                    self.progress.error(&format!(
-                        "syq: {file_rel}: cannot create a safe sidecar beside {}: {error}",
-                        display(&dst_path)
-                    ));
-                    self.unusable_files.insert(dst_path);
-                    continue;
-                }
-            };
-            let reservation = crate::fsops::partial_reservation_key(&sidecar);
-            if let Some(payload_rel) = self.payload_paths.get(&reservation) {
-                self.progress.error(&format!(
-                    "syq: source payload {payload_rel} maps to {}, which is the reserved sidecar for {file_rel}",
-                    display(&sidecar)
-                ));
-                self.collision = true;
-            }
-            if let Some(other) = self.sidecar_paths.insert(reservation, file_rel.clone()) {
-                if other != file_rel {
-                    self.progress.error(&format!(
-                        "syq: {other} and {file_rel} require the same sidecar {}",
-                        display(&sidecar)
-                    ));
-                    self.collision = true;
-                }
-            }
-        }
-        Ok(())
     }
 
     pub(super) fn entry_is_payload(&self, entry: &Entry) -> bool {
@@ -3609,23 +3528,6 @@ impl Planner<'_> {
             }
         }
         Ok(results)
-    }
-
-    pub(super) fn partial_paths(
-        &mut self,
-        paths: Vec<PathBytes>,
-    ) -> Result<Vec<std::result::Result<PathBytes, String>>> {
-        match ok(
-            self.dst.call(Request::PartialPaths {
-                paths,
-                copy_id: self.opts.copy_id,
-                guard: None,
-            })?,
-            "compute sidecar paths",
-        )? {
-            Response::PathResults(paths) => Ok(paths),
-            other => bail!("unexpected response {other:?}"),
-        }
     }
 
     pub(super) fn apply(&mut self, mut ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {

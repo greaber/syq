@@ -1390,45 +1390,50 @@ fn long_basename_partial_is_truncated_and_retry_copies_correctly() {
 
 #[test]
 fn impossible_sidecar_name_fails_one_file_and_continues() {
-    let t = Tmp::new();
-    let mut deep = PathBuf::new();
-    let target_parent_len = libc::PATH_MAX as usize - 20;
-    loop {
-        let current = t
-            .path("dst")
-            .join(&deep)
-            .as_os_str()
-            .as_encoded_bytes()
-            .len();
-        if current >= target_parent_len {
-            break;
+    for empty_destination in [false, true] {
+        let t = Tmp::new();
+        if empty_destination {
+            fs::create_dir(t.path("dst")).unwrap();
         }
-        let component_len = (target_parent_len - current - 1).min(200);
-        assert!(component_len > 0);
-        deep.push("d".repeat(component_len));
+        let mut deep = PathBuf::new();
+        let target_parent_len = libc::PATH_MAX as usize - 20;
+        loop {
+            let current = t
+                .path("dst")
+                .join(&deep)
+                .as_os_str()
+                .as_encoded_bytes()
+                .len();
+            if current >= target_parent_len {
+                break;
+            }
+            let component_len = (target_parent_len - current - 1).min(200);
+            assert!(component_len > 0);
+            deep.push("d".repeat(component_len));
+        }
+        assert!(
+            t.path("dst")
+                .join(&deep)
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                >= target_parent_len
+        );
+
+        write(&t.path("src/good"), b"copied");
+        write(
+            &t.path("src").join(&deep).join("x"),
+            b"cannot fit a sidecar",
+        );
+
+        let output = syq(&["-a", &t.s("src/"), &t.s("dst/")]);
+
+        assert_eq!(output.status.code(), Some(23));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("cannot create a partial"), "{stderr}");
+        assert_eq!(read(&t.path("dst/good")), b"copied");
+        assert!(!t.path("dst").join(deep).join("x").exists());
     }
-    assert!(
-        t.path("dst")
-            .join(&deep)
-            .as_os_str()
-            .as_encoded_bytes()
-            .len()
-            >= target_parent_len
-    );
-
-    write(&t.path("src/good"), b"copied");
-    write(
-        &t.path("src").join(&deep).join("x"),
-        b"cannot fit a sidecar",
-    );
-
-    let output = syq(&["-a", &t.s("src/"), &t.s("dst/")]);
-
-    assert_eq!(output.status.code(), Some(23));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("cannot create a safe sidecar"), "{stderr}");
-    assert_eq!(read(&t.path("dst/good")), b"copied");
-    assert!(!t.path("dst").join(deep).join("x").exists());
 }
 
 #[cfg(debug_assertions)]

@@ -143,7 +143,7 @@ fn sparse_updates_and_inplace_clear_old_nonzero_data() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn sparse_capacity_uses_inode_check_without_logical_byte_refusal() {
+fn sparse_capacity_estimates_are_advisory_and_report_unknown_allocation() {
     let t = Tmp::new();
     let data = sparse_data();
     write_sparse_source(&t.path("src/file"), &data);
@@ -162,9 +162,9 @@ fn sparse_capacity_uses_inode_check_without_logical_byte_refusal() {
         .env("SYQ_TEST_AVAILABLE_INODES", "0")
         .run()
         .unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("destination objects are required"));
-    assert!(!t.path("dst").exists());
+    assert_output_ok(&out);
+    assert_sparse_copy(&t.path("dst/file"), &data);
+    fs::remove_dir_all(t.path("dst")).unwrap();
     let out = compat_command()
         .args(["-aS", &t.s("src/"), &t.s("dst")])
         .env("SYQ_TEST_AVAILABLE_BYTES", "1")

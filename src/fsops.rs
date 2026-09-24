@@ -830,35 +830,6 @@ impl FsOps {
                 })
             })
             .collect();
-        // The engine's fresh-destination capacity preflight, on the retained
-        // selection. An exact target whose leaf is absent is fresh; a
-        // directory is fresh only while it is empty. A filesystem that cannot
-        // report its capacity is no reason to refuse, as for the engine.
-        let exact = request.identity.dst_leaf.is_some();
-        self.operator_selection = Some(selection);
-        let info = self.destination_filesystem_info(!exact, None).ok();
-        let fresh = (exact && destinations[0].is_none())
-            || info.as_ref().is_some_and(|info| info.empty == Some(true));
-        if let Some(info) = info.filter(|_| fresh) {
-            let assessment = crate::copy_policy::FreshCapacityAssessment {
-                logical_bytes: total,
-                check_bytes: true,
-                objects: request.files.len() as u64,
-                available_bytes: info.available_bytes,
-                available_inodes: info.available_inodes,
-            };
-            if !assessment.sufficient() {
-                self.operator_selection = None;
-                return Ok(Response::SmallFilesCopied(SmallCopyResponse {
-                    anchor,
-                    outcome: SmallCopyOutcome::CapacityShort,
-                }));
-            }
-        }
-        let selection = self
-            .operator_selection
-            .take()
-            .expect("selection retained for the capacity preflight");
         let ticket = self.descriptor_session.register(selection.directory)?;
         let directory = self.descriptor_session.acquire(&ticket)?;
         self.install_destination(directory, &request.request_prefix)?;
@@ -1709,34 +1680,7 @@ impl FsOps {
         let Some(prefix) = self.destination_prefix.as_deref() else {
             return Ok(path.to_vec());
         };
-        let relative = if prefix == b"." {
-            if path == b"." {
-                b"".as_slice()
-            } else if path.starts_with(b"/") {
-                bail!("destination path is outside the retained root");
-            } else {
-                path.strip_prefix(b"./").unwrap_or(path)
-            }
-        } else if path == prefix {
-            b"".as_slice()
-        } else if prefix == b"/" {
-            path.strip_prefix(b"/")
-                .context("destination path is outside the retained root")?
-        } else {
-            path.strip_prefix(prefix)
-                .and_then(|suffix| suffix.strip_prefix(b"/"))
-                .context("destination path is outside the retained root")?
-        };
-        if relative.starts_with(b"/")
-            || relative.contains(&0)
-            || relative.split(|byte| *byte == b'/').any(|component| {
-                !relative.is_empty()
-                    && (component.is_empty() || component == b"." || component == b"..")
-            })
-        {
-            bail!("destination path contains an unsafe relative component");
-        }
-        Ok(relative.to_vec())
+        destination_relative_to(prefix, path)
     }
 
     fn destination_full(&self, relative: &[u8]) -> PathBytes {

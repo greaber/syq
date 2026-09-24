@@ -237,21 +237,6 @@ pub fn is_recovery_name(name: &OsStr) -> bool {
     decimal(fields.next()) && decimal(fields.next()) && fields.next().is_none()
 }
 
-/// Identify a temporary-name reservation independently of its readable prefix.
-/// The opaque suffix already includes the complete destination spelling and
-/// copy identity. Reserving it covers every shorter spelling after a rejected
-/// filename without another filesystem lookup during collision preflight.
-pub(crate) fn partial_reservation_key(path: &[u8]) -> Vec<u8> {
-    let parent_end = path
-        .iter()
-        .rposition(|&byte| byte == b'/')
-        .map_or(0, |at| at + 1);
-    debug_assert!(is_partial_name(OsStr::from_bytes(&path[parent_end..])));
-    let mut key = path[..parent_end].to_vec();
-    key.extend_from_slice(&path[path.len() - 16..]);
-    key
-}
-
 pub fn is_partial_name(name: &OsStr) -> bool {
     let name = name.as_bytes();
     name.starts_with(b".")
@@ -298,4 +283,36 @@ pub fn normalize(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Apply the installed destination prefix without changing its spelling.
+pub(crate) fn destination_relative_to(prefix: &[u8], path: &[u8]) -> Result<PathBytes> {
+    let relative = if prefix == b"." {
+        if path == b"." {
+            b"".as_slice()
+        } else if path.starts_with(b"/") {
+            bail!("destination path is outside the retained root");
+        } else {
+            path.strip_prefix(b"./").unwrap_or(path)
+        }
+    } else if path == prefix {
+        b"".as_slice()
+    } else if prefix == b"/" {
+        path.strip_prefix(b"/")
+            .context("destination path is outside the retained root")?
+    } else {
+        path.strip_prefix(prefix)
+            .and_then(|suffix| suffix.strip_prefix(b"/"))
+            .context("destination path is outside the retained root")?
+    };
+    if relative.starts_with(b"/")
+        || relative.contains(&0)
+        || relative.split(|byte| *byte == b'/').any(|component| {
+            !relative.is_empty()
+                && (component.is_empty() || component == b"." || component == b"..")
+        })
+    {
+        bail!("destination path contains an unsafe relative component");
+    }
+    Ok(relative.to_vec())
 }

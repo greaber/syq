@@ -155,14 +155,14 @@ pub(super) fn print_dry_run_summary(
         );
         if !capacity.check_bytes {
             crate::output::human_stdout!(
-                "  capacity: {} logical data; sparse allocation size unknown; {} available; {inode_detail} ({})",
+                "  capacity: {} logical data; sparse allocation size unknown; {} available; {inode_detail} ({}; estimate only)",
                 human(capacity.logical_bytes),
                 human(capacity.available_bytes),
                 if capacity.inode_shortage() { "insufficient inodes" } else { "byte capacity not preflighted" }
             );
         } else {
             crate::output::human_stdout!(
-                "  capacity: {} logical data required; {} available; {inode_detail} ({})",
+                "  capacity: {} logical data required; {} available; {inode_detail} ({}; estimate only)",
                 human(capacity.logical_bytes),
                 human(capacity.available_bytes),
                 if capacity.sufficient() {
