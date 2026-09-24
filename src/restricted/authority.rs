@@ -2562,6 +2562,7 @@ impl RestrictedAuthority {
             | Request::ShrinkReadStream { .. }
             | Request::StopReadStream
             | Request::ReadSmallBatch(_)
+            | Request::PrepareSmallFiles(_)
             | Request::CopySmallFiles(_) => {
                 bail!("request is not valid on a command-restricted destination")
             }

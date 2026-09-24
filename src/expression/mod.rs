@@ -96,7 +96,7 @@ impl Field {
 
 /// Metadata already acquired by the copy path. Missing fields are distinct
 /// from zero values; a failed metadata read must be reported by the caller.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct File {
     pub exists: bool,
     pub kind: Option<Kind>,

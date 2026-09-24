@@ -105,6 +105,7 @@ impl Conn for LocalConn {
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }
+                    | Request::PrepareSmallFiles(_)
                     | Request::CopySmallFiles(_)
                     | Request::PruneLookup { .. }
                     | Request::Receipt

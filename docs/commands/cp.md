@@ -203,16 +203,13 @@ empty directories. Move or remove the conflicting destination before retrying.
 Other replacements can fail if the filesystem lacks the operation needed to
 replace an entry safely; the old entry is kept.
 
-## Capacity checks
+<a id="capacity-checks"></a>
+
+## Copying and failures
 
 Syq can copy files while it scans the source. If scanning or copying fails,
 completed files remain and the command reports failure. Retrying can reuse
 completed files and resumable partials.
-
-A dry run estimates available bytes and capacity for new files at missing or
-empty filesystem destinations. This estimate is advisory: it reserves no space
-and does not account for every filesystem allocation or concurrent writer.
-Actual allocation errors fail the affected copy.
 
 ## Metadata details
 

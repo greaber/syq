@@ -423,7 +423,17 @@ fn is_superuser() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+struct PreparedSmallCopy {
+    request: SmallCopyRequest,
+    anchor: DirectoryAnchor,
+    root: Arc<Root>,
+    destinations: Vec<Option<libc::stat>>,
+    permitted: Vec<bool>,
+    unchanged: Vec<bool>,
+}
+
 pub struct FsOps {
+    prepared_small_copy: Option<PreparedSmallCopy>,
     inode_preservation: crate::inode_metadata::Selection,
     sparse: bool,
     descriptor_copy: crate::descriptor_copy::Session,
@@ -624,6 +634,7 @@ impl FsOps {
             held_basis: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),
+            prepared_small_copy: None,
             operator_selection: None,
             descriptor_session,
             source_roots: HashMap::new(),
@@ -742,11 +753,11 @@ impl FsOps {
         Ok(ticket)
     }
 
-    /// Select and retain the destination once, quick-check regular files,
-    /// then stage and publish changed content through the normal rooted path.
+    /// Configure hashing and retain the destination and metadata observations.
+    /// Rejected and quick-checked entries never need source payload reads.
     /// Unsupported target types decline before installing session state.
     #[allow(clippy::unnecessary_cast)] // libc stat field widths differ on Darwin.
-    fn copy_small_files(&mut self, request: &SmallCopyRequest) -> Result<Response> {
+    fn prepare_small_files(&mut self, request: &SmallCopyRequest) -> Result<Response> {
         if self.operator_selection.is_some()
             || self.destination_root.is_some()
             || self.destination_prefix.is_some()
@@ -763,12 +774,7 @@ impl FsOps {
         let mut total = 0u64;
         let mut names: Vec<&[u8]> = Vec::with_capacity(request.files.len());
         for file in &request.files {
-            if self.hash_policy.transfer_integrity
-                && self.observed_payload_hash(&file.data) != file.hash
-            {
-                bail!("block hash mismatch on receive");
-            }
-            let bytes = file.data.len() as u64;
+            let bytes = file.size;
             if bytes > SMALL_COPY_MAX_FILE_BYTES {
                 bail!("small copy file exceeds {SMALL_COPY_MAX_FILE_BYTES} bytes");
             }
@@ -782,7 +788,14 @@ impl FsOps {
             }
             names.push(name);
         }
-        let copy_id = request.identity.copy_id;
+        self.hash_policy = request.hash_policy;
+        let condition = request
+            .copy_if
+            .as_ref()
+            .map(|(text, _)| {
+                crate::expression::Expression::compile(text, true).context("--copy-if")
+            })
+            .transpose()?;
 
         let (selection, anchor) =
             select_operator_directory(&request.directory, false, request.symlink_policy)?;
@@ -812,28 +825,143 @@ impl FsOps {
                 }
             }
         }
-        // This fused path serves native copies: share the planner's inferred
-        // destination precision so dispatch does not change the skip decision.
-        let mut unchanged: Vec<bool> = request
+        // Evaluate against the same observations used for comparison, before
+        // staging any content or repairing any destination metadata.
+        let permitted: Vec<bool> = request
             .files
             .iter()
             .zip(&destinations)
-            .map(|(file, stat)| {
-                stat.as_ref().is_some_and(|stat| {
-                    request.flags & flags::TIMES != 0
-                        && stat.st_size as u64 == file.data.len() as u64
-                        && stat.st_mtime == file.meta.mtime
-                        && destination_fraction_matches(
-                            file.meta.mtime_nsec,
-                            stat.st_mtime_nsec as u32,
-                        )
-                })
+            .zip(&names)
+            .map(|((file, stat), name)| -> Result<bool> {
+                let Some(expression) = &condition else {
+                    return Ok(true);
+                };
+                let (source, source_path) = file
+                    .expression_source
+                    .as_ref()
+                    .context("small copy condition requires source metadata")?;
+                let destination = stat
+                    .as_ref()
+                    .map(|stat| crate::expression::File {
+                        exists: true,
+                        kind: Some(Kind::File),
+                        size: Some(stat.st_size as u64),
+                        mtime: Some((stat.st_mtime as i64, stat.st_mtime_nsec as u32)),
+                        ctime: Some((stat.st_ctime as i64, stat.st_ctime_nsec as u32)),
+                        s3_last_modified: None,
+                        mode: Some(stat.st_mode as u32 & 0o7777),
+                        uid: Some(stat.st_uid),
+                        gid: Some(stat.st_gid),
+                        device: Some(stat.st_dev as u64),
+                        inode: Some(stat.st_ino as u64),
+                        nlink: Some(stat.st_nlink as u64),
+                        link_target: None,
+                    })
+                    .unwrap_or_default();
+                expression
+                    .evaluate(
+                        source,
+                        source_path,
+                        &destination,
+                        name,
+                        request.copy_if.as_ref().unwrap().1,
+                    )
+                    .context("--copy-if")
+            })
+            .collect::<Result<_>>()?;
+        // This fused path serves native copies: share the planner's inferred
+        // destination precision so dispatch does not change the skip decision.
+        let unchanged: Vec<bool> = request
+            .files
+            .iter()
+            .zip(&destinations)
+            .zip(&permitted)
+            .map(|((file, stat), permitted)| {
+                !permitted
+                    || stat.as_ref().is_some_and(|stat| {
+                        request.flags & flags::TIMES != 0
+                            && stat.st_size as u64 == file.size
+                            && stat.st_mtime == file.meta.mtime
+                            && destination_fraction_matches(
+                                file.meta.mtime_nsec,
+                                stat.st_mtime_nsec as u32,
+                            )
+                    })
             })
             .collect();
         let ticket = self.descriptor_session.register(selection.directory)?;
         let directory = self.descriptor_session.acquire(&ticket)?;
         self.install_destination(directory, &request.request_prefix)?;
 
+        let needed = unchanged
+            .iter()
+            .map(|unchanged| !unchanged)
+            .collect::<Vec<_>>();
+        self.prepared_small_copy = Some(PreparedSmallCopy {
+            request: request.clone(),
+            anchor,
+            root: self.destination_root.as_ref().unwrap().clone(),
+            destinations,
+            permitted,
+            unchanged,
+        });
+        if needed.iter().any(|needed| *needed) {
+            Ok(Response::SmallFilesPrepared(needed))
+        } else {
+            // An all-rejected/quick-checked batch completes in this first turn.
+            self.copy_small_files(&[])
+        }
+    }
+
+    #[allow(clippy::unnecessary_cast)] // libc stat field widths differ on Darwin.
+    fn copy_small_files(&mut self, payloads: &[SmallCopyPayload]) -> Result<Response> {
+        let PreparedSmallCopy {
+            request,
+            anchor,
+            root,
+            destinations,
+            permitted,
+            mut unchanged,
+        } = self
+            .prepared_small_copy
+            .take()
+            .context("small copy was not prepared")?;
+        if !self
+            .destination_root
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &root))
+            || self.hash_policy != request.hash_policy
+        {
+            bail!("small copy session changed after preparation");
+        }
+        let copy_id = request.identity.copy_id;
+        let mut data: Vec<Option<&[u8]>> = vec![None; request.files.len()];
+        for payload in payloads {
+            let index = payload.index as usize;
+            let file = request
+                .files
+                .get(index)
+                .context("small copy payload index is out of bounds")?;
+            if unchanged[index] || data[index].is_some() {
+                bail!("unexpected or duplicate small copy payload");
+            }
+            if payload.data.len() as u64 != file.size {
+                bail!("small copy payload size differs from its offer");
+            }
+            if self.hash_policy.transfer_integrity
+                && self.observed_payload_hash(&payload.data) != payload.hash
+            {
+                bail!("block hash mismatch on receive");
+            }
+            data[index] = Some(&payload.data);
+        }
+        if unchanged
+            .iter()
+            .zip(&data)
+            .any(|(unchanged, data)| !unchanged && data.is_none())
+        {
+            bail!("small copy is missing a requested payload");
+        }
         // Existing files with different mtimes may still have identical
         // content. Compare one bounded block locally, as the worker does,
         // without another data connection or a rewrite of the destination.
@@ -843,7 +971,7 @@ impl FsOps {
             if unchanged[i]
                 || destinations[i]
                     .as_ref()
-                    .is_none_or(|stat| stat.st_size as u64 != file.data.len() as u64)
+                    .is_none_or(|stat| stat.st_size as u64 != file.size)
             {
                 continue;
             }
@@ -862,14 +990,14 @@ impl FsOps {
                         ino: stat.st_ino as u64,
                     },
                 )?;
-                let mut bytes = Vec::with_capacity(file.data.len());
+                let mut bytes = Vec::with_capacity(file.size as usize);
                 Read::by_ref(&mut opened)
-                    .take(file.data.len() as u64 + 1)
+                    .take(file.size + 1)
                     .read_to_end(&mut bytes)?;
-                if bytes.len() != file.data.len() {
+                if bytes.len() as u64 != file.size {
                     return Ok(None);
                 }
-                Ok((bytes == file.data).then_some((target, opened)))
+                Ok((bytes.as_slice() == data[i].unwrap()).then_some((target, opened)))
             })();
             match check {
                 Ok(Some(held)) => {
@@ -889,8 +1017,12 @@ impl FsOps {
         // Stage everything before publishing any final files. A staging
         // failure keeps all sidecars for the fallback engine to resume.
         let mut staged = Vec::with_capacity(request.files.len());
-        for ((file, destination), unchanged) in
-            request.files.iter().zip(&destinations).zip(&unchanged)
+        for (i, ((file, destination), unchanged)) in request
+            .files
+            .iter()
+            .zip(&destinations)
+            .zip(&unchanged)
+            .enumerate()
         {
             if *unchanged {
                 staged.push(None);
@@ -904,7 +1036,13 @@ impl FsOps {
                     meta.mode = stat.st_mode as u32 & 0o7777;
                 }
             }
-            match self.stage_small_file(&file.path, &copy_id, &file.data, &meta, request.flags) {
+            match self.stage_small_file(
+                &file.path,
+                &copy_id,
+                data[i].unwrap(),
+                &meta,
+                request.flags,
+            ) {
                 Ok(item) => staged.push(Some(item)),
                 Err(error) => {
                     return Ok(Response::SmallFilesCopied(SmallCopyResponse {
@@ -928,7 +1066,14 @@ impl FsOps {
             .zip(destinations)
             .zip(staged)
             .zip(matched_content)
-            .map(|(((file, destination), item), matched_content)| {
+            .enumerate()
+            .map(|(i, (((file, destination), item), matched_content))| {
+                if !permitted[i] {
+                    return SmallCopyFileResult {
+                        disposition: SmallCopyDisposition::Excluded,
+                        error: None,
+                    };
+                }
                 let condition = destination
                     .as_ref()
                     .map_or(TargetCondition::Absent, |stat| TargetCondition::Matches {
@@ -1865,6 +2010,7 @@ impl FsOps {
             | Request::TransportStats
             | Request::Receipt
             | Request::Shutdown
+            | Request::PrepareSmallFiles(_)
             | Request::CopySmallFiles(_)
             | Request::ReadStream(_)
             | Request::WriteStreamFence

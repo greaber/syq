@@ -2012,7 +2012,8 @@ impl FsOps {
             } => self
                 .anchor_destination(*expected_dev, *expected_ino, request_prefix)
                 .map(Response::DestinationRegistered),
-            Request::CopySmallFiles(request) => self.copy_small_files(request),
+            Request::PrepareSmallFiles(request) => self.prepare_small_files(request),
+            Request::CopySmallFiles(payloads) => self.copy_small_files(payloads),
             Request::DestinationFilesystemInfo {
                 check_empty,
                 target,
@@ -2032,9 +2033,15 @@ impl FsOps {
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(Response::DefaultPermissions),
-            Request::PruneLookup { paths, guard } => self
-                .prune_lookup(paths, guard.as_ref())
-                .map(Response::Stats),
+            Request::PruneLookup { paths, guard } => (|| {
+                #[cfg(debug_assertions)]
+                record_test_event(
+                    "SYQ_TEST_DESTINATION_LOOKUPS",
+                    format_args!("lookup {}", paths.len()),
+                )?;
+                self.prune_lookup(paths, guard.as_ref())
+                    .map(Response::Stats)
+            })(),
             Request::PartialPaths {
                 paths,
                 copy_id,
@@ -2050,22 +2057,44 @@ impl FsOps {
                 directories,
                 others,
                 guard,
-            } => {
+                strict_metadata,
+            } => (|| {
+                #[cfg(debug_assertions)]
+                record_test_event(
+                    "SYQ_TEST_DESTINATION_LOOKUPS",
+                    format_args!(
+                        "batch {} {} {strict_metadata}",
+                        directories.len(),
+                        others.len()
+                    ),
+                )?;
                 let guard = guard.as_ref();
                 let partial_paths = self.partial_paths(partial_paths, copy_id, guard);
-                let directories = self.stat_many(directories, false, guard);
+                let directories = if *strict_metadata {
+                    self.prune_lookup(directories, guard)?
+                } else {
+                    self.stat_many(directories, false, guard)
+                };
                 let safe_to_stat_others = directories.iter().all(|entry| {
                     entry
                         .as_ref()
                         .is_some_and(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 == 0o700)
                 });
-                let others = safe_to_stat_others.then(|| self.stat_many(others, false, guard));
+                let others = if safe_to_stat_others {
+                    Some(if *strict_metadata {
+                        self.prune_lookup(others, guard)?
+                    } else {
+                        self.stat_many(others, false, guard)
+                    })
+                } else {
+                    None
+                };
                 Ok(Response::BatchPlan {
                     partial_paths,
                     directories,
                     others,
                 })
-            }
+            })(),
             Request::Apply { ops, guard } => Ok(Response::Applied(self.apply(ops, guard.as_ref()))),
             Request::ProbePartial {
                 path,
