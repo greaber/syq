@@ -135,11 +135,7 @@ def failed_copies():
     import time
     import uuid
     root = '/tmp/syq-real-ssh/recovery-' + uuid.uuid4().hex
-    control = root + '/fault'
-    wrapper = root + '/helper'
-    script = '#!/bin/sh\nif test -f ' + shlex.quote(control) + '; then\n' + \
-        'SYQ_TEST_FAIL_XATTR=$(cat ' + shlex.quote(control) + ')\nexport SYQ_TEST_FAIL_XATTR\nfi\nexec /usr/local/bin/syq "$@"\n'
-    remote(f'from pathlib import Path; p=Path({root!r}); p.mkdir(); w=Path({wrapper!r}); w.write_text({script!r}); w.chmod(0o755)')
+    remote(f'from pathlib import Path; Path({root!r}).mkdir()')
     with tempfile.TemporaryDirectory(prefix='syq-metadata-recovery-') as temporary:
         source = Path(temporary) / 'source'
         source.mkdir()
@@ -153,12 +149,18 @@ def failed_copies():
                     print(f'case: {label} metadata failure after writing ({inplace=}, {attribute})', flush=True)
                     destination = root + '/' + uuid.uuid4().hex
                     metadata(source / 'file', b'before failure')
+                    # A persistent control pool may start the helper before the
+                    # next invocation. Give each fault an immutable command,
+                    # then resume with the ordinary helper below.
+                    wrapper = destination + '-helper'
+                    script = '#!/bin/sh\nexport SYQ_TEST_FAIL_XATTR=' + shlex.quote(attribute) + \
+                        '\nexec /usr/local/bin/syq "$@"\n'
+                    remote(f'from pathlib import Path; w=Path({wrapper!r}); w.write_text({script!r}); w.chmod(0o755)')
                     command = ['syq', 'cp', '--preserve=permissions,ownership,hardlinks,acls,xattrs',
                         '--srcs-in', str(source), '--to', 'destination', '--into', destination,
                         '--syq-path', wrapper, '--performance-tuning=workers=1', '--no-progress', *transport]
                     if inplace:
                         command.append('--inplace')
-                    remote(f'from pathlib import Path; Path({control!r}).write_text({attribute!r})')
                     result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, env=env)
                     assert result.returncode != 0, result.stdout
                     assert 'injected attribute reconciliation failure' in result.stdout, result.stdout
@@ -169,9 +171,10 @@ def failed_copies():
                         assert not {'file', 'alias'} & staged.keys(), staged
                     if attribute == 'user.binary':
                         assert all(f['mode'] == 0o440 for f in staged.values()), staged
-                    remote(f'from pathlib import Path; Path({control!r}).unlink()')
                     metadata(source / 'file', b'after failure')
-                    subprocess.run(command, check=True, timeout=60, env=env)
+                    retry = command.copy()
+                    retry[retry.index('--syq-path') + 1] = '/usr/local/bin/syq'
+                    subprocess.run(retry, check=True, timeout=60, env=env)
                     verify(source, destination)
             print(f'case: {label} interrupted metadata copy resumes', flush=True)
             metadata(source / 'file', b'before interruption')
