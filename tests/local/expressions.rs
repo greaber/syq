@@ -507,9 +507,12 @@ fn unselected_containers_use_receiver_umask_and_inheritance() {
                 assert_eq!(read(&t.path("dst/nested/deep/keep")), b"selected");
                 for path in ["dst/nested", "dst/nested/deep"] {
                     let metadata = fs::metadata(t.path(path)).unwrap();
+                    // mode_t is u16 on macOS; MetadataExt::mode is always u32.
+                    #[allow(clippy::unnecessary_cast)]
+                    let expected_mode = 0o777 & !(umask as u32);
                     assert_eq!(
                         metadata.mode() & 0o777,
-                        0o777 & !umask,
+                        expected_mode,
                         "{path}: {filter}, remote={remote}, umask={umask:03o}"
                     );
                     #[cfg(target_os = "linux")]
