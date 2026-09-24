@@ -196,7 +196,9 @@ impl Engine {
 
     async fn server_copy_inner(self: Arc<Self>) -> Result<()> {
         let target = local::key_path(&self.args.locations.last().unwrap().path)?;
-        let (plan, prune) = self.download_plan(&target).await?;
+        let DownloadPlan {
+            jobs: plan, prune, ..
+        } = self.download_plan(&target).await?;
         self.check_upload_placement(
             plan.first()
                 .map(|job| job.path == target && !job.key.ends_with('/')),

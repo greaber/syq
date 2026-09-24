@@ -66,7 +66,6 @@ impl Drop for Engine {
 struct Download {
     expression_path: String,
     expression_destination_path: String,
-    service_time: Option<(i64, u32)>,
     kind: ObjectKind,
     key: String,
     path: String,
@@ -75,6 +74,13 @@ struct Download {
     metadata: Option<crate::mapping::Metadata>,
     copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
     source_object: Option<Object>,
+}
+struct DownloadPlan {
+    jobs: Vec<Download>,
+    prune: super::prune::Plan,
+    // Aligned with jobs when requested; empty otherwise, so ordinary copies
+    // do not retain an extra timestamp per object.
+    service_times: Vec<Option<(i64, u32)>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
@@ -304,7 +310,11 @@ impl Engine {
             self.prune(prune, None).await?;
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
-            let (mut plan, prune) = self.download_plan(&destination.prefix).await?;
+            let DownloadPlan {
+                jobs: mut plan,
+                prune,
+                service_times,
+            } = self.download_plan(&destination.prefix).await?;
             self.authorize_downloads(&mut plan).await?;
             self.finish_authorization().await?;
             let workers = self.object_workers(plan.iter().map(|s| s.size))?;
@@ -316,13 +326,17 @@ impl Engine {
             // Directory metadata is applied after descendants, so creating
             // children cannot change the restored times or require final modes.
             let directories = Arc::new(Mutex::new(Vec::new()));
+            // Authorization leaves job order unchanged, and parallel invokes
+            // this closure in plan order before spawning each future.
+            let mut service_times = service_times.into_iter();
             parallel(plan, workers, |mut job| {
+                let service_time = service_times.next().flatten();
                 let engine = self.clone();
                 let dst = destination.clone();
                 let dirs = directories.clone();
                 async move {
                     engine.check_cancelled()?;
-                    let result = engine.download(&mut job, &dst, dirs).await;
+                    let result = engine.download(&mut job, &dst, dirs, service_time).await;
                     engine.settle(
                         job.key.as_bytes(),
                         &job.path,
@@ -1260,10 +1274,7 @@ impl Engine {
         Ok(PreparedMultipart { upload, uploaded })
     }
 
-    async fn download_plan(
-        &self,
-        destination_prefix: &str,
-    ) -> Result<(Vec<Download>, super::prune::Plan)> {
+    async fn download_plan(&self, destination_prefix: &str) -> Result<DownloadPlan> {
         let mut prune = super::prune::Plan::default();
         let count = self.args.locations.len() - 1;
         let base = local::key_path(
@@ -1337,6 +1348,9 @@ impl Engine {
             .source_bucket()
             .unwrap_or(&self.options.bucket);
         let mut out = Vec::new();
+        let mut service_times = Vec::new();
+        let retain_times =
+            !self.options.route.is_server_copy() && self.args.expressions.uses_source_s3_time();
         let mut claims = BTreeMap::new();
         let mut excluded_subtrees = HashSet::new();
         let same_bucket = self.options.route.source_bucket() == Some(self.options.bucket.as_str());
@@ -1656,10 +1670,12 @@ impl Engine {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     continue;
                 }
+                if retain_times {
+                    service_times.push(service_time);
+                }
                 out.push(Download {
                     expression_path,
                     expression_destination_path,
-                    service_time,
                     kind,
                     key,
                     path,
@@ -1680,19 +1696,24 @@ impl Engine {
                     .filter_map(|j| j.metadata.map(|m| (j.path.as_bytes().to_vec(), m))),
             );
         }
-        Ok((out, prune))
+        Ok(DownloadPlan {
+            jobs: out,
+            prune,
+            service_times,
+        })
     }
     async fn download(
         self: &Arc<Self>,
         job: &mut Download,
         destination: &Destination,
         directories: DirectoryMetadata,
+        service_time: Option<(i64, u32)>,
     ) -> Result<Option<u64>> {
         let known_source = job.source_object.as_ref().map(Object::expression_file);
         let source_facts = known_source.as_ref().map_or(
             crate::expression::Facts::S3Listing {
                 size: job.size,
-                last_modified: job.service_time,
+                last_modified: service_time,
             },
             crate::expression::Facts::Complete,
         );
