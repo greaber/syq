@@ -70,10 +70,24 @@ struct Download {
     key: String,
     path: String,
     size: u64,
+    mapping: Option<Box<DownloadMapping>>,
+    copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
+    source_object: Option<Box<Object>>,
+}
+// Most mappings carry paths only. Allocate overrides only when requested,
+// rather than reserving their full size in every planned download.
+#[derive(Clone)]
+struct DownloadMapping {
     expected_hash: Option<Digest>,
     metadata: Option<crate::mapping::Metadata>,
-    copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
-    source_object: Option<Object>,
+}
+impl Download {
+    fn expected_hash(&self) -> Option<&Digest> {
+        self.mapping.as_ref().and_then(|m| m.expected_hash.as_ref())
+    }
+    fn metadata(&self) -> Option<crate::mapping::Metadata> {
+        self.mapping.as_ref().and_then(|m| m.metadata)
+    }
 }
 struct DownloadPlan {
     jobs: Vec<Download>,
@@ -342,7 +356,7 @@ impl Engine {
                         &job.path,
                         job.kind,
                         &result,
-                        job.expected_hash.as_ref(),
+                        job.expected_hash(),
                     );
                     Ok(result.ok().flatten())
                 }
@@ -530,7 +544,7 @@ impl Engine {
                     self.options.concurrency,
                 )
                 .await
-                .map(|listing| Some(listing.objects.into_iter().collect()))
+                .map(|listing| Some(listing.into_objects().into_iter().collect()))
             } else {
                 client::upload_listing(&self.client, &self.options.bucket, &prefix, &keys).await
             };
@@ -1284,17 +1298,42 @@ impl Engine {
                 .or(self.args.native_source_cwd.as_deref())
                 .unwrap_or(b"."),
         )?;
-        let mut selectors = Vec::new();
-        if self.args.native_mapping.is_some() {
-            let manifest = match self.args.parsed_mapping.clone() {
+        let manifest = if self.args.native_mapping.is_some() {
+            Some(match self.args.parsed_mapping.clone() {
                 Some(parsed) => parsed,
                 None => {
                     let args = self.args.clone();
                     tokio::task::spawn_blocking(move || crate::mapping::load(&args)).await??
                 }
-            };
-            for (_, entry) in &manifest.entries {
-                selectors.push((
+            })
+        } else {
+            None
+        };
+        if self.options.route.is_server_copy()
+            && manifest.as_ref().is_some_and(|manifest| {
+                manifest
+                    .entries
+                    .iter()
+                    .any(|(_, entry)| entry.expected_hash.is_some())
+            })
+        {
+            bail!("S3-to-S3 copies stay server-side; mapping expected hashes require reading object contents and are not supported");
+        }
+        // Consume entries as they enter the metadata window, releasing the raw
+        // input immediately when this planner owns it. An in-process mapping
+        // can remain shared; clone only its admitted entries in that case.
+        let (owned_entries, shared_manifest) = match manifest {
+            Some(manifest) => match Arc::try_unwrap(manifest) {
+                Ok(manifest) => (manifest.entries, None),
+                Err(manifest) => (Vec::new(), Some(manifest)),
+            },
+            None => (Vec::new(), None),
+        };
+        let mapping_selectors = owned_entries
+            .into_iter()
+            .chain(shared_manifest.iter().flat_map(|m| &m.entries).cloned())
+            .map(|(_, entry)| -> Result<_> {
+                Ok((
                     local::join(&base, &local::key_path(&entry.src)?),
                     local::join(destination_prefix, &local::key_path(&entry.dst)?),
                     match entry.kind.map(|k| k.label()) {
@@ -1303,30 +1342,31 @@ impl Engine {
                         _ => SourceSelection::Named,
                     },
                     entry.kind.map(|kind| kind.label()),
-                    entry.expected_hash.clone(),
+                    entry.expected_hash,
                     entry.metadata,
-                ));
-            }
+                ))
+            });
+        let locations = &self.args.locations[..if self.args.native_mapping.is_some() {
+            0
         } else {
-            for location in &self.args.locations[..count] {
-                let key = local::join(&base, &local::key_path(&location.path)?);
-                let path = if self.args.placement == Placement::As || location.copies_contents() {
-                    destination_prefix.to_owned()
-                } else {
-                    local::join(
-                        destination_prefix,
-                        &local::key_path(
-                            crate::cli::native_basename(&location.path)
-                                .context("source has no basename")?,
-                        )?,
-                    )
-                };
-                selectors.push((key, path, location.selection, None, None, None));
-            }
-        }
-        if self.options.route.is_server_copy() && selectors.iter().any(|s| s.4.is_some()) {
-            bail!("S3-to-S3 copies stay server-side; mapping expected hashes require reading object contents and are not supported");
-        }
+            count
+        }];
+        let path_selectors = locations.iter().map(|location| {
+            let key = local::join(&base, &local::key_path(&location.path)?);
+            let path = if self.args.placement == Placement::As || location.copies_contents() {
+                destination_prefix.to_owned()
+            } else {
+                local::join(
+                    destination_prefix,
+                    &local::key_path(
+                        crate::cli::native_basename(&location.path)
+                            .context("source has no basename")?,
+                    )?,
+                )
+            };
+            Ok((key, path, location.selection, None, None, None))
+        });
+        let selectors = mapping_selectors.chain(path_selectors);
         let matcher = crate::scan::build_ignore(&self.args.ignore_lines)?;
         let min = self
             .args
@@ -1359,23 +1399,43 @@ impl Engine {
         // Keep selector order for claims, but overlap bounded source metadata reads.
         let mut selectors = stream::iter(selectors)
             .map(|selector| async move {
+                self.check_cancelled()?;
+                let selector = selector?;
                 let prefix = self.args.native_mapping.is_none()
                     && matches!(
                         selector.2,
                         SourceSelection::Contents | SourceSelection::Directory
                     );
-                let head =
-                    if self.options.route.is_server_copy() && !selector.0.is_empty() && !prefix {
-                        self.copy_head(source_bucket, &selector.0).await?
+                let mut copy_source = None;
+                let mut exact = None;
+                if !selector.0.is_empty() && !prefix {
+                    if self.options.route.is_server_copy() {
+                        copy_source = self.copy_head(source_bucket, &selector.0).await?;
+                        exact = copy_source.as_ref().map(|(object, _)| object.clone());
                     } else {
-                        None
-                    };
-                Ok::<_, anyhow::Error>((selector, head))
+                        let _slot = self.tuning.requests.acquire().await;
+                        exact = client::head(&self.client, source_bucket, &selector.0).await?;
+                    }
+                    if exact.is_none() && self.args.native_mapping.is_some() {
+                        let marker = format!("{}/", selector.0);
+                        if self.options.route.is_server_copy() {
+                            copy_source = self.copy_head(source_bucket, &marker).await?;
+                            exact = copy_source.as_ref().map(|(object, _)| object.clone());
+                        } else {
+                            let _slot = self.tuning.requests.acquire().await;
+                            exact = client::head(&self.client, source_bucket, &marker).await?;
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>((selector, exact, copy_source))
             })
             .buffered(32);
         while let Some(selector) = selectors.next().await {
-            let ((key, path, selection, declared_kind, expected_hash, metadata), mut copy_source) =
-                selector?;
+            let (
+                (key, path, selection, declared_kind, expected_hash, metadata),
+                exact,
+                mut copy_source,
+            ) = selector?;
             let expression_root = if self.args.expressions.active() {
                 key.clone()
             } else {
@@ -1392,14 +1452,10 @@ impl Engine {
                 format!("{key}/")
             };
             let exact = async {
-                let exact = if key.is_empty() {
-                    None
-                } else if self.options.route.is_server_copy()
-                    && !(directory && self.args.native_mapping.is_none())
-                {
-                    copy_source.as_ref().map(|(object, _)| object.clone())
-                } else {
+                let exact = if !key.is_empty() && directory && self.args.native_mapping.is_none() {
                     client::head(&self.client, source_bucket, &key).await?
+                } else {
+                    exact
                 };
                 if exact.is_some() && directory && self.args.native_mapping.is_none() {
                     bail!("S3 selector requires a prefix but an object exists at {key:?}");
@@ -1427,22 +1483,12 @@ impl Engine {
                 (exact.await?, None)
             };
             let already_filtered = self.args.native_mapping.is_none() && exact.is_none();
-            let objects = if self.args.native_mapping.is_some() {
+            if self.args.native_mapping.is_some() {
                 // Mapping entries name individual objects. A directory entry
                 // copies its marker, while explicit child entries copy children.
-                let object = match exact {
-                    Some(object) => object,
-                    None => {
-                        let marker = format!("{key}/");
-                        let object = if self.options.route.is_server_copy() {
-                            copy_source = self.copy_head(source_bucket, &marker).await?;
-                            copy_source.as_ref().map(|(object, _)| object.clone())
-                        } else {
-                            client::head(&self.client, source_bucket, &marker).await?
-                        };
-                        object.context("S3 mapping source object or directory marker is missing")?
-                    }
-                };
+                let object = exact
+                    .as_ref()
+                    .context("S3 mapping source object or directory marker is missing")?;
                 if declared_kind
                     .map(str::parse::<ObjectKind>)
                     .transpose()?
@@ -1453,107 +1499,101 @@ impl Engine {
                 if expected_hash.is_some() && object.kind() != ObjectKind::File {
                     bail!("an expected hash requires a regular file");
                 }
-                let kind = object.kind();
-                let directory = client::is_directory_marker(&object.key, object.size);
-                vec![(
-                    object.key.clone(),
-                    object.size,
-                    path.clone(),
-                    kind,
-                    directory,
-                    None,
-                    Some(object),
-                )]
-            } else if let Some(exact) = exact {
-                let kind = exact.kind();
-                let directory = client::is_directory_marker(&exact.key, exact.size);
-                vec![(
-                    exact.key.clone(),
-                    exact.size,
-                    path.clone(),
-                    kind,
-                    directory,
-                    None,
-                    Some(exact),
-                )]
-            } else {
-                if selection == SourceSelection::File {
-                    bail!("S3 source object {key:?} is missing");
-                }
-                let mut listed = match listed {
-                    Some(listed) => listed,
-                    None => {
-                        client::list_with_times(
-                            &self.client,
-                            source_bucket,
-                            &prefix,
-                            matcher.as_ref(),
-                            &mut excluded_subtrees,
-                            self.options.concurrency,
-                            self.args.expressions.uses_source_s3_time(),
-                        )
-                        .await?
-                    }
-                };
-                if !listed.found {
-                    bail!("S3 source prefix {key:?} contains no objects");
-                }
-                self.progress
-                    .files_excluded
-                    .fetch_add(listed.excluded, Relaxed);
-                if same_bucket {
-                    copy_sources.push((prefix.clone(), true));
-                    copy_targets.push((
-                        if path.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{path}/")
-                        },
-                        true,
-                    ));
-                }
-                if self.args.delete {
-                    prune.scope(path.as_bytes(), key.as_bytes());
-                }
-                let mut objects = Vec::new();
-                for (object, size) in listed.objects {
-                    let suffix = object
-                        .strip_prefix(&prefix)
-                        .context("S3 listing returned a key outside the requested prefix")?;
-                    let directory = client::is_directory_marker(&object, size);
-                    if suffix.is_empty()
-                        && (contents
-                            || (directory
-                                && self.options.route.is_server_copy()
-                                && path.is_empty()))
-                    {
-                        continue;
-                    }
-                    let suffix = if directory {
-                        suffix.trim_end_matches('/')
-                    } else {
-                        suffix
-                    };
-                    let suffix = local::key_path(suffix.as_bytes())?;
-                    let kind = if directory {
-                        ObjectKind::Dir
-                    } else {
-                        ObjectKind::File
-                    };
-                    let service_time = listed.service_times.remove(&object);
-                    objects.push((
-                        object,
-                        size,
-                        local::join(&path, &suffix),
+            }
+            let objects: Box<dyn Iterator<Item = Result<_>> + Send + '_> =
+                if let Some(exact) = exact {
+                    let kind = exact.kind();
+                    let directory = client::is_directory_marker(&exact.key, exact.size);
+                    Box::new(std::iter::once(Ok((
+                        exact.key.clone(),
+                        exact.size,
+                        path.clone(),
                         kind,
                         directory,
-                        service_time,
                         None,
-                    ));
-                }
-                objects
-            };
-            for (key, size, path, kind, directory, service_time, source_object) in objects {
+                        Some(exact),
+                    ))))
+                } else {
+                    if selection == SourceSelection::File {
+                        bail!("S3 source object {key:?} is missing");
+                    }
+                    let listed = match listed {
+                        Some(listed) => listed,
+                        None => {
+                            client::list_with_times(
+                                &self.client,
+                                source_bucket,
+                                &prefix,
+                                matcher.as_ref(),
+                                &mut excluded_subtrees,
+                                self.options.concurrency,
+                                self.args.expressions.uses_source_s3_time(),
+                            )
+                            .await?
+                        }
+                    };
+                    if !listed.found {
+                        bail!("S3 source prefix {key:?} contains no objects");
+                    }
+                    self.progress
+                        .files_excluded
+                        .fetch_add(listed.excluded, Relaxed);
+                    if same_bucket {
+                        copy_sources.push((prefix.clone(), true));
+                        copy_targets.push((
+                            if path.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{path}/")
+                            },
+                            true,
+                        ));
+                    }
+                    if self.args.delete {
+                        prune.scope(path.as_bytes(), key.as_bytes());
+                    }
+                    Box::new(listed.into_entries().filter_map(
+                        move |(object, size, service_time)| {
+                            (|| {
+                                let suffix = object.strip_prefix(&prefix).context(
+                                    "S3 listing returned a key outside the requested prefix",
+                                )?;
+                                let directory = client::is_directory_marker(&object, size);
+                                if suffix.is_empty()
+                                    && (contents
+                                        || (directory
+                                            && self.options.route.is_server_copy()
+                                            && path.is_empty()))
+                                {
+                                    return Ok(None);
+                                }
+                                let suffix = if directory {
+                                    suffix.trim_end_matches('/')
+                                } else {
+                                    suffix
+                                };
+                                let suffix = local::key_path(suffix.as_bytes())?;
+                                let kind = if directory {
+                                    ObjectKind::Dir
+                                } else {
+                                    ObjectKind::File
+                                };
+                                Ok(Some((
+                                    object,
+                                    size,
+                                    local::join(&path, &suffix),
+                                    kind,
+                                    directory,
+                                    service_time,
+                                    None,
+                                )))
+                            })()
+                            .transpose()
+                        },
+                    ))
+                };
+            for object in objects {
+                let (key, size, path, kind, directory, service_time, source_object) = object?;
                 if !already_filtered {
                     if let Some(excluded) =
                         client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
@@ -1680,10 +1720,18 @@ impl Engine {
                     key,
                     path,
                     size,
-                    expected_hash: expected_hash.clone(),
-                    metadata,
+                    mapping: (expected_hash.is_some() || metadata.is_some()).then(|| {
+                        Box::new(DownloadMapping {
+                            expected_hash: expected_hash.clone(),
+                            metadata,
+                        })
+                    }),
                     copy_source: copy_source.take().map(Box::new),
-                    source_object,
+                    source_object: if self.options.route.is_server_copy() {
+                        None
+                    } else {
+                        source_object.map(Box::new)
+                    },
                 });
             }
         }
@@ -1693,7 +1741,7 @@ impl Engine {
         if let Some(results) = self.progress.results_writer() {
             results.mapping_metadata(
                 out.iter()
-                    .filter_map(|j| j.metadata.map(|m| (j.path.as_bytes().to_vec(), m))),
+                    .filter_map(|j| j.metadata().map(|m| (j.path.as_bytes().to_vec(), m))),
             );
         }
         Ok(DownloadPlan {
@@ -1709,7 +1757,7 @@ impl Engine {
         directories: DirectoryMetadata,
         service_time: Option<(i64, u32)>,
     ) -> Result<Option<u64>> {
-        let known_source = job.source_object.as_ref().map(Object::expression_file);
+        let known_source = job.source_object.as_deref().map(Object::expression_file);
         let source_facts = known_source.as_ref().map_or(
             crate::expression::Facts::S3Listing {
                 size: job.size,
@@ -1725,7 +1773,7 @@ impl Engine {
             return Ok(None);
         }
         let part_size = self.part_size(job.size);
-        let expected_hash = job.expected_hash.as_ref();
+        let expected_hash = job.mapping.as_ref().and_then(|m| m.expected_hash.as_ref());
         let requires_regular_file = expected_hash.is_some();
         let expected_hash = expected_hash.filter(|_| !self.args.dry_run);
         let root = &destination.root;
@@ -1809,7 +1857,7 @@ impl Engine {
         };
         let object = if let Some(output) = &initial {
             client::from_get(&job.key, job.size, part_size, output)?
-        } else if let Some(object) = &job.source_object {
+        } else if let Some(object) = job.source_object.as_deref() {
             object.clone()
         } else {
             client::head(&self.client, &self.options.bucket, &job.key)
@@ -1856,7 +1904,7 @@ impl Engine {
             hash_algorithm: HashAlgorithm::Blake3,
         });
         let source_time = (metadata.mtime, metadata.nsec);
-        let explicit = job.metadata.unwrap_or_default();
+        let explicit = job.metadata().unwrap_or_default();
         explicit.validate_kind(match object.kind() {
             ObjectKind::File => crate::proto::Kind::File,
             ObjectKind::Dir => crate::proto::Kind::Dir,

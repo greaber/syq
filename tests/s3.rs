@@ -202,6 +202,77 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault.starts_with("mapping-plan-") {
+        let path = first.split_whitespace().nth(1).unwrap();
+        if method == "HEAD" {
+            if fault.starts_with("mapping-plan-serial") {
+                assert!(
+                    !gate.0.swap(true, Ordering::AcqRel),
+                    "exceeded the HEAD request limit"
+                );
+                thread::sleep(Duration::from_millis(10));
+                gate.0.store(false, Ordering::Release);
+            } else if path == "/bucket/first" || path == "/bucket/first/" {
+                if fault == "mapping-plan-marker" && !path.ends_with('/') {
+                    reply(&mut socket, 404, &[], b"", true);
+                    return;
+                }
+                // The first source (including its marker fallback) must not
+                // prevent other metadata requests from making progress.
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut report = std::time::Instant::now() + Duration::from_secs(1);
+                while !gate.0.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                    if std::time::Instant::now() >= report {
+                        eprintln!("mapping fixture: waiting for concurrent HEAD");
+                        report += Duration::from_secs(1);
+                    }
+                }
+                assert!(
+                    gate.0.load(Ordering::Acquire),
+                    "mapping HEADs did not overlap"
+                );
+            } else {
+                gate.0.store(true, Ordering::Release);
+            }
+            if path.starts_with("/bucket/file39") {
+                let status = match fault {
+                    "mapping-plan-missing" => Some(404),
+                    "mapping-plan-denied" => Some(403),
+                    _ => None,
+                };
+                if let Some(status) = status {
+                    reply(&mut socket, status, &[], b"", true);
+                    return;
+                }
+                gate.1.store(true, Ordering::Release);
+            }
+        } else {
+            assert_eq!(method, "GET");
+            assert!(
+                matches!(fault, "mapping-plan-ok" | "mapping-plan-marker")
+                    || fault.starts_with("mapping-plan-serial"),
+                "copied before completing source validation"
+            );
+            assert!(
+                gate.1.load(Ordering::Acquire),
+                "copied before inspecting the last source"
+            );
+            assert_eq!(headers["if-match"], "\"planned\"");
+        }
+        let data: &[u8] = if path.ends_with('/') { b"" } else { b"data" };
+        reply(
+            &mut socket,
+            200,
+            &[
+                ("Content-Length".into(), data.len().to_string()),
+                ("ETag".into(), "\"planned\"".into()),
+            ],
+            data,
+            method == "HEAD",
+        );
+        return;
+    }
     if fault == "mapping-metadata-rerun" {
         let data = vec![b'x'; 65536];
         let fields = vec![
@@ -1799,6 +1870,98 @@ fn s3_ranges_signed_headers_metadata_and_results() {
     validate_results(temp.path());
     assert!(server.requests.load(Ordering::Relaxed) >= 3);
 }
+#[test]
+fn s3_mapping_download_overlaps_heads_and_validates_before_copying() {
+    for (fault, error) in [
+        ("mapping-plan-ok", None),
+        ("mapping-plan-marker", None),
+        ("mapping-plan-serial-tuning", None),
+        ("mapping-plan-serial-resource", None),
+        (
+            "mapping-plan-missing",
+            Some("source object or directory marker is missing"),
+        ),
+        ("mapping-plan-denied", Some("S3 HEAD")),
+        ("mapping-plan-collision", Some("file/directory collision")),
+        (
+            "mapping-plan-kind",
+            Some("source type does not match mapping"),
+        ),
+    ] {
+        let server = Server::start(fault);
+        let temp = crate::test_support::tempdir().unwrap();
+        let destination = temp.path().join("out");
+        std::fs::create_dir(&destination).unwrap();
+        // More than one metadata window: an error at the end must still prevent
+        // even the first valid entry from being copied.
+        let manifest = (0..40)
+            .map(|i| {
+                let source = if i == 0 {
+                    "first".into()
+                } else {
+                    format!("file{i}")
+                };
+                let target = if fault == "mapping-plan-collision" && i == 39 {
+                    "file0/child".into()
+                } else {
+                    format!("file{i}")
+                };
+                let mut entry = serde_json::json!({
+                    "src": {"encoding": "utf-8", "value": source},
+                    "dst": {"encoding": "utf-8", "value": target},
+                });
+                if fault == "mapping-plan-kind" && i == 39 {
+                    entry["kind"] = "dir".into();
+                }
+                format!("{entry}\n")
+            })
+            .collect::<String>();
+        std::fs::write(temp.path().join("mapping.jsonl"), manifest).unwrap();
+        let limit = if fault == "mapping-plan-serial-tuning" {
+            "--performance-tuning=s3-requests=1"
+        } else if fault == "mapping-plan-serial-resource" {
+            "--resource-limits=s3-requests=1"
+        } else {
+            "--performance-tuning=s3-requests=4"
+        };
+        let output = server.cp(
+            temp.path(),
+            &[
+                limit,
+                "--from",
+                "s3://bucket",
+                "--mapping",
+                "mapping.jsonl",
+                "--into",
+                destination.to_str().unwrap(),
+            ],
+        );
+        if let Some(error) = error {
+            assert!(!output.status.success(), "{fault}");
+            assert!(
+                output_text(&output).contains(error),
+                "{fault}: {}",
+                output_text(&output)
+            );
+            assert_eq!(
+                std::fs::read_dir(&destination).unwrap().count(),
+                0,
+                "{fault}"
+            );
+        } else {
+            assert!(output.status.success(), "{fault}: {}", output_text(&output));
+            for i in 0..40 {
+                let path = destination.join(format!("file{i}"));
+                if i == 0 && fault == "mapping-plan-marker" {
+                    assert!(path.is_dir());
+                } else {
+                    assert_eq!(std::fs::read(path).unwrap(), b"data");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn s3_prefix_discovery_overlaps_reads_and_checks_both_results() {
     for fault in ["prefix-ok", "prefix-collision", "prefix-list-error"] {

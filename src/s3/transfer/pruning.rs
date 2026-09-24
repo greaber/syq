@@ -149,18 +149,16 @@ impl Engine {
                         .filter(|(key, _)| key.starts_with(&prefix))
                         .map(|(key, size)| (key.clone(), *size))
                         .collect(),
-                    None => {
-                        client::list(
-                            &self.client,
-                            &self.options.bucket,
-                            &prefix,
-                            None,
-                            &mut HashSet::new(),
-                            self.options.concurrency,
-                        )
-                        .await?
-                        .objects
-                    }
+                    None => client::list(
+                        &self.client,
+                        &self.options.bucket,
+                        &prefix,
+                        None,
+                        &mut HashSet::new(),
+                        self.options.concurrency,
+                    )
+                    .await?
+                    .into_objects(),
                 };
                 for (key, size) in listed {
                     self.check_cancelled()?;
@@ -245,7 +243,7 @@ impl Engine {
                         self.options.concurrency,
                     )
                     .await?
-                    .objects,
+                    .into_objects(),
                 );
             }
             let _ = self.upload_keys.set(keys);
