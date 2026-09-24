@@ -736,10 +736,8 @@ fn remote_copy_if_batches_directory_and_leaf_observations() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn tiny_offer_does_not_read_rejected_sources() {
-    if unsafe { libc::geteuid() } == 0 {
-        return;
-    }
     for all_rejected in [false, true] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
@@ -750,7 +748,6 @@ fn tiny_offer_does_not_read_rejected_sources() {
         if all_rejected {
             write(&t.path("dst/selected"), b"keep this too");
         }
-        fs::set_permissions(t.path("src/rejected"), fs::Permissions::from_mode(0o0)).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
@@ -772,9 +769,9 @@ fn tiny_offer_does_not_read_rejected_sources() {
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("XDG_CACHE_HOME", t.path("cache"))
             .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_FAIL_READ_RANGE_NAME", "rejected")
             .run()
             .unwrap();
-        fs::set_permissions(t.path("src/rejected"), fs::Permissions::from_mode(0o600)).unwrap();
         assert_output_ok(&output);
         let stderr = stderr_of(&output);
         assert!(stderr.contains("small copy: published"), "{stderr}");
