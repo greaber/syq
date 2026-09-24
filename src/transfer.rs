@@ -388,13 +388,17 @@ fn destination_operator_symlink_policy(
 
 /// Open a control connection. It bypasses the data-connection connect
 /// limiter: the scan, and therefore every worker, waits on it.
-pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
-    let mut connection = match ep {
+fn open_control_connection(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
+    match ep {
         Endpoint::Local { .. } => ep.connect_control(args.compress),
         Endpoint::Remote(spec) => spec
             .connect_with(args.compress, false)
             .map(|c| Box::new(c) as Box<dyn Conn>),
-    }?;
+    }
+}
+
+pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
+    let mut connection = open_control_connection(ep, args)?;
     configure_hashing(
         &mut *connection,
         crate::hashing::HashPolicy {
@@ -498,7 +502,7 @@ fn fresh_file_mode(opts: &Opts, entry: &Entry) -> u32 {
     }
 }
 
-/// Outcome of the one-turn small push attempted before the ordinary engine
+/// Outcome of the bounded small push attempted before the ordinary engine
 /// starts its destination preflight.
 enum SmallCopy {
     /// The copy completed on the control connection and the run is settled.
@@ -513,9 +517,14 @@ enum SmallCopy {
     Reconnect,
 }
 
+struct SmallCopySources {
+    roots: Vec<RegisteredSourceRoot>,
+    entries: Option<Vec<Entry>>,
+}
+
 /// Whether a native push of local files to a remote directory may try the
-/// one-turn small copy. Everything the ordinary engine decides from flags
-/// that the fused request does not carry stays with the engine.
+/// small copy over the control connection. Options absent from its bounded
+/// protocol stay with the ordinary engine.
 fn small_copy_eligible(
     args: &Args,
     srcs: &[Location],
@@ -566,11 +575,9 @@ fn small_copy_eligible(
         && clean_root(&dst.path) != b"~"
 }
 
-/// Push small regular files in one control-connection turn. Sources
-/// are read through the same registered references the engine's workers
-/// use; the receiver selects, anchors, checks, stages, and publishes in one
-/// request. Every result record and the summary come from the same counters
-/// the engine settles from.
+/// Offer source metadata during receiver configuration, then read and send
+/// only requested payloads. The same control session retains the destination
+/// and publishes through the ordinary staged path, without data workers.
 #[allow(clippy::too_many_arguments)]
 fn attempt_small_copy(
     args: &Args,
@@ -582,6 +589,7 @@ fn attempt_small_copy(
     src_ctl: &mut dyn Conn,
     dst_ctl: &mut dyn Conn,
     roots: &[RegisteredSourceRoot],
+    source_entries: Option<Vec<Entry>>,
     progress: &Progress,
     t0: std::time::Instant,
 ) -> Result<SmallCopy> {
@@ -592,21 +600,14 @@ fn attempt_small_copy(
     {
         return Ok(SmallCopy::Declined);
     }
-    let follow = args.follows_native_source_paths();
+    let Some(source_entries) = source_entries else {
+        return Ok(SmallCopy::Declined);
+    };
     let mut entries = Vec::with_capacity(srcs.len());
     let mut selected_sources = Vec::new();
     let mut selected_roots = Vec::new();
     let mut total = 0u64;
-    for (source, root) in srcs.iter().zip(roots) {
-        // A missing or unusable source is the engine's to report.
-        let Ok(Some(entry)) = stat_one_registered(
-            src_ctl,
-            &source.path,
-            &root.selection,
-            source.follows_root(follow),
-        ) else {
-            return Ok(SmallCopy::Declined);
-        };
+    for ((source, root), entry) in srcs.iter().zip(roots).zip(source_entries) {
         if entry.kind != Kind::File
             || validate_native_source_type(&source.path, source.selection, entry.kind).is_err()
         {
@@ -687,91 +688,29 @@ fn attempt_small_copy(
         targets.push((dst_path, rel_bytes, rel));
     }
 
-    // Read through the engine's source-worker path.
-    let Ok(mut reader) = src_ep.connect_with_sources(args.compress, roots.to_vec(), true) else {
-        return Ok(SmallCopy::Declined);
-    };
-    let reads: Vec<SmallRead> = srcs
+    let flags = publication_metadata_flags(opts.flags);
+    let files = entries
         .iter()
-        .zip(roots)
-        .zip(&entries)
-        .filter(|(_, entry)| entry.size > 0)
-        .map(|((source, root), entry)| SmallRead {
-            path: source.path.clone(),
-            source: Some(root.selection.clone()),
-            attempt: 0,
-            len: entry.size as u32,
+        .zip(srcs)
+        .zip(&targets)
+        .map(|((entry, source), (dst_path, _, _))| {
+            let mut meta = entry.meta();
+            meta.mode = fresh_file_mode(opts, entry);
+            SmallCopyFile {
+                path: dst_path.clone(),
+                size: entry.size,
+                expression_source: args.copy_if.as_ref().map(|_| {
+                    (
+                        crate::expression::File::from_entry(entry),
+                        crate::expression::source_path(&source.path, b"").to_vec(),
+                    )
+                }),
+                meta,
+            }
         })
         .collect();
-    configure_hashing(&mut *reader, opts.hash_policy)?;
-    let native_actor = progress
-        .observations
-        .enabled
-        .load(Relaxed)
-        .then(|| progress.observations.workers.actor("worker"));
-    if let Some(actor) = &native_actor {
-        if reader
-            .observe(&progress.observations, actor, true, 0)
-            .is_err()
-        {
-            return Ok(SmallCopy::Declined);
-        }
-        if dst_ctl
-            .observe(&progress.observations, actor, false, 0)
-            .is_err()
-        {
-            // Nothing has been copied yet. Reopen the control connection before
-            // entering the ordinary transfer path; never use lost framing.
-            return Ok(SmallCopy::Reconnect);
-        }
-    }
-    let _native_work = native_actor
-        .as_ref()
-        .map(|a| a.span(crate::transfer_observations::Stage::Work));
-    let copying = progress.copying_interval();
-    let mut blocks = if reads.is_empty() {
-        Vec::new()
-    } else {
-        let count = reads.len();
-        reader.send(Request::ReadSmallBatch(reads))?;
-        match ok(reader.recv()?, "read small batch")? {
-            Response::SmallBlocks(blocks) if blocks.len() == count => blocks,
-            other => bail!("unexpected response {other:?}"),
-        }
-    }
-    .into_iter();
-    let flags = publication_metadata_flags(opts.flags);
-    let mut files = Vec::with_capacity(srcs.len());
-    for ((entry, source), (dst_path, _, _)) in entries.iter().zip(srcs).zip(&targets) {
-        let (data, hash) = if entry.size == 0 {
-            (Vec::new(), opts.hash_policy.payload_algorithm().hash(&[]))
-        } else {
-            match blocks.next() {
-                Some(Ok(block)) if block.data.len() as u64 == entry.size => {
-                    (block.data, block.hash)
-                }
-                // A read failure or a changed size is the engine's to
-                // report or retry.
-                _ => return Ok(SmallCopy::Declined),
-            }
-        };
-        let mut meta = entry.meta();
-        meta.mode = fresh_file_mode(opts, entry);
-        files.push(SmallCopyFile {
-            path: dst_path.clone(),
-            expression_source: args.copy_if.as_ref().map(|_| {
-                (
-                    crate::expression::File::from_entry(entry),
-                    crate::expression::source_path(&source.path, b"").to_vec(),
-                )
-            }),
-            data,
-            hash,
-            meta,
-        });
-    }
-
     let request = SmallCopyRequest {
+        hash_policy: opts.hash_policy,
         copy_if: args
             .copy_if
             .clone()
@@ -788,13 +727,109 @@ fn attempt_small_copy(
     };
     if debug() {
         crate::output::diagnostic!(
-            "syq: small copy: sending {} files ({} bytes) in one turn at {:.2}s",
+            "syq: small copy: offering {} files ({} bytes) at {:.2}s",
             srcs.len(),
             total,
             t0.elapsed().as_secs_f64()
         );
     }
-    let results = match dst_ctl.call(Request::CopySmallFiles(request))? {
+    let native_actor = progress
+        .observations
+        .enabled
+        .load(Relaxed)
+        .then(|| progress.observations.workers.actor("worker"));
+    let _native_work = native_actor
+        .as_ref()
+        .map(|actor| actor.span(crate::transfer_observations::Stage::Work));
+    let copying = progress.copying_interval();
+    let mut source_reader = None;
+    let response = match dst_ctl.call(Request::PrepareSmallFiles(request))? {
+        Response::SmallFilesPrepared(needed) => {
+            if needed.len() != entries.len() {
+                bail!("small copy returned a mismatched selection count");
+            }
+            // Read through the engine's source-worker path.
+            let Ok(mut reader) = src_ep.connect_with_sources(args.compress, roots.to_vec(), true)
+            else {
+                return Ok(SmallCopy::Reconnect);
+            };
+            let reads: Vec<SmallRead> = srcs
+                .iter()
+                .zip(roots)
+                .zip(&entries)
+                .enumerate()
+                .filter(|(i, (_, entry))| needed[*i] && entry.size > 0)
+                .map(|(_, ((source, root), entry))| SmallRead {
+                    path: source.path.clone(),
+                    source: Some(root.selection.clone()),
+                    attempt: 0,
+                    len: entry.size as u32,
+                })
+                .collect();
+            configure_hashing(&mut *reader, opts.hash_policy)?;
+            if let Some(actor) = &native_actor {
+                if reader
+                    .observe(&progress.observations, actor, true, 0)
+                    .is_err()
+                {
+                    return Ok(SmallCopy::Reconnect);
+                }
+                if dst_ctl
+                    .observe(&progress.observations, actor, false, 0)
+                    .is_err()
+                {
+                    // Nothing has been copied yet. Reopen the control connection before
+                    // entering the ordinary transfer path; never use lost framing.
+                    return Ok(SmallCopy::Reconnect);
+                }
+            }
+            let mut blocks = if reads.is_empty() {
+                Vec::new()
+            } else {
+                let count = reads.len();
+                reader.send(Request::ReadSmallBatch(reads))?;
+                match ok(reader.recv()?, "read small batch")? {
+                    Response::SmallBlocks(blocks) if blocks.len() == count => blocks,
+                    other => bail!("unexpected response {other:?}"),
+                }
+            }
+            .into_iter();
+            let mut payloads = Vec::new();
+            for (i, entry) in entries.iter().enumerate().filter(|(i, _)| needed[*i]) {
+                let (data, hash) = if entry.size == 0 {
+                    (Vec::new(), opts.hash_policy.payload_algorithm().hash(&[]))
+                } else {
+                    match blocks.next() {
+                        Some(Ok(block)) if block.data.len() as u64 == entry.size => {
+                            (block.data, block.hash)
+                        }
+                        // The receiver retains the offer's directory. Fall back on a
+                        // new session if a selected source could not be read.
+                        _ => return Ok(SmallCopy::Reconnect),
+                    }
+                };
+                payloads.push(SmallCopyPayload {
+                    index: i as u32,
+                    data,
+                    hash,
+                });
+            }
+            if debug() {
+                crate::output::diagnostic!(
+                    "syq: small copy: sending {} selected files ({} bytes)",
+                    payloads.len(),
+                    payloads
+                        .iter()
+                        .map(|payload| payload.data.len())
+                        .sum::<usize>()
+                );
+            }
+            source_reader = Some(reader);
+            dst_ctl.call(Request::CopySmallFiles(payloads))?
+        }
+        other => other,
+    };
+    let results = match response {
         Response::SmallFilesCopied(SmallCopyResponse {
             outcome: SmallCopyOutcome::Published(results),
             ..
@@ -1003,7 +1038,9 @@ fn attempt_small_copy(
         deletions_blocked: None,
     };
     if progress.observations.enabled.load(Relaxed) {
-        reader.transport_stats();
+        if let Some(reader) = &mut source_reader {
+            reader.transport_stats();
+        }
         dst_ctl.transport_stats();
     }
     drop(_native_work);
@@ -1629,15 +1666,103 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             spec.prime_pooled_control(args.compress);
         }
     }
-    let (mut src_ctl, mut dst_ctl) = {
+    let maximum_workers = if autotune {
+        args.automatic_worker_limit()
+    } else {
+        args.connections
+    };
+    // Descriptor preflight is an estimate, not a reservation. For automatic
+    // copies check the source roots and control session, not every worker the
+    // tuner might someday try. Fixed counts retain their up-front estimate.
+    let budgeted_workers = if autotune { 0 } else { args.connections };
+    let source_shared_workers = match &src_ep {
+        Endpoint::Local { .. } => budgeted_workers,
+        Endpoint::Remote(_) if use_tcp => budgeted_workers,
+        Endpoint::Remote(_) => 0,
+    };
+    // Only workers that can attempt local offload need foreign source claims.
+    // Actual local destinations live in a separate receiver process.
+    let mut copy_local_claim_workers = if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy()
+    {
+        budgeted_workers
+    } else {
+        0
+    };
+    // macOS cloning is optional. Its source is in this process, so use the
+    // same admission check as registration before reserving foreign claims.
+    // If those claims do not fit, keep the normal worker budget and byte-copy
+    // path on every filesystem, including APFS. Registration still rejects
+    // a budget that cannot accommodate the ordinary copy itself.
+    if cfg!(target_os = "macos")
+        && copy_local_claim_workers > 0
+        && crate::fsops::require_source_descriptor_capacity(
+            srcs.len(),
+            source_shared_workers,
+            copy_local_claim_workers,
+        )
+        .is_err()
+    {
+        opts.local_copy_fd_budget = false;
+        copy_local_claim_workers = 0;
+        if debug() {
+            crate::output::diagnostic!(
+                "syq: macOS cloning disabled: source descriptor budget leaves no room for clone claims"
+            );
+        }
+    }
+    let source_independent_handoff_workers = copy_local_claim_workers
+        .checked_add(match &src_ep {
+            Endpoint::Local { .. } => 0,
+            Endpoint::Remote(_) => budgeted_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
+        })
+        .context("source worker count overflow")?;
+    let small_copy_candidate = small_copy_eligible(&args, srcs, dst, &src_ep, &dst_ep);
+    let (mut src_ctl, early_sources, mut dst_ctl) = {
         let (a, b) = (src_ep.clone(), args.clone());
-        let t = std::thread::spawn(move || connect_ctl(&a, &b));
-        let dst_ctl = connect_ctl(&dst_ep, &args);
+        let candidates = small_copy_candidate.then(|| srcs.to_vec());
+        // Local metadata is usually ready before the SSH handshake completes.
+        let t = std::thread::spawn(move || -> Result<_> {
+            let mut connection = connect_ctl(&a, &b)?;
+            let sources = if let Some(sources) = candidates {
+                let roots = register_source_roots(
+                    &mut *connection,
+                    &sources,
+                    &b,
+                    source_shared_workers,
+                    source_independent_handoff_workers,
+                )?;
+                let entries = sources
+                    .iter()
+                    .zip(&roots)
+                    .map(|(source, root)| {
+                        stat_one_registered(
+                            &mut *connection,
+                            &source.path,
+                            &root.selection,
+                            source.follows_root(b.follows_native_source_paths()),
+                        )
+                        .ok()
+                        .flatten()
+                    })
+                    .collect();
+                Some(SmallCopySources { roots, entries })
+            } else {
+                None
+            };
+            Ok((connection, sources))
+        });
+        // The small-copy offer configures hashing and selects entries in the
+        // same turn. General copies keep the usual control initialization.
+        let dst_ctl = if small_copy_candidate {
+            open_control_connection(&dst_ep, &args)
+        } else {
+            connect_ctl(&dst_ep, &args)
+        };
         let src_ctl = t
             .join()
             .map_err(|_| anyhow::anyhow!("connect thread panicked"))?;
         match (src_ctl, dst_ctl) {
-            (Ok(a), Ok(b)) => (a, b),
+            (Ok((a, sources)), Ok(b)) => (a, sources, b),
             (Err(e), _) | (_, Err(e)) => {
                 progress.stop();
                 return Err(e);
@@ -1689,56 +1814,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
         Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
     };
-    let maximum_workers = if autotune {
-        args.automatic_worker_limit()
-    } else {
-        args.connections
-    };
-    // Descriptor preflight is an estimate, not a reservation. For automatic
-    // copies check the source roots and control session, not every worker the
-    // tuner might someday try. Fixed counts retain their up-front estimate.
-    let budgeted_workers = if autotune { 0 } else { args.connections };
-    let source_shared_workers = match &src_ep {
-        Endpoint::Local { .. } => budgeted_workers,
-        Endpoint::Remote(_) if use_tcp => budgeted_workers,
-        Endpoint::Remote(_) => 0,
-    };
-    // Only workers that can attempt local offload need foreign source claims.
-    // Actual local destinations live in a separate receiver process.
-    let mut copy_local_claim_workers = if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy()
-    {
-        budgeted_workers
-    } else {
-        0
-    };
-    // macOS cloning is optional. Its source is in this process, so use the
-    // same admission check as registration before reserving foreign claims.
-    // If those claims do not fit, keep the normal worker budget and byte-copy
-    // path on every filesystem, including APFS. Registration still rejects
-    // a budget that cannot accommodate the ordinary copy itself.
-    if cfg!(target_os = "macos")
-        && copy_local_claim_workers > 0
-        && crate::fsops::require_source_descriptor_capacity(
-            srcs.len(),
-            source_shared_workers,
-            copy_local_claim_workers,
-        )
-        .is_err()
-    {
-        opts.local_copy_fd_budget = false;
-        copy_local_claim_workers = 0;
-        if debug() {
-            crate::output::diagnostic!(
-                "syq: macOS cloning disabled: source descriptor budget leaves no room for clone claims"
-            );
-        }
-    }
-    let source_independent_handoff_workers = copy_local_claim_workers
-        .checked_add(match &src_ep {
-            Endpoint::Local { .. } => 0,
-            Endpoint::Remote(_) => budgeted_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
-        })
-        .context("source worker count overflow")?;
     // Admission is complete before worker closures receive shared options.
     let opts = Arc::new(opts);
     let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
@@ -2013,13 +2088,19 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }));
         }
     };
-    let registered_sources = register_source_roots(
-        &mut *src_ctl,
-        srcs,
-        &args,
-        source_shared_workers,
-        source_independent_handoff_workers,
-    )?;
+    let (registered_sources, small_entries) = match early_sources {
+        Some(SmallCopySources { roots, entries }) => (roots, entries),
+        None => (
+            register_source_roots(
+                &mut *src_ctl,
+                srcs,
+                &args,
+                source_shared_workers,
+                source_independent_handoff_workers,
+            )?,
+            None,
+        ),
+    };
     let source_filesystem = registered_sources
         .first()
         .and_then(|root| root.filesystem.clone())
@@ -2047,12 +2128,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "source_type":source_filesystem.as_ref().map(|fs| &fs.kind)}),
         );
     }
-    // A native push of a few small local files needs no data worker and no
-    // separate preflight: one control-connection turn selects, anchors,
-    // checks, and publishes. Source registration above was local, so nothing
-    // but the control handshake has crossed the network yet. Anything the
-    // fused request declines continues below on the same connections.
-    if small_copy_eligible(&args, srcs, dst, &src_ep, &dst_ep) {
+    // The bounded offer replaces the destination configuration turn. Its
+    // selected payloads use this control connection without data workers.
+    if small_copy_candidate {
         match attempt_small_copy(
             &args,
             &opts,
@@ -2063,6 +2141,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &mut *src_ctl,
             &mut *dst_ctl,
             source_roots.get().expect("source roots registered"),
+            small_entries,
             &progress,
             t0,
         )? {
@@ -2079,7 +2158,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 print_benchmark_observations(&opts);
                 return Ok(code);
             }
-            SmallCopy::Declined => {}
+            SmallCopy::Declined => configure_hashing(&mut *dst_ctl, opts.hash_policy)?,
             SmallCopy::Reconnect => dst_ctl = connect_ctl(&dst_ep, &args)?,
         }
     }

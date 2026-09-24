@@ -2012,7 +2012,8 @@ impl FsOps {
             } => self
                 .anchor_destination(*expected_dev, *expected_ino, request_prefix)
                 .map(Response::DestinationRegistered),
-            Request::CopySmallFiles(request) => self.copy_small_files(request),
+            Request::PrepareSmallFiles(request) => self.prepare_small_files(request),
+            Request::CopySmallFiles(payloads) => self.copy_small_files(payloads),
             Request::DestinationFilesystemInfo {
                 check_empty,
                 target,

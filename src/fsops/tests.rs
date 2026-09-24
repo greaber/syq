@@ -1328,6 +1328,28 @@ fn small_copy_leaf_accepts_root_and_relative_prefixes_without_nested_paths() {
     }
 }
 
+fn complete_small_copy(
+    operations: &mut FsOps,
+    (offer, contents): (SmallCopyRequest, Vec<Vec<u8>>),
+) -> Response {
+    match operations.handle(&Request::PrepareSmallFiles(offer)) {
+        Response::SmallFilesPrepared(needed) => {
+            let payloads = contents
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| needed[*i])
+                .map(|(i, data)| SmallCopyPayload {
+                    index: i as u32,
+                    hash: content_digest(&data),
+                    data,
+                })
+                .collect();
+            operations.handle(&Request::CopySmallFiles(payloads))
+        }
+        response => response,
+    }
+}
+
 #[test]
 fn small_copy_staging_failure_keeps_all_partials_for_retry() {
     const CHILD_ENV: &str = "SYQ_TEST_SMALL_COPY_STAGING_CHILD";
@@ -1357,6 +1379,7 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
     let canonical = dir.path().canonicalize().unwrap();
     let prefix = canonical.as_os_str().as_bytes().to_vec();
     let request = SmallCopyRequest {
+        hash_policy: Default::default(),
         copy_if: None,
         directory: prefix.clone(),
         symlink_policy: OperatorSymlinkPolicy::Refuse,
@@ -1371,8 +1394,7 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
             .map(|name| SmallCopyFile {
                 expression_source: None,
                 path: join(&prefix, name.as_bytes()),
-                data: name.as_bytes().to_vec(),
-                hash: content_digest(name.as_bytes()),
+                size: name.len() as u64,
                 meta: Meta {
                     inode_metadata: None,
                     mode: 0o600,
@@ -1386,7 +1408,10 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
     };
     // The child alone injects failure after the second sidecar is
     // complete. Timestamp rejection differs between Linux and macOS.
-    let response = FsOps::new().handle(&Request::CopySmallFiles(request.clone()));
+    let response = complete_small_copy(
+        &mut FsOps::new(),
+        (request.clone(), vec![b"one".to_vec(), b"two".to_vec()]),
+    );
     assert!(
         matches!(
             response,
@@ -1413,7 +1438,10 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
     // A fresh control session can finish the same copy with the partials
     // present, without publishing duplicates or leaving temporary files.
     std::env::remove_var("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME");
-    let response = FsOps::new().handle(&Request::CopySmallFiles(request));
+    let response = complete_small_copy(
+        &mut FsOps::new(),
+        (request, vec![b"one".to_vec(), b"two".to_vec()]),
+    );
     match response {
         Response::SmallFilesCopied(SmallCopyResponse {
             outcome: SmallCopyOutcome::Published(results),
@@ -1443,33 +1471,42 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
     let dir = test_dir();
     fs::create_dir(&dir).unwrap();
     let prefix = dir.as_os_str().as_bytes().to_vec();
-    let file = |name: &str, data: &[u8]| SmallCopyFile {
-        expression_source: None,
-        path: join(&prefix, name.as_bytes()),
-        data: data.to_vec(),
-        hash: content_digest(data),
-        meta: Meta {
-            inode_metadata: None,
-            mode: 0o640,
-            uid: 0,
-            gid: 0,
-            mtime: 1_700_000_000,
-            mtime_nsec: 0,
-        },
-    };
-    let request = |directory: PathBytes, files: Vec<SmallCopyFile>| {
-        Request::CopySmallFiles(SmallCopyRequest {
-            copy_if: None,
-            directory,
-            symlink_policy: OperatorSymlinkPolicy::Refuse,
-            request_prefix: prefix.clone(),
-            identity: SmallCopyIdentity {
-                copy_id: [7; 16],
-                dst_leaf: None,
+    let file = |name: &str, data: &[u8]| {
+        (
+            SmallCopyFile {
+                expression_source: None,
+                path: join(&prefix, name.as_bytes()),
+                size: data.len() as u64,
+                meta: Meta {
+                    inode_metadata: None,
+                    mode: 0o640,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 1_700_000_000,
+                    mtime_nsec: 0,
+                },
             },
-            flags: flags::MODE | flags::TIMES,
-            files,
-        })
+            data.to_vec(),
+        )
+    };
+    let request = |directory: PathBytes, files: Vec<(SmallCopyFile, Vec<u8>)>| {
+        let (files, contents) = files.into_iter().unzip();
+        (
+            SmallCopyRequest {
+                hash_policy: Default::default(),
+                copy_if: None,
+                directory,
+                symlink_policy: OperatorSymlinkPolicy::Refuse,
+                request_prefix: prefix.clone(),
+                identity: SmallCopyIdentity {
+                    copy_id: [7; 16],
+                    dst_leaf: None,
+                },
+                flags: flags::MODE | flags::TIMES,
+                files,
+            },
+            contents,
+        )
     };
     let message = |response: &Response| match response {
         Response::Err(message) => message.clone(),
@@ -1478,10 +1515,13 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
     };
 
     let mut operations = FsOps::new();
-    let response = operations.handle(&request(
-        prefix.clone(),
-        vec![file("one", b"first"), file("two", b"")],
-    ));
+    let response = complete_small_copy(
+        &mut operations,
+        request(
+            prefix.clone(),
+            vec![file("one", b"first"), file("two", b"")],
+        ),
+    );
     match response {
         Response::SmallFilesCopied(SmallCopyResponse {
             anchor,
@@ -1513,7 +1553,10 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
     assert!(operations.destination_root.is_some());
-    let again = operations.handle(&request(prefix.clone(), vec![file("three", b"x")]));
+    let again = complete_small_copy(
+        &mut operations,
+        request(prefix.clone(), vec![file("three", b"x")]),
+    );
     assert!(
         message(&again).contains("fresh control session"),
         "{again:?}"
@@ -1522,10 +1565,13 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
 
     fs::create_dir(dir.join("directory")).unwrap();
     let mut declined = FsOps::new();
-    let response = declined.handle(&request(
-        prefix.clone(),
-        vec![file("three", b"x"), file("directory", b"replaced")],
-    ));
+    let response = complete_small_copy(
+        &mut declined,
+        request(
+            prefix.clone(),
+            vec![file("three", b"x"), file("directory", b"replaced")],
+        ),
+    );
     assert!(
         matches!(
             &response,
@@ -1545,26 +1591,133 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
     });
     assert!(matches!(canonical, Response::Path(_)), "{canonical:?}");
 
-    let nested = SmallCopyFile {
-        path: join(&prefix, b"sub/deep"),
-        ..file("x", b"x")
-    };
-    let response = FsOps::new().handle(&request(prefix.clone(), vec![nested]));
+    let mut nested = file("x", b"x");
+    nested.0.path = join(&prefix, b"sub/deep");
+    let response = complete_small_copy(&mut FsOps::new(), request(prefix.clone(), vec![nested]));
     assert!(
         message(&response).contains("one entry beneath"),
         "{response:?}"
     );
-    let response = FsOps::new().handle(&request(
-        prefix.clone(),
-        vec![file("dup", b"a"), file("dup", b"b")],
-    ));
+    let response = complete_small_copy(
+        &mut FsOps::new(),
+        request(prefix.clone(), vec![file("dup", b"a"), file("dup", b"b")]),
+    );
     assert!(message(&response).contains("twice"), "{response:?}");
-    let response = FsOps::new().handle(&request(prefix.clone(), Vec::new()));
+    let response = complete_small_copy(&mut FsOps::new(), request(prefix.clone(), Vec::new()));
     assert!(message(&response).contains("limit"), "{response:?}");
-    let response = FsOps::new().handle(&request(join(&prefix, b"absent"), vec![file("x", b"x")]));
+    let response = complete_small_copy(
+        &mut FsOps::new(),
+        request(join(&prefix, b"absent"), vec![file("x", b"x")]),
+    );
     assert!(!message(&response).is_empty());
     assert!(!dir.join("absent").exists() && !dir.join("x").exists());
     fs::remove_dir_all(&dir).unwrap();
+}
+
+fn offered_small_copy(prefix: &[u8], names: &[&[u8]]) -> SmallCopyRequest {
+    SmallCopyRequest {
+        hash_policy: crate::hashing::HashPolicy {
+            transfer_integrity: true,
+            ..Default::default()
+        },
+        copy_if: None,
+        directory: prefix.to_vec(),
+        symlink_policy: OperatorSymlinkPolicy::Refuse,
+        request_prefix: prefix.to_vec(),
+        identity: SmallCopyIdentity {
+            copy_id: [11; 16],
+            dst_leaf: None,
+        },
+        flags: 0,
+        files: names
+            .iter()
+            .map(|name| SmallCopyFile {
+                path: join(prefix, name),
+                size: 3,
+                expression_source: None,
+                meta: Meta {
+                    inode_metadata: None,
+                    mode: 0o600,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 1_700_000_000,
+                    mtime_nsec: 0,
+                },
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn small_copy_rejects_invalid_payloads_before_writing_and_consumes_the_offer() {
+    let t = crate::test_support::tempdir().unwrap();
+    let prefix = t.path().as_os_str().as_bytes();
+    let offer = offered_small_copy(prefix, &[b"one", b"two"]);
+    let payload = |index, data: &[u8]| SmallCopyPayload {
+        index,
+        data: data.to_vec(),
+        hash: content_digest(data),
+    };
+    let mut corrupt = payload(1, b"two");
+    corrupt.hash = content_digest(b"bad");
+    for invalid in [
+        vec![payload(0, b"one")],
+        vec![payload(0, b"one"), payload(0, b"one")],
+        vec![payload(0, b"one"), payload(2, b"two")],
+        vec![payload(0, b"one"), payload(1, b"short")],
+        vec![payload(0, b"one"), corrupt],
+    ] {
+        let mut operations = FsOps::new();
+        assert!(
+            matches!(operations.handle(&Request::PrepareSmallFiles(offer.clone())),
+            Response::SmallFilesPrepared(needed) if needed == [true, true])
+        );
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 0);
+        let response = operations.handle(&Request::CopySmallFiles(invalid));
+        assert!(
+            matches!(response, Response::EndpointError(_) | Response::Err(_)),
+            "{response:?}"
+        );
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 0);
+        let response = operations.handle(&Request::CopySmallFiles(vec![
+            payload(0, b"one"),
+            payload(1, b"two"),
+        ]));
+        assert!(
+            matches!(response, Response::EndpointError(_) | Response::Err(_)),
+            "{response:?}"
+        );
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn small_copy_keeps_the_prepared_directory_when_its_name_is_replaced() {
+    let t = crate::test_support::tempdir().unwrap();
+    let selected = t.path().join("selected");
+    let moved = t.path().join("moved");
+    fs::create_dir(&selected).unwrap();
+    let mut operations = FsOps::new();
+    let offer = offered_small_copy(selected.as_os_str().as_bytes(), &[b"one"]);
+    assert!(matches!(
+        operations.handle(&Request::PrepareSmallFiles(offer)),
+        Response::SmallFilesPrepared(_)
+    ));
+    fs::rename(&selected, &moved).unwrap();
+    fs::create_dir(&selected).unwrap();
+    let response = operations.handle(&Request::CopySmallFiles(vec![SmallCopyPayload {
+        index: 0,
+        data: b"one".to_vec(),
+        hash: content_digest(b"one"),
+    }]));
+    assert!(
+        matches!(response, Response::SmallFilesCopied(SmallCopyResponse {
+        outcome: SmallCopyOutcome::Published(results), ..
+    }) if results.iter().all(|result| result.error.is_none()))
+    );
+    assert_eq!(fs::read(moved.join("one")).unwrap(), b"one");
+    assert!(!selected.join("one").exists());
+    assert!(operations.prepared_small_copy.is_none());
 }
 
 #[test]

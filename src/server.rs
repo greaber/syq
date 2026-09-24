@@ -568,6 +568,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }
+                    | Request::PrepareSmallFiles(_)
                     | Request::CopySmallFiles(_)
                     | Request::PruneLookup { .. }
                     | Request::Receipt
