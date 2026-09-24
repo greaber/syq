@@ -4726,6 +4726,95 @@ fn registered_fifo_keeps_identity_checks_without_connecting_a_writer() {
 }
 
 #[test]
+fn metadata_parent_reuse_keeps_final_ancestor_replacement_check() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let outside = crate::test_support::tempdir().unwrap();
+    fs::create_dir(tree.path().join("parent")).unwrap();
+    fs::write(tree.path().join("parent/leaf"), b"selected").unwrap();
+    fs::write(outside.path().join("leaf"), b"outside").unwrap();
+    let sentinel = fs::metadata(outside.path().join("leaf")).unwrap();
+    let root = Root::open(tree.path()).unwrap();
+    let path = RelativePath::new(b"parent/leaf").unwrap();
+    let parent = root.resolve_parent(&path).unwrap();
+    let handle = parent.open_metadata().unwrap();
+    let opened = handle.metadata().unwrap();
+    fs::rename(tree.path().join("parent"), tree.path().join("held")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), tree.path().join("parent")).unwrap();
+    parent
+        .set_times(&[
+            timespec(0, libc::UTIME_OMIT as u32),
+            timespec(1_600_000_000, 0),
+        ])
+        .unwrap();
+    assert_eq!(
+        fs::metadata(tree.path().join("held/leaf")).unwrap().mtime(),
+        1_600_000_000
+    );
+    assert!(require_rooted_named_identity_known(
+        &root,
+        &path,
+        &tree.path().join("parent/leaf"),
+        &opened,
+        TargetCondition::Any
+    )
+    .is_err());
+    let after = fs::metadata(outside.path().join("leaf")).unwrap();
+    assert_eq!(
+        (after.ino(), after.mtime(), after.mtime_nsec()),
+        (sentinel.ino(), sentinel.mtime(), sentinel.mtime_nsec())
+    );
+    assert_eq!(fs::read(outside.path().join("leaf")).unwrap(), b"outside");
+}
+
+#[test]
+fn reused_parent_errors_keep_paths_and_os_error_codes() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let mut ops = destination_ops(tree.path());
+    let long_name = vec![b'd'; 256];
+    let errors = ops.apply(
+        &[
+            Op::Mkdir {
+                path: long_name.clone(),
+                mode: 0o755,
+                condition: TargetCondition::Any,
+            },
+            Op::SetMeta {
+                path: b"missing-metadata-target".to_vec(),
+                meta: Meta {
+                    inode_metadata: None,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                },
+                flags: flags::TIMES,
+                condition: TargetCondition::Any,
+            },
+        ],
+        None,
+    );
+    for (error, (path, code)) in errors.iter().zip([
+        (&long_name[..], libc::ENAMETOOLONG),
+        (&b"missing-metadata-target"[..], libc::ENOENT),
+    ]) {
+        let error = error.as_ref().expect("operation should fail");
+        assert!(error.as_str().contains(&*String::from_utf8_lossy(path)));
+        assert_eq!(error.raw_os_error, Some(code));
+    }
+    let error = Root::open(tree.path())
+        .unwrap()
+        .create_directory(&RelativePath::new(&long_name).unwrap(), 0o755)
+        .unwrap_err();
+    assert_eq!(
+        format!("{error:#}")
+            .matches("create confined directory")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn sparse_identity_conditioned_publication_keeps_holes_and_existing_inode() {
     let directory = crate::test_support::tempdir().unwrap();
     let target = directory.path().join("target");

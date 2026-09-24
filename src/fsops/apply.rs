@@ -320,11 +320,17 @@ pub(super) fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                 }
                 return Ok(());
             }
-            if target.create_missing_parents {
-                root.create_missing_parents(path, 0o777)?;
-            }
+            let parent = if target.create_missing_parents {
+                root.resolve_parent_creating(path, 0o777)?
+            } else {
+                root.resolve_parent(path)?
+            };
             if matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
-                match root.create_directory(path, (*mode & 0o7777) | 0o700) {
+                match parent
+                    .create_directory((*mode & 0o7777) | 0o700)
+                    .with_context(|| {
+                        format!("create confined directory {}", target.label.display())
+                    }) {
                     Ok(()) => return Ok(()),
                     Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
                         if *condition == TargetCondition::Absent {
@@ -337,6 +343,7 @@ pub(super) fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                     Err(error) => return Err(error),
                 }
             }
+            drop(parent);
             match observe_rooted_condition(target, *condition)? {
                 Some(metadata) if metadata.is_dir() => {
                     if metadata.mode & 0o700 != 0o700 {
@@ -507,7 +514,10 @@ pub(super) fn set_meta_rooted(
             condition,
         );
     }
-    let metadata = target.root.metadata(&target.relative)?;
+    let parent = target.root.resolve_parent(&target.relative)?;
+    let metadata = parent
+        .metadata()
+        .with_context(|| format!("stat confined path {}", target.label.display()))?;
     require_rooted_condition(metadata, condition, &target.label)?;
     let is_link = metadata.is_symlink();
     let owner_differs = (flags & flags::OWNER != 0
@@ -525,26 +535,34 @@ pub(super) fn set_meta_rooted(
         let handle = meta
             .inode_metadata
             .as_ref()
-            .map(|_| target.root.open_metadata(&target.relative))
+            .map(|_| {
+                parent.open_metadata().with_context(|| {
+                    format!("open confined metadata handle {}", target.label.display())
+                })
+            })
             .transpose()?;
         if let Some(handle) = &handle {
             require_rooted_metadata(handle, metadata, &target.label)?;
         }
         apply_owner_if_changed(flags, meta, metadata.uid, metadata.gid, |uid, gid| {
-            target.root.chown(&target.relative, uid, gid)
+            parent.chown(uid, gid)
         })?;
         if time_differs {
             let times = [
                 timespec(0, libc::UTIME_OMIT as u32),
                 timespec(meta.mtime, meta.mtime_nsec),
             ];
-            target.root.set_times(&target.relative, &times)?;
+            parent.set_times(&times).with_context(|| {
+                format!("set times on confined path {}", target.label.display())
+            })?;
         }
         if let Some(handle) = &handle {
             crate::inode_metadata::apply(handle, meta.inode_metadata.as_deref(), meta.mode)?;
         }
     } else {
-        let handle = target.root.open_metadata(&target.relative)?;
+        let handle = parent
+            .open_metadata()
+            .with_context(|| format!("open confined metadata handle {}", target.label.display()))?;
         let opened = handle.metadata()?;
         if opened.dev() != metadata.dev || opened.ino() != metadata.ino {
             bail!(
@@ -561,11 +579,16 @@ pub(super) fn set_meta_rooted(
                 timespec(0, libc::UTIME_OMIT as u32),
                 timespec(meta.mtime, meta.mtime_nsec),
             ];
-            target.root.set_times(&target.relative, &times)?;
+            parent.set_times(&times).with_context(|| {
+                format!("set times on confined path {}", target.label.display())
+            })?;
         }
         // Birth time follows mtime: macOS may lower birth time when setting
         // an older modification time.
         set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
+        // The final lookup resolves from Root again. Release the reused
+        // parent first so that check does not raise peak descriptor usage.
+        drop(parent);
         return require_rooted_named_identity_known(
             &target.root,
             &target.relative,
@@ -574,6 +597,7 @@ pub(super) fn set_meta_rooted(
             condition,
         );
     }
+    drop(parent);
     let after = target.root.metadata(&target.relative)?;
     require_rooted_identity(after, condition, &target.label)
 }

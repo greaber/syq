@@ -1821,6 +1821,29 @@ fn os_string_conversion_in_test_is_byte_exact() {
 }
 
 #[test]
+fn creating_parent_handle_rejects_links_and_keeps_selected_directory() {
+    let tree = TestDir::new("creating-parent");
+    let outside = TestDir::new("creating-parent-outside");
+    let root = Root::open(tree.path()).unwrap();
+    let parent = root
+        .resolve_parent_creating(&relative(b"a/b/leaf"), 0o755)
+        .unwrap();
+    fs::rename(tree.path().join("a/b"), tree.path().join("held")).unwrap();
+    symlink(outside.path(), tree.path().join("a/b")).unwrap();
+    parent.create_directory(0o755).unwrap();
+    assert!(tree.path().join("held/leaf").is_dir());
+    assert!(!outside.path().join("leaf").exists());
+    assert!(root
+        .resolve_parent_creating(&relative(b"a/b/other"), 0o755)
+        .is_err());
+    root.resolve_parent_creating(&relative(b"top"), 0o755)
+        .unwrap()
+        .create_directory(0o755)
+        .unwrap();
+    assert!(tree.path().join("top").is_dir());
+}
+
+#[test]
 fn hardlink_publication_is_confined_and_rejects_a_replaced_representative() {
     let tree = TestDir::new("hardlinks");
     let root = Root::open(tree.path()).unwrap();

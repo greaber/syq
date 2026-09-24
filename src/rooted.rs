@@ -337,19 +337,12 @@ impl Root {
             let parent = self.resolve_parent(path)?;
             (parent.directory, parent.leaf)
         };
-        #[cfg(target_os = "linux")]
-        let flags =
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
-        #[cfg(target_os = "macos")]
-        // O_SYMLINK opens the link itself. O_NOFOLLOW takes precedence on
-        // macOS and would reject that link instead.
-        let flags =
-            libc::O_EVTONLY | libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let flags =
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
-        open_at(parent.as_raw_fd(), &leaf, flags, 0)
-            .with_context(|| format!("open confined metadata handle {}", path.label()))
+        ResolvedParent {
+            directory: parent,
+            leaf,
+        }
+        .open_metadata()
+        .with_context(|| format!("open confined metadata handle {}", path.label()))
     }
 
     // The Linux syscall resolves the parent and opens the leaf under the same
@@ -708,24 +701,36 @@ impl Root {
     /// Create exactly one directory. Parents must already exist and be real
     /// directories beneath this root.
     pub(crate) fn create_directory(&self, path: &RelativePath, mode: u32) -> Result<()> {
-        let parent = self.resolve_parent(path)?;
-        retry_zero(|| unsafe {
-            libc::mkdirat(
-                parent.directory.as_raw_fd(),
-                parent.leaf.as_ptr(),
-                (mode & 0o777) as libc::mode_t,
-            )
-        })
-        .with_context(|| format!("create confined directory {}", path.label()))
+        self.resolve_parent(path)?
+            .create_directory(mode)
+            .with_context(|| format!("create confined directory {}", path.label()))
     }
 
     /// Create any missing parents of `path`, walking only through real
     /// directories retained beneath this root. Concurrent creators are
     /// accepted only when the resulting component opens as a directory.
     pub(crate) fn create_missing_parents(&self, path: &RelativePath, mode: u32) -> Result<()> {
-        let (parents, _) = path.leaf()?;
-        if open_directory_components_fast(&self.directory, parents).is_ok() {
-            return Ok(());
+        self.resolve_parent_creating(path, mode).map(drop)
+    }
+
+    /// Keep the parent opened while creating missing ancestors so the caller
+    /// can create the leaf without resolving and opening that parent again.
+    pub(crate) fn resolve_parent_creating(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+    ) -> Result<ResolvedParent<'_>> {
+        let (parents, leaf) = path.leaf()?;
+        #[cfg(all(test, target_os = "linux"))]
+        self.check_test_name_limit(path)?;
+        if parents.is_empty() {
+            return self.resolve_parent(path);
+        }
+        if let Ok(directory) = open_directory_components_fast(&self.directory, parents) {
+            return Ok(ResolvedParent {
+                directory: DirectoryHandle::Owned(directory),
+                leaf: component_cstring(leaf),
+            });
         }
         let mut directory = self.directory.try_clone().context("duplicate root fd")?;
         for component in parents {
@@ -765,7 +770,10 @@ impl Root {
             directory = open_directory_at(&directory, component.as_bytes())
                 .with_context(|| format!("open created confined parent for {}", path.label()))?;
         }
-        Ok(())
+        Ok(ResolvedParent {
+            directory: DirectoryHandle::Owned(directory),
+            leaf: component_cstring(leaf),
+        })
     }
 
     pub(crate) fn metadata(&self, path: &RelativePath) -> Result<RootMetadata> {
@@ -1555,7 +1563,7 @@ impl Root {
         .with_context(|| format!("{operation} confined path {}", path.label()))
     }
 
-    fn resolve_parent(&self, path: &RelativePath) -> Result<ResolvedParent<'_>> {
+    pub(crate) fn resolve_parent(&self, path: &RelativePath) -> Result<ResolvedParent<'_>> {
         #[cfg(all(test, target_os = "linux"))]
         self.check_test_name_limit(path)?;
         let (parents, leaf) = path.leaf()?;
@@ -1592,9 +1600,65 @@ impl std::ops::Deref for DirectoryHandle<'_> {
     }
 }
 
-struct ResolvedParent<'a> {
+pub(crate) struct ResolvedParent<'a> {
     directory: DirectoryHandle<'a>,
     leaf: CString,
+}
+
+// An operation-local parent handle. Callers that check the final pathname must
+// still resolve it from Root; retaining this handle must not hide replacement
+// of an ancestor during a metadata update.
+impl ResolvedParent<'_> {
+    pub(crate) fn metadata(&self) -> io::Result<RootMetadata> {
+        metadata_at(self.directory.as_raw_fd(), &self.leaf)
+    }
+
+    pub(crate) fn open_metadata(&self) -> io::Result<File> {
+        #[cfg(target_os = "linux")]
+        let flags =
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+        #[cfg(target_os = "macos")]
+        // O_NOFOLLOW would override O_SYMLINK and reject a link on macOS.
+        let flags =
+            libc::O_EVTONLY | libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let flags =
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+        open_at(self.directory.as_raw_fd(), &self.leaf, flags, 0)
+    }
+
+    pub(crate) fn create_directory(&self, mode: u32) -> io::Result<()> {
+        retry_zero(|| unsafe {
+            libc::mkdirat(
+                self.directory.as_raw_fd(),
+                self.leaf.as_ptr(),
+                (mode & 0o777) as libc::mode_t,
+            )
+        })
+    }
+
+    pub(crate) fn set_times(&self, times: &[libc::timespec; 2]) -> io::Result<()> {
+        retry_zero(|| unsafe {
+            libc::utimensat(
+                self.directory.as_raw_fd(),
+                self.leaf.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+    }
+
+    pub(crate) fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+        retry_zero(|| unsafe {
+            libc::fchownat(
+                self.directory.as_raw_fd(),
+                self.leaf.as_ptr(),
+                uid.unwrap_or(u32::MAX),
+                gid.unwrap_or(u32::MAX),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+    }
 }
 
 #[cfg(all(target_os = "macos", debug_assertions))]
