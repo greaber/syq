@@ -27,6 +27,109 @@ fn selection_traverses_unselected_directories_and_protects_pruning() {
 }
 
 #[test]
+fn excluded_directories_allow_pruning_only_destination_children() {
+    for predicate in ["false", "src.name = 'selected'"] {
+        let t = Tmp::new();
+        write(&t.path("src/nested/excluded"), b"source");
+        write(&t.path("src/nested/selected"), b"selected payload");
+        fs::create_dir_all(t.path("src/empty")).unwrap();
+        write(&t.path("src/leaf"), b"excluded file");
+        write(&t.path("dst/nested/excluded"), b"keep destination");
+        write(&t.path("dst/nested/selected"), b"old");
+        write(&t.path("dst/nested/extra"), b"remove");
+        write(&t.path("dst/empty/extra"), b"remove");
+        write(&t.path("dst/leaf/extra"), b"protected subtree");
+        run_native_ok(&[
+            "cp",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+            "--where",
+            predicate,
+            "--prune",
+            "--dry-run",
+            "--results",
+            &t.s("preview.ndjson"),
+        ]);
+        let mut deletions: Vec<_> = fs::read_to_string(t.path("preview.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["type"] == "trace" && record["action"] == "delete")
+            .map(|record| record["dst"]["value"].as_str().unwrap().to_owned())
+            .collect();
+        deletions.sort();
+        assert_eq!(deletions, ["empty/extra", "nested/extra"]);
+        assert_eq!(read(&t.path("dst/nested/extra")), b"remove");
+        assert_eq!(read(&t.path("dst/empty/extra")), b"remove");
+        run_native_ok(&[
+            "cp",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+            "--where",
+            predicate,
+            "--prune",
+        ]);
+        assert_eq!(read(&t.path("dst/nested/excluded")), b"keep destination");
+        assert_eq!(
+            read(&t.path("dst/nested/selected")),
+            if predicate == "false" {
+                b"old".as_slice()
+            } else {
+                b"selected payload".as_slice()
+            }
+        );
+        assert!(t.path("dst/empty").is_dir());
+        assert!(!t.path("dst/nested/extra").exists());
+        assert!(!t.path("dst/empty/extra").exists());
+        // An excluded source leaf still protects a destination directory
+        // occupying that name, including its otherwise unknown descendants.
+        assert_eq!(read(&t.path("dst/leaf/extra")), b"protected subtree");
+    }
+}
+
+#[test]
+fn skipped_leaf_protection_survives_an_excluded_directory_at_the_same_name() {
+    for reverse in [false, true] {
+        for special in [false, true] {
+            let t = Tmp::new();
+            fs::create_dir_all(t.path("directory/shared")).unwrap();
+            let predicate = if special {
+                fs::create_dir_all(t.path("leaf")).unwrap();
+                mkfifo(&t.path("leaf/shared"));
+                // Selected, but copying special nodes was not requested.
+                "src.kind != 'dir'"
+            } else {
+                write(&t.path("leaf/shared"), b"excluded source file");
+                "false"
+            };
+            write(&t.path("dst/shared/extra"), b"protected subtree");
+            let (first, second) = if reverse {
+                ("leaf", "directory")
+            } else {
+                ("directory", "leaf")
+            };
+            run_native_ok(&[
+                "cp",
+                "--srcs-in",
+                &t.s(first),
+                "--srcs-in",
+                &t.s(second),
+                "--into",
+                &t.s("dst"),
+                "--where",
+                predicate,
+                "--prune",
+            ]);
+            assert_eq!(read(&t.path("dst/shared/extra")), b"protected subtree");
+        }
+    }
+}
+
+#[test]
 fn destination_conditions_apply_before_content_and_metadata_updates() {
     let t = Tmp::new();
     write(&t.path("src/grow"), b"longer source");
@@ -350,54 +453,72 @@ fn merged_directories_keep_each_sources_expression_result() {
 
 #[test]
 fn unselected_containers_use_receiver_umask_and_inheritance() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    let script = fs::read_to_string(&rsh).unwrap();
-    executable(
-        &rsh,
-        script
-            .replace("#!/bin/sh\n", "#!/bin/sh\numask 077\n")
-            .as_bytes(),
-    );
-    t.expose_remote_syq();
-    write(&t.path("src/nested/keep"), b"selected");
-    fs::create_dir_all(t.path("dst")).unwrap();
-    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o2775)).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "cp",
-            "--srcs-in",
-            &t.s("src"),
-            "--to",
-            "127.0.0.1",
-            "--into",
-            &t.s("dst"),
-            "--where",
-            "src.kind = 'file'",
-            "--copy-if",
-            "src.kind != 'dir'",
-            "--rsh",
-            rsh.to_str().unwrap(),
-            "--no-bootstrap",
-            "--no-tcp",
-            "--no-progress",
-        ])
-        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-        .env("XDG_CACHE_HOME", t.path("cache"))
-        .run()
-        .unwrap();
-    assert_output_ok(&output);
-    assert_eq!(read(&t.path("dst/nested/keep")), b"selected");
-    assert_eq!(
-        fs::metadata(t.path("dst/nested")).unwrap().mode() & 0o777,
-        0o700
-    );
-    #[cfg(target_os = "linux")]
-    assert_eq!(
-        fs::metadata(t.path("dst/nested")).unwrap().mode() & 0o2000,
-        0o2000
-    );
+    for remote in [false, true] {
+        for umask in [0o002, 0o077] {
+            for filter in ["--where", "--copy-if"] {
+                let t = Tmp::new();
+                let rsh = fake_rsh(&t);
+                let script = fs::read_to_string(&rsh).unwrap();
+                executable(
+                    &rsh,
+                    script
+                        .replace("#!/bin/sh\n", &format!("#!/bin/sh\numask {umask:03o}\n"))
+                        .as_bytes(),
+                );
+                t.expose_remote_syq();
+                write(&t.path("src/nested/deep/keep"), b"selected");
+                fs::set_permissions(t.path("src/nested"), fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                fs::create_dir_all(t.path("dst")).unwrap();
+                fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o2775)).unwrap();
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.args(["cp", "--srcs-in", &t.s("src")]);
+                if remote {
+                    command.args([
+                        "--to",
+                        "127.0.0.1",
+                        "--rsh",
+                        rsh.to_str().unwrap(),
+                        "--no-bootstrap",
+                        "--no-tcp",
+                    ]);
+                }
+                command
+                    .args([
+                        "--into",
+                        &t.s("dst"),
+                        filter,
+                        "src.kind = 'file'",
+                        "--preserve=permissions",
+                        "--no-progress",
+                    ])
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("XDG_CACHE_HOME", t.path("cache"));
+                // A remote receiver, not its coordinator, chooses the mask.
+                unsafe {
+                    command.pre_exec(move || {
+                        libc::umask(if remote { 0o077 } else { umask });
+                        Ok(())
+                    });
+                }
+                let output = command.run().unwrap();
+                assert_output_ok(&output);
+                assert_eq!(read(&t.path("dst/nested/deep/keep")), b"selected");
+                for path in ["dst/nested", "dst/nested/deep"] {
+                    let metadata = fs::metadata(t.path(path)).unwrap();
+                    assert_eq!(
+                        metadata.mode() & 0o777,
+                        0o777 & !umask,
+                        "{path}: {filter}, remote={remote}, umask={umask:03o}"
+                    );
+                    #[cfg(target_os = "linux")]
+                    assert_eq!(metadata.mode() & 0o2000, 0o2000);
+                    assert_eq!(metadata.gid(), fs::metadata(t.path("dst")).unwrap().gid());
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -416,6 +537,7 @@ fn unselected_readonly_containers_reopen_and_restore_their_modes() {
         "src.kind = 'file'",
         "--copy-if",
         "src.kind != 'dir'",
+        "--prune",
         "--preserve=permissions",
     ]);
     let mode = fs::metadata(t.path("dst/nested")).unwrap().mode() & 0o7777;
@@ -497,6 +619,7 @@ fn later_selected_directory_supplies_metadata_for_an_implicit_parent() {
         &t.s("second"),
         "--into",
         &t.s("dst"),
+        "--prune",
         "--preserve=permissions",
         "--where",
         "src.kind != 'dir' or src.mode = 0o700",

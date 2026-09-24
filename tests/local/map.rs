@@ -1925,3 +1925,35 @@ fn mapping_where_selects_records_without_changing_output_fields() {
     assert!(!bad.status.success());
     assert!(bad.stdout.is_empty());
 }
+
+#[test]
+fn native_cp_mapping_implicit_parents_keep_default_group_permissions() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"payload");
+    write(
+        &t.path("mapping"),
+        entry_line("file", "nested/deep/file", None).as_bytes(),
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command.args([
+        "cp",
+        "-C",
+        &t.s("src"),
+        "--mapping",
+        &t.s("mapping"),
+        "--into",
+        &t.s("dst"),
+        "--preserve=permissions",
+    ]);
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o002);
+            Ok(())
+        });
+    }
+    assert_output_ok(&command.run().unwrap());
+    assert_eq!(read(&t.path("dst/nested/deep/file")), b"payload");
+    for path in ["dst/nested", "dst/nested/deep"] {
+        assert_eq!(fs::metadata(t.path(path)).unwrap().mode() & 0o777, 0o775);
+    }
+}

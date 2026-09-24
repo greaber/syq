@@ -99,11 +99,10 @@ pub(super) struct Planner<'a> {
 }
 
 /// What a source entry asserts about its destination path. Two dirs merge;
-/// a dir against a leaf, or two leaves, conflict. A `Weak` claim comes from
-/// an entry syq will not transfer (a symlink without -l, a special file
-/// without -D, an unknown type): it still marks the path as the source's —
-/// so --delete leaves it alone — but yields to any real claim, so two
-/// sources overlapping on such an entry are not a conflict.
+/// a dir against a leaf, or two leaves, conflict. Weak claims mark entries
+/// that will not be transferred, including expression exclusions and unsupported
+/// types. They protect source counterparts from deletion but yield to real
+/// claims, so overlapping skipped entries do not cause a conflict.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Claim {
     Dir,
@@ -116,6 +115,9 @@ pub(super) enum Claim {
     /// A symlink or special file syq intends to create.
     Leaf,
     Weak,
+    /// An excluded directory protects its own counterpart, but its children
+    /// are still scanned and do not need blanket subtree protection.
+    WeakDir,
 }
 
 /// A failed entry's result identity, with a source path only in mapping mode.
@@ -189,7 +191,7 @@ impl<'a> PruneWalk<'a> {
             return;
         }
         if let Some(claim) = self.seen.get(&full) {
-            if *claim != Claim::Dir && entry.kind == Kind::Dir {
+            if !matches!(claim, Claim::Dir | Claim::WeakDir) && entry.kind == Kind::Dir {
                 self.shielded.insert(full);
             }
             return;
@@ -943,9 +945,7 @@ impl Planner<'_> {
                         })?
                 {
                     if self.opts.delete {
-                        self.dst_seen
-                            .entry(join(dst_root, &m.dst))
-                            .or_insert(Claim::Weak);
+                        self.protect_excluded(join(dst_root, &m.dst), e.kind);
                     }
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     continue;
@@ -1098,10 +1098,9 @@ impl Planner<'_> {
                     .selects(&crate::expression::File::from_entry(&entry), path)
                     .with_context(|| format!("source {}", display(path)))?;
                 if !included {
-                    let dst = join(dst_root, &join(sub, &entry.path));
-                    // Selection never makes a source counterpart extraneous.
                     if self.opts.delete {
-                        self.dst_seen.entry(dst).or_insert(Claim::Weak);
+                        let dst = join(dst_root, &join(sub, &entry.path));
+                        self.protect_excluded(dst, entry.kind);
                     }
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     continue;
@@ -1308,7 +1307,7 @@ impl Planner<'_> {
             // object at this path even though the namespace was already seen.
             let new_capacity_object = match self.dst_seen.get(&dst) {
                 None => true,
-                Some(Claim::Weak) if claim != Claim::Weak => true,
+                Some(Claim::Weak | Claim::WeakDir) if claim != Claim::Weak => true,
                 Some(_) => false,
             };
             let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
@@ -1360,7 +1359,7 @@ impl Planner<'_> {
                     ));
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                 }
-                Claim::Weak => {
+                Claim::Weak | Claim::WeakDir => {
                     // Symlink without -l, special without -D.
                     if opts.verbose > 0 {
                         self.progress
@@ -2988,13 +2987,37 @@ impl Planner<'_> {
         }
     }
 
+    /// Selection protects source counterparts without treating skipped
+    /// directories as completed parents or hiding destination-only children.
+    fn protect_excluded(&mut self, dst: PathBytes, kind: Kind) {
+        let claim = if kind == Kind::Dir {
+            Claim::WeakDir
+        } else {
+            Claim::Weak
+        };
+        self.dst_seen
+            .entry(dst)
+            .and_modify(|existing| {
+                // If several excluded sources share a name, a leaf's
+                // subtree protection wins regardless of scan order.
+                if *existing == Claim::WeakDir && claim == Claim::Weak {
+                    *existing = claim;
+                }
+            })
+            .or_insert(claim);
+    }
+
     /// Record a leaf (file/symlink/special) destination; return false if this
     /// exact destination was already claimed by another source (a collision).
     /// Some(contested) if the claim stands; None on a conflict (reported).
     pub(super) fn claim_dst(&mut self, dst: &PathBytes, rel: &str, claim: Claim) -> Option<bool> {
         match (self.dst_seen.get(dst), claim) {
-            (Some(Claim::Dir), Claim::Dir) | (Some(_), Claim::Weak) => Some(false),
-            (Some(Claim::Weak), c) => {
+            (Some(Claim::WeakDir), Claim::Weak) => {
+                self.dst_seen.insert(dst.clone(), Claim::Weak);
+                Some(false)
+            }
+            (Some(Claim::Dir), Claim::Dir) | (Some(_), Claim::Weak | Claim::WeakDir) => Some(false),
+            (Some(Claim::Weak | Claim::WeakDir), c) => {
                 self.dst_seen.insert(dst.clone(), c);
                 Some(false)
             }
@@ -3200,7 +3223,7 @@ impl Planner<'_> {
                     alias_parents.extend(ancestor_prefixes(&full).map(<[u8]>::to_vec));
                 }
                 match claimed {
-                    Some(Claim::Dir) => continue,
+                    Some(Claim::Dir | Claim::WeakDir) => continue,
                     Some(_) => {
                         if entry_kind == Kind::Dir {
                             shielded.insert(full);
@@ -3634,8 +3657,8 @@ impl Planner<'_> {
     }
 }
 
-/// A destination ancestor directory no manifest entry names: created with
-/// default metadata (mode through the umask, natural mtime; see
+/// A destination ancestor directory without selected source metadata: created
+/// with receiver defaults (mode through the umask, natural mtime; see
 /// `Planner::implicit_dirs`).
 pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
     Entry {
@@ -3644,7 +3667,7 @@ pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
         size: 0,
         mtime: 0,
         mtime_nsec: 0,
-        mode: 0o755,
+        mode: 0o777,
         uid: 0,
         gid: 0,
         rdev: 0,
