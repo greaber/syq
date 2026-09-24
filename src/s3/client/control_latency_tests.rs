@@ -82,7 +82,7 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
         )
         .await
         .unwrap()
-        .objects
+        .into_objects()
         .len(),
         8
     );

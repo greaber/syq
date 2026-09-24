@@ -774,10 +774,72 @@ pub(super) fn exclusion<'a>(
 }
 
 pub(super) struct Listing {
-    pub objects: Vec<(String, u64)>,
-    pub service_times: HashMap<String, (i64, u32)>,
+    objects: ListingObjects,
     pub found: bool,
     pub excluded: u64,
+}
+
+type TimedListingObject = (String, u64, Option<(i64, u32)>);
+
+// Store timestamps with their keys when requested. Plain listings retain the
+// compact pair representation and pay no per-object cost for unused times.
+enum ListingObjects {
+    Plain(Vec<(String, u64)>),
+    Timed(Vec<TimedListingObject>),
+}
+impl ListingObjects {
+    fn new(retain_times: bool) -> Self {
+        if retain_times {
+            Self::Timed(Vec::new())
+        } else {
+            Self::Plain(Vec::new())
+        }
+    }
+    fn push(&mut self, key: String, size: u64, time: Option<(i64, u32)>) {
+        match self {
+            Self::Plain(objects) => objects.push((key, size)),
+            Self::Timed(objects) => objects.push((key, size, time)),
+        }
+    }
+    fn clear(&mut self) {
+        match self {
+            Self::Plain(objects) => objects.clear(),
+            Self::Timed(objects) => objects.clear(),
+        }
+    }
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Plain(objects) => objects.is_empty(),
+            Self::Timed(objects) => objects.is_empty(),
+        }
+    }
+    fn sort(&mut self) {
+        match self {
+            Self::Plain(objects) => objects.sort_unstable_by(|a, b| a.0.cmp(&b.0)),
+            Self::Timed(objects) => objects.sort_unstable_by(|a, b| a.0.cmp(&b.0)),
+        }
+    }
+}
+impl Listing {
+    pub fn into_objects(self) -> Vec<(String, u64)> {
+        match self.objects {
+            ListingObjects::Plain(objects) => objects,
+            ListingObjects::Timed(objects) => objects
+                .into_iter()
+                .map(|(key, size, _)| (key, size))
+                .collect(),
+        }
+    }
+    pub fn into_entries(self) -> impl Iterator<Item = TimedListingObject> {
+        let (plain, timed) = match self.objects {
+            ListingObjects::Plain(objects) => (objects, Vec::new()),
+            ListingObjects::Timed(objects) => (Vec::new(), objects),
+        };
+        plain
+            .into_iter()
+            .map(|(key, size)| (key, size, None))
+            .chain(timed)
+    }
 }
 
 /// Reuse the bounded recursive planner for existing literal-prefix operations.
@@ -881,8 +943,7 @@ async fn parallel_listing(
             })
         }
     }
-    let mut objects = Vec::new();
-    let mut service_times = HashMap::new();
+    let mut objects = ListingObjects::new(retain_times);
     let store = S3 {
         client,
         bucket,
@@ -890,16 +951,23 @@ async fn parallel_listing(
         retain_times,
         discovery_denied: std::sync::atomic::AtomicBool::new(false),
     };
-    let outcome = engine::enumerate_prefix(&store, prefix, concurrency.min(32), |entry| {
-        if let Some(value) = &entry.last_modified {
-            let time = aws_smithy_types::DateTime::from_str(
-                value,
-                aws_smithy_types::date_time::Format::DateTime,
-            )?;
-            service_times.insert(entry.key.clone(), (time.secs(), time.subsec_nanos()));
-        }
-        objects.push((entry.key, entry.size));
+    let collect = |objects: &mut ListingObjects, entry: Entry| -> Result<()> {
+        let time = entry
+            .last_modified
+            .as_deref()
+            .map(|value| {
+                aws_smithy_types::DateTime::from_str(
+                    value,
+                    aws_smithy_types::date_time::Format::DateTime,
+                )
+                .map(|time| (time.secs(), time.subsec_nanos()))
+            })
+            .transpose()?;
+        objects.push(entry.key, entry.size, time);
         Ok(())
+    };
+    let outcome = engine::enumerate_prefix(&store, prefix, concurrency.min(32), |entry| {
+        collect(&mut objects, entry)
     })
     .await;
     if let Err(error) = outcome {
@@ -915,27 +983,14 @@ async fn parallel_listing(
         // Exact-prefix IAM policies can permit the original LIST while denying
         // discovery or child prefixes. No caller has consumed the plan yet.
         objects.clear();
-        service_times.clear();
-        engine::enumerate_prefix(&store, prefix, 1, |entry| {
-            if let Some(value) = &entry.last_modified {
-                let time = aws_smithy_types::DateTime::from_str(
-                    value,
-                    aws_smithy_types::date_time::Format::DateTime,
-                )?;
-                service_times.insert(entry.key.clone(), (time.secs(), time.subsec_nanos()));
-            }
-            objects.push((entry.key, entry.size));
-            Ok(())
-        })
-        .await?;
+        engine::enumerate_prefix(&store, prefix, 1, |entry| collect(&mut objects, entry)).await?;
     }
     // Previously LIST delivered keys in order. Preserve planning/claim order
     // for callers despite concurrent subtree completion.
-    objects.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    objects.sort();
     Ok(Listing {
         found: !objects.is_empty(),
         objects,
-        service_times,
         excluded: 0,
     })
 }
@@ -980,8 +1035,7 @@ pub(super) async fn list_with_times(
         return parallel_listing(client, bucket, prefix, concurrency, retain_times).await;
     }
     let mut result = Listing {
-        objects: Vec::new(),
-        service_times: HashMap::new(),
+        objects: ListingObjects::new(retain_times),
         found: false,
         excluded: 0,
     };
@@ -1114,14 +1168,14 @@ pub(super) async fn list_with_times(
                     }
                     result.excluded += excluded.count(excluded_subtrees);
                 } else {
-                    if retain_times {
-                        if let Some(time) = object.last_modified() {
-                            result
-                                .service_times
-                                .insert(key.to_owned(), (time.secs(), time.subsec_nanos()));
-                        }
-                    }
-                    result.objects.push((key.to_owned(), size));
+                    let time = if retain_times {
+                        object
+                            .last_modified()
+                            .map(|time| (time.secs(), time.subsec_nanos()))
+                    } else {
+                        None
+                    };
+                    result.objects.push(key.to_owned(), size, time);
                 }
             }
             for child in output.common_prefixes() {

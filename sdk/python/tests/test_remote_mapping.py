@@ -46,6 +46,12 @@ class ObjectServer:
                     self.reply(200, ("<ListBucketResult><EncodingType>url</EncodingType>"
                         "<IsTruncated>false</IsTruncated><Contents><Key>prefix%2Ffile</Key>"
                         f"<Size>{len(content)}</Size></Contents></ListBucketResult>").encode())
+                elif byte_range := self.headers.get("Range"):
+                    start, end = map(int, byte_range.removeprefix("bytes=").split("-"))
+                    self.reply(206, content[start:end + 1], [
+                        ("ETag", '"fixture"'),
+                        ("Content-Range", f"bytes {start}-{end}/{len(content)}"),
+                    ])
                 else:
                     self.reply(200, content, [("ETag", '"fixture"')])
 
@@ -106,3 +112,25 @@ class RemoteMappingTests(unittest.TestCase):
                 self.assertTrue(any(method == "GET" and urllib.parse.urlsplit(path).path == "/bucket/prefix/file"
                                     for method, path, _ in source.requests))
                 self.assertTrue(all(header == "A" for _, _, header in source.requests))
+
+    def test_s3_path_entries_share_a_manifest_with_callback_entries(self):
+        with tempfile.TemporaryDirectory() as directory, ObjectServer(b"source bytes") as source:
+            root = Path(directory).resolve()
+            env = os.environ | {
+                "AWS_ACCESS_KEY_ID": "fixture", "AWS_SECRET_ACCESS_KEY": "fixture",
+                "AWS_EC2_METADATA_DISABLED": "true",
+                "AWS_CONFIG_FILE": str(root / "no-config"),
+                "AWS_SHARED_CREDENTIALS_FILE": str(root / "no-credentials"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+            }
+            for key in ("AWS_SESSION_TOKEN", "AWS_PROFILE"):
+                env.pop(key, None)
+            client = syq.Client(executable=os.environ["SYQ_CANDIDATE_EXECUTABLE"],
+                                process_cwd=root, env=env, timeout=10)
+            received = []
+            client.cp(mapping=[
+                syq.MappingEntry("prefix/file", "ordinary"),
+                syq.MappingEntry("prefix/file", syq.StreamDestination(lambda inp: received.append(inp.read()))),
+            ], from_="s3://bucket", into="output", s3_endpoint=source.endpoint, s3_region="us-east-1")
+            self.assertEqual((root / "output/ordinary").read_bytes(), b"source bytes")
+            self.assertEqual(received, [b"source bytes"])

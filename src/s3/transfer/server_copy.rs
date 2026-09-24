@@ -324,7 +324,7 @@ impl Engine {
         }
 
         let mut desired_head = source_head.clone();
-        let explicit = job.metadata.unwrap_or_default();
+        let explicit = job.metadata().unwrap_or_default();
         explicit.validate_kind(match source.kind() {
             ObjectKind::File => crate::proto::Kind::File,
             ObjectKind::Dir => crate::proto::Kind::Dir,

@@ -249,7 +249,7 @@ async fn plan(
                     args.s3.as_ref().unwrap().concurrency,
                 )
                 .await?
-                .objects
+                .into_objects()
                 .into_iter()
                 .map(|(key, _)| Entry {
                     key,
