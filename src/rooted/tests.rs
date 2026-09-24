@@ -1400,6 +1400,24 @@ fn regular_opens_refuse_special_leaves_and_preserve_open_flags() {
 }
 
 #[test]
+fn exclusive_creation_returns_a_blocking_cloexec_regular_file() {
+    let tree = TestDir::new("exclusive-create-flags");
+    let root = Root::open(tree.path()).unwrap();
+    let mut file = root.create_file(&relative(b"new"), 0o600).unwrap();
+    assert!(file.metadata().unwrap().is_file());
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    assert_ne!(flags, -1);
+    assert_eq!(flags & libc::O_ACCMODE, libc::O_RDWR);
+    assert_eq!(flags & libc::O_NONBLOCK, 0);
+    let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    assert_ne!(descriptor_flags, -1);
+    assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+    file.write_all(b"created").unwrap();
+    assert!(root.create_file(&relative(b"new"), 0o600).is_err());
+    assert_eq!(fs::read(tree.path().join("new")).unwrap(), b"created");
+}
+
+#[test]
 fn publication_parent_stays_pinned_when_its_name_is_replaced() {
     let tree = TestDir::new("borrowed-publication-parent");
     fs::create_dir(tree.path().join("gate")).unwrap();

@@ -391,6 +391,9 @@ impl Root {
     pub(crate) fn create_file(&self, path: &RelativePath, mode: u32) -> Result<File> {
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(path)?;
+        // O_CREAT | O_EXCL either creates a new regular file or fails. Unlike
+        // opening an existing leaf, this cannot open a FIFO/device or follow a
+        // raced symlink, so no nonblocking flag or file-type check is needed.
         let file = self
             .open_leaf(
                 path,
@@ -398,7 +401,6 @@ impl Root {
                     | libc::O_CREAT
                     | libc::O_EXCL
                     | libc::O_NOFOLLOW
-                    | libc::O_NONBLOCK
                     | libc::O_NOCTTY
                     | libc::O_CLOEXEC,
                 mode & 0o777,
@@ -406,9 +408,6 @@ impl Root {
             .with_context(|| format!("create confined file {}", path.label()))?;
         #[cfg(any(target_os = "linux", test))]
         drop(permit);
-        require_regular(&file, path)?;
-        clear_nonblocking(&file)
-            .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
         Ok(file)
     }
 
