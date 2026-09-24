@@ -98,7 +98,7 @@ fn prepare(
         "stream source did not report its length"
     );
     if plan.source.is_none() {
-        controls.metadata.source(source_meta)?;
+        controls.metadata.source(source_meta.clone())?;
         if let Some(size) = size {
             controls.set_size(size);
         }
@@ -401,7 +401,7 @@ pub(super) async fn run(
         controls.metadata.output(output.metadata().is_some())?;
     }
     if plan.source.is_some() {
-        controls.metadata.source(input_meta)?;
+        controls.metadata.source(input_meta.clone())?;
         if let Some(size) = input
             .as_ref()
             .map(fd::Descriptor::remaining_len)

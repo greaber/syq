@@ -72,6 +72,51 @@ pub(crate) fn set_nofile_limits(limits: &libc::rlimit) -> io::Result<()> {
     Ok(())
 }
 
+/// Reserve initial headroom after informational exits, before worker threads.
+/// Source setup reserves more when its descriptor budget needs it.
+pub(crate) fn reserve_startup_descriptors() {
+    reserve_descriptor_capacity(16 * 1024);
+}
+
+/// Prepare Linux's descriptor table without keeping files open or changing
+/// limits. Growing a table shared by threads can wait for an RCU grace period;
+/// reserve initial headroom before threads start, then use known source demand
+/// to consolidate larger growth. This is only an optimization: allocation can
+/// fail, and later work may still exceed the reserved capacity.
+#[cfg(target_os = "linux")]
+pub(crate) fn reserve_descriptor_capacity(wanted: usize) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let Ok(limits) = nofile_limits() else {
+        return;
+    };
+    let slots = (wanted as u128).min(limits.rlim_cur as u128);
+    let Some(last) = slots
+        .checked_sub(1)
+        .and_then(|last| libc::c_int::try_from(last).ok())
+    else {
+        return;
+    };
+    // An occupied slot already proves the table is large enough. Never use
+    // dup2: the target could be an inherited descriptor owned by our caller.
+    if unsafe { libc::fcntl(last, libc::F_GETFD) } >= 0 {
+        return;
+    }
+    let Ok(file) = File::open("/dev/null") else {
+        return;
+    };
+    // SAFETY: file remains live, and F_DUPFD_CLOEXEC creates a new descriptor
+    // without replacing any existing one. Closing it leaves table capacity
+    // intact in this process; forked children must prepare their own tables.
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, last) };
+    if fd >= 0 {
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn reserve_descriptor_capacity(_wanted: usize) {}
+
 pub(super) fn source_descriptor_requirement(
     current_open: usize,
     root_count: usize,
@@ -165,5 +210,6 @@ pub(crate) fn require_source_descriptor_capacity(
             limit.rlim_cur
         );
     }
+    reserve_descriptor_capacity(required);
     Ok(())
 }

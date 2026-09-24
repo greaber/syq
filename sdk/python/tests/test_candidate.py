@@ -28,6 +28,26 @@ def resolved_temporary_directory() -> tempfile.TemporaryDirectory[str]:
     "candidate compatibility requires SYQ_CANDIDATE_EXECUTABLE and version",
 )
 class CandidateCompatibilityTests(unittest.TestCase):
+    def test_expression_selection_and_update(self) -> None:
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous), resolved_temporary_directory() as temporary:
+                root = Path(temporary)
+                source = root / "source"
+                source.mkdir()
+                (source / "keep").write_bytes(b"selected contents")
+                (source / "tiny").write_bytes(b"x")
+                destination = root / "destination"
+                client = (syq.AsyncClient if asynchronous else syq.Client)(executable=EXECUTABLE)
+                result = client.cp(
+                    srcs_in=source, into=destination,
+                    where='src.kind = "file" and src.size > 1B',
+                    copy_if='not dst.exists',
+                )
+                if asynchronous:
+                    asyncio.run(result)
+                self.assertEqual((destination / "keep").read_bytes(), b"selected contents")
+                self.assertFalse((destination / "tiny").exists())
+
     def test_positional_option_names_are_copied_and_removed_as_files(self) -> None:
         with resolved_temporary_directory() as temporary_directory:
             root = Path(temporary_directory)

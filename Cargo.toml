@@ -47,7 +47,9 @@ postcard = { version = "1", features = ["alloc", "use-std"] }
 jwalk = "0.9"
 rayon = "1.12"
 ignore = "0.4"
+globset = "0.4"
 regex = "1"
+time = { version = "0.3", features = ["parsing"] }
 blake3 = "1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 zstd = "0.14"

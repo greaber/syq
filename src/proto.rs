@@ -23,6 +23,7 @@ pub const MAX_FRAME: usize = 65 * 1024 * 1024;
 pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME: usize = 1024 * 1024;
 const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
+pub(crate) const METADATA_BATCH_BYTES: usize = 6 * 1024 * 1024;
 /// Supported comparison granularity floor, enforced by receivers as well as the CLI.
 /// Smaller blocks increase the number of hashes per file; this is a protocol
 /// policy, not a minimum input size imposed by the hash algorithm.
@@ -179,11 +180,18 @@ pub struct Entry {
     /// Device and inode, for detecting src==dst (same file / hardlink / alias).
     pub dev: u64,
     pub ino: u64,
+    /// Source link count; group state is needed only for multiply linked inodes.
+    pub nlink: u64,
     /// Status-change time completes the identity fingerprint used to detect an
     /// unlink/recreate race that happens to reuse the same inode number.
     pub ctime: i64,
     pub ctime_nsec: u32,
     pub link: Option<PathBytes>,
+    // Only used while capturing metadata on the scanning endpoint. The
+    // selected value travels in inode_metadata; ordinary scans pay no wire cost.
+    #[serde(skip)]
+    pub atime: crate::inode_metadata::Timestamp,
+    pub inode_metadata: Option<Box<crate::inode_metadata::InodeMetadata>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -241,6 +249,12 @@ pub enum NativeRemoveErrorClass {
 }
 
 impl Entry {
+    pub(crate) fn size_hint(&self) -> usize {
+        self.path.len()
+            + self.link.as_ref().map_or(0, Vec::len)
+            + self.inode_metadata.as_ref().map_or(0, |m| m.size_hint())
+            + 192
+    }
     pub fn meta(&self) -> Meta {
         Meta {
             mode: self.mode,
@@ -248,6 +262,7 @@ impl Entry {
             gid: self.gid,
             mtime: self.mtime,
             mtime_nsec: self.mtime_nsec,
+            inode_metadata: self.inode_metadata.clone(),
         }
     }
 }
@@ -318,13 +333,20 @@ pub struct SmallBlock {
     pub hash: ContentDigest,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Meta {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
     pub mtime: i64,
     pub mtime_nsec: u32,
+    pub inode_metadata: Option<Box<crate::inode_metadata::InodeMetadata>>,
+}
+
+impl Meta {
+    pub(crate) fn size_hint(&self) -> usize {
+        64 + self.inode_metadata.as_ref().map_or(0, |m| m.size_hint())
+    }
 }
 
 /// Which parts of a `Meta` to apply.
@@ -343,6 +365,9 @@ pub mod flags {
     /// These modifiers require the corresponding OWNER/GROUP flag and authority.
     pub const REQUIRE_OWNER: u8 = 32;
     pub const REQUIRE_GROUP: u8 = 64;
+    /// Return the identity of the held, completed inode for hardlink followers.
+    /// This changes only the reply; restricted grants do not authorize it.
+    pub const REPORT_IDENTITY: u8 = 128;
 }
 
 /// Best-effort kernel counters for one end of a TCP data socket. `None` means
@@ -413,6 +438,13 @@ pub enum Op {
         meta: Meta,
         flags: u8,
     },
+    /// Publish another name for a validated regular-file representative.
+    Hardlink {
+        path: PathBytes,
+        source: PathBytes,
+        dev: u64,
+        ino: u64,
+    },
     /// Remove whatever currently occupies the path, recursively when it is a
     /// directory. Planned deletion uses Unlink/Rmdir instead.
     Remove { path: PathBytes },
@@ -421,6 +453,23 @@ pub enum Op {
     /// Remove a non-directory; a directory that has appeared there is an
     /// error, never recursed into (used by --delete for planned leaves).
     Unlink { path: PathBytes },
+}
+
+impl Op {
+    pub(crate) fn size_hint(&self) -> usize {
+        match self {
+            Self::SetMeta { path, meta, .. } | Self::SetFileMetaIfSame { path, meta, .. } => {
+                path.len() + meta.size_hint() + 64
+            }
+            Self::Hardlink { path, source, .. } => path.len() + source.len() + 64,
+            Self::Symlink { path, target, .. } => path.len() + target.len() + 64,
+            Self::Mkdir { path, .. }
+            | Self::Mknod { path, .. }
+            | Self::Remove { path }
+            | Self::Unlink { path }
+            | Self::Rmdir { path } => path.len() + 96,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -440,6 +489,8 @@ pub struct SourceLeafIdentity {
     pub ino: u64,
     pub file_type: u32,
     pub symlink_target: Option<PathBytes>,
+    /// Captured before reading an explicitly selected symlink target.
+    pub symlink_atime: Option<crate::inode_metadata::Timestamp>,
 }
 
 /// One operator source selection registered by the endpoint control session.
@@ -792,7 +843,7 @@ pub enum WireRequest<Data> {
     /// renamed over the final path meanwhile, its complete file remains the
     /// winner and this only touches the now-unlinked old inode.
     FinishBasis {
-        expected_hash: Option<crate::hashing::Digest>,
+        expected_hash: Option<crate::hashing::ExpectedHashes>,
         path: PathBytes,
         copy_id: CopyId,
         meta: Meta,
@@ -865,7 +916,7 @@ pub enum WireRequest<Data> {
         guard: Option<ContainerGuard>,
     },
     Finalize {
-        expected_hash: Option<crate::hashing::Digest>,
+        expected_hash: Option<crate::hashing::ExpectedHashes>,
         path: PathBytes,
         inplace: bool,
         copy_id: CopyId,
@@ -949,13 +1000,25 @@ pub enum WireRequest<Data> {
     ConfigureHashing(crate::hashing::HashPolicy),
     ValidateDigest {
         path: PathBytes,
-        expected: crate::hashing::Digest,
+        expected: crate::hashing::ExpectedHashes,
         guard: Option<ContainerGuard>,
     },
     DescriptorCopy(crate::descriptor_copy::Operation),
     /// Reuse a drained stream worker within its original endpoint session.
     /// None releases its file before the control connection publishes it.
     BindStream(Option<(DescriptorTicket, crate::descriptor_copy::Settings)>),
+    ConfigurePreservation {
+        selection: crate::inode_metadata::Selection,
+        sparse: bool,
+        destination: bool,
+    },
+    /// Creation permissions from each destination directory's default ACL or
+    /// receiver umask. Used only for rsync copies without preserved modes.
+    DefaultPermissions {
+        paths: Vec<PathBytes>,
+        guard: Option<ContainerGuard>,
+    },
+    NativeMap(crate::native_map::Options),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1082,6 +1145,7 @@ impl Request {
         matches!(
             self,
             Request::ConfigureHashing(_)
+                | Request::ConfigurePreservation { .. }
                 | Request::Scan { .. }
                 | Request::StatMany { .. }
                 | Request::HashBlocks { .. }
@@ -1202,6 +1266,19 @@ pub enum Response {
         size: Option<u64>,
         metadata: Option<Meta>,
     },
+    /// Cumulative bytes written by the current CopyLocal request. This is
+    /// progress only; a terminal response still determines success.
+    CopyLocalProgress(u64),
+    Published {
+        dev: u64,
+        ino: u64,
+    },
+    PublishedBatch(Vec<std::result::Result<Option<(u64, u64)>, WireError>>),
+    /// Non-final fragment of a rich-metadata stat response.
+    StatsMore(Vec<Option<Entry>>),
+    DefaultPermissions(Vec<u32>),
+    NativeMapData(Vec<u8>),
+    NativeMapDone,
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
@@ -1360,11 +1437,13 @@ impl SizeHint for Request {
             }
             Request::PutSmallBatch(puts) => {
                 puts.iter()
-                    .map(|put| put.data.len() + put.path.len() + 96)
+                    .map(|put| put.data.len() + put.path.len() + put.meta.size_hint() + 96)
                     .sum::<usize>()
                     + 16
             }
-            Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
+            Request::StatMany { paths, .. }
+            | Request::PruneLookup { paths, .. }
+            | Request::DefaultPermissions { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
             Request::PartialPaths { paths, .. } => {
@@ -1384,7 +1463,18 @@ impl SizeHint for Request {
                     .sum::<usize>()
                     + 48
             }
-            Request::Apply { ops, .. } => ops.len() * 128 + 16,
+            Request::Apply { ops, .. } => ops.iter().map(Op::size_hint).sum::<usize>() + 16,
+            Request::NativeMap(options) => {
+                options
+                    .sources
+                    .iter()
+                    .map(|s| s.path.len() + 16)
+                    .sum::<usize>()
+                    + options.cwd.as_ref().map_or(0, Vec::len)
+                    + options.root.as_ref().map_or(0, Vec::len)
+                    + options.target.as_ref().map_or(0, Vec::len)
+                    + 128
+            }
             Request::NativeRemove { selections, .. } => {
                 selections
                     .iter()
@@ -1431,7 +1521,8 @@ impl SizeHint for Response {
                     .sum::<usize>()
                     + 16
             }
-            Response::ScanBatch(v) => v.len() * 160 + 16,
+            Response::ScanBatch(v) => v.iter().map(Entry::size_hint).sum::<usize>() + 16,
+            Response::NativeMapData(data) => data.len() + 16,
             Response::NativeRemoveBatch(v) => {
                 v.iter()
                     .map(|outcome| {
@@ -1452,7 +1543,12 @@ impl SizeHint for Response {
                     .sum::<usize>()
                     + 16
             }
-            Response::Stats(v) => v.len() * 96 + 16,
+            Response::Stats(v) | Response::StatsMore(v) => {
+                v.iter()
+                    .map(|e| e.as_ref().map_or(1, Entry::size_hint))
+                    .sum::<usize>()
+                    + 16
+            }
             Response::BatchPlan {
                 partial_paths,
                 directories,

@@ -30,7 +30,9 @@ pub enum Existence {
     Existing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum SourceSelection {
     #[default]
     Rsync,
@@ -140,6 +142,8 @@ pub struct Args {
     /// `syq map` never contacts a destination.
     #[arg(skip)]
     pub native_map_target: Option<Vec<u8>>,
+    #[arg(skip)]
+    pub native_map_include: Vec<crate::native_map::Field>,
     /// NDJSON mapping manifest consumed by native cp instead of selectors;
     /// `-` reads stdin and the complete input is acquired before mutation.
     #[arg(skip)]
@@ -194,12 +198,33 @@ pub struct Args {
     /// Follow symlinks in this machine's rsync operator paths regardless of ownership (local only, as in rsync)
     #[arg(long)]
     pub insecure_links: bool,
+    /// Preserve hard links between selected regular files
+    #[arg(short = 'H', long = "hard-links")]
+    pub hardlinks: bool,
+    /// Preserve POSIX access and default ACLs; implies permissions
+    #[arg(short = 'A', long)]
+    pub acls: bool,
+    /// Preserve extended attributes in the selected privilege namespaces
+    #[arg(short = 'X', long)]
+    pub xattrs: bool,
     /// Preserve permissions
     #[arg(short = 'p', long)]
     pub perms: bool,
     /// Preserve modification times
     #[arg(short = 't', long)]
     pub times: bool,
+    /// Preserve access times; repeat to request source no-atime reads
+    #[arg(short = 'U', long, action = clap::ArgAction::Count)]
+    pub atimes: u8,
+    /// Preserve birth (creation) times; requires a macOS destination
+    #[arg(short = 'N', long)]
+    pub crtimes: bool,
+    /// Request reads without access-time updates; warn and continue if unavailable
+    #[arg(long)]
+    pub open_noatime: bool,
+    /// Turn written zero ranges into sparse holes
+    #[arg(short = 'S', long)]
+    pub sparse: bool,
     /// Preserve group
     #[arg(short = 'g', long)]
     pub group: bool,
@@ -375,6 +400,12 @@ pub struct Args {
     /// All ignore patterns, loaded before authorization or opening results.
     #[arg(skip)]
     pub ignore_lines: Vec<String>,
+    #[arg(skip)]
+    pub where_expression: Option<String>,
+    #[arg(skip)]
+    pub copy_if: Option<String>,
+    #[arg(skip)]
+    pub expressions: crate::expression::Policy,
     /// Native copy inputs are read only after selecting the executing build.
     #[arg(skip)]
     pending_ignore_inputs: Vec<IgnoreInput>,
@@ -605,6 +636,9 @@ impl Args {
     pub fn normalize(&mut self) {
         if self.no_compress {
             self.compress = false;
+        }
+        if self.acls {
+            self.perms = true;
         }
         self.recursive_explicit = self.recursive;
         if self.archive {
@@ -1060,6 +1094,12 @@ struct NativeCopyOperationalArgs {
     /// Skip regular files newer at the destination; non-directory type replacements still occur
     #[arg(long = "skip-newer", hide = true, conflicts_with_all = ["ignore_existing", "inplace"])]
     update: bool,
+    /// Select non-directory source entries with a typed expression; directories follow normal copy rules
+    #[arg(long = "where", value_name = "EXPR")]
+    where_expression: Option<String>,
+    /// Update only entries satisfying a source/destination expression
+    #[arg(long, value_name = "EXPR", conflicts_with = "inplace")]
+    copy_if: Option<String>,
     /// Disable transport compression
     #[arg(long)]
     no_compress: bool,
@@ -1088,9 +1128,15 @@ struct NativeCopyOperationalArgs {
     /// Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order)
     #[arg(long, value_name = "FILE")]
     ignore_from: Vec<OsString>,
-    /// Preserve times, permissions or ownership, or copy special files (repeatable/comma-separated)
+    /// Preserve selected filesystem metadata or copy special files (repeatable/comma-separated)
     #[arg(long, value_name = "FEATURE", value_delimiter = ',')]
     preserve: Vec<NativePreserve>,
+    /// Request reads without access-time updates; warn and continue if unavailable
+    #[arg(long)]
+    open_noatime: bool,
+    /// Turn written zero ranges into sparse holes
+    #[arg(long)]
+    sparse: bool,
     /// Update destination files directly, using no full-sized staging file; interruption can leave them incomplete
     #[arg(long)]
     inplace: bool,
@@ -1222,6 +1268,16 @@ enum NativePreserve {
     Ownership,
     /// Copy device nodes and special files
     Specials,
+    /// Preserve hard links between selected regular files
+    Hardlinks,
+    /// Preserve native Linux or macOS ACLs and permission bits
+    Acls,
+    /// Preserve Linux or macOS extended attributes
+    Xattrs,
+    /// Preserve access times captured before reading
+    Atimes,
+    /// Preserve birth times; requires a macOS destination
+    Crtimes,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1295,7 +1351,7 @@ struct NativeCopyFields {
     version,
     about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.\nExplicit local pipe sources and --src-fd FD read raw bytes; --as-fd FD writes them.",
     before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
-    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --preserve=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --preserve; pipes have no source metadata. Output descriptors receive source timestamps only with --preserve=times. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
+    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, hardlinks, access and birth times, ACLs and xattrs, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --preserve=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --preserve; pipes have no source metadata. Output descriptors receive source timestamps only with --preserve=times. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]\n       syq cp [OPTIONS] --src-fd FD --as PATH\n       syq cp [OPTIONS] SOURCE --as-fd FD"
 )]
 struct NativeCopyCommand {
@@ -1374,12 +1430,25 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
 #[command(
     name = "syq map",
     version,
-    about = "Print source-to-destination mappings as NDJSON.\n\nScan local sources and write one JSON object per line for later cp --mapping.\n--as changes placement relative to that copy's destination directory.\nNamed selectors must be relative (use -C for the source base).\n--srcs-in must be the only selector; --as requires one named object.\nNames must be valid UTF-8. No destination is contacted.",
+    about = "Print source-to-destination mappings as NDJSON.\n\nScan local, SSH, or S3 sources and write one JSON object per line for later cp --mapping.\n--as changes placement relative to that copy's destination directory.\nNamed selectors must be relative (use -C for the source base).\n--srcs-in must be the only selector; --as requires one named object.\nNames must be valid UTF-8. No destination is contacted.",
     before_help = "Examples:\n  syq map --srcs-in photos\n  syq map photos --as archive/photos > mapping.ndjson\n  syq cp --mapping mapping.ndjson --into backup",
-    long_about = "Print source-to-destination mappings as NDJSON.\n\nScan local sources for later cp --mapping. Named selectors must be relative (use -C for the source base). --srcs-in must be the only selector; --as requires one named object and changes its placement relative to the future destination directory.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8. Attach path option values beginning with `-` by using `=`, for example --src-dir=-.",
+    long_about = "Print source-to-destination mappings as NDJSON.\n\nScan local, SSH, or S3 sources for later cp --mapping. Named selectors must be relative (use -C for the source base). --srcs-in must be the only selector; --as requires one named object and changes its placement relative to the future destination directory.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), with optional fields selected by --include. kind adds a copy-time type check. size and timestamps are informational. Missing stored S3 mtime is omitted; s3_last_modified is independent of filesystem mtime. Generation reads sources without contacting a destination. Names must be valid UTF-8. Attach path option values beginning with `-` by using `=`, for example --src-dir=-.",
     override_usage = "syq map [OPTIONS] PATH...\n       syq map [OPTIONS] --srcs-in DIR"
 )]
 struct NativeMapCommand {
+    /// Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local
+    #[arg(long, value_name = "ENDPOINT")]
+    from: Option<String>,
+    /// Include optional output fields (comma-separated or repeatable)
+    #[arg(long, value_enum, value_delimiter = ',', value_name = "FIELD")]
+    include: Vec<crate::native_map::Field>,
+    /// Remote shell command (default: ssh)
+    #[arg(long, value_name = "COMMAND")]
+    rsh: Option<String>,
+    #[command(flatten)]
+    helper: NativeRemoteHelperArgs,
+    #[command(flatten)]
+    s3: crate::s3::Flags,
     #[command(flatten)]
     source: NativeSourceArgs,
     /// Emit the single selected root at PATH, relative to the future destination container; PATH may be nested
@@ -2239,12 +2308,38 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     // to it; the walk joins it back.
     let map_cwd = parsed.source.cwd.take().map(OsStringExt::into_vec);
     let map_root = parsed.source.root.take().map(OsStringExt::into_vec);
-    let mut locations = lower_native_sources(&parsed.source, &matches, None)?;
+    let s3 = crate::s3::Options::parse(
+        parsed.s3,
+        parsed.from.as_deref().filter(|s| s.starts_with("s3://")),
+        None,
+        &matches,
+    )?;
+    let endpoint = if s3.is_some() {
+        None
+    } else {
+        parse_native_endpoint(parsed.from.as_deref())?
+    };
+    if endpoint.is_none()
+        && (parsed.rsh.is_some() || parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap)
+    {
+        bail!("--rsh, --syq-path and --no-bootstrap require an SSH source");
+    }
+    if s3.is_some() && (parsed.source.follow || parsed.source.follow_src) {
+        bail!("follow options require filesystem sources");
+    }
+    if s3.is_none()
+        && parsed
+            .include
+            .contains(&crate::native_map::Field::S3LastModified)
+    {
+        bail!("s3_last_modified requires an S3 source");
+    }
+    let mut locations = lower_native_sources(&parsed.source, &matches, endpoint)?;
     for source in &mut locations {
         if source.selection != SourceSelection::Contents
             && (source.path.starts_with(b"/")
-                || source.path == b"~"
-                || source.path.starts_with(b"~/"))
+                || (s3.is_none() && source.path == b"~")
+                || (s3.is_none() && source.path.starts_with(b"~/")))
         {
             bail!(
                 "named syq map selector {:?} is absolute and cannot be emitted relative to its mapping source base; use -C with a relative selector",
@@ -2293,6 +2388,11 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     args.native_map_cwd = map_cwd;
     args.native_map_root = map_root;
     args.native_map_target = target;
+    args.native_map_include = parsed.include;
+    args.rsh = parsed.rsh;
+    args.syq_path = parsed.helper.syq_path;
+    args.no_bootstrap = parsed.helper.no_bootstrap;
+    args.s3 = s3;
     args.native_follow = parsed.source.follow;
     args.native_follow_src = parsed.source.follow_src;
     Ok(args)
@@ -2604,6 +2704,8 @@ fn apply_native_copy_operational(
     let NativeCopyOperationalArgs {
         common,
         hash,
+        where_expression,
+        copy_if,
         ignore_existing,
         existing,
         update,
@@ -2614,11 +2716,17 @@ fn apply_native_copy_operational(
         ignore,
         ignore_from,
         preserve,
+        open_noatime,
+        sparse,
         inplace,
         receiver_max_entries,
         receiver_max_bytes,
         receiver_receipt,
     } = operational;
+    args.expressions =
+        crate::expression::Policy::compile(where_expression.as_deref(), copy_if.as_deref())?;
+    args.where_expression = where_expression;
+    args.copy_if = copy_if;
     args.receiver_receipt = receiver_receipt;
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
@@ -2637,6 +2745,8 @@ fn apply_native_copy_operational(
     args.ignore = ignore;
     args.ignore_from = ignore_from;
     args.inplace = inplace;
+    args.open_noatime = open_noatime;
+    args.sparse = sparse;
     for attribute in preserve {
         match attribute {
             NativePreserve::Times => args.times = true,
@@ -2646,7 +2756,26 @@ fn apply_native_copy_operational(
                 args.group = true;
             }
             NativePreserve::Specials => args.devices = true,
+            NativePreserve::Hardlinks => args.hardlinks = true,
+            NativePreserve::Acls => {
+                args.acls = true;
+                args.perms = true;
+            }
+            NativePreserve::Xattrs => args.xattrs = true,
+            NativePreserve::Atimes => args.atimes = 1,
+            NativePreserve::Crtimes => args.crtimes = true,
         }
+    }
+    if (args.hardlinks
+        || args.acls
+        || args.xattrs
+        || args.atimes > 0
+        || args.crtimes
+        || args.open_noatime
+        || args.sparse)
+        && (args.descriptor_copy.is_some() || args.stream_mapping_fd.is_some() || args.s3.is_some())
+    {
+        bail!("hardlink, ACL, xattr, access-time and birth-time preservation, no-atime reads and sparse allocation require named filesystem sources and destinations; descriptors, streams, and S3 are unsupported");
     }
     apply_native_operational(args, common);
     args.apply_advanced()?;
@@ -3010,10 +3139,6 @@ fn message_for_long(base: &str) -> Option<&'static str> {
             DELETE_MSG
         }
         "one-file-system" => "syq does not implement -x/--one-file-system.",
-        "sparse" => "syq does not implement -S/--sparse.",
-        "hard-links" => "syq does not preserve hard links (-H/--hard-links).",
-        "acls" => "syq does not preserve ACLs (-A/--acls).",
-        "xattrs" => "syq does not preserve extended attributes (-X/--xattrs).",
         "copy-links" | "copy-unsafe-links" | "copy-dirlinks" => SOURCE_LINK_TRAVERSAL_MSG,
         "keep-dirlinks" => DESTINATION_LINK_TRAVERSAL_MSG,
         "safe-links" => {
@@ -3032,9 +3157,6 @@ fn message_for_long(base: &str) -> Option<&'static str> {
 fn message_for_short(c: char) -> Option<&'static str> {
     message_for_long(match c {
         'H' => "hard-links",
-        'A' => "acls",
-        'X' => "xattrs",
-        'S' => "sparse",
         'x' => "one-file-system",
         'L' => "copy-links",
         'k' => "copy-dirlinks",

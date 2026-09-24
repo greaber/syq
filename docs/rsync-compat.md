@@ -30,18 +30,27 @@ Use `-c` to compare contents when size and timestamp match; source timestamps
 are preserved, so ordinary clock skew does not require the source timestamp
 to be newer.
 
+Without `-p`, existing files keep their destination permissions. On Linux, new
+files use the source permission bits limited by the destination parent's default
+ACL, or by the receiving process's umask when that parent has no default ACL.
+Use `-p` to preserve source permissions and `-A` to preserve source ACLs.
+
 Syq uses numeric IDs and always keeps partial files, so `--numeric-ids` and
 `--partial` are accepted no-ops. `-P` enables progress. Compression is on by
 default; `-z` does not enable anything extra. `-B` / `--block-size` changes
 syq's comparison and reuse block size; see the [tuning table](tuning.md#transfer-controls)
 for its default and allowed range. Values outside that range are rejected.
 
+`-H` preserves hardlinks between selected regular files. Linux copies also support
+`-A` for POSIX ACLs and `-X` for extended attributes. `-S` turns written zero
+ranges into sparse holes. See the
+[preservation rules and limits](reference.md#preserve-metadata).
+
 ## Unsupported features
 
 | Feature | Options or syntax |
 |---|---|
 | Rsync filter rules | `--exclude`, `--include`, `--filter` |
-| Hard links, ACLs, xattrs, sparse files | `-H`, `-A`, `-X`, `-S` |
 | Backup and alternate destination trees | `--backup`, `--backup-dir`, `--suffix`, `--link-dest`, `--compare-dest`, `--copy-dest` |
 | Following descendant links | `-L`, `--copy-links`, `--copy-unsafe-links`, `-k`, `--copy-dirlinks`, `-K`, `--keep-dirlinks` |
 | Link filtering or rewriting | `--safe-links`, `--munge-links` |

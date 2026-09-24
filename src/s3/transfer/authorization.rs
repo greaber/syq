@@ -101,7 +101,7 @@ impl Engine {
                 request = request.query("versionId", version);
             }
             requests.push(request);
-            jobs[index].authorized_object = Some(object);
+            jobs[index].source_object = Some(object);
         }
         self.authorize_requests(requests).await?;
         Ok(())

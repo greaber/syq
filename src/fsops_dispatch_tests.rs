@@ -8,6 +8,7 @@ fn put(path: &[u8]) -> SmallPut {
         hash: content_digest(&data),
         data,
         meta: Meta {
+            inode_metadata: None,
             mode: 0o600,
             uid: 0,
             gid: 0,

@@ -1280,6 +1280,7 @@ fn value_completion(
             _ => None,
         },
         "map" => match option {
+            b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
             b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
             | b"--src-non-dirs" | b"--src-dirs" => {
@@ -1518,9 +1519,6 @@ fn complete_source_path(
         !matches!(command, "rm" | "clean-partials") || !apply_base,
     );
     let base = if apply_base { source_base(args) } else { None };
-    if command == "map" {
-        return Ok(local_path_candidates_at(current, false, base, policy));
-    }
     let Some(endpoint_text) = find_option_value(
         args,
         if matches!(command, "rm" | "clean-partials") {

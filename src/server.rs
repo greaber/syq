@@ -561,6 +561,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::ListDir { .. }
                     | Request::ListDirDetails { .. }
                     | Request::ListDirNoFollowFinal { .. }
+                    | Request::NativeMap(_)
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }
@@ -724,6 +725,30 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     Err(e) => w.write_msg(&Response::Err(format!("{e:#}")))?,
                 }
             }
+            Request::NativeMap(options) => {
+                struct Output<'a, W: std::io::Write>(&'a mut ObservedWriter<W>);
+                impl<W: std::io::Write> std::io::Write for Output<'_, W> {
+                    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                        for chunk in data.chunks(64 * 1024) {
+                            self.0.write_msg(&Response::NativeMapData(chunk.to_vec()))?;
+                        }
+                        Ok(data.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                let mut out = std::io::BufWriter::with_capacity(64 * 1024, Output(&mut w));
+                let result = crate::native_map::write_local(&options, &mut out).and_then(|()| {
+                    std::io::Write::flush(&mut out)?;
+                    Ok(())
+                });
+                drop(out);
+                match result {
+                    Ok(()) => w.write_msg(&Response::NativeMapDone)?,
+                    Err(error) => w.write_msg(&Response::Err(format!("{error:#}")))?,
+                }
+            }
             Request::NativeRemove {
                 cwd,
                 root,
@@ -800,7 +825,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 // writer borrow suffices.
                 let warns = std::cell::RefCell::new(Vec::new());
                 let wref = std::cell::RefCell::new(&mut w);
-                let mut sink = |batch: Vec<crate::proto::Entry>| {
+                let mut sink = |mut batch: Vec<crate::proto::Entry>| {
+                    ops.capture_scan_metadata(
+                        &requested_root,
+                        source.as_ref(),
+                        follow_root,
+                        &mut batch,
+                    )?;
                     if let Some(authority) = &authority {
                         authority.record_scanned(
                             &requested_root,
@@ -811,7 +842,18 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     for m in warns.borrow_mut().drain(..) {
                         w.write_msg(&Response::ScanWarn(m))?;
                     }
-                    Ok(w.write_msg(&Response::ScanBatch(batch))?)
+                    if ops.preserving_inode_metadata() {
+                        write_metadata_batches(
+                            &mut w,
+                            batch,
+                            crate::proto::Entry::size_hint,
+                            Response::ScanBatch,
+                            Response::ScanBatch,
+                        )?;
+                        Ok(())
+                    } else {
+                        Ok(w.write_msg(&Response::ScanBatch(batch))?)
+                    }
                 };
                 let mut ignored = |paths: Vec<crate::proto::PathBytes>| {
                     if let Some(authority) = &authority {
@@ -919,14 +961,31 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 ))?,
             },
             mut other => {
-                let resp = ops.handle_in_place(&mut other);
+                let resp = ops.handle_with_copy_progress(&mut other, &mut |bytes| {
+                    w.write_msg(&Response::CopyLocalProgress(bytes))?;
+                    Ok(())
+                });
                 if let (Some(authority), Some(settlement)) = (&authority, settlement) {
                     authority.settle(settlement, &resp);
                 }
                 if drop_after_handling_for_test(&other) {
                     return Ok(());
                 }
-                w.write_msg(&resp)?;
+                if ops.preserving_inode_metadata() {
+                    if let Response::Stats(entries) = resp {
+                        write_metadata_batches(
+                            &mut w,
+                            entries,
+                            |e| e.as_ref().map_or(1, crate::proto::Entry::size_hint),
+                            Response::StatsMore,
+                            Response::Stats,
+                        )?;
+                    } else {
+                        w.write_msg(&resp)?;
+                    }
+                } else {
+                    w.write_msg(&resp)?;
+                }
             }
         }
     }
@@ -1331,3 +1390,25 @@ impl<W: Write> ObservedWriter<W> {
 
 #[cfg(test)]
 mod tests;
+
+fn write_metadata_batches<W: std::io::Write, T>(
+    writer: &mut ObservedWriter<W>,
+    items: Vec<T>,
+    size: impl Fn(&T) -> usize,
+    more: fn(Vec<T>) -> Response,
+    last: fn(Vec<T>) -> Response,
+) -> std::io::Result<()> {
+    let mut batch = Vec::new();
+    let mut bytes = 0usize;
+    for item in items {
+        let item_size = size(&item);
+        if !batch.is_empty() && bytes.saturating_add(item_size) > crate::proto::METADATA_BATCH_BYTES
+        {
+            writer.write_msg(&more(std::mem::take(&mut batch)))?;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(item_size);
+        batch.push(item);
+    }
+    writer.write_msg(&last(batch))
+}

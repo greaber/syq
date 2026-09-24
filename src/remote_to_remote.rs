@@ -965,6 +965,12 @@ fn run_remote(
             remote.push(option.into());
         }
     }
+    if let Some(expression) = &args.where_expression {
+        remote.push(format!("--where={expression}"));
+    }
+    if let Some(expression) = &args.copy_if {
+        remote.push(format!("--copy-if={expression}"));
+    }
     if args.native_follow {
         remote.push("--follow".into());
     } else {
@@ -983,6 +989,28 @@ fn run_remote(
     }
     for line in &args.ignore_lines {
         remote.push(format!("--ignore={line}"));
+    }
+    if args.acls {
+        remote.push("--preserve=acls".into());
+    }
+    if args.xattrs {
+        remote.push("--preserve=xattrs".into());
+    }
+    if args.sparse {
+        remote.push("--sparse".into());
+    }
+    if args.open_noatime || args.atimes > 1 {
+        remote.push("--open-noatime".into());
+    }
+    if args.crtimes {
+        remote.push("--preserve=crtimes".into());
+    }
+    if args.atimes > 0 {
+        remote.push("--preserve=atimes".into());
+    }
+
+    if args.hardlinks {
+        remote.push("--preserve=hardlinks".into());
     }
     if args.perms {
         remote.push("--preserve=permissions".into());

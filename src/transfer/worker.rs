@@ -1,5 +1,7 @@
 use super::*;
 
+type SmallPutOutcome = Result<Option<(u64, u64)>>;
+
 pub(super) struct RangeFlight {
     pub(super) handle: RangeHandle,
     pub(super) start: u64,
@@ -236,7 +238,7 @@ impl Worker {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
         !self.opts.dry_run
-            && self.opts.expected_for(&j.rel_bytes).is_none()
+            && !self.opts.has_expected_for(j)
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
             && jobs.destination(idx).is_none()
@@ -244,7 +246,7 @@ impl Worker {
     }
 
     pub(super) fn fail_small_batch(
-        results: &mut [Option<Result<()>>],
+        results: &mut [Option<SmallPutOutcome>],
         indices: impl IntoIterator<Item = usize>,
         error: &anyhow::Error,
     ) {
@@ -257,10 +259,14 @@ impl Worker {
     pub(super) fn record_small_batch_reply(
         sent: &[usize],
         response: Response,
-        results: &mut [Option<Result<()>>],
+        results: &mut [Option<SmallPutOutcome>],
     ) -> bool {
         let applied = ok(response, "put small batch").and_then(|response| match response {
-            Response::Applied(applied) if applied.len() == sent.len() => Ok(applied),
+            Response::Applied(applied) if applied.len() == sent.len() => Ok(applied
+                .into_iter()
+                .map(|e| e.map_or(Ok(None), Err))
+                .collect::<Vec<_>>()),
+            Response::PublishedBatch(applied) if applied.len() == sent.len() => Ok(applied),
             other => bail!("unexpected response {other:?}"),
         });
         let applied = match applied {
@@ -271,8 +277,7 @@ impl Worker {
             }
         };
         for (&idx, error) in sent.iter().zip(applied) {
-            results[idx] =
-                Some(error.map_or(Ok(()), |error| Err(endpoint_error(error)).context("put")));
+            results[idx] = Some(error.map_err(endpoint_error).context("put"));
         }
         true
     }
@@ -281,7 +286,7 @@ impl Worker {
         &mut self,
         sent: Vec<usize>,
         jobs: &[WorkerJob],
-        results: &mut [Option<Result<()>>],
+        results: &mut [Option<SmallPutOutcome>],
     ) -> Result<bool> {
         let response = self.dst.recv()?;
         let valid = Self::record_small_batch_reply(&sent, response, results);
@@ -289,7 +294,7 @@ impl Worker {
         // Confirmed file completion still belongs to the final source check.
         let (bytes, files) = sent
             .iter()
-            .filter(|&&idx| matches!(results[idx], Some(Ok(()))))
+            .filter(|&&idx| matches!(results[idx], Some(Ok(_))))
             .fold((0, 0), |(bytes, files), &idx| {
                 (bytes + jobs[idx].entry.size, files + 1)
             });
@@ -304,7 +309,7 @@ impl Worker {
         &mut self,
         jobs: &[WorkerJob],
         mut groups: impl Iterator<Item = std::ops::Range<usize>>,
-        results: &mut [Option<Result<()>>],
+        results: &mut [Option<SmallPutOutcome>],
     ) -> Result<()> {
         let window = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
         let mut read_window = if self.src.supports_request_pipelining() {
@@ -426,7 +431,7 @@ impl Worker {
                         data,
                         hash,
                         meta,
-                        flags: publication_metadata_flags(self.opts.flags_for(&job.rel_bytes)),
+                        flags: self.publication_flags(job),
                         inplace: self.opts.inplace,
                         condition: job.target_condition,
                         guard: job.container_guard.clone(),
@@ -510,8 +515,15 @@ impl Worker {
         let mut path_bytes = 0usize;
         for (i, job) in jobs.iter().enumerate() {
             let source_bytes = source_request_bytes(&job.src, Some(&job.source));
+            let file_bytes = job.entry.size.saturating_add(
+                job.entry
+                    .inode_metadata
+                    .as_ref()
+                    .map_or(0, |m| m.size_hint()) as u64,
+            );
             if i > start
-                && (bytes.saturating_add(job.entry.size) > group_bytes
+                && (bytes.saturating_add(file_bytes)
+                    > group_bytes.min(crate::proto::MAX_READ_BYTES)
                     || path_bytes.saturating_add(source_bytes) > SOURCE_BATCH_PATH_BYTES)
             {
                 groups.push(start..i);
@@ -519,7 +531,7 @@ impl Worker {
                 bytes = 0;
                 path_bytes = 0;
             }
-            bytes += job.entry.size;
+            bytes += file_bytes;
             path_bytes = path_bytes.saturating_add(source_bytes);
         }
         if start < jobs.len() {
@@ -553,7 +565,7 @@ impl Worker {
         let (credited, credited_files) = jobs
             .iter()
             .zip(&results)
-            .filter(|(_, result)| matches!(result, Some(Ok(()))))
+            .filter(|(_, result)| matches!(result, Some(Ok(_))))
             .fold((0, 0), |(bytes, files), (job, _)| {
                 (bytes + job.entry.size, files + 1)
             });
@@ -567,7 +579,7 @@ impl Worker {
         let successful = jobs
             .iter()
             .zip(&results)
-            .filter_map(|(job, result)| matches!(result, Some(Ok(()))).then_some(job));
+            .filter_map(|(job, result)| matches!(result, Some(Ok(_))).then_some(job));
         let paths = successful
             .clone()
             .map(|job| job.src.clone())
@@ -606,6 +618,7 @@ impl Worker {
                 }
                 continue;
             }
+            let published = res.expect("successful publication checked above");
             let now = now.next().expect("rechecked acknowledged file");
             let changed = match &now {
                 Some(e) => {
@@ -613,6 +626,9 @@ impl Worker {
                         || e.size != j.entry.size
                         || e.mtime != j.entry.mtime
                         || e.mtime_nsec != j.entry.mtime_nsec
+                        || (j.entry.inode_metadata.is_some()
+                            && (e.dev, e.ino, e.ctime, e.ctime_nsec)
+                                != (j.entry.dev, j.entry.ino, j.entry.ctime, j.entry.ctime_nsec))
                 }
                 None => true,
             };
@@ -655,6 +671,10 @@ impl Worker {
                     );
                     self.sched.fail_file(*idx);
                 }
+                continue;
+            }
+            if let Err(error) = self.record_hardlink_identity(*idx, j, published) {
+                self.file_error(*idx, error)?;
                 continue;
             }
             j.done.store(j.entry.size, Relaxed);
@@ -750,7 +770,7 @@ impl Worker {
         let opts = self.opts.clone();
         let _ = &opts;
 
-        match self.try_expected_match(&job) {
+        match self.try_expected_match(idx, &job) {
             Ok(true) => {
                 job.done.store(size, Relaxed);
                 self.progress.bytes_unchanged.fetch_add(size, Relaxed);
@@ -829,6 +849,21 @@ impl Worker {
             // through a sidecar + atomic rename. Small new files normally take
             // the batched small-file path instead of reaching this worker path.
 
+            // Compare before requesting write access or resizing an in-place
+            // destination. A matching read-only file needs only metadata work.
+            // Prepare binds any writes to this held inode, and the comparison
+            // below is reused rather than hashing the contents a second time.
+            let inplace_ranges = if inplace && final_is_file {
+                let diff = self.diff_final_and_hold(&job)?;
+                if diff.ranges.is_empty() && diff.held_len == Some(size) {
+                    self.finish_matched_basis(idx, &job)?;
+                    return Ok((vec![], false));
+                }
+                Some(diff.ranges)
+            } else {
+                None
+            };
+
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
             // absent until the content comparison shows a difference.
@@ -853,10 +888,7 @@ impl Worker {
                 self.sched.request_direct_fallback();
             }
             if inplace {
-                if final_is_file && size > 0 {
-                    return Ok((self.diff_blocks(&job, Which::Final)?, true));
-                }
-                return Ok((full(), true));
+                return Ok((inplace_ranges.unwrap_or_else(full), true));
             }
             // A retry's own output must be finished (and thus consumed), even
             // if another copy has meanwhile published identical final bytes.
@@ -869,20 +901,7 @@ impl Worker {
             if final_is_file {
                 let diff = self.diff_final_and_hold(&job)?;
                 if diff.ranges.is_empty() && diff.held_len == Some(size) {
-                    let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
-                    meta.mode = self.create_mode(&job);
-                    ok(
-                        self.dst.call(Request::FinishBasis {
-                            expected_hash: self.opts.expected_for(&job.rel_bytes).cloned(),
-                            path: job.dst.clone(),
-                            copy_id: self.copy_id(),
-                            meta,
-                            flags: publication_metadata_flags(self.opts.flags_for(&job.rel_bytes)),
-                            condition: job.target_condition,
-                            guard: job.container_guard.clone(),
-                        })?,
-                        "finish content-identical destination",
-                    )?;
+                    self.finish_matched_basis(idx, &job)?;
                     return Ok((vec![], false));
                 }
                 return Ok((
@@ -969,20 +988,36 @@ impl Worker {
         // Keep range parallelism for a single-file copy. Read the planned
         // file count before the RPC so no scheduler lock spans the copy.
         let allow_sequential_local_fallback = self.sched.jobs.lock().unwrap().len() > 1;
-        let resp = self.dst.call(Request::CopyLocal {
-            source: job.source.clone(),
-            dst: job.dst.clone(),
-            inplace,
-            allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
-            allow_sequential_local_fallback,
-            copy_id: self.copy_id(),
-            size: job.entry.size,
-            mode,
-        })?;
-        match resp {
+        let _whole_file = self.gate.whole_file(self.id);
+        let mut credited = 0;
+        let resp = self.dst.copy_local(
+            Request::CopyLocal {
+                source: job.source.clone(),
+                dst: job.dst.clone(),
+                inplace,
+                allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
+                allow_sequential_local_fallback,
+                copy_id: self.copy_id(),
+                size: job.entry.size,
+                mode,
+            },
+            &mut |total| {
+                if total < credited || total > job.entry.size {
+                    return Err(anyhow::Error::new(RangeReplyMismatch)
+                        .context("invalid local-copy progress"));
+                }
+                self.progress.add_bytes(total - credited);
+                credited = total;
+                Ok(())
+            },
+        );
+        if !matches!(resp, Ok(Response::Ok)) {
+            self.progress.bytes_done.fetch_sub(credited, Relaxed);
+        }
+        match resp? {
             Response::Ok => {
                 self.benchmark.local_whole_files += 1;
-                self.progress.add_bytes(job.entry.size);
+                self.progress.add_bytes(job.entry.size - credited);
                 job.done.store(job.entry.size, Relaxed);
                 if let Err(e) = self.finish_file(idx) {
                     if self.transport_dead() {
@@ -1014,7 +1049,10 @@ impl Worker {
         }
         match job.dst_entry.as_ref().filter(|d| d.kind == Kind::File) {
             Some(d) if !self.opts.perms => d.mode & 0o7777,
-            _ => fresh_file_mode(&self.opts, &job.entry),
+            _ => job
+                .creation_mode
+                .map(u32::from)
+                .unwrap_or_else(|| fresh_file_mode(&self.opts, &job.entry)),
         }
     }
 
@@ -1661,40 +1699,56 @@ impl Worker {
         meta.mode = self.create_mode(&job);
         let finalized = ok(
             self.dst.call(Request::Finalize {
-                expected_hash: self.opts.expected_for(&job.rel_bytes).cloned(),
+                expected_hash: self.opts.expected_hashes_for(&job),
                 path: job.dst.clone(),
                 inplace: job.inplace,
                 copy_id: self.copy_id(),
                 meta,
-                flags: publication_metadata_flags(self.opts.flags_for(&job.rel_bytes)),
+                flags: self.publication_flags(&job),
                 condition: job.target_condition,
                 guard: job.container_guard.clone(),
             })?,
             "finalize destination",
         );
-        if let Err(error) = finalized {
-            if self.transport_dead() || job.inplace {
-                return Err(error);
+        match finalized {
+            Ok(response) => self.accept_hardlink_reply(idx, &job, response)?,
+            Err(error) => {
+                if self.transport_dead() || job.inplace {
+                    return Err(error);
+                }
+                // If the response to a previous Finalize was lost, its sidecar is
+                // gone because publication already happened. Verify the final
+                // bytes before treating the retry as successful; if a sidecar is
+                // still present, preserve the real metadata/publication error.
+                let partial_missing = match ok(
+                    self.dst.call(Request::ProbePartial {
+                        path: job.dst.clone(),
+                        copy_id: self.copy_id(),
+                        guard: None,
+                    })?,
+                    "probe partial after finalize",
+                )? {
+                    Response::PartialSize(size) => size.is_none(),
+                    other => bail!("unexpected response {other:?}"),
+                };
+                if !partial_missing {
+                    return Err(error);
+                }
+                if (self.opts.hardlinks && job.entry.nlink > 1)
+                    || self.opts.inode_preservation.any()
+                {
+                    let diff = self.diff_final_and_hold(&job)?;
+                    if !diff.ranges.is_empty() || diff.held_len != Some(job.entry.size) {
+                        return Err(error);
+                    }
+                    self.finish_matched_basis(idx, &job)?;
+                } else {
+                    if !self.contents_match(&job)? {
+                        return Err(error);
+                    }
+                    self.validate_expected_destination(&job)?;
+                }
             }
-            // If the response to a previous Finalize was lost, its sidecar is
-            // gone because publication already happened. Verify the final
-            // bytes before treating the retry as successful; if a sidecar is
-            // still present, preserve the real metadata/publication error.
-            let partial_missing = match ok(
-                self.dst.call(Request::ProbePartial {
-                    path: job.dst.clone(),
-                    copy_id: self.copy_id(),
-                    guard: None,
-                })?,
-                "probe partial after finalize",
-            )? {
-                Response::PartialSize(size) => size.is_none(),
-                other => bail!("unexpected response {other:?}"),
-            };
-            if !partial_missing || !self.contents_match(&job)? {
-                return Err(error);
-            }
-            self.validate_expected_destination(&job)?;
         }
         #[cfg(debug_assertions)]
         crate::fsops::test_race_barrier(
@@ -1762,6 +1816,14 @@ impl Worker {
                     || e.size != job.entry.size
                     || e.mtime != job.entry.mtime
                     || e.mtime_nsec != job.entry.mtime_nsec
+                    || (job.entry.inode_metadata.is_some()
+                        && (e.dev, e.ino, e.ctime, e.ctime_nsec)
+                            != (
+                                job.entry.dev,
+                                job.entry.ino,
+                                job.entry.ctime,
+                                job.entry.ctime_nsec,
+                            ))
             }
             None => true,
         };
@@ -1826,10 +1888,11 @@ impl Worker {
     // planning. A failed check takes the normal repair path; publication still
     // validates the expected digest. Explicit --hash continues to compare both
     // endpoints regardless of matching metadata or an expected digest.
-    pub(super) fn try_expected_match(&mut self, job: &WorkerJob) -> Result<bool> {
-        let Some(expected) = self.opts.expected_for(&job.rel_bytes).cloned() else {
+    pub(super) fn try_expected_match(&mut self, idx: usize, job: &WorkerJob) -> Result<bool> {
+        let expected = self.opts.expected_hashes_for(job);
+        if expected.is_none() && !(self.opts.hardlinks && job.entry.nlink > 1) {
             return Ok(false);
-        };
+        }
         let Some(destination) = job.dst_entry.as_deref() else {
             return Ok(false);
         };
@@ -1840,14 +1903,16 @@ impl Worker {
         {
             return Ok(false);
         }
-        match self.dst.call(Request::ValidateDigest {
-            path: job.dst.clone(),
-            expected,
-            guard: job.container_guard.clone(),
-        })? {
-            Response::Ok => {}
-            Response::Err(_) | Response::EndpointError(_) => return Ok(false),
-            other => bail!("unexpected response validating destination digest: {other:?}"),
+        if let Some(expected) = expected {
+            match self.dst.call(Request::ValidateDigest {
+                path: job.dst.clone(),
+                expected,
+                guard: job.container_guard.clone(),
+            })? {
+                Response::Ok => {}
+                Response::Err(_) | Response::EndpointError(_) => return Ok(false),
+                other => bail!("unexpected response validating destination digest: {other:?}"),
+            }
         }
         // Preserve the ordinary quick check's metadata reconciliation and
         // require the same destination inode observed by the planner.
@@ -1876,11 +1941,12 @@ impl Worker {
             }
             other => bail!("unexpected metadata response: {other:?}"),
         }
+        self.record_hardlink_identity(idx, job, Some((destination.dev, destination.ino)))?;
         Ok(true)
     }
 
     pub(super) fn validate_expected_destination(&mut self, job: &WorkerJob) -> Result<()> {
-        if let Some(expected) = self.opts.expected_for(&job.rel_bytes).cloned() {
+        if let Some(expected) = self.opts.expected_hashes_for(job) {
             ok(
                 self.dst.call(Request::ValidateDigest {
                     path: job.dst.clone(),
@@ -1895,7 +1961,22 @@ impl Worker {
 
     pub(super) fn preview_file(&mut self, idx: usize) -> Result<()> {
         let job = self.job(idx);
-        let result = self.contents_match(&job);
+        let result = match job.dst_entry.as_deref() {
+            Some(destination)
+                if !self.opts.checksum
+                    && self
+                        .opts
+                        .metadata_matches(&job.rel_bytes, &job.entry, destination) =>
+            {
+                Ok(true)
+            }
+            Some(destination)
+                if destination.kind == Kind::File && destination.size == job.entry.size =>
+            {
+                self.contents_match(&job)
+            }
+            _ => Ok(false),
+        };
         self.sched.ranges_ready(idx, vec![]);
         let matched = match result {
             Ok(matched) => matched,
@@ -1906,6 +1987,16 @@ impl Worker {
                 return Err(error);
             }
         };
+        if self.opts.hardlinks && job.entry.nlink > 1 {
+            self.opts.hardlink_completions.lock().unwrap().insert(
+                idx,
+                if matched {
+                    job.dst_entry.as_deref().map(|e| (e.dev, e.ino))
+                } else {
+                    None
+                },
+            );
+        }
         let (bytes, reason) = if matched {
             self.progress.files_total.fetch_sub(1, Relaxed);
             self.progress.bytes_total.fetch_sub(job.entry.size, Relaxed);
@@ -1921,6 +2012,9 @@ impl Worker {
                 .opts
                 .metadata_fix_flags(&job.rel_bytes, &job.entry, destination)
                 == 0
+                && !self
+                    .opts
+                    .inode_metadata_differs(&job.rel_bytes, &job.entry, destination)
             {
                 return Ok(());
             }

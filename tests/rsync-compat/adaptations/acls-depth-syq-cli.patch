@@ -1,0 +1,12 @@
+--- a/testsuite/acls-depth_test.py
++++ b/testsuite/acls-depth_test.py
+@@ -17,9 +17,6 @@
+     walk_dirs, walk_files,
+ )
+ 
+-vv = run_rsync('-VV', check=True, capture_output=True).stdout
+-if '"ACLs": true' not in vv:
+-    test_skipped("rsync built without ACL support")
+ if not (shutil.which('setfacl') and shutil.which('getfacl')):
+     test_skipped("setfacl/getfacl not available")
+ 

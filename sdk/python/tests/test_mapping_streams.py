@@ -142,6 +142,41 @@ class MappingStreamCopies(unittest.TestCase):
             self.assertTrue(failure.message)
             self.assertEqual(target.read_bytes(), b"old")
 
+    def test_rejected_source_does_not_abort_another_entry(self):
+        import threading
+        from unittest.mock import patch
+        from syq._callback_runtime import Callbacks
+
+        rejected, retired = threading.Event(), threading.Event()
+        target = self.root / "existing"
+        target.write_bytes(b"old")
+        def produce(out):
+            out.write(b"data")
+            out.close()
+            self.assertTrue(rejected.wait(5))
+        failed_source = syq.StreamSource(produce, size=3)
+        invoke = Callbacks._invoke
+        def observed_invoke(callbacks, endpoint, *args):
+            try:
+                invoke(callbacks, endpoint, *args)
+            finally:
+                if endpoint is failed_source:
+                    retired.set()
+        def next_source(out):
+            self.assertTrue(retired.wait(5))
+            out.write(b"next")
+        def event(record):
+            if isinstance(record, syq.MappingStreamResult) and record.entry == 0:
+                rejected.set()
+        with patch.object(Callbacks, "_invoke", observed_invoke):
+            result = self.client.cp(mapping=[
+                syq.MappingEntry(failed_source, "existing"),
+                syq.MappingEntry(syq.StreamSource(next_source), "next"),
+            ], into=self.root, stream_concurrency=1, on_event=event, check=False)
+        self.assertEqual((result.exit_code, result.files_transferred, result.errors), (23, 1, 1))
+        self.assertEqual(target.read_bytes(), b"old")
+        self.assertEqual((self.root / "next").read_bytes(), b"next")
+
     def test_consumer_eof_validates_transfer_and_normal_early_return_drains(self):
         target = self.root / "source"
         target.write_bytes(b"x" * 1024 * 1024)

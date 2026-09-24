@@ -64,7 +64,8 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         .as_bytes(),
     );
 
-    let out = compat_command()
+    let mut command = compat_command();
+    command
         .arg("-e")
         .arg(&rsh)
         .args([
@@ -86,7 +87,11 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         // Match the unscoped legacy cache fixture regardless of the host network.
         .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("SYQ_DEBUG", "1")
-        .env("SYQ_TEST_TUNE_SAMPLE_MS", "50")
+        .env("SYQ_TEST_TUNE_SAMPLE_MS", "50");
+    assert_output_ok(&command.run().unwrap());
+    tuning::seed_start_from_last_run(&cache, 2);
+    fs::remove_dir_all(t.path("dst")).unwrap();
+    let out = command
         .env("SYQ_TEST_DROP_AFTER_REQUEST", "write")
         .env("SYQ_TEST_DROP_AFTER_N_REQUESTS", "32")
         .env("SYQ_TEST_DROP_MARKER", &marker)
@@ -104,7 +109,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // The legacy count is a weak starting guess: discover with doubling, then
+    // The measured count is a starting guess: discover with doubling, then
     // exercise retirement by probing a lower count on the bandwidth plateau.
     assert!(
         stderr.contains("2 -> 4 workers (candidate ready"),
@@ -479,7 +484,8 @@ fn one_worker_hint_prepares_spare_before_slow_connection_is_ready() {
     let cache = t.path("tuning.json");
     write(&cache, br#"{"paths":{"local>fake|ssh":1}}"#);
     let remote = format!("fake:{}", t.s("dst"));
-    let out = compat_command()
+    let mut command = compat_command();
+    command
         .arg("-e")
         .arg(&rsh)
         .args([
@@ -500,7 +506,11 @@ fn one_worker_hint_prepares_spare_before_slow_connection_is_ready() {
         // Match the unscoped legacy cache fixture regardless of the host network.
         .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("SYQ_DEBUG", "1")
-        .env("SYQ_TEST_TUNE_SAMPLE_MS", "50")
+        .env("SYQ_TEST_TUNE_SAMPLE_MS", "50");
+    assert_output_ok(&command.run().unwrap());
+    tuning::seed_start_from_last_run(&cache, 1);
+    fs::remove_dir_all(t.path("dst")).unwrap();
+    let out = command
         .env(
             "SYQ_TEST_WORKER_CONNECT_READY_FILE",
             t.path("worker-zero-waiting"),

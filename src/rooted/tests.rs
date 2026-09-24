@@ -1819,3 +1819,31 @@ fn os_string_conversion_in_test_is_byte_exact() {
     let name = OsStr::from_bytes(b"byte-\xff");
     assert_eq!(name.as_bytes(), b"byte-\xff");
 }
+
+#[test]
+fn hardlink_publication_is_confined_and_rejects_a_replaced_representative() {
+    let tree = TestDir::new("hardlinks");
+    let root = Root::open(tree.path()).unwrap();
+    fs::write(tree.path().join("source"), b"payload").unwrap();
+    fs::write(tree.path().join("outside"), b"untouched").unwrap();
+    symlink("outside", tree.path().join("target")).unwrap();
+    let source = relative(b"source");
+    let target = relative(b"target");
+    let original = root.metadata(&source).unwrap();
+    let identity = (original.dev, original.ino);
+    root.publish_hardlink(&source, &target, identity).unwrap();
+    root.publish_hardlink(&source, &target, identity).unwrap();
+    assert_eq!(root.metadata(&target).unwrap().ino, original.ino);
+    assert_eq!(fs::read(tree.path().join("outside")).unwrap(), b"untouched");
+    fs::remove_file(tree.path().join("source")).unwrap();
+    symlink("outside", tree.path().join("source")).unwrap();
+    assert!(root
+        .publish_hardlink(&source, &relative(b"other"), identity)
+        .is_err());
+    assert!(!tree.path().join("other").exists());
+    fs::create_dir(tree.path().join("directory")).unwrap();
+    assert!(root
+        .publish_hardlink(&target, &relative(b"directory"), identity)
+        .is_err());
+    assert!(tree.path().join("directory").is_dir());
+}

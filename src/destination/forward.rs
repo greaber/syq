@@ -575,6 +575,7 @@ fn resolve_ssh_destination(home: &Path, path: &[u8]) -> Result<(PathBuf, PathBuf
 }
 
 fn receive() -> Result<i32> {
+    crate::fsops::reserve_startup_descriptors();
     let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -622,6 +623,7 @@ fn receive() -> Result<i32> {
     Ok(0)
 }
 fn connect(target: &str, install: bool) -> Result<i32> {
+    crate::fsops::reserve_startup_descriptors();
     let target =
         String::from_utf8(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(target)?)?;
     let endpoint = target_endpoint(&target)?;

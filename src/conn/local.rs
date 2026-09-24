@@ -98,6 +98,7 @@ impl Conn for LocalConn {
                     | Request::ListDir { .. }
                     | Request::ListDirDetails { .. }
                     | Request::ListDirNoFollowFinal { .. }
+                    | Request::NativeMap(_)
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }
@@ -169,6 +170,22 @@ impl Conn for LocalConn {
             Request::WriteRange { data, .. } => Some(data.into_vec()),
             _ => None,
         })
+    }
+    fn copy_local(
+        &mut self,
+        mut req: Request,
+        progress: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Response> {
+        anyhow::ensure!(
+            self.role == LocalConnectionRole::DestinationWorker
+                && matches!(req, Request::CopyLocal { .. })
+                && self.pending.is_empty()
+                && self.read_stream.is_none()
+                && self.write_stream.is_none(),
+            "local copy requires an idle destination worker"
+        );
+        let _wait = self.rpc_observation.as_ref().map(|o| o.span(true));
+        Ok(self.ops.handle_with_copy_progress(&mut req, progress))
     }
     fn recv(&mut self) -> Result<Response> {
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
@@ -248,6 +265,11 @@ impl Conn for LocalConn {
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
     ) -> Result<()> {
+        let mut capture = |mut batch: Vec<Entry>| {
+            self.ops
+                .capture_scan_metadata(root, source, follow_root, &mut batch)?;
+            sink(batch)
+        };
         if let Some(source) = self.ops.source_scan_root(source)? {
             return crate::scan::scan_descriptor(
                 source.root,
@@ -257,7 +279,7 @@ impl Conn for LocalConn {
                 false,
                 ignore,
                 report_ignored,
-                sink,
+                &mut capture,
                 ignored,
                 warn,
             );
@@ -271,7 +293,7 @@ impl Conn for LocalConn {
                 true,
                 ignore,
                 report_ignored,
-                sink,
+                &mut capture,
                 ignored,
                 warn,
             );
@@ -282,7 +304,7 @@ impl Conn for LocalConn {
             follow_root,
             ignore,
             report_ignored,
-            sink,
+            &mut capture,
             ignored,
             warn,
         )

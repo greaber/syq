@@ -277,6 +277,7 @@ class MappingEntry:
     mtime: int | None = None
     expected_hash: Hash | None = None
     metadata: DestinationMetadata | None = None
+    s3_last_modified: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.src, (RelativePath, StreamSource)):
@@ -293,7 +294,7 @@ class MappingEntry:
                 raise ValueError("stream mapping endpoints carry regular-file bytes")
             if isinstance(self.dst, StreamDestination) and self.metadata is not None:
                 raise ValueError("destination metadata requires a named destination")
-        for label, value in (("size", self.size), ("mtime", self.mtime)):
+        for label, value in (("size", self.size), ("mtime", self.mtime), ("s3_last_modified", self.s3_last_modified)):
             if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
                 raise TypeError(f"{label} must be an integer or None")
         if self.expected_hash is not None:
@@ -630,6 +631,8 @@ def _mapping_json(entry: MappingEntry, *, stream_id: int | None = None) -> dict[
         record["size"] = entry.size
     if entry.mtime is not None:
         record["mtime"] = entry.mtime
+    if entry.s3_last_modified is not None:
+        record["s3_last_modified"] = entry.s3_last_modified
     if entry.expected_hash is not None:
         record["expected_hash"] = {
             "algorithm": entry.expected_hash.algorithm.value,

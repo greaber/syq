@@ -234,6 +234,81 @@ impl Digest {
     }
 }
 
+/// Transient receiver assertions. Public mappings and signed grants still carry
+/// one Digest per path. The normal case uses the existing single-hash reader.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ExpectedHashes {
+    Single(Digest),
+    Multiple(Vec<Digest>),
+}
+
+impl ExpectedHashes {
+    pub(crate) fn collect<'a>(digests: impl Iterator<Item = &'a Digest>) -> Result<Option<Self>> {
+        let mut distinct: Vec<Digest> = Vec::new();
+        for digest in digests {
+            if let Some(previous) = distinct.iter().find(|d| d.algorithm == digest.algorithm) {
+                if previous != digest {
+                    bail!(
+                        "conflicting expected {} hashes for one hardlink group",
+                        digest.algorithm
+                    );
+                }
+            } else {
+                distinct.push(digest.clone());
+            }
+        }
+        Ok(match distinct.len() {
+            0 => None,
+            1 => Some(Self::Single(distinct.pop().unwrap())),
+            _ => Some(Self::Multiple(distinct)),
+        })
+    }
+
+    pub(crate) fn verify_reader(&self, reader: &mut impl Read) -> Result<()> {
+        let digests = match self {
+            Self::Single(digest) => return digest.verify_reader(reader),
+            Self::Multiple(digests) => digests,
+        };
+        // Four supported algorithms bound both receiver CPU and allocations.
+        anyhow::ensure!(
+            (2..=4).contains(&digests.len()),
+            "invalid expected hash set"
+        );
+        for (index, digest) in digests.iter().enumerate() {
+            digest.validate()?;
+            anyhow::ensure!(
+                digests[..index]
+                    .iter()
+                    .all(|d| d.algorithm != digest.algorithm),
+                "duplicate expected hash algorithm"
+            );
+        }
+        let mut hashers: Vec<_> = digests.iter().map(|d| d.algorithm.hasher()).collect();
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .context("read file for expected hashes")?;
+            if count == 0 {
+                break;
+            }
+            for hasher in &mut hashers {
+                hasher.update(&buffer[..count]);
+            }
+        }
+        for (digest, hasher) in digests.iter().zip(hashers) {
+            digest.verify(&hasher.finalize())?;
+        }
+        Ok(())
+    }
+}
+
+impl From<Digest> for ExpectedHashes {
+    fn from(digest: Digest) -> Self {
+        Self::Single(digest)
+    }
+}
+
 impl FromStr for Digest {
     type Err = anyhow::Error;
 
@@ -254,6 +329,51 @@ impl std::fmt::Display for Digest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_assertions_share_one_read_and_reject_contradictions() {
+        let bytes = vec![37; 3 * 1024 * 1024 + 71];
+        let digests: Vec<_> = [
+            HashAlgorithm::Blake3,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Md5,
+            HashAlgorithm::Xxh3,
+        ]
+        .into_iter()
+        .map(|a| Digest::hash_bytes(a, &bytes))
+        .collect();
+        let required = ExpectedHashes::collect(digests.iter().chain(digests.iter()))
+            .unwrap()
+            .unwrap();
+        struct Counted<'a> {
+            bytes: &'a [u8],
+            read: usize,
+        }
+        impl Read for Counted<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.bytes.read(buffer)?;
+                self.read += count;
+                Ok(count)
+            }
+        }
+        let mut reader = Counted {
+            bytes: &bytes,
+            read: 0,
+        };
+        required.verify_reader(&mut reader).unwrap();
+        assert_eq!(reader.read, bytes.len());
+        assert!(matches!(
+            ExpectedHashes::collect([&digests[0], &digests[0]].into_iter()).unwrap(),
+            Some(ExpectedHashes::Single(_))
+        ));
+        let different = Digest::hash_bytes(HashAlgorithm::Blake3, b"different");
+        assert!(ExpectedHashes::collect([&digests[0], &different].into_iter()).is_err());
+        let mut wrong = digests.clone();
+        wrong[3] = Digest::hash_bytes(HashAlgorithm::Xxh3, b"different");
+        assert!(ExpectedHashes::Multiple(wrong)
+            .verify_reader(&mut bytes.as_slice())
+            .is_err());
+    }
 
     #[test]
     fn standard_vectors_and_streaming_agree() {

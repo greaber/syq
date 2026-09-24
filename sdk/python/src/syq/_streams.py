@@ -11,6 +11,7 @@ import threading
 from collections.abc import Awaitable, Callable, Mapping
 
 from ._paths import PathArgument
+from ._payload_io import OwnedPayload
 from .errors import SyqInvocationError, SyqProcessError, SyqProtocolError
 from .models import CpResult
 from .protocol import AutomationDecoder
@@ -135,8 +136,9 @@ class _Process:
             for fd in (read_fd, write_fd, results_read, results_write):
                 if fd is not None:
                     os.close(fd)
-        self.payload = self.process.stdin if writing else self.process.stdout
-        assert self.payload is not None and self.process.stderr is not None
+        payload = self.process.stdin if writing else self.process.stdout
+        assert payload is not None and self.process.stderr is not None
+        self.payload = OwnedPayload(payload)
         self.drain = threading.Thread(target=self._drain, daemon=True, name="syq-stream-stderr")
         self.drain.start()
         self.results_drain = threading.Thread(target=self._drain_results, daemon=True, name="syq-stream-results")

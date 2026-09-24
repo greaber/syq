@@ -60,6 +60,10 @@ ssh destination 'install -d -m 0755 /tmp/syq-real-ssh'
 
 case "${SYQ_REAL_SSH_SUITE:-core}" in
     core) ;;
+    metadata)
+        python3 /usr/local/libexec/syq-test-metadata.py
+        exit 0
+        ;;
     storage)
         python3 /usr/local/libexec/syq-test-storage-authorization.py
         exit 0
@@ -242,6 +246,9 @@ for commit in (b'', b'C'):
     assert result.stdout == (payload if commit else b'local producer')
 PY_DESCRIPTORS
 
+printf 'case: remote mapping generation\n'
+python3 /usr/local/libexec/syq-test-map-generation.py
+
 printf 'case: shared stream mappings over TCP and SSH\n'
 timeout --kill-after=5s 120s python3 /usr/local/libexec/syq-test-stream-mappings.py
 
@@ -353,6 +360,34 @@ syq persist receive on --name laptop --root "$receive_root"
 syq persist receive remove "$(hostname)"
 syq persist receive wait source --timeout 30
 ssh source 'syq persist destinations wait laptop --timeout 30'
+printf 'case: hardlinks survive SSH and TCP copies, updates, reruns, and pulls\n'
+python3 - <<'PY_HARDLINKS'
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+with tempfile.TemporaryDirectory(prefix='syq-hardlinks-') as scratch:
+    source = Path(scratch) / 'source'
+    source.mkdir()
+    (source / 'a').write_bytes(b'first')
+    os.link(source / 'a', source / 'b')
+    for label, transport in [('ssh', ['--no-tcp']), ('tcp', [])]:
+        destination = '/tmp/syq-real-ssh/hardlinks-' + label
+        command = ['syq', 'cp', '--preserve=hardlinks', '--srcs-in', str(source), '--to', 'destination', '--into', destination, *transport]
+        subprocess.run(command, check=True, timeout=30)
+        subprocess.run(command, check=True, timeout=30)
+        (source / 'a').write_bytes(b'changed payload')
+        subprocess.run([*command, '--inplace'], check=True, timeout=30)
+        pull = Path(scratch) / label
+        subprocess.run(['syq', 'cp', '--preserve=hardlinks', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30)
+        assert (pull / 'a').read_bytes() == b'changed payload'
+        assert (pull / 'b').read_bytes() == b'changed payload'
+        assert (pull / 'a').stat().st_ino == (pull / 'b').stat().st_ino
+PY_HARDLINKS
+
+python3 /usr/local/libexec/syq-test-metadata.py
+
 printf 'case: return copies await local approval and denial leaves no destination\n'
 timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as denied' &
 return_copy_pid=$!
@@ -923,6 +958,32 @@ syq cp --skip-newer --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
+
+printf 'case: expression selection on source, destination, and local coordinators\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/expressions/sub; printf selected > /tmp/syq-real-ssh/expressions/sub/keep; printf x > /tmp/syq-real-ssh/expressions/sub/tiny'
+for coordinator in src dst local; do
+    set --
+    if [ "$coordinator" = dst ]; then set -- --peer-auth broker; fi
+    syq cp "$@" --from source --srcs-in /tmp/syq-real-ssh/expressions \
+        --to destination --into "/tmp/syq-real-ssh/expressions-$coordinator" \
+        --coordinate-at "$coordinator" --no-progress \
+        --where "src.kind = 'file' and src.size > 1B and src.path glob 'sub/*'" \
+        --copy-if 'not dst.exists or src.size > dst.size'
+    ssh destination "test \"\$(cat /tmp/syq-real-ssh/expressions-$coordinator/sub/keep)\" = selected; test ! -e /tmp/syq-real-ssh/expressions-$coordinator/sub/tiny"
+done
+
+printf 'case: restricted expressions preserve container permissions and inheritance\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/expression-modes/new /tmp/syq-real-ssh/expression-modes/old; printf selected > /tmp/syq-real-ssh/expression-modes/new/keep; printf selected > /tmp/syq-real-ssh/expression-modes/old/keep; chmod 710 /tmp/syq-real-ssh/expression-modes/new'
+for preservation in default permissions; do
+    destination=/tmp/syq-real-ssh/expression-modes-$preservation
+    ssh destination "mkdir -p $destination/old; chmod 2775 $destination; chmod 2555 $destination/old"
+    set --
+    if [ "$preservation" = permissions ]; then set -- --preserve=permissions; fi
+    syq cp "$@" --from source --srcs-in /tmp/syq-real-ssh/expression-modes \
+        --to destination --into "$destination" --coordinate-at src --no-progress \
+        --where "src.kind = 'file'" --copy-if "src.kind != 'dir'"
+    ssh destination "test \"\$(cat $destination/new/keep)\" = selected; test \"\$(cat $destination/old/keep)\" = selected; test \"\$(stat -c %a $destination/new)\" = 2755; test \"\$(stat -c %a $destination/old)\" = 2555"
+done
 
 printf 'case: destination firewall triggers automatic TCP fallback to SSH\n'
 make_tree source /tmp/syq-real-ssh/firewall-source firewall
