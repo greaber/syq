@@ -283,7 +283,6 @@ mod tests {
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
-            reuse_blocks: true,
             guard: None,
         };
         first_writer.write_msg(&prepare("target/a", 1024)).unwrap();

@@ -1001,7 +1001,7 @@ fn block_reuse_is_a_native_filesystem_control() {
         .map(OsString::from),
     )
     .unwrap();
-    assert!(!args.tuning_options.unwrap().reuse_blocks());
+    assert!(!args.tuning_options.unwrap().reuse_destination_blocks(false));
     let error = parse_native_copy(
         &[
             "source",

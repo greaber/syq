@@ -336,17 +336,12 @@ impl FsOps {
             mode,
             attempt,
             create_if_missing,
-            reuse_blocks,
         } = options;
         let target = self.destination_mutation_target(path, guard)?;
         // Existing finals get their equality check first. For new files,
         // defer allocation until seeding so a fresh preallocation cannot be
         // mistaken for bytes already written by this invocation on a retry.
-        if reuse_blocks
-            && !inplace
-            && create_if_missing
-            && size > 0
-            && !self.candidate_partials(&target).is_empty()
+        if !inplace && create_if_missing && size > 0 && !self.candidate_partials(&target).is_empty()
         {
             return Ok(Preparation {
                 partial_size: None,
@@ -2125,7 +2120,6 @@ impl FsOps {
                 mode,
                 attempt,
                 create_if_missing,
-                reuse_blocks,
                 guard,
             } => self
                 .prepare(
@@ -2140,7 +2134,6 @@ impl FsOps {
                         mode: *mode,
                         attempt: *attempt,
                         create_if_missing: *create_if_missing,
-                        reuse_blocks: *reuse_blocks,
                     },
                 )
                 .map(Response::Prepared),

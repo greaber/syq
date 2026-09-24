@@ -10,7 +10,7 @@ const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
 pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\nworkers=N: fixed filesystem copy-worker slots, 1..65536. Workers process files or ranges; remote workers use data channels, SSH channels can share a TCP socket, and local workers need no network connection.\ns3-requests=N: maximum simultaneous data requests across all objects, 1..65536; excludes metadata requests and idle pooled sockets.\ns3-objects=N: maximum objects in progress, including preparation and finalization, 1..65536.\ns3-parts-per-object=N: maximum simultaneous parts or ranges for each object, 1..1024. Small objects use fewer parts; every data request also needs a shared request slot. These are nested concurrency limits, not thread counts.\ns3-part-size=SIZE: part size, 5M..5G.\ns3-retries=N: transient retry budget, 0..100; default 10.\nblock-reuse=auto|off: default auto; off rewrites every byte of files selected for copying without comparing or reusing destination/partial blocks. Metadata quick checks, explicit --hash/--checksum comparisons, integrity checks and copy-path selection remain unchanged. Interrupted files restart from the beginning. Filesystem copies only.\ncomparison-block-size=SIZE: comparison and reuse granularity, 64K..64M; default 4M. Smaller blocks can reuse more unchanged bytes in files with scattered edits, at the cost of more hashes. At 64K, block comparison and resume require files smaller than 130 GiB; exceeding the hash-response limit fails the copy. Increase comparison-block-size for larger files; doubling it doubles the limit. Filesystem copies only.\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 2M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Auto streams remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default ceiling 2048; smaller queues are shared across the active workers.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires resource-limits bandwidth. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Request-size overrides do not change comparison blocks. A fixed count disables automatic adjustment of that count; unused slots can remain idle. Counts do not bound total sockets, CPU or memory. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
+pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\nworkers=N: fixed filesystem copy-worker slots, 1..65536. Workers process files or ranges; remote workers use data channels, SSH channels can share a TCP socket, and local workers need no network connection.\ns3-requests=N: maximum simultaneous data requests across all objects, 1..65536; excludes metadata requests and idle pooled sockets.\ns3-objects=N: maximum objects in progress, including preparation and finalization, 1..65536.\ns3-parts-per-object=N: maximum simultaneous parts or ranges for each object, 1..1024. Small objects use fewer parts; every data request also needs a shared request slot. These are nested concurrency limits, not thread counts.\ns3-part-size=SIZE: part size, 5M..5G.\ns3-retries=N: transient retry budget, 0..100; default 10.\nblock-reuse=auto|on|off: default auto enables reuse for copies with a remote syq endpoint and disables it for same-machine copies, including mounted network filesystems. on enables reuse and bypasses whole-file copy shortcuts. off disables comparison and reuse of the final destination. Partial-file resume remains enabled in every mode. Metadata quick checks, explicit --hash/--checksum comparisons, and integrity checks remain unchanged. Filesystem copies only.\ncomparison-block-size=SIZE: comparison and reuse granularity, 64K..64M; default 4M. Smaller blocks can reuse more unchanged bytes in files with scattered edits, at the cost of more hashes. At 64K, block comparison and resume require files smaller than 130 GiB; exceeding the hash-response limit fails the copy. Increase comparison-block-size for larger files; doubling it doubles the limit. Filesystem copies only.\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 2M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Auto streams remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default ceiling 2048; smaller queues are shared across the active workers.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires resource-limits bandwidth. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Request-size overrides do not change comparison blocks. A fixed count disables automatic adjustment of that count; unused slots can remain idle. Counts do not bound total sockets, CPU or memory. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CopyPath {
@@ -36,6 +36,7 @@ impl std::fmt::Display for CopyPath {
 pub(crate) enum BlockReuse {
     #[default]
     Auto,
+    On,
     Off,
 }
 
@@ -43,6 +44,7 @@ impl std::fmt::Display for BlockReuse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Auto => "auto",
+            Self::On => "on",
             Self::Off => "off",
         })
     }
@@ -112,8 +114,12 @@ pub(crate) struct TransferTuning {
 }
 
 impl TransferTuning {
-    pub fn reuse_blocks(self) -> bool {
-        self.block_reuse.unwrap_or_default() != BlockReuse::Off
+    pub fn reuse_destination_blocks(self, same_host: bool) -> bool {
+        match self.block_reuse.unwrap_or_default() {
+            BlockReuse::Auto => !same_host,
+            BlockReuse::On => true,
+            BlockReuse::Off => false,
+        }
     }
 
     pub fn has_s3_controls(self) -> bool {
@@ -307,8 +313,9 @@ impl FromStr for TransferTuning {
                     &mut tuning.block_reuse,
                     match value {
                         "auto" => BlockReuse::Auto,
+                        "on" => BlockReuse::On,
                         "off" => BlockReuse::Off,
-                        _ => bail!("block-reuse must be auto or off"),
+                        _ => bail!("block-reuse must be auto, on or off"),
                     },
                     key,
                 )?,
@@ -444,25 +451,29 @@ mod tests {
     }
 
     #[test]
-    fn block_reuse_is_independent_of_copy_path_and_round_trips() {
-        assert!(TransferTuning::default().reuse_blocks());
-        for value in [
-            "block-reuse=auto",
-            "block-reuse=off",
-            "copy-path=ranges,block-reuse=off",
-            "copy-path=streaming,block-reuse=off",
-        ] {
-            let tuning: TransferTuning = value.parse().unwrap();
-            tuning.validate(0).unwrap();
-            assert_eq!(tuning.reuse_blocks(), value == "block-reuse=auto");
-            assert_eq!(
-                tuning.to_string().parse::<TransferTuning>().unwrap(),
-                tuning
-            );
+    fn block_reuse_defaults_follow_placement_and_overrides_round_trip() {
+        assert!(!TransferTuning::default().reuse_destination_blocks(true));
+        assert!(TransferTuning::default().reuse_destination_blocks(false));
+        for path in ["auto", "ranges", "streaming", "auto-streaming"] {
+            for reuse in ["auto", "on", "off"] {
+                let tuning: TransferTuning = format!("copy-path={path},block-reuse={reuse}")
+                    .parse()
+                    .unwrap();
+                tuning.validate(0).unwrap();
+                for same_host in [false, true] {
+                    assert_eq!(
+                        tuning.reuse_destination_blocks(same_host),
+                        reuse == "on" || (reuse == "auto" && !same_host)
+                    );
+                }
+                assert_eq!(
+                    tuning.to_string().parse::<TransferTuning>().unwrap(),
+                    tuning
+                );
+            }
         }
         for value in [
             "block-reuse=",
-            "block-reuse=on",
             "block-reuse=false",
             "block-reuse=off,block-reuse=auto",
         ] {

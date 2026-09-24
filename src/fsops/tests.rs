@@ -117,7 +117,6 @@ fn payload_integrity_checks_are_explicit() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -200,7 +199,6 @@ fn expected_hash_failure_preserves_existing_destination() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -481,7 +479,6 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -536,7 +533,6 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .is_err());
@@ -1927,7 +1923,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -1949,7 +1944,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .is_err());
@@ -2066,7 +2060,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -2113,7 +2106,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -2196,7 +2188,6 @@ fn rooted_ranged_write_does_not_follow_a_swapped_parent() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -2288,7 +2279,6 @@ fn rooted_finalize_rejects_replacement_of_the_opened_partial() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -2860,7 +2850,6 @@ fn seed_basis_without_a_usable_donor_returns_no_reusable_blocks() {
                     mode: 0o600,
                     attempt: 0,
                     create_if_missing: true,
-                    reuse_blocks: true,
                 },
             )
             .unwrap();
@@ -2999,7 +2988,6 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: false,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -3019,7 +3007,6 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -3051,7 +3038,6 @@ fn observation_only_prepare_preserves_unsafe_sidecars() {
                     mode: 0o600,
                     attempt: 0,
                     create_if_missing: false,
-                    reuse_blocks: true,
                 },
             )
             .unwrap()
@@ -3119,7 +3105,6 @@ fn observation_only_rooted_prepare_preserves_an_unsafe_sidecar() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: false,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -5013,7 +4998,6 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_existing_inode() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         )
         .unwrap();
@@ -5140,7 +5124,6 @@ fn inplace_prepare_rejects_replaced_hashed_basis_before_mutation() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                reuse_blocks: true,
             },
         );
         assert!(result.is_err(), "accepted {replacement} replacement");
@@ -5196,40 +5179,28 @@ fn strict_plan_batch_distinguishes_missing_entries_from_read_errors() {
 }
 
 #[test]
-fn prepare_without_reuse_materializes_output_and_truncates_owned_partial() {
+fn partial_seeding_does_not_fall_back_to_final_when_disallowed() {
     let directory = crate::test_support::tempdir().unwrap();
-    let final_path = directory.path().join("file");
-    let copy_id = [25; 16];
-    let own = partial_path(&final_path, &copy_id).unwrap();
-    let donor = partial_path(&final_path, &[26; 16]).unwrap();
-    fs::write(&donor, b"donor bytes").unwrap();
-    fs::set_permissions(&donor, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(directory.path().join("file"), b"final bytes").unwrap();
     let mut operations = destination_ops(directory.path());
-    let mut prepare = |reuse_blocks| {
-        operations
-            .prepare(
-                PartialTarget {
-                    path: b"file",
-                    id: &copy_id,
-                    guard: None,
-                },
-                PrepareOptions {
-                    size: 4,
-                    inplace: false,
-                    mode: 0o600,
-                    attempt: 0,
-                    create_if_missing: true,
-                    reuse_blocks,
-                },
-            )
-            .unwrap()
-    };
-    assert!(prepare(true).has_candidates);
-    assert!(!own.exists());
-    assert!(!prepare(false).has_candidates);
-    assert_eq!(fs::metadata(&own).unwrap().len(), 4);
-    fs::write(&own, b"oversized own partial").unwrap();
-    assert!(prepare(false).partial_size.unwrap() > 4);
-    assert_eq!(fs::metadata(&own).unwrap().len(), 4);
-    assert_eq!(fs::read(&donor).unwrap(), b"donor bytes");
+    let copy_id = [25; 16];
+    let seeded = operations
+        .seed_basis(
+            PartialTarget {
+                path: b"file",
+                id: &copy_id,
+                guard: None,
+            },
+            11,
+            64 << 10,
+            Some(&[]),
+            0,
+        )
+        .unwrap();
+    assert!(seeded.hashes.is_empty());
+    assert!(!seeded.selected_final);
+    assert_eq!(
+        fs::read(directory.path().join("file")).unwrap(),
+        b"final bytes"
+    );
 }

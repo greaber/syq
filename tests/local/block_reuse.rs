@@ -34,7 +34,7 @@ fn off_skips_comparison_but_keeps_parallel_ranges() {
             command.run().unwrap()
         };
         // Prove the fault hook catches the normal comparison path.
-        let failed = run("auto");
+        let failed = run("on");
         assert!(!failed.status.success());
         assert!(stderr_of(&failed).contains("injected block-comparison failure"));
         assert_eq!(read(&t.path("dst")), old);
@@ -70,32 +70,43 @@ fn off_skips_comparison_but_keeps_parallel_ranges() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn off_ignores_prior_partial_without_hashing_it() {
-    let t = Tmp::new();
-    let source = prng(8 << 20, 832);
-    write(&t.path("src"), &source);
-    let args = [
-        "-a",
-        "--syq-no-tcp",
-        "--performance-tuning=copy-path=ranges,block-reuse=off,workers=2",
-        &t.s("src"),
-        &t.s("dst"),
-    ];
-    let partial = interrupted_partial(&args, &t.0);
-    // An oversized donor must not contribute stale bytes to the new output.
-    write(&partial, &vec![b'z'; 12 << 20]);
-    let out = compat_command()
-        .args(args)
-        .env("SYQ_TEST_FAIL_BLOCK_COMPARISON", "1")
-        .env("SYQ_DEBUG", "1")
-        .run()
-        .unwrap();
-    assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst")), source);
-    assert_eq!(tuning_observed(&out)["range_requests"], 2);
-    // A previous invocation's donor belongs to that invocation, not this one.
-    assert_eq!(read(&partial), vec![b'z'; 12 << 20]);
-    assert_eq!(partial_files(&t.0), vec![partial]);
+fn local_default_and_off_preserve_partial_resume_without_reusing_final() {
+    for reuse in ["auto", "off"] {
+        let t = Tmp::new();
+        let source = prng(8 << 20, 832);
+        write(&t.path("src"), &source);
+        let tuning = format!("copy-path=ranges,block-reuse={reuse},workers=1");
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let args = [
+            "-a",
+            "--syq-no-tcp",
+            "--performance-tuning",
+            &tuning,
+            &src,
+            &dst,
+        ];
+        let partial = interrupted_partial(&args, &t.0);
+        // The partial matches only the first block; the final matches only
+        // the second. Only the partial may contribute bytes with reuse off.
+        let mut donor = source.clone();
+        donor[4 << 20..].fill(b'z');
+        write(&partial, &donor);
+        let mut old = source.clone();
+        old[..4 << 20].fill(b'x');
+        write(&t.path("dst"), &old);
+        set_mtime(&t.path("dst"), 1);
+        let out = compat_command()
+            .args(args)
+            .env("SYQ_DEBUG", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), source);
+        assert_eq!(tuning_observed(&out)["range_requests"], 1);
+        assert_eq!(read(&partial), donor);
+        assert_eq!(partial_files(&t.0), vec![partial]);
+    }
 }
 
 #[test]
@@ -192,4 +203,100 @@ fn off_preserves_expected_hash_failure_and_old_destination() {
     assert!(!output.status.success());
     assert!(stderr_of(&output).contains("hash"), "{output:?}");
     assert_eq!(read(&t.path("destination")), b"old contents");
+}
+
+#[test]
+fn local_default_replaces_blocks_and_on_overrides_whole_file_copy() {
+    for inplace in [false, true] {
+        for reuse in [None, Some("auto"), Some("on"), Some("off")] {
+            let t = Tmp::new();
+            let source = prng(8 << 20, 836);
+            let mut old = source.clone();
+            old[..4 << 20].fill(b'x');
+            write(&t.path("src"), &source);
+            write(&t.path("dst"), &old);
+            set_mtime(&t.path("dst"), 1);
+            // On must reach comparison even without forcing the range path.
+            let mut tuning = if reuse == Some("on") {
+                "workers=1"
+            } else {
+                "copy-path=ranges,workers=1"
+            }
+            .to_string();
+            if let Some(reuse) = reuse {
+                tuning.push_str(&format!(",block-reuse={reuse}"));
+            }
+            let mut cmd = compat_command();
+            cmd.args([
+                "-a",
+                "--syq-no-tcp",
+                "--performance-tuning",
+                &tuning,
+                &t.s("src"),
+                &t.s("dst"),
+            ])
+            .env("SYQ_DEBUG", "1");
+            if inplace {
+                cmd.arg("--inplace");
+            }
+            let out = cmd.run().unwrap();
+            assert_output_ok(&out);
+            assert_eq!(read(&t.path("dst")), source);
+            assert_eq!(
+                tuning_observed(&out)["range_requests"],
+                if reuse == Some("on") { 1 } else { 2 }
+            );
+            assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
+            assert!(stderr_of(&out).contains(if reuse == Some("on") {
+                "(effective on)"
+            } else {
+                "(effective off)"
+            }));
+            assert!(partial_files(&t.0).is_empty());
+        }
+    }
+}
+
+#[test]
+fn remote_defaults_reuse_blocks_for_push_and_pull() {
+    for pull in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        let source = prng(8 << 20, 837);
+        let mut old = source.clone();
+        old[..4 << 20].fill(b'x');
+        write(&t.path("src"), &source);
+        write(&t.path("dst"), &old);
+        set_mtime(&t.path("dst"), 1);
+        let src = if pull {
+            format!("fake:{}", t.s("src"))
+        } else {
+            t.s("src")
+        };
+        let dst = if pull {
+            t.s("dst")
+        } else {
+            format!("fake:{}", t.s("dst"))
+        };
+        let out = remote_syq_command(
+            &t,
+            &rsh,
+            &[
+                "-a",
+                "--rsync-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--syq-no-bootstrap",
+                "--performance-tuning=copy-path=ranges",
+                &src,
+                &dst,
+            ],
+        )
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), source);
+        assert_eq!(tuning_observed(&out)["range_requests"], 1);
+        assert!(stderr_of(&out).contains("block-reuse=auto (effective on)"));
+    }
 }

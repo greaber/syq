@@ -829,8 +829,6 @@ pub enum WireRequest<Data> {
         mode: u32,
         attempt: u32,
         create_if_missing: bool,
-        /// Allow donor discovery to defer allocation until SeedBasis.
-        reuse_blocks: bool,
         guard: Option<ContainerGuard>,
     },
     /// Hash an existing final file and retain that open inode as the repair

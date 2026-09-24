@@ -854,7 +854,10 @@ impl Worker {
             // destination. A matching read-only file needs only metadata work.
             // Prepare binds any writes to this held inode, and the comparison
             // below is reused rather than hashing the contents a second time.
-            let reuse_blocks = self.opts.tuning.reuse_blocks();
+            let reuse_blocks = self
+                .opts
+                .tuning
+                .reuse_destination_blocks(self.opts.same_host);
             let inplace_ranges = if inplace && final_is_file && (reuse_blocks || self.opts.checksum)
             {
                 let diff = self.diff_final_and_hold(&job)?;
@@ -886,28 +889,29 @@ impl Worker {
                 };
                 return Ok((ranges, true));
             }
+            // Resume an owned output or a previous invocation's partial,
+            // independently of the policy for reusing the final destination.
+            if prepared.partial_size.is_some() || (!reuse_blocks && prepared.has_candidates) {
+                if size == 0 {
+                    return Ok((vec![], true));
+                }
+                return Ok((self.diff_blocks(&job, Which::Partial)?, true));
+            }
             if !reuse_blocks {
-                // Explicit content comparison still decides whether a final file
-                // is already correct. Never use its matching blocks as donors.
-                // An existing partial is our output to replace in full, including
-                // on retries; it must still be finalized and consumed.
-                if self.opts.checksum && final_is_file && prepared.partial_size.is_none() {
+                // An explicit checksum may still establish a complete match.
+                // A differing final file contributes no blocks to the output.
+                if self.opts.checksum && final_is_file {
                     let diff = self.diff_final_and_hold(&job)?;
                     if diff.ranges.is_empty() && diff.held_len == Some(size) {
                         self.finish_matched_basis(idx, &job)?;
                         return Ok((vec![], false));
                     }
-                    self.prepare_file(&job, true)?;
+                    let prepared = self.prepare_file(&job, true)?;
+                    if prepared.partial_size.is_some() || prepared.has_candidates {
+                        return Ok((self.diff_blocks(&job, Which::Partial)?, true));
+                    }
                 }
                 return Ok((full(), true));
-            }
-            // A retry's own output must be finished (and thus consumed), even
-            // if another copy has meanwhile published identical final bytes.
-            if prepared.partial_size.is_some() {
-                if size == 0 {
-                    return Ok((vec![], true));
-                }
-                return Ok((self.diff_blocks(&job, Which::Partial)?, true));
             }
             if final_is_file {
                 let diff = self.diff_final_and_hold(&job)?;
@@ -1089,10 +1093,19 @@ impl Worker {
     /// Hash blocks on both sides (in parallel) and return the ranges that differ.
     pub(super) fn diff_blocks(&mut self, job: &WorkerJob, which: Which) -> Result<Vec<(u64, u64)>> {
         if which == Which::Partial {
+            // Empty final ranges still allow partial donors, but prohibit falling
+            // back to the final file if a partial disappears before seeding.
             return self
                 .diff_with(
                     job,
-                    self.seed_request(job, None),
+                    self.seed_request(
+                        job,
+                        (!self
+                            .opts
+                            .tuning
+                            .reuse_destination_blocks(self.opts.same_host))
+                        .then(Vec::new),
+                    ),
                     "seed and hash destination",
                 )
                 .map(|diff| diff.ranges);
@@ -1187,7 +1200,6 @@ impl Worker {
                 mode: self.create_mode(job),
                 attempt: job.attempt,
                 create_if_missing,
-                reuse_blocks: self.opts.tuning.reuse_blocks(),
                 guard: job.container_guard.clone(),
             })?,
             "prepare",

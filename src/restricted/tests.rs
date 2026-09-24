@@ -1025,7 +1025,6 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         mode: 0o600,
         attempt: 0,
         create_if_missing: true,
-        reuse_blocks: true,
         guard: None,
     };
     let mut included_prepare = prepare(included);
@@ -1105,7 +1104,6 @@ fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
         mode: 0o600,
         attempt: 0,
         create_if_missing: true,
-        reuse_blocks: true,
         guard: None,
     };
     let mut cache_root = prepare(cache.clone());
@@ -1136,7 +1134,6 @@ fn signed_inplace_policy_requires_inplace_file_mutations() {
         mode: 0o600,
         attempt: 0,
         create_if_missing: true,
-        reuse_blocks: true,
         guard: None,
     };
     let mut inplace = prepare(true);
@@ -1188,7 +1185,6 @@ fn prepare_request(path: &Path) -> Request {
         mode: 0o600,
         attempt: 0,
         create_if_missing: true,
-        reuse_blocks: true,
         guard: None,
     }
 }
@@ -2896,7 +2892,6 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         mode: 0o600,
         attempt: 0,
         create_if_missing: true,
-        reuse_blocks: true,
         guard: None,
     };
     let settlement = authority.authorize(&mut prepare, false).unwrap();
@@ -2948,7 +2943,6 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         mode: 0o600,
         attempt: 0,
         create_if_missing: true,
-        reuse_blocks: true,
         guard: None,
     };
     let settlement = finished.authorize(&mut prepare, false).unwrap();
@@ -3736,7 +3730,6 @@ fn signed_file_data_rate_is_enforced_across_requests() {
         mode: 0o600,
         attempt: 0,
         create_if_missing: true,
-        reuse_blocks: true,
         guard: None,
     };
     authority.authorize(&mut prepare, false).unwrap();
@@ -4099,7 +4092,6 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         mode: 0o600,
         attempt: 0,
         create_if_missing: true,
-        reuse_blocks: true,
         guard: None,
     };
     authority.authorize(&mut prepare("a", 10), false).unwrap();

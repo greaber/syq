@@ -281,7 +281,8 @@ impl Opts {
             same_host: self.same_host,
             // Payload checks do not disable same-host copy shortcuts.
             checksum: self.checksum,
-            force_ranges: self.tuning.force_ranges(),
+            force_ranges: self.tuning.force_ranges()
+                || self.tuning.block_reuse == Some(crate::transfer_tuning::BlockReuse::On),
             bandwidth_limited,
             receiver_copy_disabled: !cfg!(any(target_os = "linux", target_os = "macos"))
                 || !self.local_copy_fd_budget
@@ -1647,12 +1648,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, block-reuse={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, block-reuse={} (effective {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.tuning.block_reuse.unwrap_or_default(),
+            if opts.tuning.reuse_destination_blocks(opts.same_host) { "on" } else { "off" },
             opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
             if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
