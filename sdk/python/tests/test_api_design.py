@@ -212,9 +212,9 @@ class MappingContextTests(unittest.TestCase):
             self.assertEqual(transformed.root, self.source)
             self.consumer.cp(mapping=transformed, into="destination")
         self.assertEqual((self.other / "destination/a").read_bytes(), b"correct source")
-        # A transformed source symlink cannot escape the carried root.
+        # An explicit file constraint rejects replacement by a symlink.
         (self.source / "escape").symlink_to(self.other / "a")
-        with self.producer.map(src="a", root=self.source) as mapping:
+        with self.producer.map(src="a", root=self.source, include=["kind"]) as mapping:
             transformed = mapping.transform(lambda entry: dataclasses.replace(entry, src=syq.RelativePath("escape")))
             with self.assertRaises(syq.SyqError):
                 self.consumer.cp(mapping=transformed, into="escaped", follow_src=True)

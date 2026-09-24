@@ -10,11 +10,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod command;
+mod inference;
 #[cfg(test)]
 mod tests;
 pub(crate) use command::{command_for_help, run};
-const SCHEMA: i64 = 1;
-const DEFAULT_BUDGET: u64 = 128 << 20;
+const SCHEMA: i64 = 2;
+const DEFAULT_BUDGET: u64 = 10 << 20;
 const MAX_PENDING: usize = 4096;
 const FINISH_LOCK_WAIT: Duration = Duration::from_millis(100);
 
@@ -33,6 +34,8 @@ struct Writer {
     budget: u64,
     finished: bool,
     recommendation: Option<(usize, bool)>,
+    measurements: inference::Eligibility,
+    measurement_segment: i64,
     salt: [u8; 32],
 }
 
@@ -84,8 +87,8 @@ fn budget() -> Result<u64> {
     };
     let size = crate::cli::parse_size(&value.to_string_lossy())?;
     anyhow::ensure!(
-        size >= 16 << 20,
-        "SYQ_TUNING_HISTORY_SIZE must be at least 16M"
+        size >= 10 << 20,
+        "SYQ_TUNING_HISTORY_SIZE must be at least 10M"
     );
     Ok(size)
 }
@@ -122,19 +125,21 @@ fn open(path: &Path) -> Result<Connection> {
     db.pragma_update(None, "synchronous", "OFF")?;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     anyhow::ensure!(
-        matches!(version, 0 | SCHEMA),
+        (0..=SCHEMA).contains(&version),
         "unsupported tuning history version {version}"
     );
-    if version == 0 {
-        db.pragma_update(None, "auto_vacuum", "INCREMENTAL")
-            .context("configure history page reclamation")?;
+    if version < SCHEMA {
+        if version == 0 {
+            db.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+                .context("configure history page reclamation")?;
+        }
         let transaction = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .context("lock history for initialization")?;
         // Another process may have initialized the database while we waited.
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         anyhow::ensure!(
-            matches!(version, 0 | SCHEMA),
+            (0..=SCHEMA).contains(&version),
             "unsupported tuning history version {version}"
         );
         if version == 0 {
@@ -154,8 +159,20 @@ fn open(path: &Path) -> Result<Connection> {
                 CREATE TABLE events (
                     run INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
                     sequence INTEGER NOT NULL, elapsed_us INTEGER NOT NULL, data TEXT NOT NULL,
-                    PRIMARY KEY(run,sequence));
-                PRAGMA user_version=1;")?;
+                    PRIMARY KEY(run,sequence));")?;
+        }
+        if version < 2 {
+            // An empty indexed table is cheap to add even to a large history.
+            // Do not scan or backfill old JSON events while holding this lock.
+            transaction.execute_batch(
+                "CREATE TABLE measurements (
+                run INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                sequence INTEGER NOT NULL, elapsed_us INTEGER NOT NULL,
+                segment INTEGER NOT NULL, workers INTEGER NOT NULL,
+                seconds REAL NOT NULL, rate REAL NOT NULL, usable INTEGER NOT NULL,
+                PRIMARY KEY(run,sequence)) WITHOUT ROWID;
+                PRAGMA user_version=2;",
+            )?;
         }
         transaction.commit()?;
     }
@@ -231,6 +248,8 @@ impl Recorder {
             budget,
             finished: false,
             recommendation: None,
+            measurements: Default::default(),
+            measurement_segment: 0,
             salt,
         })));
         recorder.event("start", details);
@@ -280,7 +299,7 @@ impl Recorder {
         );
     }
 
-    pub(crate) fn event(&self, kind: &str, data: Value) {
+    pub(crate) fn event(&self, kind: &str, mut data: Value) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if state.finished {
             return;
@@ -288,10 +307,17 @@ impl Recorder {
         let elapsed_us = state.start.elapsed().as_micros().min(i64::MAX as u128) as u64;
         let sequence = state.sequence;
         state.sequence += 1;
+        if matches!(kind, "transition" | "sequential_evidence") {
+            state.measurement_segment = sequence as i64;
+        }
+        if kind == "observation" {
+            data["segment"] = json!(state.measurement_segment);
+        }
         if state.pending.len() < MAX_PENDING {
-            state
-                .pending
-                .push(json!({"sequence":sequence,"elapsed_us":elapsed_us,"kind":kind,"data":data}));
+            let event =
+                json!({"sequence":sequence,"elapsed_us":elapsed_us,"kind":kind,"data":data});
+            state.measurements.push(&event);
+            state.pending.push(event);
         } else {
             state.lost += 1;
         }
@@ -316,11 +342,20 @@ impl Recorder {
         }
     }
 
+    pub(crate) fn starting_count(&self, key: &ContextKey, allow_route: bool) -> Option<Hint> {
+        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        inference::starting_count(&state.db, key, allow_route)
+            .ok()
+            .flatten()
+    }
+
+    #[cfg(test)]
     pub(crate) fn hint(&self, key: &ContextKey, allow_route: bool) -> Option<Hint> {
         let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         select_hint(&state.db, key, allow_route).ok().flatten()
     }
 
+    #[cfg(test)]
     pub(crate) fn recommend(&self, workers: usize, discovery_complete: bool) {
         self.0
             .lock()
@@ -364,6 +399,7 @@ impl Recorder {
     }
 }
 
+#[cfg(test)]
 fn select_hint(db: &Connection, key: &ContextKey, allow_route: bool) -> Result<Option<Hint>> {
     if let (Some(src), Some(dst)) = (&key.source_filesystem, &key.destination_filesystem) {
         let hint = db.query_row("SELECT id,workers,summary FROM runs WHERE route=?1 AND mode=?2 AND source_fs=?3 AND destination_fs=?4 AND status='success' AND eligible=1 AND workers>0 ORDER BY id DESC LIMIT 1",
@@ -409,7 +445,21 @@ impl Writer {
         }
         {
             let mut insert = transaction.prepare("INSERT INTO events VALUES (?1,?2,?3,?4)")?;
+            let mut measurement =
+                transaction.prepare("INSERT INTO measurements VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?;
             for event in &self.pending {
+                if let Some(o) = inference::Observation::from_event(event) {
+                    measurement.execute(params![
+                        self.id,
+                        event["sequence"].as_i64(),
+                        event["elapsed_us"].as_i64(),
+                        o.segment,
+                        o.workers as i64,
+                        o.seconds,
+                        o.rate,
+                        o.usable
+                    ])?;
+                }
                 insert.execute(params![
                     self.id,
                     event["sequence"].as_i64(),
@@ -438,6 +488,16 @@ impl Writer {
         workers: Option<usize>,
         summary: Value,
     ) -> Result<()> {
+        let summary = serde_json::to_string(&summary)?;
+        let eligibility = if success && self.lost == 0 {
+            if self.measurements.reusable() {
+                inference::MEASUREMENTS
+            } else {
+                i64::from(eligible && workers.is_some())
+            }
+        } else {
+            0
+        };
         // Pay at most one small lock wait for the entire final save. Once the
         // immediate transaction owns the writer lock, samples, context and the
         // recommendation commit together without per-statement busy waits.
@@ -453,9 +513,9 @@ impl Writer {
             "UPDATE runs SET status=?1,eligible=?2,workers=?3,summary=?4,lost=?5 WHERE id=?6",
             params![
                 if success { "success" } else { "failed" },
-                success && eligible && self.lost == 0 && workers.is_some(),
+                eligibility,
                 workers.map(|n| n as u32),
-                serde_json::to_string(&summary)?,
+                summary,
                 self.lost,
                 self.id
             ],

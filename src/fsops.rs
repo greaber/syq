@@ -167,12 +167,12 @@ enum FileSystemKey {
 }
 
 // Whole-file copying uses Linux offload or macOS cloning.
-#[derive(Clone, Copy)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-struct CopyLocalPolicy {
+struct CopyLocalPolicy<'a> {
     inplace: bool,
     allow_sequential_nfs_fallback: bool,
     allow_sequential_local_fallback: bool,
+    progress: &'a mut dyn FnMut(u64) -> Result<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,6 +424,8 @@ fn is_superuser() -> bool {
 }
 
 pub struct FsOps {
+    inode_preservation: crate::inode_metadata::Selection,
+    sparse: bool,
     descriptor_copy: crate::descriptor_copy::Session,
     stream_worker: Option<crate::descriptor_copy::FileWorker>,
     stream_ticket: Option<crate::descriptor_broker::DescriptorTicket>,
@@ -504,7 +506,7 @@ pub(crate) fn require_source_leaf_identity(
 /// exact operator-selected leaf, validating the opened descriptor is the
 /// decisive check: once it matches, the descriptor itself pins that object for
 /// the whole read even if its name is replaced concurrently.
-fn open_registered_source(target: &RegisteredSourceTarget) -> Result<File> {
+fn open_registered_source(target: &RegisteredSourceTarget, noatime: bool) -> Result<File> {
     let file = target.root.open_regular_read(&target.relative)?;
     match (&target.expected_leaf, &target.leaf_object) {
         (Some(expected), Some(object)) => {
@@ -516,6 +518,7 @@ fn open_registered_source(target: &RegisteredSourceTarget) -> Result<File> {
         (None, None) => {}
         _ => bail!("registered source leaf identity and retained object disagree"),
     }
+    crate::inode_metadata::prepare_read(&file, noatime);
     Ok(file)
 }
 
@@ -602,6 +605,8 @@ impl FsOps {
         let observations = Arc::new(crate::transfer_observations::Registry::default());
         let operation = observations.actor("filesystem");
         FsOps {
+            inode_preservation: Default::default(),
+            sparse: false,
             descriptor_copy: Default::default(),
             stream_worker: None,
             stream_ticket: None,
@@ -891,7 +896,7 @@ impl FsOps {
                 staged.push(None);
                 continue;
             }
-            let mut meta = file.meta;
+            let mut meta = file.meta.clone();
             // Without source permission preservation, a replacement keeps
             // the destination's mode, as in the ordinary worker.
             if request.flags & flags::MODE == 0 {
@@ -998,7 +1003,7 @@ impl FsOps {
                                         &[Op::SetFileMetaIfSame {
                                             path,
                                             condition,
-                                            meta: file.meta,
+                                            meta: file.meta.clone(),
                                             flags: repair,
                                         }],
                                         None,
@@ -1047,7 +1052,7 @@ impl FsOps {
         if basis_size.is_some() {
             file.set_len(0)?;
         }
-        observed_write(&self.operation, &file, data, 0)
+        observed_write(&self.operation, &file, data, 0, false)
             .with_context(|| format!("write {}", label.display()))?;
         set_meta_file(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
@@ -1218,6 +1223,9 @@ impl FsOps {
                             dev: metadata.dev,
                             ino: metadata.ino,
                             file_type: metadata.file_type(),
+                            symlink_atime: (metadata.is_symlink()
+                                && self.inode_preservation.atimes)
+                                .then_some(metadata.atime),
                             symlink_target,
                         }),
                         object,
@@ -1478,6 +1486,7 @@ impl FsOps {
             | Request::StatMany { guard, .. }
             | Request::PartialPaths { guard, .. }
             | Request::PruneLookup { guard, .. }
+            | Request::DefaultPermissions { guard, .. }
             | Request::Apply { guard, .. }
             | Request::PlanBatch { guard, .. }
             | Request::ProbePartial { guard, .. }
@@ -1768,7 +1777,8 @@ impl FsOps {
             }
             Request::StatMany { paths, guard, .. }
             | Request::PartialPaths { paths, guard, .. }
-            | Request::PruneLookup { paths, guard } => {
+            | Request::PruneLookup { paths, guard }
+            | Request::DefaultPermissions { paths, guard } => {
                 if guard.is_none() {
                     for path in paths {
                         map(path)?;
@@ -1791,10 +1801,14 @@ impl FsOps {
             Request::Apply { ops, guard } => {
                 if guard.is_none() {
                     for op in ops {
+                        if let Op::Hardlink { source, .. } = op {
+                            map(source)?;
+                        }
                         let path = match op {
                             Op::Mkdir { path, .. }
                             | Op::Symlink { path, .. }
                             | Op::Mknod { path, .. }
+                            | Op::Hardlink { path, .. }
                             | Op::SetMeta { path, .. }
                             | Op::SetFileMetaIfSame { path, .. }
                             | Op::Remove { path }
@@ -1840,6 +1854,7 @@ impl FsOps {
             | Request::ListDir { .. }
             | Request::ListDirDetails { .. }
             | Request::ListDirNoFollowFinal { .. }
+            | Request::NativeMap(_)
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
@@ -1855,6 +1870,7 @@ impl FsOps {
             | Request::WriteStreamFence
             | Request::ShrinkReadStream { .. }
             | Request::MappingChunk { .. }
+            | Request::ConfigurePreservation { .. }
             | Request::StopReadStream => {}
         }
         Ok(())
@@ -1991,6 +2007,7 @@ impl FsOps {
                 self.fds.remove(&victim);
             }
             let f = open_existing_regular(p, false)?;
+            crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
             self.fds.insert(key.clone(), CachedFile::new(f));
             self.fd_order.push(key.clone());
         }
@@ -2111,7 +2128,10 @@ impl FsOps {
             }
             self.fds.insert(
                 key.clone(),
-                CachedFile::new(open_registered_source(target)?),
+                CachedFile::new(open_registered_source(
+                    target,
+                    self.inode_preservation.open_noatime,
+                )?),
             );
             self.fd_order.push(key.clone());
         }
@@ -2197,7 +2217,7 @@ impl FsOps {
         .collect()
     }
 
-    fn stat_many_request(
+    fn stat_many_unadorned_request(
         &mut self,
         paths: &[PathBytes],
         sources: Option<&[RegisteredPath]>,
@@ -2480,9 +2500,15 @@ fn observed_write(
     file: &File,
     data: &[u8],
     off: u64,
+    sparse: bool,
 ) -> std::io::Result<()> {
     let writing = actor.span(crate::transfer_observations::Stage::DestinationWrite);
-    file.write_all_at(data, off)?;
+    if sparse {
+        crate::sparse::write_at(file, data, off, false)?;
+        crate::sparse::set_len(file, off + data.len() as u64)?;
+    } else {
+        file.write_all_at(data, off)?;
+    }
     writing.bytes(data.len() as u64);
     Ok(())
 }

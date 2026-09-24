@@ -1,6 +1,10 @@
 use super::*;
 
 pub(super) struct Planner<'a> {
+    /// Bounded parent cache, only for newly created rsync leaves without -p.
+    pub(super) default_permissions: std::collections::HashMap<PathBytes, u32>,
+    pub(super) directory_expression_sources: std::collections::HashMap<PathBytes, PathBytes>,
+    pub(super) unselected_dirs: std::collections::HashSet<PathBytes>,
     pub(super) dst: &'a mut dyn Conn,
     pub(super) sched: &'a Sched,
     pub(super) progress: &'a Progress,
@@ -8,6 +12,7 @@ pub(super) struct Planner<'a> {
     /// Capability reported by the destination receiver's authenticated
     /// handshake. The coordinator may be running on a different platform.
     pub(super) destination_supports_confined_socket_nodes: bool,
+    pub(super) destination_metadata_platform: String,
     /// Destination paths claimed by source entries (see `Claim`).
     pub(super) dst_seen: std::collections::HashMap<PathBytes, Claim>,
     /// Directories this run will not create — --existing: they don't exist
@@ -90,6 +95,7 @@ pub(super) struct Planner<'a> {
     /// Descriptor-session capability for the source currently feeding
     /// planner batches. Buffered jobs retain their own derived path.
     pub(super) active_source: Option<RegisteredPath>,
+    pub(super) hardlinks: super::hardlinks::Hardlinks,
 }
 
 /// What a source entry asserts about its destination path. Two dirs merge;
@@ -310,6 +316,7 @@ type PlannedDir = (PathBytes, PathBytes, Entry, Option<Entry>);
 /// them have been scanned, so a conflict between sources is reported before
 /// the destination is changed at all.
 pub(super) struct Mapped {
+    directory_expression_sources: std::collections::HashMap<PathBytes, PathBytes>,
     pub(super) dst_root: PathBytes,
     pub(super) dirs: Vec<(PathBytes, PathBytes, Entry)>,
     pub(super) others: Vec<Planned>,
@@ -371,6 +378,13 @@ impl Planner<'_> {
         let Some(plan) = &mut self.fresh_capacity else {
             return;
         };
+        if self.opts.hardlinks
+            && entry.kind == Kind::File
+            && entry.nlink > 1
+            && !plan.hardlink_inodes.insert((entry.dev, entry.ino))
+        {
+            return;
+        }
         // When source contents map directly into an existing empty container,
         // the source's root directory reuses that one existing inode.
         if !(plan.root_existed && reuses_existing_root) {
@@ -388,9 +402,16 @@ impl Planner<'_> {
     }
 
     pub(super) fn assess_fresh_capacity(&mut self) -> Result<Option<FreshCapacityAssessment>> {
-        let Some(plan) = self.fresh_capacity.clone() else {
+        // Destination-dependent eligibility is resolved later. Counting all
+        // candidates here could reject a copy whose selected files fit.
+        if self.opts.expressions.update.is_some() {
+            return Ok(None);
+        }
+        let Some(plan) = self.fresh_capacity.as_mut() else {
             return Ok(None);
         };
+        // The completed estimate no longer needs the scan's hardlink set.
+        plan.hardlink_inodes = Default::default();
         if plan.overflowed {
             return Err(std::io::Error::from_raw_os_error(libc::ENOSPC)).context(
                 "fresh destination logical size or object count exceeds supported limits",
@@ -411,6 +432,7 @@ impl Planner<'_> {
         };
         Ok(Some(FreshCapacityAssessment {
             logical_bytes: plan.logical_bytes,
+            check_bytes: !self.opts.sparse,
             objects: plan.objects,
             available_bytes: info.available_bytes,
             available_inodes: info.available_inodes,
@@ -1042,6 +1064,46 @@ impl Planner<'_> {
         sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
+        let batch = if self.opts.expressions.selection.is_some() {
+            let mut selected = Vec::with_capacity(batch.len());
+            for entry in batch {
+                if entry.kind == Kind::Dir {
+                    selected.push(entry);
+                    continue;
+                }
+                let relative = self
+                    .src_overrides
+                    .get(&entry.path)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&entry.path);
+                let path = crate::expression::source_path(src_root, relative);
+                let included = self
+                    .opts
+                    .expressions
+                    .selects(&crate::expression::File::from_entry(&entry), path)
+                    .with_context(|| format!("source {}", display(path)))?;
+                if !included {
+                    let dst = join(dst_root, &join(sub, &entry.path));
+                    // Selection never makes a source counterpart extraneous.
+                    if self.opts.delete {
+                        self.dst_seen.entry(dst).or_insert(Claim::Weak);
+                    }
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                    continue;
+                }
+                selected.push(entry);
+            }
+            selected
+        } else {
+            batch
+        };
+        if self.opts.hardlinks
+            && batch
+                .iter()
+                .any(|e| e.nlink > 1 && !matches!(e.kind, Kind::File | Kind::Dir))
+        {
+            bail!("hardlink preservation currently supports regular files only; the source contains a multiply linked non-regular file");
+        }
         // Temporary names include a fresh invocation nonce. They are created
         // exclusively by the receiver, not reserved in a whole-copy index.
         for entry in &batch {
@@ -1139,6 +1201,7 @@ impl Planner<'_> {
         let opts = self.opts;
         let mut dirs: Vec<(PathBytes, PathBytes, Entry)> = Vec::new();
         let mut others: Vec<Planned> = Vec::new();
+        let mut directory_expression_sources = std::collections::HashMap::new();
         for e in batch {
             if e.kind == Kind::Dir && !opts.recursive && !self.keep_dirs {
                 continue;
@@ -1220,7 +1283,15 @@ impl Planner<'_> {
                 .join(source_relative)
                 .expect("scanner and manifest paths are strict relative paths");
             match claim {
-                Claim::Dir => dirs.push((dst, dst_rel, e)),
+                Claim::Dir => {
+                    if opts.expressions.active() {
+                        directory_expression_sources.insert(
+                            dst.clone(),
+                            crate::expression::source_path(src_root, source_relative).to_vec(),
+                        );
+                    }
+                    dirs.push((dst, dst_rel, e));
+                }
                 Claim::Weak if e.kind == Kind::Other => {
                     // Unknown type: never transferred.
                     self.progress.files_excluded.fetch_add(1, Relaxed);
@@ -1258,6 +1329,7 @@ impl Planner<'_> {
             }
         }
         Mapped {
+            directory_expression_sources,
             dst_root: dst_root.to_vec(),
             dirs,
             others,
@@ -1297,6 +1369,14 @@ impl Planner<'_> {
         let Some(mut buffered) = self.buffer.take() else {
             return Ok(());
         };
+        if self.opts.hardlinks && self.opts.inode_preservation.acls {
+            super::hardlinks::validate_macos_acls(buffered.iter().flat_map(|m| &m.others).filter(
+                |p| {
+                    self.opts.max_size.is_none_or(|max| p.e.size <= max)
+                        && self.opts.min_size.is_none_or(|min| p.e.size >= min)
+                },
+            ))?;
+        }
         // Every claimant of each contested destination, as a group: the first
         // (from dst_seen) plus all the contested ones. The group is fine only
         // if at most one *distinct* file among them is not the destination
@@ -1344,7 +1424,8 @@ impl Planner<'_> {
         }
         if let Some((root, condition, is_destination_root)) = self.create_root.take() {
             if self.use_operator_anchor {
-                let selection = create_operator_directory(self.dst, condition)?;
+                let selection =
+                    create_operator_directory(self.dst, condition, self.opts.rsync_creation)?;
                 let anchor = activate_control_destination(self.dst, selection, root.clone())?;
                 if is_destination_root {
                     self.mutation_root_condition = TargetCondition::Matches {
@@ -1388,6 +1469,9 @@ impl Planner<'_> {
         for m in buffered {
             self.apply_mapped(m)?;
         }
+        if !self.collision {
+            self.finish_hardlink_planning()?;
+        }
         self.retire_planning_state();
         Ok(())
     }
@@ -1395,12 +1479,32 @@ impl Planner<'_> {
     /// Everything after the mapping loop: stat, create directories, filter,
     /// enqueue.
     pub(super) fn apply_mapped(&mut self, mapped: Mapped) -> Result<()> {
+        if self.opts.inode_preservation.xattrs {
+            for entry in mapped
+                .dirs
+                .iter()
+                .map(|(_, _, e)| e)
+                .chain(mapped.others.iter().map(|p| &p.e))
+            {
+                if let Some(attributes) = entry
+                    .inode_metadata
+                    .as_ref()
+                    .and_then(|m| m.xattrs.as_ref())
+                {
+                    crate::inode_metadata::validate_xattr_destination(
+                        attributes,
+                        &self.destination_metadata_platform,
+                    )?;
+                }
+            }
+        }
         if self.collision {
             return Ok(());
         }
         self.assert_mutation_root()?;
         let opts = self.opts;
         let Mapped {
+            directory_expression_sources,
             dst_root,
             dirs,
             mut others,
@@ -1408,6 +1512,8 @@ impl Planner<'_> {
             mut other_stats,
         } = mapped;
         let dst_root = &dst_root[..];
+        self.directory_expression_sources = directory_expression_sources;
+        self.unselected_dirs.clear();
 
         // Directories: one stat pass decides everything about each one, and
         // the same filtered list drives creation, listing and deferred
@@ -1422,7 +1528,7 @@ impl Planner<'_> {
             } else {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
-            let planned = self.filter_dirs(dirs, stats, dst_root);
+            let planned = self.filter_dirs(dirs, stats, dst_root)?;
             if opts.dry_run {
                 self.trace_dry_run_dirs(&planned, dst_root);
             } else {
@@ -1458,6 +1564,41 @@ impl Planner<'_> {
                 dst_root,
             )?
         };
+        if opts.rsync_creation && !opts.perms && !opts.dry_run {
+            // Jobs retain the resolved mode, so old parents need not accumulate
+            // with the full directory tree. A wide batch adds at most BATCH more.
+            if self.default_permissions.len() >= crate::scan::BATCH {
+                self.default_permissions.clear();
+            }
+            let parents: std::collections::BTreeSet<_> = others
+                .iter()
+                .zip(&stats)
+                .filter(|(p, existing)| {
+                    p.e.kind != Kind::Symlink
+                        && !self.skip_existing(existing)
+                        && !((opts.existing || opts.ignore_existing)
+                            && self.under_missing_dir(&p.dst, dst_root))
+                        && !(p.e.kind == Kind::File
+                            && (opts.max_size.is_some_and(|m| p.e.size > m)
+                                || opts.min_size.is_some_and(|m| p.e.size < m)))
+                        && existing.as_ref().is_none_or(|d| {
+                            d.kind != p.e.kind || (p.e.kind != Kind::File && d.rdev != p.e.rdev)
+                        })
+                })
+                .map(|(p, _)| parent_path(&p.dst))
+                .filter(|parent| !self.default_permissions.contains_key(parent))
+                .collect();
+            for paths in parents
+                .into_iter()
+                .collect::<Vec<_>>()
+                .chunks(crate::scan::BATCH)
+            {
+                let modes =
+                    default_permissions(self.dst, paths.to_vec(), self.container_guard.clone())?;
+                self.default_permissions
+                    .extend(paths.iter().cloned().zip(modes));
+            }
+        }
         let mut leaf_ops = LeafOps::default();
         for (p, dst_entry) in others.into_iter().zip(stats) {
             let target_condition = self.exact_condition_for(&p.dst);
@@ -1497,6 +1638,31 @@ impl Planner<'_> {
                 // destination has something reachable there through a symlink.
                 self.progress.files_excluded.fetch_add(1, Relaxed);
                 continue;
+            }
+            if opts.expressions.update.is_some() {
+                let source = crate::expression::File::from_entry(&p.e);
+                let destination = dst_entry
+                    .as_ref()
+                    .map(crate::expression::File::from_entry)
+                    .unwrap_or_default();
+                let relative = self
+                    .src_overrides
+                    .get(&p.e.path)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&p.e.path);
+                if !opts
+                    .expressions
+                    .permits(
+                        &source,
+                        crate::expression::source_path(&p.src, relative),
+                        &destination,
+                        crate::expression::source_path(&p.dst, &p.dst_rel),
+                    )
+                    .with_context(|| format!("entry {}", p.rel))?
+                {
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                    continue;
+                }
             }
             match p.e.kind {
                 Kind::File => self.plan_file(p, dst_entry, target_condition, &mut leaf_ops),
@@ -1582,13 +1748,28 @@ impl Planner<'_> {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;
         }
+        if opts.hardlinks && e.nlink > 1 {
+            self.plan_hardlinked_file(
+                Planned {
+                    src: src_path,
+                    source,
+                    dst: dst_path,
+                    dst_rel,
+                    rel,
+                    e,
+                    contested,
+                },
+                dst_entry,
+            );
+            return;
+        }
         if same && !opts.checksum && (opts.dry_run || opts.expected_for(&dst_rel).is_none()) {
             // Content is up to date, but still reconcile metadata
             // (mode/owner/group) the way rsync does — a skipped file
             // shouldn't keep stale permissions.
             if let Some(d) = &dst_entry {
                 let ff = opts.metadata_fix_flags(&dst_rel, &e, d);
-                if ff != 0 {
+                if ff != 0 || opts.inode_metadata_differs(&dst_rel, &e, d) {
                     self.progress.files_unchanged.fetch_add(1, Relaxed);
                     self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
                     if opts.dry_run {
@@ -1707,16 +1888,29 @@ impl Planner<'_> {
         destination: &Entry,
         ops: &mut LeafOps,
     ) {
-        let Some(requested) = self.opts.mapping_metadata.get(rel) else {
+        let requested = self.opts.mapping_metadata.get(rel);
+        if requested.is_none() && source.inode_metadata.is_none() {
             return;
-        };
+        }
         let meta = self.opts.metadata_for(rel, source);
-        let flags = requested.apply_flags();
+        let flags = if source.inode_metadata.is_some() {
+            self.opts.flags_for(rel)
+        } else {
+            requested.map_or(0, |r| r.apply_flags())
+        };
         // Explicit nanoseconds must be attempted even if preservation's quick
         // comparison would tolerate truncation by the destination filesystem.
-        let time_differs = requested.mtime.is_some()
+        let time_differs = requested.is_some_and(|r| r.mtime.is_some())
             && (meta.mtime, meta.mtime_nsec) != (destination.mtime, destination.mtime_nsec);
-        if !time_differs && !metadata_differs(&meta, &destination.meta(), flags) {
+        // Comparing a symlink target can change its access time after the
+        // destination stat. Even matching captured times need restoration.
+        let restore_link_atime = source.kind == Kind::Symlink
+            && self.opts.inode_preservation.atimes
+            && !self.opts.dry_run;
+        if !time_differs
+            && !restore_link_atime
+            && !metadata_differs(&meta, &destination.meta(), flags)
+        {
             return;
         }
         if self.opts.dry_run {
@@ -1929,7 +2123,10 @@ impl Planner<'_> {
         let mut meta = opts.metadata_for(&dst_rel, &e);
         let mut flags = opts.flags_for(&dst_rel);
         if flags & flags::MODE == 0 {
-            meta.mode = e.mode & 0o777 & !opts.umask;
+            meta.mode = self
+                .creation_mode(&dst_path, &e)
+                .map(u32::from)
+                .unwrap_or(e.mode & 0o777 & !opts.umask);
             flags |= flags::RECEIVER_MODE;
         }
         leaf_ops.ops.push(Op::SetMeta {
@@ -1947,7 +2144,7 @@ impl Planner<'_> {
         dirs: Vec<(PathBytes, PathBytes, Entry)>,
         stats: Vec<Option<Entry>>,
         dst_root: &[u8],
-    ) -> Vec<PlannedDir> {
+    ) -> Result<Vec<PlannedDir>> {
         let opts = self.opts;
         let mut planned: Vec<PlannedDir> = Vec::new();
         for ((p, dst_rel, e), st) in dirs.into_iter().zip(stats) {
@@ -1996,9 +2193,33 @@ impl Planner<'_> {
                 self.blocked_directory_paths.insert(p);
                 continue;
             }
+            if opts.expressions.update.is_some() {
+                let source = crate::expression::File::from_entry(&e);
+                let destination = st
+                    .as_ref()
+                    .map(crate::expression::File::from_entry)
+                    .unwrap_or_default();
+                let source_path = self
+                    .directory_expression_sources
+                    .get(&p)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&e.path);
+                if !opts
+                    .expressions
+                    .permits(
+                        &source,
+                        source_path,
+                        &destination,
+                        crate::expression::source_path(&p, &dst_rel),
+                    )
+                    .with_context(|| format!("directory {}", display(&p)))?
+                {
+                    self.unselected_dirs.insert(p.clone());
+                }
+            }
             planned.push((p, dst_rel, e, st));
         }
-        planned
+        Ok(planned)
     }
 
     /// Create this batch's missing directories and reopen existing ones that
@@ -2032,7 +2253,11 @@ impl Planner<'_> {
             })
             .map(|(p, _, e, st)| Op::Mkdir {
                 path: p.clone(),
-                mode: e.mode,
+                mode: if self.unselected_dirs.contains(p) {
+                    0o777
+                } else {
+                    e.mode
+                },
                 condition: if opts.restricted_receiver
                     && st.is_none()
                     && self.implicit_dirs.contains(p)
@@ -2124,7 +2349,7 @@ impl Planner<'_> {
                 if preexisting && succeeded {
                     // Reopened for writability only; nothing was made.
                     reopened += 1;
-                    if self.implicit_dirs.contains(name) {
+                    if self.implicit_dirs.contains(name) || self.unselected_dirs.contains(name) {
                         reopened_dirs.insert(name.clone());
                     }
                     continue;
@@ -2196,6 +2421,7 @@ impl Planner<'_> {
                 }
                 Some(d)
                     if !opts.preserve_existing_directory_metadata
+                        && !self.unselected_dirs.contains(p)
                         && (metadata_differs(&meta, &d.meta(), meta_flags)
                             || opts.metadata_fix_flags(dst_rel, e, d) != 0)
                         && !self.implicit_dirs.contains(p) =>
@@ -2232,6 +2458,40 @@ impl Planner<'_> {
     ) {
         let opts = self.opts;
         for (p, dst_rel, e, s) in planned {
+            if self.unselected_dirs.contains(p) {
+                // Containers keep receiver-created metadata. Only restore a
+                // mode temporarily reopened for their children. A restricted
+                // receiver stages new directories at 0700 and chooses the
+                // final default mode itself, including its umask and setgid.
+                let meta = if reopened_dirs.contains(p) {
+                    let mut meta = s.as_ref().expect("reopened directory was observed").meta();
+                    meta.inode_metadata = None;
+                    meta
+                } else if s.is_none() && opts.restricted_receiver && !opts.perms {
+                    Meta {
+                        mode: 0o777,
+                        uid: 0,
+                        gid: 0,
+                        mtime: 0,
+                        mtime_nsec: 0,
+                        inode_metadata: None,
+                    }
+                } else {
+                    continue;
+                };
+                self.deferred.push((
+                    p.clone(),
+                    meta,
+                    if opts.restricted_receiver && !opts.perms {
+                        flags::RECEIVER_MODE
+                    } else {
+                        flags::MODE
+                    },
+                    p.iter().filter(|&&c| c == b'/').count(),
+                    self.metadata_condition_for(p),
+                ));
+                continue;
+            }
             // New implicit parents already have their final modes.
             // Restore only those temporarily reopened for writing.
             if self.implicit_dirs.contains(p) {
@@ -2389,7 +2649,9 @@ impl Planner<'_> {
     fn inspect_destination_batch(&mut self, mapped: &mut Mapped) -> Result<()> {
         // Keep the remote receiver's combined metadata lookup, but no longer
         // ask it to compute temporary names for every source file.
-        if !self.opts.dst_remote
+        if self.opts.expressions.update.is_some()
+            || self.opts.inode_preservation.any()
+            || !self.opts.dst_remote
             || self.buffer.is_some()
             || self.opts.dry_run
             || self.destination_tree_known_missing
@@ -2738,6 +3000,15 @@ impl Planner<'_> {
         false
     }
 
+    fn creation_mode(&self, destination: &[u8], entry: &Entry) -> Option<u16> {
+        if !self.opts.rsync_creation || self.opts.perms {
+            return None;
+        }
+        self.default_permissions
+            .get(&parent_path(destination))
+            .map(|permissions| (entry.mode & permissions & 0o777) as u16)
+    }
+
     pub(super) fn enqueue(
         &mut self,
         source_path: (PathBytes, RegisteredPath),
@@ -2746,10 +3017,11 @@ impl Planner<'_> {
         rel_bytes: PathBytes,
         entry: Entry,
         dst_entry: Option<Entry>,
-    ) {
+    ) -> usize {
         let (src, source) = source_path;
         let target_condition = self.exact_condition_for(&dst);
         let src_rel = self.mapping_source_rel(&rel_bytes);
+        let creation_mode = self.creation_mode(&dst, &entry);
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
         self.sched.push_file(FileJob {
@@ -2764,13 +3036,14 @@ impl Planner<'_> {
                 target_condition,
                 container_guard: self.container_guard.clone(),
                 attempt: 0,
+                creation_mode,
                 done: Arc::new(AtomicU64::new(0)),
                 inplace: self.opts.inplace
                     && target_condition == TargetCondition::Any
                     && self.container_guard.is_none(),
                 src_rel,
             },
-        });
+        })
     }
 
     /// --ignore-existing / --existing for a leaf, given what's on the destination.
@@ -3114,7 +3387,58 @@ impl Planner<'_> {
     }
 
     pub(super) fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
-        let entries = stat_many(self.dst, paths, false)?;
+        let entries = if self.opts.expressions.update.is_some() {
+            // This existing endpoint operation distinguishes absence from an
+            // unreadable path, unlike ordinary planning stats. It has the same
+            // destination-observation authority and needs no wire extension.
+            let mut inspected = Vec::with_capacity(paths.len());
+            for chunk in paths.chunks(512) {
+                match ok(
+                    self.dst.call(Request::PruneLookup {
+                        paths: chunk.to_vec(),
+                        guard: self.container_guard.clone(),
+                    })?,
+                    "inspect destination for --copy-if",
+                )? {
+                    Response::Stats(entries) if entries.len() == chunk.len() => {
+                        inspected.extend(entries)
+                    }
+                    other => bail!("unexpected destination inspection response {other:?}"),
+                }
+            }
+            if self.opts.inode_preservation.any() && inspected.iter().any(Option::is_some) {
+                // Strict lookup supplies expression fields. Rich preservation
+                // still uses the existing metadata capture request.
+                let captured = stat_many(self.dst, paths, false)?;
+                anyhow::ensure!(
+                    captured.len() == inspected.len(),
+                    "destination stat count changed"
+                );
+                for (before, after) in inspected.iter().zip(&captured) {
+                    if let Some(before) = before {
+                        anyhow::ensure!(
+                            after.as_ref().is_some_and(|after| (
+                                before.dev,
+                                before.ino,
+                                before.ctime,
+                                before.ctime_nsec
+                            ) == (
+                                after.dev,
+                                after.ino,
+                                after.ctime,
+                                after.ctime_nsec
+                            )),
+                            "destination changed while reading metadata for --copy-if"
+                        );
+                    }
+                }
+                captured
+            } else {
+                inspected
+            }
+        } else {
+            stat_many(self.dst, paths, false)?
+        };
         self.progress
             .observe_destination_devices(entries.iter().flatten());
         Ok(entries)
@@ -3206,7 +3530,15 @@ impl Planner<'_> {
         Ok(results)
     }
 
-    pub(super) fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
+    pub(super) fn apply(&mut self, mut ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
+        if ops.len() > 1
+            && ops.iter().map(Op::size_hint).sum::<usize>() > crate::proto::METADATA_BATCH_BYTES
+        {
+            let tail = ops.split_off(ops.len() / 2);
+            let mut results = self.apply(ops)?;
+            results.extend(self.apply(tail)?);
+            return Ok(results);
+        }
         match ok(
             self.dst.call(Request::Apply {
                 ops,
@@ -3228,7 +3560,7 @@ impl Planner<'_> {
                 .iter()
                 .map(|(p, m, f, _, condition)| Op::SetMeta {
                     path: p.clone(),
-                    meta: *m,
+                    meta: m.clone(),
                     flags: *f,
                     condition: *condition,
                 })
@@ -3268,6 +3600,9 @@ pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
         dev: 0,
         ino: 0,
         ctime: 0,
+        atime: Default::default(),
+        inode_metadata: None,
+        nlink: 1,
         ctime_nsec: 0,
         link: None,
     }

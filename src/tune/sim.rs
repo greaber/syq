@@ -3,7 +3,9 @@
 //! hardware runs cannot: how often a rule helps, how much throughput the
 //! search costs, and whether the remembered count drifts across copies.
 //!
-//! The loop mirrors the decisions in [`run`] without threads or a clock:
+//! This coarse model does not model the fine-grained sequential evidence in
+//! [`run`]; it is not a validation of the production observation pipeline.
+//! It exercises policy decisions without threads or a clock:
 //! reductions apply at once, increases wait for connection setup while the
 //! settled count refreshes its baseline, the tail stops measuring, and two
 //! collapsed samples short-circuit a probe. It does not model handshakes
@@ -184,6 +186,7 @@ fn copy_observing(
 
     for _ in 0..1_000_000 {
         assert!(t < 1_000_000.0, "simulation deadline: {}", s.name);
+        policy.advance_time(Duration::from_secs_f64(t), SAMPLE);
         observe(t, &policy);
         let needs = last_rate.map_or(0.0, |rate| rate * SAMPLE_SECS * MEASUREMENT_SAMPLES);
         // All initial connections have already completed the same deterministic
@@ -218,7 +221,9 @@ fn copy_observing(
             (sample_start, sample_bytes, collapsed) = (t, 0.0, 0);
             continue;
         }
-        let tail_blocks_increase = policy.n > active && total - done < needs;
+        let tail_blocks_increase = policy.n > active
+            && matches!(policy.state, State::Explore { .. })
+            && total - done < needs;
         if tail_blocks_increase {
             policy.cancel_unapplied();
             if policy.n <= active {
@@ -767,7 +772,7 @@ fn diagnostics() {
 }
 
 #[test]
-fn tail_blocked_rollback_keeps_copying_instead_of_spinning() {
+fn rollback_is_not_blocked_by_probe_admission() {
     let mut s = fixture(Curve::Knee {
         per_worker: 1.0,
         cap: 2.0,
@@ -781,7 +786,7 @@ fn tail_blocked_rollback_keeps_copying_instead_of_spinning() {
     policy.n = 2;
     policy.state = State::Hold;
     let out = copy(&s, policy, &mut Rng(0));
-    assert!(out.tail_rollback_blocked);
+    assert!(!out.tail_rollback_blocked);
     assert_eq!(out.policy.active(), 1);
     assert_eq!(out.elapsed, 4.0);
     assert_eq!(out.ideal_elapsed, 2.0);

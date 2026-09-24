@@ -30,9 +30,23 @@ def _map_stream_cwd(
     env: Mapping[str, str] | None,
     selected_base: PathArgument | None,
     contents_selector: PathArgument | None,
-) -> Path:
+    from_: str | None = None,
+) -> Path | str:
     """Derive the consumer base using the native component spelling."""
 
+    if from_ is not None:
+        base = "." if selected_base is None else os.fsdecode(os.fspath(selected_base))
+        if contents_selector is None:
+            return base
+        selected = os.fsdecode(os.fspath(contents_selector))
+        if from_.startswith("s3://"):
+            selected = selected.rstrip("/")
+            if selected == ".":
+                return base
+            return selected if base == "." else base.rstrip("/") + "/" + selected
+        if selected.startswith("/") or selected == "~" or selected.startswith("~/"):
+            return selected
+        return selected if base == "." else base.rstrip("/") + "/" + selected
     if process_cwd is None:
         process_base = os.getcwd()
     else:

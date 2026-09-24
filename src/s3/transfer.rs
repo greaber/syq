@@ -64,6 +64,8 @@ impl Drop for Engine {
 }
 #[derive(Clone)]
 struct Download {
+    expression_path: String,
+    expression_destination_path: String,
     kind: ObjectKind,
     key: String,
     path: String,
@@ -71,7 +73,7 @@ struct Download {
     expected_hash: Option<Digest>,
     metadata: Option<crate::mapping::Metadata>,
     copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
-    authorized_object: Option<Object>,
+    source_object: Option<Object>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
@@ -134,6 +136,23 @@ struct DownloadState {
 }
 
 impl Engine {
+    fn expression_destination_path<'a>(&self, path: &'a str) -> &'a [u8] {
+        let path = path.trim_end_matches('/');
+        let root = self
+            .args
+            .locations
+            .last()
+            .map(|l| l.path.as_slice())
+            .unwrap_or(b"");
+        let root = std::str::from_utf8(root).unwrap_or("").trim_matches('/');
+        let relative = path.strip_prefix(root).and_then(|s| s.strip_prefix('/'));
+        crate::expression::source_path(
+            path.as_bytes(),
+            relative
+                .unwrap_or_else(|| if path == root { "" } else { path })
+                .as_bytes(),
+        )
+    }
     pub async fn new(args: Arc<Args>, progress: Arc<Progress>) -> Result<Arc<Self>> {
         let setup = super::diagnostics::start();
         let mut options = args.s3.clone().unwrap();
@@ -586,6 +605,20 @@ impl Engine {
         {
             return Ok(UploadPreparation::Skipped);
         }
+        if self.args.expressions.update.is_some()
+            && !self.args.expressions.permits(
+                &source.expression_file()?,
+                source.expression_path(),
+                &existing
+                    .as_ref()
+                    .map(Object::expression_file)
+                    .unwrap_or_default(),
+                self.expression_destination_path(&source.key),
+            )?
+        {
+            return Ok(UploadPreparation::Skipped);
+        }
+
         if self.args.update
             && existing.as_ref().is_some_and(|o| {
                 o.metadata.as_ref().map_or(o.mtime, |m| m.mtime) > source.meta.mtime
@@ -1328,6 +1361,11 @@ impl Engine {
         while let Some(selector) = selectors.next().await {
             let ((key, path, selection, declared_kind, expected_hash, metadata), mut copy_source) =
                 selector?;
+            let expression_root = if self.args.expressions.active() {
+                key.clone()
+            } else {
+                String::new()
+            };
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
                 selection,
@@ -1401,11 +1439,25 @@ impl Engine {
                 }
                 let kind = object.kind();
                 let directory = client::is_directory_marker(&object.key, object.size);
-                vec![(object.key, object.size, path.clone(), kind, directory)]
+                vec![(
+                    object.key.clone(),
+                    object.size,
+                    path.clone(),
+                    kind,
+                    directory,
+                    Some(object),
+                )]
             } else if let Some(exact) = exact {
                 let kind = exact.kind();
                 let directory = client::is_directory_marker(&exact.key, exact.size);
-                vec![(exact.key, exact.size, path.clone(), kind, directory)]
+                vec![(
+                    exact.key.clone(),
+                    exact.size,
+                    path.clone(),
+                    kind,
+                    directory,
+                    Some(exact),
+                )]
             } else {
                 if selection == SourceSelection::File {
                     bail!("S3 source object {key:?} is missing");
@@ -1469,11 +1521,18 @@ impl Engine {
                     } else {
                         ObjectKind::File
                     };
-                    objects.push((object, size, local::join(&path, &suffix), kind, directory));
+                    objects.push((
+                        object,
+                        size,
+                        local::join(&path, &suffix),
+                        kind,
+                        directory,
+                        None,
+                    ));
                 }
                 objects
             };
-            for (key, size, path, kind, directory) in objects {
+            for (key, size, path, kind, directory, source_object) in objects {
                 if !already_filtered {
                     if let Some(excluded) =
                         client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
@@ -1510,13 +1569,89 @@ impl Engine {
                     } else if self.options.route.is_server_copy()
                         && !self.args.ignore_existing
                         && !self.args.existing
+                        && !self.args.expressions.active()
                     {
                         prune.claim_file(path.as_bytes());
                     } else {
                         prune.protect(path.as_bytes());
                     }
                 }
+                let expression_destination_path = if !self.args.expressions.active() {
+                    String::new()
+                } else {
+                    path.strip_prefix(destination_prefix)
+                        .and_then(|s| s.strip_prefix('/'))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(if destination_prefix.is_empty() {
+                            &path
+                        } else {
+                            path.rsplit('/').next().unwrap_or(&path)
+                        })
+                        .to_owned()
+                };
+                // Directory markers use the same path spelling as filesystem
+                // directories. A mapping keeps its complete source-relative path.
+                let expression_key = if directory {
+                    key.trim_end_matches('/')
+                } else {
+                    &key
+                };
+                let expression_path = if !self.args.expressions.active() {
+                    String::new()
+                } else if self.args.native_mapping.is_some() {
+                    if base.is_empty() {
+                        expression_key
+                    } else {
+                        expression_key
+                            .strip_prefix(&base)
+                            .and_then(|s| s.strip_prefix('/'))
+                            .context("mapped S3 source is outside its base")?
+                    }
+                    .to_owned()
+                } else {
+                    let relative = if expression_root.is_empty() {
+                        expression_key
+                    } else {
+                        expression_key
+                            .strip_prefix(&expression_root)
+                            .and_then(|s| s.strip_prefix('/'))
+                            .unwrap_or("")
+                    };
+                    String::from_utf8(
+                        crate::expression::source_path(
+                            expression_root.as_bytes(),
+                            relative.as_bytes(),
+                        )
+                        .to_vec(),
+                    )?
+                };
+                let known_source = source_object.as_ref().map(Object::expression_file);
+                let facts = known_source.as_ref().map_or(
+                    crate::expression::Facts::S3Listing {
+                        size,
+                        directory_marker: directory,
+                    },
+                    crate::expression::Facts::Complete,
+                );
+                let selected = self
+                    .args
+                    .expressions
+                    .selects_known(facts, expression_path.as_bytes())?;
+                if selected == Some(false)
+                    || (selected == Some(true)
+                        && self.args.expressions.permits_known(
+                            facts,
+                            expression_path.as_bytes(),
+                            crate::expression::Facts::Unread,
+                            expression_destination_path.as_bytes(),
+                        )? == Some(false))
+                {
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                    continue;
+                }
                 out.push(Download {
+                    expression_path,
+                    expression_destination_path,
                     kind,
                     key,
                     path,
@@ -1524,7 +1659,7 @@ impl Engine {
                     expected_hash: expected_hash.clone(),
                     metadata,
                     copy_source: copy_source.take().map(Box::new),
-                    authorized_object: None,
+                    source_object,
                 });
             }
         }
@@ -1545,6 +1680,21 @@ impl Engine {
         destination: &Destination,
         directories: DirectoryMetadata,
     ) -> Result<Option<u64>> {
+        let known_source = job.source_object.as_ref().map(Object::expression_file);
+        let source_facts = known_source.as_ref().map_or(
+            crate::expression::Facts::S3Listing {
+                size: job.size,
+                directory_marker: client::is_directory_marker(&job.key, job.size),
+            },
+            crate::expression::Facts::Complete,
+        );
+        let selected = self
+            .args
+            .expressions
+            .selects_known(source_facts, job.expression_path.as_bytes())?;
+        if selected == Some(false) {
+            return Ok(None);
+        }
         let part_size = self.part_size(job.size);
         let expected_hash = job.expected_hash.as_ref();
         let requires_regular_file = expected_hash.is_some();
@@ -1568,25 +1718,54 @@ impl Engine {
         {
             return Ok(None);
         }
+        let destination_file = || -> Result<crate::expression::File> {
+            let mut file = existing
+                .map(crate::expression::File::from_root)
+                .unwrap_or_default();
+            if file.kind == Some(crate::proto::Kind::Symlink) {
+                file.link_target = Some(root.read_link(&path)?);
+            }
+            Ok(file)
+        };
+        let mut observed_destination = None;
+        let permitted = if self.args.expressions.update.is_none() {
+            Some(true)
+        } else if selected == Some(true) {
+            let file = destination_file()?;
+            let result = self.args.expressions.permits_known(
+                source_facts,
+                job.expression_path.as_bytes(),
+                crate::expression::Facts::Complete(&file),
+                job.expression_destination_path.as_bytes(),
+            )?;
+            observed_destination = Some(file);
+            result
+        } else {
+            None
+        };
+        if permitted == Some(false) {
+            return Ok(None);
+        }
         // A fresh file obtains metadata with its first data request. For a
         // multipart download, receiving these headers is enough to start the
         // other ranges; the first body is consumed alongside them.
         // Existing files still use HEAD so an unchanged object is not fetched.
         let mut initial_slot = None;
-        let initial = if existing.is_none() && !self.args.dry_run && !job.key.ends_with('/') {
+        let initial = if existing.is_none()
+            && !self.args.dry_run
+            && !job.key.ends_with('/')
+            && selected == Some(true)
+            && permitted == Some(true)
+        {
             initial_slot = Some(self.tuning.requests.acquire().await);
             Some(
                 self.client
                     .get_object()
                     .bucket(&self.options.bucket)
                     .key(&job.key)
-                    .set_if_match(
-                        job.authorized_object
-                            .as_ref()
-                            .map(|object| object.etag.clone()),
-                    )
+                    .set_if_match(job.source_object.as_ref().map(|object| object.etag.clone()))
                     .set_version_id(
-                        job.authorized_object
+                        job.source_object
                             .as_ref()
                             .and_then(|object| object.version.clone()),
                     )
@@ -1601,7 +1780,7 @@ impl Engine {
         };
         let object = if let Some(output) = &initial {
             client::from_get(&job.key, job.size, part_size, output)?
-        } else if let Some(object) = &job.authorized_object {
+        } else if let Some(object) = &job.source_object {
             object.clone()
         } else {
             client::head(&self.client, &self.options.bucket, &job.key)
@@ -1609,6 +1788,29 @@ impl Engine {
                 .context("S3 source disappeared after listing")?
         };
         job.kind = object.kind();
+        if self.args.expressions.active() {
+            let source = object.expression_file();
+            if !self
+                .args
+                .expressions
+                .selects(&source, job.expression_path.as_bytes())?
+            {
+                return Ok(None);
+            }
+            let dest = match observed_destination {
+                Some(file) => file,
+                None if self.args.expressions.update.is_some() => destination_file()?,
+                None => crate::expression::File::default(),
+            };
+            if !self.args.expressions.permits(
+                &source,
+                job.expression_path.as_bytes(),
+                &dest,
+                job.expression_destination_path.as_bytes(),
+            )? {
+                return Ok(None);
+            }
+        }
         let mut initial = initial.map(|output| output.body);
         let mut metadata = object.metadata.clone().unwrap_or(Metadata {
             kind: object.kind(),

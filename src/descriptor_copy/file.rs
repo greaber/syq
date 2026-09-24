@@ -186,7 +186,7 @@ impl FileSession {
         source_meta: Option<crate::proto::Meta>,
     ) -> Result<Self> {
         let new_mode =
-            source_meta.map_or(0o666, |m| m.mode & 0o777) & !crate::fsops::process_umask();
+            source_meta.as_ref().map_or(0o666, |m| m.mode & 0o777) & !crate::fsops::process_umask();
         let (file, destination) = if write {
             let (root, target, mode) = match selected {
                 PinnedPath::Leaf(leaf) => {
@@ -249,7 +249,10 @@ impl FileSession {
                     target,
                     temporary,
                     mode: if metadata.preserve & crate::proto::flags::MODE != 0 {
-                        source_meta.context("missing source permissions")?.mode
+                        source_meta
+                            .as_ref()
+                            .context("missing source permissions")?
+                            .mode
                     } else {
                         mode
                     },
@@ -312,7 +315,7 @@ impl FileSession {
                     "invalid stream request size"
                 );
                 if *write {
-                    metadata.source(*source_meta)?;
+                    metadata.source(source_meta.clone())?;
                 }
                 let check_only = *dry_run || *only_new || *only_existing || metadata.skip_newer;
                 let mut selected = if *write {
@@ -348,6 +351,7 @@ impl FileSession {
                     PinnedPath::Leaf(leaf) if leaf.metadata().is_file() => {
                         let m = leaf.metadata();
                         Some(crate::proto::Meta {
+                            inode_metadata: None,
                             mode: m.mode & 0o7777,
                             uid: m.uid,
                             gid: m.gid,
@@ -358,7 +362,7 @@ impl FileSession {
                     _ => None,
                 };
                 let skipped = if *write {
-                    metadata.newer(*source_meta, file_meta)
+                    metadata.newer(source_meta.clone(), file_meta.clone())
                 } else {
                     *only_new
                 };
@@ -378,7 +382,7 @@ impl FileSession {
                 {
                     selected = resolve_destination(path, *follow, placement, true)?;
                 }
-                let mut stream = Self::open(selected, *write, *metadata, *source_meta)?;
+                let mut stream = Self::open(selected, *write, *metadata, source_meta.clone())?;
                 let size = (!*write).then_some(stream.original.len());
                 let ticket = descriptors.register_stream(stream.file.try_clone()?, *write)?;
                 stream.registration = Some(Registration {
@@ -400,7 +404,7 @@ impl FileSession {
                     "stream completion length mismatch"
                 );
                 if let Some(destination) = &stream.destination {
-                    if let Some(mut meta) = destination.source_meta {
+                    if let Some(mut meta) = destination.source_meta.clone() {
                         meta.mode = destination.mode;
                         crate::fsops::set_meta_file(
                             &stream.file,

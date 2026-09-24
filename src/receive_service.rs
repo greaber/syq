@@ -1284,6 +1284,7 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
             if argv.len() != 3 {
                 bail!("receive service needs its control path");
             }
+            crate::fsops::reserve_startup_descriptors();
             run(Path::new(&argv[2]))?;
             Ok(0)
         })()),

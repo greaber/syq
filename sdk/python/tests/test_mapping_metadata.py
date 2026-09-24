@@ -26,6 +26,14 @@ class MetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "symlink"):
             syq.MappingEntry("a", "b", "symlink", metadata=metadata)
 
+    def test_s3_timestamp_is_independent_and_roundtrips(self):
+        entry = syq.MappingEntry("a", "b", mtime=123, s3_last_modified=456)
+        self.assertEqual(parse_mapping_line(json.dumps(_mapping_json(entry)).encode()), entry)
+        self.assertNotIn("mtime", _mapping_json(syq.MappingEntry("a", "b", s3_last_modified=456)))
+        self.assertEqual(set(_mapping_json(syq.MappingEntry("a", "b"))), {"src", "dst"})
+        with self.assertRaises(TypeError):
+            syq.MappingEntry("a", "b", s3_last_modified=True)
+
     def test_failed_operation_retry_keeps_metadata(self):
         fixture = Path(__file__).resolve().parents[3] / "tests/fixtures/automation/partial.ndjson"
         records = [json.loads(line) for line in fixture.read_bytes().splitlines()]

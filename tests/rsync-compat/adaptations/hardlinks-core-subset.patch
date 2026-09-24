@@ -1,0 +1,63 @@
+--- a/testsuite/hardlinks_test.py
++++ b/testsuite/hardlinks_test.py
+@@ -40,14 +40,14 @@
+     text.extend(f.read_bytes())
+ (FROMDIR / 'text').write_bytes(bytes(text))
+ 
+-checkit(['-aHivv', '--debug=HLINK5', f'{FROMDIR}/', f'{TODIR}/'], FROMDIR, TODIR)
++checkit(['-aHvv', f'{FROMDIR}/', f'{TODIR}/'], FROMDIR, TODIR)
+ 
+ # Force a delta-overwrite on one of the linked names; -H should still
+ # leave name1..name3 hard-linked on the destination.
+ with open(TODIR / 'name1', 'a') as f:
+     f.write("extra extra\n")
+ 
+-checkit(['-aHivv', '--debug=HLINK5', '--no-whole-file',
++checkit(['-aHvv', '--performance-tuning=copy-path=ranges',
+          f'{FROMDIR}/', f'{TODIR}/'], FROMDIR, TODIR)
+ 
+ # Add a new link under a subdir that doesn't exist on the dest yet, plus
+@@ -64,41 +64,12 @@
+ os.link(name1, FROMDIR / 'subdir' / 'down' / 'deep' / 'new-file')
+ (TODIR / 'text').unlink()
+ 
+-checkit(['-aHivve', SSH, '--debug=HLINK5', f'--rsync-path={rsync_path_arg()}',
+-         f'{FROMDIR}/', f'localhost:{TODIR}/'], FROMDIR, TODIR)
+-
+-# --link-dest and --copy-dest should also keep hard-linked entries.
+-checkit(['-aHivv', '--debug=HLINK5', f'--link-dest={TODIR}',
+-         f'{FROMDIR}/', f'{CHKDIR}/'], TODIR, CHKDIR)
+-
+-shutil.rmtree(CHKDIR, ignore_errors=True)
+-checkit(['-aHivv', '--debug=HLINK5', f'--copy-dest={TODIR}',
+-         f'{FROMDIR}/', f'{CHKDIR}/'], FROMDIR, CHKDIR)
+-
+-# Make a hard link whose other end is outside the source -- the dest
+-# stays single-linked -- and re-sync with --checksum.
+-(FROMDIR / 'solo').write_text("This is another file\n")
+-try:
+-    os.link(FROMDIR / 'solo', CHKDIR / 'solo')
+-except OSError:
+-    test_fail("Can't create hardlink")
+-
+-# Make sure --checksum doesn't slip the offset due to an HLINK_BUMP() change.
+-proc = subprocess.run(
+-    rsync_argv('-aHivc', '--debug=HLINK5', f'{FROMDIR}/', f'{CHKDIR}/'),
+-    capture_output=True, text=True,
+-)
+-OUTFILE.write_text(proc.stdout)
+-print(proc.stdout, end='')
+-if proc.returncode != 0:
+-    test_fail(f"-aHivc run exited {proc.returncode}")
+-if 'solo' in proc.stdout:
+-    test_fail("Erroneous copy of solo file occurred!")
++checkit(['-aHvv', f'{FROMDIR}/', f'{TODIR}/'], FROMDIR, TODIR)
+ 
+ # Single-file with -H is a regression-prone path; just confirm it copies.
+ shutil.rmtree(TODIR, ignore_errors=True)
+ TODIR.mkdir(parents=True, exist_ok=True)
+-subprocess.run(rsync_argv('-aHivv', '--debug=HLINK5', str(name1), f'{TODIR}/'))
++subprocess.run(rsync_argv('-aHvv', str(name1), f'{TODIR}/'))
+ diff = subprocess.run(['diff', '-u', str(name1), str(TODIR / 'name1')])
+ if diff.returncode != 0:
+     test_fail("solo copy of name1 failed")

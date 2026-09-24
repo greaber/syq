@@ -99,13 +99,12 @@ context remain available for that fallback; a known network starts its own
 history. Local-copy hints are unchanged. A change of transport or observed
 network context during a copy prevents saving a new hint for its initial path.
 
-`--performance-tuning` bypasses remembered counts and does not save a new
-recommendation. `--resource-limits workers=N` caps the starting count while
-leaving recommendations unchanged.
+`--performance-tuning` bypasses automatic starting choices.
+`--resource-limits workers=N` caps the starting count and subsequent exploration.
 
-The older cache remains at `~/.cache/syq/tuning.json`, in its existing format.
-`SYQ_TUNING_CACHE` names another file; an empty value disables both this cache
-and the history below. `XDG_CACHE_HOME` changes their parent directory.
+`SYQ_TUNING_CACHE` sets the base path for history; an empty value disables
+history and remembered starts. `XDG_CACHE_HOME` changes the default parent
+directory.
 
 Syq can keep idle connections ready for later tuning changes. These connections
 and their helper processes still use resources, so the active worker count is
@@ -152,17 +151,16 @@ machine running the coordinator; run the inspection commands there.
 The default file is `~/.cache/syq/tuning.history-v1.sqlite`. When
 `SYQ_TUNING_CACHE` selects another file, the history uses that name with its
 extension replaced by `.history-v1.sqlite`. `SYQ_TUNING_HISTORY` selects an
-independent history file; an empty value disables history and its startup hints
-while leaving the older cache available. New database files are private to the
-user. SQLite may create adjacent `-wal` and `-shm` files while in use.
+independent history file; an empty value disables history and remembered starts.
+New database files are private to the user. SQLite may create adjacent `-wal`
+and `-shm` files while in use.
 
-`SYQ_TUNING_HISTORY_SIZE` sets how much history to keep, default `128M`, minimum
-`16M`. History may be removed when this size target is exceeded.
+`SYQ_TUNING_HISTORY_SIZE` sets how much history to keep, default `10M`, minimum
+`10M`. History may be removed when this size target is exceeded.
 
 Recording is best effort: an interrupted transfer or a storage error can leave
 gaps in the history. Copies still proceed when history cannot be saved.
-Clearing history also removes its startup hints; it leaves the older
-connection-count cache intact.
+Clearing history resets remembered starting counts.
 
 ## Filesystem tuning examples
 

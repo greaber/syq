@@ -197,7 +197,7 @@ pub(crate) fn take(control: &Path, program: &str) -> Option<PooledSession> {
     let mut line = serde_json::to_vec(&request).ok()?;
     line.push(b'\n');
     stream.write_all(&line).ok()?;
-    let (payload, mut descriptors) = receive_message(stream.as_raw_fd(), MAX_MESSAGE).ok()?;
+    let (payload, mut descriptors) = receive_message(&stream, MAX_MESSAGE).ok()?;
     let reply: PoolReply = serde_json::from_slice(&payload).ok()?;
     if reply.status != "session" || reply.identity != crate::identity::build() {
         return None;
@@ -253,7 +253,7 @@ pub(crate) fn stop(control: &Path) -> Result<()> {
                     // Keep the connection open until the pool consumes the
                     // request. Closing a queued Unix connection can discard
                     // its unread data on macOS.
-                    requested = receive_message(stream.as_raw_fd(), MAX_MESSAGE)
+                    requested = receive_message(&stream, MAX_MESSAGE)
                         .ok()
                         .and_then(|(payload, descriptors)| {
                             if !descriptors.is_empty() {
@@ -828,6 +828,81 @@ mod tests {
         assert!(request.exit);
         assert_eq!(request.identity, "test");
         sender.join().unwrap();
+    }
+
+    #[test]
+    fn pooled_pipe_reply_keeps_the_existing_wire_format_and_io() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let control = temporary.path().join("cm-00112233aabbccdd");
+        let listener = UnixListener::bind(socket_path(&control)).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let request = read_request(&mut socket).unwrap();
+            assert_eq!(request.program.as_deref(), Some("syq --server"));
+            let ((input, stdin), (stdout, output), (stderr, errors)) =
+                crate::process::with_inheritance_guard(|| {
+                    (
+                        std::io::pipe().unwrap(),
+                        std::io::pipe().unwrap(),
+                        std::io::pipe().unwrap(),
+                    )
+                });
+            let reply = serde_json::to_vec(&PoolReply {
+                status: "session".into(),
+                identity: crate::identity::build().to_string(),
+            })
+            .unwrap();
+            send_message(
+                socket.as_raw_fd(),
+                &reply,
+                &[stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()],
+            )
+            .unwrap();
+            (input, output, errors)
+        });
+        let session = take(&control, "syq --server").expect("pooled session");
+        let (mut input, mut output, mut errors) = server.join().unwrap();
+        let PooledSession {
+            mut stdin,
+            mut stdout,
+            mut stderr,
+        } = session;
+        stdin.write_all(b"request").unwrap();
+        drop(stdin);
+        output.write_all(b"response").unwrap();
+        drop(output);
+        errors.write_all(b"diagnostic").unwrap();
+        drop(errors);
+        for (reader, expected) in [
+            (&mut input as &mut dyn Read, b"request".as_slice()),
+            (&mut stdout as &mut dyn Read, b"response".as_slice()),
+            (&mut stderr as &mut dyn Read, b"diagnostic".as_slice()),
+        ] {
+            let mut contents = Vec::new();
+            reader.read_to_end(&mut contents).unwrap();
+            assert_eq!(contents, expected);
+        }
+    }
+
+    #[test]
+    fn a_silent_pool_falls_back_after_the_existing_two_second_timeout() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let control = temporary.path().join("cm-00112233aabbccdd");
+        let listener = UnixListener::bind(socket_path(&control)).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            assert!(read_request(&mut socket).is_some());
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let start = Instant::now();
+        let session = take(&control, "syq --server");
+        let elapsed = start.elapsed();
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+        assert!(session.is_none());
+        assert!(elapsed >= CLIENT_IO_TIMEOUT);
+        assert!(elapsed < Duration::from_secs(4));
     }
 
     #[test]

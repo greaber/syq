@@ -9,6 +9,7 @@ mod diagnostics;
 mod dns;
 pub(crate) mod listing;
 mod local;
+pub(crate) mod map;
 mod remove;
 pub(crate) use remove::RemoveFlags;
 mod prune;
@@ -130,7 +131,9 @@ impl Options {
         matches: &clap::ArgMatches,
     ) -> Result<Option<Self>> {
         let tuning = matches
-            .get_many::<String>("performance_tuning")
+            .try_get_many::<String>("performance_tuning")
+            .ok()
+            .flatten()
             .map(|v| v.cloned().collect::<Vec<_>>().join(","))
             .map(|v| {
                 v.parse::<crate::transfer_tuning::TransferTuning>()

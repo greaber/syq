@@ -48,6 +48,8 @@
         "ignore",
         "ignore-from",
         "preserve",
+        "open-noatime",
+        "sparse",
         "inplace",
         "s3-endpoint",
         "s3-region",
@@ -55,7 +57,9 @@
         "s3-header",
         "performance-tuning",
         "resource-limits",
-        "integrity-checking"
+        "integrity-checking",
+        "where",
+        "copy-if"
       ],
       "internal": [
         "delegated-operands-b64",
@@ -135,7 +139,16 @@
         "src",
         "src-dir",
         "src-non-dir",
-        "srcs-in"
+        "srcs-in",
+        "from",
+        "include",
+        "rsh",
+        "syq-path",
+        "no-bootstrap",
+        "s3-endpoint",
+        "s3-region",
+        "s3-profile",
+        "s3-header"
       ],
       "internal": [],
       "aliases": {

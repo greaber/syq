@@ -1713,6 +1713,10 @@ impl RestrictedAuthority {
         condition: &mut proto::TargetCondition,
         target: ReceiverModeTarget,
     ) -> Result<()> {
+        anyhow::ensure!(
+            meta.inode_metadata.is_none(),
+            "signed grants do not authorize additional inode metadata"
+        );
         if *flags & proto::flags::RECEIVER_MODE != 0 {
             let decision = self.receiver_mode(path, meta.mode, target)?;
             meta.mode = decision.mode;
@@ -1830,6 +1834,9 @@ impl RestrictedAuthority {
         outcomes: &mut Vec<PendingOutcome>,
         touched: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
+        if matches!(operation, Op::Hardlink { .. }) {
+            bail!("hardlink creation is not authorized by the signed grant");
+        }
         let path = match &*operation {
             Op::Mkdir { path, .. }
             | Op::SetMeta { path, .. }
@@ -1846,6 +1853,7 @@ impl RestrictedAuthority {
                 }
                 path
             }
+            Op::Hardlink { .. } => unreachable!("hardlinks rejected above"),
             Op::Remove { .. } => {
                 bail!("recursive remove is not supported by the root-confined receiver")
             }
@@ -1889,6 +1897,7 @@ impl RestrictedAuthority {
             bail!("expected hash requires a regular file");
         }
         match operation {
+            Op::Hardlink { .. } => bail!("hardlink creation is not authorized by the signed grant"),
             Op::Mkdir {
                 path,
                 mode,
@@ -2165,7 +2174,7 @@ impl RestrictedAuthority {
             } => {
                 self.check_observation_path(path)?;
                 if let Some(authorized) = self.expected_hash(path)? {
-                    if *expected != authorized {
+                    if *expected != crate::hashing::ExpectedHashes::Single(authorized) {
                         bail!("expected hash differs from the authorized copy");
                     }
                 }
@@ -2379,7 +2388,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                *expected_hash = self.expected_hash(path)?;
+                *expected_hash = self.expected_hash(path)?.map(Into::into);
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
@@ -2479,7 +2488,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                *expected_hash = self.expected_hash(path)?;
+                *expected_hash = self.expected_hash(path)?.map(Into::into);
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file finalization does not match the signed publication policy");
                 }
@@ -2568,8 +2577,17 @@ impl RestrictedAuthority {
             | Request::AnchorDestination { .. } => {
                 bail!("destination-anchor management is not valid on a root-confined receiver")
             }
+            Request::NativeMap(_) => {
+                bail!("mapping generation is not valid on a command-restricted destination")
+            }
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a command-restricted destination")
+            }
+            Request::DefaultPermissions { .. } => {
+                bail!("rsync creation policy is not valid on a command-restricted receiver")
+            }
+            Request::ConfigurePreservation { .. } => {
+                bail!("signed grants do not authorize additional inode metadata or read policies")
             }
             Request::DescriptorCopy(_) | Request::BindStream(_) => {
                 bail!("descriptor copies are not valid on a command-restricted receiver")

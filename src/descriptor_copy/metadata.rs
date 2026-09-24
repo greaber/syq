@@ -56,6 +56,7 @@ impl Policy {
 }
 pub(crate) fn from_file(meta: &Metadata) -> Meta {
     Meta {
+        inode_metadata: None,
         mode: meta.mode() & 0o7777,
         uid: meta.uid(),
         gid: meta.gid(),

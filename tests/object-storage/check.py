@@ -266,6 +266,25 @@ def check():
         assert sorted(p.name for p in (mapped_tree / 'renamed').iterdir()) == ['program']
         assert (mapped_tree / 'renamed/program').read_bytes() == (src / 'script').read_bytes()
 
+        # Generated mappings retain source identity while destinations change.
+        generated = subprocess.run([SYQ, 'map', '--from', remote, '--srcs-in',
+                                    placement + '/source'], capture_output=True, check=True)
+        records = [json.loads(line) for line in generated.stdout.splitlines()]
+        assert records and all(set(entry) == {'src', 'dst'} for entry in records)
+        for entry in records:
+            entry['dst']['value'] = 'renamed/' + entry['dst']['value']
+        manifest.write_text(''.join(json.dumps(entry) + '\n' for entry in records))
+        generated_tree = root / 'generated-map'
+        run(['--from', remote, '-C', placement + '/source', '--mapping', manifest,
+             '--into', generated_tree])
+        assert (generated_tree / 'renamed/script').read_bytes() == (src / 'script').read_bytes()
+        times = subprocess.run([SYQ, 'map', '--from', remote, '--src',
+                                placement + '/source/script', '--include',
+                                'mtime,s3_last_modified'], capture_output=True, check=True)
+        observed = json.loads(times.stdout)
+        assert observed['mtime'] == int((src / 'script').stat().st_mtime)
+        assert isinstance(observed['s3_last_modified'], int)
+
         # Retrying a partial multipart upload/download must reuse completed work.
         upload_key=PREFIX+'/resume-upload'
         interrupted([src/'large','--to',remote,'--as',upload_key])

@@ -1611,6 +1611,7 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
             if argv.len() != 5 {
                 bail!("invalid destination registration arguments");
             }
+            crate::fsops::reserve_startup_descriptors();
             register(
                 argv[2].to_str().context("invalid name")?,
                 Path::new(&argv[3]),

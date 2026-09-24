@@ -149,10 +149,16 @@ fn fifo_node_operations_do_not_connect_a_producer() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         match operation {
             "map" => {
-                command.args(["map", "-C"]).arg(&t.0).arg("pipe");
+                command
+                    .args(["map", "--include", "kind", "-C"])
+                    .arg(&t.0)
+                    .arg("pipe");
             }
             "map-root" => {
-                command.args(["map", "--root"]).arg(&t.0).arg("pipe");
+                command
+                    .args(["map", "--include", "kind", "--root"])
+                    .arg(&t.0)
+                    .arg("pipe");
             }
             "remove-preview" => {
                 command.args(["rm", "--dry-run"]).arg(&fifo);

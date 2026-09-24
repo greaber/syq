@@ -259,6 +259,7 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
         command
     };
     let failed = run()
+        .env("SYQ_TEST_COPY_AFTER_PLANNING", "1")
         .env("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE", "1")
         .run()
         .unwrap();

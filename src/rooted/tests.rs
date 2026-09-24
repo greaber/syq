@@ -1842,3 +1842,31 @@ fn creating_parent_handle_rejects_links_and_keeps_selected_directory() {
         .unwrap();
     assert!(tree.path().join("top").is_dir());
 }
+
+#[test]
+fn hardlink_publication_is_confined_and_rejects_a_replaced_representative() {
+    let tree = TestDir::new("hardlinks");
+    let root = Root::open(tree.path()).unwrap();
+    fs::write(tree.path().join("source"), b"payload").unwrap();
+    fs::write(tree.path().join("outside"), b"untouched").unwrap();
+    symlink("outside", tree.path().join("target")).unwrap();
+    let source = relative(b"source");
+    let target = relative(b"target");
+    let original = root.metadata(&source).unwrap();
+    let identity = (original.dev, original.ino);
+    root.publish_hardlink(&source, &target, identity).unwrap();
+    root.publish_hardlink(&source, &target, identity).unwrap();
+    assert_eq!(root.metadata(&target).unwrap().ino, original.ino);
+    assert_eq!(fs::read(tree.path().join("outside")).unwrap(), b"untouched");
+    fs::remove_file(tree.path().join("source")).unwrap();
+    symlink("outside", tree.path().join("source")).unwrap();
+    assert!(root
+        .publish_hardlink(&source, &relative(b"other"), identity)
+        .is_err());
+    assert!(!tree.path().join("other").exists());
+    fs::create_dir(tree.path().join("directory")).unwrap();
+    assert!(root
+        .publish_hardlink(&target, &relative(b"directory"), identity)
+        .is_err());
+    assert!(tree.path().join("directory").is_dir());
+}

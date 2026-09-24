@@ -496,15 +496,20 @@ fn released_v040_preamble_keeps_its_build_identity_boundary() {
 }
 
 #[test]
-fn released_v052_preamble_rejects_new_transfer_messages_before_decoding() {
-    // Literal v0.5.2 preamble, independent of today's enum encodings.
+fn released_preambles_reject_new_transfer_messages_before_decoding() {
+    // Literal released preambles, independent of today's enum encodings.
     const V052: &[u8] = b"SYQWIRE\0\0\x06v0.5.2";
-    if crate::identity::build() != "v0.5.2" {
-        let error = FrameReader::new(V052).read_msg::<Response>().unwrap_err();
-        assert!(
-            error.to_string().contains("build identity mismatch"),
-            "{error}"
-        );
+    const V071: &[u8] = b"SYQWIRE\0\0\x06v0.7.1";
+    for (identity, preamble) in [("v0.5.2", V052), ("v0.7.1", V071)] {
+        if crate::identity::build() != identity {
+            let error = FrameReader::new(preamble)
+                .read_msg::<Response>()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("build identity mismatch"),
+                "{error}"
+            );
+        }
     }
 }
 
@@ -798,5 +803,19 @@ fn zstd_known_unknown_and_concatenated_sizes_preserve_decoding_and_limits() {
         assert!(FrameReader::new(bytes.as_slice())
             .read_msg::<Response>()
             .is_err());
+    }
+}
+
+#[test]
+fn released_v071_preamble_rejects_copy_progress_before_decoding() {
+    // Literal released preamble, not regenerated with today's encoder. The
+    // exact build boundary precedes any new CopyLocalProgress response.
+    const V071: &[u8] = b"SYQWIRE\0\0\x06v0.7.1";
+    if crate::identity::build() != "v0.7.1" {
+        let error = FrameReader::new(V071).read_msg::<Response>().unwrap_err();
+        assert!(
+            error.to_string().contains("build identity mismatch"),
+            "{error}"
+        );
     }
 }

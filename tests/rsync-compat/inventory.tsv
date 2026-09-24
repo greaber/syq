@@ -2,17 +2,17 @@
 # Every upstream *_test.py must appear once. Update and review this file with the pin.
 # test<TAB>classification<TAB>reason-id (or -)
 00-hello	out-of-scope	rsync-internal
-acl-symlink-race	unsupported	unsupported-acls
-acls	unsupported	unsupported-acls
-acls-default	unsupported	unsupported-acls
-acls-depth	unsupported	unsupported-acls
-acls-unpinnable	unsupported	unsupported-acls
+acl-symlink-race	out-of-scope	rsync-daemon
+acls	adapted	-
+acls-default	adapted	-
+acls-depth	adapted	-
+acls-unpinnable	adapted	-
 alt-dest	unsupported	unsupported-alt-dest
 alt-dest-deep	unsupported	unsupported-alt-dest
 alt-dest-symlink-race	unsupported	unsupported-alt-dest
 append	unsupported	unsupported-transfer-mode
 append-shortsum	unsupported	unsupported-transfer-mode
-atimes	unsupported	unsupported-metadata
+atimes	adapted	-
 authenticate-no-ocloexec-build-regression	out-of-scope	rsync-internal
 backup	unsupported	unsupported-alt-dest
 backup-acl-xattr-cache	unsupported	unsupported-xattrs
@@ -55,7 +55,7 @@ connect-prog-nested-singlequote-host-injection	out-of-scope	rsync-daemon
 copy-dest-source-symlink	unsupported	unsupported-alt-dest
 copy-dest-symlink-readleak	unsupported	unsupported-alt-dest
 copy-xattrs-symlink-race	unsupported	unsupported-xattrs
-crtimes	unsupported	unsupported-metadata
+crtimes	adapted	-
 cvs-exclude	unsupported	unsupported-filters
 daemon	out-of-scope	rsync-daemon
 daemon-access	out-of-scope	rsync-daemon
@@ -156,8 +156,8 @@ fuzzy-basis	unsupported	unsupported-transfer-mode
 git-set-file-times-python-compat-regression	out-of-scope	rsync-internal
 growing-file	adapted	-
 hands	adapted	-
-hardlinks	unsupported	unsupported-hardlinks
-hardlinks-deep	adapted	-
+hardlinks	adapted	-
+hardlinks-deep	conformance	-
 hashsearch-chain	out-of-scope	rsync-internal
 hashtable-overflow	out-of-scope	rsync-internal
 highfd-hang	conformance	-
@@ -184,7 +184,7 @@ link-dest-symlink-enotsup	unsupported	unsupported-alt-dest
 links	adapted	-
 log-control-chars	unsupported	unsupported-transfer-mode
 log-file-symlink	unsupported	unsupported-transfer-mode
-longdir	adapted	-
+longdir	conformance	-
 macos-setgid-ordinary-mode-regression	unsupported	unsupported-metadata
 malicious-dot-dir-delete-scope	out-of-scope	rsync-wire
 malicious-dot-file-delete-scope	out-of-scope	rsync-wire
@@ -205,7 +205,7 @@ no-implied-dirs-symlink	unsupported	unsupported-relative
 nondaemon-symlink-race	unsupported	unsupported-alt-dest
 nonroot-restrictive-perms	out-of-scope	rsync-daemon
 omit-times	unsupported	unsupported-metadata
-open-noatime	unsupported	unsupported-metadata
+open-noatime	adapted	-
 operator-path-backup-dir	unsupported	unsupported-alt-dest
 operator-path-backup-dir-daemon	out-of-scope	rsync-daemon
 operator-path-backup-dir-exclude-daemon	out-of-scope	rsync-daemon
@@ -318,7 +318,7 @@ simd-checksum	out-of-scope	rsync-internal
 size-filter	conformance	-
 skiplist-spec	out-of-scope	rsync-internal
 source-change-size-continues	adapted	-
-sparse	unsupported	unsupported-transfer-mode
+sparse	adapted	-
 ssh-basic	adapted	-
 stop-time	unsupported	unsupported-transfer-mode
 symlink-dest-backupdir	unsupported	unsupported-alt-dest
@@ -348,7 +348,7 @@ wildmatch	out-of-scope	rsync-internal
 write-batch-filter-injection	unsupported	unsupported-batch
 write-batch-quoting	unsupported	unsupported-batch
 xattr-wire-cap	unsupported	unsupported-xattrs
-xattrs	unsupported	unsupported-xattrs
-xattrs-depth	unsupported	unsupported-xattrs
-xattrs-hlink	unsupported	unsupported-xattrs
+xattrs	adapted	-
+xattrs-depth	adapted	-
+xattrs-hlink	adapted	-
 xrsync	out-of-scope	rsync-wire

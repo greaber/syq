@@ -1,7 +1,6 @@
-//! `syq map`: print a local source selection as an NDJSON mapping, one JSON
-//! object per line.
+//! `syq map`: print source selections as NDJSON mappings, one JSON object per line.
 //!
-//! Emission is local and read-only, and destination-independent by design:
+//! Emission is read-only and destination-independent by design:
 //! `dst` values are relative to the target container, so the same manifest
 //! can be executed against any target with `syq cp --mapping`. Only `--as`
 //! changes emitted values, by placing the single selected root at a chosen
@@ -19,13 +18,122 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::cli::{native_basename, Args, Placement, SourceSelection};
+use crate::cli::{native_basename, Args, SourceSelection};
 use crate::fsops::{require_source_leaf_identity, rooted_entry_in_directory, rooted_source_entry};
 use crate::proto::{Entry, Kind, OperatorSymlinkPolicy, SourceLeafIdentity};
 use crate::rooted::{
     read_open_symlink, OperatorFinalComponent, OperatorResolver, PinnedPath, RelativePath, Root,
     OPERATOR_SYMLINK_FOLLOW_ADVICE,
 };
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+#[value(rename_all = "snake_case")]
+pub enum Field {
+    Kind,
+    Size,
+    Mtime,
+    S3LastModified,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Source {
+    pub path: Vec<u8>,
+    pub selection: SourceSelection,
+}
+
+/// Endpoint-local input to the map walker. This travels only over the exactly
+/// pinned helper protocol; manifests remain independent of helper versions.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Options {
+    pub cwd: Option<Vec<u8>>,
+    pub root: Option<Vec<u8>>,
+    pub target: Option<Vec<u8>>,
+    pub sources: Vec<Source>,
+    pub follow: bool,
+    pub include: Vec<Field>,
+}
+
+impl Options {
+    pub fn from_args(args: &Args) -> Self {
+        Self {
+            cwd: args.native_map_cwd.clone(),
+            root: args.native_map_root.clone(),
+            target: args.native_map_target.clone(),
+            sources: args
+                .locations
+                .iter()
+                .map(|location| Source {
+                    path: location.path.clone(),
+                    selection: location.selection,
+                })
+                .collect(),
+            follow: args.follows_native_source_paths(),
+            include: args.native_map_include.clone(),
+        }
+    }
+
+    pub fn destinations(&self) -> Result<Vec<Vec<u8>>> {
+        let mut names = HashSet::new();
+        self.sources
+            .iter()
+            .map(|source| {
+                if source.selection == SourceSelection::Contents {
+                    return Ok(Vec::new());
+                }
+                let destination = match &self.target {
+                    Some(target) => target.clone(),
+                    None => native_basename(&source.path)
+                        .context("named source has no target basename")?
+                        .to_vec(),
+                };
+                crate::mapping::validate_manifest_path(&destination, "dst")?;
+                if !names.insert(destination.clone()) {
+                    bail!(
+                        "two selectors map to the same destination name {:?}",
+                        String::from_utf8_lossy(&destination)
+                    );
+                }
+                Ok(destination)
+            })
+            .collect()
+    }
+}
+
+pub struct Emitter<'a, W> {
+    pub out: &'a mut W,
+    pub fields: &'a [Field],
+}
+
+impl<W: Write> Emitter<'_, W> {
+    pub fn entry(
+        &mut self,
+        src: &[u8],
+        dst: &[u8],
+        kind: Option<&str>,
+        size: Option<u64>,
+        mtime: Option<i64>,
+        s3_last_modified: Option<i64>,
+    ) -> Result<()> {
+        crate::mapping::validate_manifest_path(src, "src")?;
+        crate::mapping::validate_manifest_path(dst, "dst")?;
+        let record = MapRecord {
+            src: tagged(utf8(src)?),
+            dst: tagged(utf8(dst)?),
+            kind: kind.filter(|_| self.fields.contains(&Field::Kind)),
+            size: size.filter(|_| self.fields.contains(&Field::Size)),
+            mtime: mtime.filter(|_| self.fields.contains(&Field::Mtime)),
+            s3_last_modified: s3_last_modified
+                .filter(|_| self.fields.contains(&Field::S3LastModified)),
+        };
+        serde_json::to_writer(&mut *self.out, &record).context("writing mapping to stdout")?;
+        self.out
+            .write_all(b"\n")
+            .context("writing mapping to stdout")?;
+        Ok(())
+    }
+}
 
 #[derive(Serialize)]
 struct TaggedPath<'a> {
@@ -37,11 +145,14 @@ struct TaggedPath<'a> {
 struct MapRecord<'a> {
     src: TaggedPath<'a>,
     dst: TaggedPath<'a>,
-    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mtime: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    s3_last_modified: Option<i64>,
 }
 
 struct MapSelection {
@@ -64,59 +175,63 @@ struct PendingMapEntry {
 }
 
 pub fn run(args: &Args) -> Result<i32> {
-    let follow_src = args.follows_native_source_paths();
-    let symlink_policy = if follow_src {
-        OperatorSymlinkPolicy::FollowAll
-    } else {
-        OperatorSymlinkPolicy::Refuse
-    };
-    let base = pin_base(args, &args.locations, symlink_policy)?;
-    let mut top_level_dst: HashSet<Vec<u8>> = HashSet::new();
-    let destination_prefixes = args
-        .locations
-        .iter()
-        .map(|location| {
-            if location.selection == SourceSelection::Contents {
-                return Ok(Vec::new());
-            }
-            let destination = match (args.placement, &args.native_map_target) {
-                (Placement::As, Some(target)) => target.clone(),
-                _ => native_basename(&location.path)
-                    .expect("parse validated that named selectors have a basename")
-                    .to_vec(),
-            };
-            if !top_level_dst.insert(destination.clone()) {
-                bail!(
-                    "two selectors map to the same destination name {:?}",
-                    String::from_utf8_lossy(&destination)
-                );
-            }
-            Ok(destination)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let options = Options::from_args(args);
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    for (location, destination) in args.locations.iter().zip(destination_prefixes) {
-        let selection = pin_selection(&base, location, follow_src, symlink_policy)?;
-        hold_map_selection_for_test()?;
-        emit_selection(location, selection, &destination, &mut out)?;
+    if args.s3.is_some() {
+        crate::s3::map::run(args, &options, &mut out)?;
+    } else if args.locations[0].is_remote() {
+        let endpoint = crate::transfer::endpoint(&args.locations[0], args)?;
+        let mut connection = crate::transfer::connect_ctl(&endpoint, args)?;
+        connection.send(crate::proto::Request::NativeMap(options))?;
+        loop {
+            match connection.recv()? {
+                crate::proto::Response::NativeMapData(data) => out.write_all(&data)?,
+                crate::proto::Response::NativeMapDone => break,
+                crate::proto::Response::Err(error) => bail!("remote map: {error}"),
+                other => bail!("unexpected remote map response: {other:?}"),
+            }
+        }
+    } else {
+        write_local(&options, &mut out)?;
     }
     out.flush().context("writing mapping to stdout")?;
     Ok(0)
 }
 
+pub fn write_local(options: &Options, out: &mut impl Write) -> Result<()> {
+    let follow_src = options.follow;
+    let symlink_policy = if follow_src {
+        OperatorSymlinkPolicy::FollowAll
+    } else {
+        OperatorSymlinkPolicy::Refuse
+    };
+    let base = pin_base(options, &options.sources, symlink_policy)?;
+    let destinations = options.destinations()?;
+    let mut emitter = Emitter {
+        out,
+        fields: &options.include,
+    };
+    for (location, destination) in options.sources.iter().zip(destinations) {
+        let selection = pin_selection(&base, location, follow_src, symlink_policy)?;
+        hold_map_selection_for_test()?;
+        emit_selection(location, selection, &destination, &mut emitter)?;
+    }
+    Ok(())
+}
+
 fn pin_base(
-    args: &Args,
-    locations: &[crate::cli::Location],
+    args: &Options,
+    locations: &[Source],
     symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<MapBase> {
-    if args.native_map_cwd.is_some() && args.native_map_root.is_some() {
+    if args.cwd.is_some() && args.root.is_some() {
         bail!("--cwd and --root are mutually exclusive");
     }
-    let (path, confined) = if let Some(path) = args.native_map_root.as_deref() {
+    let (path, confined) = if let Some(path) = args.root.as_deref() {
         (Some(path), true)
     } else {
-        (args.native_map_cwd.as_deref(), false)
+        (args.cwd.as_deref(), false)
     };
     if let Some(path) = path {
         if path.is_empty() {
@@ -160,7 +275,7 @@ fn pin_base(
 
 fn pin_selection(
     base: &MapBase,
-    location: &crate::cli::Location,
+    location: &Source,
     follow_src: bool,
     symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<MapSelection> {
@@ -241,6 +356,7 @@ fn pin_selection(
                     dev: metadata.dev,
                     ino: metadata.ino,
                     file_type: metadata.file_type(),
+                    symlink_atime: metadata.is_symlink().then_some(metadata.atime),
                     symlink_target,
                 }),
                 _leaf_object: object,
@@ -252,10 +368,7 @@ fn pin_selection(
     }
 }
 
-fn emitted_source(
-    location: &crate::cli::Location,
-    resolved_relative: Option<&[u8]>,
-) -> Result<Vec<u8>> {
+fn emitted_source(location: &Source, resolved_relative: Option<&[u8]>) -> Result<Vec<u8>> {
     if location.selection == SourceSelection::Contents {
         return Ok(Vec::new());
     }
@@ -275,10 +388,10 @@ fn emitted_source(
 }
 
 fn emit_selection(
-    location: &crate::cli::Location,
+    location: &Source,
     selection: MapSelection,
     destination_prefix: &[u8],
-    out: &mut impl Write,
+    out: &mut Emitter<'_, impl Write>,
 ) -> Result<()> {
     let contents = location.selection == SourceSelection::Contents;
     let scan_relative = RelativePath::new(&selection.relative)?;
@@ -339,7 +452,7 @@ fn walk_directory(
     source_prefix: &[u8],
     destination_prefix: &[u8],
     contents: bool,
-    out: &mut impl Write,
+    out: &mut Emitter<'_, impl Write>,
 ) -> Result<()> {
     let mut pending = Vec::new();
     push_directory_children(root, scan_root, b"", scan_root_metadata, &mut pending)?;
@@ -409,30 +522,21 @@ fn hold_map_selection_for_test() -> Result<()> {
     Ok(())
 }
 
-fn emit(out: &mut impl Write, src: &[u8], dst: &[u8], entry: &Entry) -> Result<()> {
-    let src = utf8(src)?;
-    let dst = utf8(dst)?;
+fn emit(out: &mut Emitter<'_, impl Write>, src: &[u8], dst: &[u8], entry: &Entry) -> Result<()> {
     let kind = match entry.kind {
         Kind::Dir => "dir",
         Kind::File => "file",
         Kind::Symlink => "symlink",
         _ => "special",
     };
-    let (size, mtime) = if kind == "file" {
-        (Some(entry.size), Some(entry.mtime))
-    } else {
-        (None, None)
-    };
-    let record = MapRecord {
-        src: tagged(src),
-        dst: tagged(dst),
-        kind,
-        size,
-        mtime,
-    };
-    serde_json::to_writer(&mut *out, &record).context("writing mapping to stdout")?;
-    out.write_all(b"\n").context("writing mapping to stdout")?;
-    Ok(())
+    out.entry(
+        src,
+        dst,
+        Some(kind),
+        (entry.kind == Kind::File).then_some(entry.size),
+        (entry.kind == Kind::File).then_some(entry.mtime),
+        None,
+    )
 }
 
 fn tagged(value: &str) -> TaggedPath<'_> {

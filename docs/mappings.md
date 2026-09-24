@@ -33,7 +33,9 @@ syq map photos              # named directory; paths include photos/
 syq map photo.jpg --as albums/cover.jpg
 ```
 
-`map` lists local files without copying them. Use the same source directory
+`map` lists sources without copying them. Add `--from HOST` for SSH or
+`--from s3://BUCKET` for S3. It emits `src` and `dst` by default; request
+additional fields with `--include`, for example `--include kind,size,mtime`. Use the same source directory
 when making the copy: a list produced with `--srcs-in photos` needs `-C photos`
 on `cp`. Each listed directory includes separate entries for its contents.
 
@@ -41,7 +43,7 @@ on `cp`. Each listed directory includes separate entries for its contents.
 
 ```bash
 set -o pipefail
-syq map --srcs-in photos \
+syq map --srcs-in photos --include kind,mtime \
   | jq -c 'select(.kind == "file")
         | .dst.value = (.mtime | gmtime | strftime("%Y/%m")) + "/" + .dst.value' \
   | syq cp --mapping - -C photos --to nas --into /archive

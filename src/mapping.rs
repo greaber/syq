@@ -91,6 +91,9 @@ pub(crate) struct WireEntry<P> {
     #[serde(default)]
     #[allow(dead_code)]
     mtime: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    s3_last_modified: Option<i64>,
 }
 impl<P> WireEntry<P> {
     pub(crate) fn validate(&self) -> Result<Option<DeclaredKind>> {
