@@ -788,21 +788,39 @@ class NativeClientTests(unittest.TestCase):
 
     def test_remote_map_keeps_endpoint_and_base_through_transform(self) -> None:
         with self.client.map(from_="source", srcs_in="photos", cwd="~/data",
-                             include=["mtime", "kind"], no_bootstrap=True) as stream:
-            transformed = stream.transform(lambda entry: entry)
+                             include=["mtime", "kind"], no_bootstrap=True,
+                             rsh="ssh -F source-config", syq_path="~/bin/syq") as stream:
+            transformed = stream.transform(lambda entry: entry).transform(lambda entry: entry)
             self.assertEqual(transformed.from_, "source")
             self.assertEqual(transformed.cwd, "~/data/photos")
-            list(transformed)
+            self.client.cp(mapping=transformed, into="output")
         argv = self.argv()
+        self.assertEqual(argv[0], "cp")
         self.assertEqual(argv[argv.index("--from") + 1], "source")
-        self.assertIn("--include=mtime", argv)
-        self.assertIn("--include=kind", argv)
+        self.assertIn("~/data/photos", argv)
         self.assertIn("--no-bootstrap", argv)
-        mapping = syq.Mapping([syq.MappingEntry("a", "b")], from_="source", cwd="~/data")
-        self.client.cp(mapping=mapping.transform(lambda entry: entry), into="output")
+        self.assertIn("ssh -F source-config", argv)
+        self.assertIn("~/bin/syq", argv)
+
+    def test_mapping_connection_options_are_captured_and_conflicts_rejected(self) -> None:
+        configured = dict(s3_endpoint="http://source.invalid", s3_region="region-a",
+                          s3_profile="profile-a", s3_header=["X-Test: one"],
+                          rsh="ssh -F source-config", syq_path="~/bin/syq")
+        mapping = syq.Mapping([syq.MappingEntry("a", "b")], from_="source", cwd="~/data",
+                              no_bootstrap=True, **configured).transform(lambda entry: entry)
+        configured["s3_header"].append("X-Test: mutation")
+        for name in configured:
+            with self.subTest(name=name), self.assertRaisesRegex(syq.SyqInvocationError, name):
+                value = ["X-Test: other"] if name == "s3_header" else "other"
+                self.client.cp(mapping=mapping, into="output", **{name: value})
+        self.client.cp(mapping=mapping, into="output", s3_endpoint="http://source.invalid")
         argv = self.argv()
-        self.assertEqual(argv[argv.index("--from") + 1], "source")
-        self.assertIn("~/data", argv)
+        self.assertIn("--s3-endpoint=http://source.invalid", argv)
+        self.assertIn("--s3-region=region-a", argv)
+        self.assertIn("--s3-profile=profile-a", argv)
+        self.assertIn("--s3-header=X-Test: one", argv)
+        self.assertNotIn("--s3-header=X-Test: mutation", argv)
+        self.assertIn("--no-bootstrap", argv)
 
     def test_map_cwd_preserves_the_unresolved_source_spelling(self) -> None:
         base = self.root / "base"

@@ -6,7 +6,7 @@ import inspect
 from collections.abc import (
     AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable, Iterator,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from ._paths import PathArgument, _map_stream_cwd
@@ -15,11 +15,47 @@ from .models import MappingEntry
 
 
 @dataclass(frozen=True, slots=True)
+class _Connection:
+    rsh: str | None = None
+    syq_path: PathArgument | None = None
+    no_bootstrap: bool = False
+    s3_endpoint: str | None = None
+    s3_region: str | None = None
+    s3_profile: str | None = None
+    s3_header: Iterable[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.s3_header is not None:
+            if isinstance(self.s3_header, (str, bytes)):
+                raise SyqInvocationError("s3_header must be an iterable of header strings")
+            object.__setattr__(self, "s3_header", tuple(self.s3_header))
+
+    def arguments(self) -> dict[str, object]:
+        return {field.name: getattr(self, field.name) for field in fields(self)}
+
+
+def _connection_options(mapping: object, supplied: _Connection) -> _Connection:
+    if not isinstance(mapping, _ContextMapping):
+        return supplied
+    options = supplied.arguments()
+    for name, value in mapping._source.connection.arguments().items():
+        unset = False if name == "no_bootstrap" else None
+        if value != unset:
+            if options[name] != unset and options[name] != value:
+                raise SyqInvocationError(
+                    f"a context-carrying mapping cannot override source connection option {name}"
+                )
+            options[name] = value
+    return _Connection(**options)
+
+
+@dataclass(frozen=True, slots=True)
 class _Source:
     base: Path | str
     from_: str | None
     confined: bool
     follow_src: bool
+    connection: _Connection
 
 
 class _ContextMapping:
@@ -29,6 +65,13 @@ class _ContextMapping:
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow_src: bool = False,
+        rsh: str | None = None,
+        syq_path: PathArgument | None = None,
+        no_bootstrap: bool = False,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
     ) -> None:
         if cwd is not None and root is not None:
             raise SyqInvocationError("cwd and root are mutually exclusive")
@@ -36,6 +79,7 @@ class _ContextMapping:
             _map_stream_cwd(None, None, root if root is not None else cwd, None, from_),
             from_,
             root is not None, follow_src,
+            _Connection(rsh, syq_path, no_bootstrap, s3_endpoint, s3_region, s3_profile, s3_header),
         )
 
     @property
@@ -104,8 +148,18 @@ class Mapping(_ContextMapping, Iterable[MappingEntry]):
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow_src: bool = False,
+        rsh: str | None = None,
+        syq_path: PathArgument | None = None,
+        no_bootstrap: bool = False,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
     ) -> None:
-        super().__init__(from_=from_, cwd=cwd, root=root, follow_src=follow_src)
+        super().__init__(from_=from_, cwd=cwd, root=root, follow_src=follow_src,
+                         rsh=rsh, syq_path=syq_path, no_bootstrap=no_bootstrap,
+                         s3_endpoint=s3_endpoint, s3_region=s3_region,
+                         s3_profile=s3_profile, s3_header=s3_header)
         self._entries = entries
 
     def __iter__(self) -> Iterator[MappingEntry]:
@@ -117,6 +171,7 @@ class Mapping(_ContextMapping, Iterable[MappingEntry]):
             _TransformedEntries(self, function),
             cwd=None if self.root is not None else self.cwd,
             root=self.root, from_=self.from_, follow_src=self.follow_src,
+            **self._source.connection.arguments(),
         )
 
 
@@ -129,8 +184,18 @@ class AsyncMapping(_ContextMapping, AsyncIterable[MappingEntry]):
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow_src: bool = False,
+        rsh: str | None = None,
+        syq_path: PathArgument | None = None,
+        no_bootstrap: bool = False,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
     ) -> None:
-        super().__init__(from_=from_, cwd=cwd, root=root, follow_src=follow_src)
+        super().__init__(from_=from_, cwd=cwd, root=root, follow_src=follow_src,
+                         rsh=rsh, syq_path=syq_path, no_bootstrap=no_bootstrap,
+                         s3_endpoint=s3_endpoint, s3_region=s3_region,
+                         s3_profile=s3_profile, s3_header=s3_header)
         self._entries = entries
 
     def __aiter__(self) -> AsyncIterator[MappingEntry]:
@@ -144,6 +209,7 @@ class AsyncMapping(_ContextMapping, AsyncIterable[MappingEntry]):
             _AsyncTransformedEntries(self, function),
             cwd=None if self.root is not None else self.cwd,
             root=self.root, from_=self.from_, follow_src=self.follow_src,
+            **self._source.connection.arguments(),
         )
 
 

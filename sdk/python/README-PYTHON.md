@@ -155,8 +155,9 @@ with syq.map(srcs_in="photos") as mapping:
 ```
 
 This places the contents of `photos` under `published/archive`. The mapping
-carries its source endpoint, base, and symlink-following policy through the
-transform. Use `from_="server"` or `from_="s3://bucket"` for remote generation.
+carries its source endpoint, base, explicit connection options, and
+symlink-following policy through the transform. Use `from_="server"` or
+`from_="s3://bucket"` for remote generation.
 By default entries contain only source and destination paths. Request extra
 fields with `include=["kind", "size", "mtime"]`; S3 object time is separately
 available as `s3_last_modified`. Missing stored S3 `mtime` stays `None`.

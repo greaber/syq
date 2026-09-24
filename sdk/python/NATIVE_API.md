@@ -291,9 +291,30 @@ one version of one exact key. These options are mutually exclusive.
 
 ## map
 
-`map(*sources, **options) → MapStream` lists local mapping entries without
-copying. Besides the shared arguments, it accepts `as_` to rename a selected
+`map(*sources, **options) → MapStream` lists local, SSH, or S3 source entries
+without copying. Use `from_="server"` or `from_="s3://bucket"` for a remote
+source. Besides the shared arguments, it accepts `as_` to rename a selected
 object. `srcs_in` must be the sole selector when used.
+
+By default entries contain only source and destination paths. `include` is an
+iterable of field names: `kind`, `size`, `mtime`, and `s3_last_modified`.
+`kind` adds a copy-time type check; the other fields are informational.
+For filesystem sources, size and modification time describe regular files.
+For S3, `mtime` is stored filesystem time, omitted when unavailable;
+`s3_last_modified` is the independent S3 object modification time. Requesting
+`kind` or `mtime` reads S3 object metadata; generation never downloads bodies.
+
+Connection options are `rsh`, `syq_path`, `no_bootstrap`, `s3_endpoint`,
+`s3_region`, `s3_profile`, and `s3_header`, with the same types as on `cp`.
+Explicit connection options are kept through transformations and copying.
+For example, the consumer uses the same object service here:
+
+```python
+with client.map(from_="s3://photos", srcs_in="originals",
+                s3_endpoint="https://objects.example.com",
+                s3_region="us-east-1") as mapping:
+    client.cp(mapping=mapping, into="restored")
+```
 
 `MapStream` is a `Mapping` and an iterable context manager; use `with`.
 `AsyncMapStream` is an `AsyncMapping` and an async context manager; use
@@ -303,20 +324,26 @@ environment, and timeout when created, even though execution starts later.
 
 ### Mapping and AsyncMapping
 
-A mapping combines entries with their local source context. Pass it directly
-to `cp(mapping=...)`, even on a client with a different `process_cwd`.
+A mapping combines entries with their source endpoint, base, and explicit
+connection options. Pass it directly to `cp(mapping=...)`, even on a client
+with a different `process_cwd`.
 
-`Mapping(entries, *, cwd=None, root=None, follow_src=False)` accepts an iterable
-of `MappingEntry`. `AsyncMapping(...)` accepts an async iterable. If both `cwd`
-and `root` are omitted, the source base is the current directory at construction.
-Otherwise exactly one may be supplied. Relative `cwd` and `root` paths resolve
-against the Python process directory at construction, not a client's
-`process_cwd`. `root` confines source resolution.
+`Mapping(entries, *, from_=None, cwd=None, root=None, follow_src=False,
+**connection_options)` accepts an iterable of `MappingEntry`.
+`AsyncMapping(...)` accepts an async iterable. The connection options are the
+same seven options listed for `map` above.
+
+Supply at most one of `cwd` and `root`; `root` confines source resolution.
+Local relative bases resolve against the Python process directory at
+construction, not a client's `process_cwd`. With neither supplied, the local
+base is that directory. Remote bases remain strings interpreted at the source
+endpoint, defaulting to `"."`; remote `~` is not expanded using the local home.
 
 | Member | Type | Meaning |
 |---|---|---|
-| `cwd` | `pathlib.Path` | Absolute source-base spelling, preserving symlinks and `..` |
-| `root` | `pathlib.Path` or `None` | Confinement base, when created with `root` |
+| `from_` | `str` or `None` | Source endpoint; `None` means local |
+| `cwd` | `pathlib.Path` or `str` | Absolute local source-base spelling, or a base interpreted at the remote endpoint |
+| `root` | `pathlib.Path`, `str`, or `None` | Confinement base, when created with `root` |
 | `follow_src` | `bool` | Whether the copy should follow source symlinks |
 | `transform(function)` | `Mapping` or `AsyncMapping` | Lazy transformation that keeps the source context |
 
@@ -326,6 +353,11 @@ chained. Async transforms also accept awaitable callbacks and await them in
 entry order. Neither form caches entries; reuse depends on the supplied iterable.
 
 A context-carrying mapping rejects `from_`, `cwd`, and `root` overrides on `cp`.
+It also rejects conflicting values for connection options explicitly supplied
+when it was created; repeating the same value is allowed. A captured
+`no_bootstrap=True` remains enabled. Header iterables are captured at construction.
+Unspecified connection settings still use the copy's environment and configuration; specify `s3_endpoint` when the service must stay
+fixed across clients. The mapping does not snapshot credentials or source data.
 It automatically enables the source-following policy used by `map`; enabling
 `follow` or `follow_src` on the copy is also permitted. The destination options
 remain independent. `map(root=..., srcs_in=...)` carries the selected directory
@@ -425,13 +457,15 @@ of these to `cp(mapping=...)`; use `dataclasses.replace` to change an entry.
 | `dst` | `RelativePath` or `StreamDestination` | Path relative to the destination container, or a consumer callback |
 | `kind` | `EntryKind` or `None` | Object kind, when known; default `None` |
 | `size` | `int` or `None` | Informational size in bytes; default `None` |
-| `mtime` | `int` or `None` | Informational modification time in Unix seconds; default `None` |
+| `mtime` | `int` or `None` | Informational filesystem modification time in Unix seconds; default `None` |
+| `s3_last_modified` | `int` or `None` | Informational S3 object modification time in Unix seconds; default `None` |
 | `expected_hash` | `Hash` or `None` | Expected whole-file hash; requires a regular file; default `None` |
 | `metadata` | `DestinationMetadata` or `None` | Explicit destination attributes; default `None` |
 
-`MappingEntry(src, dst, kind=None, size=None, mtime=None, expected_hash=None, metadata=None)` also accepts text or
-byte paths for `src` and `dst` and converts them to `RelativePath`. `size` and
-`mtime` do not impose preconditions on the copy. `expected_hash` does: a file
+`MappingEntry(src, dst, kind=None, size=None, mtime=None, expected_hash=None,
+metadata=None, s3_last_modified=None)` also accepts text or byte paths for
+`src` and `dst` and converts them to `RelativePath`. `size`, `mtime`, and
+`s3_last_modified` do not impose preconditions on the copy. `expected_hash` does: a file
 cannot succeed unless its contents match. For example, an adapter can supply
 an MD5 from a DVC manifest without changing syq's ordinary comparison algorithm:
 

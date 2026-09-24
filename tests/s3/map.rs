@@ -62,7 +62,11 @@ impl MapServer {
                         );
                         continue;
                     }
-                    let contents = if mode == "invalid" {
+                    let contents = if mode == "nonempty-slash" {
+                        "<Contents><Key>prefix%2F</Key><Size>4</Size></Contents>".to_owned()
+                    } else if mode == "nonempty-child-slash" {
+                        "<Contents><Key>prefix%2Fchild%2F</Key><Size>4</Size></Contents>".to_owned()
+                    } else if mode == "invalid" {
                         "<Contents><Key>prefix%2Fa%2F%2Fb</Key><Size>1</Size></Contents>".to_owned()
                     } else if second {
                         "<Contents><Key>prefix%2Fempty%2F</Key><Size>0</Size><LastModified>2026-01-01T00:00:00Z</LastModified></Contents><Contents><Key>prefix%2Flink</Key><Size>4</Size><LastModified>2026-01-01T00:00:00Z</LastModified></Contents>".to_owned()
@@ -343,4 +347,32 @@ fn s3_map_exact_object_keeps_source_base_and_does_not_decode_unused_metadata() {
         .capture_output()
         .unwrap();
     assert!(!output.status.success());
+}
+
+#[test]
+fn s3_map_rejects_nonempty_slash_objects_for_named_and_contents_selectors() {
+    let temp = test_support::tempdir().unwrap();
+    for mode in ["nonempty-slash", "nonempty-child-slash"] {
+        for selector in ["--srcs-in", "--src-dir", "--src"] {
+            for include in [None, Some("kind,mtime")] {
+                let server = MapServer::new(mode);
+                let mut command = server.command(
+                    temp.path(),
+                    &["map", "--from", "s3://bucket", selector, "prefix"],
+                );
+                if let Some(include) = include {
+                    command.args(["--include", include]);
+                }
+                let output = command.capture_output().unwrap();
+                assert!(!output.status.success(), "{mode} {selector}: {output:?}");
+                assert!(output.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&output.stderr).contains("not a directory marker"));
+                assert_eq!(
+                    server.requests.lock().unwrap().len(),
+                    2,
+                    "no object metadata or body should be read"
+                );
+            }
+        }
+    }
 }

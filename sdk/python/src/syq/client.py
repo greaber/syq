@@ -19,7 +19,9 @@ from typing import BinaryIO
 
 from ._streams import StreamReader, StreamWriter
 from ._defaults import CLIENT_DEFAULT, Timeout, resolve_timeout
-from ._mapping import Mapping as FileMapping, _source_options
+from ._mapping import (
+    _Connection, _connection_options, Mapping as FileMapping, _source_options,
+)
 from ._paths import PathArgument, _map_stream_cwd
 from .managed import managed_executable
 from .bundled import bundled_executable
@@ -919,10 +921,12 @@ class MapStream(FileMapping):
     def __init__(
         self, process: _LineProcess, cwd: PathArgument, *,
         confined: bool = False, follow_src: bool = False, from_: str | None = None,
+        connection: _Connection = _Connection(),
     ) -> None:
         super().__init__(
             (), cwd=None if confined else cwd,
             root=cwd if confined else None, follow_src=follow_src, from_=from_,
+            **connection.arguments(),
         )
         self._process = process
         self._complete = False
@@ -1271,6 +1275,9 @@ class Client:
         timeout: Timeout = CLIENT_DEFAULT,
         check: bool = True,
     ) -> CpResult:
+        connection = _connection_options(mapping, _Connection(
+            rsh, syq_path, no_bootstrap, s3_endpoint, s3_region, s3_profile, s3_header,
+        ))
         from_, cwd, root, follow_src = _source_options(
             mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
         )
@@ -1330,16 +1337,17 @@ class Client:
             max_delete=max_delete,
             allow_missing_placement=mapping is not None and not isinstance(mapping, (str, bytes, os.PathLike)),
         )
-        _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
+        _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
+                      connection.s3_profile, connection.s3_header)
         if auth_from is not None:
             argv.extend(("--auth-from", _text_arg(auth_from, label="auth_from")))
         _append_remote_arguments(
             argv,
             coordinate_at=coordinate_at,
-            rsh=rsh,
+            rsh=connection.rsh,
             pscope=pscope,
-            syq_path=syq_path,
-            no_bootstrap=no_bootstrap,
+            syq_path=connection.syq_path,
+            no_bootstrap=connection.no_bootstrap,
             tcp_plain=tcp_plain,
             no_tcp=no_tcp,
             tcp_ports=tcp_ports,
@@ -1551,9 +1559,12 @@ class Client:
             inplace=False,
             max_delete=None,
         )
-        _map_options(argv, include=include, rsh=rsh, syq_path=syq_path,
-                     no_bootstrap=no_bootstrap)
-        _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
+        connection = _Connection(rsh, syq_path, no_bootstrap,
+                                 s3_endpoint, s3_region, s3_profile, s3_header)
+        _map_options(argv, include=include, rsh=connection.rsh, syq_path=connection.syq_path,
+                     no_bootstrap=connection.no_bootstrap)
+        _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
+                      connection.s3_profile, connection.s3_header)
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
         command = (self._executable_value(), *argv)
@@ -1580,5 +1591,5 @@ class Client:
             ),
             effective_cwd,
             confined=root is not None,
-            follow_src=follow or follow_src, from_=from_,
+            follow_src=follow or follow_src, from_=from_, connection=connection,
         )

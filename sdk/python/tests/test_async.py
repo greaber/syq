@@ -214,15 +214,20 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_remote_map_context_and_fields(self) -> None:
         stream = self.client.map(from_="s3://bucket", srcs_in="photos/", cwd="prefix",
-                                 include=["s3_last_modified"], s3_region="us-east-1")
+                                 include=["s3_last_modified"], s3_region="region-a",
+                                 s3_endpoint="http://source.invalid", s3_profile="profile-a",
+                                 s3_header=iter(["X-Test: one"]))
         async with stream:
-            transformed = stream.transform(lambda entry: entry)
+            transformed = stream.transform(lambda entry: entry).transform(lambda entry: entry)
             self.assertEqual(transformed.from_, "s3://bucket")
             self.assertEqual(transformed.cwd, "prefix/photos")
-            entries = [entry async for entry in transformed]
-        self.assertEqual(len(entries), 1)
-        self.assertIn("--include=s3_last_modified", self.argv())
-        self.assertIn("--s3-region=us-east-1", self.argv())
+            with self.assertRaisesRegex(syq.SyqInvocationError, "s3_endpoint"):
+                await self.client.cp(mapping=transformed, into="output", s3_endpoint="http://other.invalid")
+            await self.client.cp(mapping=transformed, into="output")
+        self.assertEqual(self.argv()[0], "cp")
+        for option in ["--s3-endpoint=http://source.invalid", "--s3-region=region-a",
+                       "--s3-profile=profile-a", "--s3-header=X-Test: one"]:
+            self.assertIn(option, self.argv())
 
     async def test_map_cwd_preserves_the_unresolved_source_spelling(self) -> None:
         base = self.root / "base"

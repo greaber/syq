@@ -88,6 +88,11 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                     let page =
                         listing::engine::read(&store, &prefix, false, token.as_deref()).await?;
                     found |= !page.entries.is_empty();
+                    for entry in &page.entries {
+                        if entry.key.ends_with('/') && !client::is_directory_marker(&entry.key, entry.size) {
+                            bail!("S3 object {:?} ends in '/' but is not a directory marker and cannot be represented as a mapping path", entry.key);
+                        }
+                    }
                     let mut objects = stream::iter(
                         page.entries
                             .into_iter()
@@ -114,9 +119,6 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                             .key
                             .strip_prefix(&prefix)
                             .context("S3 listing returned a key outside the requested prefix")?;
-                        if suffix.is_empty() && contents {
-                            continue;
-                        }
                         let marker = client::is_directory_marker(&entry.key, entry.size);
                         let suffix = if marker {
                             suffix.strip_suffix('/').unwrap_or(suffix)
