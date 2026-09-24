@@ -969,6 +969,8 @@ for coordinator in src dst local; do
         --coordinate-at "$coordinator" --no-progress \
         --where "src.kind = 'file' and src.size > 1B and src.path glob 'sub/*'" \
         --copy-if 'not dst.exists or src.size > dst.size'
+    # Select the fixture path locally; read its contents on the destination.
+    # shellcheck disable=SC2029
     ssh destination "test \"\$(cat /tmp/syq-real-ssh/expressions-$coordinator/sub/keep)\" = selected; test ! -e /tmp/syq-real-ssh/expressions-$coordinator/sub/tiny"
 done
 
@@ -976,12 +978,16 @@ printf 'case: restricted expressions preserve container permissions and inherita
 ssh source 'mkdir -p /tmp/syq-real-ssh/expression-modes/new /tmp/syq-real-ssh/expression-modes/old; printf selected > /tmp/syq-real-ssh/expression-modes/new/keep; printf selected > /tmp/syq-real-ssh/expression-modes/old/keep; chmod 710 /tmp/syq-real-ssh/expression-modes/new'
 for preservation in default permissions; do
     destination=/tmp/syq-real-ssh/expression-modes-$preservation
+    # This controlled fixture path is set by the local loop.
+    # shellcheck disable=SC2029
     ssh destination "mkdir -p $destination/old; chmod 2775 $destination; chmod 2555 $destination/old"
     set --
     if [ "$preservation" = permissions ]; then set -- --preserve=permissions; fi
     syq cp "$@" --from source --srcs-in /tmp/syq-real-ssh/expression-modes \
         --to destination --into "$destination" --coordinate-at src --no-progress \
         --where "src.kind = 'file'" --copy-if "src.kind != 'dir'"
+    # Expand the fixture path locally; run cat and stat on the destination.
+    # shellcheck disable=SC2029
     ssh destination "test \"\$(cat $destination/new/keep)\" = selected; test \"\$(cat $destination/old/keep)\" = selected; test \"\$(stat -c %a $destination/new)\" = 2755; test \"\$(stat -c %a $destination/old)\" = 2555"
 done
 
