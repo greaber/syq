@@ -35,6 +35,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--src-non-dirs <PATH>...` | Select several named non-directory source objects |
 | `--src-dirs <DIR>...` | Select several named source directories |
 | `--srcs <PATH>...` | Select several named source objects |
+| `--where <EXPR>` | Select non-directory source entries with a typed expression; directories follow normal copy rules |
 | `--ignore <PATTERN>` | Skip paths matching a gitignore-style pattern (repeatable) |
 | `--ignore-from <FILE>` | Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order) |
 | `[PATH]...` | Named source objects (shorthand for --src) |
@@ -62,6 +63,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--only-new` | Copy entries found missing; keep metadata of entries found present; adding children requires write access |
+| `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
 | `--max-delete <N>` | With --prune, refuse all removals if more than N are planned |

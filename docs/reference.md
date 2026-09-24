@@ -191,6 +191,21 @@ syq cp --prune --srcs-in build --into backup
 
 See [Pruning](commands/cp.md#pruning) for restrictions and files kept for recovery.
 
+## Select files by metadata
+
+Use `--where` to select source entries and `--copy-if` to decide which
+source/destination pairs may be updated:
+
+```sh
+syq cp --srcs-in project --into backup \
+  --where 'src.kind = "file" and src.size >= 1MiB' \
+  --copy-if 'not dst.exists or src.mtime > dst.mtime'
+```
+
+Directories remain traversable so matching descendants can be found. Excluded
+source entries protect their destination counterparts from pruning. See
+[expressions](expressions.md) for fields, operators, and directory behavior.
+
 ## Ignoring paths
 
 ```sh

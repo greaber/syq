@@ -656,8 +656,12 @@ def _copy_arguments(
     max_delete: int | None,
     integrity_checking: str | None = None,
     allow_missing_placement: bool = False,
+    where: str | None = None,
+    copy_if: str | None = None,
 ) -> tuple[list[Argument], int, int]:
     argv: list[Argument] = [command]
+    _append_text(argv, "--where", where)
+    _append_text(argv, "--copy-if", copy_if)
     source_count = 0
     contents_count = 0
     for index, source in enumerate(sources):
@@ -1243,6 +1247,8 @@ class Client:
         only_new: bool = False,
         only_existing: bool = False,
         skip_newer: bool = False,
+        where: str | None = None,
+        copy_if: str | None = None,
         no_compress: bool = False,
         resource_limits: str | None = None,
         performance_tuning: str | None = None,
@@ -1322,6 +1328,8 @@ class Client:
             only_new=only_new,
             only_existing=only_existing,
             skip_newer=skip_newer,
+            where=where,
+            copy_if=copy_if,
             no_compress=no_compress,
             resource_limits=resource_limits,
             performance_tuning=performance_tuning,

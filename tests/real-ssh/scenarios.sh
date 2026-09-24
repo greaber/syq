@@ -959,6 +959,32 @@ syq cp --skip-newer --no-progress --performance-tuning workers=2 \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
 
+printf 'case: expression selection on source, destination, and local coordinators\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/expressions/sub; printf selected > /tmp/syq-real-ssh/expressions/sub/keep; printf x > /tmp/syq-real-ssh/expressions/sub/tiny'
+for coordinator in src dst local; do
+    set --
+    if [ "$coordinator" = dst ]; then set -- --peer-auth broker; fi
+    syq cp "$@" --from source --srcs-in /tmp/syq-real-ssh/expressions \
+        --to destination --into "/tmp/syq-real-ssh/expressions-$coordinator" \
+        --coordinate-at "$coordinator" --no-progress \
+        --where "src.kind = 'file' and src.size > 1B and src.path glob 'sub/*'" \
+        --copy-if 'not dst.exists or src.size > dst.size'
+    ssh destination "test \"\$(cat /tmp/syq-real-ssh/expressions-$coordinator/sub/keep)\" = selected; test ! -e /tmp/syq-real-ssh/expressions-$coordinator/sub/tiny"
+done
+
+printf 'case: restricted expressions preserve container permissions and inheritance\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/expression-modes/new /tmp/syq-real-ssh/expression-modes/old; printf selected > /tmp/syq-real-ssh/expression-modes/new/keep; printf selected > /tmp/syq-real-ssh/expression-modes/old/keep; chmod 710 /tmp/syq-real-ssh/expression-modes/new'
+for preservation in default permissions; do
+    destination=/tmp/syq-real-ssh/expression-modes-$preservation
+    ssh destination "mkdir -p $destination/old; chmod 2775 $destination; chmod 2555 $destination/old"
+    set --
+    if [ "$preservation" = permissions ]; then set -- --preserve=permissions; fi
+    syq cp "$@" --from source --srcs-in /tmp/syq-real-ssh/expression-modes \
+        --to destination --into "$destination" --coordinate-at src --no-progress \
+        --where "src.kind = 'file'" --copy-if "src.kind != 'dir'"
+    ssh destination "test \"\$(cat $destination/new/keep)\" = selected; test \"\$(cat $destination/old/keep)\" = selected; test \"\$(stat -c %a $destination/new)\" = 2755; test \"\$(stat -c %a $destination/old)\" = 2555"
+done
+
 printf 'case: destination firewall triggers automatic TCP fallback to SSH\n'
 make_tree source /tmp/syq-real-ssh/firewall-source firewall
 syq cp --no-progress --performance-tuning workers=2 --preserve=permissions \
