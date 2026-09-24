@@ -49,6 +49,7 @@ enum Field {
     Exists,
     Size,
     Mtime,
+    S3LastModified,
     Ctime,
     Mode,
     Uid,
@@ -68,6 +69,7 @@ impl Field {
             "exists" => Self::Exists,
             "size" => Self::Size,
             "mtime" => Self::Mtime,
+            "s3_last_modified" => Self::S3LastModified,
             "ctime" => Self::Ctime,
             "mode" => Self::Mode,
             "uid" => Self::Uid,
@@ -86,7 +88,7 @@ impl Field {
             }
             Self::Exists => Type::Bool,
             Self::Size => Type::Size,
-            Self::Mtime | Self::Ctime => Type::Timestamp,
+            Self::Mtime | Self::Ctime | Self::S3LastModified => Type::Timestamp,
             _ => Type::Number,
         }
     }
@@ -101,6 +103,7 @@ pub(crate) struct File {
     pub size: Option<u64>,
     pub mtime: Option<(i64, u32)>,
     pub ctime: Option<(i64, u32)>,
+    pub s3_last_modified: Option<(i64, u32)>,
     pub mode: Option<u32>,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
@@ -124,6 +127,7 @@ impl File {
             inode: Some(e.ino),
             nlink: Some(e.nlink),
             link_target: e.link.clone(),
+            s3_last_modified: None,
         }
     }
     pub fn from_root(m: crate::rooted::RootMetadata) -> Self {
@@ -150,6 +154,7 @@ impl File {
             inode: Some(m.ino),
             nlink: Some(m.nlink),
             link_target: None,
+            s3_last_modified: None,
         }
     }
     fn field(&self, path: &[u8], field: Field) -> Value {
@@ -189,11 +194,12 @@ impl File {
                 })
             }),
             Size => quantity(self.size.map(i128::from), Type::Size),
-            Mtime | Ctime => quantity(
-                if matches!(field, Mtime) {
-                    self.mtime
-                } else {
-                    self.ctime
+            Mtime | Ctime | S3LastModified => quantity(
+                match field {
+                    Mtime => self.mtime,
+                    Ctime => self.ctime,
+                    S3LastModified => self.s3_last_modified,
+                    _ => unreachable!(),
                 }
                 .map(|(s, n)| i128::from(s) * 1_000_000_000 + i128::from(n)),
                 Type::Timestamp,
@@ -215,7 +221,10 @@ impl File {
 #[derive(Clone, Copy)]
 pub(crate) enum Facts<'a> {
     Complete(&'a File),
-    S3Listing { size: u64, directory_marker: bool },
+    S3Listing {
+        size: u64,
+        last_modified: Option<(i64, u32)>,
+    },
     Unread,
 }
 #[derive(Debug)]
@@ -234,10 +243,20 @@ impl Facts<'_> {
         if matches!(field, Field::Path | Field::Name | Field::Extension) {
             return Ok(File::default().field(path, field));
         }
-        if let Self::S3Listing { size, .. } = self {
+        if let Self::S3Listing {
+            size,
+            last_modified,
+        } = self
+        {
             return Ok(match field {
                 Field::Exists => Value::Bool(true),
                 Field::Size => Value::Quantity(i128::from(size), Type::Size),
+                Field::S3LastModified => last_modified.map_or(Value::Null, |(s, n)| {
+                    Value::Quantity(
+                        i128::from(s) * 1_000_000_000 + i128::from(n),
+                        Type::Timestamp,
+                    )
+                }),
                 // S3 never exposes these fields, including through HEAD.
                 Field::Ctime | Field::Device | Field::Inode | Field::Links | Field::LinkTarget => {
                     Value::Null
@@ -284,6 +303,22 @@ enum Node {
     Coalesce(Box<Node>, Box<Node>),
 }
 impl Node {
+    fn uses_source_s3_time(&self) -> bool {
+        match self {
+            Self::Field(false, Field::S3LastModified) => true,
+            Self::Not(n) | Self::Negative(n) | Self::Pattern(n, _) => n.uses_source_s3_time(),
+            Self::Binary(_, a, b) | Self::Coalesce(a, b) => {
+                a.uses_source_s3_time() || b.uses_source_s3_time()
+            }
+            Self::Between(a, b, c) | Self::If(a, b, c) => {
+                a.uses_source_s3_time() || b.uses_source_s3_time() || c.uses_source_s3_time()
+            }
+            Self::In(a, items) => {
+                a.uses_source_s3_time() || items.iter().any(Self::uses_source_s3_time)
+            }
+            _ => false,
+        }
+    }
     fn ty(&self) -> Result<Type> {
         use Type::*;
         Ok(match self {
@@ -558,13 +593,16 @@ impl Policy {
                 .as_nanos() as i128,
         })
     }
+    pub fn uses_source_s3_time(&self) -> bool {
+        [&self.selection, &self.update]
+            .into_iter()
+            .flatten()
+            .any(|e| e.root.uses_source_s3_time())
+    }
     pub fn active(&self) -> bool {
         self.selection.is_some() || self.update.is_some()
     }
     pub fn selects(&self, src: &File, path: &[u8]) -> Result<bool> {
-        if src.kind == Some(Kind::Dir) {
-            return Ok(true);
-        }
         self.selection
             .as_ref()
             .map_or(Ok(true), |e| {
@@ -580,17 +618,6 @@ impl Policy {
         let Some(expression) = &self.selection else {
             return Ok(Some(true));
         };
-        if matches!(
-            src,
-            Facts::S3Listing {
-                directory_marker: true,
-                ..
-            }
-        ) {
-            // HEAD distinguishes a directory marker from a file/symlink object
-            // stored under a marker-shaped key. Directories bypass --where.
-            return Ok(None);
-        }
         expression
             .evaluate_known(src, path, Facts::Unread, b"", self.now)
             .context("--where")

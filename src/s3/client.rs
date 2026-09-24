@@ -543,11 +543,8 @@ impl Object {
                 ObjectKind::Symlink => crate::proto::Kind::Symlink,
             }),
             size: Some(self.size),
-            mtime: Some(
-                self.metadata
-                    .as_ref()
-                    .map_or((self.mtime, 0), |m| (m.mtime, m.nsec)),
-            ),
+            mtime: self.metadata.as_ref().map(|m| (m.mtime, m.nsec)),
+            s3_last_modified: Some((self.mtime, 0)),
             mode: self.metadata.as_ref().map(|m| m.mode & 0o7777),
             uid: self.metadata.as_ref().map(|m| m.uid),
             gid: self.metadata.as_ref().map(|m| m.gid),
@@ -778,6 +775,7 @@ pub(super) fn exclusion<'a>(
 
 pub(super) struct Listing {
     pub objects: Vec<(String, u64)>,
+    pub service_times: HashMap<String, (i64, u32)>,
     pub found: bool,
     pub excluded: u64,
 }
@@ -790,12 +788,14 @@ async fn parallel_listing(
     bucket: &str,
     prefix: &str,
     concurrency: usize,
+    retain_times: bool,
 ) -> Result<Listing> {
     use super::listing::engine::{self, Entry, Page, Store};
     struct S3<'a> {
         client: &'a Client,
         bucket: &'a str,
         root: &'a str,
+        retain_times: bool,
         discovery_denied: std::sync::atomic::AtomicBool,
     }
     impl Store for S3<'_> {
@@ -842,7 +842,14 @@ async fn parallel_listing(
                     Ok(Entry {
                         key: object.key().context("S3 listing omitted key")?.to_owned(),
                         size: u64::try_from(object.size().context("S3 listing omitted size")?)?,
-                        last_modified: None,
+                        last_modified: if self.retain_times {
+                            object
+                                .last_modified()
+                                .map(|t| t.fmt(aws_smithy_types::date_time::Format::DateTime))
+                                .transpose()?
+                        } else {
+                            None
+                        },
                         etag: None,
                     })
                 })
@@ -875,13 +882,22 @@ async fn parallel_listing(
         }
     }
     let mut objects = Vec::new();
+    let mut service_times = HashMap::new();
     let store = S3 {
         client,
         bucket,
         root: prefix,
+        retain_times,
         discovery_denied: std::sync::atomic::AtomicBool::new(false),
     };
     let outcome = engine::enumerate_prefix(&store, prefix, concurrency.min(32), |entry| {
+        if let Some(value) = &entry.last_modified {
+            let time = aws_smithy_types::DateTime::from_str(
+                value,
+                aws_smithy_types::date_time::Format::DateTime,
+            )?;
+            service_times.insert(entry.key.clone(), (time.secs(), time.subsec_nanos()));
+        }
         objects.push((entry.key, entry.size));
         Ok(())
     })
@@ -899,7 +915,15 @@ async fn parallel_listing(
         // Exact-prefix IAM policies can permit the original LIST while denying
         // discovery or child prefixes. No caller has consumed the plan yet.
         objects.clear();
+        service_times.clear();
         engine::enumerate_prefix(&store, prefix, 1, |entry| {
+            if let Some(value) = &entry.last_modified {
+                let time = aws_smithy_types::DateTime::from_str(
+                    value,
+                    aws_smithy_types::date_time::Format::DateTime,
+                )?;
+                service_times.insert(entry.key.clone(), (time.secs(), time.subsec_nanos()));
+            }
             objects.push((entry.key, entry.size));
             Ok(())
         })
@@ -911,6 +935,7 @@ async fn parallel_listing(
     Ok(Listing {
         found: !objects.is_empty(),
         objects,
+        service_times,
         excluded: 0,
     })
 }
@@ -929,11 +954,34 @@ pub(super) async fn list(
     excluded_subtrees: &mut std::collections::HashSet<String>,
     concurrency: usize,
 ) -> Result<Listing> {
+    list_with_times(
+        client,
+        bucket,
+        prefix,
+        matcher,
+        excluded_subtrees,
+        concurrency,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn list_with_times(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    matcher: Option<&ignore::gitignore::Gitignore>,
+    excluded_subtrees: &mut std::collections::HashSet<String>,
+    concurrency: usize,
+    retain_times: bool,
+) -> Result<Listing> {
     if matcher.is_none() {
-        return parallel_listing(client, bucket, prefix, concurrency).await;
+        return parallel_listing(client, bucket, prefix, concurrency, retain_times).await;
     }
     let mut result = Listing {
         objects: Vec::new(),
+        service_times: HashMap::new(),
         found: false,
         excluded: 0,
     };
@@ -1066,6 +1114,13 @@ pub(super) async fn list(
                     }
                     result.excluded += excluded.count(excluded_subtrees);
                 } else {
+                    if retain_times {
+                        if let Some(time) = object.last_modified() {
+                            result
+                                .service_times
+                                .insert(key.to_owned(), (time.secs(), time.subsec_nanos()));
+                        }
+                    }
                     result.objects.push((key.to_owned(), size));
                 }
             }

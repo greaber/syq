@@ -100,7 +100,7 @@ impl MapServer {
                     ),
                 ];
                 // A third-party directory marker has no syq timestamp.
-                if file || link {
+                if (file || link) && mode != "plain" {
                     for (name, value) in [
                         (
                             "syq-format",
@@ -375,4 +375,109 @@ fn s3_map_rejects_nonempty_slash_objects_for_named_and_contents_selectors() {
             }
         }
     }
+}
+
+#[test]
+fn s3_mapping_predicates_read_metadata_only_when_needed() {
+    let temp = test_support::tempdir().unwrap();
+    for (expression, count, heads) in [
+        ("src.size > 1B", 2, 1),
+        (
+            "src.s3_last_modified = timestamp('2026-01-01T00:00:00Z')",
+            3,
+            1,
+        ),
+        ("src.name = 'missing' and src.mtime is not null", 0, 1),
+        ("src.kind = 'file'", 1, 4),
+        ("src.mtime is null", 1, 4),
+        (
+            "src.name = 'link' and src.mtime = timestamp('1970-01-01T00:02:03Z')",
+            1,
+            2,
+        ),
+    ] {
+        let server = MapServer::new("ok");
+        let output = server
+            .command(
+                temp.path(),
+                &[
+                    "map",
+                    "--from",
+                    "s3://bucket",
+                    "--srcs-in",
+                    "prefix",
+                    "--where",
+                    expression,
+                ],
+            )
+            .capture_output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{expression}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let entries = records(&output);
+        assert_eq!(entries.len(), count, "{expression}");
+        assert!(entries.iter().all(|e| e.as_object().unwrap().len() == 2));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(
+            requests.iter().filter(|r| r.starts_with("HEAD ")).count(),
+            heads,
+            "{expression}: {requests:?}"
+        );
+        assert!(requests
+            .iter()
+            .all(|r| !r.starts_with("GET /bucket/prefix/")));
+    }
+}
+
+#[test]
+fn s3_null_mtime_keeps_download_fallback_and_supports_opt_out() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = test_support::tempdir().unwrap();
+    let server = MapServer::new("plain");
+    for (name, preserve) in [("default", "mtime"), ("disabled", "-mtime")] {
+        let destination = temp.path().join(name);
+        let output = server.command(temp.path(), &["cp", "--from", "s3://bucket", "-C", "prefix", "--src-non-dir", "nested/line\n%2F+", "--as", destination.to_str().unwrap(), "--where", "src.mtime is null and src.s3_last_modified = timestamp('2026-01-01T00:00:00Z')", &format!("--preserve={preserve}")]).capture_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"data");
+        assert_eq!(
+            std::fs::metadata(&destination).unwrap().mtime() == 1767225600,
+            name == "default"
+        );
+    }
+    server.requests.lock().unwrap().clear();
+    let destination = temp.path().join("default");
+    let output = server
+        .command(
+            temp.path(),
+            &[
+                "cp",
+                "--from",
+                "s3://bucket",
+                "-C",
+                "prefix",
+                "--src-non-dir",
+                "nested/line\n%2F+",
+                "--as",
+                destination.to_str().unwrap(),
+            ],
+        )
+        .capture_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.requests.lock().unwrap();
+    assert!(
+        requests.iter().all(|r| !r.starts_with("GET ")),
+        "unchanged default copy downloaded data: {requests:?}"
+    );
 }

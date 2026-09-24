@@ -1098,6 +1098,7 @@ class AsyncClient:
         src_dir: Selector | None = None,
         from_: str | None = None,
         include: Iterable[str] | None = None,
+        where: str | None = None,
         rsh: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
@@ -1165,6 +1166,7 @@ class AsyncClient:
             sparse=False,
             inplace=False,
             max_delete=None,
+            where=where,
         )
         connection = _Connection(rsh, syq_path, no_bootstrap,
                                  s3_endpoint, s3_region, s3_profile, s3_header)

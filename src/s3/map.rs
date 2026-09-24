@@ -34,12 +34,15 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
             let mut emitter = Emitter {
                 out,
                 fields: &options.include,
+                policy: args.expressions.clone(),
             };
             let mut claims = HashSet::new();
             let details = options
                 .include
                 .iter()
                 .any(|field| matches!(field, Field::Kind | Field::Mtime));
+            let service_time = options.include.contains(&Field::S3LastModified)
+                || args.expressions.uses_source_s3_time();
             for (source, destination) in options.sources.iter().zip(destinations) {
                 let source_path = local::key_path(&source.path)?;
                 let key = local::join(&base, &source_path);
@@ -59,9 +62,17 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                             .content_length()
                             .context("S3 HEAD omitted Content-Length")?,
                     )?;
-                    let object = details
-                        .then(|| client::from_head(&key, &output))
-                        .transpose()?;
+                    let object_time = output.last_modified().map(|time| (time.secs(), time.subsec_nanos()));
+                    let expression_path = crate::expression::source_path(&source.path, b"");
+                    let selected = args.expressions.selects_known(
+                        crate::expression::Facts::S3Listing { size, last_modified: object_time }, expression_path)?;
+                    if selected == Some(false) { continue; }
+                    let object = (details || selected.is_none())
+                        .then(|| client::from_head(&key, &output)).transpose()?;
+                    if selected.is_none() && !args.expressions.selects(
+                        &object.as_ref().expect("expression metadata").expression_file(), expression_path)? {
+                        continue;
+                    }
                     emit(
                         &mut emitter,
                         &mut claims,
@@ -94,58 +105,41 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                         }
                     }
                     let mut objects = stream::iter(
-                        page.entries
-                            .into_iter()
-                            .filter(|entry| !(contents && entry.key == prefix)),
-                    )
-                    .map(|entry| {
+                        page.entries.into_iter().filter(|entry| !(contents && entry.key == prefix)),
+                    ).map(|entry| {
                         let client = &client;
                         let bucket = &storage.bucket;
+                        let prefix = &prefix;
+                        let source_path = &source_path;
+                        let destination = &destination;
                         async move {
-                            let object =
-                                if details {
-                                    Some(client::head(client, bucket, &entry.key).await?.context(
-                                        "S3 source disappeared during mapping generation",
-                                    )?)
-                                } else {
-                                    None
-                                };
-                            Ok::<_, anyhow::Error>((entry, object))
+                            let suffix = entry.key.strip_prefix(prefix)
+                                .context("S3 listing returned a key outside the requested prefix")?;
+                            let marker = client::is_directory_marker(&entry.key, entry.size);
+                            let suffix = if marker { suffix.strip_suffix('/').unwrap_or(suffix) } else { suffix };
+                            let src = if contents { suffix.to_owned() } else { local::join(source_path, suffix) };
+                            let dst = local::join(std::str::from_utf8(destination)?, suffix);
+                            let object_time = if service_time { listed_time(&entry)? } else { None };
+                            let expression_path = crate::expression::source_path(source_path.as_bytes(), suffix.as_bytes());
+                            let selected = args.expressions.selects_known(
+                                crate::expression::Facts::S3Listing { size: entry.size, last_modified: object_time },
+                                expression_path)?;
+                            if selected == Some(false) { return Ok(None); }
+                            let object = if details || selected.is_none() {
+                                Some(client::head(client, bucket, &entry.key).await?
+                                    .context("S3 source disappeared during mapping generation")?)
+                            } else { None };
+                            if selected.is_none() && !args.expressions.selects(
+                                &object.as_ref().expect("expression metadata").expression_file(), expression_path)? {
+                                return Ok(None);
+                            }
+                            Ok::<_, anyhow::Error>(Some((src, dst, entry.size, object, object_time, marker)))
                         }
-                    })
-                    .buffered(32);
-                    while let Some((entry, object)) = objects.try_next().await? {
-                        let suffix = entry
-                            .key
-                            .strip_prefix(&prefix)
-                            .context("S3 listing returned a key outside the requested prefix")?;
-                        let marker = client::is_directory_marker(&entry.key, entry.size);
-                        let suffix = if marker {
-                            suffix.strip_suffix('/').unwrap_or(suffix)
-                        } else {
-                            suffix
-                        };
-                        let src = if contents {
-                            suffix.to_owned()
-                        } else {
-                            local::join(&source_path, suffix)
-                        };
-                        let dst = local::join(std::str::from_utf8(&destination)?, suffix);
-                        let object_time = if options.include.contains(&Field::S3LastModified) {
-                            listed_time(&entry)?
-                        } else {
-                            None
-                        };
-                        emit(
-                            &mut emitter,
-                            &mut claims,
-                            src.as_bytes(),
-                            dst.as_bytes(),
-                            entry.size,
-                            object.as_ref(),
-                            object_time,
-                            marker,
-                        )?;
+                    }).buffered(32);
+                    while let Some(record) = objects.try_next().await? {
+                        let Some((src, dst, size, object, object_time, marker)) = record else { continue; };
+                        emit(&mut emitter, &mut claims, src.as_bytes(), dst.as_bytes(), size,
+                            object.as_ref(), object_time.map(|(s, _)| s), marker)?;
                     }
                     token = page.next;
                     if token.is_none() {
@@ -160,7 +154,7 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
         })
 }
 
-fn listed_time(entry: &Entry) -> Result<Option<i64>> {
+fn listed_time(entry: &Entry) -> Result<Option<(i64, u32)>> {
     entry
         .last_modified
         .as_deref()
@@ -169,7 +163,7 @@ fn listed_time(entry: &Entry) -> Result<Option<i64>> {
                 value,
                 aws_smithy_types::date_time::Format::DateTime,
             )
-            .map(|time| time.secs())
+            .map(|time| (time.secs(), time.subsec_nanos()))
             .context("invalid S3 Last-Modified")
         })
         .transpose()

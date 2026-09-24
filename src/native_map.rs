@@ -53,6 +53,8 @@ pub struct Options {
     pub sources: Vec<Source>,
     pub follow: bool,
     pub include: Vec<Field>,
+    pub where_expression: Option<String>,
+    pub expression_now: i128,
 }
 
 impl Options {
@@ -71,6 +73,8 @@ impl Options {
                 .collect(),
             follow: args.follows_native_source_paths(),
             include: args.native_map_include.clone(),
+            where_expression: args.where_expression.clone(),
+            expression_now: args.expressions.now,
         }
     }
 
@@ -104,6 +108,7 @@ impl Options {
 pub struct Emitter<'a, W> {
     pub out: &'a mut W,
     pub fields: &'a [Field],
+    pub(crate) policy: crate::expression::Policy,
 }
 
 impl<W: Write> Emitter<'_, W> {
@@ -208,9 +213,12 @@ pub fn write_local(options: &Options, out: &mut impl Write) -> Result<()> {
     };
     let base = pin_base(options, &options.sources, symlink_policy)?;
     let destinations = options.destinations()?;
+    let mut policy = crate::expression::Policy::compile(options.where_expression.as_deref(), None)?;
+    policy.now = options.expression_now;
     let mut emitter = Emitter {
         out,
         fields: &options.include,
+        policy,
     };
     for (location, destination) in options.sources.iter().zip(destinations) {
         let selection = pin_selection(&base, location, follow_src, symlink_policy)?;
@@ -523,6 +531,14 @@ fn hold_map_selection_for_test() -> Result<()> {
 }
 
 fn emit(out: &mut Emitter<'_, impl Write>, src: &[u8], dst: &[u8], entry: &Entry) -> Result<()> {
+    if out.policy.selection.is_some()
+        && !out.policy.selects(
+            &crate::expression::File::from_entry(entry),
+            crate::expression::source_path(src, &entry.path),
+        )?
+    {
+        return Ok(());
+    }
     let kind = match entry.kind {
         Kind::Dir => "dir",
         Kind::File => "file",

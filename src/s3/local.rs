@@ -528,19 +528,21 @@ pub(super) fn apply_metadata(
         };
         crate::fsops::set_mode_handle(&file, mode)?;
     }
-    root.set_times(
-        path,
-        &[
-            libc::timespec {
-                tv_sec: 0,
-                tv_nsec: libc::UTIME_OMIT,
-            },
-            libc::timespec {
-                tv_sec: metadata.mtime as _,
-                tv_nsec: metadata.nsec as _,
-            },
-        ],
-    )?;
+    if args.times || explicit.mtime.is_some() {
+        root.set_times(
+            path,
+            &[
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                },
+                libc::timespec {
+                    tv_sec: metadata.mtime as _,
+                    tv_nsec: metadata.nsec as _,
+                },
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -570,7 +572,7 @@ pub(super) fn apply_file_metadata(
             mtime_nsec: metadata.nsec,
         },
         flags::MODE
-            | flags::TIMES
+            | if args.times { flags::TIMES } else { 0 }
             | explicit.apply_flags()
             | if args.owner || explicit.uid.is_some() {
                 flags::OWNER

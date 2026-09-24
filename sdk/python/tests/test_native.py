@@ -773,9 +773,15 @@ class NativeClientTests(unittest.TestCase):
             ["--ignore-from", "rules", "--ignore", "!keep.tmp"],
         )
 
+    def test_mtime_opt_out_is_an_attached_option_value(self) -> None:
+        self.client.cp(src="source", into="target", preserve=["permissions", "-mtime"])
+        self.assertIn("--preserve=-mtime", self.argv())
+        with self.assertRaises(syq.SyqInvocationError):
+            self.client.cp(src="source", into="target", preserve="-permissions")
+
     def test_map_is_streaming_typed_and_context_managed(self) -> None:
         with self.client.map(
-            srcs_in="source", root="source-root", follow_src=True
+            srcs_in="source", root="source-root", follow_src=True, where="src.kind = 'file'"
         ) as stream:
             entries = list(stream)
         self.assertEqual(len(entries), 1)
@@ -784,6 +790,7 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(self.argv()[0], "map")
         self.assertIn("--root", self.argv())
         self.assertIn("--follow-src", self.argv())
+        self.assertEqual(self.argv()[self.argv().index("--where") + 1], "src.kind = 'file'")
         self.assertEqual(stream.cwd, Path.cwd() / "source-root" / "source")
 
     def test_remote_map_keeps_endpoint_and_base_through_transform(self) -> None:

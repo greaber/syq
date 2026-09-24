@@ -293,7 +293,15 @@ in-place writes with other copy policies.
 ## Preserve metadata
 
 Syq preserves modification times and copies symlinks as links, like rsync with
-`-t -l`. Existing files keep their destination permissions. New files use the
+`-t -l`. Use `--preserve=-mtime` to leave modification times as produced by
+writing. `--preserve=mtime` enables preservation again; `times` remains an alias
+for `mtime`. Repeated settings take effect in order, with the last one winning.
+Other preservation features are off unless requested and have no negative form.
+Disabling modification-time preservation can make later copies do more work
+because source and destination times no longer match. Explicit mapping
+`metadata.mtime` still sets the requested destination time.
+
+Existing files keep their destination permissions. New files use the
 source read, write, and execute permissions, limited by the destination umask.
 For example, a new script with mode `755` stays executable with umask `022`.
 

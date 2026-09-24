@@ -990,6 +990,9 @@ fn run_remote(
     for line in &args.ignore_lines {
         remote.push(format!("--ignore={line}"));
     }
+    if !args.times {
+        remote.push("--preserve=-mtime".into());
+    }
     if args.acls {
         remote.push("--preserve=acls".into());
     }

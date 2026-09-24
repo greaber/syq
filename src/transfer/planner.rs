@@ -931,6 +931,25 @@ impl Planner<'_> {
                         continue;
                     }
                 }
+                // Filter real mapping entries before synthesizing containers;
+                // an excluded leaf must not create its otherwise unused parents.
+                if self.opts.expressions.selection.is_some()
+                    && !self
+                        .opts
+                        .expressions
+                        .selects(&crate::expression::File::from_entry(&e), &m.src)
+                        .with_context(|| {
+                            format!("--mapping line {line_number}: source {}", display(&m.src))
+                        })?
+                {
+                    if self.opts.delete {
+                        self.dst_seen
+                            .entry(join(dst_root, &m.dst))
+                            .or_insert(Claim::Weak);
+                    }
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                    continue;
+                }
                 // Destination ancestors: consistent with what earlier entries
                 // established, with missing ones synthesized parent-first.
                 let mut conflict = false;
@@ -1064,13 +1083,9 @@ impl Planner<'_> {
         sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
-        let batch = if self.opts.expressions.selection.is_some() {
+        let batch = if self.opts.expressions.selection.is_some() && !self.mapping_mode {
             let mut selected = Vec::with_capacity(batch.len());
             for entry in batch {
-                if entry.kind == Kind::Dir {
-                    selected.push(entry);
-                    continue;
-                }
                 let relative = self
                     .src_overrides
                     .get(&entry.path)
@@ -1091,9 +1106,45 @@ impl Planner<'_> {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     continue;
                 }
+                if entry.kind == Kind::Dir {
+                    // A later selected source can supply metadata for a parent
+                    // an earlier source needed only as a container.
+                    self.implicit_dirs
+                        .remove(&join(dst_root, &join(sub, &entry.path)));
+                }
                 selected.push(entry);
             }
-            selected
+            // A selected descendant may need an unselected directory as a
+            // container. Synthesize only those ancestors, with the same
+            // receiver-default metadata used by file-only mappings.
+            let mut present: std::collections::HashSet<PathBytes> = selected
+                .iter()
+                .filter(|entry| entry.kind == Kind::Dir)
+                .map(|entry| entry.path.clone())
+                .collect();
+            let mut with_parents = Vec::with_capacity(selected.len());
+            for entry in selected {
+                if !entry.path.is_empty() {
+                    for end in std::iter::once(0).chain(
+                        entry
+                            .path
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, byte)| (*byte == b'/').then_some(i)),
+                    ) {
+                        let ancestor = &entry.path[..end];
+                        let destination = join(dst_root, &join(sub, ancestor));
+                        if !matches!(self.dst_seen.get(&destination), Some(Claim::Dir))
+                            && present.insert(ancestor.to_vec())
+                        {
+                            self.implicit_dirs.insert(destination);
+                            with_parents.push(implicit_dir_entry(ancestor.to_vec()));
+                        }
+                    }
+                }
+                with_parents.push(entry);
+            }
+            with_parents
         } else {
             batch
         };
@@ -2193,7 +2244,7 @@ impl Planner<'_> {
                 self.blocked_directory_paths.insert(p);
                 continue;
             }
-            if opts.expressions.update.is_some() {
+            if opts.expressions.update.is_some() && !self.implicit_dirs.contains(&p) {
                 let source = crate::expression::File::from_entry(&e);
                 let destination = st
                     .as_ref()

@@ -251,7 +251,7 @@ fn expressions_reject_streams_and_copy_if_rejects_inplace() {
 }
 
 #[test]
-fn where_filters_leaves_and_copy_if_controls_directory_metadata() {
+fn where_selects_directories_and_copy_if_controls_their_metadata() {
     let t = Tmp::new();
     write(&t.path("src/private/keep.jpg"), b"selected");
     write(&t.path("src/private/skip.txt"), b"excluded");
@@ -267,7 +267,7 @@ fn where_filters_leaves_and_copy_if_controls_directory_metadata() {
             &t.s("dst"),
             "--preserve=permissions",
             "--where",
-            "src.extension = 'jpg'",
+            "src.kind = 'dir' or src.extension = 'jpg'",
         ]);
         assert_eq!(
             fs::metadata(t.path("dst/private")).unwrap().mode() & 0o777,
@@ -289,7 +289,7 @@ fn where_filters_leaves_and_copy_if_controls_directory_metadata() {
         &t.s("dst"),
         "--preserve=permissions",
         "--where",
-        "src.extension = 'jpg'",
+        "src.kind = 'dir' or src.extension = 'jpg'",
         "--copy-if",
         "src.kind != 'dir'",
     ]);
@@ -311,7 +311,7 @@ fn where_filters_leaves_and_copy_if_controls_directory_metadata() {
     ]);
     assert_eq!(
         fs::metadata(t.path("dst/private")).unwrap().mode() & 0o777,
-        0o700
+        0o755
     );
 }
 
@@ -480,4 +480,31 @@ fn destination_inspection_errors_are_not_missing_entries() {
             Path::new("destination-target")
         );
     }
+}
+
+#[test]
+fn later_selected_directory_supplies_metadata_for_an_implicit_parent() {
+    let t = Tmp::new();
+    write(&t.path("first/shared/one"), b"one");
+    write(&t.path("second/shared/two"), b"two");
+    fs::set_permissions(t.path("first/shared"), fs::Permissions::from_mode(0o750)).unwrap();
+    fs::set_permissions(t.path("second/shared"), fs::Permissions::from_mode(0o700)).unwrap();
+    run_native_ok(&[
+        "cp",
+        "--srcs-in",
+        &t.s("first"),
+        "--srcs-in",
+        &t.s("second"),
+        "--into",
+        &t.s("dst"),
+        "--preserve=permissions",
+        "--where",
+        "src.kind != 'dir' or src.mode = 0o700",
+    ]);
+    assert_eq!(read(&t.path("dst/shared/one")), b"one");
+    assert_eq!(read(&t.path("dst/shared/two")), b"two");
+    assert_eq!(
+        fs::metadata(t.path("dst/shared")).unwrap().mode() & 0o777,
+        0o700
+    );
 }

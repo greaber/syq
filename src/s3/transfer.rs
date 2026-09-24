@@ -66,6 +66,7 @@ impl Drop for Engine {
 struct Download {
     expression_path: String,
     expression_destination_path: String,
+    service_time: Option<(i64, u32)>,
     kind: ObjectKind,
     key: String,
     path: String,
@@ -1397,13 +1398,14 @@ impl Engine {
             let (exact, listed) = if directory && self.args.native_mapping.is_none() {
                 let (exact, listed) = tokio::try_join!(
                     exact,
-                    client::list(
+                    client::list_with_times(
                         &self.client,
                         source_bucket,
                         &prefix,
                         matcher.as_ref(),
                         &mut excluded_subtrees,
                         self.options.concurrency,
+                        self.args.expressions.uses_source_s3_time(),
                     )
                 )?;
                 (exact, Some(listed))
@@ -1445,6 +1447,7 @@ impl Engine {
                     path.clone(),
                     kind,
                     directory,
+                    None,
                     Some(object),
                 )]
             } else if let Some(exact) = exact {
@@ -1456,22 +1459,24 @@ impl Engine {
                     path.clone(),
                     kind,
                     directory,
+                    None,
                     Some(exact),
                 )]
             } else {
                 if selection == SourceSelection::File {
                     bail!("S3 source object {key:?} is missing");
                 }
-                let listed = match listed {
+                let mut listed = match listed {
                     Some(listed) => listed,
                     None => {
-                        client::list(
+                        client::list_with_times(
                             &self.client,
                             source_bucket,
                             &prefix,
                             matcher.as_ref(),
                             &mut excluded_subtrees,
                             self.options.concurrency,
+                            self.args.expressions.uses_source_s3_time(),
                         )
                         .await?
                     }
@@ -1521,18 +1526,20 @@ impl Engine {
                     } else {
                         ObjectKind::File
                     };
+                    let service_time = listed.service_times.remove(&object);
                     objects.push((
                         object,
                         size,
                         local::join(&path, &suffix),
                         kind,
                         directory,
+                        service_time,
                         None,
                     ));
                 }
                 objects
             };
-            for (key, size, path, kind, directory, source_object) in objects {
+            for (key, size, path, kind, directory, service_time, source_object) in objects {
                 if !already_filtered {
                     if let Some(excluded) =
                         client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
@@ -1629,7 +1636,7 @@ impl Engine {
                 let facts = known_source.as_ref().map_or(
                     crate::expression::Facts::S3Listing {
                         size,
-                        directory_marker: directory,
+                        last_modified: service_time,
                     },
                     crate::expression::Facts::Complete,
                 );
@@ -1652,6 +1659,7 @@ impl Engine {
                 out.push(Download {
                     expression_path,
                     expression_destination_path,
+                    service_time,
                     kind,
                     key,
                     path,
@@ -1684,7 +1692,7 @@ impl Engine {
         let source_facts = known_source.as_ref().map_or(
             crate::expression::Facts::S3Listing {
                 size: job.size,
-                directory_marker: client::is_directory_marker(&job.key, job.size),
+                last_modified: job.service_time,
             },
             crate::expression::Facts::Complete,
         );
@@ -1933,7 +1941,8 @@ impl Engine {
                     && metadata.mode & 0o7777 != current.mode & 0o7777)
                     || ((self.args.owner || explicit.uid.is_some()) && metadata.uid != current.uid)
                     || ((self.args.group || explicit.gid.is_some()) && metadata.gid != current.gid)
-                    || (metadata.mtime, metadata.nsec) != (current.mtime, current.mtime_nsec);
+                    || ((self.args.times || explicit.mtime.is_some())
+                        && (metadata.mtime, metadata.nsec) != (current.mtime, current.mtime_nsec));
                 if differs {
                     if self.args.verbose > 0 {
                         self.progress.println(&format!(

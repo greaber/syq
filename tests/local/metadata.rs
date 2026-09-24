@@ -1180,3 +1180,54 @@ fn rsync_new_remote_files_use_receiver_umask() {
     }
     assert_eq!(read(&t.path("dst/file")), read(&t.path("src/file")));
 }
+
+#[test]
+fn native_mtime_opt_out_keeps_write_times_and_other_preservation() {
+    let t = Tmp::new();
+    write(&t.path("src/nested/file"), b"contents");
+    fs::create_dir_all(t.path("src/empty")).unwrap();
+    std::os::unix::fs::symlink("nested/file", t.path("src/link")).unwrap();
+    for path in [
+        "src",
+        "src/nested",
+        "src/nested/file",
+        "src/empty",
+        "src/link",
+    ] {
+        set_mtime(&t.path(path), 123);
+    }
+    fs::set_permissions(t.path("src/nested/file"), fs::Permissions::from_mode(0o600)).unwrap();
+    for (dest, option, preserved) in [
+        ("default", "--preserve=permissions", true),
+        ("disabled", "--preserve=permissions,-mtime", false),
+    ] {
+        run_native_ok(&["cp", &t.s("src"), "--as", &t.s(dest), option]);
+        for path in ["", "/nested", "/nested/file", "/empty", "/link"] {
+            let m = fs::symlink_metadata(t.path(&format!("{dest}{path}"))).unwrap();
+            assert_eq!(m.mtime() == 123, preserved, "{dest}{path}");
+        }
+        assert_eq!(
+            fs::metadata(t.path(&format!("{dest}/nested/file")))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    // Content-based no-op copies must not restore the disabled timestamp either.
+    set_mtime(&t.path("disabled/nested/file"), 456);
+    run_native_ok(&[
+        "cp",
+        &t.s("src/nested/file"),
+        "--as",
+        &t.s("disabled/nested/file"),
+        "--hash",
+        "--preserve=-mtime",
+    ]);
+    assert_eq!(
+        fs::metadata(t.path("disabled/nested/file"))
+            .unwrap()
+            .mtime(),
+        456
+    );
+}

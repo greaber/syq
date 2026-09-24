@@ -91,7 +91,7 @@ In addition to the shared arguments above, it accepts:
 | `only_new` | Boolean: copy missing entries without replacing existing ones |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
-| `preserve` | Preservation string or iterable: `times`, `permissions`, `ownership`, `specials`, `hardlinks`, `acls`, `xattrs`, `atimes`, `crtimes`; see [filesystem preservation](https://greaber.github.io/syq/reference.html#preserve-metadata) for platform and route support |
+| `preserve` | Preservation string or iterable: `mtime` (on by default), `-mtime` (opt out), `times` (alias for `mtime`), `permissions`, `ownership`, `specials`, `hardlinks`, `acls`, `xattrs`, `atimes`, `crtimes`; see [filesystem preservation](https://greaber.github.io/syq/reference.html#preserve-metadata) for platform and route support |
 | `open_noatime` | Boolean: request file reads without access-time updates; warns and continues if unavailable |
 | `sparse` | Boolean: turn written zero ranges into sparse holes on filesystem destinations |
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
@@ -294,7 +294,10 @@ one version of one exact key. These options are mutually exclusive.
 `map(*sources, **options) → MapStream` lists local, SSH, or S3 source entries
 without copying. Use `from_="server"` or `from_="s3://bucket"` for a remote
 source. Besides the shared arguments, it accepts `as_` to rename a selected
-object. `srcs_in` must be the sole selector when used.
+object. `srcs_in` must be the sole selector when used. `where` accepts the same
+source expression as `cp(where=...)`, including directory selection. Unselected
+directories remain traversable, and expression fields are included in output
+only when requested through `include`.
 
 By default entries contain only source and destination paths. `include` is an
 iterable of field names: `kind`, `size`, `mtime`, and `s3_last_modified`.

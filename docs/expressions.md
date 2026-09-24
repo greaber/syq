@@ -1,7 +1,7 @@
 # Select entries with expressions
 
-Use `--where` to select non-directory source entries and `--copy-if` to decide whether an
-entry may update its destination. Both take a quoted expression:
+Use `--where` to select source entries in `map` and `cp`, and `--copy-if`
+to decide whether a copy may update its destination. Both take a quoted expression:
 
 ```sh
 # Copy regular files between 1 MiB and 100 MiB.
@@ -17,14 +17,14 @@ syq cp --srcs-in photos --into archive --ignore-from .gitignore \
   --where 'src.name matches "(?i)\\.jpe?g$" and src.mtime >= now - 7d'
 ```
 
-These options work with local, SSH, and S3 pathname copies. They do not apply
-to descriptor or pipe copies. `syq map` does not accept them.
+`--where` works with local, SSH, and S3 sources in both commands. `--copy-if`
+is available only for `cp`. Neither applies to descriptor or pipe copies.
 
 ## Selection and updates
 
 `--where` accepts only `src` fields. `--copy-if` accepts both `src` and `dst`:
 `dst` always names the destination chosen by the copy's placement or mapping.
-For non-directory entries, both options must pass when present. Existing policies such as
+Both options must pass when present. Existing policies such as
 `--only-new` also apply. Each expression option can be supplied once; combine
 conditions with `and` and `or`.
 
@@ -32,23 +32,26 @@ A true expression allows the copy to proceed through its normal comparison.
 It does not force a rewrite of an unchanged file. Use `--hash` when contents
 must be compared even if size and modification time match.
 
-Directories bypass `--where` and follow the normal creation and metadata rules,
-including any `--preserve=FEATURE` controls. They remain traversable and can be
-created even when none of their children are selected. For example, this copies
-JPEGs while preserving the permissions of their containing directories:
+Directories are selected by the same expression as files. A directory failing
+`--where` remains traversable: its children are tested independently. Copying a
+selected child can create necessary parent directories, using destination
+defaults rather than the unselected source directory's metadata. Existing
+unselected directories keep their metadata apart from changes caused by adding
+or removing children. With no filter, directories, including empty ones, are
+selected as usual.
+
+To select JPEGs and also copy all directory entries, including empty directories:
 
 ```sh
 syq cp --srcs-in photos --into archive --preserve=permissions \
-  --where 'src.extension = "jpg"'
+  --where 'src.kind = "dir" or src.extension = "jpg"'
 ```
 
-`--copy-if` applies to directories too: a false result suppresses their source
-metadata, without blocking their children. Existing filesystem directories then
-keep their metadata, apart from the effects of adding or removing children;
-their permissions can be temporarily reopened for copying and are restored
-afterward. New containers use receiver defaults, including umask and setgid
-inheritance. On S3, directory-marker objects bypass `--where`; `--copy-if` can
-skip their copy, while keys beneath them are considered independently.
+`map --where` emits matching records; metadata used by the expression is added
+to those records only when requested with `--include`. `cp --copy-if` also
+applies to directories: a false result suppresses their source metadata,
+without blocking selected children. On S3, directory-marker objects are tested
+independently from the objects beneath their prefix.
 
 Use [ignore rules](reference.md#ignoring-paths) to stop traversal of a subtree.
 An expression cannot re-include an ignored path. With `--prune`, excluded
@@ -84,7 +87,8 @@ the selected entry; recursively discovered symlinks are not followed.
 | `exists` | Whether the entry exists; always true for a scanned source |
 | `kind` | `"file"`, `"dir"`, `"symlink"`, `"fifo"`, `"socket"`, `"char"`, `"block"`, or `"other"` |
 | `size` | Entry size in bytes; regular-file length. Sizes of other filesystem entry types are platform-dependent. |
-| `mtime` | Modification timestamp, including nanoseconds when available |
+| `mtime` | Filesystem modification timestamp, stored in syq object metadata on S3; `null` when unavailable |
+| `s3_last_modified` | S3 service modification timestamp; `null` on filesystem endpoints |
 | `ctime` | Filesystem status-change timestamp, not creation time |
 | `mode` | Permission and special bits as an integer; excludes the entry type |
 | `uid`, `gid` | Numeric owner and group IDs |
@@ -99,11 +103,13 @@ equal numbers on separate hosts do not establish a shared identity.
 For an absent destination, `exists` is false, path fields still describe its
 placement, and metadata fields are `null`. S3 has no `ctime`, device, inode,
 link count, or exposed link-target field. Permissions and ownership are
-available only when the object carries syq metadata. S3 `mtime` uses stored
-source time when present, otherwise the provider's modification time.
+available only when the object carries syq metadata. `mtime` and `s3_last_modified` are separate facts. Use
+`coalesce(src.mtime, src.s3_last_modified)` to explicitly prefer stored time
+with a service-time fallback. Downloaded files use that fallback by default
+when restoring their modification times; see [S3 metadata](object-storage.md#filesystem-differences).
 
-S3 evaluates conditions from listing data when possible. Path, name, extension,
-and size conditions do not require an extra per-object metadata request. Put
+S3 evaluates conditions from listing data when possible. Path, name, extension, size,
+and `s3_last_modified` conditions do not require an extra per-object metadata request. Put
 cheap conditions first: a filename test can reject an object before a later
 condition needs its stored modification time, kind, permissions, or ownership.
 Metadata requests still apply when needed for comparison, authorization, or

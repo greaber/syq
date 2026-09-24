@@ -100,7 +100,7 @@ fn overflow_limits_and_zero_division() {
 fn partial_facts_keep_unread_metadata_distinct_from_null() {
     let listed = Facts::S3Listing {
         size: 12,
-        directory_marker: false,
+        last_modified: Some((123, 0)),
     };
     for (expression, expected) in [
         ("src.size > 1B and src.name = 'keep.jpg'", Some(true)),
@@ -142,28 +142,58 @@ fn partial_facts_keep_unread_metadata_distinct_from_null() {
 }
 
 #[test]
-fn directory_selection_bypasses_where_but_not_copy_if() {
+fn directory_selection_uses_the_same_predicate_as_files() {
     let directory = File {
         exists: true,
         kind: Some(Kind::Dir),
         ..File::default()
     };
-    let policy = Policy::compile(Some("1 / 0 = 0"), Some("false")).unwrap();
-    assert!(policy.selects(&directory, b"dir").unwrap());
-    assert!(!policy
-        .permits(&directory, b"dir", &File::default(), b"dir")
+    assert!(!Policy::compile(Some("src.kind = 'file'"), None)
+        .unwrap()
+        .selects(&directory, b"dir")
         .unwrap());
-    // Listing shape alone does not override the kind in object metadata.
+    assert!(Policy::compile(Some("1 / 0 = 0"), None)
+        .unwrap()
+        .selects(&directory, b"dir")
+        .is_err());
     assert_eq!(
-        policy
+        Policy::compile(Some("src.name = 'keep'"), None)
+            .unwrap()
             .selects_known(
                 Facts::S3Listing {
                     size: 0,
-                    directory_marker: true
+                    last_modified: None
                 },
                 b"dir"
             )
             .unwrap(),
-        None
+        Some(false)
     );
+}
+
+#[test]
+fn service_time_is_distinct_and_available_from_listing() {
+    let facts = Facts::S3Listing {
+        size: 4,
+        last_modified: Some((123, 123_456_789)),
+    };
+    let policy = Policy::compile(
+        Some("src.s3_last_modified = timestamp('1970-01-01T00:02:03.123456789Z')"),
+        None,
+    )
+    .unwrap();
+    assert!(policy.uses_source_s3_time());
+    assert_eq!(policy.selects_known(facts, b"file").unwrap(), Some(true));
+    let file = File {
+        exists: true,
+        s3_last_modified: Some((123, 0)),
+        ..File::default()
+    };
+    assert!(Policy::compile(
+        Some("src.mtime is null and src.s3_last_modified is not null"),
+        None
+    )
+    .unwrap()
+    .selects(&file, b"file")
+    .unwrap());
 }

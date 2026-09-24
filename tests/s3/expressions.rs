@@ -181,6 +181,10 @@ fn listing_fields_select_without_object_heads() {
     for options in [
         vec!["--where", "src.size > 1B"],
         vec!["--where", "src.name = 'keep'"],
+        vec![
+            "--where",
+            "src.name = 'keep' and src.s3_last_modified = timestamp('2026-01-01T00:00:00Z')",
+        ],
         vec!["--copy-if", "src.path = 'keep' and not dst.exists"],
         vec![
             "--where",

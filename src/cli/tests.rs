@@ -955,3 +955,36 @@ fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
         }
     }
 }
+
+#[test]
+fn native_mtime_preservation_is_default_and_last_explicit_setting_wins() {
+    for (options, expected, explicit) in [
+        (vec![], true, false),
+        (vec!["--preserve=mtime"], true, true),
+        (vec!["--preserve=times"], true, true), // released spelling
+        (vec!["--preserve=permissions,-mtime"], false, false),
+        (vec!["--preserve=mtime,-mtime"], false, false),
+        (vec!["--preserve=-mtime", "--preserve=mtime"], true, true),
+        (vec!["--preserve=times", "--preserve=-mtime"], false, false),
+    ] {
+        let mut command = options.clone();
+        command.extend(["source", "--as", "destination"]);
+        let args = parse_native_copy(&argv(&command)).unwrap();
+        assert_eq!(args.times, expected, "{options:?}");
+        assert_eq!(args.stream_preserve_times, explicit, "{options:?}");
+    }
+    for option in [
+        "--preserve=-permissions",
+        "--preserve=-times",
+        "--preserve=-ownership",
+    ] {
+        assert!(NativeCopyCommand::try_parse_from([
+            "syq cp",
+            option,
+            "source",
+            "--as",
+            "destination"
+        ])
+        .is_err());
+    }
+}

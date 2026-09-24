@@ -35,7 +35,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--src-non-dirs <PATH>...` | Select several named non-directory source objects |
 | `--src-dirs <DIR>...` | Select several named source directories |
 | `--srcs <PATH>...` | Select several named source objects |
-| `--where <EXPR>` | Select non-directory source entries with a typed expression; directories follow normal copy rules |
+| `--where <EXPR>` | Select source entries with a typed expression; unselected directories remain traversable |
 | `--ignore <PATTERN>` | Skip paths matching a gitignore-style pattern (repeatable) |
 | `--ignore-from <FILE>` | Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order) |
 | `[PATH]...` | Named source objects (shorthand for --src) |
@@ -75,7 +75,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow` | Follow symlinks in all directly supplied filesystem paths |
 | `--follow-src` | Follow symlinks in directly supplied source paths |
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
-| `--preserve <FEATURE>` | Preserve selected filesystem metadata or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- times: Preserve modification times (already the default for named destinations)<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination |
+| `--preserve <FEATURE>` | Preserve selected filesystem metadata or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Preserve modification times (already the default for named destinations)<br>- -mtime: Leave filesystem modification times as produced by writing<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination |
 | `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
 | `--sparse` | Turn written zero ranges into sparse holes |
 
@@ -222,7 +222,7 @@ destination directory must be readable before syq can temporarily repair
 missing write or search permission.
 
 Modification times are preserved for named file destinations. Output
-descriptors require explicit `--preserve=times`; see below.
+descriptors require explicit `--preserve=mtime`; see below.
 
 ## File descriptors
 
@@ -308,7 +308,7 @@ destination umask; existing files keep their permissions. S3 uploads store file
 attributes in object metadata.
 
 Output descriptors use the timestamps from normal writes, including when
-appending to an existing file. Add `--preserve=times` to copy the source
+appending to an existing file. Add `--preserve=mtime` to copy the source
 modification time instead; this changes the whole destination file's timestamp
 even for a partial write. `--preserve=permissions,ownership` copies those
 attributes without changing timestamps. S3 downloads interpret object metadata

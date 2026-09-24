@@ -194,7 +194,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_map_is_a_lazy_async_context_managed_stream(self) -> None:
         stream = self.client.map(
-            srcs_in="source", root="source-root", follow_src=True
+            srcs_in="source", root="source-root", follow_src=True, where="src.kind = 'file'"
         )
         self.assertFalse(self.argv_log.exists(), "map started before it was consumed")
         async with stream:
@@ -203,6 +203,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
                 if time.monotonic() >= deadline:
                     self.fail("fake syq map did not record its arguments")
                 await asyncio.sleep(0.01)
+            self.assertEqual(self.argv()[self.argv().index("--where") + 1], "src.kind = 'file'")
             self.assertIn("--follow-src", self.argv())
             self.assertIn("--root", self.argv())
             copied = await self.client.cp(
