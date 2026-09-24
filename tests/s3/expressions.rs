@@ -224,32 +224,39 @@ fn listing_fields_select_without_object_heads() {
 
 #[test]
 fn listing_times_stay_with_selected_jobs_after_filtering() {
-    let temp = test_support::tempdir().unwrap();
-    let server = ExpressionServer::new();
-    let output = server.copy(temp.path(), &[
+    // Exercise both sorted parallel listings and exclusion-aware flat listings.
+    for ignored in [false, true] {
+        let temp = test_support::tempdir().unwrap();
+        let server = ExpressionServer::new();
+        let mut options = vec![
         "--where", "src.name != 'skip'",
         "--copy-if", "not dst.exists and ((src.name = 'keep' and src.s3_last_modified = timestamp('2026-01-01T00:00:00Z')) or (src.name = 'link' and src.s3_last_modified = timestamp('2026-01-03T00:00:00Z')))",
-    ]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        std::fs::read(temp.path().join("out/keep")).unwrap(),
-        b"data"
-    );
-    assert_eq!(
-        std::fs::read_link(temp.path().join("out/link")).unwrap(),
-        Path::new("data")
-    );
-    assert!(!temp.path().join("out/skip").exists());
-    assert!(
-        server.object_heads().is_empty(),
-        "{:?}",
-        server.object_heads()
-    );
-    assert_eq!(server.gets(), 2);
+    ];
+        if ignored {
+            options.extend(["--ignore", "unmatched"]);
+        }
+        let output = server.copy(temp.path(), &options);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("out/keep")).unwrap(),
+            b"data"
+        );
+        assert_eq!(
+            std::fs::read_link(temp.path().join("out/link")).unwrap(),
+            Path::new("data")
+        );
+        assert!(!temp.path().join("out/skip").exists());
+        assert!(
+            server.object_heads().is_empty(),
+            "{:?}",
+            server.object_heads()
+        );
+        assert_eq!(server.gets(), 2);
+    }
 }
 
 #[test]
