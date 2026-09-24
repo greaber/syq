@@ -127,7 +127,7 @@ impl File {
         }
     }
     pub fn from_root(m: crate::rooted::RootMetadata) -> Self {
-        let kind = match m.mode & libc::S_IFMT {
+        let kind = match (m.mode as libc::mode_t) & libc::S_IFMT {
             libc::S_IFREG => Kind::File,
             libc::S_IFDIR => Kind::Dir,
             libc::S_IFLNK => Kind::Symlink,
