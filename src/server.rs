@@ -561,6 +561,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::ListDir { .. }
                     | Request::ListDirDetails { .. }
                     | Request::ListDirNoFollowFinal { .. }
+                    | Request::NativeMap(_)
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }
@@ -722,6 +723,30 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         w.write_msg(&Response::TcpCongestionRejected(format!("{e:#}")))?
                     }
                     Err(e) => w.write_msg(&Response::Err(format!("{e:#}")))?,
+                }
+            }
+            Request::NativeMap(options) => {
+                struct Output<'a, W: std::io::Write>(&'a mut ObservedWriter<W>);
+                impl<W: std::io::Write> std::io::Write for Output<'_, W> {
+                    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                        for chunk in data.chunks(64 * 1024) {
+                            self.0.write_msg(&Response::NativeMapData(chunk.to_vec()))?;
+                        }
+                        Ok(data.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                let mut out = std::io::BufWriter::with_capacity(64 * 1024, Output(&mut w));
+                let result = crate::native_map::write_local(&options, &mut out).and_then(|()| {
+                    std::io::Write::flush(&mut out)?;
+                    Ok(())
+                });
+                drop(out);
+                match result {
+                    Ok(()) => w.write_msg(&Response::NativeMapDone)?,
+                    Err(error) => w.write_msg(&Response::Err(format!("{error:#}")))?,
                 }
             }
             Request::NativeRemove {

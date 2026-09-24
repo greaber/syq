@@ -104,9 +104,9 @@ pub(crate) fn run(args: &[OsString]) -> Result<i32> {
     Ok(0)
 }
 
-struct S3<'a> {
-    client: aws_sdk_s3::Client,
-    bucket: &'a str,
+pub(super) struct S3<'a> {
+    pub(super) client: aws_sdk_s3::Client,
+    pub(super) bucket: &'a str,
 }
 impl Store for S3<'_> {
     fn ordered(&self) -> bool {

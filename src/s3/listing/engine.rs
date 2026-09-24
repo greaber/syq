@@ -107,7 +107,7 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page, start_after: Option<&
     }
 }
 
-async fn read(
+pub(in crate::s3) async fn read(
     store: &impl Store,
     prefix: &str,
     delimiter: bool,

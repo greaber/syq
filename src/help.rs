@@ -205,7 +205,8 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "prune"
                     | "help"
                     | "version"
-            ) || (rm && id == "root")
+            ) || (map && id == "include")
+                || (rm && id == "root")
                 || (clean && matches!(id, "trees" | "on"))
         };
         let heading = if cp {
@@ -220,6 +221,8 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 "results" | "results_fd" | "progress" | "no_progress" | "stats" => {
                     "Progress and results"
                 }
+                "include" if map => "Output fields",
+                "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" if map => "Object storage",
                 "resource_limits_arg" => "Resource limits",
                 "integrity_checking_arg" | "hash" => "Integrity checking",
                 "performance_tuning" | "block_size" => "Performance tuning",
