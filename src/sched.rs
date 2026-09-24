@@ -530,15 +530,18 @@ impl Sched {
 
     pub fn push_file(&self, job: FileJob) -> usize {
         let size = job.entry.size;
-        // Take the queue lock first: waiting for it must not prevent workers
-        // from snapshotting jobs. Other paths release jobs before taking inner.
+        let (idx, snapshot) = {
+            let mut jobs = self.jobs.lock().unwrap();
+            jobs.push(job);
+            let idx = jobs.len() - 1;
+            (idx, jobs.current(idx).snapshot())
+        };
+        // Retain the immutable job's chunk while registering its parent. No
+        // path copy or allocation is needed, and neither lock waits on the other.
+        let job: &FileJobData = snapshot.borrow();
         let mut inner = self.inner.lock().unwrap();
-        let mut jobs = self.jobs.lock().unwrap();
-        jobs.push(job);
-        let idx = jobs.len() - 1;
-        inner.files.register(idx, &jobs[idx].dst);
+        inner.files.register(idx, &job.dst);
         inner.files.push((size, Reverse(FileOrder::new(idx))));
-        drop(jobs);
         // New batches can run once the source-wide preflights have passed.
         let runnable = inner.scan_done || inner.work_released;
         drop(inner);
@@ -948,33 +951,52 @@ impl Sched {
         max_bytes: u64,
     ) -> Vec<usize> {
         let mut g = self.inner.lock().unwrap();
-        let mut group = first.map(|idx| g.files.group_of[idx]);
+        let files = &mut g.files;
+        let mut group = first.map(|idx| files.group_of[idx]);
         let mut out = Vec::new();
         let mut bytes = 0u64;
         while out.len() < max_n {
             // Exhaust nearby siblings before moving on, but do not turn a
             // tree of singleton directories into one-file network requests.
-            if group.is_some_and(|group| g.files.groups[group].is_empty()) {
-                group = g.files.heads.last().map(|(_, group)| *group);
+            if group.is_some_and(|group| files.groups[group].is_empty()) {
+                group = files.heads.last().map(|(_, group)| *group);
             }
-            let next = match group {
-                Some(group) => g.files.groups[group].peek(),
-                None => g.files.peek(),
+            let Some(selected) = group.or_else(|| files.heads.last().map(|(_, group)| *group))
+            else {
+                break;
             };
-            match next {
-                Some(&(size, _)) if size <= max_size && size <= max_bytes - bytes => {
-                    let (size, Reverse(order)) = match group {
-                        Some(group) => g.files.pop_group(group),
-                        None => g.files.pop(),
-                    }
-                    .unwrap();
-                    bytes += size;
-                    g.probing += 1;
-                    out.push(order.index());
+            let heap = &mut files.groups[selected];
+            let Some(&head) = heap.peek() else {
+                break;
+            };
+            if head.0 > max_size || head.0 > max_bytes - bytes {
+                break;
+            }
+            // This lock excludes other queue users for the entire batch.
+            // Update the global directory head once, after draining siblings.
+            files.heads.remove(&(head, selected));
+            while out.len() < max_n {
+                let Some(&(size, _)) = heap.peek() else {
+                    break;
+                };
+                if size > max_size || size > max_bytes - bytes {
+                    break;
                 }
-                _ => break,
+                let (_, Reverse(order)) = heap.pop().unwrap();
+                bytes += size;
+                out.push(order.index());
+                if first.is_none() {
+                    // The test-only global order must reconsider every head.
+                    break;
+                }
+            }
+            if let Some(&head) = heap.peek() {
+                files.heads.insert((head, selected));
             }
         }
+        files.bytes -= bytes;
+        files.count -= out.len();
+        g.probing += out.len();
         out
     }
 

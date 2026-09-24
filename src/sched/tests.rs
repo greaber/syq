@@ -988,3 +988,122 @@ fn directory_queue_matches_global_priority_through_insertions_and_retries() {
         assert_eq!(queue.pop(), None);
     }
 }
+
+#[test]
+fn enqueue_waiting_for_queue_releases_jobs_and_preserves_the_path() {
+    let sched = Arc::new(Sched::new(64, 128));
+    let queue = sched.inner.lock().unwrap();
+    let worker = {
+        let sched = sched.clone();
+        std::thread::spawn(move || sched.push_file(test_job(b"parent/file", 128)))
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let published = loop {
+        let available = sched.jobs.try_lock().is_ok_and(|jobs| {
+            if jobs.len() != 1 {
+                return false;
+            }
+            assert_eq!(jobs[0].dst, b"parent/file-dst");
+            true
+        });
+        if available {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+    // Always unblock and join the producer, including on a regression.
+    drop(queue);
+    assert_eq!(worker.join().unwrap(), 0);
+    assert!(
+        published,
+        "enqueue must not hold or wait for jobs under the queue lock"
+    );
+    sched.scan_done();
+    assert!(matches!(sched.next(), Item::File(0)));
+    let g = sched.inner.lock().unwrap();
+    assert_eq!(g.files.directories.get(b"parent".as_slice()), Some(&0));
+}
+
+#[test]
+fn nearby_batches_match_a_flat_reference_with_limits_and_retries() {
+    let sched = Sched::new(64, 128);
+    let count = 1031;
+    let parents: Vec<_> = (0..count)
+        .map(|i| if i < 512 { 0 } else { i % 67 })
+        .collect();
+    let sizes: Vec<_> = (0..count).map(|i| [0, 1, 127, 128, 513][i % 5]).collect();
+    for idx in 0..count {
+        sched.push_file(test_job(
+            format!("d{}/f{idx}", parents[idx]).as_bytes(),
+            sizes[idx],
+        ));
+    }
+    sched.scan_done();
+    let priority = |idx: usize| (sizes[idx], Reverse(FileOrder::new(idx)));
+    for round in 0..2 {
+        if round == 1 {
+            for idx in (0..count).rev() {
+                sched.requeue(idx);
+            }
+        }
+        let mut pending: Vec<_> = (0..count).collect();
+        let mut step = 0;
+        while !pending.is_empty() {
+            let first = *pending.iter().max_by_key(|&&idx| priority(idx)).unwrap();
+            assert!(matches!(sched.next(), Item::File(idx) if idx == first));
+            pending.retain(|&idx| idx != first);
+            let (max_size, max_n, max_bytes) = match step % 6 {
+                0 => (513, 64, 4096),
+                1 => (128, 7, 256),
+                2 => (0, 31, 0),
+                3 => (513, 0, u64::MAX),
+                4 => (513, 3, 0),
+                _ => (513, 1024, u64::MAX),
+            };
+            let mut parent = parents[first];
+            let mut expected = Vec::new();
+            let mut bytes = 0;
+            while expected.len() < max_n && !pending.is_empty() {
+                if !pending.iter().any(|&idx| parents[idx] == parent) {
+                    parent = parents[*pending.iter().max_by_key(|&&idx| priority(idx)).unwrap()];
+                }
+                let idx = *pending
+                    .iter()
+                    .filter(|&&idx| parents[idx] == parent)
+                    .max_by_key(|&&idx| priority(idx))
+                    .unwrap();
+                if sizes[idx] > max_size || sizes[idx] > max_bytes - bytes {
+                    break;
+                }
+                bytes += sizes[idx];
+                expected.push(idx);
+                pending.retain(|&other| other != idx);
+            }
+            assert_eq!(
+                sched.take_small_near(first, max_size, max_n, max_bytes),
+                expected
+            );
+            {
+                let g = sched.inner.lock().unwrap();
+                assert_eq!(g.files.len(), pending.len());
+                assert_eq!(
+                    g.files.bytes,
+                    pending.iter().map(|&idx| sizes[idx]).sum::<u64>()
+                );
+                assert_eq!(
+                    g.files.peek().copied(),
+                    pending.iter().map(|&idx| priority(idx)).max()
+                );
+            }
+            for idx in std::iter::once(first).chain(expected) {
+                sched.ranges_ready(idx, Vec::new());
+            }
+            step += 1;
+        }
+        assert!(matches!(sched.next(), Item::Exit));
+        assert!(sched.finished());
+    }
+}
