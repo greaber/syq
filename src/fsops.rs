@@ -2713,10 +2713,7 @@ fn hash_reader_buffered(
     let mut scratch = Vec::new();
     let buf = retained.unwrap_or(&mut scratch);
     let buffer_len = if retain_all { len } else { block.min(len) };
-    buf.resize(
-        usize::try_from(buffer_len).context("hash buffer exceeds this platform")?,
-        0,
-    );
+    *buf = vec![0; usize::try_from(buffer_len).context("hash buffer exceeds this platform")?];
     let mut remaining = len;
     while remaining > 0 {
         let want = remaining.min(block) as usize;
