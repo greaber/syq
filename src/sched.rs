@@ -394,11 +394,16 @@ impl FileQueue {
     fn push(&mut self, item: (u64, Reverse<FileOrder>)) {
         let group = self.group_of[item.1 .0.index()];
         let heap = &mut self.groups[group];
-        if let Some(&head) = heap.peek() {
-            self.heads.remove(&(head, group));
-        }
+        let previous = heap.peek().copied();
         heap.push(item);
-        self.heads.insert((*heap.peek().unwrap(), group));
+        let head = *heap.peek().unwrap();
+        // Most siblings do not change their directory's global priority.
+        if previous != Some(head) {
+            if let Some(previous) = previous {
+                self.heads.remove(&(previous, group));
+            }
+            self.heads.insert((head, group));
+        }
         self.bytes += item.0;
         self.count += 1;
     }
@@ -525,11 +530,12 @@ impl Sched {
 
     pub fn push_file(&self, job: FileJob) -> usize {
         let size = job.entry.size;
-        // No scheduler path takes the jobs lock while holding inner.
+        // Take the queue lock first: waiting for it must not prevent workers
+        // from snapshotting jobs. Other paths release jobs before taking inner.
+        let mut inner = self.inner.lock().unwrap();
         let mut jobs = self.jobs.lock().unwrap();
         jobs.push(job);
         let idx = jobs.len() - 1;
-        let mut inner = self.inner.lock().unwrap();
         inner.files.register(idx, &jobs[idx].dst);
         inner.files.push((size, Reverse(FileOrder::new(idx))));
         drop(jobs);

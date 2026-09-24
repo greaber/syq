@@ -954,3 +954,37 @@ fn nearby_batches_fill_across_directories_without_skipping_siblings() {
     }
     assert!(matches!(sched.next(), Item::Exit));
 }
+
+#[test]
+fn directory_queue_matches_global_priority_through_insertions_and_retries() {
+    let mut queue = FileQueue::default();
+    let mut reference = BinaryHeap::new();
+    for idx in 0..513 {
+        queue.register(idx, format!("group{}/file{idx}", idx % 17).as_bytes());
+    }
+    // Mix changed and unchanged directory heads, ties and zero-sized files.
+    // Drain and reinsert the same indices to cover empty groups and retries.
+    for round in 0..3 {
+        for idx in (0..513).rev() {
+            let size = if round == 0 { 128 } else { (idx % 7) as u64 };
+            let item = (size, Reverse(FileOrder::new(idx)));
+            queue.push(item);
+            reference.push(item);
+            assert_eq!(queue.peek(), reference.peek());
+            if idx % 3 == 0 {
+                assert_eq!(queue.pop(), reference.pop());
+            }
+            assert_eq!(queue.len(), reference.len());
+            assert_eq!(
+                queue.bytes,
+                reference.iter().map(|item| item.0).sum::<u64>()
+            );
+        }
+        while let Some(expected) = reference.pop() {
+            assert_eq!(queue.pop(), Some(expected));
+        }
+        assert!(queue.is_empty());
+        assert_eq!(queue.bytes, 0);
+        assert_eq!(queue.pop(), None);
+    }
+}
