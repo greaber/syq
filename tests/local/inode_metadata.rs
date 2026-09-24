@@ -579,3 +579,250 @@ fn archival_reruns_repair_hardlinks_inside_readonly_directories() {
         }
     }
 }
+
+#[test]
+fn rsync_new_files_follow_destination_default_acls_without_preserving_modes() {
+    use std::os::unix::process::CommandExt;
+    for transport in ["local", "ssh", "tcp"] {
+        for inplace in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("src/file"), &prng(2 << 20, 918));
+            write(&t.path("src/program"), b"program");
+            fs::create_dir(t.path("src/directory")).unwrap();
+            fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o666)).unwrap();
+            fs::set_permissions(t.path("src/program"), fs::Permissions::from_mode(0o777)).unwrap();
+            fs::set_permissions(t.path("src/directory"), fs::Permissions::from_mode(0o777))
+                .unwrap();
+            fs::create_dir(t.path("parent")).unwrap();
+            // The named user's full grant is limited by the inherited ACL mask.
+            set_attr(&t.path("parent"), "system.posix_acl_default", &acl(7, 5));
+            let shell = fake_rsh(&t);
+            t.expose_remote_syq();
+            let destination = if transport == "local" {
+                t.s("parent/container/")
+            } else {
+                format!("remote:{}", t.s("parent/container/"))
+            };
+            let arguments = [
+                "-r",
+                "--no-progress",
+                &t.s("src/file"),
+                &t.s("src/program"),
+                &t.s("src/directory"),
+                &destination,
+            ];
+            let mut command = compat_command();
+            command.args(arguments);
+            if transport != "local" {
+                fs::create_dir(t.path("remote-home")).unwrap();
+                command
+                    .arg("-e")
+                    .arg(&shell)
+                    .arg("--syq-no-bootstrap")
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                    .env("XDG_CONFIG_HOME", t.path("config"))
+                    .env("XDG_CACHE_HOME", t.path("cache"));
+            }
+            if transport == "ssh" {
+                command.arg("--syq-no-tcp");
+            } else if transport == "tcp" {
+                command.env("SYQ_TEST_REQUIRE_TCP", "1");
+            }
+            if inplace {
+                command.arg("--inplace");
+            }
+            // Both the local process and the fake remote helper inherit this
+            // restrictive mask; the parent ACL must take precedence over it.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o077);
+                    Ok(())
+                });
+            }
+            assert_output_ok(&command.run().unwrap());
+            for (name, mode) in [
+                ("", 0o750),
+                ("directory", 0o750),
+                ("file", 0o640),
+                ("program", 0o750),
+            ] {
+                let path = t.path(&format!("parent/container/{name}"));
+                assert_eq!(
+                    fs::metadata(&path).unwrap().mode() & 0o777,
+                    mode,
+                    "{transport}, inplace={inplace}, {name}"
+                );
+                assert!(attr(&path, "system.posix_acl_access").is_some());
+            }
+            assert_eq!(
+                read(&t.path("src/file")),
+                read(&t.path("parent/container/file"))
+            );
+            // Existing files keep their destination modes, even when bytes change.
+            fs::set_permissions(
+                t.path("parent/container/file"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            write(&t.path("src/file"), b"changed");
+            assert_output_ok(&command.run().unwrap());
+            assert_eq!(read(&t.path("parent/container/file")), b"changed");
+            assert_eq!(
+                fs::metadata(t.path("parent/container/file"))
+                    .unwrap()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[test]
+fn default_acl_creation_keeps_native_and_explicit_preservation_semantics() {
+    use std::os::unix::process::CommandExt;
+    for kind in ["native", "native-ranges", "preserve", "acl", "plain"] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), b"contents");
+        fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o666)).unwrap();
+        fs::create_dir(t.path("parent")).unwrap();
+        if kind != "plain" {
+            set_attr(&t.path("parent"), "system.posix_acl_default", &acl(7, 5));
+        }
+        let mut command = if kind.starts_with("native") {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command.args(["cp", &t.s("src/file"), "--into", &t.s("parent")]);
+            if kind == "native-ranges" {
+                command.arg("--performance-tuning=copy-path=ranges");
+            }
+            command
+        } else {
+            let mut command = compat_command();
+            command.args([
+                match kind {
+                    "preserve" => "-p",
+                    "acl" => "-A",
+                    _ => "-r",
+                },
+                &t.s("src/file"),
+                &t.s("parent/"),
+            ]);
+            command
+        };
+        unsafe {
+            command.pre_exec(|| {
+                libc::umask(0o077);
+                Ok(())
+            });
+        }
+        assert_output_ok(&command.run().unwrap());
+        let expected = if kind == "preserve" || kind == "acl" {
+            0o666
+        } else {
+            0o600
+        };
+        assert_eq!(
+            fs::metadata(t.path("parent/file")).unwrap().mode() & 0o777,
+            expected,
+            "{kind}"
+        );
+        assert_eq!(read(&t.path("parent/file")), b"contents");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn failed_inode_metadata_is_visible_and_resumes_with_current_metadata() {
+    for failed_attribute in ["system.posix_acl_access", "user.binary"] {
+        for path in ["batch", "ranges", "local", "inplace"] {
+            let t = Tmp::new();
+            let data = prng(if path == "batch" { 8192 } else { 2 << 20 }, 927);
+            write(&t.path("src/file"), &data);
+            // Two independent small files exercise batched publication; the
+            // other paths exercise a representative and its hardlink alias.
+            if path == "batch" {
+                write(&t.path("src/alias"), &data);
+            } else {
+                fs::hard_link(t.path("src/file"), t.path("src/alias")).unwrap();
+            }
+            for name in ["file", "alias"] {
+                let file = t.path(&format!("src/{name}"));
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+                set_attr(&file, "user.binary", b"before failure");
+                set_attr(&file, "user.empty", b"");
+                set_attr(&file, "system.posix_acl_access", &acl(4, 4));
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o440)).unwrap();
+            }
+            let tuning = match path {
+                "batch" => "batch-bytes=64K,workers=1",
+                "ranges" => "copy-path=ranges,workers=1",
+                _ => "workers=1",
+            };
+            let mut args = vec!["-aHAX", "--no-progress", "--performance-tuning", tuning];
+            if path == "inplace" {
+                args.push("--inplace");
+            }
+            let source = t.s("src/");
+            let destination = t.s("dst/");
+            args.extend([source.as_str(), destination.as_str()]);
+            let failed = compat_command()
+                .args(&args)
+                .env("SYQ_TEST_FAIL_XATTR", failed_attribute)
+                .run()
+                .unwrap();
+            assert!(!failed.status.success(), "{path}: {failed:?}");
+            assert!(
+                stderr_of(&failed).contains("injected attribute reconciliation failure"),
+                "{path}: {failed:?}"
+            );
+            let written = if path == "inplace" {
+                ["file", "alias"]
+                    .iter()
+                    .map(|name| t.path(&format!("dst/{name}")))
+                    .filter(|file| file.exists())
+                    .collect::<Vec<_>>()
+            } else {
+                assert!(!t.path("dst/file").exists());
+                assert!(!t.path("dst/alias").exists());
+                partial_files(&t.path("dst"))
+            };
+            assert!(
+                !written.is_empty(),
+                "must reach writing before failure: {path}"
+            );
+            for file in written {
+                assert_eq!(read(&file), data, "{path}");
+                if failed_attribute == "user.binary" {
+                    assert_eq!(
+                        fs::metadata(file).unwrap().mode() & 0o777,
+                        0o440,
+                        "temporary owner-write must be restored after an xattr error"
+                    );
+                }
+            }
+            // A retry must capture new metadata, not accept matching bytes as
+            // proof that the earlier metadata failure has been repaired.
+            for name in ["file", "alias"] {
+                let file = t.path(&format!("src/{name}"));
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+                set_attr(&file, "user.binary", b"after failure");
+                set_attr(&file, "system.posix_acl_access", &acl(6, 4));
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o440)).unwrap();
+            }
+            assert_output_ok(&compat_command().args(&args).run().unwrap());
+            for name in ["file", "alias"] {
+                let file = t.path(&format!("dst/{name}"));
+                assert_eq!(read(&file), data);
+                verify_metadata(&t.path(&format!("src/{name}")), &file);
+            }
+            if path != "batch" {
+                assert_eq!(
+                    fs::metadata(t.path("dst/file")).unwrap().ino(),
+                    fs::metadata(t.path("dst/alias")).unwrap().ino()
+                );
+            }
+        }
+    }
+}

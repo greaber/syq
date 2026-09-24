@@ -1098,3 +1098,49 @@ fn inplace_copy_local_fallback_creates_readonly_files() {
         }
     }
 }
+
+#[test]
+fn rsync_new_remote_files_use_receiver_umask() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let wrapper = t.path("receiver");
+    executable(
+        &wrapper,
+        format!(
+            "#!/bin/sh\numask 077\nexec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_syq")
+        )
+        .as_bytes(),
+    );
+    write(&t.path("src/file"), &prng(2 << 20, 772));
+    write(&t.path("src/program"), b"program");
+    fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o666)).unwrap();
+    fs::set_permissions(t.path("src/program"), fs::Permissions::from_mode(0o777)).unwrap();
+    let mut command = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "-r",
+            "--rsync-path",
+            wrapper.to_str().unwrap(),
+            &t.s("src/file"),
+            &t.s("src/program"),
+            &format!("fake:{}/", t.s("dst")),
+        ],
+    );
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o022);
+            Ok(())
+        });
+    }
+    assert_output_ok(&command.run().unwrap());
+    for (name, mode) in [("", 0o700), ("file", 0o600), ("program", 0o700)] {
+        assert_eq!(
+            fs::metadata(t.path(&format!("dst/{name}"))).unwrap().mode() & 0o777,
+            mode,
+            "{name}"
+        );
+    }
+    assert_eq!(read(&t.path("dst/file")), read(&t.path("src/file")));
+}

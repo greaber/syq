@@ -58,6 +58,9 @@ pub struct FileJobData {
     /// Opened directory identity that anchors descendant target mutations.
     pub container_guard: Option<ContainerGuard>,
     pub attempt: u32,
+    /// Rsync's fresh-file permissions derived from the destination parent.
+    /// None keeps native creation and explicit preservation behavior unchanged.
+    pub creation_mode: Option<u16>,
     /// Bytes of this file in place on the destination (transferred or matched).
     pub done: Arc<AtomicU64>,
     /// Written directly to the final path (no partial + rename).
@@ -592,6 +595,13 @@ impl Sched {
     /// Release validated jobs while the planner finishes preparing later
     /// batches. An empty queue is still a wait, not EOF, until scan_done.
     pub fn release_preflighted_work(&self) {
+        // Path-specific fixtures need the complete file population before any
+        // worker chooses a copy path. scan_done releases all workers after
+        // buffered replay, preserving their configured concurrency.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_COPY_AFTER_PLANNING").is_some() {
+            return;
+        }
         self.inner.lock().unwrap().work_released = true;
         self.cv.notify_all();
     }

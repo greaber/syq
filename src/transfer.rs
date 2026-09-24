@@ -133,6 +133,7 @@ pub struct Opts {
     pub recursive: bool,
     pub links: bool,
     pub perms: bool,
+    pub rsync_creation: bool,
     pub hardlinks: bool,
     pub sparse: bool,
     pub inode_preservation: crate::inode_metadata::Selection,
@@ -1512,6 +1513,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         recursive: args.recursive,
         links: args.links,
         perms: args.perms,
+        rsync_creation: args.interface == Interface::Rsync,
         hardlinks: args.hardlinks,
         sparse: args.sparse,
         inode_preservation: crate::inode_metadata::Selection {
@@ -2543,7 +2545,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             } else {
                 TargetCondition::Any
             };
-            directory_selection = Some(create_operator_directory(&mut *dst_ctl, condition)?);
+            directory_selection = Some(create_operator_directory(
+                &mut *dst_ctl,
+                condition,
+                opts.rsync_creation,
+            )?);
         }
         if let Some(selection) = directory_selection.take() {
             let anchor = match prepared_anchor.take() {
@@ -2764,6 +2770,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let ticker = progress.spawn_ticker();
 
     let mut st = Planner {
+        default_permissions: Default::default(),
         dst: &mut *dst_ctl,
         sched: &sched,
         progress: &progress,
@@ -3653,6 +3660,28 @@ fn stat_many_registered(
     }
 }
 
+fn default_permissions(
+    conn: &mut dyn Conn,
+    mut paths: Vec<PathBytes>,
+    guard: Option<ContainerGuard>,
+) -> Result<Vec<u32>> {
+    if paths.len() > 1 && paths.iter().map(|p| p.len() + 8).sum::<usize>() > SOURCE_BATCH_PATH_BYTES
+    {
+        let tail = paths.split_off(paths.len() / 2);
+        let mut modes = default_permissions(conn, paths, guard.clone())?;
+        modes.extend(default_permissions(conn, tail, guard)?);
+        return Ok(modes);
+    }
+    let count = paths.len();
+    match ok(
+        conn.call(Request::DefaultPermissions { paths, guard })?,
+        "read destination creation permissions",
+    )? {
+        Response::DefaultPermissions(modes) if modes.len() == count => Ok(modes),
+        other => bail!("unexpected creation permissions response {other:?}"),
+    }
+}
+
 fn target_identity(entry: &Entry) -> TargetCondition {
     TargetCondition::Matches {
         dev: entry.dev,
@@ -3901,10 +3930,11 @@ fn register_source_roots(
 fn create_operator_directory(
     conn: &mut dyn Conn,
     condition: TargetCondition,
+    rsync_creation: bool,
 ) -> Result<DirectoryAnchor> {
     match ok(
         conn.call(Request::CreateOperatorDirectory {
-            mode: 0o755,
+            mode: if rsync_creation { 0o777 } else { 0o755 },
             require_absent: condition == TargetCondition::Absent,
         })?,
         "create destination directory",

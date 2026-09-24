@@ -1012,6 +1012,12 @@ pub enum WireRequest<Data> {
         sparse: bool,
         destination: bool,
     },
+    /// Creation permissions from each destination directory's default ACL or
+    /// receiver umask. Used only for rsync copies without preserved modes.
+    DefaultPermissions {
+        paths: Vec<PathBytes>,
+        guard: Option<ContainerGuard>,
+    },
     NativeMap(crate::native_map::Options),
 }
 
@@ -1270,6 +1276,7 @@ pub enum Response {
     PublishedBatch(Vec<std::result::Result<Option<(u64, u64)>, WireError>>),
     /// Non-final fragment of a rich-metadata stat response.
     StatsMore(Vec<Option<Entry>>),
+    DefaultPermissions(Vec<u32>),
     NativeMapData(Vec<u8>),
     NativeMapDone,
 }
@@ -1434,7 +1441,9 @@ impl SizeHint for Request {
                     .sum::<usize>()
                     + 16
             }
-            Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
+            Request::StatMany { paths, .. }
+            | Request::PruneLookup { paths, .. }
+            | Request::DefaultPermissions { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
             Request::PartialPaths { paths, .. } => {

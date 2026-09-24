@@ -6,6 +6,8 @@ pub(super) fn path_has_partial_component(path: &[u8]) -> bool {
 }
 
 pub(super) struct Planner<'a> {
+    /// Bounded parent cache, only for newly created rsync leaves without -p.
+    pub(super) default_permissions: std::collections::HashMap<PathBytes, u32>,
     pub(super) dst: &'a mut dyn Conn,
     pub(super) sched: &'a Sched,
     pub(super) progress: &'a Progress,
@@ -1334,7 +1336,8 @@ impl Planner<'_> {
         }
         if let Some((root, condition, is_destination_root)) = self.create_root.take() {
             if self.use_operator_anchor {
-                let selection = create_operator_directory(self.dst, condition)?;
+                let selection =
+                    create_operator_directory(self.dst, condition, self.opts.rsync_creation)?;
                 let anchor = activate_control_destination(self.dst, selection, root.clone())?;
                 if is_destination_root {
                     self.mutation_root_condition = TargetCondition::Matches {
@@ -1474,6 +1477,42 @@ impl Planner<'_> {
                 dst_root,
             )?
         };
+        if opts.rsync_creation && !opts.perms && !opts.dry_run {
+            // Jobs retain the resolved mode, so old parents need not accumulate
+            // with the full directory tree. A wide batch adds at most BATCH more.
+            if self.default_permissions.len() >= crate::scan::BATCH {
+                self.default_permissions.clear();
+            }
+            let parents: std::collections::BTreeSet<_> = others
+                .iter()
+                .zip(&stats)
+                .filter(|(p, existing)| {
+                    p.e.kind != Kind::Symlink
+                        && !self.skip_existing(existing)
+                        && !((opts.existing || opts.ignore_existing)
+                            && self.under_missing_dir(&p.dst, dst_root))
+                        && !(p.e.kind == Kind::File
+                            && (self.unusable_files.contains(&p.dst)
+                                || opts.max_size.is_some_and(|m| p.e.size > m)
+                                || opts.min_size.is_some_and(|m| p.e.size < m)))
+                        && existing.as_ref().is_none_or(|d| {
+                            d.kind != p.e.kind || (p.e.kind != Kind::File && d.rdev != p.e.rdev)
+                        })
+                })
+                .map(|(p, _)| parent_path(&p.dst))
+                .filter(|parent| !self.default_permissions.contains_key(parent))
+                .collect();
+            for paths in parents
+                .into_iter()
+                .collect::<Vec<_>>()
+                .chunks(crate::scan::BATCH)
+            {
+                let modes =
+                    default_permissions(self.dst, paths.to_vec(), self.container_guard.clone())?;
+                self.default_permissions
+                    .extend(paths.iter().cloned().zip(modes));
+            }
+        }
         let mut leaf_ops = LeafOps::default();
         for (p, dst_entry) in others.into_iter().zip(stats) {
             let target_condition = self.exact_condition_for(&p.dst);
@@ -1977,7 +2016,10 @@ impl Planner<'_> {
         let mut meta = opts.metadata_for(&dst_rel, &e);
         let mut flags = opts.flags_for(&dst_rel);
         if flags & flags::MODE == 0 {
-            meta.mode = e.mode & 0o777 & !opts.umask;
+            meta.mode = self
+                .creation_mode(&dst_path, &e)
+                .map(u32::from)
+                .unwrap_or(e.mode & 0o777 & !opts.umask);
             flags |= flags::RECEIVER_MODE;
         }
         leaf_ops.ops.push(Op::SetMeta {
@@ -2885,6 +2927,15 @@ impl Planner<'_> {
         false
     }
 
+    fn creation_mode(&self, destination: &[u8], entry: &Entry) -> Option<u16> {
+        if !self.opts.rsync_creation || self.opts.perms {
+            return None;
+        }
+        self.default_permissions
+            .get(&parent_path(destination))
+            .map(|permissions| (entry.mode & permissions & 0o777) as u16)
+    }
+
     pub(super) fn enqueue(
         &mut self,
         source_path: (PathBytes, RegisteredPath),
@@ -2897,6 +2948,7 @@ impl Planner<'_> {
         let (src, source) = source_path;
         let target_condition = self.exact_condition_for(&dst);
         let src_rel = self.mapping_source_rel(&rel_bytes);
+        let creation_mode = self.creation_mode(&dst, &entry);
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
         self.sched.push_file(FileJob {
@@ -2911,6 +2963,7 @@ impl Planner<'_> {
                 target_condition,
                 container_guard: self.container_guard.clone(),
                 attempt: 0,
+                creation_mode,
                 done: Arc::new(AtomicU64::new(0)),
                 inplace: self.opts.inplace
                     && target_condition == TargetCondition::Any

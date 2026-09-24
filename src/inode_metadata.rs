@@ -202,6 +202,12 @@ mod platform {
         if get(file, name)?.as_deref() == value {
             return Ok(());
         }
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_XATTR")
+            .is_some_and(|selected| selected.as_encoded_bytes() == name)
+        {
+            anyhow::bail!("injected attribute reconciliation failure: {:?}", name);
+        }
         let path = handle(file);
         let name = CString::new(name)?;
         let result = if let Some(value) = value {
@@ -282,6 +288,36 @@ mod platform {
         );
         Ok(metadata)
     }
+    pub(super) fn default_permissions(directory: &File) -> Result<Option<u32>> {
+        let Some(acl) = get(directory, DEFAULT)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            acl.len() >= 4 && (acl.len() - 4).is_multiple_of(8) && acl[..4] == 2u32.to_le_bytes(),
+            "invalid Linux default ACL encoding"
+        );
+        let mut owner = None;
+        let mut group = None;
+        let mut mask = None;
+        let mut other = None;
+        for entry in acl[4..].chunks_exact(8) {
+            let permissions = u32::from(u16::from_le_bytes([entry[2], entry[3]]));
+            anyhow::ensure!(permissions <= 7, "invalid default ACL permissions");
+            match u16::from_le_bytes([entry[0], entry[1]]) {
+                0x01 => owner = Some(permissions),
+                0x04 => group = Some(permissions),
+                0x10 => mask = Some(permissions),
+                0x20 => other = Some(permissions),
+                _ => {}
+            }
+        }
+        Ok(Some(
+            (owner.context("default ACL lacks owner")? << 6)
+                | (mask.or(group).context("default ACL lacks group")? << 3)
+                | other.context("default ACL lacks other")?,
+        ))
+    }
+
     pub(super) fn access_for_mode(raw: &[u8], mode: u32) -> Result<Vec<u8>> {
         anyhow::ensure!(
             raw.len() >= 4 && (raw.len() - 4).is_multiple_of(8) && raw[..4] == 2u32.to_le_bytes(),
@@ -439,6 +475,17 @@ pub(crate) fn capture(
     );
     Ok(Some(Box::new(metadata)))
 }
+/// Permissions available to new entries: a POSIX default ACL takes precedence
+/// over umask, just as it does for ordinary kernel file creation.
+pub(crate) fn default_permissions(directory: &File) -> Result<u32> {
+    #[cfg(target_os = "linux")]
+    if let Some(mode) = platform::default_permissions(directory)? {
+        return Ok(mode);
+    }
+    let _ = directory;
+    Ok(0o777 & !crate::fsops::process_umask())
+}
+
 pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) -> Result<()> {
     apply_inner(file, metadata, mode, false)
 }

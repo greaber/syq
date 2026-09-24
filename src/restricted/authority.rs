@@ -2583,6 +2583,9 @@ impl RestrictedAuthority {
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a command-restricted destination")
             }
+            Request::DefaultPermissions { .. } => {
+                bail!("rsync creation policy is not valid on a command-restricted receiver")
+            }
             Request::ConfigurePreservation { .. } => {
                 bail!("signed grants do not authorize additional inode metadata or read policies")
             }
