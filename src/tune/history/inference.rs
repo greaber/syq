@@ -7,12 +7,9 @@ use std::collections::BTreeMap;
 // turning a collection of one-sided comparisons into a maximum-ever rule.
 const STARTUP_CONNECTION_COST: f64 = 0.01;
 
-// The schema's original indexes already partition runs by `eligible`. Reserve
-// a distinct value for comparisons with rate bounds; 1 and 2 identify older
-// recommendation/measurement formats. Old rows stay inspectable, not backfilled.
-// Tag new measurements at completion instead of indexing historical JSON at open.
-pub(super) const MEASUREMENTS: i64 = 3;
-pub(super) const MAX_SUMMARY: usize = 65536;
+// Original run indexes already partition by eligibility. Older formats remain
+// inspectable, but only runs with ordered measurement rows seed new starts.
+pub(super) const MEASUREMENTS: i64 = 4;
 
 struct Comparison {
     workers: usize,
@@ -48,47 +45,50 @@ pub(super) fn starting_count(
         } else {
             "AND ?3 IS NULL AND ?4 IS NULL"
         };
-        let mut statement = db.prepare(&format!("SELECT id,day,CASE WHEN length(CAST(summary AS BLOB))<={MAX_SUMMARY} THEN summary END FROM runs WHERE route=?1 AND mode=?2 AND eligible={MEASUREMENTS} AND status='success' AND lost=0 {filesystem_match} ORDER BY id DESC LIMIT 32"))?;
-        let runs = statement
-            .query_map(
-                params![
-                    key.route,
-                    key.mode,
-                    if specific {
-                        key.source_filesystem.as_deref()
-                    } else {
-                        None
-                    },
-                    if specific {
-                        key.destination_filesystem.as_deref()
-                    } else {
-                        None
-                    }
-                ],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                    ))
+        let mut statement = db.prepare(&format!("SELECT id,day FROM runs WHERE route=?1 AND mode=?2 AND eligible={MEASUREMENTS} AND status='success' AND lost=0 {filesystem_match} ORDER BY id DESC"))?;
+        let runs = statement.query_map(
+            params![
+                key.route,
+                key.mode,
+                if specific {
+                    key.source_filesystem.as_deref()
+                } else {
+                    None
                 },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+                if specific {
+                    key.destination_filesystem.as_deref()
+                } else {
+                    None
+                }
+            ],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )?;
         let mut choices = Vec::new();
-        for (rank, (run, when, summary)) in runs.into_iter().enumerate() {
-            let evidence = summary
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|s| {
-                    serde_json::from_value::<RunEvidence>(s["measurement_totals"].clone()).ok()
+        let mut measurements = db.prepare(
+            "SELECT segment,workers,seconds,rate,usable FROM measurements WHERE run=?1 ORDER BY sequence",
+        )?;
+        for run in runs {
+            let (run, when) = run?;
+            let mut evidence = RunEvidence::default();
+            let mut rows = measurements.query([run])?;
+            while let Some(row) = rows.next()? {
+                evidence.push(Observation {
+                    segment: row.get(0)?,
+                    workers: row.get::<_, u32>(1)? as usize,
+                    seconds: row.get(2)?,
+                    rate: row.get(3)?,
+                    usable: row.get(4)?,
                 });
-            let Some(evidence) = evidence else {
-                continue;
-            };
+            }
             if let Some(comparison) = evidence.finish() {
+                let rank = choices.len();
                 let age = day().saturating_sub(when).max(0) as f64;
                 let weight = 2.0_f64.powf(-age / 7.0) / (rank + 1) as f64;
                 if weight > 0.0 {
                     choices.push((comparison, weight, run));
+                    if choices.len() == 32 {
+                        break;
+                    }
                 }
             }
         }
@@ -129,41 +129,17 @@ pub(super) fn starting_count(
     Ok(None)
 }
 
-#[derive(Default, Serialize, Deserialize)]
-pub(super) struct RunEvidence {
-    // Persist measurements, never a selected starting count or a utility score.
-    observations: BTreeMap<usize, Observations>,
+/// Run facts used to exclude fixed-count, mixed-context and unmeasured runs
+/// before the lookup limit. No rates, durations or inferred choices are saved.
+#[derive(Default)]
+pub(super) struct Eligibility {
     consistent: bool,
     incompatible: bool,
+    counts: std::collections::BTreeSet<usize>,
+    positive: bool,
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct Observations {
-    activity: f64,
-    seconds: f64,
-    intervals: usize,
-    low: f64,
-    high: f64,
-}
-
-impl Observations {
-    fn rate(&self) -> Option<f64> {
-        if self.intervals < 2
-            || !self.seconds.is_finite()
-            || self.seconds <= 0.0
-            || !self.low.is_finite()
-            || self.low < 0.0
-            || !self.high.is_finite()
-            || self.high < self.low
-        {
-            return None;
-        }
-        let rate = self.activity / self.seconds;
-        (rate.is_finite() && rate >= 0.0).then_some(rate)
-    }
-}
-
-impl RunEvidence {
+impl Eligibility {
     pub(super) fn push(&mut self, event: &Value) {
         if event["kind"] == "start" {
             self.incompatible |= event["data"]["automatic"] == false
@@ -175,80 +151,95 @@ impl RunEvidence {
             self.consistent =
                 event["data"]["consistent"] == true && event["data"]["automatic"] == true;
         }
-        if event["kind"] != "observation" {
-            return;
-        }
-        let data = &event["data"];
-        let Some(n) = data["active"].as_u64().filter(|n| *n > 0 && *n <= 65536) else {
-            return;
-        };
-        if data["usable"] != true {
-            return;
-        }
-        let Some(seconds) = data["seconds"]
-            .as_f64()
-            .filter(|v| v.is_finite() && *v > 0.0)
-        else {
-            return;
-        };
-        let Some(rate) = data["rate"].as_f64().filter(|v| v.is_finite() && *v >= 0.0) else {
-            return;
-        };
-        let point = self.observations.entry(n as usize).or_default();
-        point.low = if point.intervals == 0 {
-            rate
-        } else {
-            point.low.min(rate)
-        };
-        point.high = point.high.max(rate);
-        point.activity += rate * seconds;
-        point.seconds += seconds;
-        point.intervals += 1;
-    }
-
-    fn points(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
-        // A brief probe cannot establish the reference rate. Once another
-        // count has enough exposure, retain consistently severe losses using
-        // the same threshold as live rollback. Averaging alone would mistake
-        // a silence/burst pair for equally strong evidence.
-        let reference = self
-            .observations
-            .iter()
-            .filter(|(n, point)| (1..=65536).contains(*n) && point.seconds >= 2.5)
-            .filter_map(|(_, point)| point.rate())
-            .fold(0.0, f64::max);
-        self.observations.iter().filter_map(move |(n, point)| {
-            if !(1..=65536).contains(n) {
-                return None;
+        if let Some(observation) = Observation::from_event(event) {
+            if observation.valid() {
+                self.counts.insert(observation.workers);
+                self.positive |= observation.rate > 0.0;
             }
-            let rate = point.rate()?;
-            (point.seconds >= 2.5
-                || crate::tune::evidence::severe_loss(
-                    point.seconds,
-                    point.low,
-                    point.high,
-                    reference,
-                ))
-            .then_some((*n, rate))
-        })
-    }
-
-    pub(super) fn measured_counts(&self) -> usize {
-        self.points().count()
+        }
     }
 
     pub(super) fn reusable(&self) -> bool {
-        self.consistent
-            && !self.incompatible
-            && self.measured_counts() >= 2
-            && self.points().any(|(_, rate)| rate > 0.0)
+        self.consistent && !self.incompatible && self.counts.len() >= 2 && self.positive
+    }
+}
+
+pub(super) struct Observation {
+    pub segment: i64,
+    pub workers: usize,
+    pub seconds: f64,
+    pub rate: f64,
+    pub usable: bool,
+}
+
+impl Observation {
+    pub(super) fn from_event(event: &Value) -> Option<Self> {
+        if event["kind"] != "observation" {
+            return None;
+        }
+        let data = &event["data"];
+        Some(Self {
+            segment: data["segment"].as_i64().unwrap_or(0),
+            workers: data["active"].as_u64().filter(|n| *n <= 65536).unwrap_or(0) as usize,
+            seconds: data["seconds"]
+                .as_f64()
+                .filter(|s| s.is_finite())
+                .unwrap_or(0.0),
+            rate: data["rate"]
+                .as_f64()
+                .filter(|r| r.is_finite())
+                .unwrap_or(-1.0),
+            usable: data["usable"] == true,
+        })
+    }
+
+    fn valid(&self) -> bool {
+        self.usable
+            && (1..=65536).contains(&self.workers)
+            && self.seconds.is_finite()
+            && self.seconds > 0.0
+            && self.rate.is_finite()
+            && self.rate >= 0.0
+    }
+}
+
+#[derive(Default)]
+struct RunEvidence {
+    points: BTreeMap<usize, f64>,
+    current: Option<(i64, usize)>,
+    current_rate: Option<f64>,
+    reference: f64,
+    recent: crate::tune::evidence::Evidence,
+}
+
+impl RunEvidence {
+    fn push(&mut self, observation: Observation) {
+        let current = (observation.segment, observation.workers);
+        if self.current != Some(current) {
+            // Compare against the preceding setting, not the fastest rate
+            // anywhere in the run. Never join separate visits to a count.
+            self.reference = self.current_rate.unwrap_or(0.0);
+            self.current_rate = None;
+            self.current = Some(current);
+            self.recent.clear();
+        }
+        if !observation.valid() {
+            self.recent.clear();
+            return;
+        }
+        let score = self
+            .recent
+            .push(observation.rate, observation.seconds, self.reference)
+            .or_else(|| self.recent.window())
+            .filter(|score| score.rate.is_finite() && score.rate >= 0.0);
+        if let Some(score) = score {
+            self.points.insert(observation.workers, score.rate);
+            self.current_rate = Some(score.rate);
+        }
     }
 
     fn finish(self) -> Option<Comparison> {
-        if self.incompatible || !self.consistent {
-            return None;
-        }
-        let points: Vec<_> = self.points().collect();
+        let points: Vec<_> = self.points.into_iter().collect();
         // One observed count establishes throughput, not a relative preference.
         if points.len() < 2 {
             return None;
@@ -280,8 +271,15 @@ impl RunEvidence {
 #[cfg(test)]
 fn infer_run(events: &[Value]) -> Option<(usize, bool)> {
     let mut evidence = RunEvidence::default();
+    let mut eligibility = Eligibility::default();
     for event in events {
-        evidence.push(event);
+        eligibility.push(event);
+        if let Some(observation) = Observation::from_event(event) {
+            evidence.push(observation);
+        }
+    }
+    if !eligibility.reusable() {
+        return None;
     }
     evidence.finish().map(|c| (c.workers, c.refine))
 }
@@ -322,49 +320,155 @@ mod tests {
     #[test]
     fn fast_rollback_measurements_change_the_next_start() {
         use crate::tune::{evidence::Evidence, Policy};
-
-        let temp = crate::test_support::tempdir().unwrap();
-        let path = temp.path().join("history.sqlite");
-        let key = super::super::tests::key("a");
-        record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
-        let writer = super::super::tests::recorder(&path);
-        writer.context(&key);
-        writer.event("learning_context", context()["data"].clone());
-        for _ in 0..2 {
-            writer.event("observation", observation(8, 100.0, true)["data"].clone());
-        }
-
-        let mut policy = Policy::new(8, 1, 16);
-        assert_eq!(policy.observe(100.0), 16);
-        policy.activated();
-        let mut evidence = Evidence::default();
-        for i in 0..2 {
-            let data = json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true});
-            writer.event("observation", data);
-            let score = evidence.push(20.0, 0.5, 100.0);
-            if i == 0 {
-                assert!(score.is_none());
-            } else {
-                let score = score.expect("a severe loss warrants an early rollback");
-                assert_eq!(score.seconds, 1.0);
-                assert_eq!(policy.observe(score.rate), 8);
+        for prefix in [vec![], vec![100.0]] {
+            let temp = crate::test_support::tempdir().unwrap();
+            let path = temp.path().join("history.sqlite");
+            let key = super::super::tests::key("a");
+            record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
+            let writer = super::super::tests::recorder(&path);
+            writer.context(&key);
+            writer.event("learning_context", context()["data"].clone());
+            for _ in 0..2 {
+                writer.event("observation", observation(8, 100.0, true)["data"].clone());
             }
+            let mut policy = Policy::new(8, 1, 16);
+            assert_eq!(policy.observe(100.0), 16);
+            policy.activated();
+            let mut evidence = Evidence::default();
+            let rates = prefix
+                .iter()
+                .copied()
+                .chain([20.0, 20.0])
+                .collect::<Vec<_>>();
+            for (i, rate) in rates.iter().copied().enumerate() {
+                writer.event(
+                    "observation",
+                    json!({"active":16,"seconds":0.5,"rate":rate,"usable":true}),
+                );
+                let score = evidence.push(rate, 0.5, 100.0);
+                if i + 1 != rates.len() {
+                    assert!(score.is_none());
+                } else {
+                    let score = score.expect("recent loss warrants an early rollback");
+                    assert_eq!(score.seconds, 1.0);
+                    assert_eq!(policy.observe(score.rate), 8);
+                }
+            }
+            writer.complete(true, json!({}));
+            drop(writer);
+            let db = Connection::open(&path).unwrap();
+            let saved = command::read_run(&db, 2).unwrap();
+            assert_eq!(saved["selected_workers"], Value::Null);
+            assert_eq!(saved["summary"]["measurement_totals"], Value::Null);
+            let stored = db
+                .prepare(
+                    "SELECT rate FROM measurements WHERE run=2 AND workers=16 ORDER BY sequence",
+                )
+                .unwrap()
+                .query_map([], |r| r.get::<_, f64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                stored, rates,
+                "store every interval, including the transient"
+            );
+            let next = super::super::tests::recorder(&path);
+            assert_eq!(
+                next.starting_count(&key, false).unwrap().workers,
+                8,
+                "the next copy must retain the window that justified rollback"
+            );
         }
-        writer.complete(true, json!({}));
-        drop(writer);
-        let db = Connection::open(&path).unwrap();
-        let saved = command::read_run(&db, 2).unwrap();
-        assert_eq!(saved["selected_workers"], Value::Null);
-        assert_eq!(
-            saved["summary"]["measurement_totals"]["observations"]["16"],
-            json!({"activity":20.0,"seconds":1.0,"intervals":2,"low":20.0,"high":20.0})
-        );
-        let next = super::super::tests::recorder(&path);
-        assert_eq!(
-            next.starting_count(&key, false).unwrap().workers,
-            8,
-            "the next copy must retain the measurements that justified rollback"
-        );
+    }
+
+    #[test]
+    fn ordering_interruptions_and_separate_visits_change_the_evidence() {
+        let short = |n, rate, usable| {
+            json!({"kind":"observation","data":{
+            "active":n,"seconds":0.5,"rate":rate,"usable":usable}})
+        };
+        let base = vec![
+            context(),
+            observation(8, 100.0, true),
+            observation(8, 100.0, true),
+        ];
+        for (probe, expected) in [
+            (
+                vec![
+                    short(16, 100.0, true),
+                    short(16, 20.0, true),
+                    short(16, 20.0, true),
+                ],
+                Some((8, false)),
+            ),
+            (
+                vec![
+                    short(16, 20.0, true),
+                    short(16, 100.0, true),
+                    short(16, 20.0, true),
+                ],
+                None,
+            ),
+            (
+                vec![
+                    short(16, 20.0, true),
+                    short(16, 20.0, false),
+                    short(16, 20.0, true),
+                ],
+                None,
+            ),
+            (
+                vec![
+                    short(16, 20.0, true),
+                    short(32, 20.0, true),
+                    short(16, 20.0, true),
+                ],
+                None,
+            ),
+        ] {
+            let mut events = base.clone();
+            events.extend(probe);
+            assert_eq!(infer_run(&events), expected);
+        }
+        // A later visit to 16 must not inherit its earlier high maximum.
+        let mut events = vec![
+            context(),
+            observation(16, 200.0, true),
+            observation(16, 200.0, true),
+        ];
+        events.extend(base.into_iter().skip(1));
+        events.extend([short(16, 20.0, true), short(16, 20.0, true)]);
+        assert_eq!(infer_run(&events), Some((8, false)));
+    }
+
+    #[test]
+    fn persisted_boundaries_split_windows_without_an_intervening_observation() {
+        for boundary in ["transition", "sequential_evidence"] {
+            let temp = crate::test_support::tempdir().unwrap();
+            let path = temp.path().join("history.sqlite");
+            let key = super::super::tests::key("a");
+            let writer = super::super::tests::recorder(&path);
+            writer.context(&key);
+            writer.event("learning_context", context()["data"].clone());
+            for _ in 0..2 {
+                writer.event("observation", observation(8, 100.0, true)["data"].clone());
+            }
+            writer.event(
+                "observation",
+                json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
+            );
+            writer.event(boundary, json!({}));
+            writer.event(
+                "observation",
+                json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
+            );
+            writer.complete(true, json!({}));
+            assert!(
+                writer.starting_count(&key, false).is_none(),
+                "{boundary} must split the window"
+            );
+        }
     }
 
     #[test]
@@ -432,7 +536,7 @@ mod tests {
         let key = super::super::tests::key("a");
         let writer = record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
         // Unchanged summary representation from #548. No conversion or fallback
-        // should feed a format with no rate bounds into the new inference rule.
+        // should turn an unordered summary into ordered measurements.
         let old = json!({"measured_worker_counts":2,"measurement_totals":{
             "observations":{"8":[500.0,5.0,2],"16":[1000.0,5.0,2]},
             "consistent":true,"incompatible":false}});
@@ -525,6 +629,20 @@ mod tests {
         for _ in 0..40 {
             record(&path, &key, None, true, &[(2, 0.0), (4, 0.0)]);
         }
+        // Runs can have multiple measured counts but no qualifying window.
+        // They must not displace the older usable comparison either.
+        for _ in 0..40 {
+            let short = super::super::tests::recorder(&path);
+            short.context(&key);
+            short.event("learning_context", context()["data"].clone());
+            for n in [2, 4] {
+                short.event(
+                    "observation",
+                    json!({"active":n,"seconds":0.5,"rate":100.0,"usable":true}),
+                );
+            }
+            short.complete(true, json!({}));
+        }
         let fixed = record(&path, &key, None, false, &[(2, 100.0), (4, 200.0)]);
         assert_eq!(fixed.starting_count(&key, false).unwrap().workers, 16);
         let mut route_key = key.clone();
@@ -533,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_reads_bounded_summaries_without_reading_timelines() {
+    fn startup_reads_measurement_rows_without_parsing_diagnostics() {
         let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().join("history.sqlite");
         let key = super::super::tests::key("a");
@@ -547,8 +665,7 @@ mod tests {
         }
         writer.finish(true, false, None, json!({}));
         let db = Connection::open(path).unwrap();
-        // Lookup must work even with no timeline table: its size cannot affect
-        // the amount of event data fetched or parsed at startup.
+        // Diagnostic JSON and summaries are not part of the inference query.
         db.execute("DROP TABLE events", []).unwrap();
         assert_eq!(
             starting_count(&db, &key, false).unwrap().unwrap().workers,
@@ -556,7 +673,10 @@ mod tests {
         );
         db.execute("UPDATE runs SET summary=?1", [" ".repeat(65537)])
             .unwrap();
-        assert!(starting_count(&db, &key, false).unwrap().is_none());
+        assert_eq!(
+            starting_count(&db, &key, false).unwrap().unwrap().workers,
+            16
+        );
     }
 
     #[test]
@@ -571,13 +691,13 @@ mod tests {
         assert_eq!(run["selected_workers"], Value::Null);
         assert_eq!(writer.starting_count(&key, false).unwrap().workers, 16);
         // Earlier writers used 0 (no evidence), 1 (recommendation), or 2
-        // (measurement totals). None is backfilled during startup.
-        for old_eligibility in [0, 1, 2] {
+        // (measurement totals, with bounds added in 3). None is backfilled.
+        for old_eligibility in [0, 1, 2, 3] {
             db.execute("UPDATE runs SET eligible=?1", [old_eligibility])
                 .unwrap();
             assert!(writer.starting_count(&key, false).is_none());
             let run = command::read_run(&db, 1).unwrap();
-            assert_eq!(run["summary"]["measured_worker_counts"], 2);
+            assert_eq!(run["summary"], json!({}));
         }
     }
 
@@ -595,8 +715,8 @@ mod tests {
                 "automatic":true,"overrides":"Some(TuningOptions { request_size: Some(1024) })"
             }}),
             observation(4, 50.0, true),
-            observation(8, 100.0, true),
             observation(4, 50.0, true),
+            observation(8, 100.0, true),
             observation(8, 100.0, true),
             context(),
         ];

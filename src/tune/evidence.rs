@@ -6,10 +6,9 @@ pub(super) struct Score {
     pub intervals: usize,
 }
 
-// Shared with history inference: a full second of consistently nonzero,
-// less-than-half-rate observations is enough to retain a severe loss.
-// Callers also require at least two observations.
-pub(super) fn severe_loss(seconds: f64, low: f64, high: f64, base: f64) -> bool {
+// A full second of consistently nonzero, less-than-half-rate observations
+// is enough to establish a severe loss. The caller also requires two intervals.
+fn severe_loss(seconds: f64, low: f64, high: f64, base: f64) -> bool {
     seconds >= 1.0 && low > 0.0 && high < base * 0.5
 }
 
@@ -21,6 +20,17 @@ pub(super) struct Evidence {
 impl Evidence {
     pub fn clear(&mut self) {
         self.intervals.clear();
+    }
+
+    /// Descriptive rate of the recent window, independent of a comparison.
+    /// Startup inference uses this when no directional conclusion is available.
+    pub(super) fn window(&self) -> Option<Score> {
+        let seconds: f64 = self.intervals.iter().map(|p| p.1).sum();
+        (self.intervals.len() >= 2 && seconds >= 2.5).then(|| Score {
+            rate: self.intervals.iter().map(|p| p.0 * p.1).sum::<f64>() / seconds,
+            seconds,
+            intervals: self.intervals.len(),
+        })
     }
 
     /// Consistent losses warrant shorter exposure as their cost increases.
