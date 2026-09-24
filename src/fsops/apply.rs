@@ -546,7 +546,8 @@ pub(super) fn set_meta_rooted(
         }
         apply_owner_if_changed(flags, meta, metadata.uid, metadata.gid, |uid, gid| {
             parent.chown(uid, gid)
-        })?;
+        })
+        .with_context(|| format!("change owner of confined path {}", target.label.display()))?;
         if time_differs {
             let times = [
                 timespec(0, libc::UTIME_OMIT as u32),

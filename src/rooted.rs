@@ -721,11 +721,11 @@ impl Root {
         mode: u32,
     ) -> Result<ResolvedParent<'_>> {
         let (parents, leaf) = path.leaf()?;
-        #[cfg(all(test, target_os = "linux"))]
-        self.check_test_name_limit(path)?;
         if parents.is_empty() {
             return self.resolve_parent(path);
         }
+        #[cfg(all(test, target_os = "linux"))]
+        self.check_test_name_limit(path)?;
         if let Ok(directory) = open_directory_components_fast(&self.directory, parents) {
             return Ok(ResolvedParent {
                 directory: DirectoryHandle::Owned(directory),
