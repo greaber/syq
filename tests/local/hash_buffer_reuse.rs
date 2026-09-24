@@ -16,7 +16,7 @@ fn changed_files_write_the_retained_source_bytes() {
             "-a",
             "--syq-no-tcp",
             "--no-progress",
-            "--performance-tuning=copy-path=ranges,workers=1",
+            "--performance-tuning=copy-path=ranges,workers=1,block-reuse=on",
             "--integrity-checking=transfer=blake3",
             &t.s("src/"),
             &t.s("dst/"),
