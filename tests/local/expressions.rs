@@ -481,3 +481,318 @@ fn destination_inspection_errors_are_not_missing_entries() {
         );
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_dry_run_estimates_count_copy_if_selected_leaves() {
+    for existing in [false, true] {
+        for (condition, bytes) in [
+            ("not dst.exists and src.path = 'nested/tiny'", "3 B"),
+            ("dst.exists", "0 B"),
+        ] {
+            let t = Tmp::new();
+            write(&t.path("src/nested/tiny"), b"abc");
+            write(&t.path("src/nested/large"), b"longer contents");
+            if existing {
+                fs::create_dir(t.path("dst")).unwrap();
+            }
+            let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args([
+                    "cp",
+                    "--srcs-in",
+                    &t.s("src"),
+                    "--into",
+                    &t.s("dst"),
+                    "--dry-run",
+                    "--copy-if",
+                    condition,
+                    "--no-progress",
+                ])
+                .env("SYQ_TEST_AVAILABLE_BYTES", "1")
+                .run()
+                .unwrap();
+            assert_output_ok(&out);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains(&format!("capacity: {bytes} logical data required")),
+                "{stdout}"
+            );
+            assert!(!t.path("dst/nested").exists());
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn tiny_expression_pushes_use_fused_copy_and_preserve_excluded_files() {
+    for force_planner in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        t.expose_remote_syq();
+        write(&t.path("src/keep"), b"new contents");
+        write(&t.path("src/skip"), b"rejected source");
+        write(&t.path("src/existing"), b"replace?");
+        write(&t.path("dst/existing"), b"keep destination unchanged");
+        fs::set_permissions(t.path("src/existing"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(t.path("dst/existing"), fs::Permissions::from_mode(0o644)).unwrap();
+        let results = t.s("results.jsonl");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args([
+                "cp",
+                &t.s("src/keep"),
+                &t.s("src/skip"),
+                &t.s("src/existing"),
+                "--to",
+                "host",
+                "--into",
+                &t.s("dst"),
+                "--where",
+                "src.name != 'skip' and src.kind = 'file'",
+                "--copy-if",
+                "not dst.exists or src.size > dst.size",
+                "--preserve=permissions",
+                "--results",
+                &results,
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--no-bootstrap",
+                "--no-tcp",
+                "--no-progress",
+            ])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("SYQ_DEBUG", "1");
+        if force_planner {
+            command.env("SYQ_TEST_DISABLE_SMALL_COPY", "1");
+        }
+        let output = command.run().unwrap();
+        assert_output_ok(&output);
+        assert_eq!(
+            stderr_of(&output).contains("small copy: published"),
+            !force_planner,
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(read(&t.path("dst/keep")), b"new contents");
+        assert!(!t.path("dst/skip").exists());
+        assert_eq!(read(&t.path("dst/existing")), b"keep destination unchanged");
+        assert_eq!(
+            fs::metadata(t.path("dst/existing")).unwrap().mode() & 0o777,
+            0o644
+        );
+        let records: Vec<serde_json::Value> = fs::read_to_string(results)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["files_excluded"], 2, "{terminal}");
+        assert_eq!(terminal["files_transferred"], 1, "{terminal}");
+    }
+}
+
+#[test]
+fn tiny_copy_if_sees_original_source_and_renamed_destination() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    t.expose_remote_syq();
+    write(&t.path("original"), b"contents");
+    write(&t.path("renamed"), b"x");
+    fs::set_permissions(t.path("original"), fs::Permissions::from_mode(0o400)).unwrap();
+    // The source mode must remain 0400 in the expression, even though normal
+    // staging adds owner-write permission to the publication metadata.
+    let meta = fs::metadata(t.path("original")).unwrap();
+    let predicate = format!("src.name = 'original' and dst.path = 'renamed' and dst.exists and src.mode = 0o400 and src.inode = {} and src.nlink = 1 and src.ctime <= now and src.size > dst.size", meta.ino());
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("original"),
+            "--to",
+            "host",
+            "--as",
+            &t.s("renamed"),
+            "--copy-if",
+            &predicate,
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--no-bootstrap",
+            "--no-tcp",
+            "--no-progress",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(
+        stderr_of(&output).contains("small copy: published"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(read(&t.path("renamed")), b"contents");
+}
+
+#[test]
+fn tiny_copy_if_rejection_and_errors_leave_missing_targets_absent() {
+    for predicate in ["dst.exists", "dst.exists or 1 / 0 = 0"] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        t.expose_remote_syq();
+        write(&t.path("source"), b"contents");
+        fs::create_dir(t.path("dst")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                &t.s("source"),
+                "--to",
+                "host",
+                "--into",
+                &t.s("dst"),
+                "--copy-if",
+                predicate,
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--no-bootstrap",
+                "--no-tcp",
+                "--no-progress",
+            ])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("SYQ_DEBUG", "1")
+            .run()
+            .unwrap();
+        if predicate == "dst.exists" {
+            assert_output_ok(&output);
+            assert!(
+                stderr_of(&output).contains("small copy: published"),
+                "{}",
+                stderr_of(&output)
+            );
+        } else {
+            assert!(!output.status.success(), "{}", stderr_of(&output));
+            assert!(
+                stderr_of(&output).contains("division by zero"),
+                "{}",
+                stderr_of(&output)
+            );
+        }
+        assert!(!t.path("dst/source").exists());
+        assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn remote_copy_if_batches_directory_and_leaf_observations() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    t.expose_remote_syq();
+    write(&t.path("src/nested/keep"), b"longer new contents");
+    write(&t.path("src/nested/skip"), b"x");
+    write(&t.path("dst/nested/keep"), b"old");
+    write(&t.path("dst/nested/skip"), b"keep old contents");
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--srcs-in",
+            &t.s("src"),
+            "--to",
+            "host",
+            "--into",
+            &t.s("dst"),
+            "--copy-if",
+            "not dst.exists or src.size > dst.size",
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--no-bootstrap",
+            "--no-tcp",
+            "--no-progress",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_TEST_DESTINATION_LOOKUPS", t.path("lookups"))
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/nested/keep")), b"longer new contents");
+    assert_eq!(read(&t.path("dst/nested/skip")), b"keep old contents");
+    let lookups = fs::read_to_string(t.path("lookups")).unwrap();
+    assert!(
+        lookups
+            .lines()
+            .any(|line| line.starts_with("batch ") && line.ends_with(" 2 true")),
+        "{lookups}"
+    );
+    assert!(
+        !lookups.lines().any(|line| line.starts_with("lookup ")),
+        "{lookups}"
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn tiny_offer_does_not_read_rejected_sources() {
+    for all_rejected in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        t.expose_remote_syq();
+        write(&t.path("src/rejected"), &vec![42; 1024 * 1024]);
+        write(&t.path("src/selected"), b"selected");
+        write(&t.path("dst/rejected"), b"keep existing");
+        if all_rejected {
+            write(&t.path("dst/selected"), b"keep this too");
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                &t.s("src/rejected"),
+                &t.s("src/selected"),
+                "--to",
+                "host",
+                "--into",
+                &t.s("dst"),
+                "--copy-if",
+                "not dst.exists",
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--no-bootstrap",
+                "--no-tcp",
+                "--no-progress",
+            ])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_FAIL_READ_RANGE_NAME", "rejected")
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        let stderr = stderr_of(&output);
+        assert!(stderr.contains("small copy: published"), "{stderr}");
+        assert_eq!(
+            stderr.contains("small copy: sending 1 selected files (8 bytes)"),
+            !all_rejected,
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("small copy: sending"),
+            !all_rejected,
+            "{stderr}"
+        );
+        assert_eq!(read(&t.path("dst/rejected")), b"keep existing");
+        assert_eq!(
+            read(&t.path("dst/selected")),
+            if all_rejected {
+                b"keep this too".as_slice()
+            } else {
+                b"selected".as_slice()
+            }
+        );
+    }
+}

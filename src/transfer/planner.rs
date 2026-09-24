@@ -346,9 +346,16 @@ impl Deletes {
 }
 
 impl Planner<'_> {
-    pub(super) fn record_fresh_entry(&mut self, dst: &[u8], entry: &Entry, new_object: bool) {
+    pub(super) fn record_fresh_entry(
+        &mut self,
+        dst: &[u8],
+        dst_rel: &[u8],
+        src_root: &[u8],
+        entry: &Entry,
+        new_object: bool,
+    ) -> Result<()> {
         if !new_object || self.fresh_capacity.is_none() {
-            return;
+            return Ok(());
         }
         let included = match entry.kind {
             Kind::Dir => true,
@@ -372,18 +379,40 @@ impl Planner<'_> {
             Kind::Other => false,
         };
         if !included {
-            return;
+            return Ok(());
+        }
+        // A fresh target has no existing leaves. Directory containers are
+        // still needed even when --copy-if excludes their source metadata.
+        if entry.kind != Kind::Dir && self.opts.expressions.update.is_some() {
+            let relative = self
+                .src_overrides
+                .get(&entry.path)
+                .map(Vec::as_slice)
+                .unwrap_or(&entry.path);
+            if !self
+                .opts
+                .expressions
+                .permits(
+                    &crate::expression::File::from_entry(entry),
+                    crate::expression::source_path(src_root, relative),
+                    &crate::expression::File::default(),
+                    crate::expression::source_path(dst, dst_rel),
+                )
+                .with_context(|| format!("capacity estimate for {}", display(dst)))?
+            {
+                return Ok(());
+            }
         }
         let reuses_existing_root = dst == self.dst_root && entry.kind == Kind::Dir;
         let Some(plan) = &mut self.fresh_capacity else {
-            return;
+            return Ok(());
         };
         if self.opts.hardlinks
             && entry.kind == Kind::File
             && entry.nlink > 1
             && !plan.hardlink_inodes.insert((entry.dev, entry.ino))
         {
-            return;
+            return Ok(());
         }
         // When source contents map directly into an existing empty container,
         // the source's root directory reuses that one existing inode.
@@ -399,14 +428,10 @@ impl Planner<'_> {
                 None => plan.overflowed = true,
             }
         }
+        Ok(())
     }
 
     pub(super) fn assess_fresh_capacity(&mut self) -> Result<Option<FreshCapacityAssessment>> {
-        // Destination-dependent eligibility is resolved later. Counting all
-        // candidates here could reject a copy whose selected files fit.
-        if self.opts.expressions.update.is_some() {
-            return Ok(None);
-        }
         let Some(plan) = self.fresh_capacity.as_mut() else {
             return Ok(None);
         };
@@ -1128,7 +1153,7 @@ impl Planner<'_> {
         {
             self.sched.anticipate_file_work();
         }
-        let mut mapped = self.map_batch(batch, src_root, sub, dst_root);
+        let mut mapped = self.map_batch(batch, src_root, sub, dst_root)?;
         if self.collision {
             return Ok(());
         }
@@ -1197,7 +1222,7 @@ impl Planner<'_> {
         src_root: &[u8],
         sub: &[u8],
         dst_root: &[u8],
-    ) -> Mapped {
+    ) -> Result<Mapped> {
         let opts = self.opts;
         let mut dirs: Vec<(PathBytes, PathBytes, Entry)> = Vec::new();
         let mut others: Vec<Planned> = Vec::new();
@@ -1266,7 +1291,7 @@ impl Planner<'_> {
             if claim != Claim::Weak && self.fail_blocked_mapping_entry(&dst, &dst_rel, e.kind) {
                 continue;
             }
-            self.record_fresh_entry(&dst, &e, new_capacity_object);
+            self.record_fresh_entry(&dst, &dst_rel, src_root, &e, new_capacity_object)?;
             let src = match self.src_overrides.get(&e.path) {
                 Some(actual) => join(src_root, actual),
                 None => join(src_root, &e.path),
@@ -1328,14 +1353,14 @@ impl Planner<'_> {
                 }),
             }
         }
-        Mapped {
+        Ok(Mapped {
             directory_expression_sources,
             dst_root: dst_root.to_vec(),
             dirs,
             others,
             dir_stats: None,
             other_stats: None,
-        }
+        })
     }
 
     pub(super) fn buffered_file_population(&self, fast_limit: u64) -> (usize, u64, bool) {
@@ -2649,8 +2674,7 @@ impl Planner<'_> {
     fn inspect_destination_batch(&mut self, mapped: &mut Mapped) -> Result<()> {
         // Keep the remote receiver's combined metadata lookup, but no longer
         // ask it to compute temporary names for every source file.
-        if self.opts.expressions.update.is_some()
-            || self.opts.inode_preservation.any()
+        if self.opts.inode_preservation.any()
             || !self.opts.dst_remote
             || self.buffer.is_some()
             || self.opts.dry_run
@@ -2680,6 +2704,7 @@ impl Planner<'_> {
                 directories: directories.clone(),
                 others: others.clone(),
                 guard: None,
+                strict_metadata: self.opts.expressions.update.is_some(),
             })?,
             "plan destination batch",
         )? {

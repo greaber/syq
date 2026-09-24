@@ -804,6 +804,8 @@ pub enum WireRequest<Data> {
         directories: Vec<PathBytes>,
         others: Vec<PathBytes>,
         guard: Option<ContainerGuard>,
+        /// Fail on unreadable entries instead of treating them as absent.
+        strict_metadata: bool,
     },
     /// Return the size of this invocation's partial, if it is a regular file.
     /// The planner has already statted the final path.
@@ -948,11 +950,8 @@ pub enum WireRequest<Data> {
     /// ends the grant's mutation authority.
     Receipt,
     Shutdown,
-    /// One turn for a bounded push of regular files on a fresh control
-    /// session: retain and register the destination directory, quick-check
-    /// existing files, repair metadata and publish changed content through
-    /// the ordinary staged path. See `SmallCopyRequest`.
-    CopySmallFiles(SmallCopyRequest),
+    /// Supply only payloads requested by PrepareSmallFiles on this session.
+    CopySmallFiles(Vec<SmallCopyPayload>),
     /// On-demand completion metadata. Appended to preserve existing wire tags.
     ListDirDetails {
         directory: PathBytes,
@@ -1019,6 +1018,8 @@ pub enum WireRequest<Data> {
         guard: Option<ContainerGuard>,
     },
     NativeMap(crate::native_map::Options),
+    /// Configure and select a bounded small push without reading its payloads.
+    PrepareSmallFiles(SmallCopyRequest),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1059,7 +1060,7 @@ impl ReadStreamRequest {
     }
 }
 
-/// Bounds for one-turn small pushes. The receiver enforces them independently
+/// Bounds for small pushes. The receiver enforces them independently
 /// of the coordinator's eligibility check.
 pub const SMALL_COPY_MAX_FILES: usize = 64;
 pub const SMALL_COPY_MAX_FILE_BYTES: u64 = 1 << 20;
@@ -1078,14 +1079,25 @@ pub struct SmallCopyIdentity {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallCopyFile {
     pub path: PathBytes,
-    #[serde(with = "serde_bytes")]
-    pub data: Vec<u8>,
-    pub hash: ContentDigest,
+    /// Original source facts and expression path, before publication modes.
+    pub expression_source: Option<(crate::expression::File, PathBytes)>,
+    pub size: u64,
     pub meta: Meta,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallCopyPayload {
+    pub index: u32,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    pub hash: ContentDigest,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallCopyRequest {
+    pub hash_policy: crate::hashing::HashPolicy,
+    /// Update expression and coordinator's fixed invocation time.
+    pub copy_if: Option<(String, i128)>,
     /// The operator directory: the `--into` directory, or the parent of an
     /// `--as` leaf. It must already exist.
     pub directory: PathBytes,
@@ -1123,6 +1135,8 @@ pub enum SmallCopyDisposition {
     QuickChecked,
     /// Content was read and matched; the source must still be rechecked.
     ContentMatched,
+    /// The destination condition rejected this entry without updating it.
+    Excluded,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -1279,6 +1293,8 @@ pub enum Response {
     DefaultPermissions(Vec<u32>),
     NativeMapData(Vec<u8>),
     NativeMapDone,
+    /// One bit per offered file; true requests its payload (including empty files).
+    SmallFilesPrepared(Vec<bool>),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
