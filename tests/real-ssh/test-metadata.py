@@ -29,12 +29,13 @@ def successful_copies():
         expected_atime = 1_000_000_000_123456789
         os.utime(source / 'file', ns=(expected_atime, (source / 'file').stat().st_mtime_ns))
         for label, transport in [('ssh', ['--no-tcp']), ('tcp', [])]:
+            env = dict(os.environ, SYQ_TEST_REQUIRE_TCP='1') if label == 'tcp' else None
             destination = '/tmp/syq-real-ssh/inode-metadata-' + label
             push = ['syq', 'cp', '--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse', '--srcs-in', str(source), '--to', 'destination', '--into', destination, *transport]
-            subprocess.run(push, check=True, timeout=30)
-            subprocess.run(push, check=True, timeout=30)
+            subprocess.run(push, check=True, timeout=30, env=env)
+            subprocess.run(push, check=True, timeout=30, env=env)
             pull = root / label
-            subprocess.run(['syq', 'cp', '--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30)
+            subprocess.run(['syq', 'cp', '--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30, env=env)
             assert (source / 'file').stat().st_atime_ns == expected_atime
             assert (pull / 'file').stat().st_atime_ns == expected_atime
             copied = (pull / 'file').stat()
@@ -50,9 +51,9 @@ def successful_copies():
             os.removexattr(pull / 'file','user.empty')
             os.removexattr(pull / 'file','system.posix_acl_access')
             os.removexattr(pull,'system.posix_acl_default')
-            subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse','--srcs-in',str(pull),'--to','destination','--into',destination,*transport],check=True,timeout=30)
+            subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse','--srcs-in',str(pull),'--to','destination','--into',destination,*transport],check=True,timeout=30,env=env)
             verify = root / (label + '-reconciled')
-            subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse','--from','destination','--srcs-in',destination,'--into',str(verify),*transport],check=True,timeout=30)
+            subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse','--from','destination','--srcs-in',destination,'--into',str(verify),*transport],check=True,timeout=30,env=env)
             assert (verify / 'file').stat().st_atime_ns == expected_atime
             assert 'user.empty' not in os.listxattr(verify / 'file')
             assert 'system.posix_acl_access' not in os.listxattr(verify / 'file')
@@ -146,6 +147,7 @@ def failed_copies():
         (source / 'file').write_bytes(data)
         os.link(source / 'file', source / 'alias')
         for label, transport in [('ssh', ['--no-tcp']), ('tcp', [])]:
+            env = dict(os.environ, SYQ_TEST_REQUIRE_TCP='1') if label == 'tcp' else None
             for inplace in (False, True):
                 for attribute in ('system.posix_acl_access', 'user.binary'):
                     print(f'case: {label} metadata failure after writing ({inplace=}, {attribute})', flush=True)
@@ -157,7 +159,7 @@ def failed_copies():
                     if inplace:
                         command.append('--inplace')
                     remote(f'from pathlib import Path; Path({control!r}).write_text({attribute!r})')
-                    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+                    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, env=env)
                     assert result.returncode != 0, result.stdout
                     assert 'injected attribute reconciliation failure' in result.stdout, result.stdout
                     staged = snapshot(destination)
@@ -169,7 +171,7 @@ def failed_copies():
                         assert all(f['mode'] == 0o440 for f in staged.values()), staged
                     remote(f'from pathlib import Path; Path({control!r}).unlink()')
                     metadata(source / 'file', b'after failure')
-                    subprocess.run(command, check=True, timeout=60)
+                    subprocess.run(command, check=True, timeout=60, env=env)
                     verify(source, destination)
             print(f'case: {label} interrupted metadata copy resumes', flush=True)
             metadata(source / 'file', b'before interruption')
@@ -179,7 +181,7 @@ def failed_copies():
                 '--performance-tuning=workers=1,comparison-block-size=1M', '--no-progress', *transport]
             with tempfile.TemporaryFile() as log:
                 process = subprocess.Popen([*command, '--resource-limits=bandwidth=2M'],
-                    stdout=log, stderr=log, start_new_session=True)
+                    stdout=log, stderr=log, start_new_session=True, env=env)
                 try:
                     deadline = time.monotonic() + 30
                     next_report = 0
@@ -212,7 +214,7 @@ print(any(f.open('rb').read(4 << 20) == {data[:256]!r} * (4 * 4096) for f in p.g
             assert not {'file', 'alias'} & snapshot(destination).keys()
             metadata(source / 'file', b'after interruption')
             results = Path(temporary) / (label + '.ndjson')
-            subprocess.run([*command, '--results', str(results)], check=True, timeout=60)
+            subprocess.run([*command, '--results', str(results)], check=True, timeout=60, env=env)
             terminal = json.loads(results.read_text().splitlines()[-1])
             assert terminal['status'] == 'success', terminal
             assert 0 < terminal['bytes_transferred'] < len(data), terminal
