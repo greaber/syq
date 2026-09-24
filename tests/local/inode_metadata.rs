@@ -847,7 +847,7 @@ fn expressions_keep_unselected_container_attributes() {
         "--where",
         "src.kind = 'file'",
         "--copy-if",
-        "true",
+        "src.kind != 'dir'",
         "--preserve=permissions,xattrs",
     ]);
     let mode = fs::metadata(t.path("dst/existing")).unwrap().mode() & 0o7777;

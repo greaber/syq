@@ -1094,7 +1094,7 @@ struct NativeCopyOperationalArgs {
     /// Skip regular files newer at the destination; non-directory type replacements still occur
     #[arg(long = "skip-newer", hide = true, conflicts_with_all = ["ignore_existing", "inplace"])]
     update: bool,
-    /// Select source entries with a typed expression; directories remain traversable
+    /// Select non-directory source entries with a typed expression; directories follow normal copy rules
     #[arg(long = "where", value_name = "EXPR")]
     where_expression: Option<String>,
     /// Update only entries satisfying a source/destination expression

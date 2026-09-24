@@ -73,7 +73,7 @@ struct Download {
     expected_hash: Option<Digest>,
     metadata: Option<crate::mapping::Metadata>,
     copy_source: Option<Box<(Object, aws_sdk_s3::operation::head_object::HeadObjectOutput)>>,
-    authorized_object: Option<Object>,
+    source_object: Option<Object>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
@@ -1439,11 +1439,25 @@ impl Engine {
                 }
                 let kind = object.kind();
                 let directory = client::is_directory_marker(&object.key, object.size);
-                vec![(object.key, object.size, path.clone(), kind, directory)]
+                vec![(
+                    object.key.clone(),
+                    object.size,
+                    path.clone(),
+                    kind,
+                    directory,
+                    Some(object),
+                )]
             } else if let Some(exact) = exact {
                 let kind = exact.kind();
                 let directory = client::is_directory_marker(&exact.key, exact.size);
-                vec![(exact.key, exact.size, path.clone(), kind, directory)]
+                vec![(
+                    exact.key.clone(),
+                    exact.size,
+                    path.clone(),
+                    kind,
+                    directory,
+                    Some(exact),
+                )]
             } else {
                 if selection == SourceSelection::File {
                     bail!("S3 source object {key:?} is missing");
@@ -1507,11 +1521,18 @@ impl Engine {
                     } else {
                         ObjectKind::File
                     };
-                    objects.push((object, size, local::join(&path, &suffix), kind, directory));
+                    objects.push((
+                        object,
+                        size,
+                        local::join(&path, &suffix),
+                        kind,
+                        directory,
+                        None,
+                    ));
                 }
                 objects
             };
-            for (key, size, path, kind, directory) in objects {
+            for (key, size, path, kind, directory, source_object) in objects {
                 if !already_filtered {
                     if let Some(excluded) =
                         client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
@@ -1604,6 +1625,30 @@ impl Engine {
                         .to_vec(),
                     )?
                 };
+                let known_source = source_object.as_ref().map(Object::expression_file);
+                let facts = known_source.as_ref().map_or(
+                    crate::expression::Facts::S3Listing {
+                        size,
+                        directory_marker: directory,
+                    },
+                    crate::expression::Facts::Complete,
+                );
+                let selected = self
+                    .args
+                    .expressions
+                    .selects_known(facts, expression_path.as_bytes())?;
+                if selected == Some(false)
+                    || (selected == Some(true)
+                        && self.args.expressions.permits_known(
+                            facts,
+                            expression_path.as_bytes(),
+                            crate::expression::Facts::Unread,
+                            expression_destination_path.as_bytes(),
+                        )? == Some(false))
+                {
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                    continue;
+                }
                 out.push(Download {
                     expression_path,
                     expression_destination_path,
@@ -1614,7 +1659,7 @@ impl Engine {
                     expected_hash: expected_hash.clone(),
                     metadata,
                     copy_source: copy_source.take().map(Box::new),
-                    authorized_object: None,
+                    source_object,
                 });
             }
         }
@@ -1635,6 +1680,21 @@ impl Engine {
         destination: &Destination,
         directories: DirectoryMetadata,
     ) -> Result<Option<u64>> {
+        let known_source = job.source_object.as_ref().map(Object::expression_file);
+        let source_facts = known_source.as_ref().map_or(
+            crate::expression::Facts::S3Listing {
+                size: job.size,
+                directory_marker: client::is_directory_marker(&job.key, job.size),
+            },
+            crate::expression::Facts::Complete,
+        );
+        let selected = self
+            .args
+            .expressions
+            .selects_known(source_facts, job.expression_path.as_bytes())?;
+        if selected == Some(false) {
+            return Ok(None);
+        }
         let part_size = self.part_size(job.size);
         let expected_hash = job.expected_hash.as_ref();
         let requires_regular_file = expected_hash.is_some();
@@ -1658,6 +1718,34 @@ impl Engine {
         {
             return Ok(None);
         }
+        let destination_file = || -> Result<crate::expression::File> {
+            let mut file = existing
+                .map(crate::expression::File::from_root)
+                .unwrap_or_default();
+            if file.kind == Some(crate::proto::Kind::Symlink) {
+                file.link_target = Some(root.read_link(&path)?);
+            }
+            Ok(file)
+        };
+        let mut observed_destination = None;
+        let permitted = if self.args.expressions.update.is_none() {
+            Some(true)
+        } else if selected == Some(true) {
+            let file = destination_file()?;
+            let result = self.args.expressions.permits_known(
+                source_facts,
+                job.expression_path.as_bytes(),
+                crate::expression::Facts::Complete(&file),
+                job.expression_destination_path.as_bytes(),
+            )?;
+            observed_destination = Some(file);
+            result
+        } else {
+            None
+        };
+        if permitted == Some(false) {
+            return Ok(None);
+        }
         // A fresh file obtains metadata with its first data request. For a
         // multipart download, receiving these headers is enough to start the
         // other ranges; the first body is consumed alongside them.
@@ -1666,7 +1754,8 @@ impl Engine {
         let initial = if existing.is_none()
             && !self.args.dry_run
             && !job.key.ends_with('/')
-            && !self.args.expressions.active()
+            && selected == Some(true)
+            && permitted == Some(true)
         {
             initial_slot = Some(self.tuning.requests.acquire().await);
             Some(
@@ -1674,13 +1763,9 @@ impl Engine {
                     .get_object()
                     .bucket(&self.options.bucket)
                     .key(&job.key)
-                    .set_if_match(
-                        job.authorized_object
-                            .as_ref()
-                            .map(|object| object.etag.clone()),
-                    )
+                    .set_if_match(job.source_object.as_ref().map(|object| object.etag.clone()))
                     .set_version_id(
-                        job.authorized_object
+                        job.source_object
                             .as_ref()
                             .and_then(|object| object.version.clone()),
                     )
@@ -1695,7 +1780,7 @@ impl Engine {
         };
         let object = if let Some(output) = &initial {
             client::from_get(&job.key, job.size, part_size, output)?
-        } else if let Some(object) = &job.authorized_object {
+        } else if let Some(object) = &job.source_object {
             object.clone()
         } else {
             client::head(&self.client, &self.options.bucket, &job.key)
@@ -1712,12 +1797,11 @@ impl Engine {
             {
                 return Ok(None);
             }
-            let mut dest = existing
-                .map(crate::expression::File::from_root)
-                .unwrap_or_default();
-            if dest.kind == Some(crate::proto::Kind::Symlink) {
-                dest.link_target = Some(root.read_link(&path)?);
-            }
+            let dest = match observed_destination {
+                Some(file) => file,
+                None if self.args.expressions.update.is_some() => destination_file()?,
+                None => crate::expression::File::default(),
+            };
             if !self.args.expressions.permits(
                 &source,
                 job.expression_path.as_bytes(),

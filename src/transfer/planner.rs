@@ -2165,7 +2165,7 @@ impl Planner<'_> {
                 self.blocked_directory_paths.insert(p);
                 continue;
             }
-            if opts.expressions.active() {
+            if opts.expressions.update.is_some() {
                 let source = crate::expression::File::from_entry(&e);
                 let destination = st
                     .as_ref()
@@ -2176,20 +2176,15 @@ impl Planner<'_> {
                     .get(&p)
                     .map(Vec::as_slice)
                     .unwrap_or(&e.path);
-                let selected = opts
+                if !opts
                     .expressions
-                    .selects(&source, source_path)
-                    .with_context(|| format!("directory {}", display(&p)))?;
-                if !selected
-                    || !opts
-                        .expressions
-                        .permits(
-                            &source,
-                            source_path,
-                            &destination,
-                            crate::expression::source_path(&p, &dst_rel),
-                        )
-                        .with_context(|| format!("directory {}", display(&p)))?
+                    .permits(
+                        &source,
+                        source_path,
+                        &destination,
+                        crate::expression::source_path(&p, &dst_rel),
+                    )
+                    .with_context(|| format!("directory {}", display(&p)))?
                 {
                     self.unselected_dirs.insert(p.clone());
                 }

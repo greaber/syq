@@ -251,12 +251,36 @@ fn expressions_reject_streams_and_copy_if_rejects_inplace() {
 }
 
 #[test]
-fn selected_directory_metadata_is_independent_of_descendants() {
+fn where_filters_leaves_and_copy_if_controls_directory_metadata() {
     let t = Tmp::new();
-    write(&t.path("src/child/file"), b"contents");
-    write(&t.path("dst/child/old"), b"existing");
-    fs::set_permissions(t.path("src/child"), fs::Permissions::from_mode(0o750)).unwrap();
-    fs::set_permissions(t.path("dst/child"), fs::Permissions::from_mode(0o755)).unwrap();
+    write(&t.path("src/private/keep.jpg"), b"selected");
+    write(&t.path("src/private/skip.txt"), b"excluded");
+    fs::create_dir_all(t.path("src/empty")).unwrap();
+    fs::set_permissions(t.path("src/private"), fs::Permissions::from_mode(0o700)).unwrap();
+    for run in 0..2 {
+        // Cover both fresh and existing destination directories.
+        run_native_ok(&[
+            "cp",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+            "--preserve=permissions",
+            "--where",
+            "src.extension = 'jpg'",
+        ]);
+        assert_eq!(
+            fs::metadata(t.path("dst/private")).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(read(&t.path("dst/private/keep.jpg")), b"selected");
+        assert!(!t.path("dst/private/skip.txt").exists());
+        assert!(t.path("dst/empty").is_dir());
+        if run == 0 {
+            fs::set_permissions(t.path("dst/private"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    fs::set_permissions(t.path("dst/private"), fs::Permissions::from_mode(0o755)).unwrap();
     run_native_ok(&[
         "cp",
         "--srcs-in",
@@ -265,13 +289,14 @@ fn selected_directory_metadata_is_independent_of_descendants() {
         &t.s("dst"),
         "--preserve=permissions",
         "--where",
-        "src.kind = 'file'",
+        "src.extension = 'jpg'",
+        "--copy-if",
+        "src.kind != 'dir'",
     ]);
     assert_eq!(
-        fs::metadata(t.path("dst/child")).unwrap().mode() & 0o777,
+        fs::metadata(t.path("dst/private")).unwrap().mode() & 0o777,
         0o755
     );
-    assert_eq!(read(&t.path("dst/child/file")), b"contents");
     run_native_ok(&[
         "cp",
         "--srcs-in",
@@ -280,11 +305,13 @@ fn selected_directory_metadata_is_independent_of_descendants() {
         &t.s("dst"),
         "--preserve=permissions",
         "--where",
+        "false",
+        "--copy-if",
         "src.kind = 'dir'",
     ]);
     assert_eq!(
-        fs::metadata(t.path("dst/child")).unwrap().mode() & 0o777,
-        0o750
+        fs::metadata(t.path("dst/private")).unwrap().mode() & 0o777,
+        0o700
     );
 }
 
@@ -310,7 +337,7 @@ fn merged_directories_keep_each_sources_expression_result() {
         "--into",
         &t.s("dst"),
         "--preserve=permissions",
-        "--where",
+        "--copy-if",
         "src.kind = 'file' or src.mode = 0o750",
     ]);
     assert_eq!(
@@ -347,6 +374,8 @@ fn unselected_containers_use_receiver_umask_and_inheritance() {
             &t.s("dst"),
             "--where",
             "src.kind = 'file'",
+            "--copy-if",
+            "src.kind != 'dir'",
             "--rsh",
             rsh.to_str().unwrap(),
             "--no-bootstrap",
@@ -385,6 +414,8 @@ fn unselected_readonly_containers_reopen_and_restore_their_modes() {
         &t.s("dst"),
         "--where",
         "src.kind = 'file'",
+        "--copy-if",
+        "src.kind != 'dir'",
         "--preserve=permissions",
     ]);
     let mode = fs::metadata(t.path("dst/nested")).unwrap().mode() & 0o7777;

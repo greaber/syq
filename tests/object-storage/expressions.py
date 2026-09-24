@@ -65,10 +65,10 @@ def check():
         marker_copy = checks.PREFIX + '/markers'
         marker_predicate = "src.kind = 'dir' and src.name = 'nested' and src.path = 'nested'"
         checks.run(['--from', remote, '--srcs-in', prefix, '--to', remote, '--into', marker_copy,
-                    '--where', marker_predicate])
+                    '--where', 'false', '--copy-if', marker_predicate])
         assert set(checks.listing(marker_copy + '/')) == {marker_copy + '/nested/'}
         checks.run(['--from', remote, '--srcs-in', prefix, '--into', root / 'marker-download',
-                    '--where', marker_predicate])
+                    '--where', 'false', '--copy-if', marker_predicate])
         assert (root / 'marker-download/nested').is_dir()
         assert not (root / 'marker-download/nested/keep').exists()
         # Provider objects have no Unix owner metadata; test null deliberately.

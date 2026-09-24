@@ -210,6 +210,46 @@ impl File {
     }
 }
 
+/// Facts available without another metadata request. Unread fields are distinct
+/// from known-unavailable (`null`) fields, so short-circuiting stays exact.
+#[derive(Clone, Copy)]
+pub(crate) enum Facts<'a> {
+    Complete(&'a File),
+    S3Listing { size: u64, directory_marker: bool },
+    Unread,
+}
+#[derive(Debug)]
+struct NeedMetadata;
+impl std::fmt::Display for NeedMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("expression needs metadata")
+    }
+}
+impl std::error::Error for NeedMetadata {}
+impl Facts<'_> {
+    fn field(self, path: &[u8], field: Field) -> Result<Value> {
+        if let Self::Complete(file) = self {
+            return Ok(file.field(path, field));
+        }
+        if matches!(field, Field::Path | Field::Name | Field::Extension) {
+            return Ok(File::default().field(path, field));
+        }
+        if let Self::S3Listing { size, .. } = self {
+            return Ok(match field {
+                Field::Exists => Value::Bool(true),
+                Field::Size => Value::Quantity(i128::from(size), Type::Size),
+                // S3 never exposes these fields, including through HEAD.
+                Field::Ctime | Field::Device | Field::Inode | Field::Links | Field::LinkTarget => {
+                    Value::Null
+                }
+                // Stored Unix metadata determines kind, mtime and ownership.
+                _ => return Err(NeedMetadata.into()),
+            });
+        }
+        Err(NeedMetadata.into())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
     And,
@@ -291,9 +331,9 @@ impl Node {
             Self::Now => Value::Quantity(c.now, Type::Timestamp),
             Self::Field(dst, f) => {
                 if *dst {
-                    c.dst.field(c.dst_path, *f)
+                    c.dst.field(c.dst_path, *f)?
                 } else {
-                    c.src.field(c.src_path, *f)
+                    c.src.field(c.src_path, *f)?
                 }
             }
             Self::Not(n) => Value::Bool(!n.eval(c)?.boolean()?),
@@ -440,8 +480,8 @@ fn binary(op: Op, a: Value, b: Value) -> Result<Value> {
     Ok(Value::Quantity(n, ty))
 }
 struct ContextValues<'a> {
-    src: &'a File,
-    dst: &'a File,
+    src: Facts<'a>,
+    dst: Facts<'a>,
     src_path: &'a [u8],
     dst_path: &'a [u8],
     now: i128,
@@ -469,13 +509,33 @@ impl Expression {
     ) -> Result<bool> {
         self.root
             .eval(&ContextValues {
-                src,
-                dst,
+                src: Facts::Complete(src),
+                dst: Facts::Complete(dst),
                 src_path,
                 dst_path,
                 now,
             })?
             .boolean()
+    }
+    fn evaluate_known(
+        &self,
+        src: Facts<'_>,
+        src_path: &[u8],
+        dst: Facts<'_>,
+        dst_path: &[u8],
+        now: i128,
+    ) -> Result<Option<bool>> {
+        match self.root.eval(&ContextValues {
+            src,
+            dst,
+            src_path,
+            dst_path,
+            now,
+        }) {
+            Ok(value) => Ok(Some(value.boolean()?)),
+            Err(error) if error.is::<NeedMetadata>() => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 #[derive(Clone, Debug, Default)]
@@ -502,12 +562,52 @@ impl Policy {
         self.selection.is_some() || self.update.is_some()
     }
     pub fn selects(&self, src: &File, path: &[u8]) -> Result<bool> {
+        if src.kind == Some(Kind::Dir) {
+            return Ok(true);
+        }
         self.selection
             .as_ref()
             .map_or(Ok(true), |e| {
                 e.evaluate(src, path, &File::default(), b"", self.now)
             })
             .context("--where")
+    }
+    /// None means evaluation reached a field not provided by the listing.
+    pub fn selects_known(&self, src: Facts<'_>, path: &[u8]) -> Result<Option<bool>> {
+        if let Facts::Complete(file) = src {
+            return self.selects(file, path).map(Some);
+        }
+        let Some(expression) = &self.selection else {
+            return Ok(Some(true));
+        };
+        if matches!(
+            src,
+            Facts::S3Listing {
+                directory_marker: true,
+                ..
+            }
+        ) {
+            // HEAD distinguishes a directory marker from a file/symlink object
+            // stored under a marker-shaped key. Directories bypass --where.
+            return Ok(None);
+        }
+        expression
+            .evaluate_known(src, path, Facts::Unread, b"", self.now)
+            .context("--where")
+    }
+    pub fn permits_known(
+        &self,
+        src: Facts<'_>,
+        src_path: &[u8],
+        dst: Facts<'_>,
+        dst_path: &[u8],
+    ) -> Result<Option<bool>> {
+        self.update
+            .as_ref()
+            .map_or(Ok(Some(true)), |e| {
+                e.evaluate_known(src, src_path, dst, dst_path, self.now)
+            })
+            .context("--copy-if")
     }
     pub fn permits(
         &self,

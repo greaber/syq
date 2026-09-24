@@ -95,3 +95,75 @@ fn overflow_limits_and_zero_division() {
     );
     assert!(Expression::compile(&"true or ".repeat(300), true).is_err());
 }
+
+#[test]
+fn partial_facts_keep_unread_metadata_distinct_from_null() {
+    let listed = Facts::S3Listing {
+        size: 12,
+        directory_marker: false,
+    };
+    for (expression, expected) in [
+        ("src.size > 1B and src.name = 'keep.jpg'", Some(true)),
+        ("src.name = 'skip' and src.mtime > now - 1d", Some(false)),
+        ("src.name = 'keep.jpg' and src.mtime > now - 1d", None),
+        ("src.mtime is null", None),
+        ("coalesce(src.mtime, now) = now", None),
+        ("src.kind = 'file'", None),
+        ("src.uid is null", None),
+        ("src.ctime is null and src.link_target is null", Some(true)),
+        ("if(src.size > 1B, true, src.uid = 0)", Some(true)),
+    ] {
+        let policy = Policy::compile(Some(expression), None).unwrap();
+        assert_eq!(
+            policy.selects_known(listed, b"nested/keep.jpg").unwrap(),
+            expected,
+            "{expression}"
+        );
+    }
+    // A real error in an evaluated branch must not become "need metadata".
+    let error = Policy::compile(Some("1 / 0 = 0 or src.uid = 0"), None)
+        .unwrap()
+        .selects_known(listed, b"keep.jpg")
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("division by zero"));
+    let policy = Policy::compile(None, Some("dst.path = 'missing' and dst.exists")).unwrap();
+    assert_eq!(
+        policy
+            .permits_known(listed, b"keep.jpg", Facts::Unread, b"actual")
+            .unwrap(),
+        Some(false)
+    );
+    assert_eq!(
+        policy
+            .permits_known(listed, b"keep.jpg", Facts::Unread, b"missing")
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn directory_selection_bypasses_where_but_not_copy_if() {
+    let directory = File {
+        exists: true,
+        kind: Some(Kind::Dir),
+        ..File::default()
+    };
+    let policy = Policy::compile(Some("1 / 0 = 0"), Some("false")).unwrap();
+    assert!(policy.selects(&directory, b"dir").unwrap());
+    assert!(!policy
+        .permits(&directory, b"dir", &File::default(), b"dir")
+        .unwrap());
+    // Listing shape alone does not override the kind in object metadata.
+    assert_eq!(
+        policy
+            .selects_known(
+                Facts::S3Listing {
+                    size: 0,
+                    directory_marker: true
+                },
+                b"dir"
+            )
+            .unwrap(),
+        None
+    );
+}

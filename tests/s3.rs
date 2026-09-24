@@ -16,6 +16,9 @@ mod listing;
 #[path = "s3/map.rs"]
 mod map;
 
+#[path = "s3/expressions.rs"]
+mod expressions;
+
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -2881,10 +2884,10 @@ fn s3_download_retries_share_one_budget_across_statuses_and_error_codes() {
             "{fault}: {}",
             output_text(&output)
         );
-        // A HEAD to plan the named object, a HEAD to compare the existing
-        // file, then the GET and exactly one retry from the download loop:
-        // the SDK must not retry inside it (six requests when it does).
-        assert_eq!(server.requests.load(Ordering::Relaxed), 4, "{fault}");
+        // Reuse the discovery HEAD to compare the existing file, then issue
+        // the GET and exactly one retry from the download loop. The SDK must
+        // not retry inside it (five requests when it does).
+        assert_eq!(server.requests.load(Ordering::Relaxed), 3, "{fault}");
         assert_eq!(
             std::fs::read(temp.path().join("result")).unwrap(),
             b"stale",
@@ -4650,13 +4653,8 @@ fn s3_mapping_metadata_uses_existing_requests_for_upload_and_download() {
             ],
         );
         assert!(output.status.success(), "{fault}: {}", output_text(&output));
-        // Upload: HEAD + PUT. Existing download: discovery HEAD + execution
-        // HEAD + GET, as for ordinary existing-file downloads.
-        assert_eq!(
-            server.requests.load(Ordering::Relaxed),
-            if fault == "single-ok" { 3 } else { 2 },
-            "{fault}"
-        );
+        // Upload: HEAD + PUT. Download: reuse the discovery HEAD, then GET.
+        assert_eq!(server.requests.load(Ordering::Relaxed), 2, "{fault}");
         if fault == "single-ok" {
             let meta = std::fs::metadata(temp.path().join("output/file")).unwrap();
             assert_eq!(
@@ -4836,7 +4834,8 @@ fn s3_mapping_metadata_dry_run_reports_repairs_on_unchanged_download() {
         }
         assert_eq!(records.last().unwrap()["files_unchanged"], 1);
         assert_eq!(records.last().unwrap()["bytes_transferred"], 0);
-        assert_eq!(server.requests.load(Ordering::Relaxed) - before, 2);
+        // The discovery HEAD supplies the metadata and stored content hash.
+        assert_eq!(server.requests.load(Ordering::Relaxed) - before, 1);
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(
             meta.mode() & 0o7777,

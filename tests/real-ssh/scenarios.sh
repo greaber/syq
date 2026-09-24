@@ -981,7 +981,7 @@ for preservation in default permissions; do
     if [ "$preservation" = permissions ]; then set -- --preserve=permissions; fi
     syq cp "$@" --from source --srcs-in /tmp/syq-real-ssh/expression-modes \
         --to destination --into "$destination" --coordinate-at src --no-progress \
-        --where "src.kind = 'file'" --copy-if true
+        --where "src.kind = 'file'" --copy-if "src.kind != 'dir'"
     ssh destination "test \"\$(cat $destination/new/keep)\" = selected; test \"\$(cat $destination/old/keep)\" = selected; test \"\$(stat -c %a $destination/new)\" = 2755; test \"\$(stat -c %a $destination/old)\" = 2555"
 done
 
