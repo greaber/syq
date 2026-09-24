@@ -731,3 +731,98 @@ fn default_acl_creation_keeps_native_and_explicit_preservation_semantics() {
         assert_eq!(read(&t.path("parent/file")), b"contents");
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn failed_inode_metadata_is_visible_and_resumes_with_current_metadata() {
+    for failed_attribute in ["system.posix_acl_access", "user.binary"] {
+        for path in ["batch", "ranges", "local", "inplace"] {
+            let t = Tmp::new();
+            let data = prng(if path == "batch" { 8192 } else { 2 << 20 }, 927);
+            write(&t.path("src/file"), &data);
+            // Two independent small files exercise batched publication; the
+            // other paths exercise a representative and its hardlink alias.
+            if path == "batch" {
+                write(&t.path("src/alias"), &data);
+            } else {
+                fs::hard_link(t.path("src/file"), t.path("src/alias")).unwrap();
+            }
+            for name in ["file", "alias"] {
+                let file = t.path(&format!("src/{name}"));
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+                set_attr(&file, "user.binary", b"before failure");
+                set_attr(&file, "user.empty", b"");
+                set_attr(&file, "system.posix_acl_access", &acl(4, 4));
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o440)).unwrap();
+            }
+            let tuning = match path {
+                "batch" => "batch-bytes=64K,workers=1",
+                "ranges" => "copy-path=ranges,workers=1",
+                _ => "workers=1",
+            };
+            let mut args = vec!["-aHAX", "--no-progress", "--performance-tuning", tuning];
+            if path == "inplace" {
+                args.push("--inplace");
+            }
+            let source = t.s("src/");
+            let destination = t.s("dst/");
+            args.extend([source.as_str(), destination.as_str()]);
+            let failed = compat_command()
+                .args(&args)
+                .env("SYQ_TEST_FAIL_XATTR", failed_attribute)
+                .run()
+                .unwrap();
+            assert!(!failed.status.success(), "{path}: {failed:?}");
+            assert!(
+                stderr_of(&failed).contains("injected attribute reconciliation failure"),
+                "{path}: {failed:?}"
+            );
+            let written = if path == "inplace" {
+                ["file", "alias"]
+                    .iter()
+                    .map(|name| t.path(&format!("dst/{name}")))
+                    .filter(|file| file.exists())
+                    .collect::<Vec<_>>()
+            } else {
+                assert!(!t.path("dst/file").exists());
+                assert!(!t.path("dst/alias").exists());
+                partial_files(&t.path("dst"))
+            };
+            assert!(
+                !written.is_empty(),
+                "must reach writing before failure: {path}"
+            );
+            for file in written {
+                assert_eq!(read(&file), data, "{path}");
+                if failed_attribute == "user.binary" {
+                    assert_eq!(
+                        fs::metadata(file).unwrap().mode() & 0o777,
+                        0o440,
+                        "temporary owner-write must be restored after an xattr error"
+                    );
+                }
+            }
+            // A retry must capture new metadata, not accept matching bytes as
+            // proof that the earlier metadata failure has been repaired.
+            for name in ["file", "alias"] {
+                let file = t.path(&format!("src/{name}"));
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+                set_attr(&file, "user.binary", b"after failure");
+                set_attr(&file, "system.posix_acl_access", &acl(6, 4));
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o440)).unwrap();
+            }
+            assert_output_ok(&compat_command().args(&args).run().unwrap());
+            for name in ["file", "alias"] {
+                let file = t.path(&format!("dst/{name}"));
+                assert_eq!(read(&file), data);
+                verify_metadata(&t.path(&format!("src/{name}")), &file);
+            }
+            if path != "batch" {
+                assert_eq!(
+                    fs::metadata(t.path("dst/file")).unwrap().ino(),
+                    fs::metadata(t.path("dst/alias")).unwrap().ino()
+                );
+            }
+        }
+    }
+}

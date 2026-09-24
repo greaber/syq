@@ -202,6 +202,12 @@ mod platform {
         if get(file, name)?.as_deref() == value {
             return Ok(());
         }
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_XATTR")
+            .is_some_and(|selected| selected.as_encoded_bytes() == name)
+        {
+            anyhow::bail!("injected attribute reconciliation failure: {:?}", name);
+        }
         let path = handle(file);
         let name = CString::new(name)?;
         let result = if let Some(value) = value {
