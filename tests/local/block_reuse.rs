@@ -5,7 +5,7 @@ use super::*;
 fn off_skips_comparison_but_keeps_parallel_ranges() {
     for inplace in [false, true] {
         let t = Tmp::new();
-        let source = prng(12 << 20, 831);
+        let source = prng(128 << 20, 831);
         let mut old = source.clone();
         old[..4096].fill(b'x');
         write(&t.path("src"), &source);
@@ -17,6 +17,8 @@ fn off_skips_comparison_but_keeps_parallel_ranges() {
                 "-a",
                 "--stats",
                 "--no-progress",
+                // Leave time for both workers to consume their pre-split ranges.
+                "--bwlimit=64M",
                 "--performance-tuning",
                 &format!("copy-path=ranges,workers=2,block-reuse={reuse}"),
                 &t.s("src"),
@@ -40,7 +42,7 @@ fn off_skips_comparison_but_keeps_parallel_ranges() {
         let output = run("off");
         assert_output_ok(&output);
         assert_eq!(read(&t.path("dst")), source);
-        assert_eq!(tuning_observed(&output)["range_requests"], 3);
+        assert_eq!(tuning_observed(&output)["range_requests"], 32);
         assert_eq!(tuning_observed(&output)["local_whole_files"], 0);
         let events = fs::read_to_string(t.path("workers")).unwrap();
         assert_eq!(
@@ -51,6 +53,17 @@ fn off_skips_comparison_but_keeps_parallel_ranges() {
             2,
             "{events}"
         );
+        let mut range_workers = std::collections::BTreeSet::new();
+        let mut transferred = 0u64;
+        for event in events.lines().filter(|line| line.starts_with("range ")) {
+            let fields: Vec<_> = event.split_whitespace().collect();
+            let bytes: u64 = fields[3].parse().unwrap();
+            assert!(bytes > 0, "{event}");
+            range_workers.insert(fields[1]);
+            transferred += bytes;
+        }
+        assert_eq!(range_workers.len(), 2, "{events}");
+        assert_eq!(transferred, source.len() as u64, "{events}");
         assert!(partial_files(&t.0).is_empty());
     }
 }

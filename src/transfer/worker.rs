@@ -1355,7 +1355,16 @@ impl Worker {
         } else {
             1
         };
-        self.transfer_range_pipeline(&job, h, credited, block, read_window, write_window)
+        let result =
+            self.transfer_range_pipeline(&job, h, credited, block, read_window, write_window);
+        #[cfg(debug_assertions)]
+        if result.is_ok() {
+            crate::fsops::record_test_event(
+                "SYQ_TEST_WORKER_EVENTS",
+                format_args!("range {} {idx} {credited}", self.id),
+            )?;
+        }
+        result
     }
 
     pub(super) fn acknowledge_range_write(
