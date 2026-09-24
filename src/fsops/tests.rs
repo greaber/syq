@@ -5204,3 +5204,143 @@ fn partial_seeding_does_not_fall_back_to_final_when_disallowed() {
         b"final bytes"
     );
 }
+
+fn retained_hash_request(source: &RegisteredPath, len: u64, attempt: u32) -> Request {
+    Request::HashBlocks {
+        path: b"display-only".to_vec(),
+        source: Some(source.clone()),
+        which: Which::Final,
+        copy_id: [0; 16],
+        block: MIN_HASH_BLOCK_BYTES,
+        len,
+        attempt,
+        guard: None,
+    }
+}
+
+fn retained_read_request(source: &RegisteredPath, len: u32, off: u64, attempt: u32) -> Request {
+    Request::ReadRange {
+        path: b"display-only".to_vec(),
+        source: Some(source.clone()),
+        attempt,
+        off,
+        len,
+    }
+}
+
+fn observed_source_bytes(worker: &FsOps) -> u64 {
+    let snapshot = serde_json::to_value(worker.observations.snapshot()).unwrap();
+    snapshot["actors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|actor| {
+            actor["bytes"][crate::transfer_observations::Stage::SourceRead as usize]
+                .as_u64()
+                .unwrap()
+        })
+        .sum()
+}
+
+#[test]
+fn retained_hash_buffer_serves_whole_and_split_reads_without_rereading() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let path = temporary.path().join("source");
+    let bytes = vec![b'a'; 2 * MIN_HASH_BLOCK_BYTES as usize];
+    fs::write(&path, &bytes).unwrap();
+    for split in [false, true] {
+        let (mut worker, selections, _control) = registered_source_worker(&[&path], false);
+        worker.observations.enable();
+        let source = &selections[0];
+        assert!(
+            matches!(worker.handle(&retained_hash_request(source, bytes.len() as u64, 0)), Response::Hashes(h) if h.len() == 2)
+        );
+        let parts = if split { 2 } else { 1 };
+        let len = bytes.len() / parts;
+        for part in 0..parts {
+            let response = worker.handle(&retained_read_request(
+                source,
+                len as u32,
+                (part * len) as u64,
+                0,
+            ));
+            assert!(
+                matches!(response, Response::Block { hash, data, .. } if data == bytes[part * len..(part + 1) * len] && hash == content_digest(&data))
+            );
+        }
+        assert_eq!(observed_source_bytes(&worker), bytes.len() as u64);
+        if !split {
+            assert!(worker.hashed_source.is_none());
+        }
+    }
+}
+
+#[test]
+fn retained_hash_buffer_rejects_changed_contents_and_retry() {
+    for retry in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let path = temporary.path().join("source");
+        fs::write(&path, b"original").unwrap();
+        let (mut worker, selections, _control) = registered_source_worker(&[&path], false);
+        worker.observations.enable();
+        let source = &selections[0];
+        assert!(matches!(
+            worker.handle(&retained_hash_request(source, 8, 0)),
+            Response::Hashes(_)
+        ));
+        if !retry {
+            fs::write(&path, b"modified").unwrap();
+        }
+        let response = worker.handle(&retained_read_request(source, 8, 0, u32::from(retry)));
+        let expected = if retry { b"original" } else { b"modified" };
+        assert!(matches!(response, Response::Block { data, .. } if data == expected));
+        assert_eq!(observed_source_bytes(&worker), 16);
+        assert!(worker.hashed_source.is_none());
+    }
+}
+
+#[test]
+fn retained_hash_buffer_does_not_cross_source_authority_or_other_requests() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let first = temporary.path().join("first");
+    let second = temporary.path().join("second");
+    fs::write(&first, b"firstone").unwrap();
+    fs::write(&second, b"otherone").unwrap();
+    let (mut worker, selections, _control) = registered_source_worker(&[&first, &second], false);
+    worker.observations.enable();
+    assert!(matches!(
+        worker.handle(&retained_hash_request(&selections[0], 8, 0)),
+        Response::Hashes(_)
+    ));
+    let response = worker.handle(&retained_read_request(&selections[1], 8, 0, 0));
+    assert!(matches!(response, Response::Block { data, .. } if data == b"otherone"));
+    assert_eq!(observed_source_bytes(&worker), 16);
+    worker.handle(&retained_hash_request(&selections[0], 8, 0));
+    assert!(worker.hashed_source.is_some());
+    worker.handle(&Request::ConfigureHashing(worker.hash_policy));
+    assert!(worker.hashed_source.is_none());
+}
+
+#[test]
+fn retained_hash_buffer_respects_memory_bound_and_short_source() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let path = temporary.path().join("source");
+    let size = SOURCE_HASH_BUFFER_MAX + MIN_HASH_BLOCK_BYTES;
+    fs::write(&path, vec![b'a'; size as usize]).unwrap();
+    let (mut worker, selections, _control) = registered_source_worker(&[&path], false);
+    assert!(matches!(
+        worker.handle(&retained_hash_request(&selections[0], size, 0)),
+        Response::Hashes(_)
+    ));
+    assert!(worker.hashed_source.is_none());
+    fs::write(&path, b"short").unwrap();
+    let response = worker.handle(&retained_hash_request(
+        &selections[0],
+        MIN_HASH_BLOCK_BYTES * 2,
+        0,
+    ));
+    assert!(
+        matches!(response, Response::Hashes(h) if h == vec![content_digest(b"short"), content_digest(b"")])
+    );
+    assert!(worker.hashed_source.is_none());
+}
