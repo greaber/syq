@@ -6,6 +6,12 @@ pub(super) struct Score {
     pub intervals: usize,
 }
 
+// A full second of consistently nonzero, less-than-half-rate observations
+// is enough to establish a severe loss. The caller also requires two intervals.
+fn severe_loss(seconds: f64, low: f64, high: f64, base: f64) -> bool {
+    seconds >= 1.0 && low > 0.0 && high < base * 0.5
+}
+
 #[derive(Default)]
 pub(super) struct Evidence {
     intervals: std::collections::VecDeque<(f64, f64)>,
@@ -14,6 +20,17 @@ pub(super) struct Evidence {
 impl Evidence {
     pub fn clear(&mut self) {
         self.intervals.clear();
+    }
+
+    /// Descriptive rate of the recent window, independent of a comparison.
+    /// Startup inference uses this when no directional conclusion is available.
+    pub(super) fn window(&self) -> Option<Score> {
+        let seconds: f64 = self.intervals.iter().map(|p| p.1).sum();
+        (self.intervals.len() >= 2 && seconds >= 2.5).then(|| Score {
+            rate: self.intervals.iter().map(|p| p.0 * p.1).sum::<f64>() / seconds,
+            seconds,
+            intervals: self.intervals.len(),
+        })
     }
 
     /// Consistent losses warrant shorter exposure as their cost increases.
@@ -40,7 +57,7 @@ impl Evidence {
             // Zero counters can be batched completion reports. Require the
             // longer exposure before interpreting complete silence as loss.
             if i >= 1
-                && ((elapsed >= 1.0 && low > 0.0 && high < base * 0.5)
+                && (severe_loss(elapsed, low, high, base)
                     || (elapsed >= 2.5 && ((low > 0.0 && high < base * 0.8) || low > base * 1.2))
                     || (elapsed >= 5.0 && (high < base * 0.95 || low * 0.95 > base)))
             {

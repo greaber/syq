@@ -847,3 +847,89 @@ fn rejected_counter_interval_does_not_discard_the_next_clean_interval() {
         "clean interval must reach the sampler: {statuses:?}"
     );
 }
+
+#[test]
+fn schema_v1_upgrade_keeps_old_events_without_backfilling_measurements() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("old.sqlite");
+    let db = Connection::open(&path).unwrap();
+    // Unchanged schema-v1 tables from #548. No measurement table existed.
+    db.execute_batch(r#"CREATE TABLE metadata (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, day INTEGER NOT NULL,
+            updated_day INTEGER NOT NULL, build TEXT NOT NULL, context TEXT NOT NULL DEFAULT '{}',
+            route TEXT, source_fs TEXT, destination_fs TEXT, mode TEXT,
+            status TEXT NOT NULL DEFAULT 'incomplete', eligible INTEGER NOT NULL DEFAULT 0,
+            workers INTEGER, summary TEXT, lost INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX by_filesystems ON runs(route,mode,source_fs,destination_fs,eligible,id DESC);
+        CREATE INDEX by_route ON runs(route,mode,eligible,id DESC);
+        CREATE TABLE events (
+            run INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL, elapsed_us INTEGER NOT NULL, data TEXT NOT NULL,
+            PRIMARY KEY(run,sequence));
+        PRAGMA user_version=1;
+        INSERT INTO runs(day,updated_day,build,status,eligible,summary) VALUES(1,1,'old','success',2,'{}');
+        INSERT INTO events VALUES(1,0,500000,'{"kind":"observation","data":{"active":8,"seconds":0.5,"rate":100.0,"usable":true}}');"#).unwrap();
+    let old_event: String = db
+        .query_row("SELECT data FROM events", [], |r| r.get(0))
+        .unwrap();
+    drop(db);
+    let upgraded = open(&path).unwrap();
+    assert_eq!(
+        upgraded
+            .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        upgraded
+            .query_row::<i64, _, _>("SELECT count(*) FROM measurements", [], |r| r.get(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        upgraded
+            .query_row::<String, _, _>("SELECT data FROM events", [], |r| r.get(0))
+            .unwrap(),
+        old_event
+    );
+    assert!(inference::starting_count(&upgraded, &key("a"), false)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn measurement_rows_retry_and_prune_with_their_events() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let writer = recorder(&path);
+    let db = open(&path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer.event(
+        "observation",
+        json!({"active":8,"seconds":0.5,"rate":100.0,"usable":true}),
+    );
+    writer.flush();
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM measurements", [], |r| r.get(0))
+            .unwrap(),
+        0
+    );
+    db.execute_batch("COMMIT").unwrap();
+    writer.flush();
+    writer.flush();
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM measurements", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(db.query_row::<i64,_,_>("SELECT count(*) FROM measurements m JOIN events e ON m.run=e.run AND m.sequence=e.sequence",[],|r| r.get(0)).unwrap(),1);
+    writer.complete(true, json!({}));
+    let current = recorder(&path);
+    prune(&db, 1, current.0.lock().unwrap().id).unwrap();
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM measurements", [], |r| r.get(0))
+            .unwrap(),
+        0
+    );
+}

@@ -1772,18 +1772,26 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
         .query_row("SELECT source_fs FROM runs LIMIT 1", [], |row| row.get(0))
         .unwrap();
     assert!(fs.is_some(), "test filesystem did not provide an identity");
-    // Saved recommendations are misleading; only measurement totals count.
+    // Saved recommendations are misleading; only ordered measurements count.
     db.execute("UPDATE runs SET eligible=1,workers=99", [])
         .unwrap();
-    let mut totals = serde_json::json!({"observations":{"6":[250.0,5.0,2]},"consistent":true,"incompatible":false});
-    let mut seed_samples = |workers: usize| {
-        let rate = if workers == 2 { 99.0 } else { 100.0 };
-        totals["observations"][workers.to_string()] = serde_json::json!([rate * 5.0, 5.0, 2]);
-        db.execute(
-            "UPDATE runs SET eligible=2,summary=json_set(summary,'$.measurement_totals',json(?1),'$.measured_worker_counts',?2) WHERE id=1",
-            rusqlite::params![totals.to_string(),totals["observations"].as_object().unwrap().len() as i64],
-        )
+    db.execute("DELETE FROM measurements WHERE run=1", [])
         .unwrap();
+    let mut sequence = 0;
+    let mut seed_samples = |workers: usize| {
+        db.execute("UPDATE runs SET eligible=4 WHERE id=1", [])
+            .unwrap();
+        let rate = if workers == 2 { 99.0 } else { 100.0 };
+        for (n, rate) in [(6, 50.0), (workers, rate)] {
+            for _ in 0..2 {
+                sequence += 1;
+                db.execute(
+                    "INSERT INTO measurements VALUES(1,?1,?2,0,?3,2.5,?4,1)",
+                    rusqlite::params![sequence, sequence * 2500000, n as i64, rate],
+                )
+                .unwrap();
+            }
+        }
     };
     seed_samples(3);
     let copy_with_hint = |name: &str, controls: &[&str]| {
@@ -1810,17 +1818,6 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
         &["--resource-limits", "workers=2"],
     ));
     assert!(startup_doubling(3));
-    let capped_incompatible: bool = db
-        .query_row(
-            "SELECT json_extract(summary,'$.measurement_totals.incompatible') FROM runs WHERE id=3",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(
-        !capped_incompatible,
-        "caps alone do not invalidate comparisons"
-    );
     let event: String = db
         .query_row(
             "SELECT data FROM events WHERE run=3 AND json_extract(data,'$.kind')='starting_count'",
@@ -2138,7 +2135,7 @@ fn whole_file_progress_reaches_tuner_before_completion() {
     }
 }
 
-/// Seed measurement totals under the context established by a real
+/// Seed ordered measurements under the context established by a real
 /// command. Tests must not depend on the implementation of opaque route tokens.
 pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) {
     let db = rusqlite::Connection::open(cache.with_extension("history-v1.sqlite")).unwrap();
@@ -2146,16 +2143,26 @@ pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) 
         .query_row("SELECT max(id) FROM runs", [], |r| r.get(0))
         .unwrap();
     db.execute("DELETE FROM events WHERE run=?1", [id]).unwrap();
+    db.execute("DELETE FROM measurements WHERE run=?1", [id])
+        .unwrap();
     db.execute(
-        "UPDATE runs SET status='success',eligible=2,workers=NULL,lost=0 WHERE id=?1",
+        "UPDATE runs SET status='success',eligible=4,workers=NULL,lost=0 WHERE id=?1",
         [id],
     )
     .unwrap();
-    let totals = serde_json::json!({"observations":{workers.to_string():[500.0,5.0,2],(workers+1).to_string():[250.0,5.0,2]},
-        "consistent":true,"incompatible":false});
-    db.execute(
-        "UPDATE runs SET summary=json_set(summary,'$.measurement_totals',json(?1),'$.measured_worker_counts',2) WHERE id=?2",
-        rusqlite::params![totals.to_string(), id],
-    )
-    .unwrap();
+    for (i, (n, rate)) in [
+        (workers, 100.0),
+        (workers, 100.0),
+        (workers + 1, 50.0),
+        (workers + 1, 50.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        db.execute(
+            "INSERT INTO measurements VALUES(?1,?2,?3,0,?4,2.5,?5,1)",
+            rusqlite::params![id, i as i64, (i as i64 + 1) * 2500000, n as i64, rate],
+        )
+        .unwrap();
+    }
 }

@@ -155,8 +155,8 @@ independent history file; an empty value disables history and remembered starts.
 New database files are private to the user. SQLite may create adjacent `-wal`
 and `-shm` files while in use.
 
-`SYQ_TUNING_HISTORY_SIZE` sets how much history to keep, default `128M`, minimum
-`16M`. History may be removed when this size target is exceeded.
+`SYQ_TUNING_HISTORY_SIZE` sets how much history to keep, default `10M`, minimum
+`10M`. History may be removed when this size target is exceeded.
 
 Recording is best effort: an interrupted transfer or a storage error can leave
 gaps in the history. Copies still proceed when history cannot be saved.
