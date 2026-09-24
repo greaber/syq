@@ -192,7 +192,7 @@ fn native_comparison_blocks_reuse_only_verified_matching_bytes() {
             "cp",
             "--hash",
             "--stats",
-            "--performance-tuning=comparison-block-size=64K,request-size=4M,copy-path=ranges",
+            "--performance-tuning=comparison-block-size=64K,request-size=4M,copy-path=ranges,block-reuse=on",
             &t.s("src"),
             "--as",
             &t.s("dst"),
