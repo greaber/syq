@@ -99,6 +99,17 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                 assert file.tell() == len(DATA) + 6
                 assert fcntl.fcntl(file, fcntl.F_GETFL) == before
             assert output_path.read_bytes() == b'prefix' + DATA + b'x' * 8
+            # Explicit mtime opt-out also controls a named descriptor destination.
+            small = directory / 'timestamp-source'
+            small.write_bytes(b'timestamps')
+            os.utime(small, (123, 123))
+            for preserve in ('mtime', '-mtime'):
+                dated = directory / ('timestamp-' + preserve)
+                with small.open('rb') as file:
+                    run([*options, '--src-fd', str(file.fileno()), *destination,
+                         '--as', str(dated), '--preserve=' + preserve], pass_fds=(file.fileno(),))
+                assert dated.read_bytes() == b'timestamps'
+                assert (dated.stat().st_mtime_ns == 123_000_000_000) == (preserve == 'mtime')
             # Cancellation while awaiting input keeps the old destination and
             # removes staging, without changing a shared socket's flags.
             for nonblocking in (False, True):

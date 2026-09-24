@@ -49,8 +49,8 @@ impl ExpressionServer {
                 let path = parts.next().unwrap();
                 if path.contains("list-type=2") {
                     let mut contents = String::new();
-                    for name in ["keep", "skip", "link"] {
-                        contents.push_str(&format!("<Contents><Key>tree/{name}</Key><Size>4</Size><LastModified>2026-01-01T00:00:00Z</LastModified></Contents>"));
+                    for (name, day) in [("keep", "01"), ("skip", "02"), ("link", "03")] {
+                        contents.push_str(&format!("<Contents><Key>tree/{name}</Key><Size>4</Size><LastModified>2026-01-{day}T00:00:00Z</LastModified></Contents>"));
                     }
                     let body = format!("<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>");
                     reply(&mut socket, 200, &[], body.as_bytes(), false);
@@ -75,7 +75,12 @@ impl ExpressionServer {
                     ("ETag".into(), "\"fixture\"".into()),
                     (
                         "Last-Modified".into(),
-                        "Thu, 01 Jan 2026 00:00:00 GMT".into(),
+                        match key.rsplit('/').next().unwrap() {
+                            "keep" => "Thu, 01 Jan 2026 00:00:00 GMT",
+                            "skip" => "Fri, 02 Jan 2026 00:00:00 GMT",
+                            _ => "Sat, 03 Jan 2026 00:00:00 GMT",
+                        }
+                        .into(),
                     ),
                 ];
                 for (name, value) in [
@@ -181,6 +186,10 @@ fn listing_fields_select_without_object_heads() {
     for options in [
         vec!["--where", "src.size > 1B"],
         vec!["--where", "src.name = 'keep'"],
+        vec![
+            "--where",
+            "src.name = 'keep' and src.s3_last_modified = timestamp('2026-01-01T00:00:00Z')",
+        ],
         vec!["--copy-if", "src.path = 'keep' and not dst.exists"],
         vec![
             "--where",
@@ -211,6 +220,36 @@ fn listing_fields_select_without_object_heads() {
             if options[1] == "src.size > 1B" { 3 } else { 1 }
         );
     }
+}
+
+#[test]
+fn listing_times_stay_with_selected_jobs_after_filtering() {
+    let temp = test_support::tempdir().unwrap();
+    let server = ExpressionServer::new();
+    let output = server.copy(temp.path(), &[
+        "--where", "src.name != 'skip'",
+        "--copy-if", "not dst.exists and ((src.name = 'keep' and src.s3_last_modified = timestamp('2026-01-01T00:00:00Z')) or (src.name = 'link' and src.s3_last_modified = timestamp('2026-01-03T00:00:00Z')))",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("out/keep")).unwrap(),
+        b"data"
+    );
+    assert_eq!(
+        std::fs::read_link(temp.path().join("out/link")).unwrap(),
+        Path::new("data")
+    );
+    assert!(!temp.path().join("out/skip").exists());
+    assert!(
+        server.object_heads().is_empty(),
+        "{:?}",
+        server.object_heads()
+    );
+    assert_eq!(server.gets(), 2);
 }
 
 #[test]

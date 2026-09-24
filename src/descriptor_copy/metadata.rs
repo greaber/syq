@@ -13,6 +13,7 @@ use std::{
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Policy {
     pub preserve: u8,
+    pub restore_named_mtime: bool,
     pub skip_newer: bool,
     pub specials: bool,
     pub overrides: Option<crate::mapping::Metadata>,
@@ -24,6 +25,7 @@ impl Policy {
                 | if args.owner { flags::OWNER } else { 0 }
                 | if args.group { flags::GROUP } else { 0 }
                 | if args.times { flags::TIMES } else { 0 },
+            restore_named_mtime: !args.no_preserve_mtime,
             skip_newer: args.update,
             specials: args.devices,
             overrides: None,

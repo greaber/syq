@@ -848,6 +848,7 @@ impl FsOps {
                         size: Some(stat.st_size as u64),
                         mtime: Some((stat.st_mtime as i64, stat.st_mtime_nsec as u32)),
                         ctime: Some((stat.st_ctime as i64, stat.st_ctime_nsec as u32)),
+                        s3_last_modified: None,
                         mode: Some(stat.st_mode as u32 & 0o7777),
                         uid: Some(stat.st_uid),
                         gid: Some(stat.st_gid),

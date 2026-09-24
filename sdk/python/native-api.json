@@ -142,6 +142,7 @@
         "srcs-in",
         "from",
         "include",
+        "where",
         "rsh",
         "syq-path",
         "no-bootstrap",

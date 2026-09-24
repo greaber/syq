@@ -75,6 +75,9 @@ pub struct Args {
     pub(crate) stream_concurrency: usize,
     #[arg(skip)]
     pub(crate) stream_preserve_times: bool,
+    /// Explicit opt-out also applies to named descriptor destinations.
+    #[arg(skip)]
+    pub(crate) no_preserve_mtime: bool,
     #[arg(skip)]
     pub(crate) results_override: Option<std::sync::Arc<crate::results::ResultsWriter>>,
     #[arg(skip)]
@@ -1094,7 +1097,7 @@ struct NativeCopyOperationalArgs {
     /// Skip regular files newer at the destination; non-directory type replacements still occur
     #[arg(long = "skip-newer", hide = true, conflicts_with_all = ["ignore_existing", "inplace"])]
     update: bool,
-    /// Select non-directory source entries with a typed expression; directories follow normal copy rules
+    /// Select source entries with a typed expression; unselected directories remain traversable
     #[arg(long = "where", value_name = "EXPR")]
     where_expression: Option<String>,
     /// Update only entries satisfying a source/destination expression
@@ -1261,7 +1264,11 @@ struct NativeRemoteArgs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum NativePreserve {
     /// Preserve modification times (already the default for named destinations)
-    Times,
+    #[value(alias = "times")]
+    Mtime,
+    /// Leave filesystem modification times as produced by writing
+    #[value(name = "-mtime")]
+    NoMtime,
     /// Preserve permission bits
     Permissions,
     /// Preserve owner and group IDs
@@ -1351,7 +1358,7 @@ struct NativeCopyFields {
     version,
     about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.\nExplicit local pipe sources and --src-fd FD read raw bytes; --as-fd FD writes them.",
     before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
-    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, hardlinks, access and birth times, ACLs and xattrs, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --preserve=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --preserve; pipes have no source metadata. Output descriptors receive source timestamps only with --preserve=times. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
+    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve=-mtime to disable restoring modification times. Use --preserve to add permissions, ownership, hardlinks, access and birth times, ACLs and xattrs, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --preserve=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --preserve; pipes have no source metadata. Output descriptors receive source timestamps only with --preserve=mtime. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]\n       syq cp [OPTIONS] --src-fd FD --as PATH\n       syq cp [OPTIONS] SOURCE --as-fd FD"
 )]
 struct NativeCopyCommand {
@@ -1442,6 +1449,9 @@ struct NativeMapCommand {
     /// Include optional output fields (comma-separated or repeatable)
     #[arg(long, value_enum, value_delimiter = ',', value_name = "FIELD")]
     include: Vec<crate::native_map::Field>,
+    /// Filter emitted mapping entries with a source expression
+    #[arg(long = "where", value_name = "EXPR")]
+    where_expression: Option<String>,
     /// Remote shell command (default: ssh)
     #[arg(long, value_name = "COMMAND")]
     rsh: Option<String>,
@@ -2207,7 +2217,13 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         .operational
         .preserve
         .iter()
-        .any(|p| matches!(p, NativePreserve::Times));
+        .rev()
+        .find_map(|p| match p {
+            NativePreserve::Mtime => Some(true),
+            NativePreserve::NoMtime => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false);
     if let Some(fd) = args.stream_mapping_fd {
         anyhow::ensure!(
             fd > 2 && Some(fd) != results_fd,
@@ -2389,6 +2405,9 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     args.native_map_root = map_root;
     args.native_map_target = target;
     args.native_map_include = parsed.include;
+    args.expressions =
+        crate::expression::Policy::compile(parsed.where_expression.as_deref(), None)?;
+    args.where_expression = parsed.where_expression;
     args.rsh = parsed.rsh;
     args.syq_path = parsed.helper.syq_path;
     args.no_bootstrap = parsed.helper.no_bootstrap;
@@ -2749,7 +2768,14 @@ fn apply_native_copy_operational(
     args.sparse = sparse;
     for attribute in preserve {
         match attribute {
-            NativePreserve::Times => args.times = true,
+            NativePreserve::Mtime => {
+                args.times = true;
+                args.no_preserve_mtime = false;
+            }
+            NativePreserve::NoMtime => {
+                args.times = false;
+                args.no_preserve_mtime = true;
+            }
             NativePreserve::Permissions => args.perms = true,
             NativePreserve::Ownership => {
                 args.owner = true;

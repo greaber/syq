@@ -410,7 +410,11 @@ impl FileSession {
                             &stream.file,
                             &meta,
                             crate::proto::flags::MODE
-                                | crate::proto::flags::TIMES
+                                | if destination.metadata.restore_named_mtime {
+                                    crate::proto::flags::TIMES
+                                } else {
+                                    0
+                                }
                                 | destination.metadata.preserve,
                         )?;
                     } else {

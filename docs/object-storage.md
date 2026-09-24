@@ -56,8 +56,12 @@ objects.
   `NAME/` prefix. Use `--srcs-in` for prefix contents. A prefix exists when it
   contains objects, including an empty directory marker.
 - **Metadata:** syq stores timestamps, permissions, ownership, and symlinks in
-  object metadata or contents. Downloads restore timestamps and symlinks;
-  `--preserve` restores permissions or ownership. Special files are unsupported.
+  object metadata or contents. Downloads restore symlinks and set filesystem
+  modification time from the stored source time, falling back to S3 Last-Modified
+  when unavailable. `--preserve=-mtime` disables setting that filesystem time;
+  `--preserve=permissions,ownership` also restores permissions and ownership.
+  These options control filesystem restoration; uploads and server-side copies
+  still retain source metadata. Special files are unsupported.
 - **Updates:** `--only-new`, `--into-new`, and `--as-new` protect individual
   objects against concurrent creation. Prefix checks are not transactional.
   `--inplace` and SSH/S3 combinations are unsupported.

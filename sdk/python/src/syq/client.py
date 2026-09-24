@@ -779,11 +779,11 @@ def _copy_arguments(
     if preserve is not None:
         attributes = (preserve,) if isinstance(preserve, str) else tuple(preserve)
         for attribute in attributes:
-            if attribute not in {"times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes", "crtimes"}:
+            if attribute not in {"mtime", "-mtime", "times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes", "crtimes"}:
                 raise SyqInvocationError(
-                    "--preserve must contain times, permissions, ownership, specials, hardlinks, acls, xattrs, atimes, or crtimes"
+                    "--preserve must contain mtime, -mtime, times, permissions, ownership, specials, hardlinks, acls, xattrs, atimes, or crtimes"
                 )
-            argv.extend(("--preserve", attribute))
+            _append_path_option(argv, "--preserve", attribute)
     if open_noatime:
         argv.append("--open-noatime")
     if sparse:
@@ -1507,6 +1507,7 @@ class Client:
         src_dir: Selector | None = None,
         from_: str | None = None,
         include: Iterable[str] | None = None,
+        where: str | None = None,
         rsh: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
@@ -1566,6 +1567,7 @@ class Client:
             sparse=False,
             inplace=False,
             max_delete=None,
+            where=where,
         )
         connection = _Connection(rsh, syq_path, no_bootstrap,
                                  s3_endpoint, s3_region, s3_profile, s3_header)

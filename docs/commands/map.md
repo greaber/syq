@@ -43,6 +43,12 @@ syq map [OPTIONS] --srcs-in DIR
 |---|---|
 | `--include <FIELD>` | Include optional output fields (comma-separated or repeatable)<br><br>[possible values: kind, size, mtime, s3_last_modified] |
 
+## Copy policy and filtering
+
+| Argument / option | Meaning |
+|---|---|
+| `--where <EXPR>` | Filter emitted mapping entries with a source expression |
+
 ## SSH and transport
 
 | Argument / option | Meaning |
@@ -89,6 +95,11 @@ emit size and modification time for regular files. S3 size is the object body
 size; `mtime` is the filesystem time stored by syq, omitted if unavailable.
 `s3_last_modified` is S3's object modification time, available only for S3
 sources. Both timestamps use Unix seconds and can be requested independently.
+`--where` selects entries with the same [expressions](../expressions.md) as
+`cp`, including directory entries, while continuing to traverse their children.
+Fields used by a condition need not be included in the output. For example,
+`--where 'src.kind = "file" and src.size > 1MiB'` emits matching file records.
+
 S3 object time comes from listing; requesting `kind` or `mtime` also reads
 object metadata. Generating mappings never downloads object bodies.
 

@@ -99,11 +99,10 @@ pub(super) struct Planner<'a> {
 }
 
 /// What a source entry asserts about its destination path. Two dirs merge;
-/// a dir against a leaf, or two leaves, conflict. A `Weak` claim comes from
-/// an entry syq will not transfer (a symlink without -l, a special file
-/// without -D, an unknown type): it still marks the path as the source's —
-/// so --delete leaves it alone — but yields to any real claim, so two
-/// sources overlapping on such an entry are not a conflict.
+/// a dir against a leaf, or two leaves, conflict. Weak claims mark entries
+/// that will not be transferred, including expression exclusions and unsupported
+/// types. They protect source counterparts from deletion but yield to real
+/// claims, so overlapping skipped entries do not cause a conflict.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Claim {
     Dir,
@@ -116,6 +115,9 @@ pub(super) enum Claim {
     /// A symlink or special file syq intends to create.
     Leaf,
     Weak,
+    /// An excluded directory protects its own counterpart, but its children
+    /// are still scanned and do not need blanket subtree protection.
+    WeakDir,
 }
 
 /// A failed entry's result identity, with a source path only in mapping mode.
@@ -189,7 +191,7 @@ impl<'a> PruneWalk<'a> {
             return;
         }
         if let Some(claim) = self.seen.get(&full) {
-            if *claim != Claim::Dir && entry.kind == Kind::Dir {
+            if !matches!(claim, Claim::Dir | Claim::WeakDir) && entry.kind == Kind::Dir {
                 self.shielded.insert(full);
             }
             return;
@@ -956,6 +958,23 @@ impl Planner<'_> {
                         continue;
                     }
                 }
+                // Filter real mapping entries before synthesizing containers;
+                // an excluded leaf must not create its otherwise unused parents.
+                if self.opts.expressions.selection.is_some()
+                    && !self
+                        .opts
+                        .expressions
+                        .selects(&crate::expression::File::from_entry(&e), &m.src)
+                        .with_context(|| {
+                            format!("--mapping line {line_number}: source {}", display(&m.src))
+                        })?
+                {
+                    if self.opts.delete {
+                        self.protect_excluded(join(dst_root, &m.dst), e.kind);
+                    }
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                    continue;
+                }
                 // Destination ancestors: consistent with what earlier entries
                 // established, with missing ones synthesized parent-first.
                 let mut conflict = false;
@@ -1089,13 +1108,9 @@ impl Planner<'_> {
         sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
-        let batch = if self.opts.expressions.selection.is_some() {
+        let batch = if self.opts.expressions.selection.is_some() && !self.mapping_mode {
             let mut selected = Vec::with_capacity(batch.len());
             for entry in batch {
-                if entry.kind == Kind::Dir {
-                    selected.push(entry);
-                    continue;
-                }
                 let relative = self
                     .src_overrides
                     .get(&entry.path)
@@ -1108,17 +1123,52 @@ impl Planner<'_> {
                     .selects(&crate::expression::File::from_entry(&entry), path)
                     .with_context(|| format!("source {}", display(path)))?;
                 if !included {
-                    let dst = join(dst_root, &join(sub, &entry.path));
-                    // Selection never makes a source counterpart extraneous.
                     if self.opts.delete {
-                        self.dst_seen.entry(dst).or_insert(Claim::Weak);
+                        let dst = join(dst_root, &join(sub, &entry.path));
+                        self.protect_excluded(dst, entry.kind);
                     }
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     continue;
                 }
+                if entry.kind == Kind::Dir {
+                    // A later selected source can supply metadata for a parent
+                    // an earlier source needed only as a container.
+                    self.implicit_dirs
+                        .remove(&join(dst_root, &join(sub, &entry.path)));
+                }
                 selected.push(entry);
             }
-            selected
+            // A selected descendant may need an unselected directory as a
+            // container. Synthesize only those ancestors, with the same
+            // receiver-default metadata used by file-only mappings.
+            let mut present: std::collections::HashSet<PathBytes> = selected
+                .iter()
+                .filter(|entry| entry.kind == Kind::Dir)
+                .map(|entry| entry.path.clone())
+                .collect();
+            let mut with_parents = Vec::with_capacity(selected.len());
+            for entry in selected {
+                if !entry.path.is_empty() {
+                    for end in std::iter::once(0).chain(
+                        entry
+                            .path
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, byte)| (*byte == b'/').then_some(i)),
+                    ) {
+                        let ancestor = &entry.path[..end];
+                        let destination = join(dst_root, &join(sub, ancestor));
+                        if !matches!(self.dst_seen.get(&destination), Some(Claim::Dir))
+                            && present.insert(ancestor.to_vec())
+                        {
+                            self.implicit_dirs.insert(destination);
+                            with_parents.push(implicit_dir_entry(ancestor.to_vec()));
+                        }
+                    }
+                }
+                with_parents.push(entry);
+            }
+            with_parents
         } else {
             batch
         };
@@ -1282,7 +1332,7 @@ impl Planner<'_> {
             // object at this path even though the namespace was already seen.
             let new_capacity_object = match self.dst_seen.get(&dst) {
                 None => true,
-                Some(Claim::Weak) if claim != Claim::Weak => true,
+                Some(Claim::Weak | Claim::WeakDir) if claim != Claim::Weak => true,
                 Some(_) => false,
             };
             let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
@@ -1334,7 +1384,7 @@ impl Planner<'_> {
                     ));
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                 }
-                Claim::Weak => {
+                Claim::Weak | Claim::WeakDir => {
                     // Symlink without -l, special without -D.
                     if opts.verbose > 0 {
                         self.progress
@@ -2218,7 +2268,7 @@ impl Planner<'_> {
                 self.blocked_directory_paths.insert(p);
                 continue;
             }
-            if opts.expressions.update.is_some() {
+            if opts.expressions.update.is_some() && !self.implicit_dirs.contains(&p) {
                 let source = crate::expression::File::from_entry(&e);
                 let destination = st
                     .as_ref()
@@ -2962,13 +3012,37 @@ impl Planner<'_> {
         }
     }
 
+    /// Selection protects source counterparts without treating skipped
+    /// directories as completed parents or hiding destination-only children.
+    fn protect_excluded(&mut self, dst: PathBytes, kind: Kind) {
+        let claim = if kind == Kind::Dir {
+            Claim::WeakDir
+        } else {
+            Claim::Weak
+        };
+        self.dst_seen
+            .entry(dst)
+            .and_modify(|existing| {
+                // If several excluded sources share a name, a leaf's
+                // subtree protection wins regardless of scan order.
+                if *existing == Claim::WeakDir && claim == Claim::Weak {
+                    *existing = claim;
+                }
+            })
+            .or_insert(claim);
+    }
+
     /// Record a leaf (file/symlink/special) destination; return false if this
     /// exact destination was already claimed by another source (a collision).
     /// Some(contested) if the claim stands; None on a conflict (reported).
     pub(super) fn claim_dst(&mut self, dst: &PathBytes, rel: &str, claim: Claim) -> Option<bool> {
         match (self.dst_seen.get(dst), claim) {
-            (Some(Claim::Dir), Claim::Dir) | (Some(_), Claim::Weak) => Some(false),
-            (Some(Claim::Weak), c) => {
+            (Some(Claim::WeakDir), Claim::Weak) => {
+                self.dst_seen.insert(dst.clone(), Claim::Weak);
+                Some(false)
+            }
+            (Some(Claim::Dir), Claim::Dir) | (Some(_), Claim::Weak | Claim::WeakDir) => Some(false),
+            (Some(Claim::Weak | Claim::WeakDir), c) => {
                 self.dst_seen.insert(dst.clone(), c);
                 Some(false)
             }
@@ -3174,7 +3248,7 @@ impl Planner<'_> {
                     alias_parents.extend(ancestor_prefixes(&full).map(<[u8]>::to_vec));
                 }
                 match claimed {
-                    Some(Claim::Dir) => continue,
+                    Some(Claim::Dir | Claim::WeakDir) => continue,
                     Some(_) => {
                         if entry_kind == Kind::Dir {
                             shielded.insert(full);
@@ -3608,8 +3682,8 @@ impl Planner<'_> {
     }
 }
 
-/// A destination ancestor directory no manifest entry names: created with
-/// default metadata (mode through the umask, natural mtime; see
+/// A destination ancestor directory without selected source metadata: created
+/// with receiver defaults (mode through the umask, natural mtime; see
 /// `Planner::implicit_dirs`).
 pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
     Entry {
@@ -3618,7 +3692,7 @@ pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
         size: 0,
         mtime: 0,
         mtime_nsec: 0,
-        mode: 0o755,
+        mode: 0o777,
         uid: 0,
         gid: 0,
         rdev: 0,

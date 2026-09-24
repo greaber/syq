@@ -28,13 +28,23 @@ os.mkfifo(p/'fifo')
 os.utime(p/'photos'/'line\\n%2F+', (123,123))
 ''')
 try:
-    for extra in [[], ['--include', 'kind,size,mtime']]:
+    for extra in [[], ['--include', 'kind,size,mtime'], ['--where', 'src.kind = \"file\" and src.mtime < now']]:
         args = ['--srcs-in', root, *extra]
         # The same walker and ordering run locally on the source or via RPC.
         import shlex
         direct = run(['ssh', 'source', shlex.join(['syq', 'map', *args])])
         invoked = run(['syq', 'map', '--from', 'source', *args])
         assert invoked.stdout == direct.stdout, (invoked.stdout, direct.stdout)
+    filtered = run(['syq', 'map', '--from', 'source', '--srcs-in', root,
+                    '--where', 'src.kind = "file"'])
+    assert len(filtered.stdout.splitlines()) == 1
+    for option in ['mtime', '-mtime']:
+        destination = '/tmp/syq-real-ssh/mtime-' + option
+        run(['syq', 'cp', '--from', 'source', '-C', root, '--src', 'photos/line\n%2F+',
+             '--to', 'destination', '--as', destination, '--preserve=' + option])
+        observed = run(['ssh', 'destination', 'stat', '-c', '%Y', destination])
+        assert (int(observed.stdout) == 123) == (option == 'mtime'), observed.stdout
+        run(['ssh', 'destination', 'rm', destination])
     generated = run(['syq', 'map', '--from', 'source', '--srcs-in', root])
     entries = [json.loads(line) for line in generated.stdout.splitlines()]
     assert all(set(entry) == {'src', 'dst'} for entry in entries)
