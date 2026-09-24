@@ -627,6 +627,8 @@ fn rsync_new_files_follow_destination_default_acls_without_preserving_modes() {
             }
             if transport == "ssh" {
                 command.arg("--syq-no-tcp");
+            } else if transport == "tcp" {
+                command.env("SYQ_TEST_REQUIRE_TCP", "1");
             }
             if inplace {
                 command.arg("--inplace");
