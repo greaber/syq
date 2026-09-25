@@ -19,12 +19,15 @@ case "$1:$2" in
   run:list)
     shift 2
     workflow=
+    limit=
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --workflow) workflow=$2; shift 2 ;;
+        --limit) limit=$2; shift 2 ;;
         *) shift ;;
       esac
     done
+    test "$limit" = 10 || exit 2
     cat "$SYQ_TEST_RUNS_DIR/$workflow.json"
     ;;
   pr:list)
@@ -180,6 +183,29 @@ expect_output 'macos.yml        in_progress'
 expect_no_output WARNING
 set_run macos.yml completed success
 
+# A later success does not erase an earlier failure, or turn it into a gate.
+set_run ci.yml completed success
+jq --arg sha "$previous_sha" '. + [.[0] | .headSha = $sha |
+  .databaseId = 2 | .conclusion = "failure" | .url = "https://example.invalid/earlier-failure"]' \
+  "$runs_dir/ci.yml.json" > "$work/history.json"
+mv "$work/history.json" "$runs_dir/ci.yml.json"
+expect_exit 0 run_status
+expect_output 'success covers only selected checks'
+expect_output "Recent failure: failure ${previous_sha:0:7}  https://example.invalid/earlier-failure"
+expect_output 'they may already be fixed'
+expect_no_output WARNING
+expect_exit 0 run_status --json
+jq -e --arg sha "$previous_sha" '.master_ci[0].state == "success" and
+  .master_ci[0].recent_failures[0].headSha == $sha and .warnings == []' "$work/out" >/dev/null
+set_run ci.yml completed success
+
+# Prefer the fetched master over a stale coordination branch.
+git -C "$repo" update-ref refs/remotes/origin/master "$previous_sha"
+expect_exit 0 run_status --json
+jq -e --arg sha "$previous_sha" '.worktree.master_ref == "refs/remotes/origin/master" and
+  .worktree.master == $sha and .worktree.ahead_of_master == 1' "$work/out" >/dev/null
+git -C "$repo" update-ref -d refs/remotes/origin/master
+
 # A dirty worktree is stated but does not fail the report.
 touch "$repo/scratch"
 expect_exit 0 run_status
@@ -212,9 +238,27 @@ run_status --json --check > "$work/out" 2>"$work/err" || json_check_status=$?
 test "$json_check_status" = 1
 grep -F 'fake cargo clippy' "$work/err" >/dev/null
 jq -e '.checks == [{name:"fmt", command:"cargo fmt --all -- --check", result:"pass"},
-  {name:"clippy", command:"cargo clippy --all-targets --all-features -- -D warnings", result:"fail"},
-  {name:"unit-tests", command:"cargo test --bin syq", result:"pass"}]
+  {name:"clippy", command:"cargo clippy --locked --all-targets --all-features -- -D warnings", result:"fail"},
+  {name:"unit-tests", command:"cargo test --locked --bin syq", result:"pass"}]
   and .warnings == ["clippy failed"] and .exit_status == 1' "$work/out" >/dev/null
+# Check-generated changes must be visible in the final report and fail validation.
+cat > "$fakebin/cargo" <<'FAKE'
+#!/bin/sh
+touch generated
+FAKE
+expect_exit 1 run_status --json --check
+jq -e '.worktree.clean == false and .worktree.untracked == 1 and
+  (.warnings | index("worktree status changed during baseline checks; inspect changes and rerun affected checks")) != null' "$work/out" >/dev/null
+rm "$repo/generated"
+
+# A check that moves HEAD cannot report its results against the new commit.
+cat > "$fakebin/cargo" <<'FAKE'
+#!/bin/sh
+if [ "$1" = test ]; then git commit -q --allow-empty -m 'moved during check'; fi
+FAKE
+expect_exit 2 run_status --check
+expect_output 'HEAD changed during baseline checks'
+expect_no_output 'Baseline checks ('
 rm "$fakebin/cargo"
 
 # Usage errors.

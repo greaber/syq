@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Report the state of the current task branch: the worktree, the branch's
-# pull request, and the latest post-merge CI runs on master. Its output is
+# pull request, and recent post-merge CI runs on master. Its output is
 # what a status report or review request should state.
 #
 # Only reads git and GitHub state. With --check it also runs the fixed Rust
@@ -36,11 +36,12 @@ head_sha=$(git rev-parse HEAD)
 short_sha=$(git rev-parse --short HEAD)
 branch=$(git symbolic-ref --quiet --short HEAD || echo HEAD)
 status_lines=$(git status --porcelain --untracked-files=all)
+initial_status_lines=$status_lines
+initial_head_sha=$head_sha
 staged=$(grep -c '^[MADRCT]' <<<"$status_lines" || true)
 unstaged=$(grep -c '^.[MADRCT]' <<<"$status_lines" || true)
 untracked=$(grep -c '^??' <<<"$status_lines" || true)
 if [ -z "$status_lines" ]; then clean=true; else clean=false; fi
-[ "$clean" = true ] || warn "worktree is dirty: $staged staged, $unstaged unstaged, $untracked untracked"
 
 upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
 upstream_ahead=null
@@ -50,7 +51,7 @@ if [ -n "$upstream" ]; then
 fi
 
 master_ref=
-for candidate in refs/heads/master refs/remotes/origin/master; do
+for candidate in refs/remotes/origin/master refs/heads/master; do
   if git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null; then master_ref=$candidate; break; fi
 done
 master_sha=null
@@ -63,10 +64,12 @@ if [ -n "$master_ref" ]; then
   read -r ahead_of_master behind_master < <(git rev-list --left-right --count "HEAD...$master_ref")
 fi
 
-# Latest post-merge run of each workflow on master.
+# Latest run plus failures among the ten most recent post-merge runs.
+# A later success may cover different checks; do not infer that it fixed them.
+# Historical failures are context, not an additional merge gate.
 master_runs='[]'
 for workflow in "${workflows[@]}"; do
-  if ! runs=$(gh run list --repo "$repository" --workflow "$workflow" --branch master --event push --limit 1 \
+  if ! runs=$(gh run list --repo "$repository" --workflow "$workflow" --branch master --event push --limit 10 \
       --json headSha,status,conclusion,url,createdAt,databaseId); then
     echo "could not list $workflow runs on master" >&2
     exit 2
@@ -84,8 +87,10 @@ for workflow in "${workflows[@]}"; do
     queued|in_progress|pending|waiting|requested) ;;
     *) warn "master is red: $workflow $state at $(jq -r '.headSha[0:7]' <<<"$run") $(jq -r .url <<<"$run")" ;;
   esac
-  master_runs=$(jq -c --arg workflow "$workflow" --arg state "$state" --argjson run "$run" \
-    '. + [{workflow:$workflow, state:$state, run:$run}]' <<<"$master_runs")
+  recent_failures=$(jq -c '[.[] | select(.status == "completed") |
+    select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure") ]' <<<"$runs")
+  master_runs=$(jq -c --argjson recent_failures "$recent_failures" --arg workflow "$workflow" --arg state "$state" --argjson run "$run" \
+    '. + [{workflow:$workflow, state:$state, run:$run, recent_failures:$recent_failures}]' <<<"$master_runs")
 done
 
 # The pull request for this branch, if any.
@@ -141,9 +146,27 @@ if [ "$check" = true ]; then
       '. + [{name:$name, command:$command, result:$result}]' <<<"$checks")
   }
   run_check fmt cargo fmt --all -- --check
-  run_check clippy cargo clippy --all-targets --all-features -- -D warnings
-  run_check unit-tests cargo test --bin syq
+  run_check clippy cargo clippy --locked --all-targets --all-features -- -D warnings
+  run_check unit-tests cargo test --locked --bin syq
+  # Checks can modify files or overlap an edit. Report the state after checking,
+  # and never attribute checks to a commit that moved while they ran.
+  head_sha=$(git rev-parse HEAD)
+  short_sha=$(git rev-parse --short HEAD)
+  status_lines=$(git status --porcelain --untracked-files=all)
+  staged=$(grep -c '^[MADRCT]' <<<"$status_lines" || true)
+  unstaged=$(grep -c '^.[MADRCT]' <<<"$status_lines" || true)
+  untracked=$(grep -c '^??' <<<"$status_lines" || true)
+  if [ -z "$status_lines" ]; then clean=true; else clean=false; fi
+  if [ "$head_sha" != "$initial_head_sha" ]; then
+    echo "HEAD changed during baseline checks: $initial_head_sha -> $head_sha; rerun branch-status" >&2
+    exit 2
+  fi
+  if [ "$status_lines" != "$initial_status_lines" ]; then
+    warn "worktree status changed during baseline checks; inspect changes and rerun affected checks"
+  fi
 fi
+
+[ "$clean" = true ] || warn "worktree is dirty: $staged staged, $unstaged unstaged, $untracked untracked"
 
 exit_status=0
 [ "${#warnings[@]}" -eq 0 ] || exit_status=1
@@ -194,7 +217,7 @@ else
   echo "Master:   no local master ref"
 fi
 echo
-echo "Master CI (latest post-merge run per workflow):"
+echo "Master CI (latest post-merge run per workflow; success covers only selected checks):"
 while IFS= read -r entry; do
   [ -n "$entry" ] || continue
   workflow=$(jq -r .workflow <<<"$entry")
@@ -205,7 +228,9 @@ while IFS= read -r entry; do
     printf '  %-16s %-12s %s  %s\n' "$workflow" "$state" \
       "$(jq -r '.run.headSha[0:7]' <<<"$entry")" "$(jq -r .run.url <<<"$entry")"
   fi
+  jq -r '.recent_failures[] | "    Recent failure: \(.conclusion) \(.headSha[0:7])  \(.url)"' <<<"$entry"
 done < <(jq -c '.[]' <<<"$master_runs")
+echo "Recent failures cover the last 10 pushes per workflow; they may already be fixed. Compare check coverage before treating a later success as recovery."
 echo
 if [ "$pr" = null ]; then
   echo "Pull request: none for $branch"
@@ -225,7 +250,7 @@ else
 fi
 if [ "$check" = true ]; then
   echo
-  echo "Baseline checks:"
+  echo "Baseline checks (started at ${initial_head_sha:0:7}; worktree state is reported above):"
   jq -r '.[] | "  \(.name): \(.result)  (\(.command))"' <<<"$checks"
 fi
 if [ "${#warnings[@]}" -gt 0 ]; then
