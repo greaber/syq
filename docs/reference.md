@@ -239,8 +239,12 @@ Ignored paths are also protected from pruning.
 ## Resume an interrupted copy
 
 Rerun the same command. Syq skips completed files and can reuse matching parts
-of interrupted files. It assembles each updated file beside the destination
-and replaces the destination when complete.
+of interrupted files. Partial-file resume is independent of
+[`block-reuse`](tuning.md#compare-block-reuse-with-full-replacement), which controls
+comparison against an existing final destination. Unless `--inplace` is selected,
+syq assembles each updated file beside the destination and replaces it when
+complete. With `--inplace`, interrupted bytes are in the final file itself;
+reusing them follows the block-reuse policy.
 
 Partial files may remain after a successful retry. To remove them:
 

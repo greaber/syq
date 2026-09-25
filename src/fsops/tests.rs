@@ -5177,3 +5177,30 @@ fn strict_plan_batch_distinguishes_missing_entries_from_read_errors() {
     fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
     assert!(matches!(denied, Response::EndpointError(_)), "{denied:?}");
 }
+
+#[test]
+fn partial_seeding_does_not_fall_back_to_final_when_disallowed() {
+    let directory = crate::test_support::tempdir().unwrap();
+    fs::write(directory.path().join("file"), b"final bytes").unwrap();
+    let mut operations = destination_ops(directory.path());
+    let copy_id = [25; 16];
+    let seeded = operations
+        .seed_basis(
+            PartialTarget {
+                path: b"file",
+                id: &copy_id,
+                guard: None,
+            },
+            11,
+            64 << 10,
+            Some(&[]),
+            0,
+        )
+        .unwrap();
+    assert!(seeded.hashes.is_empty());
+    assert!(!seeded.selected_final);
+    assert_eq!(
+        fs::read(directory.path().join("file")).unwrap(),
+        b"final bytes"
+    );
+}

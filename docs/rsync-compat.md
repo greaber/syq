@@ -15,7 +15,7 @@ See [`syq rsync`](commands/rsync.md) for all accepted options.
 | Type changes | Refuses replacement between a directory and any non-directory, even when the directory is empty |
 | `--update` | Checks mtimes only for regular files; replacements between non-directory types still occur |
 | Resume | Always keeps syq partial files; cannot reuse rsync partials |
-| Delta transfer | Reuses matching blocks at the same offsets; does not find shifted blocks |
+| Delta transfer | Reuses matching blocks at the same offsets for remote copies by default; use `block-reuse=on` locally. Does not find shifted blocks |
 | `--rsync-path PATH` | Exact syq executable path, not a shell fragment |
 | Remote-to-remote | Refused; use native `syq cp` |
 

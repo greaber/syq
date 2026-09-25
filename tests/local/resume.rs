@@ -898,7 +898,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
         .args([
             "-a",
             "--performance-tuning",
-            "workers=1",
+            "workers=1,block-reuse=on",
             "--resource-limits",
             "bandwidth=1G",
             "--no-progress",
@@ -918,7 +918,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     let second = syq(&[
         "-a",
         "--performance-tuning",
-        "workers=1",
+        "workers=1,block-reuse=on",
         "--resource-limits",
         "bandwidth=1G",
         &t.s("second"),
@@ -950,7 +950,7 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
         .args([
             "-a",
             "--performance-tuning",
-            "workers=1",
+            "workers=1,block-reuse=on",
             "--resource-limits",
             "bandwidth=1G",
             "--no-progress",
@@ -997,7 +997,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
         .args([
             "-a",
             "--performance-tuning",
-            "workers=1",
+            "workers=1,block-reuse=on",
             "--resource-limits",
             "bandwidth=1G",
             "--no-progress",
@@ -1017,7 +1017,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     let second = syq(&[
         "-a",
         "--performance-tuning",
-        "workers=1",
+        "workers=1,block-reuse=on",
         "--resource-limits",
         "bandwidth=1G",
         &t.s("second"),
@@ -1454,6 +1454,7 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
         .args([
             "-a",
             "--stats",
+            "--performance-tuning=block-reuse=on",
             "--resource-limits",
             "bandwidth=1G",
             "--no-progress",

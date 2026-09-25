@@ -1873,6 +1873,17 @@ impl FsOps {
         if let Err(error) = self.map_request(req) {
             return Response::EndpointError(wire_error(&error));
         }
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_BLOCK_COMPARISON").is_some()
+            && matches!(
+                req,
+                Request::HashBlocks { .. }
+                    | Request::HashAndHold { .. }
+                    | Request::SeedBasis { .. }
+            )
+        {
+            return Response::Err("injected block-comparison failure".into());
+        }
         // HashAndHold's next request must consume the retained descriptor.
         // Any other request means the controller abandoned that comparison
         // (for example because the source hash failed), so release it here.

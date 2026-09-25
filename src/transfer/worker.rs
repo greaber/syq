@@ -804,11 +804,22 @@ impl Worker {
         // framing, hashing and scheduling them through the transport.
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
-        if self
-            .opts
-            .copy_policy(self.bwlimit.is_some())
-            .file_operation(job.entry.size, job.container_guard.is_some())
-            == crate::copy_policy::FileOperation::ReceiverCopy
+        // Reuse needs comparison only when there is a final file to compare.
+        // Fresh files can still use the whole-file shortcut with reuse enabled.
+        let compare_existing = job
+            .dst_entry
+            .as_ref()
+            .is_some_and(|entry| entry.kind == Kind::File)
+            && self
+                .opts
+                .tuning
+                .reuse_destination_blocks(self.opts.same_host);
+        if !compare_existing
+            && self
+                .opts
+                .copy_policy(self.bwlimit.is_some())
+                .file_operation(job.entry.size, job.container_guard.is_some())
+                == crate::copy_policy::FileOperation::ReceiverCopy
         {
             match self.try_copy_local(idx, &job) {
                 Ok(true) => {
@@ -854,7 +865,12 @@ impl Worker {
             // destination. A matching read-only file needs only metadata work.
             // Prepare binds any writes to this held inode, and the comparison
             // below is reused rather than hashing the contents a second time.
-            let inplace_ranges = if inplace && final_is_file {
+            let reuse_blocks = self
+                .opts
+                .tuning
+                .reuse_destination_blocks(self.opts.same_host);
+            let inplace_ranges = if inplace && final_is_file && (reuse_blocks || self.opts.checksum)
+            {
                 let diff = self.diff_final_and_hold(&job)?;
                 if diff.ranges.is_empty() && diff.held_len == Some(size) {
                     self.finish_matched_basis(idx, &job)?;
@@ -868,36 +884,45 @@ impl Worker {
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
             // absent until the content comparison shows a difference.
-            let prepared = match ok(
-                self.dst.call(Request::Prepare {
-                    path: job.dst.clone(),
-                    size,
-                    inplace,
-                    copy_id: self.copy_id(),
-                    mode: self.create_mode(&job),
-                    attempt: job.attempt,
-                    create_if_missing: inplace || !final_is_file,
-                    guard: job.container_guard.clone(),
-                })?,
-                "prepare",
-            )? {
-                Response::Prepared(prepared) => prepared,
-                other => bail!("unexpected response {other:?}"),
-            };
+            let prepared = self.prepare_file(
+                &job,
+                inplace || !final_is_file || (!reuse_blocks && !self.opts.checksum),
+            )?;
 
             if prepared.partial_size.is_some() || prepared.has_candidates || final_is_file {
                 self.sched.request_direct_fallback();
             }
             if inplace {
-                return Ok((inplace_ranges.unwrap_or_else(full), true));
+                let ranges = if reuse_blocks {
+                    inplace_ranges.unwrap_or_else(full)
+                } else {
+                    full()
+                };
+                return Ok((ranges, true));
             }
-            // A retry's own output must be finished (and thus consumed), even
-            // if another copy has meanwhile published identical final bytes.
-            if prepared.partial_size.is_some() {
+            // Resume an owned output or a previous invocation's partial,
+            // independently of the policy for reusing the final destination.
+            if prepared.partial_size.is_some() || (!reuse_blocks && prepared.has_candidates) {
                 if size == 0 {
                     return Ok((vec![], true));
                 }
                 return Ok((self.diff_blocks(&job, Which::Partial)?, true));
+            }
+            if !reuse_blocks {
+                // An explicit checksum may still establish a complete match.
+                // A differing final file contributes no blocks to the output.
+                if self.opts.checksum && final_is_file {
+                    let diff = self.diff_final_and_hold(&job)?;
+                    if diff.ranges.is_empty() && diff.held_len == Some(size) {
+                        self.finish_matched_basis(idx, &job)?;
+                        return Ok((vec![], false));
+                    }
+                    let prepared = self.prepare_file(&job, true)?;
+                    if prepared.partial_size.is_some() || prepared.has_candidates {
+                        return Ok((self.diff_blocks(&job, Which::Partial)?, true));
+                    }
+                }
+                return Ok((full(), true));
             }
             if final_is_file {
                 let diff = self.diff_final_and_hold(&job)?;
@@ -1079,10 +1104,19 @@ impl Worker {
     /// Hash blocks on both sides (in parallel) and return the ranges that differ.
     pub(super) fn diff_blocks(&mut self, job: &WorkerJob, which: Which) -> Result<Vec<(u64, u64)>> {
         if which == Which::Partial {
+            // Empty final ranges still allow partial donors, but prohibit falling
+            // back to the final file if a partial disappears before seeding.
             return self
                 .diff_with(
                     job,
-                    self.seed_request(job, None),
+                    self.seed_request(
+                        job,
+                        (!self
+                            .opts
+                            .tuning
+                            .reuse_destination_blocks(self.opts.same_host))
+                        .then(Vec::new),
+                    ),
                     "seed and hash destination",
                 )
                 .map(|diff| diff.ranges);
@@ -1161,6 +1195,29 @@ impl Worker {
             block,
             size,
         ))
+    }
+
+    fn prepare_file(
+        &mut self,
+        job: &WorkerJob,
+        create_if_missing: bool,
+    ) -> Result<crate::proto::Preparation> {
+        match ok(
+            self.dst.call(Request::Prepare {
+                path: job.dst.clone(),
+                size: job.entry.size,
+                inplace: job.inplace,
+                copy_id: self.copy_id(),
+                mode: self.create_mode(job),
+                attempt: job.attempt,
+                create_if_missing,
+                guard: job.container_guard.clone(),
+            })?,
+            "prepare",
+        )? {
+            Response::Prepared(prepared) => Ok(prepared),
+            other => bail!("unexpected response {other:?}"),
+        }
     }
 
     pub(super) fn seed_request(
@@ -1321,7 +1378,16 @@ impl Worker {
         } else {
             1
         };
-        self.transfer_range_pipeline(&job, h, credited, block, read_window, write_window)
+        let result =
+            self.transfer_range_pipeline(&job, h, credited, block, read_window, write_window);
+        #[cfg(debug_assertions)]
+        if result.is_ok() {
+            crate::fsops::record_test_event(
+                "SYQ_TEST_WORKER_EVENTS",
+                format_args!("range {} {idx} {credited}", self.id),
+            )?;
+        }
+        result
     }
 
     pub(super) fn acknowledge_range_write(
