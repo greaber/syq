@@ -152,7 +152,9 @@ the conversation instead.
   contexts. Any pull-request check results are informational. A red `master`
   run makes the script exit 1; report it to the user even when the current task
   did not cause it. `--check` also runs the Rust baseline below, and `--json`
-  prints the same facts for scripting.
+  prints the same facts for scripting. The report also lists failures among
+  the last ten post-merge runs per workflow. These may already be fixed;
+  compare the checks that ran before interpreting a later success as recovery.
 - Before removing a worktree or branch, require a clean worktree, no retained
   task-related stash, and no commits that still need integration. An ancestry
   result such as `git branch --merged` says nothing about uncommitted files.
@@ -474,6 +476,13 @@ coverage their consequences warrant. Keep the release validation gates intact.
 When CI fails, first distinguish product defects from test, fixture, and runner
 problems; investigate the failure rather than reflexively expanding the suite.
 
+Validate the final changes, including conflict resolutions after branch
+synchronization. Use `--locked` for Cargo validation so a check cannot silently
+repair an uncommitted lockfile. For shell changes, run ShellCheck on the changed
+scripts; passing Rust checks does not cover shell lint. Inspect worktree changes
+after validation and commit intended generated changes before reporting the
+validated SHA.
+
 Choose checks from the behavior changed, not every workflow available. For a
 narrow change confined to one test or its private fixture, run formatting and
 that exact test on the affected platform. The full Rust baseline below is not
@@ -487,8 +496,8 @@ For a substantial Rust runtime change, the normal pre-merge baseline is:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --bin syq
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --bin syq
 ```
 
 For a small, well-understood runtime fix, formatting and focused tests may be
@@ -497,7 +506,7 @@ when that uncertainty matters, not merely because runtime code changed.
 Select the integration tests that can plausibly exercise the changed behavior.
 Prefer exact or narrow filters in the `local` target (`tests/local.rs`
 holds the shared helpers and `tests/local/<topic>.rs` the tests, named
-`<topic>::<test>`); those tests invoke the built binary against temporary trees. Run `cargo test --all-targets` before
+`<topic>::<test>`); those tests invoke the built binary against temporary trees. Run `cargo test --locked --all-targets` before
 handoff when a change is broad, crosses subsystem boundaries, changes shared
 test infrastructure, or leaves meaningful uncertainty about the affected
 surface. Do not run unrelated suites merely because they exist.
