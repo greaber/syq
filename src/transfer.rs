@@ -2951,8 +2951,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         destination_supports_confined_socket_nodes,
         destination_metadata_platform,
         destination_tree_known_missing,
-        destination_children_known_missing: opts.same_host
-            && fresh_destination
+        destination_children_known_missing: fresh_destination
             && opts.expressions.update.is_none()
             && !opts.existing
             && !opts.ignore_existing

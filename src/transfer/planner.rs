@@ -26,7 +26,7 @@ pub(super) struct Planner<'a> {
     /// cannot supply comparison bases. Local fresh trees retain the root
     /// lookup separately below so its existing metadata is preserved.
     pub(super) destination_tree_known_missing: bool,
-    /// The local destination was missing or empty at preflight. Its root may
+    /// The destination was missing or empty at preflight. Its root may
     /// still have metadata to preserve; only descendants are known absent.
     pub(super) destination_children_known_missing: bool,
     /// Called after jobs are queued; starts streaming only when useful work exists.
