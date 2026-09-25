@@ -11,17 +11,27 @@ dirtiness does not block creating or using a separate task worktree, and is not
 permission to clean, reset, or stash them. Apart from administering branches
 and worktrees, only writes to gitignored files are normally allowed there.
 
+`master` means the branch on GitHub. The coordination checkout's local
+`master` and its files change only when the user occasionally pulls by hand,
+so they are often stale. Do not use them to answer questions about `master`,
+as a base for new work, or for comparisons, and leave pulling to the user.
+Run `git fetch origin master` and read `origin/master` instead, for example
+with `git show origin/master:<path>`, `git log origin/master`, or a detached
+worktree for broader reading.
+
 Check `git status` and `git worktree list` before choosing a worktree. A branch
 and worktree should correspond 1:1 with a task or pull request. Also check the
 primary checkout's `current-plans/` for plans or handoff notes that cover the
 topic. The normal setup from the primary checkout is:
 
 ```bash
-git worktree add .worktrees/<task> -b <task> master
+git fetch origin master
+git worktree add --no-track .worktrees/<task> -b <task> origin/master
 ln -s ../../current-plans .worktrees/<task>/current-plans
 cd .worktrees/<task>
 ```
 
+`--no-track` keeps `origin/master` from becoming the task branch's upstream.
 Keep `current-plans/` shared by symlinking it from task worktrees as shown
 above; do not copy it. This keeps short-lived planning state visible across
 conversations and worktrees.
@@ -134,7 +144,8 @@ the conversation instead.
 - Before rebasing, resetting, or otherwise synchronizing a task branch with
   advancing `master`, require its worktree to be clean, including staged and
   untracked changes. Prefer a checkpoint commit on the task branch. Never use
-  reset to discard task work.
+  reset to discard task work. Fetch first and synchronize with `origin/master`,
+  not local `master`.
 - If a safety stash is genuinely necessary to make the worktree clean, give it
   a task-specific name and include untracked files. Restore it after the
   synchronization, verify the resulting worktree, and drop it after the
@@ -145,16 +156,15 @@ the conversation instead.
   review-ready and merge-ready as separate states.
 - Run `scripts/branch-status.sh` from the task worktree before opening a pull
   request, before asking for review, and before merging, and include its output
-  in the report. It prints the branch SHA and cleanliness, the pull request's
-  GitHub head and check results, and the latest post-merge `ci`,
-  `rsync-compat`, and `macos` runs on `master`. Pull requests do not start
-  automated test workflows and branch protection does not require test status
-  contexts. Any pull-request check results are informational. A red `master`
-  run makes the script exit 1; report it to the user even when the current task
-  did not cause it. `--check` also runs the Rust baseline below, and `--json`
-  prints the same facts for scripting. The report also lists failures among
-  the last ten post-merge runs per workflow. These may already be fixed;
-  compare the checks that ran before interpreting a later success as recovery.
+  in the report. It fetches `origin/master` and prints the branch SHA,
+  cleanliness, and position relative to it, the pull request's GitHub head and
+  check results, and the latest post-merge `ci`, `rsync-compat`, and `macos`
+  runs on `master`. Pull requests do not start automated test workflows and
+  branch protection does not require test status contexts. Any pull-request
+  check results are informational. A red `master` run makes the script exit 1;
+  report it to the user even when the current task did not cause it. `--check`
+  also runs the Rust baseline below, and `--json` prints the same facts for
+  scripting.
 - Before removing a worktree or branch, require a clean worktree, no retained
   task-related stash, and no commits that still need integration. An ancestry
   result such as `git branch --merged` says nothing about uncommitted files.

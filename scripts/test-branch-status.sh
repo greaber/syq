@@ -19,15 +19,12 @@ case "$1:$2" in
   run:list)
     shift 2
     workflow=
-    limit=
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --workflow) workflow=$2; shift 2 ;;
-        --limit) limit=$2; shift 2 ;;
         *) shift ;;
       esac
     done
-    test "$limit" = 10 || exit 2
     cat "$SYQ_TEST_RUNS_DIR/$workflow.json"
     ;;
   pr:list)
@@ -58,6 +55,11 @@ head_sha=$(git -C "$repo" rev-parse HEAD)
 short_sha=$(git -C "$repo" rev-parse --short HEAD)
 previous_sha=$(git -C "$repo" rev-parse HEAD^)
 master_sha=$(git -C "$repo" rev-parse master)
+# The script fetches master from origin; a local bare repository stands in.
+origin="$work/origin.git"
+git init -q --bare -b master "$origin"
+git -C "$repo" push -q "$origin" master
+git -C "$repo" remote add origin "$origin"
 
 set_run() {
   local workflow=$1 status=$2 conclusion=$3
@@ -183,28 +185,21 @@ expect_output 'macos.yml        in_progress'
 expect_no_output WARNING
 set_run macos.yml completed success
 
-# A later success does not erase an earlier failure, or turn it into a gate.
-set_run ci.yml completed success
-jq --arg sha "$previous_sha" '. + [.[0] | .headSha = $sha |
-  .databaseId = 2 | .conclusion = "failure" | .url = "https://example.invalid/earlier-failure"]' \
-  "$runs_dir/ci.yml.json" > "$work/history.json"
-mv "$work/history.json" "$runs_dir/ci.yml.json"
-expect_exit 0 run_status
-expect_output 'success covers only selected checks'
-expect_output "Recent failure: failure ${previous_sha:0:7}  https://example.invalid/earlier-failure"
-expect_output 'they may already be fixed'
-expect_no_output WARNING
-expect_exit 0 run_status --json
-jq -e --arg sha "$previous_sha" '.master_ci[0].state == "success" and
-  .master_ci[0].recent_failures[0].headSha == $sha and .warnings == []' "$work/out" >/dev/null
-set_run ci.yml completed success
-
-# Prefer the fetched master over a stale coordination branch.
-git -C "$repo" update-ref refs/remotes/origin/master "$previous_sha"
+# Master comes from a fresh fetch, not a stale local branch or tracking ref.
+git -C "$repo" push -q origin "$previous_sha:refs/heads/master"
+git -C "$repo" update-ref refs/remotes/origin/master "$master_sha"
 expect_exit 0 run_status --json
 jq -e --arg sha "$previous_sha" '.worktree.master_ref == "refs/remotes/origin/master" and
   .worktree.master == $sha and .worktree.ahead_of_master == 1' "$work/out" >/dev/null
-git -C "$repo" update-ref -d refs/remotes/origin/master
+test "$(git -C "$repo" rev-parse master)" = "$master_sha"
+git -C "$repo" push -q -f origin "$master_sha:refs/heads/master"
+
+# Without current master, ahead/behind counts would mislead; fail instead.
+git -C "$repo" remote set-url origin "$work/missing.git"
+expect_exit 2 run_status
+expect_output 'could not fetch master from origin'
+expect_no_output 'Master:'
+git -C "$repo" remote set-url origin "$origin"
 
 # A dirty worktree is stated but does not fail the report.
 touch "$repo/scratch"
