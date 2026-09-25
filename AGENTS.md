@@ -506,7 +506,7 @@ when that uncertainty matters, not merely because runtime code changed.
 Select the integration tests that can plausibly exercise the changed behavior.
 Prefer exact or narrow filters in the `local` target (`tests/local.rs`
 holds the shared helpers and `tests/local/<topic>.rs` the tests, named
-`<topic>::<test>`); those tests invoke the built binary against temporary trees. Run `cargo test --all-targets` before
+`<topic>::<test>`); those tests invoke the built binary against temporary trees. Run `cargo test --locked --all-targets` before
 handoff when a change is broad, crosses subsystem boundaries, changes shared
 test infrastructure, or leaves meaningful uncertainty about the affected
 surface. Do not run unrelated suites merely because they exist.

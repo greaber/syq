@@ -8,8 +8,9 @@
 #
 # Exit status: 0 when nothing needs attention; 1 when master's latest
 # post-merge run failed, the GitHub head is stale or unrelated, or a --check
-# step failed; 2 on usage or tooling errors. Pull-request checks are reported
-# for context but do not gate handoff or merging.
+# step failed or changed worktree status; 2 on usage/tooling errors or HEAD
+# moving during checks (stderr diagnostic, no report, even with --json).
+# Pull-request checks are reported but do not gate handoff or merging.
 set -euo pipefail
 
 repository=greaber/syq
