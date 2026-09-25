@@ -100,6 +100,25 @@ allocation groups. Check the proposed group and journal sizes:
 excessively small groups constrain allocation sizes, and the internal journal
 must fit within one group. See [XFS format options](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html).
 
+To investigate an existing workload, use a kernel-capable `perf` installation
+on the destination host. Find the syq process doing the destination writes,
+then replace `COPY_PID` with its process ID:
+
+```sh
+pgrep -a -x syq
+sudo perf top -g -p COPY_PID
+```
+
+Inspect call stacks while the copy is active; press `q` to stop profiling.
+CPU time spent spinning on locks in XFS allocation-group paths is a reason to
+test more groups. Allocation functions being busy, or generic spinlock samples
+without their callers, do not by themselves establish contention on those
+locks. CPU sampling also misses time threads spend asleep waiting for locks
+or I/O. A low group count alone is not a diagnosis: confirm the effect with
+the same workload and worker count on a disposable filesystem with more groups,
+keeping the device, journal size, occupancy, and flush policy comparable.
+See [perf top](https://man7.org/linux/man-pages/man1/perf-top.1.html).
+
 ### Keep free space available for allocation
 
 As an XFS filesystem fills and its free space becomes fragmented, new writes
