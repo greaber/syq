@@ -66,20 +66,6 @@ can force extra logins.
 Validate changes with `sshd -t`, then reload SSH using your system's procedure.
 Keep an administrative session open. See [OpenSSH's settings](https://man.openbsd.org/sshd_config#MaxStartups).
 
-## Check local storage placement
-
-On Linux, inspect the source and destination filesystems:
-
-```sh
-findmnt -T /path/to/source -o TARGET,SOURCE,FSTYPE,OPTIONS
-findmnt -T /path/to/destination-parent -o TARGET,SOURCE,FSTYPE,OPTIONS
-```
-
-Use an existing destination parent and run remote-path checks on the machine
-that owns the path. Copies within a filesystem supporting cloning can share
-storage while remaining independently writable. See [local copies and NFS](speed.md#local-copies-and-nfs)
-for filesystem and mount considerations.
-
 ## Tune XFS storage
 
 ### Compare allocation-group counts
