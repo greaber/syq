@@ -6,9 +6,9 @@ before a tag can publish anything. The workflow uses a draft until every file
 is uploaded and checked, then publishes it once. Enable GitHub's immutable
 releases setting so published assets and tags cannot be changed afterward.
 
-The Python SDK shares the version of the syq release it pins. JavaScript and Go
-SDKs have independent versions, and every SDK has its own tag convention. Their
-registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.md).
+The Python SDK shares the version of the syq release it pins and uses
+`sdk-python-v*` tags. Its registry setup and release procedure live in
+[`sdk/RELEASING.md`](sdk/RELEASING.md).
 
 ## One-time repository setup
 

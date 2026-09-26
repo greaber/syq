@@ -177,7 +177,7 @@ class PythonTests(Tests):
     def test_publication_requires_verification_and_either_build_path(self):
         root = Path(__file__).resolve().parent.parent
         workflow = (root / ".github/workflows/publish-sdks.yml").read_text()
-        publish = workflow.split("  publish-python:\n", 1)[1].split("  build-js:", 1)[0]
+        publish = workflow.split("  publish-python:\n", 1)[1]
         for condition in ("needs.verify-tag.result == 'success'",
                           "needs.candidate-python.result == 'success'",
                           "needs.build-python.result == 'success'",

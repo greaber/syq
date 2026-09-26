@@ -1,19 +1,11 @@
-# Releasing the language SDKs
+# Releasing the Python SDK
 
-The Python SDK shares the version of the exact syq release it pins. JavaScript
-and Go SDKs use independent versions, and every SDK uses its own tag convention.
-Published versions are immutable: never move or delete their release tags or
-attempt to replace an uploaded package. A Python or JavaScript tag whose
+The Python SDK shares the version of the exact syq release it pins and uses
+`sdk-python-v*` tags. Published versions are immutable: never move or delete
+their release tags or attempt to replace an uploaded package. A tag whose
 publication is abandoned before any permanent release or registry state exists
 remains provisional; audit all destinations, clean any recoverable draft, and
 delete that tag rather than burning an unpublished SDK version.
-
-A Go module tag such as `sdk/go/v*` is permanent as soon as it is pushed. The
-tag itself publishes the version: a client or arbitrary module proxy may fetch
-and cache it before the documented `proxy.golang.org` request. That publication
-cannot be fully audited, and deleting or recreating the tag can leave clients
-with conflicting authenticated content. Never delete, recreate, or move a Go
-module tag.
 
 ## One-time setup
 
@@ -32,48 +24,10 @@ existing PyPI account, create a pending GitHub trusted publisher with:
 The pending publisher is the remaining account-side setup. It does not reserve
 the name; the first successful workflow run creates the project.
 
-### npm
-
-In the existing npm account, create the free organization `syq` for unlimited
-public packages. Require two-factor authentication for the organization and
-add a second trusted maintainer when one is available.
-
-npm cannot configure a trusted publisher until the package exists. The first
-release therefore requires `npm login` and one local publish from a clean,
-reviewed `master` checkout:
-
-```sh
-cd sdk/js
-npm ci
-npm test
-npm pack --dry-run
-npm publish --access public
-```
-
-After `@syq/sdk` exists, configure its GitHub Actions trusted publisher with:
-
-- organization or user: `greaber`
-- repository: `syq`
-- workflow: `publish-sdks.yml`
-- environment: `npm`
-- allowed action: `npm publish`
-
-Create a protected GitHub environment named `npm`, require approval, and
-restrict it to `sdk-js-v*` release tags. Future releases use OIDC and need no
-long-lived npm token in GitHub.
-
-### Go
-
-Go has no publisher account or central name reservation. The module path in
-`go/go.mod` and an immutable Git tag identify the module. Publishing the first
-tag commits the project to `github.com/greaber/syq/sdk/go`; changing to a
-future vanity domain would create a different Go module.
-
 The repository's release-tag ruleset restricts creation, update, deletion, and
-non-fast-forward changes for `sdk-python-v*`, `sdk-js-v*`, and `sdk/go/v*` tags
-to the release maintainer, alongside the existing `v*` protection. Like binary
-releases, every SDK release uses a signed annotated tag whose signature GitHub
-recognizes.
+non-fast-forward changes for `sdk-python-v*` tags to the release maintainer,
+alongside the existing `v*` protection. Like binary releases, every SDK release
+uses a signed annotated tag whose signature GitHub recognizes.
 
 ## Release checks
 
@@ -117,16 +71,7 @@ git push origin "sdk-python-v$version"
 Do not upload the package locally. The protected workflow publishes the
 already-tested distributions through PyPI trusted publishing with OIDC.
 
-JavaScript `0.0.1` is the package that requires the manual bootstrap publish.
-After those exact bytes are verified and its trusted publisher is configured,
-subsequent JavaScript tags use the version in `js/package.json` normally:
-
-```sh
-git tag -s sdk-js-v0.0.1 -m 'JavaScript SDK 0.0.1'
-git push origin sdk-js-v0.0.1
-```
-
-Those tags run `.github/workflows/publish-sdks.yml`, which verifies that the
+Python tags run `.github/workflows/publish-sdks.yml`, which verifies that the
 signed tag targets a `master` commit whose `sdks` check passed, then verifies
 the version, tests, package contents, bundled execution, and executable identity
 before entering the protected publishing environment.
@@ -202,20 +147,3 @@ metadata. CI compares two separate builds byte for byte. This makes a full
 workflow rerun safe even when the first run partly reached PyPI and its
 short-lived GitHub artifact has expired: rebuilding the same tag produces the
 same immutable files.
-
-Because the Go module lives below the repository root, its tag must include
-the module directory:
-
-```sh
-cd sdk/go
-go mod tidy
-go test ./...
-cd ../..
-git tag -s sdk/go/v0.0.1 -m 'Go SDK 0.0.1'
-git push origin sdk/go/v0.0.1
-GOPROXY=https://proxy.golang.org go list -m \
-  github.com/greaber/syq/sdk/go@v0.0.1
-```
-
-The final command asks the public Go proxy to fetch the tagged module. It then
-becomes discoverable through `pkg.go.dev`; no separate upload is performed.

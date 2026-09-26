@@ -40,8 +40,6 @@ jobs:
       sdks: ${{ steps.changes.outputs.sdks }}
       sdk_matrix: ${{ steps.changes.outputs.sdk_matrix }}
       python_sdk: ${{ steps.changes.outputs.python_sdk }}
-      javascript_sdk: ${{ steps.changes.outputs.javascript_sdk }}
-      go_sdk: ${{ steps.changes.outputs.go_sdk }}
       tooling: ${{ steps.changes.outputs.tooling }}
       tooling_checks: ${{ steps.changes.outputs.tooling_checks }}
       shellcheck: ${{ steps.changes.outputs.shellcheck }}
@@ -264,7 +262,7 @@ jobs:
         sdk: ${{ fromJSON(needs.scope.outputs.sdk_matrix || '["none"]') }}
     # Cancel only matching automatic checks; manual runs keep a unique group.
     concurrency:
-      group: ${{ github.workflow }}-sdks-${{ matrix.sdk }}-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.python_sdk }}-${{ needs.scope.outputs.javascript_sdk }}-${{ needs.scope.outputs.go_sdk }}
+      group: ${{ github.workflow }}-sdks-${{ matrix.sdk }}-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.python_sdk }}
       cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
@@ -291,8 +289,7 @@ jobs:
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
         run: >-
-          scripts/setup.sh github
-          ${{ matrix.sdk == 'python' && 'uv python jq' || matrix.sdk == 'javascript' && 'node' || 'go' }}
+          scripts/setup.sh github uv python jq
       - name: Cache Cargo dependencies and build output
         if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -365,20 +362,6 @@ jobs:
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
-      - name: Test and package JavaScript SDK
-        if: matrix.sdk == 'javascript' && needs.scope.outputs.javascript_sdk == 'true'
-        working-directory: sdk/js
-        run: |
-          npm ci --ignore-scripts
-          npm test
-          npm pack --dry-run
-      - name: Format, vet, and test Go SDK
-        if: matrix.sdk == 'go' && needs.scope.outputs.go_sdk == 'true'
-        working-directory: sdk/go
-        run: |
-          test -z "$(gofmt -l .)"
-          go vet ./...
-          go test ./...
 
   # Keep the public check name consumed by generated-SDK validation and release
   # preflight. A successful subset cannot hide a failed/cancelled matrix job.
@@ -507,8 +490,6 @@ jobs:
       needs.scope.outputs.full_suite == 'true' &&
       needs.scope.outputs.native == 'true' &&
       needs.scope.outputs.python_sdk == 'true' &&
-      needs.scope.outputs.javascript_sdk == 'true' &&
-      needs.scope.outputs.go_sdk == 'true' &&
       needs.scope.outputs.linux_arm64 == 'true' &&
       needs.scope.outputs.macos == 'true'
     runs-on: ubuntu-latest

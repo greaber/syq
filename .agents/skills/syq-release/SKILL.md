@@ -23,7 +23,7 @@ release and ends on completion or cancellation.
 
 Default destinations are the syq GitHub release, crates.io, Homebrew, and the
 matching Python SDK on PyPI. Python preparation and publication are required
-phases of the same release; JavaScript and Go SDK releases remain separate.
+phases of the same release.
 Preserve protections and secret boundaries. Report concrete credential,
 required-review, or product-decision blockers; do not bypass them.
 
@@ -105,8 +105,7 @@ incomplete: rerun the idempotent workflow from the same permanent SDK tag and
 verify the registry rather than moving the tag or requiring a new release.
 Exercise the documented installation paths in disposable locations. A partial
 publication is incomplete, including a missing matching PyPI version. Apply the
-provisional/permanent tag rules in `AGENTS.md`; never move a permanent tag,
-including any pushed Go module tag.
+provisional/permanent tag rules in `AGENTS.md`; never move a permanent tag.
 
 When the release host does not have Homebrew, verify the Homebrew install path
 in a disposable Docker container instead of asking the user to install Homebrew

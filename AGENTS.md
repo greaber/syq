@@ -236,22 +236,18 @@ report actual access or decision blockers instead of bypassing them.
   release workflow starts. Use `scripts/release-status.sh v<version>` after
   the push to correlate the exact tag, workflow, approvals, and publication
   destinations.
-- Except for Go module tags, treat a release tag as provisional until its
-  release workflow connects it to permanent published state. If an attempt is
+- Treat a release tag as provisional until its release workflow connects it
+  to permanent published state. If an attempt is
   abandoned before that boundary, remove the failed tag locally and remotely
   instead of reserving a version that was never released. Never force-update or
   silently move the tag.
-- A Go module tag such as `sdk/go/v*` is permanent as soon as it is pushed.
-  Pushing the tag publishes the module: clients or arbitrary proxies may fetch
-  and cache it without an observable central publication step. Never delete,
-  recreate, or move a Go module tag.
 - A release tag becomes permanent as soon as any associated version or artifact
   reaches an immutable or append-only destination, including an immutable
   GitHub release, a package registry, a module proxy, the Homebrew tap, or a
   durable artifact attestation. Never move or delete a permanent tag. Repair or
   rerun the remaining publication steps from that exact tag when safe, or cut a
   new version when they cannot be completed consistently.
-- Before deleting a provisional non-Go tag, stop or wait for its active
+- Before deleting a provisional tag, stop or wait for its active
   workflows and audit every release destination with read-only checks. Resolve
   the exact tag object and target commit; verify that no permanent publication
   exists; and inspect and clean any recoverable draft state. Delete only the
@@ -473,7 +469,7 @@ and variability, and lengthen or repeat the test as needed to support the claim.
 
 `scripts/setup.sh` is that setup. Run it without arguments to install the
 Rust toolchain from `rust-toolchain.toml` and the tools pinned in
-`scripts/setup.lock` (ShellCheck, jq, mdBook, uv, Python, Node.js, and Go)
+`scripts/setup.lock` (ShellCheck, jq, mdBook, uv, Python, and Node.js)
 into a cache shared by all worktrees, then run
 `eval "$(scripts/setup.sh env)"` in the shell that runs the check. CI uses
 the same script.

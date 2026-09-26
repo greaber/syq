@@ -14,8 +14,6 @@ run_everything() {
     'native=true' \
     'sdks=true' \
     'python_sdk=true' \
-    'javascript_sdk=true' \
-    'go_sdk=true' \
     'tooling=true' \
     "tooling_checks=$all_tooling" \
     'shellcheck=true' \
@@ -24,7 +22,7 @@ run_everything() {
     'macos=true' \
     'linux_arm64=true' \
     'full_suite=true' \
-    'sdk_matrix=["python","javascript","go"]'
+    'sdk_matrix=["python"]'
 }
 
 if [ -n "${SYQ_TEST_CHANGED_PATHS_FILE:-}" ]; then
@@ -110,8 +108,6 @@ fi
 native=false
 sdks=false
 python_sdk=false
-javascript_sdk=false
-go_sdk=false
 tooling=false
 shellcheck=false
 mapping_docs=false
@@ -142,7 +138,7 @@ while IFS= read -r path; do
     tests/support/*|tests/fixtures/*) integration_targets+=" all" ;;
   esac
   case "$path" in
-    sdk/README.md|sdk/RELEASING.md|sdk/python/README-PYTHON.md|sdk/python/NATIVE_API.md|sdk/python/API_DESIGN.md|sdk/js/README.md|sdk/go/README.md)
+    sdk/README.md|sdk/RELEASING.md|sdk/python/README-PYTHON.md|sdk/python/NATIVE_API.md|sdk/python/API_DESIGN.md)
       # These are prose, not executable SDK test inputs. Keep the exception
       # explicit: native-api.json is compiled into Rust, and files elsewhere
       # in an SDK (including future Markdown fixtures) still select its tests.
@@ -159,17 +155,9 @@ while IFS= read -r path; do
     sdk/python/*)
       python_sdk=true
       ;;
-    sdk/js/*)
-      javascript_sdk=true
-      ;;
-    sdk/go/*)
-      go_sdk=true
-      ;;
     sdk/*)
-      # Files shared by the language SDKs can affect all of them.
+      # Files shared across sdk/ can affect the Python SDK.
       python_sdk=true
-      javascript_sdk=true
-      go_sdk=true
       ;;
     MAPPINGS.md|docs/mappings.md|docs/automation.md|docs/commands/map.md)
       # The documented jq programs are executable integration-test inputs.
@@ -209,8 +197,6 @@ while IFS= read -r path; do
       # Pinned tools run the Rust, SDK, conformance, and tooling tests.
       native=true
       python_sdk=true
-      javascript_sdk=true
-      go_sdk=true
       path_tooling=true
       shellcheck=true
       mapping_docs=true
@@ -225,8 +211,6 @@ while IFS= read -r path; do
       # Unknown inputs fail safe until their dependency boundary is explicit.
       native=true
       python_sdk=true
-      javascript_sdk=true
-      go_sdk=true
       path_tooling=true
       shellcheck=true
       mapping_docs=true
@@ -286,8 +270,6 @@ done <<<"$changed_paths"
 if [ "$saw_path" = false ]; then
   native=true
   python_sdk=true
-  javascript_sdk=true
-  go_sdk=true
   tooling_checks=$all_tooling
   shellcheck=true
   mapping_docs=true
@@ -301,20 +283,22 @@ tooling_checks=$(printf '%s\n' ${selected_tooling[@]+"${selected_tooling[@]}"} |
 if [ -n "$tooling_checks" ]; then tooling=true; fi
 printf 'tooling_checks=%s\n' "$tooling_checks"
 
-if [ "$python_sdk" = true ] || [ "$javascript_sdk" = true ] || [ "$go_sdk" = true ]; then
+if [ "$python_sdk" = true ]; then
   sdks=true
 fi
 
-printf 'native=%s\nsdks=%s\npython_sdk=%s\njavascript_sdk=%s\ngo_sdk=%s\ntooling=%s\nshellcheck=%s\nmapping_docs=%s\nconformance=%s\nmacos=%s\nlinux_arm64=%s\nfull_suite=%s\n' \
-  "$native" "$sdks" "$python_sdk" "$javascript_sdk" "$go_sdk" \
+printf 'native=%s\nsdks=%s\npython_sdk=%s\ntooling=%s\nshellcheck=%s\nmapping_docs=%s\nconformance=%s\nmacos=%s\nlinux_arm64=%s\nfull_suite=%s\n' \
+  "$native" "$sdks" "$python_sdk" \
   "$tooling" "$shellcheck" "$mapping_docs" "$conformance" "$macos" \
   "$linux_arm64" "$full_suite"
 # Canonicalize selections so equivalent changes share a cancellation group.
 read -r -a selected_targets <<< "$integration_targets"
 integration_targets=$(printf '%s\n' "${selected_targets[@]}" | LC_ALL=C sort -u | paste -sd ' ' -)
 printf 'integration_targets=%s\n' "$integration_targets"
-echo "CI scope: native=$native sdks=$sdks python_sdk=$python_sdk javascript_sdk=$javascript_sdk go_sdk=$go_sdk tooling=$tooling shellcheck=$shellcheck mapping_docs=$mapping_docs conformance=$conformance macos=$macos linux_arm64=$linux_arm64 full_suite=$full_suite" >&2
+echo "CI scope: native=$native sdks=$sdks python_sdk=$python_sdk tooling=$tooling shellcheck=$shellcheck mapping_docs=$mapping_docs conformance=$conformance macos=$macos linux_arm64=$linux_arm64 full_suite=$full_suite" >&2
 
-jq -cn --argjson python "$python_sdk" --argjson javascript "$javascript_sdk" --argjson go "$go_sdk" \
-  '[$python, $javascript, $go] as $enabled | [range(3) | select($enabled[.]) | ["python", "javascript", "go"][.]] | if length == 0 then ["none"] else . end' | \
-  sed 's/^/sdk_matrix=/'
+if [ "$python_sdk" = true ]; then
+  echo 'sdk_matrix=["python"]'
+else
+  echo 'sdk_matrix=["none"]'
+fi
