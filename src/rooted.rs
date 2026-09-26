@@ -254,6 +254,13 @@ impl Root {
         self.identity
     }
 
+    /// Export the already-selected root for an executor's descriptor handoff.
+    pub(crate) fn duplicate_directory(&self) -> Result<File> {
+        self.directory
+            .try_clone()
+            .context("duplicate selected root for executor")
+    }
+
     /// Open the root or a descendant directory without following any
     /// descendant symlink.
     pub(crate) fn open_directory(&self, path: &RelativePath) -> Result<File> {

@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod apply;
+mod apply_pool;
+mod apply_queue;
 mod entry;
 mod limits;
 mod operator;
@@ -433,6 +435,7 @@ struct PreparedSmallCopy {
 }
 
 pub struct FsOps {
+    metadata_pool: apply_pool::Pool,
     prepared_small_copy: Option<PreparedSmallCopy>,
     inode_preservation: crate::inode_metadata::Selection,
     sparse: bool,
@@ -615,6 +618,7 @@ impl FsOps {
         let observations = Arc::new(crate::transfer_observations::Registry::default());
         let operation = observations.actor("filesystem");
         FsOps {
+            metadata_pool: Default::default(),
             inode_preservation: Default::default(),
             sparse: false,
             descriptor_copy: Default::default(),
@@ -742,7 +746,7 @@ impl FsOps {
         }
         let ticket = self.descriptor_session.register(selection.directory)?;
         let directory = self.descriptor_session.acquire(&ticket)?;
-        self.install_destination(directory, request_prefix)?;
+        self.install_destination(directory, request_prefix, Some(ticket.clone()))?;
 
         #[cfg(debug_assertions)]
         test_race_barrier(
@@ -891,7 +895,7 @@ impl FsOps {
             .collect();
         let ticket = self.descriptor_session.register(selection.directory)?;
         let directory = self.descriptor_session.acquire(&ticket)?;
-        self.install_destination(directory, &request.request_prefix)?;
+        self.install_destination(directory, &request.request_prefix, None)?;
 
         let needed = unchanged
             .iter()
@@ -1238,7 +1242,11 @@ impl FsOps {
 
     pub(crate) fn initialize_destination(&mut self, destination: &DestinationRoot) -> Result<()> {
         let directory = self.descriptor_session.acquire(&destination.ticket)?;
-        self.install_destination(directory, &destination.request_prefix)
+        self.install_destination(
+            directory,
+            &destination.request_prefix,
+            Some(destination.ticket.clone()),
+        )
     }
 
     /// Resolve a batch completely before registering any of it. Each result is
@@ -1704,12 +1712,18 @@ impl FsOps {
         bail!("source content request omitted its registered source reference")
     }
 
-    fn install_destination(&mut self, directory: File, request_prefix: &[u8]) -> Result<()> {
+    fn install_destination(
+        &mut self,
+        directory: File,
+        request_prefix: &[u8],
+        ticket: Option<DescriptorTicket>,
+    ) -> Result<()> {
         let root = Arc::new(Root::from_directory(directory)?);
         self.fds.clear();
         self.fd_order.clear();
         self.held_basis.take();
         self.destination_prefix = Some(request_prefix.to_vec());
+        self.metadata_pool = apply_pool::Pool::new(ticket);
         self.destination_root = Some(root);
         Ok(())
     }
@@ -2477,12 +2491,12 @@ impl FsOps {
         .collect()
     }
 
-    /// Ops within a batch are independent (the planner orders batches so that
-    /// parents come first), so they run in parallel too.
+    /// Placement-root preconditions precede dependent mutations. Within the
+    /// remaining batch, parent creation releases children and directory metadata
+    /// waits for descendants, while independent branches remain runnable.
     pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<WireError>> {
-        // SetMeta depends on the object existing, so create everything first,
-        // then apply metadata — otherwise a parallel SetMeta can beat its
-        // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
+        // Keep the placement-root failure boundary: a failed conditional create
+        // skips the rest of the batch before any descendant is changed.
         let is_meta = |op: &Op| matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. });
         let is_guarded_create = |op: &Op| match op {
             Op::Mkdir { condition, .. }
@@ -2516,23 +2530,18 @@ impl FsOps {
             }
             return out;
         }
-        let cres = parallel_map(&create_idx, |&i| {
-            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
-                .err()
-                .as_ref()
-                .map(wire_error)
-        });
-        for (i, r) in create_idx.iter().zip(cres) {
-            out[*i] = r;
-        }
-        let mres = parallel_map(&meta_idx, |&i| {
-            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
-                .err()
-                .as_ref()
-                .map(wire_error)
-        });
-        for (i, r) in meta_idx.iter().zip(mres) {
-            out[*i] = r;
+        let selected: Vec<_> = create_idx.into_iter().chain(meta_idx).collect();
+        let batch = Arc::new(apply_pool::Batch::new(
+            ops,
+            &selected,
+            guard,
+            destination_prefix,
+        ));
+        let results =
+            self.metadata_pool
+                .run(batch, destination_root.as_ref(), &self.descriptor_session);
+        for i in selected {
+            out[i] = results[i].clone();
         }
         out
     }

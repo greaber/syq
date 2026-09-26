@@ -61,6 +61,79 @@ pub(crate) fn proc_fd_path(file: &impl AsRawFd) -> String {
     format!("{PROC_FD_DIRECTORY}/{}", file.as_raw_fd())
 }
 
+/// Give a fresh filesystem thread its own descriptor table on Linux. Restricted
+/// containers and other platforms keep the shared table; ownership and explicit
+/// descriptor handoff remain the same in either case.
+///
+/// # Safety
+/// Call only at the start of a thread with no descriptor-owning captures or
+/// thread-local state. After success it may not use descriptors owned by another
+/// thread, including process-global signal-handler descriptors. Blocked signals
+/// stay blocked for this thread's lifetime. Descriptors 0..=2 are retained for
+/// the process's standard input/output and diagnostics.
+pub(crate) unsafe fn isolate_descriptor_table() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut all = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        unsafe {
+            libc::sigfillset(all.as_mut_ptr());
+        }
+        let error =
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, all.as_ptr(), previous.as_mut_ptr()) };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        if unsafe { libc::unshare(libc::CLONE_FILES) } != 0 {
+            let error = io::Error::last_os_error();
+            let restored = unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, previous.as_ptr(), std::ptr::null_mut())
+            };
+            if restored != 0 {
+                return Err(io::Error::from_raw_os_error(restored));
+            }
+            return match error.raw_os_error() {
+                Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EINVAL) => Ok(()),
+                _ => Err(error),
+            };
+        }
+        // Closing inherited sockets is essential: a dormant copy in this table
+        // must not keep an unrelated connection alive. The table is private now.
+        if unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32) } != 0 {
+            let error = io::Error::last_os_error();
+            if !matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS | libc::EPERM | libc::EACCES)
+            ) {
+                return Err(error);
+            }
+            // Old kernels or a restricted close_range syscall. Enumerate first,
+            // drop the iterator, then close; no other thread can recycle these
+            // numbers in this table and this thread opens nothing in between.
+            let descriptors: Vec<RawFd> = std::fs::read_dir(PROC_FD_DIRECTORY)?
+                .map(|entry| {
+                    entry.map(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .and_then(|name| name.parse().ok())
+                    })
+                })
+                .collect::<io::Result<Vec<Option<RawFd>>>>()?
+                .into_iter()
+                .flatten()
+                .filter(|fd| *fd >= 3)
+                .collect();
+            for descriptor in descriptors {
+                unsafe {
+                    libc::close(descriptor);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run a call that reports success as zero, retrying while it is interrupted.
 pub(crate) fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {
     loop {
