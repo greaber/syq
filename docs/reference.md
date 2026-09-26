@@ -260,8 +260,10 @@ restarts. Partial-file resume is independent of
 [`block-reuse`](tuning.md#compare-block-reuse-with-full-replacement), which controls
 comparison against an existing final destination. Unless `--inplace` is selected,
 syq assembles each updated file beside the destination and replaces it when
-complete. With `--inplace`, interrupted bytes are in the final file itself;
-reusing them follows the block-reuse policy.
+complete. With `--inplace`, interrupted bytes are in the final file itself.
+`--resume` cannot distinguish those bytes from a different pre-existing file;
+finishing that update requires `--if-exists=update`. Reusing matching parts
+follows the block-reuse policy.
 
 A copy may temporarily make a newly created directory writable while filling it.
 After interruption, syq cannot distinguish that directory from a pre-existing

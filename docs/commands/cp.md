@@ -175,8 +175,10 @@ size/time or hashes are used for comparison. See
 files inside it. `--if-exists=keep` can add children to an existing directory, but
 does not change that directory's permissions to make it writable.
 
-`--if-exists=keep` cannot combine with `--inplace`: an interrupted write could leave
-a file that a retry skips. Restricted receivers also reject `--as-new --inplace`,
+`--if-exists=keep` and `update-if-older` cannot combine with `--inplace`: an
+interrupted write could leave a file that a retry skips. With the default policy,
+a retry can instead reject that incomplete file as different; use
+`--if-exists=update` to finish it. Restricted receivers also reject `--as-new --inplace`,
 because direct writes do not enforce that destination condition. S3 and named
 receiving destinations do not support `--inplace`; see
 [Copy limits](../persistence-reference.md#copy-limits).

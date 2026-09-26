@@ -966,7 +966,21 @@ impl Engine {
             source.key
         );
         if same_contents {
-            if let Some(old) = existing.as_ref().and_then(|o| o.metadata.as_ref()) {
+            if let Some(object) = &existing {
+                let old = object.metadata.clone().unwrap_or(Metadata {
+                    kind: object.kind(),
+                    mode: if object.kind() == ObjectKind::Dir {
+                        0o777
+                    } else {
+                        0o666
+                    },
+                    uid: unsafe { libc::geteuid() },
+                    gid: unsafe { libc::getegid() },
+                    mtime: object.mtime,
+                    nsec: 0,
+                    hash: None,
+                    hash_algorithm: HashAlgorithm::Blake3,
+                });
                 metadata.hash = old.hash.clone();
                 metadata.hash_algorithm = old.hash_algorithm;
                 let flags = self.args.matching_meta_flags()

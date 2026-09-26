@@ -3,12 +3,13 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 pub(super) fn serve(
     socket: &mut TcpStream,
+    fault: &str,
     method: &str,
     target: &str,
     headers: &std::collections::HashMap<String, String>,
     gate: &(AtomicBool, AtomicBool),
 ) {
-    let fields = vec![
+    let mut fields = vec![
         ("ETag".into(), "\"stored\"".into()),
         (
             "Last-Modified".into(),
@@ -31,6 +32,10 @@ pub(super) fn serve(
         ("x-amz-meta-syq-mtime".into(), "10".into()),
         ("x-amz-meta-syq-mtime-nsec".into(), "0".into()),
     ];
+    let foreign = fault == "existing-policy-foreign";
+    if foreign {
+        fields.retain(|(name, _): &(String, String)| !name.starts_with("x-amz-meta-syq-"));
+    }
     match method {
         "HEAD" => reply(socket, 200, &fields, b"stored", true),
         "GET" if target.contains("list-type=") => reply(
@@ -60,7 +65,11 @@ pub(super) fn serve(
             assert_eq!(headers["content-type"], "application/example");
             assert_eq!(headers["cache-control"], "max-age=60");
             assert_eq!(headers["x-amz-meta-other"], "keep");
-            assert_eq!(headers["x-amz-meta-syq-mode"], "416");
+            assert_eq!(
+                headers["x-amz-meta-syq-mode"],
+                if foreign { "438" } else { "416" }
+            );
+            assert!(!headers.contains_key("x-amz-meta-syq-blake3"));
             assert_eq!(headers["x-amz-meta-syq-mtime"], "20");
             gate.1.store(true, Ordering::Relaxed);
             reply(
@@ -248,4 +257,26 @@ fn expected_upload_hash_does_not_allow_a_metadata_only_update_of_wrong_contents(
         );
         assert_eq!(server.gate.1.load(Ordering::Relaxed), policy == "update");
     }
+}
+
+#[test]
+fn metadata_only_upload_to_foreign_object_keeps_unselected_defaults() {
+    let temp = test_support::tempdir().unwrap();
+    let server = Server::start("existing-policy-foreign");
+    // The source is private (0600); copying only mtime must not also copy mode
+    // or attach a hash computed solely to compare the existing contents.
+    file(&temp.path().join("source"), b"stored", 20);
+    let output = server.cp(
+        temp.path(),
+        &[
+            "source",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "object",
+            "--copy-metadata=mtime",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.1.load(Ordering::Relaxed));
 }

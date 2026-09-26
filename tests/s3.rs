@@ -208,9 +208,10 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
-    if fault == "existing-policy" {
+    if fault.starts_with("existing-policy") {
         existing_policy::serve(
             &mut socket,
+            fault,
             method,
             first.split_whitespace().nth(1).unwrap(),
             &headers,
