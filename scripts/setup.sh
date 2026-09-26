@@ -106,32 +106,45 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
-install_tool() {
+# Set destination to the tool's installation directory. uv chooses which
+# build of a uv-installed tool to download, so its directory also names the
+# pinned uv; a uv upgrade then installs afresh instead of reusing a build
+# that the new uv would not have chosen.
+install_destination() {
   read_entry "$1"
-  if [ -d "$tools_dir/$1/$version" ]; then
+  destination=$tools_dir/$1/$version
+  if [ "$url" = uv ]; then
+    read_entry uv
+    uv_command=$tools_dir/uv/$version/$bin/uv
+    destination=$destination-uv$version
+    read_entry "$1"
+  fi
+}
+
+installed() {
+  [ -x "$destination/$bin/$(executable "$1")" ]
+}
+
+install_tool() {
+  install_destination "$1"
+  if installed "$1"; then
     return
   fi
   if [ "$url" = uv ]; then
     install_tool uv
-    read_entry uv
-    uv_command=$tools_dir/uv/$version/$bin/uv
-    read_entry "$1"
-  fi
-  destination=$tools_dir/$1/$version
-  echo "setup: installing $1 $version" >&2
-  mkdir -p "$tools_dir/$1"
-  # Unpack beside the destination and rename it into place, so other
-  # checkouts never see a partial installation.
-  staging=$(mktemp -d "$tools_dir/$1/.$version.XXXXXX")
-  chmod 755 "$staging"
-  if [ "$url" = uv ]; then
+    install_destination "$1"
+    echo "setup: installing $1 $version with uv" >&2
+    # uv installs each interpreter atomically under a lock and records its
+    # final location in the interpreter's build settings, so install in place.
     "$uv_command" --no-config python install --no-bin \
-      --install-dir "$staging" "$version" >&2
-    # uv also links the minor version to the staging path; nothing uses it.
-    for link in "$staging"/*; do
-      if [ -L "$link" ]; then rm "$link"; fi
-    done
+      --install-dir "$destination" "$version" >&2
   else
+    echo "setup: installing $1 $version" >&2
+    mkdir -p "$tools_dir/$1"
+    # Unpack beside the destination and rename it into place, so other
+    # checkouts never see a partial installation.
+    staging=$(mktemp -d "$tools_dir/$1/.$version.XXXXXX")
+    chmod 755 "$staging"
     download=$staging.download
     fetch "$url" "$sha256" "$download"
     case "$url" in
@@ -143,23 +156,24 @@ install_tool() {
         ;;
     esac
     rm -f "$download"
+    [ -x "$staging/$bin/$(executable "$1")" ] ||
+      die "$1 $version did not provide $bin/$(executable "$1")"
+    # If another process installed the same version first, mv places this copy
+    # inside the complete directory; remove it from there.
+    mv "$staging" "$destination"
+    rm -rf "${destination:?}/${staging##*/}"
+    staging=
   fi
-  [ -x "$staging/$bin/$(executable "$1")" ] ||
-    die "$1 $version did not provide $bin/$(executable "$1")"
-  # If another process installed the same version first, mv places this copy
-  # inside the complete directory; remove it from there.
-  mv "$staging" "$destination"
-  rm -rf "${destination:?}/${staging##*/}"
-  staging=
+  installed "$1" || die "$1 $version did not provide $bin/$(executable "$1")"
 }
 
 bin_directory() {
-  read_entry "$1"
-  [ -d "$tools_dir/$1/$version" ] ||
+  install_destination "$1"
+  installed "$1" ||
     die "$1 $version is not installed; run: scripts/setup.sh install $1"
   case "$bin" in
-    .) echo "$tools_dir/$1/$version" ;;
-    *) echo "$tools_dir/$1/$version/$bin" ;;
+    .) echo "$destination" ;;
+    *) echo "$destination/$bin" ;;
   esac
 }
 
