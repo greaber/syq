@@ -159,7 +159,7 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
             .env("SYQ_TEST_CLONE_ERROR", "EXDEV")
             .env("SYQ_DEBUG", "1")
-            .env("SYQ_TEST_COPY_LOCAL_SOURCE_NFS", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "unsupported")
             .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
             .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())

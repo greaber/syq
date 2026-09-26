@@ -776,10 +776,9 @@ impl FsOps {
     }
 
     /// Copy a whole same-machine file without routing its bytes through the
-    /// transport. Prefer copy_file_range; eligible local filesystems and the
-    /// measured asynchronous NFS destination case use a sequential userspace
-    /// writer when offload is unsupported. File workers still run in parallel;
-    /// other filesystem pairs retain the adaptive range path.
+    /// transport. Prefer copy_file_range; eligible local and NFS pairs use a
+    /// sequential userspace writer when offload is unsupported. File workers
+    /// still run in parallel; other pairs retain the adaptive range path.
     #[cfg(target_os = "linux")]
     pub(super) fn copy_local(
         &mut self,
@@ -917,18 +916,26 @@ impl FsOps {
             ..destination_fs
         };
         // The measured fast path is a local filesystem feeding an ordinary
-        // asynchronous NFS mount. NFS reads can benefit from parallelism, and
-        // a synchronous destination makes every write syscall wait for the
-        // server, so let the normal adaptive range path handle either case.
+        // asynchronous NFS mount. A synchronous destination makes every write
+        // syscall wait for the server, so retain the adaptive range path there.
         let use_sequential_nfs_fallback = allow_sequential_nfs_fallback
             && !source_fs.is_nfs
             && source_fs.measured_local_source
             && destination_fs.is_nfs
             && !destination_fs.synchronous;
-        // Local files keep parallelism across files without paying transport
-        // and per-range hashing costs. Explicit sparse mode also needs a buffered
-        // writer when cloning cannot preserve its allocation.
+        // For an NFS source feeding local storage, parallel file workers avoid
+        // comparing blocks and reading changed source bytes again for transport.
+        // Keep parallel ranges for a single file and for NFS destinations.
+        let use_sequential_nfs_read_fallback = allow_sequential_local_fallback
+            && source_fs.is_nfs
+            && destination_fs.local_userspace_copy
+            && !destination_fs.is_nfs
+            && !destination_fs.synchronous;
+        // Local files also keep parallelism across files without transport and
+        // per-range hashing costs. Explicit sparse mode needs a buffered writer
+        // when cloning cannot preserve its allocation.
         let use_userspace_fallback = self.sparse
+            || use_sequential_nfs_read_fallback
             || use_sequential_nfs_fallback
             || (allow_sequential_local_fallback
                 && source_fs.local_userspace_copy
