@@ -2649,7 +2649,7 @@ impl Planner<'_> {
                     self.implicit_restorations.push((
                         p.clone(),
                         existing.meta(),
-                        if opts.restricted_receiver {
+                        if opts.restricted_receiver && !opts.perms {
                             flags::RECEIVER_MODE
                         } else {
                             flags::MODE
