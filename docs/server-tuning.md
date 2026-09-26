@@ -66,136 +66,54 @@ can force extra logins.
 Validate changes with `sshd -t`, then reload SSH using your system's procedure.
 Keep an administrative session open. See [OpenSSH's settings](https://man.openbsd.org/sshd_config#MaxStartups).
 
-## Tune XFS storage
+<a id="check-local-storage-placement"></a>
 
-### Choose an allocation-group count
+## Check storage
 
-XFS divides storage into allocation groups, each with its own allocation
-metadata. More groups can let concurrent file creation and block allocation
-spread across independent locks. Inspect `agcount` and `agsize` with:
+Filesystem choice, mount settings, free space, and competing I/O can all affect
+copy speed. On Linux, inspect each path on the machine that owns it:
+
+```sh
+findmnt -T /srv/data -o TARGET,SOURCE,FSTYPE,OPTIONS
+```
+
+Compare settings with your actual workload on disposable data. Keep free space
+for growth and allocation; 20% is an example budget, not a universal performance
+threshold. For local copies and mounted NFS, see [local copies and NFS](speed.md#local-copies-and-nfs).
+
+### XFS example
+
+Some systems default to four XFS allocation groups, which can limit concurrent
+transfers on fast SSDs. Our tests found similar performance across a wide range
+of higher counts: 512 worked well, but was not uniquely good. Tradeoffs depend
+on filesystem size and workload, especially when nearly full. There is no need
+to reformat a filesystem that already performs well.
+
+Inspect the current geometry, or preview a new filesystem with 512 groups:
 
 ```sh
 xfs_info /srv/data
-```
-
-Some systems create XFS filesystems with only four allocation groups by
-default; the default depends on device size and storage geometry. Four groups
-can leave substantial performance on the table for concurrent transfers on
-fast SSD storage, so it is worth testing a higher count when creating a new
-filesystem.
-
-In our concurrent-copy tests, a wide range of higher counts performed
-similarly. For example, 512 worked well, but there was nothing special about
-that number. Differences were often marginal, and tradeoffs became more
-apparent in extreme conditions such as a nearly full filesystem.
-
-At a fixed filesystem size, more groups mean smaller groups and more per-group
-metadata. Large files may need more extents, and fragmented or nearly full
-filesystems can require more searching. Choose based on your filesystem size
-and workload; a different count alone is not a reason to reformat an existing
-filesystem that performs well.
-
-When comparing configurations, measure command-completion time. If you also
-measure the time to flush pending writes to storage, report it separately:
-faster flushing does not necessarily mean the copy command finishes sooner.
-
-Choose the count when creating the filesystem. For example, to preview a
-512-group layout on a device you intend to format, without writing it:
-
-```sh
 sudo mkfs.xfs -N -d agcount=512 /dev/your-empty-device
 ```
 
-`-N` only prints the proposed layout. Removing it creates a filesystem and can
-destroy existing data. The count cannot be changed through a mount option to subdivide existing
-allocation groups. Check the proposed group and journal sizes:
-excessively small groups constrain allocation sizes, and the internal journal
-must fit within one group. See [XFS format options](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html).
+`-N` previews without writing; removing it formats the device and can destroy
+data. More groups mean smaller groups and more metadata. See
+[XFS format options](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html)
+for group and journal size constraints.
 
-To investigate an existing workload, use a kernel-capable `perf` installation
-on the destination host. Find the syq process doing the destination writes,
-then replace `COPY_PID` with its process ID:
-
-```sh
-pgrep -a -x syq
-sudo perf top -g -p COPY_PID
-```
-
-Inspect call stacks while the copy is active; press `q` to stop profiling.
-CPU time spent spinning on locks in XFS allocation-group paths is a reason to
-test more groups. Allocation functions being busy, or generic spinlock samples
-without their callers, do not by themselves establish contention on those
-locks. CPU sampling also misses time threads spend asleep waiting for locks
-or I/O. A low group count alone is not a diagnosis: confirm the effect with
-the same workload and worker count on a disposable filesystem with more groups,
-keeping the device, journal size, occupancy, and flush policy comparable.
-See [perf top](https://man7.org/linux/man-pages/man1/perf-top.1.html).
-
-### Keep free space available for allocation
-
-As an XFS filesystem fills and its free space becomes fragmented, new writes
-can require more allocation work and smaller extents. Keeping headroom gives
-XFS more choices when placing data. An operating budget of 80% used and 20%
-free is one starting point to evaluate; degradation is gradual and depends on
-the workload and free-space layout, rather than starting at a universal 80%
-threshold.
-
-XFS's reserved-block pool can enforce headroom across the filesystem, including
-for ordinary writes by root. It withholds an amount of space through accounting,
-without allocating particular disk blocks. When ordinary available space runs
-out, allocations fail with `ENOSPC` even though the reserve remains physically
-free. The pool is normally a small emergency allowance for internal metadata
-operations; enlarging it is an option to evaluate for your workload, not an
-established general performance recommendation.
-
-Inspect the filesystem geometry and current reserve on the machine that owns
-the mount:
-
-```sh
-xfs_info /srv/data
-sudo xfs_io -x -r -c 'resblks' /srv/data
-```
-
-Record the original reserve before changing it. The `resblks` values are
-**filesystem blocks**, using `bsize` from the `data` line of `xfs_info`.
-`reserved blocks` is the target pool size; `available reserved blocks` is the
-amount currently held in it. The usual default with 4 KiB blocks is 8,192
-blocks, or 32 MiB.
-
-Set the desired total reserve, rather than an increment. For example,
-**100 GiB on a filesystem with 4 KiB blocks** is 26,214,400 blocks:
-
-```sh
-sudo xfs_io -x -r -c 'resblks 26214400' /srv/data
-sudo xfs_io -x -r -c 'resblks' /srv/data
-```
-
-The change is live: no remount or reformat is needed. Check the available
-reserve afterward; increasing the target cannot reclaim space occupied by
-existing files. The setting is not stored on disk. Reapply it after each mount,
-including after reboot, before starting workloads that depend on the limit.
-The reserve reduces the space reported as free by `df`, rather than reducing
-the reported filesystem size.
-
-A larger reserve also provides temporary recovery capacity. If ordinary writes
-run out of space, lower the target with the same command to release part of the
-available reserve immediately. Keep the original emergency allowance, then
-restore the larger target after deleting or moving enough data. Released
-headroom can be consumed again, so it buys time rather than solving continued
-growth.
-
-Compare command-completion time before adopting a larger reserve, and report
-any subsequent flush time separately. XFS
-reduces speculative preallocation near its available-space limit, and a larger
-reserve makes that behavior start at a lower physical occupancy. A reserve
-preserves allocation choices but does not guarantee unchanged throughput near
-the imposed limit. See the [reserved-block command](https://man7.org/linux/man-pages/man8/xfs_io.8.html),
-[reserve interface](https://man7.org/linux/man-pages/man2/ioctl_xfs_setresblks.2.html),
-and [XFS allocation policy](https://github.com/torvalds/linux/blob/v6.12/fs/xfs/xfs_iomap.c).
+XFS's [reserved-block pool](https://man7.org/linux/man-pages/man8/xfs_io.8.html)
+can withhold headroom even from ordinary root writes, which fail with `ENOSPC`
+when unreserved space runs out. Enlarging this metadata emergency pool is an
+option to test, not a general performance recommendation. Reserve sizes use
+filesystem blocks, reduce the free space shown by `df`, and must be reapplied
+after mounting. Record the original reserve before changing it; lowering an
+expanded reserve can temporarily release capacity without removing the original
+emergency allowance. See the [reserve interface](https://man7.org/linux/man-pages/man2/ioctl_xfs_setresblks.2.html).
 
 ## Measure and track improvements
 
 Use [syq-bench](https://greaber.github.io/syq-bench/reproduce.html) for repeatable
 comparisons. Record the commands, versions, mounts, cache state, and other load.
-Keep reporting and flush settings consistent across runs. See
+Keep reporting and flush settings consistent across runs. Measure copy-command
+completion and any subsequent flush separately. See
 [performance tuning](tuning.md) to compare worker counts and request sizes.
