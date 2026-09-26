@@ -73,7 +73,11 @@ fn unregister_signal_cleanup(path: &Path) {
 /// another location that cannot be used, such as a deleted job directory.
 pub(crate) fn private_temp_dir(prefix: &str) -> io::Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
-    builder.prefix(prefix);
+    // Request the mode at creation: tempfile otherwise uses 0777 minus the
+    // umask, which can let group members replace entries.
+    builder
+        .prefix(prefix)
+        .permissions(std::fs::Permissions::from_mode(0o700));
     builder.tempdir().or_else(|error| {
         if std::env::temp_dir() == Path::new("/tmp") {
             return Err(error);
@@ -143,6 +147,7 @@ impl PrivateBroker {
         let socket_dir = if in_current_dir {
             tempfile::Builder::new()
                 .prefix(config.directory_prefix)
+                .permissions(std::fs::Permissions::from_mode(0o700))
                 .tempdir_in(".")
         } else {
             private_temp_dir(config.directory_prefix)
@@ -406,6 +411,17 @@ impl Write for TrackedStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_temp_dir_is_created_owner_only() {
+        let directory = private_temp_dir("syq-test-").unwrap();
+        let mode = std::fs::metadata(directory.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
 
     #[test]
     fn broker_uses_private_modes_and_removes_its_directory() {
