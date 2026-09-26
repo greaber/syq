@@ -30,7 +30,7 @@ def check():
         (destination / 'nested/keep').write_bytes(b'x')
         checks.run(['--from', remote, '--srcs-in', prefix, '--into', destination,
                     '--where', "src.path = 'nested/keep' and src.size > 1B",
-                    '--copy-if', 'not dst.exists or src.size > dst.size'])
+                    '--copy-if', 'not dst.exists or src.size > dst.size', '--if-exists=update'])
         assert (destination / 'nested/keep').read_bytes() == b'longer source'
         assert not (destination / 'nested/tiny').exists()
         copied = checks.PREFIX + '/copy'

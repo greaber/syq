@@ -145,7 +145,7 @@ def direct():
         selected["metadata"] = {"mode": 0o640, "mtime": 123, "mtime_nsec": 456, "uid": owner[0], "gid": owner[1]}
         metadata_manifest = (json.dumps(selected) + "\n").encode()
         destination = root + "/metadata"
-        command = prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--no-tcp"]
+        command = prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--no-tcp", "--if-exists=update"]
         refused = run(command, data=metadata_manifest, expected=1)
         assert b"matching --copy-metadata options" in refused.stderr, refused.stderr
         run(command + ["--copy-metadata=permissions,ownership"], data=metadata_manifest)
@@ -153,7 +153,7 @@ def direct():
         local_source = Path(temporary) / "metadata-source"
         local_source.mkdir()
         (local_source / "file").write_bytes(b'ordinary mapping')
-        run(["syq", "cp", "--no-progress", "-C", str(local_source), "--mapping", "-", "--to", "destination", "--into", destination, "--no-tcp"], data=metadata_manifest)
+        run(["syq", "cp", "--if-exists=update", "--no-progress", "-C", str(local_source), "--mapping", "-", "--to", "destination", "--into", destination, "--no-tcp"], data=metadata_manifest)
         ssh("destination", f"from pathlib import Path; p=Path({destination!r})/'file'; assert p.read_bytes()==b'ordinary mapping'; s=p.stat(); assert s.st_mode & 0o7777==0o640; assert s.st_mtime_ns==123000000456")
         if owner[0] != 0:
             selected["metadata"]["uid"] = 4294967294

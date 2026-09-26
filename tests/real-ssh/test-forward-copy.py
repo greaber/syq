@@ -257,7 +257,7 @@ copy("/tmp/syq-real-ssh/forward/cancelled", source=source, prefix=prefix,
 remote("test ! -e /tmp/syq-real-ssh/forward/cancelled")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 results = "/tmp/syq-real-ssh/forward-resume.ndjson"
-copy("/tmp/syq-real-ssh/forward/cancelled", source=source, extra=("--results", results))
+copy("/tmp/syq-real-ssh/forward/cancelled", source=source, extra=("--resume", "--results", results))
 records = [json.loads(line) for line in run("ssh", "source", f"cat {results}").splitlines()]
 assert records[-1]["type"] == "result", records
 assert records[-1]["bytes_unchanged"] >= 4 * 1024 * 1024, records[-1]

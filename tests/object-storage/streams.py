@@ -51,7 +51,7 @@ def main():
             stream(['--to', bucket, '--as-new', key], input=data)
             stream(['--to', bucket, '--as-new', key], input=b'no', success=False)
             assert check.request('GET', key)[1] == data
-            stream(['--to', bucket, '--as-existing', key], input=b'updated')
+            stream(['--to', bucket, '--as-existing', key, '--if-exists=update'], input=b'updated')
             assert stream(['--from', bucket, '--root', check.PREFIX, 'placement-' + name]) == b'updated'
             assert stream(['--from', bucket, '--cwd', check.PREFIX, 'placement-' + name]) == b'updated'
         stream(['--from', bucket, '--root', check.PREFIX, '../outside'], success=False)
