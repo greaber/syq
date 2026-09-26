@@ -150,17 +150,21 @@ pub(super) fn source_descriptor_requirement(
         .context("source descriptor requirement overflow")
 }
 
-/// Count a snapshot of the process's live descriptors. Reading an fd directory keeps
+/// Count a snapshot of the calling thread's live descriptors. Reading an fd directory keeps
 /// the common Linux and Darwin paths proportional to the number of open
 /// descriptors. Its directory descriptor is visible in the listing, which is
 /// a harmless conservative overcount. The portable fallback scans the finite
 /// descriptor range and treats unexpected `fcntl` errors as open.
 pub(crate) fn current_open_descriptor_count(soft_limit: libc::rlim_t) -> Result<usize> {
-    for fd_directory in ["/proc/self/fd", "/dev/fd"] {
-        if let Ok(entries) = fs::read_dir(fd_directory) {
-            return Ok(entries.count());
-        }
+    #[cfg(target_os = "linux")]
+    let fd_directory = crate::sys::PROC_FD_DIRECTORY;
+    #[cfg(not(target_os = "linux"))]
+    let fd_directory = "/dev/fd";
+    if let Ok(entries) = fs::read_dir(fd_directory) {
+        return Ok(entries.count());
     }
+    // On Linux /dev/fd normally selects /proc/self/fd, so it is not a valid
+    // fallback for a private table. fcntl always consults the current table.
 
     let limit = usize::try_from(soft_limit).context("open-file limit does not fit usize")?;
     let max_fd = usize::try_from(libc::c_int::MAX).expect("c_int maximum fits usize");

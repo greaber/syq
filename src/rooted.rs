@@ -1302,7 +1302,7 @@ impl Root {
             Err(error) => return Err(error.into()),
         }
         #[cfg(target_os = "linux")]
-        let source_name = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        let source_name = CString::new(crate::sys::proc_fd_path(&file))?;
         #[cfg(not(target_os = "linux"))]
         let source_parent = self.resolve_parent(source)?;
         #[cfg(any(target_os = "linux", test))]
