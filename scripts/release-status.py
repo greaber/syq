@@ -160,7 +160,8 @@ def human(result):
         environments = run["pending_environments"]
         pending = ("unknown" if environments is None
                    else ", ".join(name or "" for name in environments) or "none")
-        conclusion = f"/{run['conclusion']}" if run.get("conclusion") else ""
+        # gh reports an unfinished run's conclusion as "", shown as "in_progress/".
+        conclusion = "" if run.get("conclusion") is None else f"/{run['conclusion']}"
         lines.append(f"  run {run.get('databaseId')}: {run.get('status')}{conclusion}, "
                      f"pending environments: {pending}\n    {run.get('url')}")
     return "\n".join(lines)
