@@ -597,7 +597,7 @@ platform. It does not produce full-suite release certification. Monitor the
 returned run with `gh run watch <run-id> --exit-status`. Leaving `test_name`
 empty selects the full workflow; use that only when broad validation is needed.
 
-Run the local-only three-container OpenSSH suite when changes materially affect
+Run the three-container OpenSSH suite when changes materially affect
 connection setup, helper bootstrap, authentication or authorization, remote
 process lifecycle, transport behavior, or remote coordinator placement:
 
@@ -605,7 +605,8 @@ process lifecycle, transport behavior, or remote coordinator placement:
 scripts/test-real-ssh.py
 ```
 
-It is intentionally not part of ordinary CI or `cargo test`; see
+It is not part of `cargo test` or post-merge CI; full nightly and manual
+`ci.yml` runs include it and `scripts/test-s3.sh`. See
 `tests/real-ssh/README.md` for its isolation and coverage.
 
 Choose this check by behavioral impact, not merely by which file changed.

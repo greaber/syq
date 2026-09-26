@@ -1,6 +1,6 @@
 # Real-SSH integration tests
 
-This local-only suite runs the candidate syq build through live OpenSSH clients
+This suite runs the candidate syq build through live OpenSSH clients
 and servers. Docker Compose creates three containers on an internal network:
 
 ```text
@@ -23,6 +23,9 @@ Run the suite from any syq checkout:
 ```sh
 scripts/test-real-ssh.py
 ```
+
+Full nightly and manual `ci.yml` runs also run the core suite on GitHub's
+Linux runner. Pull requests and post-merge runs do not.
 
 The suite also runs a pinned MinIO fixture on the runner. Storage checks approve
 requests through the return connection and disconnect receiving before uploads

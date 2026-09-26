@@ -506,6 +506,69 @@ jobs:
            needs.macos_intel.result == 'success')
         run: echo 'Required macOS validation succeeded.'
 
+  # The disposable MinIO and three-container OpenSSH suites need Docker, so
+  # they use GitHub's Linux runner. They run only in full nightly and manual
+  # suites and are not part of release-certification.
+  object-storage:
+    needs: scope
+    if: >-
+      inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
+      needs.scope.result == 'success' &&
+      needs.scope.outputs.native == 'true' &&
+      needs.scope.outputs.full_suite == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
+      - name: Cache Cargo dependencies and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ci-object-storage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-ci-object-storage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-ci-object-storage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Test against disposable MinIO
+        run: scripts/test-s3.sh
+
+  real-ssh:
+    needs: scope
+    if: >-
+      inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
+      needs.scope.result == 'success' &&
+      needs.scope.outputs.native == 'true' &&
+      needs.scope.outputs.full_suite == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test the core suite through real OpenSSH
+        run: scripts/test-real-ssh.sh
+      - name: Keep real-SSH diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: real-ssh-diagnostics
+          path: target/real-ssh.*/compose.log
+          if-no-files-found: ignore
+          retention-days: 14
+
   # A skipped certificate cannot certify successful selective stubs.
   release-certification:
     needs: [scope, rust, sdks, linux-arm64, macos]
