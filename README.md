@@ -55,7 +55,10 @@ examples.
 
 ## Developing syq
 
-See [CONTRIBUTING.md](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for source builds and contribution checks.
+In a fresh clone, run `scripts/setup.sh` to install the Rust toolchain and
+the pinned development tools. See
+[CONTRIBUTING.md](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md)
+for details, source builds, and contribution checks.
 
 ## License
 

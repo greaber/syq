@@ -1,10 +1,11 @@
-# Development and CI tools pinned for scripts/dev-tools.sh.
+# Development and CI tools pinned for scripts/setup.sh.
 #
 # Fields: tool version platform sha256 url bin
-# `bin` is the directory, relative to the unpacked archive, that goes on PATH.
-# A URL that is not a .tar.gz archive is a single executable named after the
-# tool and placed in `bin`. Every tool lists linux-x86_64, linux-aarch64,
-# macos-arm64, and macos-x86_64. Use official upstream release artifacts only.
+# `bin` is the directory, relative to the installation, that goes on PATH.
+# A tool lists a download for each of linux-x86_64, linux-aarch64, macos-arm64,
+# and macos-x86_64. A download that is not a .tar.gz archive is a single
+# executable named after the tool and placed in `bin`. Use official upstream
+# release artifacts only.
 
 # ShellCheck: sha256 from GitHub's release asset digests, confirmed by
 # downloading and hashing (the project publishes no checksum file).
@@ -26,7 +27,8 @@ mdbook 0.5.4 linux-aarch64 753e5c5c363ee8a56972344dcf91466f005a51db84a7aeffe427a
 mdbook 0.5.4 macos-arm64 03e8a6d8b13a2971e0b3280affd03b388373c1485e26f73407c3a76b0b1838df https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-aarch64-apple-darwin.tar.gz .
 mdbook 0.5.4 macos-x86_64 a47d7bf0d5d670cff9ee6cce95537cbeb62dc10704d9e7131ffbd13e2b59a5de https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-apple-darwin.tar.gz .
 
-# uv: sha256 from each asset's published .sha256 file.
+# uv: sha256 from each asset's published .sha256 file. sdk/python/pyproject.toml
+# requires this exact uv, which the release workflows also install.
 uv 0.11.6 linux-x86_64 0c6bab77a67a445dc849ed5e8ee8d3cb333b6e2eba863643ce1e228075f27943 https://github.com/astral-sh/uv/releases/download/0.11.6/uv-x86_64-unknown-linux-gnu.tar.gz uv-x86_64-unknown-linux-gnu
 uv 0.11.6 linux-aarch64 d5be4bf7015ea000378cb3c3aba53ba81a8673458ace9c7fa25a0be005b74802 https://github.com/astral-sh/uv/releases/download/0.11.6/uv-aarch64-unknown-linux-gnu.tar.gz uv-aarch64-unknown-linux-gnu
 uv 0.11.6 macos-arm64 4b69a4e366ec38cd5f305707de95e12951181c448679a00dce2a78868dfc9f5b https://github.com/astral-sh/uv/releases/download/0.11.6/uv-aarch64-apple-darwin.tar.gz uv-aarch64-apple-darwin
@@ -48,8 +50,9 @@ node 22.23.3 linux-aarch64 5ced2d48d1d7198739b7f86804de0171aefb6823b684b12341d33
 node 22.23.3 macos-arm64 23b25245dcfb9af7262f8ff142e9e2e0af025368117329e7a7458a51e5922f53 https://nodejs.org/dist/v22.23.3/node-v22.23.3-darwin-arm64.tar.gz node-v22.23.3-darwin-arm64/bin
 node 22.23.3 macos-x86_64 8a677b0219178efd6eb0e475457c4afb452b521a92f6e67845a73bd85727f2a8 https://nodejs.org/dist/v22.23.3/node-v22.23.3-darwin-x64.tar.gz node-v22.23.3-darwin-x64/bin
 
-# Go: sha256 from https://go.dev/dl/?mode=json. sdk/go/go.mod requires 1.26.
-go 1.26.8 linux-x86_64 d0f743b33e8d8945e6b1f432edd15785c70507121d6e2a723b21285eddf8b57b https://go.dev/dl/go1.26.8.linux-amd64.tar.gz go/bin
-go 1.26.8 linux-aarch64 211ffced9dcb9633a55eac6364816ec0ddd951389a740e88fa8b3337971bdda0 https://go.dev/dl/go1.26.8.linux-arm64.tar.gz go/bin
-go 1.26.8 macos-arm64 a012b25b571bd0138a03dcd25375ceba866fe5ca822f426d2c66a4de56fd3f4b https://go.dev/dl/go1.26.8.darwin-arm64.tar.gz go/bin
-go 1.26.8 macos-x86_64 186be014105aa6542b767d2c6ed5cca10a0214bdff809ef1724022a8c7894150 https://go.dev/dl/go1.26.8.darwin-amd64.tar.gz go/bin
+# Go: sha256 from https://go.dev/dl/?mode=json. sdk/go/go.mod requires >=1.26.0.
+go 1.27.1 linux-x86_64 63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445 https://go.dev/dl/go1.27.1.linux-amd64.tar.gz go/bin
+go 1.27.1 linux-aarch64 3450b45a3f9ee8568792736a5c5e70a1f2e9b36c35a8f74958c03e51d7d92bec https://go.dev/dl/go1.27.1.linux-arm64.tar.gz go/bin
+go 1.27.1 macos-arm64 ee215d57e0ec269c60cc9ceca68e6bda321ba9ee5afe24f4b0988703c2d87d12 https://go.dev/dl/go1.27.1.darwin-arm64.tar.gz go/bin
+go 1.27.1 macos-x86_64 8f8f52c6649542cf027bbc9b9c68d1ec042f9f34808a40413f0b8b3f66f3caa4 https://go.dev/dl/go1.27.1.darwin-amd64.tar.gz go/bin
+

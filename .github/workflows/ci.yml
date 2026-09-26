@@ -59,11 +59,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/dev-tools.sh github jq python
+        run: scripts/setup.sh github jq python
       - name: Classify changed paths
         id: changes
         env:
@@ -109,7 +109,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         if: >-
           needs.scope.outputs.native == 'true' ||
@@ -118,7 +118,7 @@ jobs:
           needs.scope.outputs.mapping_docs == 'true'
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/dev-tools.sh github shellcheck jq python
+        run: scripts/setup.sh github shellcheck jq python
       - name: Show Linux trial hardware
         if: inputs.linux_trial == 'github' || inputs.linux_trial == 'namespace'
         run: |
@@ -241,10 +241,10 @@ jobs:
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' branch ')
         run: scripts/test-branch-status.sh
-      - name: Test development tool setup
+      - name: Test the development setup
         if: >-
-          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' devtools ')
-        run: scripts/test-dev-tools.sh
+          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' setup ')
+        run: scripts/test-setup.sh
       - name: Validate workflow syntax
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' workflows ')
@@ -285,13 +285,13 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-${{ matrix.sdk }}-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-${{ matrix.sdk }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         if: needs.scope.outputs[format('{0}_sdk', matrix.sdk)] == 'true'
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
         run: >-
-          scripts/dev-tools.sh github
+          scripts/setup.sh github
           ${{ matrix.sdk == 'python' && 'uv python jq' || matrix.sdk == 'javascript' && 'node' || 'go' }}
       - name: Cache Cargo dependencies and build output
         if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'

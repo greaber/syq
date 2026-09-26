@@ -43,11 +43,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-pages-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-pages-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/dev-tools.sh github python node mdbook
+        run: scripts/setup.sh github python node mdbook
       - name: Check documentation links
         run: python3 scripts/check-doc-links.py
       - name: Test version selection

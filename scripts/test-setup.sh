@@ -1,15 +1,15 @@
 #!/bin/sh
-# Check scripts/dev-tools.lock and exercise scripts/dev-tools.sh against local
-# fixture artifacts, without network access.
+# Check scripts/setup.lock and exercise scripts/setup.sh against local fixture
+# artifacts, without network access.
 set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-work=$(mktemp -d "${TMPDIR:-/tmp}/syq-dev-tools-test.XXXXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/syq-setup-test.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
 trap 'exit 1' HUP INT TERM
 
 fail() {
-  printf 'test-dev-tools: %s\n' "$*" >&2
+  printf 'test-setup: %s\n' "$*" >&2
   exit 1
 }
 
@@ -34,8 +34,8 @@ awk '
   $5 != "uv" && $5 !~ "^https://(github[.]com/(koalaman/shellcheck|jqlang/jq|rust-lang/mdBook|astral-sh/uv)/releases/download/|nodejs[.]org/dist/|go[.]dev/dl/)" {
     printf "line %d: unexpected download location\n", NR; bad = 1
   }
-  $5 != "uv" && index($5, $2) == 0 { printf "line %d: URL does not name version %s\n", NR, $2; bad = 1 }
   {
+    if ($5 != "uv" && index($5, $2) == 0) { printf "line %d: URL does not name version %s\n", NR, $2; bad = 1 }
     if (seen[$1, $3]++) { printf "line %d: duplicate %s %s\n", NR, $1, $3; bad = 1 }
     if (($1 in version) && version[$1] != $2) { printf "line %d: %s has two versions\n", NR, $1; bad = 1 }
     version[$1] = $2
@@ -49,12 +49,12 @@ awk '
     if (uses_uv && !("uv" in version)) { print "uv installs need a pinned uv"; bad = 1 }
     exit bad
   }
-' "$script_dir/dev-tools.lock" || fail 'scripts/dev-tools.lock is malformed'
+' "$script_dir/setup.lock" || fail 'scripts/setup.lock is malformed'
 
 # A copy of the script reads the fixture manifest beside it.
 mkdir -p "$work/scripts" "$work/src" "$work/fakebin"
-cp "$script_dir/dev-tools.sh" "$work/scripts/dev-tools.sh"
-fixture=$work/scripts/dev-tools.lock
+cp "$script_dir/setup.sh" "$work/scripts/setup.sh"
+fixture=$work/scripts/setup.lock
 tools="$work/tool cache's"
 cat > "$work/fakebin/uname" <<'EOF'
 #!/bin/sh
@@ -67,7 +67,7 @@ EOF
 chmod 755 "$work/fakebin/uname"
 
 run() {
-  PATH="$work/fakebin:$PATH" SYQ_TOOLS_DIR=$tools "$work/scripts/dev-tools.sh" "$@"
+  PATH="$work/fakebin:$PATH" SYQ_TOOLS_DIR=$tools "$work/scripts/setup.sh" "$@"
 }
 
 # One single-file artifact per platform prints the platform it was chosen for.
@@ -114,7 +114,7 @@ rm -rf "$tools"
 
 # A checksum mismatch fails without leaving a visible or partial installation.
 if run install bad 2>"$work/stderr"; then fail 'installed an artifact with the wrong checksum'; fi
-grep -F 'bad 1.0 checksum mismatch' "$work/stderr" >/dev/null ||
+grep -F "checksum mismatch for file://$work/src/bad" "$work/stderr" >/dev/null ||
   fail 'checksum mismatch was not reported'
 [ -z "$(ls -A "$tools/bad")" ] || fail 'checksum mismatch left files behind'
 if run env bad 2>"$work/stderr"; then fail 'env accepted a tool that is not installed'; fi
@@ -139,4 +139,4 @@ GITHUB_PATH=$work/github-path GITHUB_ENV=$work/github-env run github demo probe
 $tools/probe/1.0/bin" ] || fail 'unexpected GITHUB_PATH entries'
 [ ! -s "$work/github-env" ] || fail 'unexpected GITHUB_ENV entries'
 
-echo 'dev-tools tests passed'
+echo 'setup tests passed'

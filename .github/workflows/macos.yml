@@ -84,11 +84,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/dev-tools.sh github jq python
+        run: scripts/setup.sh github jq python
       - name: Run the exact test
         shell: bash
         env:
@@ -129,11 +129,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/dev-tools.sh github jq python
+        run: scripts/setup.sh github jq python
       - id: changes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -195,11 +195,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-suite-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-suite-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/dev-tools.sh github jq uv python node go
+        run: scripts/setup.sh github jq uv python node go
       - name: Show toolchain and environment
         run: |
           rustc --version
@@ -323,11 +323,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-python-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/dev-tools.sh github python
+        run: scripts/setup.sh github python
       - name: Measure APFS cloning
         run: |
           cargo build --release --locked --bin syq

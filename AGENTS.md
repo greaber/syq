@@ -472,11 +472,12 @@ and variability, and lengthen or repeat the test as needed to support the claim.
 
 **Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
 
-`scripts/dev-tools.sh` is that setup for ShellCheck, jq, mdBook, uv, Python,
-Node.js, and Go. It installs the versions pinned in `scripts/dev-tools.lock`
-into a cache shared by all worktrees; CI uses the same script. Run
-`scripts/dev-tools.sh install`, then `eval "$(scripts/dev-tools.sh env)"` in
-the shell that runs the check. Rust comes from `rust-toolchain.toml`.
+`scripts/setup.sh` is that setup. Run it without arguments to install the
+Rust toolchain from `rust-toolchain.toml` and the tools pinned in
+`scripts/setup.lock` (ShellCheck, jq, mdBook, uv, Python, Node.js, and Go)
+into a cache shared by all worktrees, then run
+`eval "$(scripts/setup.sh env)"` in the shell that runs the check. CI uses
+the same script.
 
 Rust fixtures use `test_support::tempdir()` or `test_support::temp_dir()`
 from `tests/support/temp.rs` (re-exported by `src/test_support.rs` for unit

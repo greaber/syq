@@ -1,12 +1,37 @@
 # Developing syq
 
-## Build and try a remote copy
+## Set up a checkout
 
-Install Rust with rustup, Git, and a C compiler, then:
+Install Git, [rustup](https://rustup.rs), and a C compiler (on macOS,
+`xcode-select --install`; on Debian or Ubuntu,
+`sudo apt-get install build-essential curl git`). Then, in a fresh clone:
 
 ```sh
 git clone https://github.com/greaber/syq.git
 cd syq
+scripts/setup.sh
+eval "$(scripts/setup.sh env)"
+```
+
+`scripts/setup.sh` checks those prerequisites, installs the Rust toolchain
+from `rust-toolchain.toml` with rustfmt and clippy, and installs the tools
+pinned in `scripts/setup.lock`: ShellCheck, jq, mdBook, uv, Python, Node.js,
+and Go. Downloads are checked against the pinned SHA-256 sums; uv installs
+Python using the checksums built into the pinned uv. Tools are kept in
+`~/.cache/syq/tools` (or
+`$XDG_CACHE_HOME/syq/tools`) and shared by every checkout; set
+`SYQ_TOOLS_DIR` to use another directory. Running the script again installs
+only what is missing.
+
+The `eval` line puts the pinned tools first on `PATH` in the current shell;
+repeat it in each new shell. It also sets `UV_PYTHON` to the pinned Python and
+`GOTOOLCHAIN=local` so Go does not download a different toolchain. Pass tool
+names to select only some of them, for example `scripts/setup.sh env python jq`.
+CI runs the same script.
+
+## Build and try a remote copy
+
+```sh
 cargo build --locked --release
 ./target/release/syq cp data --to server --into /tmp/syq-dev-copy
 ```
@@ -122,29 +147,6 @@ and comparison. The tag must contain the `python-dist` recipe.
 `flake.lock` pins the build environment, `sdk/python/uv.lock` pins maturin,
 and `sdk/python/native-source.json` pins the native source. Installing a source
 archive uses maturin and does not require Nix.
-
-## Development tools
-
-Rust is pinned by `rust-toolchain.toml` and installed by rustup. The other
-tools used by tests, lint, and the docs build are pinned in
-`scripts/dev-tools.lock`: ShellCheck, jq, mdBook, uv, Python, Node.js, and Go.
-Install them and put them first on `PATH` in your current shell:
-
-```sh
-scripts/dev-tools.sh install
-eval "$(scripts/dev-tools.sh env)"
-```
-
-Pass tool names to use only some of them, for example
-`scripts/dev-tools.sh env python jq`. Downloads are checked against the pinned
-SHA-256 sums; uv installs Python using the checksums built into the pinned uv.
-Tools are kept in `~/.cache/syq/tools` (or `$XDG_CACHE_HOME/syq/tools`) and
-shared by every checkout; set `SYQ_TOOLS_DIR` to use another directory. CI
-runs the same script. `env` also sets `UV_PYTHON` to the pinned Python and
-`GOTOOLCHAIN=local` so Go does not download a different toolchain.
-The script needs only `sh`, `curl`, `tar`, and `sha256sum` or `shasum`.
-Building upstream rsync for the conformance tests also needs autoconf,
-automake, and a C compiler from your system.
 
 ## Before a pull request
 

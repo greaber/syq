@@ -1,6 +1,7 @@
 #!/bin/sh
-# Install the development and CI tools pinned in scripts/dev-tools.lock into a
-# cache shared by every checkout, and put them on PATH.
+# Set up a syq checkout for development: check the prerequisites that cannot
+# be pinned, install the Rust toolchain, and install the tools pinned in
+# scripts/setup.lock into a cache shared by every checkout.
 #
 # This is POSIX sh so that it runs on a stock macOS or Linux machine before
 # any pinned tool exists.
@@ -8,13 +9,17 @@ set -eu
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/dev-tools.sh install [TOOL...]
-       scripts/dev-tools.sh env [TOOL...]
-       scripts/dev-tools.sh github [TOOL...]
+usage: scripts/setup.sh
+       scripts/setup.sh install [TOOL...]
+       scripts/setup.sh env [TOOL...]
+       scripts/setup.sh github [TOOL...]
 
-install  Download, verify, and unpack the pinned tools (default: all).
+With no command, check prerequisites, install the Rust toolchain from
+rust-toolchain.toml, and install every pinned tool.
+
+install  Download, verify, and unpack pinned tools (default: all).
 env      Print shell commands that put installed tools first on PATH:
-           eval "$(scripts/dev-tools.sh env)"
+           eval "$(scripts/setup.sh env)"
 github   Install, then add the tools to a GitHub Actions job's PATH.
 
 Tools are cached in ${SYQ_TOOLS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/syq/tools}.
@@ -23,12 +28,13 @@ EOF
 }
 
 die() {
-  printf 'dev-tools: %s\n' "$*" >&2
+  printf 'setup: %s\n' "$*" >&2
   exit 1
 }
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-manifest=$script_dir/dev-tools.lock
+repository=$(dirname -- "$script_dir")
+manifest=$script_dir/setup.lock
 tools_dir=${SYQ_TOOLS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/syq/tools}
 
 detect_platform() {
@@ -50,9 +56,11 @@ manifest_tools() {
 # Set version, sha256, url, and bin from the tool's entry for this platform.
 read_entry() {
   entry=$(awk -v tool="$1" -v platform="$platform" '
-    !/^#/ && NF && $1 == tool && $3 == platform { found++; entry = $2 " " $4 " " $5 " " $6 }
+    !/^#/ && NF && $1 == tool && $3 == platform {
+      found++; entry = $2 " " $4 " " $5 " " $6
+    }
     END { if (found != 1) exit 1; print entry }
-  ' "$manifest") || die "scripts/dev-tools.lock has no single $1 entry for $platform"
+  ' "$manifest") || die "scripts/setup.lock has no single $1 entry for $platform"
   set -f
   # shellcheck disable=SC2086 # the manifest's fields contain no spaces
   set -- $entry
@@ -60,7 +68,7 @@ read_entry() {
   version=$1 sha256=$2 url=$3 bin=$4
 }
 
-# The main executable, used to check that an unpacked tool is complete.
+# The main executable, used to check that an installed tool is complete.
 executable() {
   case "$1" in
     python) echo python3 ;;
@@ -80,9 +88,20 @@ shell_quote() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+# Download $1 to $3 and require SHA-256 $2.
+fetch() {
+  curl --fail --silent --show-error --location --retry 3 \
+    --proto '=https,file' --proto-redir '=https' --output "$3" "$1"
+  actual=$(sha256_of "$3")
+  [ "$actual" = "$2" ] ||
+    die "checksum mismatch for $1: expected $2, got $actual"
+}
+
 staging=
 cleanup() {
-  if [ -n "$staging" ]; then rm -rf "$staging" "$staging.download"; fi
+  if [ -n "$staging" ]; then
+    rm -rf "$staging" "$staging.download"
+  fi
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -99,7 +118,7 @@ install_tool() {
     read_entry "$1"
   fi
   destination=$tools_dir/$1/$version
-  echo "dev-tools: installing $1 $version" >&2
+  echo "setup: installing $1 $version" >&2
   mkdir -p "$tools_dir/$1"
   # Unpack beside the destination and rename it into place, so other
   # checkouts never see a partial installation.
@@ -114,12 +133,7 @@ install_tool() {
     done
   else
     download=$staging.download
-    curl --fail --silent --show-error --location --retry 3 \
-      --proto '=https,file' --proto-redir '=https' \
-      --output "$download" "$url"
-    actual=$(sha256_of "$download")
-    [ "$actual" = "$sha256" ] ||
-      die "$1 $version checksum mismatch for $url: expected $sha256, got $actual"
+    fetch "$url" "$sha256" "$download"
     case "$url" in
       *.tar.gz) tar -xzf "$download" -C "$staging" ;;
       *)
@@ -142,22 +156,57 @@ install_tool() {
 bin_directory() {
   read_entry "$1"
   [ -d "$tools_dir/$1/$version" ] ||
-    die "$1 $version is not installed; run: scripts/dev-tools.sh install $1"
+    die "$1 $version is not installed; run: scripts/setup.sh install $1"
   case "$bin" in
     .) echo "$tools_dir/$1/$version" ;;
     *) echo "$tools_dir/$1/$version/$bin" ;;
   esac
 }
 
-[ "$#" -ge 1 ] || usage
-command=$1
-shift
-case "$command" in
-  install|env|github) ;;
+# Prerequisites that the setup cannot pin.
+check_prerequisites() {
+  missing=
+  for prerequisite in git curl tar cc rustup; do
+    command -v "$prerequisite" >/dev/null 2>&1 || missing="$missing $prerequisite"
+  done
+  if command -v cc >/dev/null 2>&1 && ! cc --version >/dev/null 2>&1; then
+    missing="$missing cc"
+  fi
+  if [ -n "$missing" ]; then
+    cat >&2 <<EOF
+setup: missing prerequisites:$missing
+  macOS: run xcode-select --install for Git and a C compiler.
+  Debian or Ubuntu: sudo apt-get install git curl build-essential
+  Rust: install rustup from https://rustup.rs
+EOF
+    exit 1
+  fi
+}
+
+install_rust() {
+  channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' "$repository/rust-toolchain.toml")
+  [ -n "$channel" ] || die 'rust-toolchain.toml has no channel'
+  echo "setup: installing Rust $channel" >&2
+  rustup toolchain install "$channel" --no-self-update --profile minimal \
+    --component rustfmt --component clippy >&2
+}
+
+if [ "$#" -eq 0 ]; then
+  action=setup
+else
+  action=$1
+  shift
+fi
+case "$action" in
+  setup|install|env|github) ;;
   *) usage ;;
 esac
 [ -f "$manifest" ] || die "missing $manifest"
 platform=$(detect_platform)
+if [ "$action" = setup ]; then
+  check_prerequisites
+  install_rust
+fi
 if [ "$#" -eq 0 ]; then
   # shellcheck disable=SC2046 # tool names contain no spaces
   set -- $(manifest_tools)
@@ -166,7 +215,7 @@ for tool in "$@"; do
   manifest_tools | grep -Fqx -- "$tool" || die "unknown tool: $tool"
 done
 
-if [ "$command" != env ]; then
+if [ "$action" != env ]; then
   for tool in "$@"; do install_tool "$tool"; done
 fi
 
@@ -183,7 +232,13 @@ for tool in "$@"; do
   esac
 done
 
-case "$command" in
+case "$action" in
+  setup)
+    cat >&2 <<'EOF'
+setup: done. To use the pinned tools in a shell, run:
+  eval "$(scripts/setup.sh env)"
+EOF
+    ;;
   env)
     # shellcheck disable=SC2016 # $PATH expands when the output is evaluated
     printf 'export PATH=%s"$PATH"\n' "$(shell_quote "$path")"
