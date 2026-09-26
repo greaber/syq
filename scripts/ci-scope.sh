@@ -279,7 +279,8 @@ fi
 
 # Sort and deduplicate so equivalent selections share a cancellation group.
 read -r -a selected_tooling <<< "$tooling_checks"
-tooling_checks=$(printf '%s\n' "${selected_tooling[@]}" | sed '/^$/d' | sort -u | paste -sd ' ' -)
+# Expand an empty array portably: Bash 3.2 on macOS rejects it under set -u.
+tooling_checks=$(printf '%s\n' ${selected_tooling[@]+"${selected_tooling[@]}"} | sed '/^$/d' | sort -u | paste -sd ' ' -)
 if [ -n "$tooling_checks" ]; then tooling=true; fi
 printf 'tooling_checks=%s\n' "$tooling_checks"
 
