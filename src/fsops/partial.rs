@@ -1,5 +1,13 @@
 use super::*;
 
+pub(super) struct SmallStage {
+    rooted: RootedTarget,
+    relative: RelativePath,
+    label: PathBuf,
+    file: File,
+    reused: bool,
+}
+
 impl FsOps {
     pub fn probe_partial(
         &mut self,
@@ -45,7 +53,9 @@ impl FsOps {
         // reopen this new inode for writing. Finalize applies the requested
         // mode after every writer is done. Never chmod an existing destination
         // here: its write permissions still decide whether an update is allowed.
+        let turn = namespace::single(root, relative)?;
         let file = root.create_file(relative, mode | 0o200)?;
+        drop(turn);
         let permissions = file.metadata()?.permissions();
         if permissions.mode() & 0o200 == 0 {
             // A umask or inherited default ACL can remove even owner write.
@@ -74,6 +84,7 @@ impl FsOps {
         create_if_missing: bool,
         create_mode: u32,
     ) -> Result<Option<(File, Option<u64>)>> {
+        let _turn = namespace::single(root, relative)?;
         self.uncache_rooted(root, relative);
         let mut repaired_permissions = false;
         if create_if_missing {
@@ -1211,7 +1222,6 @@ impl FsOps {
         if self.hash_policy.transfer_integrity && self.observed_payload_hash(data) != hash {
             bail!("block hash mismatch on receive");
         }
-        let staged_mode = staged_file_mode(meta, flags);
         let rooted = self.destination_mutation_target(target.path, target.guard)?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
         if inplace {
@@ -1309,39 +1319,94 @@ impl FsOps {
             return published_identity(&file, flags);
         }
 
-        // New/replace small files, and the existing guarded-receiver
-        // policy, stage through the same private rooted sidecar as ranged
-        // writes do.
+        let stage = self.create_small_stage(put, rooted)?;
+        self.write_small_stage(put, &stage)?;
+        self.publish_small_stage(put, stage)
+    }
+
+    pub(super) fn create_small_stage(
+        &mut self,
+        put: &SmallPut,
+        rooted: RootedTarget,
+    ) -> Result<SmallStage> {
+        self.uncache_rooted(&rooted.root, &rooted.relative);
         let (relative, label, opened) =
-            with_rooted_partial(&rooted, target.id, |relative, label| {
-                self.open_private_partial_rooted(&rooted.root, relative, label, true, staged_mode)
+            with_rooted_partial(&rooted, &put.copy_id, |relative, label| {
+                self.open_private_partial_rooted(
+                    &rooted.root,
+                    relative,
+                    label,
+                    true,
+                    staged_file_mode(&put.meta, put.flags),
+                )
             })?;
         let (file, basis_size) = opened.context("sidecar creation was requested")?;
+        Ok(SmallStage {
+            rooted,
+            relative,
+            label,
+            file,
+            reused: basis_size.is_some(),
+        })
+    }
+
+    pub(super) fn write_small_stage(&self, put: &SmallPut, stage: &SmallStage) -> Result<()> {
+        // This entire phase runs without a namespace turn, including metadata
+        // and test pauses. Only creation and publication are directory work.
         #[cfg(debug_assertions)]
         test_race_barrier(
             "SYQ_TEST_SMALL_STAGE_READY_FILE",
             "SYQ_TEST_SMALL_STAGE_CONTINUE_FILE",
             "small-file stage before data",
         )?;
-        if basis_size.is_some() {
-            file.set_len(0)?;
+        if stage.reused {
+            stage.file.set_len(0)?;
         }
-        observed_write(&self.operation, &file, data, 0, self.sparse)
-            .with_context(|| format!("write {}", label.display()))?;
-        set_meta_file_for_publication(&file, meta, flags)
-            .with_context(|| format!("set metadata {}", label.display()))?;
-        // `publish_partial_rooted` re-checks the staged name against the
-        // open descriptor immediately before the rename, so no separate
-        // check is needed here.
+        observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse)
+            .with_context(|| format!("write {}", stage.label.display()))?;
+        set_meta_file_for_publication(&stage.file, &put.meta, put.flags)
+            .with_context(|| format!("set metadata {}", stage.label.display()))?;
         #[cfg(debug_assertions)]
-        fail_put_small_before_rename_for_test(&rooted.label)?;
-        publish_partial_rooted(&rooted.root, &relative, &rooted.relative, &file, condition)?;
+        fail_put_small_before_rename_for_test(&stage.rooted.label)?;
+        Ok(())
+    }
+
+    pub(super) fn publish_small_stage(
+        &self,
+        put: &SmallPut,
+        stage: SmallStage,
+    ) -> Result<Option<(u64, u64)>> {
+        self.publish_small_stage_name(put, &stage)?;
+        self.finish_small_stage(put, stage)
+    }
+
+    pub(super) fn publish_small_stage_name(
+        &self,
+        put: &SmallPut,
+        stage: &SmallStage,
+    ) -> Result<()> {
+        // This still re-resolves from Root and checks the staged name against
+        // the held inode. The scheduling directory is never mutation authority.
+        publish_partial_rooted(
+            &stage.rooted.root,
+            &stage.relative,
+            &stage.rooted.relative,
+            &stage.file,
+            put.condition,
+        )
+    }
+
+    pub(super) fn finish_small_stage(
+        &self,
+        put: &SmallPut,
+        stage: SmallStage,
+    ) -> Result<Option<(u64, u64)>> {
         crate::inode_metadata::finish_publication(
-            &file,
-            meta.inode_metadata.as_deref(),
-            meta.mode,
+            &stage.file,
+            put.meta.inode_metadata.as_deref(),
+            put.meta.mode,
         )?;
-        published_identity(&file, flags)
+        published_identity(&stage.file, put.flags)
     }
 
     pub(super) fn hash_blocks(
@@ -1436,16 +1501,28 @@ impl FsOps {
     }
 
     pub(crate) fn begin_source_range(&mut self, _range: std::ops::Range<u64>) {
+        if let Some(executor) = &self.data_executor {
+            executor.begin_read(_range.clone());
+        }
+
         #[cfg(target_os = "linux")]
         self.read_ahead.begin_stream(_range);
     }
 
     pub(crate) fn shrink_source_range(&mut self, _end: u64) {
+        if let Some(executor) = &self.data_executor {
+            executor.shrink_read(_end);
+        }
+
         #[cfg(target_os = "linux")]
         self.read_ahead.shrink_stream(_end);
     }
 
     pub(crate) fn end_source_range(&mut self) {
+        if let Some(executor) = &self.data_executor {
+            executor.end_read();
+        }
+
         #[cfg(target_os = "linux")]
         self.read_ahead.end_stream();
     }
@@ -1844,6 +1921,19 @@ impl FsOps {
         req: &mut Request,
         progress: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Response {
+        if executor::Executor::handles(req) {
+            if let Some(executor) = &mut self.data_executor {
+                return executor.execute(
+                    req,
+                    executor::Settings {
+                        preservation: self.inode_preservation,
+                        sparse: self.sparse,
+                        hashing: self.hash_policy,
+                    },
+                    progress,
+                );
+            }
+        }
         let _handling = self
             .operation
             .span(crate::transfer_observations::Stage::Handling);
@@ -2215,17 +2305,12 @@ impl FsOps {
                     CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
                 }),
             Request::PutSmallBatch(puts) => {
+                let results = self.put_small_batch(puts);
                 if puts.iter().any(|p| p.flags & flags::REPORT_IDENTITY != 0) {
-                    Ok(Response::PublishedBatch(
-                        puts.iter()
-                            .map(|put| self.put_small(put).map_err(|e| wire_error(&e)))
-                            .collect(),
-                    ))
+                    Ok(Response::PublishedBatch(results))
                 } else {
                     Ok(Response::Applied(
-                        puts.iter()
-                            .map(|put| self.put_small(put).err().as_ref().map(wire_error))
-                            .collect(),
+                        results.into_iter().map(Result::err).collect(),
                     ))
                 }
             }
@@ -2386,6 +2471,7 @@ pub(super) fn publish_partial_rooted(
     staged: &File,
     condition: TargetCondition,
 ) -> Result<()> {
+    let _turn = namespace::single(root, target)?;
     let metadata = staged.metadata()?;
     if !is_safe_partial(&metadata) {
         bail!("confined partial is not a private regular file");

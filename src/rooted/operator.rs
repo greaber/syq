@@ -916,7 +916,8 @@ pub(super) fn operator_descriptor_is_procfs(file: &File) -> Result<bool> {
 /// decimal entry an exact reference to `object`, even after namespace rename.
 #[cfg(target_os = "linux")]
 pub(super) fn reopen_pinned_object_for_read(object: &File) -> Result<Option<File>> {
-    let proc_path = CString::new("/proc/self/fd").expect("fixed procfs path contains no NUL");
+    let proc_path =
+        CString::new(crate::sys::PROC_FD_DIRECTORY).expect("fixed procfs path contains no NUL");
     let proc_fd = match open_at(
         libc::AT_FDCWD,
         &proc_path,

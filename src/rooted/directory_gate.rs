@@ -44,22 +44,25 @@ impl Gate {
         }
         state.active += 1;
         drop(state);
-        Permit(self.clone())
+        Permit(Some(self.clone()))
     }
 }
 
-pub(super) struct Permit(Arc<Gate>);
+pub(super) struct Permit(Option<Arc<Gate>>);
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
+        let Some(gate) = &self.0 else {
+            return;
+        };
+        let mut state = gate.state.lock().unwrap();
         state.active -= 1;
         let waiting = state.waiting != 0;
         drop(state);
         // Condvar notification can enter the kernel even without a waiter.
         // Uncontended directories need only the userspace mutex fast path.
         if waiting {
-            self.0.available.notify_one();
+            gate.available.notify_one();
         }
     }
 }
@@ -94,6 +97,9 @@ impl Registry {
 }
 
 pub(super) fn acquire(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
+    if super::MutationBurst::active() {
+        return Permit(None);
+    }
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
     let key = Directory {
         root,
@@ -170,6 +176,27 @@ mod tests {
         let _parent_permit = other_parent.acquire();
         let _root_permit = other_root.acquire();
         drop(busy);
+    }
+
+    #[test]
+    fn burst_scope_is_thread_local_and_restores_admission_after_unwind() {
+        let root = RootIdentity { dev: 9, ino: 7 };
+        let parent = vec![b"burst".to_vec()];
+        assert!(acquire(root, &parent).0.is_some());
+        let outer = crate::rooted::MutationBurst::enter();
+        assert!(acquire(root, &parent).0.is_none());
+        std::thread::scope(|scope| {
+            scope.spawn(|| assert!(acquire(root, &parent).0.is_some()));
+        });
+        assert!(std::panic::catch_unwind(|| {
+            let _inner = crate::rooted::MutationBurst::enter();
+            assert!(acquire(root, &parent).0.is_none());
+            panic!("mutation failed");
+        })
+        .is_err());
+        assert!(acquire(root, &parent).0.is_none());
+        drop(outer);
+        assert!(acquire(root, &parent).0.is_some());
     }
 
     #[test]

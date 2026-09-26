@@ -459,6 +459,11 @@ pub(crate) struct FileWorker {
     settings: Settings,
 }
 impl FileWorker {
+    /// Borrow the selected stream object during an executor's startup handoff.
+    pub(crate) fn bootstrap(&self) -> (&File, bool, Settings) {
+        (&self.file, self.write, self.settings)
+    }
+
     pub(crate) fn new(file: File, write: bool, settings: Settings) -> Result<Self> {
         anyhow::ensure!(
             file.metadata()?.is_file(),

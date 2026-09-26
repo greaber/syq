@@ -928,7 +928,7 @@ pub(crate) fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
     // support. procfs still resolves this stable O_PATH descriptor, never the
     // possibly replaced pathname.
     fs::set_permissions(
-        PathBuf::from("/proc/self/fd").join(fd.to_string()),
+        crate::sys::proc_fd_path(file),
         fs::Permissions::from_mode(mode),
     )?;
     Ok(())

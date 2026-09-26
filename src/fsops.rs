@@ -32,11 +32,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod apply;
+mod apply_pool;
+mod apply_queue;
 mod entry;
+mod executor;
 mod limits;
+mod namespace;
 mod operator;
 mod partial;
 mod paths;
+mod small_batch;
 
 pub(crate) use apply::*;
 pub(crate) use entry::*;
@@ -433,6 +438,8 @@ struct PreparedSmallCopy {
 }
 
 pub struct FsOps {
+    data_executor: Option<executor::Executor>,
+    metadata_pool: apply_pool::Pool,
     prepared_small_copy: Option<PreparedSmallCopy>,
     inode_preservation: crate::inode_metadata::Selection,
     sparse: bool,
@@ -596,6 +603,31 @@ impl Default for FsOps {
 }
 
 impl FsOps {
+    pub(crate) fn start_data_executor(&mut self, role: &ConnectionRole) -> Result<()> {
+        if cfg!(target_os = "linux") && !matches!(role, ConnectionRole::Control) {
+            // An optional ownership optimization must not invalidate roots the
+            // caller already holds when thread/socket resources are exhausted.
+            match executor::Executor::start(self) {
+                Ok(Some(executor)) => {
+                    self.data_executor = Some(executor);
+                    // Stream reads, writes, and rebinds now run in the executor.
+                    // Retaining the owner's copy would pin the initial file
+                    // even after the executor unbinds it while idle.
+                    self.stream_worker = None;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if crate::output::debug() {
+                        crate::output::diagnostic!(
+                            "syq: filesystem executor unavailable; using caller: {error:#}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_hash_policy(&mut self, policy: crate::hashing::HashPolicy) {
         self.hash_policy = policy;
     }
@@ -612,9 +644,20 @@ impl FsOps {
     }
 
     pub(crate) fn with_descriptor_session(descriptor_session: DescriptorSessionSlot) -> Self {
-        let observations = Arc::new(crate::transfer_observations::Registry::default());
+        Self::with_observations(
+            descriptor_session,
+            Arc::new(crate::transfer_observations::Registry::default()),
+        )
+    }
+
+    fn with_observations(
+        descriptor_session: DescriptorSessionSlot,
+        observations: Arc<crate::transfer_observations::Registry>,
+    ) -> Self {
         let operation = observations.actor("filesystem");
         FsOps {
+            data_executor: None,
+            metadata_pool: Default::default(),
             inode_preservation: Default::default(),
             sparse: false,
             descriptor_copy: Default::default(),
@@ -1710,6 +1753,7 @@ impl FsOps {
         self.fd_order.clear();
         self.held_basis.take();
         self.destination_prefix = Some(request_prefix.to_vec());
+        self.metadata_pool = Default::default();
         self.destination_root = Some(root);
         Ok(())
     }
@@ -2477,12 +2521,12 @@ impl FsOps {
         .collect()
     }
 
-    /// Ops within a batch are independent (the planner orders batches so that
-    /// parents come first), so they run in parallel too.
+    /// Placement-root preconditions precede dependent mutations. Within the
+    /// remaining batch, parent creation releases children and directory metadata
+    /// waits for descendants, while independent branches remain runnable.
     pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<WireError>> {
-        // SetMeta depends on the object existing, so create everything first,
-        // then apply metadata — otherwise a parallel SetMeta can beat its
-        // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
+        // Keep the placement-root failure boundary: a failed conditional create
+        // skips the rest of the batch before any descendant is changed.
         let is_meta = |op: &Op| matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. });
         let is_guarded_create = |op: &Op| match op {
             Op::Mkdir { condition, .. }
@@ -2516,23 +2560,16 @@ impl FsOps {
             }
             return out;
         }
-        let cres = parallel_map(&create_idx, |&i| {
-            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
-                .err()
-                .as_ref()
-                .map(wire_error)
-        });
-        for (i, r) in create_idx.iter().zip(cres) {
-            out[*i] = r;
-        }
-        let mres = parallel_map(&meta_idx, |&i| {
-            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
-                .err()
-                .as_ref()
-                .map(wire_error)
-        });
-        for (i, r) in meta_idx.iter().zip(mres) {
-            out[*i] = r;
+        let selected: Vec<_> = create_idx.into_iter().chain(meta_idx).collect();
+        let batch = Arc::new(apply_pool::Batch::new(
+            ops,
+            &selected,
+            guard,
+            destination_prefix,
+        ));
+        let results = self.metadata_pool.run(batch, destination_root.as_ref());
+        for i in selected {
+            out[i] = results[i].clone();
         }
         out
     }

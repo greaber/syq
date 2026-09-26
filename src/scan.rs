@@ -26,6 +26,15 @@ const DESCRIPTOR_STAT_THREADS: usize = 8;
 const DESCRIPTOR_STAT_PAR_MIN: usize = 32;
 const DESCRIPTOR_DIRECTORY_FDS: usize = 8;
 
+mod descriptor_pool;
+
+type Inspected = Vec<(PathBytes, Result<(Entry, RootMetadata)>)>;
+
+struct UnopenedDirectory {
+    relative: PathBytes,
+    expected: RootMetadata,
+}
+
 /// Per-entry result of the parallel read_dir hook.
 #[derive(Clone, Default, Debug)]
 enum State {
@@ -191,8 +200,7 @@ fn inspect_descriptor_children(
     directory: &File,
     parent: &[u8],
     names: &[PathBytes],
-    parallel: bool,
-) -> Vec<(PathBytes, Result<(Entry, RootMetadata)>)> {
+) -> Inspected {
     let inspect = |name: &PathBytes| {
         let relative = join(parent, name);
         let result = (|| {
@@ -203,25 +211,7 @@ fn inspect_descriptor_children(
         })();
         (relative, result)
     };
-    if !parallel || names.len() < DESCRIPTOR_STAT_PAR_MIN {
-        return names.iter().map(inspect).collect();
-    }
-    let chunk = names.len().div_ceil(DESCRIPTOR_STAT_THREADS).max(1);
-    use rayon::prelude::*;
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    let pool = POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(DESCRIPTOR_STAT_THREADS)
-            .thread_name(|index| format!("syq-scan-stat-{index}"))
-            .build()
-            .expect("directory stat worker pool")
-    });
-    pool.install(|| {
-        names
-            .par_chunks(chunk)
-            .flat_map_iter(|names| names.iter().map(&inspect))
-            .collect()
-    })
+    names.iter().map(inspect).collect()
 }
 
 struct DescriptorDirectory {
@@ -272,7 +262,7 @@ impl DescriptorScan<'_> {
         &self,
         mut directory: DescriptorDirectory,
         retain: usize,
-        parallel_stats: bool,
+        inspect: &mut impl FnMut(&Root, &File, &[u8], &[PathBytes]) -> Result<Inspected>,
     ) -> Result<DirectoryStep> {
         if directory.names.is_none() && self.hold_destination_for_test {
             hold_descriptor_directory_for_test(&directory.relative)?;
@@ -296,13 +286,11 @@ impl DescriptorScan<'_> {
         let mut events = Vec::with_capacity(batch.len());
         let mut children = Vec::new();
         let mut retained = 0;
-        for (name, (relative, result)) in batch.iter().zip(inspect_descriptor_children(
-            self.root,
-            &opened,
-            &directory.relative,
-            &batch,
-            parallel_stats,
-        )) {
+        for (name, (relative, result)) in
+            batch
+                .iter()
+                .zip(inspect(self.root, &opened, &directory.relative, &batch)?)
+        {
             let (entry, metadata) = match result {
                 Ok(result) => result,
                 Err(error) => {
@@ -370,115 +358,6 @@ impl DescriptorScan<'_> {
             remainder,
         })
     }
-}
-
-fn produce_descriptor_scan(
-    root: Arc<Root>,
-    scan_root: PathBytes,
-    mut directories: Vec<DescriptorDirectory>,
-    hold_destination_for_test: bool,
-    ignore: Option<Gitignore>,
-    report_ignored: bool,
-    tx: SyncSender<ScanChunk>,
-) {
-    const DIRECTORY_WORKERS: usize = 8;
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    let pool = POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(DIRECTORY_WORKERS)
-            .thread_name(|index| format!("syq-scan-directory-{index}"))
-            .build()
-            .expect("directory scan worker pool")
-    });
-    let scan = DescriptorScan {
-        root: &root,
-        scan_root: &scan_root,
-        hold_destination_for_test,
-        ignore: ignore.as_ref(),
-        report_ignored,
-    };
-    let mut chunk = Vec::with_capacity(FIRST_BATCH);
-    let mut entries_sent = 1;
-    let mut entries_in_chunk = 0;
-    let mut retained_directories = 0;
-    while !directories.is_empty() {
-        // Keep the dispatcher inside the pool across a few empty rounds.
-        // Empty steps have no children, remainders, events or warnings, so
-        // skipping the producer round trip cannot change traversal order.
-        // Return every productive round before sending to the consumer: a
-        // backpressured scan must never occupy one of the shared pool threads.
-        use rayon::prelude::*;
-        let steps = pool.install(|| {
-            let started = Instant::now();
-            for round in 0..8 {
-                let count = DIRECTORY_WORKERS.min(directories.len());
-                let work: Vec<_> = (0..count).map(|_| directories.pop().unwrap()).collect();
-                retained_directories -= work.iter().filter(|d| d.opened.is_some()).count();
-                let available =
-                    DESCRIPTOR_DIRECTORY_FDS.saturating_sub(retained_directories + count);
-                let steps: Vec<_> = work
-                    .into_par_iter()
-                    .enumerate()
-                    .map(|(index, directory)| {
-                        let label = directory.relative.clone();
-                        let retain = available / count + usize::from(index < available % count);
-                        scan.step(directory, retain, count == 1).map_err(|error| {
-                            format!("scan: {}: {error:#}", String::from_utf8_lossy(&label))
-                        })
-                    })
-                    .collect();
-                let productive = steps.iter().any(|step| match step {
-                    Ok(step) => {
-                        !step.events.is_empty()
-                            || !step.children.is_empty()
-                            || step.remainder.is_some()
-                    }
-                    Err(_) => true,
-                });
-                if productive
-                    || directories.is_empty()
-                    || round == 7
-                    || started.elapsed() >= FIRST_BATCH_MAX_DELAY
-                {
-                    return steps;
-                }
-            }
-            unreachable!("bounded empty-directory rounds always return")
-        });
-        let mut children = Vec::new();
-        let mut remainders = Vec::new();
-        for step in steps {
-            let events = match step {
-                Ok(step) => {
-                    children.extend(step.children);
-                    remainders.extend(step.remainder);
-                    step.events
-                }
-                Err(error) => vec![ScanEvent::Warning(error)],
-            };
-            for event in events {
-                entries_in_chunk += usize::from(matches!(event, ScanEvent::Entry(_)));
-                chunk.push(event);
-                if chunk.len() >= FIRST_BATCH
-                    && !send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk)
-                {
-                    return;
-                }
-            }
-        }
-        retained_directories += children
-            .iter()
-            .chain(&remainders)
-            .filter(|d| d.opened.is_some())
-            .count();
-        // Finish already-open large directories before opening further ones.
-        // This bounds the number of directory name lists held across steps.
-        children.reverse();
-        directories.extend(children);
-        remainders.reverse();
-        directories.extend(remainders);
-    }
-    let _ = send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -646,25 +525,20 @@ pub(crate) fn scan_descriptor(
     let mut ignored_batch = Vec::new();
     let (tx, rx) = mpsc::sync_channel(BATCH / FIRST_BATCH);
     let scan_root = scan_root.to_vec();
-    let producer = std::thread::Builder::new()
-        .name("syq-descriptor-scan-producer".into())
-        .spawn(move || {
-            produce_descriptor_scan(
-                root,
-                scan_root,
-                vec![DescriptorDirectory {
-                    relative: Vec::new(),
-                    expected: metadata,
-                    opened: None,
-                    names: None,
-                }],
-                hold_destination_for_test,
-                matcher,
-                report_ignored,
-                tx,
-            )
-        })
-        .context("start descriptor scan producer")?;
+    let producer = descriptor_pool::start(
+        &root,
+        descriptor_pool::Options {
+            scan_root,
+            hold_destination_for_test,
+            ignore: matcher,
+            report_ignored,
+        },
+        vec![UnopenedDirectory {
+            relative: Vec::new(),
+            expected: metadata,
+        }],
+        tx,
+    )?;
     let received = receive_scan(
         &rx,
         scan_started,
@@ -701,11 +575,9 @@ pub(crate) fn scan_descriptor_selected(
     for relative in selections {
         let metadata = root.metadata(&RelativePath::new(&join(scan_root, relative))?)?;
         if metadata.is_dir() {
-            directories.push(DescriptorDirectory {
+            directories.push(UnopenedDirectory {
                 relative: relative.clone(),
                 expected: metadata,
-                opened: None,
-                names: None,
             });
         }
     }
@@ -713,12 +585,17 @@ pub(crate) fn scan_descriptor_selected(
     let (tx, rx) = mpsc::sync_channel(BATCH / FIRST_BATCH);
     let scan_root = scan_root.to_vec();
     let scan_started = Instant::now();
-    let producer = std::thread::Builder::new()
-        .name("syq-descriptor-scan-producer".into())
-        .spawn(move || {
-            produce_descriptor_scan(root, scan_root, directories, false, None, false, tx)
-        })
-        .context("start selected descriptor scan producer")?;
+    let producer = descriptor_pool::start(
+        &root,
+        descriptor_pool::Options {
+            scan_root,
+            hold_destination_for_test: false,
+            ignore: None,
+            report_ignored: false,
+        },
+        directories,
+        tx,
+    )?;
     let mut batch = Vec::with_capacity(FIRST_BATCH);
     let mut ignored_batch = Vec::new();
     let received = receive_scan(

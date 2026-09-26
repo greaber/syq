@@ -178,6 +178,28 @@ impl RelativePath {
     }
 }
 
+// A burst remains on its executing thread. Nested file-stage helpers already
+// belong to that burst and must not wait for the directory they currently own.
+thread_local! { static MUTATION_BURSTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+/// Marks a scheduler-owned namespace burst, without replacing confinement or
+/// publication checks. The non-Send scope also suppresses legacy admission.
+pub(crate) struct MutationBurst(std::marker::PhantomData<std::rc::Rc<()>>);
+impl MutationBurst {
+    pub(crate) fn active() -> bool {
+        MUTATION_BURSTS.with(|count| count.get() != 0)
+    }
+    pub(crate) fn enter() -> Self {
+        MUTATION_BURSTS.with(|count| count.set(count.get() + 1));
+        Self(std::marker::PhantomData)
+    }
+}
+impl Drop for MutationBurst {
+    fn drop(&mut self) {
+        MUTATION_BURSTS.with(|count| count.set(count.get() - 1));
+    }
+}
+
 /// An existing directory opened once as the authority boundary.
 pub(crate) struct Root {
     directory: File,
@@ -252,6 +274,11 @@ impl Root {
 
     pub(crate) fn identity(&self) -> RootIdentity {
         self.identity
+    }
+
+    /// Borrow the selected root during a caller-owned descriptor transfer.
+    pub(crate) fn directory_descriptor(&self) -> &File {
+        &self.directory
     }
 
     /// Open the root or a descendant directory without following any
@@ -1302,7 +1329,7 @@ impl Root {
             Err(error) => return Err(error.into()),
         }
         #[cfg(target_os = "linux")]
-        let source_name = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        let source_name = CString::new(crate::sys::proc_fd_path(&file))?;
         #[cfg(not(target_os = "linux"))]
         let source_parent = self.resolve_parent(source)?;
         #[cfg(any(target_os = "linux", test))]

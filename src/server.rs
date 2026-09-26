@@ -503,6 +503,16 @@ fn serve<R: Read + Send + 'static, W: Write>(
             destination: None, ..
         } => {}
     }
+    // An independent stdio/SSH helper already owns a process descriptor table.
+    // Only workers sharing a TCP/named receiver need a separate file executor.
+    if !over_ssh {
+        if let Err(error) = ops.start_data_executor(&role) {
+            w.write_msg(&Response::Err(format!(
+                "initialize filesystem executor: {error:#}"
+            )))?;
+            return Err(error).context("initialize filesystem executor");
+        }
+    }
     // All foreign descriptor claims and their close-on-exec setup are complete
     // before readiness is acknowledged or this connection starts its reader.
     w.write_msg(&Response::HelloOk {
