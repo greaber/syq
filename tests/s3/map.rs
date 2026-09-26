@@ -380,20 +380,22 @@ fn s3_map_rejects_nonempty_slash_objects_for_named_and_contents_selectors() {
 #[test]
 fn s3_mapping_predicates_read_metadata_only_when_needed() {
     let temp = test_support::tempdir().unwrap();
+    // The directory marker prefix/empty/ always costs one HEAD, which confirms
+    // it is a directory; directories bypass --where and are always emitted.
     for (expression, count, heads) in [
-        ("src.size > 1B", 2, 1),
+        ("src.size > 1B", 3, 2),
         (
             "src.s3_last_modified = timestamp('2026-01-01T00:00:00Z')",
             3,
-            1,
+            2,
         ),
-        ("src.name = 'missing' and src.mtime is not null", 0, 1),
-        ("src.kind = 'file'", 1, 4),
+        ("src.name = 'missing' and src.mtime is not null", 1, 2),
+        ("src.kind = 'file'", 2, 4),
         ("src.mtime is null", 1, 4),
         (
             "src.name = 'link' and src.mtime = timestamp('1970-01-01T00:02:03Z')",
-            1,
             2,
+            3,
         ),
     ] {
         let server = MapServer::new("ok");

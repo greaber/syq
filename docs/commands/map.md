@@ -96,9 +96,11 @@ size; `mtime` is the filesystem time stored by syq, omitted if unavailable.
 `s3_last_modified` is S3's object modification time, available only for S3
 sources. Both timestamps use Unix seconds and can be requested independently.
 `--where` selects entries with the same [expressions](../expressions.md) as
-`cp`, including directory entries, while continuing to traverse their children.
+`cp`. As in `cp`, it does not filter directories: directory records are always
+emitted.
 Fields used by a condition need not be included in the output. For example,
-`--where 'src.kind = "file" and src.size > 1MiB'` emits matching file records.
+`--where 'src.kind = "file" and src.size > 1MiB'` emits the matching file records
+and every directory record.
 
 S3 object time comes from listing; requesting `kind` or `mtime` also reads
 object metadata. Generating mappings never downloads object bodies.

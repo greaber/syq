@@ -1879,9 +1879,16 @@ fn mapping_where_selects_records_without_changing_output_fields() {
         .lines()
         .map(|s| serde_json::from_str(s).unwrap())
         .collect();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["src"]["value"], "nested/keep.jpg");
-    assert_eq!(entries[0].as_object().unwrap().len(), 2);
+    // Directory records bypass --where, as directories do in cp.
+    let mut sources: Vec<_> = entries
+        .iter()
+        .map(|entry| entry["src"]["value"].as_str().unwrap())
+        .collect();
+    sources.sort_unstable();
+    assert_eq!(sources, ["empty", "nested", "nested/keep.jpg"]);
+    assert!(entries
+        .iter()
+        .all(|entry| entry.as_object().unwrap().len() == 2));
     let copied = syq_cp_in(
         &t.path(""),
         &["--mapping", "-", "-C", "src", "--into", "mapped"],
@@ -1900,7 +1907,7 @@ fn mapping_where_selects_records_without_changing_output_fields() {
     for dest in ["mapped", "direct"] {
         assert_eq!(read(&t.path(&format!("{dest}/nested/keep.jpg"))), b"photo");
         assert!(!t.path(&format!("{dest}/nested/skip.txt")).exists());
-        assert!(!t.path(&format!("{dest}/empty")).exists());
+        assert!(t.path(&format!("{dest}/empty")).is_dir());
     }
     let excluded = syq_cp_in(
         &t.path(""),
@@ -1917,10 +1924,17 @@ fn mapping_where_selects_records_without_changing_output_fields() {
         Some(&generated.stdout),
     );
     assert_output_ok(&excluded);
-    assert!(!t.path("excluded/nested").exists());
-    let empty = syq_map_in(&t.path(""), &["src", "--where", "false"]);
-    assert_output_ok(&empty);
-    assert!(empty.stdout.is_empty());
+    assert!(t.path("excluded/nested").is_dir());
+    assert!(!t.path("excluded/nested/keep.jpg").exists());
+    let directories = syq_map_in(&t.path(""), &["src", "--where", "false"]);
+    assert_output_ok(&directories);
+    assert_eq!(
+        String::from_utf8(directories.stdout)
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
     let bad = syq_map_in(&t.path(""), &["src", "--where", "dst.exists"]);
     assert!(!bad.status.success());
     assert!(bad.stdout.is_empty());

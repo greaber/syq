@@ -65,7 +65,11 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                     let object_time = output.last_modified().map(|time| (time.secs(), time.subsec_nanos()));
                     let expression_path = crate::expression::source_path(&source.path, b"");
                     let selected = args.expressions.selects_known(
-                        crate::expression::Facts::S3Listing { size, last_modified: object_time }, expression_path)?;
+                        crate::expression::Facts::S3Listing {
+                            size,
+                            directory_marker: client::is_directory_marker(&key, size),
+                            last_modified: object_time,
+                        }, expression_path)?;
                     if selected == Some(false) { continue; }
                     let object = (details || selected.is_none())
                         .then(|| client::from_head(&key, &output)).transpose()?;
@@ -122,7 +126,7 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                             let object_time = if service_time { listed_time(&entry)? } else { None };
                             let expression_path = crate::expression::source_path(source_path.as_bytes(), suffix.as_bytes());
                             let selected = args.expressions.selects_known(
-                                crate::expression::Facts::S3Listing { size: entry.size, last_modified: object_time },
+                                crate::expression::Facts::S3Listing { size: entry.size, directory_marker: marker, last_modified: object_time },
                                 expression_path)?;
                             if selected == Some(false) { return Ok(None); }
                             let object = if details || selected.is_none() {

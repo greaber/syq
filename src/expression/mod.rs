@@ -223,6 +223,7 @@ pub(crate) enum Facts<'a> {
     Complete(&'a File),
     S3Listing {
         size: u64,
+        directory_marker: bool,
         last_modified: Option<(i64, u32)>,
     },
     Unread,
@@ -246,6 +247,7 @@ impl Facts<'_> {
         if let Self::S3Listing {
             size,
             last_modified,
+            ..
         } = self
         {
             return Ok(match field {
@@ -603,6 +605,9 @@ impl Policy {
         self.selection.is_some() || self.update.is_some()
     }
     pub fn selects(&self, src: &File, path: &[u8]) -> Result<bool> {
+        if src.kind == Some(Kind::Dir) {
+            return Ok(true);
+        }
         self.selection
             .as_ref()
             .map_or(Ok(true), |e| {
@@ -618,6 +623,17 @@ impl Policy {
         let Some(expression) = &self.selection else {
             return Ok(Some(true));
         };
+        if matches!(
+            src,
+            Facts::S3Listing {
+                directory_marker: true,
+                ..
+            }
+        ) {
+            // HEAD distinguishes a directory marker from a file/symlink object
+            // stored under a marker-shaped key. Directories bypass --where.
+            return Ok(None);
+        }
         expression
             .evaluate_known(src, path, Facts::Unread, b"", self.now)
             .context("--where")

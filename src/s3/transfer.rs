@@ -1768,6 +1768,7 @@ impl Engine {
                 let facts = known_source.as_ref().map_or(
                     crate::expression::Facts::S3Listing {
                         size,
+                        directory_marker: directory,
                         last_modified: service_time,
                     },
                     crate::expression::Facts::Complete,
@@ -1839,6 +1840,7 @@ impl Engine {
         let source_facts = known_source.as_ref().map_or(
             crate::expression::Facts::S3Listing {
                 size: job.size,
+                directory_marker: client::is_directory_marker(&job.key, job.size),
                 last_modified: service_time,
             },
             crate::expression::Facts::Complete,

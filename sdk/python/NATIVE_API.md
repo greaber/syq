@@ -295,9 +295,9 @@ one version of one exact key. These options are mutually exclusive.
 without copying. Use `from_="server"` or `from_="s3://bucket"` for a remote
 source. Besides the shared arguments, it accepts `as_` to rename a selected
 object. `srcs_in` must be the sole selector when used. `where` accepts the same
-source expression as `cp(where=...)`, including directory selection. Unselected
-directories remain traversable, and expression fields are included in output
-only when requested through `include`.
+source expression as `cp(where=...)`. As in `cp`, it does not filter
+directories, and expression fields are included in output only when requested
+through `include`.
 
 By default entries contain only source and destination paths. `include` is an
 iterable of field names: `kind`, `size`, `mtime`, and `s3_last_modified`.

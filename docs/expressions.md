@@ -1,7 +1,8 @@
 # Select entries with expressions
 
-Use `--where` to select source entries in `map` and `cp`, and `--copy-if`
-to decide whether a copy may update its destination. Both take a quoted expression:
+Use `--where` to select files and other non-directory source entries in `map`
+and `cp`, and `--copy-if` to decide whether a copy may update its destination.
+Both take a quoted expression:
 
 ```sh
 # Copy regular files between 1 MiB and 100 MiB.
@@ -24,7 +25,7 @@ is available only for `cp`. Neither applies to descriptor or pipe copies.
 
 `--where` accepts only `src` fields. `--copy-if` accepts both `src` and `dst`:
 `dst` always names the destination chosen by the copy's placement or mapping.
-Both options must pass when present. Existing policies such as
+For non-directory entries, both options must pass when present. Existing policies such as
 `--only-new` also apply. Each expression option can be supplied once; combine
 conditions with `and` and `or`.
 
@@ -32,26 +33,29 @@ A true expression allows the copy to proceed through its normal comparison.
 It does not force a rewrite of an unchanged file. Use `--hash` when contents
 must be compared even if size and modification time match.
 
-Directories are selected by the same expression as files. A directory failing
-`--where` remains traversable: its children are tested independently. Copying a
-selected child can create necessary parent directories, using destination
-defaults rather than the unselected source directory's metadata. Existing
-unselected directories keep their metadata apart from changes caused by adding
-or removing children. With no filter, directories, including empty ones, are
-selected as usual.
-
-To select JPEGs and also copy all directory entries, including empty directories:
+`--where` does not filter directories. They are copied as in an unfiltered
+copy, with their usual metadata and any `--preserve=FEATURE` controls, and they
+are created even when none of their contents are selected. For example, this
+copies JPEGs while keeping the permissions and modification times of the
+directories around them:
 
 ```sh
 syq cp --srcs-in photos --into archive --preserve=permissions \
-  --where 'src.kind = "dir" or src.extension = "jpg"'
+  --where 'src.extension = "jpg"'
 ```
 
-`map --where` emits matching records; metadata used by the expression is added
-to those records only when requested with `--include`. `cp --copy-if` also
-applies to directories: a false result suppresses their source metadata,
-without blocking selected children. On S3, directory-marker objects are tested
-independently from the objects beneath their prefix.
+`map --where` likewise always emits directory records and filters the others.
+Metadata used by the expression is added to records only when requested with
+`--include`.
+
+`--copy-if` applies to directories too: a false result suppresses their source
+metadata, without blocking their children. Existing filesystem directories then
+keep their metadata, apart from the effects of adding or removing children;
+their permissions can be temporarily reopened for copying and are restored
+afterward. New directories get the receiver's defaults, including its umask and
+setgid inheritance. On S3, directory-marker objects are never filtered by
+`--where`; `--copy-if` can skip their copy, while keys beneath them are
+considered independently.
 
 Use [ignore rules](reference.md#ignoring-paths) to stop traversal of a subtree.
 An expression cannot re-include an ignored path. With `--prune`, excluded
