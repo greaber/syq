@@ -24,6 +24,7 @@ def main():
         return 2
     tag, prepared = sys.argv[1:]
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
+        print(f"invalid release tag: {tag}", file=sys.stderr)
         return 2
     version = tag[1:]
     if output("git", "status", "--porcelain").rstrip("\n"):
@@ -31,12 +32,15 @@ def main():
         return 1
     metadata = json.loads(output("cargo", "metadata", "--locked", "--no-deps",
                                  "--format-version", "1"))
-    if [package["version"] for package in metadata["packages"]
-            if package["name"] == "syq"] != [version]:
+    versions = [package["version"] for package in metadata["packages"] if package["name"] == "syq"]
+    if versions != [version]:
+        print(f"Cargo metadata reports syq {', '.join(versions) or 'missing'}, not {version}",
+              file=sys.stderr)
         return 1
     package = os.path.join(metadata["target_directory"], "package", f"syq-{version}.crate")
     validated = os.path.join(prepared, f"syq-{version}.crate")
     if not os.path.isfile(validated) or os.path.islink(validated):
+        print(f"missing regular prepared crate: {validated}", file=sys.stderr)
         return 1
     if os.path.lexists(package):
         os.remove(package)

@@ -133,6 +133,7 @@ class PackagingTests(unittest.TestCase):
             nix.write_text(
                 "#!/bin/sh\n"
                 + 'test "$6" = "github:greaber/syq/' + revision + '" || exit 1\n'
+                + 'test -z "${NO_HASH:-}" || { echo "{}"; exit 0; }\n'
                 + "echo '{\"hash\":\"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}'\n"
             )
             nix.chmod(0o755)
@@ -145,6 +146,11 @@ class PackagingTests(unittest.TestCase):
             })
             previous = pin.read_bytes()
             subprocess.run([sys.executable, str(script)], env=env, check=True)
+            self.assertEqual(previous, pin.read_bytes())
+            result = subprocess.run([sys.executable, str(script)], env={**env, "NO_HASH": "1"},
+                                    stderr=subprocess.PIPE, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("reported no source hash", result.stderr)
             self.assertEqual(previous, pin.read_bytes())
             manifest.write_text(json.dumps({"tag": "../invalid"}))
             result = subprocess.run([sys.executable, str(script)], env=env)

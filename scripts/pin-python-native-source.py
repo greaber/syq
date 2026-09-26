@@ -17,21 +17,6 @@ def output(*args):
     return completed.stdout.rstrip("\n")
 
 
-def hash_text(prefetched):
-    """The prefetched hash as `jq -r .hash` printed it: "null" when absent and
-    empty when the output is unreadable."""
-    try:
-        source = json.loads(prefetched)
-    except ValueError:
-        return ""
-    if source is None:
-        return "null"
-    if not isinstance(source, dict):
-        return ""
-    value = source.get("hash")
-    return (value if isinstance(value, str) else json.dumps(value)).rstrip("\n")
-
-
 def main():
     os.chdir(ROOT)
     manifest = json.loads(Path("sdk/python/src/syq/syq-release-manifest.json").read_text())
@@ -42,8 +27,15 @@ def main():
     revision = output("git", "rev-parse", f"refs/tags/{tag}^{{commit}}")
     prefetched = output("nix", "--extra-experimental-features", "nix-command flakes", "flake",
                         "prefetch", "--json", f"github:greaber/syq/{revision}")
-    pin = {"tag": tag, "rev": revision, "narHash": hash_text(prefetched)}
-    Path("sdk/python/native-source.json").write_text(json.dumps(pin, indent=2, ensure_ascii=False) + "\n")
+    try:
+        narhash = json.loads(prefetched)["hash"]
+    except (ValueError, KeyError, TypeError):
+        narhash = None
+    if not isinstance(narhash, str) or not narhash:
+        print(f"nix flake prefetch reported no source hash for {revision}", file=sys.stderr)
+        return 1
+    pin = {"tag": tag, "rev": revision, "narHash": narhash}
+    Path("sdk/python/native-source.json").write_text(json.dumps(pin, indent=2) + "\n")
     return 0
 
 

@@ -621,6 +621,7 @@ class PreflightTests(Scratch):
         self.git(self.repo, "switch", "--detach", "-q")
         self.assertPasses(self.preflight())
         status, report = self.readiness()
+        self.assertEqual(status, 0, report)
         self.assertTrue(report["ready"])
         self.assertEqual(len(report["ci"]["workflows"]), 3)
         self.assertEqual(report["ssh"]["profile"], "default")
@@ -631,6 +632,7 @@ class PreflightTests(Scratch):
         self.git(self.repo, "update-ref", "refs/remotes/origin/master", later)
         self.assertPasses(self.preflight(SYQ_TEST_PREFLIGHT_HEAD=later))
         status, report = self.readiness(SYQ_TEST_PREFLIGHT_HEAD=later)
+        self.assertEqual(status, 0, report)
         self.assertTrue(report["ready"])
         self.assertEqual(report["commit"], self.head)
         self.assertEqual(report["remote_master"], later)
@@ -658,6 +660,7 @@ class PreflightTests(Scratch):
 
     def test_existing_release_resumes_without_receipts_or_ci(self):
         # Existing releases resume immediately, even without local SSH receipts or CI.
+        self.receipt.unlink()
         self.git(self.repo, "-c", "tag.gpgsign=false", "tag", "v9.9.9")
         status, report = self.readiness(SYQ_TEST_WORKFLOW_RUNS_JSON='{"workflow_runs":[]}')
         self.assertEqual(status, 1)

@@ -9,6 +9,7 @@ import decimal
 import hashlib
 import json
 import re
+import signal
 import subprocess
 import sys
 
@@ -326,3 +327,49 @@ def join(values, separator):
         else:
             raise JqError(5, f"cannot join {kind(value)}")
     return separator.join(parts)
+
+
+class ForwardSignals:
+    """Run child commands one at a time and pass SIGINT, SIGTERM, and SIGHUP to
+    the running child. Once that child ends, the interrupted script exits with
+    128 plus the signal number, as a shell does; `shield()` lets its cleanup
+    finish without further interruption."""
+
+    SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+    def __init__(self):
+        self.child = None
+        self.received = None
+        for signum in self.SIGNALS:
+            signal.signal(signum, self._receive)
+
+    def _receive(self, signum, frame):
+        if self.received is None:
+            self.received = signum
+        if self.child is not None and self.child.poll() is None:
+            self.child.send_signal(signum)
+
+    def check(self):
+        if self.received is not None:
+            raise SystemExit(128 + self.received)
+
+    def run(self, *args, capture=False, stop=True, **kwargs):
+        """Run a command and return (exit status, captured stdout or None).
+        With stop=False, a signal during the command is left for the caller's
+        next `check()`, so it can record what the command created first."""
+        self.check()
+        sys.stdout.flush()
+        self.child = subprocess.Popen(list(args), stdout=subprocess.PIPE if capture else None,
+                                      text=True, **kwargs)
+        try:
+            output, _ = self.child.communicate()
+        finally:
+            status = self.child.wait()
+            self.child = None
+        if stop:
+            self.check()
+        return status, output
+
+    def shield(self):
+        for signum in self.SIGNALS:
+            signal.signal(signum, signal.SIG_IGN)

@@ -5,12 +5,13 @@ Usage: scripts/test-real-ssh.py [--profile max-sessions-1]
        [--suite core|benchmark|storage|metadata]
 """
 import os
+import secrets
 import shutil
-import signal
 import subprocess
 import sys
-import tempfile
 import time
+
+from tooling import ForwardSignals
 
 USAGE = ("usage: scripts/test-real-ssh.py [--profile max-sessions-1] "
          "[--suite core|benchmark|storage|metadata]")
@@ -18,19 +19,6 @@ USAGE = ("usage: scripts/test-real-ssh.py [--profile max-sessions-1] "
 
 class Die(Exception):
     pass
-
-
-def interrupted(status):
-    def handler(signum, frame):
-        raise SystemExit(status)
-    return handler
-
-
-def run(*args, **kwargs):
-    sys.stdout.flush()
-    completed = subprocess.run(list(args), **kwargs)
-    if completed.returncode:
-        raise SystemExit(completed.returncode)
 
 
 def main():
@@ -83,41 +71,46 @@ def lab():
     elif profile != "default":
         raise Die(f"unknown real-SSH test profile: {profile}")
     os.makedirs(f"{root}/target", exist_ok=True)
-    state = tempfile.mkdtemp(prefix="real-ssh.", dir=f"{root}/target")
-    os.chmod(state, 0o700)
-    token = state.rsplit(".", 1)[-1]
-    project = f"syq-real-ssh-{token.lower()}"
+    # Docker Compose project names allow only lowercase letters, digits,
+    # hyphens, and underscores; a hexadecimal token keeps the name valid.
+    token = secrets.token_hex(4)
+    state = f"{root}/target/real-ssh.{token}"
+    os.mkdir(state, 0o700)
+    project = f"syq-real-ssh-{token}"
     os.environ["SYQ_REAL_SSH_IMAGE"] = f"{project}-node"
     os.environ["SYQ_REAL_SSH_STATE"] = state
     os.environ["SYQ_REAL_SSH_SUITE"] = suite
     compose = ["docker", "compose", "--project-name", project, *compose_files]
 
+    children = ForwardSignals()
+
+    def run(*args):
+        status, _ = children.run(*args)
+        if status:
+            raise SystemExit(status)
+
     passed = False
-    signal.signal(signal.SIGINT, interrupted(130))
-    signal.signal(signal.SIGTERM, interrupted(143))
     try:
         run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "syq real-SSH test", "-f",
             f"{state}/id_ed25519")
         revision = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"],
-                                  stdout=subprocess.PIPE, text=True, check=True).stdout.rstrip("\n")
-        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"],
-                               stdout=subprocess.PIPE, text=True, check=True).stdout.rstrip("\n")
-        if dirty:
+                                  stdout=subprocess.PIPE, text=True, check=True).stdout.strip()
+        if subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"],
+                          stdout=subprocess.PIPE, text=True, check=True).stdout.strip():
             revision += " (dirty)"
         print(f"building real-SSH lab for syq {revision} (profile {profile}, suite {suite})")
         run(*compose, "config", "--quiet")
-        build_started = int(time.time())
+        build_started = time.monotonic()
         run(*compose, "build", "runner")
-        print(f"real-SSH build: {int(time.time()) - build_started}s")
-        execution_started = int(time.time())
+        print(f"real-SSH build: {time.monotonic() - build_started:.0f}s")
+        execution_started = time.monotonic()
         run(*compose, "up", "--detach", "--wait", "--wait-timeout", "60", "source", "destination")
         run(*compose, "run", "--rm", "--no-deps", "runner")
         passed = True
         print(f"real-SSH integration tests passed for syq {revision} (profile {profile}, suite "
-              f"{suite}) in {int(time.time()) - execution_started}s excluding build")
+              f"{suite}) in {time.monotonic() - execution_started:.0f}s excluding build")
     finally:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        children.shield()
         sys.stdout.flush()
         cleanup(compose, state, root, passed)
     return 0
