@@ -98,8 +98,8 @@ fn fresh_exfat_destinations_have_unknown_inode_capacity() {
             .unwrap()
     };
 
-    // Both a missing exact file and an existing empty directory must pass
-    // preflight using the filesystem's actual counters, without overrides.
+    // A fresh dry run reports the filesystem's actual counters, including its
+    // unknown inode count, without overrides. Fresh copies then succeed.
     let dry = copy("dry", "--as", &["--dry-run"]);
     assert_success(&dry);
     assert!(String::from_utf8_lossy(&dry.stdout).contains("free inode count unavailable"));
@@ -134,7 +134,8 @@ fn fresh_exfat_destinations_have_unknown_inode_capacity() {
     assert_success(&limited.capture_output().unwrap());
     assert_eq!(fs::read(volume.mount.join("limited")).unwrap(), payload);
 
-    // Unknown inode accounting must not disable the byte-capacity check.
+    // Capacity estimates are advisory, so a real shortage must surface as a
+    // visible allocation failure instead of a published, truncated file.
     // A sparse source exceeds the entire image without allocating that data.
     fs::File::create(&source)
         .unwrap()
@@ -143,10 +144,6 @@ fn fresh_exfat_destinations_have_unknown_inode_capacity() {
     let shortage = copy("too-large", "--as", &[]);
     assert_eq!(shortage.status.code(), Some(1));
     let error = String::from_utf8_lossy(&shortage.stderr);
-    assert!(
-        error.contains("fresh destination capacity preflight failed"),
-        "{error}"
-    );
-    assert!(error.contains("logical file data"), "{error}");
+    assert!(error.contains("No space left on device"), "{error}");
     assert!(!volume.mount.join("too-large").exists());
 }

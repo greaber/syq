@@ -590,10 +590,10 @@ adaptation_kind = "invocation"
 area = "sparse"
 position = "compatible"
 baseline = "pass"
-platforms = ["linux", "macos"]
+platforms = ["linux"]
 tags = ["local", "sparse"]
 requirements = ["sparse filesystem"]
-note = "Keep all upstream byte/allocation assertions; omit --no-sparse because sparse mode is already off by default."
+note = "Keep all upstream byte/allocation assertions; omit --no-sparse because sparse mode is already off by default. Linux only: the upstream test skips on the macOS CI runner, whose scratch filesystem does not create its sparse source file."
 
 [[tests]]
 name = "acls"

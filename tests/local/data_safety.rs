@@ -295,12 +295,7 @@ fn dry_run_leaves_unsearchable_destination_permissions_unchanged() {
         ]);
         let after = fs::metadata(t.path("dst/sub")).unwrap();
         fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o755)).unwrap();
-        if cfg!(target_os = "macos") && mode == 0 {
-            assert!(!out.status.success(), "{out:?}");
-            assert!(stderr_of(&out).contains("Permission denied"), "{out:?}");
-        } else {
-            assert_output_ok(&out);
-        }
+        assert_output_ok(&out);
         assert_eq!(after.mode(), before.mode());
         assert_eq!(
             (after.ctime(), after.ctime_nsec()),
