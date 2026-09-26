@@ -24,7 +24,7 @@ fn put(path: &[u8]) -> SmallPut {
 
 fn rooted(dir: &Path) -> FsOps {
     let mut ops = FsOps::new();
-    ops.install_destination(File::open(dir).unwrap(), b"logical", None)
+    ops.install_destination(File::open(dir).unwrap(), b"logical")
         .unwrap();
     ops
 }

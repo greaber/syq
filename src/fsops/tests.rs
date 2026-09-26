@@ -1116,7 +1116,7 @@ fn destination_activation_does_not_change_process_cwd() {
     let mut operations = FsOps::new();
 
     operations
-        .install_destination(File::open(&dir).unwrap(), b"logical", None)
+        .install_destination(File::open(&dir).unwrap(), b"logical")
         .unwrap();
 
     assert_eq!(std::env::current_dir().unwrap(), before);
@@ -1210,7 +1210,7 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
 
     let mut rooted = FsOps::new();
     rooted
-        .install_destination(File::open(&dir).unwrap(), b"logical", None)
+        .install_destination(File::open(&dir).unwrap(), b"logical")
         .unwrap();
     let response = rooted.handle(&mkdir(b"logical/made".to_vec(), None));
     assert!(
@@ -1226,7 +1226,7 @@ fn put_small_stages_with_final_mode_and_truncates_reused_sidecar() {
     let dir = crate::test_support::tempdir().unwrap();
     let mut rooted = FsOps::new();
     rooted
-        .install_destination(File::open(dir.path()).unwrap(), b"logical", None)
+        .install_destination(File::open(dir.path()).unwrap(), b"logical")
         .unwrap();
     let copy_id: CopyId = [7; 16];
     // A sidecar left by an interrupted run must be truncated before the new
@@ -3904,7 +3904,7 @@ fn partial_path_batches_preserve_names_errors_and_order() {
     std::os::unix::fs::symlink("parent", temporary.path().join("link")).unwrap();
     let mut operations = FsOps::new();
     operations
-        .install_destination(File::open(temporary.path()).unwrap(), b"logical", None)
+        .install_destination(File::open(temporary.path()).unwrap(), b"logical")
         .unwrap();
     let id = [17; 16];
     let mut cases: Vec<PathBytes> = [

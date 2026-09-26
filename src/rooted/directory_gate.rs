@@ -9,6 +9,23 @@ use super::RootIdentity;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
+// A ready namespace burst already owns its directory turn. Suppress legacy
+// per-syscall admission within that burst, including its registry allocation.
+// The counter is thread-local and the scope cannot move to another thread.
+thread_local! { static BURSTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+pub(super) struct Burst(std::marker::PhantomData<std::rc::Rc<()>>);
+impl Burst {
+    pub(super) fn enter() -> Self {
+        BURSTS.with(|count| count.set(count.get() + 1));
+        Self(std::marker::PhantomData)
+    }
+}
+impl Drop for Burst {
+    fn drop(&mut self) {
+        BURSTS.with(|count| count.set(count.get() - 1));
+    }
+}
+
 // Full serialization delayed local copies. A few contenders preserve the
 // create/rename pipeline without letting every transfer worker spin in the
 // kernel on one directory. Eight retains the CPU saving while avoiding the
@@ -44,22 +61,25 @@ impl Gate {
         }
         state.active += 1;
         drop(state);
-        Permit(self.clone())
+        Permit(Some(self.clone()))
     }
 }
 
-pub(super) struct Permit(Arc<Gate>);
+pub(super) struct Permit(Option<Arc<Gate>>);
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
+        let Some(gate) = &self.0 else {
+            return;
+        };
+        let mut state = gate.state.lock().unwrap();
         state.active -= 1;
         let waiting = state.waiting != 0;
         drop(state);
         // Condvar notification can enter the kernel even without a waiter.
         // Uncontended directories need only the userspace mutex fast path.
         if waiting {
-            self.0.available.notify_one();
+            gate.available.notify_one();
         }
     }
 }
@@ -94,6 +114,9 @@ impl Registry {
 }
 
 pub(super) fn acquire(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
+    if BURSTS.with(|count| count.get() != 0) {
+        return Permit(None);
+    }
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
     let key = Directory {
         root,

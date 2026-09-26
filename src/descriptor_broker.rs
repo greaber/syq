@@ -488,26 +488,6 @@ impl DescriptorSessionSlot {
         }
     }
 
-    /// Drop an internal executor root registration when its pool is retired.
-    /// Workers already holding an imported descriptor retain that exact object.
-    pub(crate) fn release_directory(&self, ticket: &DescriptorTicket) {
-        let session = self.session.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(session) = session.as_ref() {
-            if ticket.secret == session.secret
-                && ticket.socket_path == session.broker.socket_path().as_os_str().as_bytes()
-                && ticket.kind == RegisteredDescriptorKind::Directory
-            {
-                session
-                    .registry
-                    .state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .roots
-                    .remove(&ticket.root_id);
-            }
-        }
-    }
-
     pub(crate) fn register(&self, directory: File) -> Result<DescriptorTicket> {
         Ok(self.register_many(vec![directory])?.remove(0))
     }

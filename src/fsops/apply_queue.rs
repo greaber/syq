@@ -28,7 +28,7 @@ struct Task {
 
 pub(super) struct Burst {
     lane: Lane,
-    pub(super) tasks: Vec<usize>,
+    pub(super) tasks: Vec<(usize, usize)>,
 }
 
 pub(super) struct Queue {
@@ -181,7 +181,7 @@ impl Queue {
     pub(super) fn finished(&self) -> bool {
         self.remaining == 0
     }
-    pub(super) fn operation(&self, task: usize) -> usize {
+    fn operation(&self, task: usize) -> usize {
         self.tasks[task]
             .operation
             .expect("only operations are dispatched")
@@ -194,10 +194,13 @@ impl Queue {
         // A fairness bound, not a threshold derived from a benchmark. Never
         // wait to fill a burst; later ready lanes get the next available turn.
         let count = pending.len().min(64);
-        Some(Burst {
-            lane,
-            tasks: pending.drain(..count).collect(),
-        })
+        let tasks = pending
+            .drain(..count)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|task| (task, self.operation(task)))
+            .collect();
+        Some(Burst { lane, tasks })
     }
 
     pub(super) fn complete(&mut self, task: usize, error: Option<WireError>) {
@@ -272,8 +275,12 @@ mod tests {
         }
     }
     fn complete(queue: &mut Queue, burst: Burst) -> Vec<usize> {
-        let operations = burst.tasks.iter().map(|&id| queue.operation(id)).collect();
-        for &id in &burst.tasks {
+        let operations = burst
+            .tasks
+            .iter()
+            .map(|&(_, operation)| operation)
+            .collect();
+        for &(id, _) in &burst.tasks {
             queue.complete(id, None);
         }
         queue.release(burst);
@@ -311,7 +318,7 @@ mod tests {
             .tasks
             .iter()
             .chain(&second.tasks)
-            .map(|&id| queue.operation(id))
+            .map(|&(_, operation)| operation)
             .collect();
         assert!(ready.contains(&1));
         assert!(ready.contains(&4));

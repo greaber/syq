@@ -2390,22 +2390,23 @@ impl Endpoint {
                 // run_transfer substitutes an isolated receiver for every
                 // destination before opening workers, on every platform.
                 let mut conn = LocalConn::new(&role, descriptor_session.clone());
-                match role {
+                match &role {
                     ConnectionRole::DestinationWorker { .. } => {
                         unreachable!("destination workers require an isolated receiver")
                     }
                     ConnectionRole::SourceWorker { roots } => {
-                        conn.ops.initialize_sources(&roots).map_err(|error| {
+                        conn.ops.initialize_sources(roots).map_err(|error| {
                             WorkerInitializationError(format!(
                                 "initialize local source worker: {error:#}"
                             ))
                         })?
                     }
                     ConnectionRole::StreamWorker { ticket, settings } => {
-                        conn.ops.initialize_stream(&ticket, settings)?
+                        conn.ops.initialize_stream(ticket, *settings)?
                     }
                     ConnectionRole::Control => {}
                 }
+                conn.ops.start_data_executor(&role)?;
                 Ok(Box::new(conn))
             }
             Endpoint::Remote(spec) => {

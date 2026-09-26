@@ -35,10 +35,13 @@ mod apply;
 mod apply_pool;
 mod apply_queue;
 mod entry;
+mod executor;
 mod limits;
+mod namespace;
 mod operator;
 mod partial;
 mod paths;
+mod small_batch;
 
 pub(crate) use apply::*;
 pub(crate) use entry::*;
@@ -435,6 +438,7 @@ struct PreparedSmallCopy {
 }
 
 pub struct FsOps {
+    data_executor: Option<executor::Executor>,
     metadata_pool: apply_pool::Pool,
     prepared_small_copy: Option<PreparedSmallCopy>,
     inode_preservation: crate::inode_metadata::Selection,
@@ -599,6 +603,24 @@ impl Default for FsOps {
 }
 
 impl FsOps {
+    pub(crate) fn start_data_executor(&mut self, role: &ConnectionRole) -> Result<()> {
+        if cfg!(target_os = "linux") && !matches!(role, ConnectionRole::Control) {
+            // An optional ownership optimization must not invalidate roots the
+            // caller already holds when thread/socket resources are exhausted.
+            match executor::Executor::start(self) {
+                Ok(executor) => self.data_executor = executor,
+                Err(error) => {
+                    if crate::output::debug() {
+                        crate::output::diagnostic!(
+                            "syq: filesystem executor unavailable; using caller: {error:#}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_hash_policy(&mut self, policy: crate::hashing::HashPolicy) {
         self.hash_policy = policy;
     }
@@ -615,9 +637,19 @@ impl FsOps {
     }
 
     pub(crate) fn with_descriptor_session(descriptor_session: DescriptorSessionSlot) -> Self {
-        let observations = Arc::new(crate::transfer_observations::Registry::default());
+        Self::with_observations(
+            descriptor_session,
+            Arc::new(crate::transfer_observations::Registry::default()),
+        )
+    }
+
+    fn with_observations(
+        descriptor_session: DescriptorSessionSlot,
+        observations: Arc<crate::transfer_observations::Registry>,
+    ) -> Self {
         let operation = observations.actor("filesystem");
         FsOps {
+            data_executor: None,
             metadata_pool: Default::default(),
             inode_preservation: Default::default(),
             sparse: false,
@@ -746,7 +778,7 @@ impl FsOps {
         }
         let ticket = self.descriptor_session.register(selection.directory)?;
         let directory = self.descriptor_session.acquire(&ticket)?;
-        self.install_destination(directory, request_prefix, Some(ticket.clone()))?;
+        self.install_destination(directory, request_prefix)?;
 
         #[cfg(debug_assertions)]
         test_race_barrier(
@@ -895,7 +927,7 @@ impl FsOps {
             .collect();
         let ticket = self.descriptor_session.register(selection.directory)?;
         let directory = self.descriptor_session.acquire(&ticket)?;
-        self.install_destination(directory, &request.request_prefix, None)?;
+        self.install_destination(directory, &request.request_prefix)?;
 
         let needed = unchanged
             .iter()
@@ -1242,11 +1274,7 @@ impl FsOps {
 
     pub(crate) fn initialize_destination(&mut self, destination: &DestinationRoot) -> Result<()> {
         let directory = self.descriptor_session.acquire(&destination.ticket)?;
-        self.install_destination(
-            directory,
-            &destination.request_prefix,
-            Some(destination.ticket.clone()),
-        )
+        self.install_destination(directory, &destination.request_prefix)
     }
 
     /// Resolve a batch completely before registering any of it. Each result is
@@ -1712,18 +1740,13 @@ impl FsOps {
         bail!("source content request omitted its registered source reference")
     }
 
-    fn install_destination(
-        &mut self,
-        directory: File,
-        request_prefix: &[u8],
-        ticket: Option<DescriptorTicket>,
-    ) -> Result<()> {
+    fn install_destination(&mut self, directory: File, request_prefix: &[u8]) -> Result<()> {
         let root = Arc::new(Root::from_directory(directory)?);
         self.fds.clear();
         self.fd_order.clear();
         self.held_basis.take();
         self.destination_prefix = Some(request_prefix.to_vec());
-        self.metadata_pool = apply_pool::Pool::new(ticket);
+        self.metadata_pool = Default::default();
         self.destination_root = Some(root);
         Ok(())
     }
@@ -2537,9 +2560,7 @@ impl FsOps {
             guard,
             destination_prefix,
         ));
-        let results =
-            self.metadata_pool
-                .run(batch, destination_root.as_ref(), &self.descriptor_session);
+        let results = self.metadata_pool.run(batch, destination_root.as_ref());
         for i in selected {
             out[i] = results[i].clone();
         }

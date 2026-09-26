@@ -70,8 +70,10 @@ pub(crate) fn proc_fd_path(file: &impl AsRawFd) -> String {
 /// thread-local state. After success it may not use descriptors owned by another
 /// thread, including process-global signal-handler descriptors. Blocked signals
 /// stay blocked for this thread's lifetime. Descriptors 0..=2 are retained for
-/// the process's standard input/output and diagnostics.
-pub(crate) unsafe fn isolate_descriptor_table() -> io::Result<()> {
+/// the process's standard input/output and diagnostics. `bootstrap`, when set,
+/// is borrowed from a live caller until this thread acknowledges table setup;
+/// only the private copy may be adopted after a successful separation.
+pub(crate) unsafe fn isolate_descriptor_table(bootstrap: Option<RawFd>) -> io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
         let mut all = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
@@ -93,13 +95,19 @@ pub(crate) unsafe fn isolate_descriptor_table() -> io::Result<()> {
                 return Err(io::Error::from_raw_os_error(restored));
             }
             return match error.raw_os_error() {
-                Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EINVAL) => Ok(()),
+                Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EINVAL) => Ok(false),
                 _ => Err(error),
             };
         }
         // Closing inherited sockets is essential: a dormant copy in this table
         // must not keep an unrelated connection alive. The table is private now.
-        if unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32) } != 0 {
+        let close_range = |first: u32, last: u32| -> io::Result<()> {
+            if first > last {
+                return Ok(());
+            }
+            if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0_u32) } == 0 {
+                return Ok(());
+            }
             let error = io::Error::last_os_error();
             if !matches!(
                 error.raw_os_error(),
@@ -107,9 +115,8 @@ pub(crate) unsafe fn isolate_descriptor_table() -> io::Result<()> {
             ) {
                 return Err(error);
             }
-            // Old kernels or a restricted close_range syscall. Enumerate first,
-            // drop the iterator, then close; no other thread can recycle these
-            // numbers in this table and this thread opens nothing in between.
+            // Enumerate then close without opening anything in between. The
+            // caller owns this table; another thread cannot recycle its slots.
             let descriptors: Vec<RawFd> = std::fs::read_dir(PROC_FD_DIRECTORY)?
                 .map(|entry| {
                     entry.map(|entry| {
@@ -122,16 +129,29 @@ pub(crate) unsafe fn isolate_descriptor_table() -> io::Result<()> {
                 .collect::<io::Result<Vec<Option<RawFd>>>>()?
                 .into_iter()
                 .flatten()
-                .filter(|fd| *fd >= 3)
+                .filter(|fd| *fd >= 3 && (*fd as u32) >= first && (*fd as u32) <= last)
                 .collect();
             for descriptor in descriptors {
                 unsafe {
                     libc::close(descriptor);
                 }
             }
+            Ok(())
+        };
+        if let Some(bootstrap) = bootstrap {
+            debug_assert!(bootstrap >= 3);
+            close_range(3, bootstrap as u32 - 1)?;
+            close_range(bootstrap as u32 + 1, u32::MAX)?;
+        } else {
+            close_range(3, u32::MAX)?;
         }
+        Ok(true)
     }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = bootstrap;
+        Ok(false)
+    }
 }
 
 /// Run a call that reports success as zero, retrying while it is interrupted.

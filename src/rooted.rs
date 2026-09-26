@@ -178,6 +178,21 @@ impl RelativePath {
     }
 }
 
+/// Marks the lifetime of a scheduler-owned namespace burst. This only skips
+/// redundant legacy admission; all confined resolution and identity checks run.
+pub(crate) struct MutationBurst {
+    #[cfg(any(target_os = "linux", test))]
+    _scope: directory_gate::Burst,
+}
+impl MutationBurst {
+    pub(crate) fn enter() -> Self {
+        Self {
+            #[cfg(any(target_os = "linux", test))]
+            _scope: directory_gate::Burst::enter(),
+        }
+    }
+}
+
 /// An existing directory opened once as the authority boundary.
 pub(crate) struct Root {
     directory: File,
@@ -254,11 +269,9 @@ impl Root {
         self.identity
     }
 
-    /// Export the already-selected root for an executor's descriptor handoff.
-    pub(crate) fn duplicate_directory(&self) -> Result<File> {
-        self.directory
-            .try_clone()
-            .context("duplicate selected root for executor")
+    /// Borrow the selected root during a caller-owned descriptor transfer.
+    pub(crate) fn directory_descriptor(&self) -> &File {
+        &self.directory
     }
 
     /// Open the root or a descendant directory without following any
