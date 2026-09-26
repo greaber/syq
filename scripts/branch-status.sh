@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Report the state of the current task branch: the worktree, the branch's
-# pull request, and recent post-merge CI runs on master. Its output is
-# what a status report or review request should state.
+# pull request, and the latest post-merge and nightly CI runs on master. Its
+# output is what a status report or review request should state.
 #
-# Only reads git and GitHub state. With --check it also runs the fixed Rust
-# baseline (fmt, clippy, unit tests) in this worktree.
+# Fetches origin's master, since a local master branch is updated only by
+# manual pulls and says nothing about current master. Otherwise only reads git
+# and GitHub state. With --check it also runs the fixed Rust baseline (fmt,
+# clippy, unit tests) in this worktree.
 #
 # Exit status: 0 when nothing needs attention; 1 when master's latest
-# post-merge run failed, the GitHub head is stale or unrelated, or a --check
+# post-merge or nightly run failed, the GitHub head is stale or unrelated, or a --check
 # step failed or changed worktree status; 2 on usage/tooling errors or HEAD
 # moving during checks (stderr diagnostic, no report, even with --json).
 # Pull-request checks are reported but do not gate handoff or merging.
@@ -51,28 +53,21 @@ if [ -n "$upstream" ]; then
   read -r upstream_ahead upstream_behind < <(git rev-list --left-right --count "HEAD...$upstream")
 fi
 
-master_ref=
-for candidate in refs/remotes/origin/master refs/heads/master; do
-  if git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null; then master_ref=$candidate; break; fi
-done
-master_sha=null
-master_short=
-behind_master=null
-ahead_of_master=null
-if [ -n "$master_ref" ]; then
-  master_sha=$(git rev-parse "$master_ref")
-  master_short=$(git rev-parse --short "$master_ref")
-  read -r ahead_of_master behind_master < <(git rev-list --left-right --count "HEAD...$master_ref")
+master_ref=refs/remotes/origin/master
+if ! git fetch --quiet origin "+refs/heads/master:$master_ref"; then
+  echo "could not fetch master from origin" >&2
+  exit 2
 fi
+master_sha=$(git rev-parse "$master_ref")
+master_short=$(git rev-parse --short "$master_ref")
+read -r ahead_of_master behind_master < <(git rev-list --left-right --count "HEAD...$master_ref")
 
-# Latest run plus failures among the ten most recent post-merge runs.
-# A later success may cover different checks; do not infer that it fixed them.
-# Historical failures are context, not an additional merge gate.
-master_runs='[]'
-for workflow in "${workflows[@]}"; do
-  if ! runs=$(gh run list --repo "$repository" --workflow "$workflow" --branch master --event push --limit 10 \
+# Latest run of a workflow on master for one trigger; sets run and state.
+latest_run() {
+  local workflow=$1 event=$2 kind=$3 runs status conclusion
+  if ! runs=$(gh run list --repo "$repository" --workflow "$workflow" --branch master --event "$event" --limit 1 \
       --json headSha,status,conclusion,url,createdAt,databaseId); then
-    echo "could not list $workflow runs on master" >&2
+    echo "could not list $workflow $kind runs on master" >&2
     exit 2
   fi
   run=$(jq -c 'first // null' <<<"$runs")
@@ -84,14 +79,24 @@ for workflow in "${workflows[@]}"; do
   fi
   case "$state" in
     success) ;;
-    missing) warn "$workflow has no post-merge run on master" ;;
+    missing) warn "$workflow has no $kind run on master" ;;
     queued|in_progress|pending|waiting|requested) ;;
-    *) warn "master is red: $workflow $state at $(jq -r '.headSha[0:7]' <<<"$run") $(jq -r .url <<<"$run")" ;;
+    *) warn "master is red: $workflow $kind $state at $(jq -r '.headSha[0:7]' <<<"$run") $(jq -r .url <<<"$run")" ;;
   esac
-  recent_failures=$(jq -c '[.[] | select(.status == "completed") |
-    select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure") ]' <<<"$runs")
-  master_runs=$(jq -c --argjson recent_failures "$recent_failures" --arg workflow "$workflow" --arg state "$state" --argjson run "$run" \
-    '. + [{workflow:$workflow, state:$state, run:$run, recent_failures:$recent_failures}]' <<<"$master_runs")
+}
+
+# Post-merge runs select checks from the changed paths, so a later success
+# need not rerun an earlier failure. The nightly run covers the full suite
+# whenever test inputs changed since its last success.
+master_runs='[]'
+for workflow in "${workflows[@]}"; do
+  latest_run "$workflow" push post-merge
+  push_run=$run push_state=$state
+  latest_run "$workflow" schedule nightly
+  master_runs=$(jq -c --arg workflow "$workflow" --arg state "$push_state" --argjson run "$push_run" \
+    --arg nightly_state "$state" --argjson nightly_run "$run" \
+    '. + [{workflow:$workflow, state:$state, run:$run, nightly:{state:$nightly_state, run:$nightly_run}}]' \
+    <<<"$master_runs")
 done
 
 # The pull request for this branch, if any.
@@ -193,8 +198,7 @@ if [ "$json" = true ]; then
        staged:$staged, unstaged:$unstaged, untracked:$untracked,
        upstream:(if $upstream == "" then null else $upstream end),
        ahead_of_upstream:$upstream_ahead, behind_upstream:$upstream_behind,
-       master_ref:(if $master_ref == "" then null else $master_ref end),
-       master:(if $master_sha == "null" then null else $master_sha end),
+       master_ref:$master_ref, master:$master_sha,
        ahead_of_master:$ahead_of_master, behind_master:$behind_master},
       master_ci:$master_runs, pull_request:$pr, pull_request_head:$pr_head_relation,
       checks:$checks, warnings:$warnings, exit_status:$exit_status}'
@@ -212,26 +216,22 @@ if [ -n "$upstream" ]; then
 else
   echo "Upstream: none"
 fi
-if [ -n "$master_ref" ]; then
-  echo "Master:   $master_short from $master_ref (branch is ahead $ahead_of_master, behind $behind_master)"
-else
-  echo "Master:   no local master ref"
-fi
+echo "Master:   $master_short from $master_ref (branch is ahead $ahead_of_master, behind $behind_master)"
 echo
-echo "Master CI (latest post-merge run per workflow; success covers only selected checks):"
+echo "Master CI (latest post-merge run per workflow, then its latest nightly full suite):"
+print_run() {
+  local label=$1 state=$2 run=$3
+  if [ "$run" = null ]; then
+    printf '  %-16s %-12s (no run)\n' "$label" "$state"
+  else
+    printf '  %-16s %-12s %s  %s\n' "$label" "$state" "$(jq -r '.headSha[0:7]' <<<"$run")" "$(jq -r .url <<<"$run")"
+  fi
+}
 while IFS= read -r entry; do
   [ -n "$entry" ] || continue
-  workflow=$(jq -r .workflow <<<"$entry")
-  state=$(jq -r .state <<<"$entry")
-  if [ "$(jq -r .run <<<"$entry")" = null ]; then
-    printf '  %-16s %-12s (no run)\n' "$workflow" "$state"
-  else
-    printf '  %-16s %-12s %s  %s\n' "$workflow" "$state" \
-      "$(jq -r '.run.headSha[0:7]' <<<"$entry")" "$(jq -r .run.url <<<"$entry")"
-  fi
-  jq -r '.recent_failures[] | "    Recent failure: \(.conclusion) \(.headSha[0:7])  \(.url)"' <<<"$entry"
+  print_run "$(jq -r .workflow <<<"$entry")" "$(jq -r .state <<<"$entry")" "$(jq -c .run <<<"$entry")"
+  print_run '  nightly' "$(jq -r .nightly.state <<<"$entry")" "$(jq -c .nightly.run <<<"$entry")"
 done < <(jq -c '.[]' <<<"$master_runs")
-echo "Recent failures cover the last 10 pushes per workflow; they may already be fixed. Compare check coverage before treating a later success as recovery."
 echo
 if [ "$pr" = null ]; then
   echo "Pull request: none for $branch"
