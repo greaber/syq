@@ -178,18 +178,25 @@ impl RelativePath {
     }
 }
 
-/// Marks the lifetime of a scheduler-owned namespace burst. This only skips
-/// redundant legacy admission; all confined resolution and identity checks run.
-pub(crate) struct MutationBurst {
-    #[cfg(any(target_os = "linux", test))]
-    _scope: directory_gate::Burst,
-}
+// A burst remains on its executing thread. Nested file-stage helpers already
+// belong to that burst and must not wait for the directory they currently own.
+thread_local! { static MUTATION_BURSTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+/// Marks a scheduler-owned namespace burst, without replacing confinement or
+/// publication checks. The non-Send scope also suppresses legacy admission.
+pub(crate) struct MutationBurst(std::marker::PhantomData<std::rc::Rc<()>>);
 impl MutationBurst {
+    pub(crate) fn active() -> bool {
+        MUTATION_BURSTS.with(|count| count.get() != 0)
+    }
     pub(crate) fn enter() -> Self {
-        Self {
-            #[cfg(any(target_os = "linux", test))]
-            _scope: directory_gate::Burst::enter(),
-        }
+        MUTATION_BURSTS.with(|count| count.set(count.get() + 1));
+        Self(std::marker::PhantomData)
+    }
+}
+impl Drop for MutationBurst {
+    fn drop(&mut self) {
+        MUTATION_BURSTS.with(|count| count.set(count.get() - 1));
     }
 }
 

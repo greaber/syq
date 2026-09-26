@@ -9,23 +9,6 @@ use super::RootIdentity;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
-// A ready namespace burst already owns its directory turn. Suppress legacy
-// per-syscall admission within that burst, including its registry allocation.
-// The counter is thread-local and the scope cannot move to another thread.
-thread_local! { static BURSTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-pub(super) struct Burst(std::marker::PhantomData<std::rc::Rc<()>>);
-impl Burst {
-    pub(super) fn enter() -> Self {
-        BURSTS.with(|count| count.set(count.get() + 1));
-        Self(std::marker::PhantomData)
-    }
-}
-impl Drop for Burst {
-    fn drop(&mut self) {
-        BURSTS.with(|count| count.set(count.get() - 1));
-    }
-}
-
 // Full serialization delayed local copies. A few contenders preserve the
 // create/rename pipeline without letting every transfer worker spin in the
 // kernel on one directory. Eight retains the CPU saving while avoiding the
@@ -114,7 +97,7 @@ impl Registry {
 }
 
 pub(super) fn acquire(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
-    if BURSTS.with(|count| count.get() != 0) {
+    if super::MutationBurst::active() {
         return Permit(None);
     }
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
@@ -200,13 +183,13 @@ mod tests {
         let root = RootIdentity { dev: 9, ino: 7 };
         let parent = vec![b"burst".to_vec()];
         assert!(acquire(root, &parent).0.is_some());
-        let outer = Burst::enter();
+        let outer = crate::rooted::MutationBurst::enter();
         assert!(acquire(root, &parent).0.is_none());
         std::thread::scope(|scope| {
             scope.spawn(|| assert!(acquire(root, &parent).0.is_some()));
         });
         assert!(std::panic::catch_unwind(|| {
-            let _inner = Burst::enter();
+            let _inner = crate::rooted::MutationBurst::enter();
             assert!(acquire(root, &parent).0.is_none());
             panic!("mutation failed");
         })

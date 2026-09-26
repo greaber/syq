@@ -21,6 +21,37 @@ pub(crate) unsafe fn spawn<S: 'static>(
     setup: impl FnOnce(Vec<File>) -> Result<S> + Send + 'static,
     run: impl FnOnce(S) + Send + 'static,
 ) -> Result<Option<JoinHandle<()>>> {
+    Ok(unsafe {
+        spawn_connected(
+            name,
+            require_private,
+            handles,
+            move |handles, socket| {
+                drop(socket);
+                setup(handles)
+            },
+            run,
+        )?
+    }
+    .map(|(thread, socket)| {
+        drop(socket);
+        thread
+    }))
+}
+
+/// As `spawn`, retaining a private socket endpoint on each side for later
+/// descriptor handoffs. The caller must close its endpoint before joining a
+/// worker that might be waiting for a handoff.
+///
+/// # Safety
+/// The descriptor ownership restrictions of `spawn` apply to both callbacks.
+pub(crate) unsafe fn spawn_connected<S: 'static>(
+    name: String,
+    require_private: bool,
+    handles: &[&File],
+    setup: impl FnOnce(Vec<File>, UnixStream) -> Result<S> + Send + 'static,
+    run: impl FnOnce(S) + Send + 'static,
+) -> Result<Option<(JoinHandle<()>, UnixStream)>> {
     fn above_stdio(socket: UnixStream) -> Result<UnixStream> {
         if socket.as_raw_fd() >= 3 {
             return Ok(socket);
@@ -80,8 +111,7 @@ pub(crate) unsafe fn spawn<S: 'static>(
                     );
                     handles.extend(files);
                 }
-                drop(socket);
-                setup(handles)
+                setup(handles, socket)
             })();
             match setup {
                 Ok(state) => {
@@ -112,8 +142,8 @@ pub(crate) unsafe fn spawn<S: 'static>(
         let descriptors: Vec<_> = files.iter().map(|file| file.as_raw_fd()).collect();
         crate::descriptor_broker::send_message(sender.as_raw_fd(), &[1], &descriptors)
     });
-    drop(sender);
     if let Err(error) = sent {
+        drop(sender);
         let _ = thread.join();
         return Err(error).context("send executor descriptors");
     }
@@ -122,8 +152,9 @@ pub(crate) unsafe fn spawn<S: 'static>(
         .context("executor stopped during initialization")
         .and_then(|result| result)
     {
-        Ok(()) => Ok(Some(thread)),
+        Ok(()) => Ok(Some((thread, sender))),
         Err(error) => {
+            drop(sender);
             let _ = thread.join();
             Err(error)
         }

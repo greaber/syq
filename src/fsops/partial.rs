@@ -53,7 +53,9 @@ impl FsOps {
         // reopen this new inode for writing. Finalize applies the requested
         // mode after every writer is done. Never chmod an existing destination
         // here: its write permissions still decide whether an update is allowed.
+        let turn = namespace::single(root, relative)?;
         let file = root.create_file(relative, mode | 0o200)?;
+        drop(turn);
         let permissions = file.metadata()?.permissions();
         if permissions.mode() & 0o200 == 0 {
             // A umask or inherited default ACL can remove even owner write.
@@ -82,6 +84,7 @@ impl FsOps {
         create_if_missing: bool,
         create_mode: u32,
     ) -> Result<Option<(File, Option<u64>)>> {
+        let _turn = namespace::single(root, relative)?;
         self.uncache_rooted(root, relative);
         let mut repaired_permissions = false;
         if create_if_missing {
@@ -2468,6 +2471,7 @@ pub(super) fn publish_partial_rooted(
     staged: &File,
     condition: TargetCondition,
 ) -> Result<()> {
+    let _turn = namespace::single(root, target)?;
     let metadata = staged.metadata()?;
     if !is_safe_partial(&metadata) {
         bail!("confined partial is not a private regular file");

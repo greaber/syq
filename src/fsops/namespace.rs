@@ -66,6 +66,30 @@ impl Registry {
     }
 }
 
+/// A singleton stage joins the same queue as batched work. Its request cannot
+/// offer other ready files, so park before the short namespace phase. Callers
+/// release this turn before resizing, allocating or writing file data.
+pub(super) fn single(root: &Root, relative: &RelativePath) -> Result<Option<Turn>> {
+    if crate::rooted::MutationBurst::active() {
+        return Ok(None);
+    }
+    let path = relative.to_path_buf();
+    let parent = path
+        .parent()
+        .context("namespace operation requires a leaf")?;
+    let directory = root.open_directory(&RelativePath::new(parent.as_os_str().as_bytes())?)?;
+    let domain = Domain::new(directory)?;
+    let wake = Arc::new(Wake::default());
+    let mut ticket = domain.request(&wake);
+    loop {
+        let version = wake.version();
+        if let Some(turn) = ticket.try_enter() {
+            return Ok(Some(turn));
+        }
+        wake.wait(version);
+    }
+}
+
 pub(super) struct Domain {
     pub(super) identity: RootIdentity,
     _directory: File,
