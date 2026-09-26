@@ -37,7 +37,9 @@ try:
         assert invoked.stdout == direct.stdout, (invoked.stdout, direct.stdout)
     filtered = run(['syq', 'map', '--from', 'source', '--srcs-in', root,
                     '--where', 'src.kind = "file"'])
-    assert len(filtered.stdout.splitlines()) == 1
+    # --where filters the file, link and FIFO records; directories always remain.
+    assert sorted(json.loads(line)['src']['value'] for line in filtered.stdout.splitlines()) \
+        == ['empty', 'photos', 'photos/line\n%2F+'], filtered.stdout
     for option in ['mtime', '-mtime']:
         destination = '/tmp/syq-real-ssh/mtime-' + option
         run(['syq', 'cp', '--from', 'source', '-C', root, '--src', 'photos/line\n%2F+',
