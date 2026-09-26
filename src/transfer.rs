@@ -520,6 +520,40 @@ enum SmallCopy {
 struct SmallCopySources {
     roots: Vec<RegisteredSourceRoot>,
     entries: Option<Vec<Entry>>,
+    claim_workers: usize,
+}
+
+/// Foreign source claims that macOS cloning may reserve. Cloning is optional:
+/// when its claims do not fit, return 0 so the copy keeps its normal worker
+/// budget and byte-copies on every filesystem, including APFS. Registration
+/// still rejects a budget that cannot accommodate the ordinary copy itself.
+///
+/// The source is in this process, so this uses registration's admission
+/// check. Call it after the source control connection is open, as
+/// registration is: an earlier count misses that connection's descriptors
+/// and can admit claims that registration then rejects.
+fn admitted_clone_claim_workers(
+    root_count: usize,
+    shared_workers: usize,
+    claim_workers: usize,
+) -> usize {
+    if !cfg!(target_os = "macos")
+        || claim_workers == 0
+        || crate::fsops::require_source_descriptor_capacity(
+            root_count,
+            shared_workers,
+            claim_workers,
+        )
+        .is_ok()
+    {
+        return claim_workers;
+    }
+    if debug() {
+        crate::output::diagnostic!(
+            "syq: macOS cloning disabled: source descriptor budget leaves no room for clone claims"
+        );
+    }
+    0
 }
 
 /// Whether a native push of local files to a remote directory may try the
@@ -1684,40 +1718,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     // Only workers that can attempt local offload need foreign source claims.
     // Actual local destinations live in a separate receiver process.
-    let mut copy_local_claim_workers = if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy()
-    {
+    let copy_local_claim_workers = if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() {
         budgeted_workers
     } else {
         0
     };
-    // macOS cloning is optional. Its source is in this process, so use the
-    // same admission check as registration before reserving foreign claims.
-    // If those claims do not fit, keep the normal worker budget and byte-copy
-    // path on every filesystem, including APFS. Registration still rejects
-    // a budget that cannot accommodate the ordinary copy itself.
-    if cfg!(target_os = "macos")
-        && copy_local_claim_workers > 0
-        && crate::fsops::require_source_descriptor_capacity(
-            srcs.len(),
-            source_shared_workers,
-            copy_local_claim_workers,
-        )
-        .is_err()
-    {
-        opts.local_copy_fd_budget = false;
-        copy_local_claim_workers = 0;
-        if debug() {
-            crate::output::diagnostic!(
-                "syq: macOS cloning disabled: source descriptor budget leaves no room for clone claims"
-            );
-        }
-    }
-    let source_independent_handoff_workers = copy_local_claim_workers
-        .checked_add(match &src_ep {
-            Endpoint::Local { .. } => 0,
-            Endpoint::Remote(_) => budgeted_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
-        })
-        .context("source worker count overflow")?;
+    let remote_source_handoff_workers = match &src_ep {
+        Endpoint::Local { .. } => 0,
+        Endpoint::Remote(_) => budgeted_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
+    };
     let small_copy_candidate = small_copy_eligible(&args, srcs, dst, &src_ep, &dst_ep);
     let (mut src_ctl, early_sources, mut dst_ctl) = {
         let (a, b) = (src_ep.clone(), args.clone());
@@ -1726,12 +1735,19 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let t = std::thread::spawn(move || -> Result<_> {
             let mut connection = connect_ctl(&a, &b)?;
             let sources = if let Some(sources) = candidates {
+                let claim_workers = admitted_clone_claim_workers(
+                    sources.len(),
+                    source_shared_workers,
+                    copy_local_claim_workers,
+                );
                 let roots = register_source_roots(
                     &mut *connection,
                     &sources,
                     &b,
                     source_shared_workers,
-                    source_independent_handoff_workers,
+                    claim_workers
+                        .checked_add(remote_source_handoff_workers)
+                        .context("source worker count overflow")?,
                 )?;
                 let entries = sources
                     .iter()
@@ -1747,7 +1763,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .flatten()
                     })
                     .collect();
-                Some(SmallCopySources { roots, entries })
+                Some(SmallCopySources {
+                    roots,
+                    entries,
+                    claim_workers,
+                })
             } else {
                 None
             };
@@ -1771,6 +1791,20 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     };
+    let clone_claim_workers = match &early_sources {
+        Some(sources) => sources.claim_workers,
+        None => admitted_clone_claim_workers(
+            srcs.len(),
+            source_shared_workers,
+            copy_local_claim_workers,
+        ),
+    };
+    if clone_claim_workers < copy_local_claim_workers {
+        opts.local_copy_fd_budget = false;
+    }
+    let source_independent_handoff_workers = clone_claim_workers
+        .checked_add(remote_source_handoff_workers)
+        .context("source worker count overflow")?;
     let platform = |endpoint: &Endpoint| -> Result<String> {
         match endpoint {
             Endpoint::Remote(spec) => Ok(spec
@@ -2091,7 +2125,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     };
     let (registered_sources, small_entries) = match early_sources {
-        Some(SmallCopySources { roots, entries }) => (roots, entries),
+        Some(SmallCopySources { roots, entries, .. }) => (roots, entries),
         None => (
             register_source_roots(
                 &mut *src_ctl,
