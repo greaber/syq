@@ -21,6 +21,8 @@ use std::{
 pub(super) struct State {
     persistent: Option<PersistentState>,
     writable: AtomicBool,
+    // A record this process could not read is left alone, even on success.
+    readable: AtomicBool,
     recorded: AtomicBool,
 }
 impl State {
@@ -45,32 +47,34 @@ impl State {
     fn open_at(path: std::path::PathBuf, identity: &[u8]) -> Result<Self> {
         match PersistentState::open(path, identity) {
             Ok(state) => Ok(Self::new(Some(state))),
-            Err(error) if cache_io_error(&error) => {
+            Err(error) if blocked(&error) => Err(error),
+            Err(error) => {
                 warn(&format!("{error:#}"));
                 Ok(Self::new(None))
             }
-            Err(error) => Err(error),
         }
     }
     fn new(persistent: Option<PersistentState>) -> Self {
         Self {
             writable: AtomicBool::new(persistent.is_some()),
+            readable: AtomicBool::new(true),
             persistent,
             recorded: AtomicBool::new(false),
         }
     }
-    // Only filesystem failures make the cache optional. Invalid records,
-    // unsafe identities and a busy recovery lock still stop the transfer.
-    fn optional_io<T>(&self, result: Result<T>) -> Result<Option<T>> {
+    // The cache is optional: a copy continues without it when it cannot be
+    // read, written, or trusted. Only an invalid record and a busy recovery
+    // lock stop the transfer, because they need the user's attention.
+    fn optional<T>(&self, result: Result<T>) -> Result<Option<T>> {
         match result {
             Ok(value) => Ok(Some(value)),
-            Err(error) if cache_io_error(&error) => {
+            Err(error) if blocked(&error) => Err(error),
+            Err(error) => {
                 if self.writable.swap(false, Relaxed) {
                     warn(&format!("{error:#}"));
                 }
                 Ok(None)
             }
-            Err(error) => Err(error),
         }
     }
     pub fn load<T: DeserializeOwned>(&self) -> Result<Option<T>> {
@@ -81,7 +85,11 @@ impl State {
         else {
             return Ok(None);
         };
-        let value = self.optional_io(state.load())?.flatten();
+        let loaded = self.optional(state.load())?;
+        if loaded.is_none() {
+            self.readable.store(false, Relaxed);
+        }
+        let value = loaded.flatten();
         self.recorded.store(value.is_some(), Relaxed);
         Ok(value)
     }
@@ -91,7 +99,7 @@ impl State {
             .as_ref()
             .filter(|_| self.writable.load(Relaxed))
         {
-            if self.optional_io(state.save(value))?.is_some() {
+            if self.optional(state.save(value))?.is_some() {
                 self.recorded.store(true, Relaxed);
             }
         }
@@ -99,10 +107,14 @@ impl State {
     }
     pub fn clear(&self) -> Result<()> {
         self.recorded.store(false, Relaxed);
-        if let Some(state) = &self.persistent {
+        if let Some(state) = self
+            .persistent
+            .as_ref()
+            .filter(|_| self.readable.load(Relaxed))
+        {
             // Try cleanup even after a checkpoint failure, but do not turn a
             // completed copy into an error because its cache is unwritable.
-            self.optional_io(state.clear())?;
+            self.optional(state.clear())?;
         }
         Ok(())
     }
@@ -110,19 +122,27 @@ impl State {
         self.recorded.load(Relaxed)
     }
 }
-fn cache_io_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|e| {
-        e.downcast_ref::<std::io::Error>()
-            // O_NOFOLLOW rejects substituted cache files with ELOOP. Keep
-            // that identity check fatal instead of treating it as capacity
-            // or permission failure.
-            .is_some_and(|e| e.raw_os_error() != Some(libc::ELOOP))
-    })
+// A recovery problem the user should resolve rather than have syq bypass.
+#[derive(Debug)]
+struct Blocked(String);
+impl std::fmt::Display for Blocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Blocked {}
+fn blocked(error: &anyhow::Error) -> bool {
+    // Also finds Blocked when it was attached as context.
+    error.downcast_ref::<Blocked>().is_some()
 }
 fn warn(reason: &str) {
-    crate::output::diagnostic!(
-        "syq: warning: cannot use S3 recovery cache ({reason}); continuing without saving recovery progress"
-    );
+    // Every multipart object opens its own record; say this once per process.
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Relaxed) {
+        crate::output::diagnostic!(
+            "syq: warning: cannot use S3 recovery cache ({reason}); continuing without saving recovery progress"
+        );
+    }
 }
 
 struct PersistentState {
@@ -136,7 +156,10 @@ impl PersistentState {
         std::fs::create_dir_all(&path).context("create S3 recovery directory")?;
         let m = std::fs::symlink_metadata(&path)?;
         if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
-            bail!("S3 recovery directory must be owned by this user and not be a symlink");
+            bail!(
+                "{} is a symlink or is not a directory owned by this user",
+                path.display()
+            );
         }
         // A private, searchable cache can already be used read-only. Avoid
         // chmod on every open: even an unchanged mode fails on a read-only FS.
@@ -157,17 +180,20 @@ impl PersistentState {
                     Err(error) => return Err(error),
                 }
             }
-            Err(error) if cache_io_error(&error) => root.open_regular_read(&lock_path)?,
-            Err(error) => return Err(error),
+            // flock needs only a readable descriptor.
+            Err(_) => root.open_regular_read(&lock_path)?,
         };
         let m = lock.metadata()?;
         if m.nlink() != 1 || m.uid() != unsafe { libc::geteuid() } {
-            bail!("unsafe S3 recovery lock");
+            bail!("S3 recovery lock is not a private file owned by this user");
         }
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::WouldBlock {
-                bail!("another S3 copy is using this recovery record; retry after it finishes");
+                return Err(Blocked(
+                    "another S3 copy is using this recovery record; retry after it finishes".into(),
+                )
+                .into());
             }
             return Err(error).context("lock S3 recovery record");
         }
@@ -198,17 +224,24 @@ impl PersistentState {
         }
         let file = self.root.open_regular_read(&path)?;
         let m = file.metadata()?;
-        if m.nlink() != 1 || m.uid() != unsafe { libc::geteuid() } || m.len() > 16 * 1024 * 1024 {
-            bail!("unsafe S3 recovery record");
+        if m.nlink() != 1 || m.uid() != unsafe { libc::geteuid() } {
+            bail!("S3 recovery record is not a private file owned by this user");
+        }
+        let invalid = || {
+            Blocked(format!(
+                "invalid S3 recovery record {}; preserve it for recovery or remove it to restart",
+                self.directory.join(format!("{}.json", self.name)).display()
+            ))
+        };
+        if m.len() > 16 * 1024 * 1024 {
+            return Err(invalid().into());
         }
         let mut text = Vec::new();
         file.take(16 * 1024 * 1024 + 1).read_to_end(&mut text)?;
-        Ok(Some(serde_json::from_slice(&text).with_context(|| {
-            format!(
-                "invalid S3 recovery record {}; preserve it for recovery or remove it to restart",
-                self.directory.join(format!("{}.json", self.name)).display()
-            )
-        })?))
+        match serde_json::from_slice(&text) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => Err(anyhow::Error::new(error).context(invalid())),
+        }
     }
     pub fn save<T: Serialize>(&self, value: &T) -> Result<()> {
         let tmp = self.temporary()?;
@@ -380,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_records_and_unsafe_cache_paths_are_still_errors() {
+    fn invalid_records_are_still_errors() {
         let temp = crate::test_support::tempdir().unwrap();
         let directory = temp.path().join("cache");
         let state = State::open_at(directory.clone(), b"download").unwrap();
@@ -389,13 +422,57 @@ mod tests {
         std::fs::write(&path, b"{").unwrap();
         let error = state.load::<serde_json::Value>().unwrap_err();
         assert!(format!("{error:#}").contains(path.to_str().unwrap()));
-        std::fs::remove_file(&path).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(16 * 1024 * 1024 + 1)
+            .unwrap();
+        let error = state.load::<serde_json::Value>().unwrap_err();
+        assert!(format!("{error:#}").contains(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn untrusted_cache_entries_are_skipped_and_kept() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let directory = temp.path().join("cache");
+        let state = State::open_at(directory.clone(), b"download").unwrap();
+        let name = state.persistent.as_ref().unwrap().name.clone();
+        drop(state);
+        let path = directory.join(format!("{name}.json"));
         let other = temp.path().join("other.json");
-        std::fs::write(&other, b"{}").unwrap();
-        std::os::unix::fs::symlink(other, &path).unwrap();
-        assert!(state.load::<serde_json::Value>().is_err());
+        std::fs::write(&other, br#"{"parts": {}}"#).unwrap();
+        for link in [
+            std::os::unix::fs::symlink::<&std::path::Path, &std::path::Path>,
+            std::fs::hard_link,
+        ] {
+            link(&other, &path).unwrap();
+            let state = State::open_at(directory.clone(), b"download").unwrap();
+            assert!(state.load::<serde_json::Value>().unwrap().is_none());
+            state
+                .save(&serde_json::json!({"parts": {"0": "new"}}))
+                .unwrap();
+            assert!(!state.has_record());
+            state.clear().unwrap();
+            drop(state);
+            // A record this process could not read is neither replaced nor removed.
+            assert!(std::fs::symlink_metadata(&path).is_ok());
+            assert_eq!(std::fs::read(&other).unwrap(), br#"{"parts": {}}"#);
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        let lock = directory.join(format!("{name}.lock"));
+        std::fs::hard_link(&lock, temp.path().join("lock-alias")).unwrap();
+        let state = State::open_at(directory.clone(), b"download").unwrap();
+        assert!(state.persistent.is_none());
+        std::fs::remove_file(temp.path().join("lock-alias")).unwrap();
+
+        // The same check covers a cache directory owned by another user.
         let alias = temp.path().join("alias");
-        std::os::unix::fs::symlink(directory, &alias).unwrap();
-        assert!(State::open_at(alias, b"other").is_err());
+        std::os::unix::fs::symlink(&directory, &alias).unwrap();
+        let state = State::open_at(alias, b"download").unwrap();
+        assert!(state.persistent.is_none());
+        assert!(State::open_at(directory, b"download")
+            .unwrap()
+            .persistent
+            .is_some());
     }
 }

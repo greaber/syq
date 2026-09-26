@@ -310,6 +310,14 @@ impl Engine {
                 parallel(prepared, workers, |(key, label, kind, expected, work)| {
                     let engine = self.clone();
                     async move {
+                        // Keep admitting jobs after cancellation so each one can
+                        // abort its unrecorded upload, but report nothing new.
+                        if engine.check_cancelled().is_err() {
+                            if let UploadPreparation::Ready(work) = &work {
+                                engine.abort_unrecorded_preparation(work).await;
+                            }
+                            return Ok(None);
+                        }
                         let result = engine.execute_upload(work).await;
                         engine.settle(&label, &key, kind, &result, expected.as_ref());
                         Ok(result.ok().flatten())

@@ -83,6 +83,16 @@ fn configure_cache(command: &mut Command, root: &Path, mode: &str) -> Option<Rea
             command.env("XDG_CACHE_HOME", cache);
             None
         }
+        "untrusted-cache" => {
+            // A symlinked recovery directory fails the same check as one owned
+            // by another user, which a non-root test cannot create.
+            let elsewhere = root.join("elsewhere");
+            std::fs::create_dir_all(root.join("cache/syq")).unwrap();
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, root.join("cache/syq/s3")).unwrap();
+            command.env("XDG_CACHE_HOME", root.join("cache"));
+            None
+        }
         "no-home" => None,
         _ => unreachable!(),
     }
@@ -94,6 +104,7 @@ fn multipart_upload_accepts_read_only_source_and_unavailable_cache() {
         ("read-only-home", "sha256"),
         ("blocked-cache", "sha256"),
         ("no-home", "sha256"),
+        ("untrusted-cache", "sha256"),
         ("blocked-cache", "md5"),
     ] {
         // Root bypasses permission bits; the other cases still exercise absent
@@ -106,27 +117,48 @@ fn multipart_upload_accepts_read_only_source_and_unavailable_cache() {
         let source = temp.path().join("source");
         std::fs::create_dir(&source).unwrap();
         let bytes = vec![b'x'; SIZE];
-        let file = source.join("data");
-        std::fs::write(&file, &bytes).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let files = ["first", "second"].map(|name| source.join(name));
+        for file in &files {
+            std::fs::write(file, &bytes).unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
         let _source = ReadOnlyDirectory::new(source);
         let mut command = server.command(temp.path());
         let _home = configure_cache(&mut command, temp.path(), mode);
         command.arg(format!("--integrity-checking=transfer={algorithm}"));
         let output = command
             .args(["--s3-endpoint", &server.address])
-            .arg(&file)
-            .args(["--to", "s3://bucket", "--as", "object"])
+            .arg("--srcs-in")
+            .arg(&_source.0)
+            .args(["--to", "s3://bucket", "--into", "prefix"])
             .capture_output()
             .unwrap();
         assert!(output.status.success(), "{mode}: {}", output_text(&output));
-        assert!(output_text(&output).contains("without saving recovery progress"));
+        // Each multipart object opens its own record, but one warning suffices.
+        assert_eq!(
+            output_text(&output)
+                .matches("without saving recovery progress")
+                .count(),
+            1,
+            "{mode}: {}",
+            output_text(&output)
+        );
         assert!(server.gate.0.load(Ordering::Relaxed));
         assert!(!server.gate.1.load(Ordering::Relaxed));
-        assert_eq!(std::fs::read(file).unwrap(), bytes);
-        assert_eq!(std::fs::read_dir(&_source.0).unwrap().count(), 1);
+        for file in files {
+            assert_eq!(std::fs::read(file).unwrap(), bytes);
+        }
+        assert_eq!(std::fs::read_dir(&_source.0).unwrap().count(), 2);
         if let Some(home) = _home {
             assert_eq!(std::fs::read_dir(&home.0).unwrap().count(), 0);
+        }
+        if mode == "untrusted-cache" {
+            assert_eq!(
+                std::fs::read_dir(temp.path().join("elsewhere"))
+                    .unwrap()
+                    .count(),
+                0
+            );
         }
     }
 }
