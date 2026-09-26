@@ -39,20 +39,17 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || 'master' }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-pages-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/dev-tools.sh github python node mdbook
       - name: Check documentation links
         run: python3 scripts/check-doc-links.py
-      - name: Install mdBook
-        env:
-          MDBOOK_VERSION: v0.5.4
-          MDBOOK_SHA256: 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7
-        run: |
-          set -euo pipefail
-          curl --proto '=https' --tlsv1.2 -sSfL -o mdbook.tar.gz \
-            "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/mdbook-${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-          echo "${MDBOOK_SHA256}  mdbook.tar.gz" | sha256sum -c -
-          mkdir -p "$HOME/.local/bin"
-          tar -xzf mdbook.tar.gz -C "$HOME/.local/bin" mdbook
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Test version selection
         run: |
           python3 scripts/test-doc-site.py

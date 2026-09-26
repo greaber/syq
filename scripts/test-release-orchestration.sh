@@ -157,6 +157,16 @@ assert_scope "$scope" tooling true
 assert_scope "$scope" sdks false
 assert_scope "$scope" python_sdk false
 assert_scope "$scope" native false
+# Pinned tool versions run everything that uses those tools.
+printf 'scripts/dev-tools.lock\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+for key in native sdks python_sdk javascript_sdk go_sdk tooling shellcheck mapping_docs conformance; do
+  assert_scope "$scope" "$key" true
+done
+assert_scope "$scope" tooling_checks 'benchmark branch devtools focused installer orchestration package release workflows'
+for key in macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" false
+done
 
 # The surface touched by PR #190 should run the Rust baseline, Python SDK, and
 # shell lint without promoting the pull request to unrelated suites.
@@ -760,6 +770,8 @@ for fixture in \
   'scripts/test-try-benchmark.py|benchmark' \
   'scripts/test-run-focused-check.py|focused' \
   'scripts/test-branch-status.sh|branch' \
+  'scripts/dev-tools.sh|devtools' \
+  'scripts/test-dev-tools.sh|devtools' \
   'scripts/test-release-orchestration.sh|orchestration' \
   '.github/workflows/macos.yml|orchestration workflows' \
   '.github/workflows/ci.yml|orchestration workflows'
@@ -773,7 +785,7 @@ printf '%s\n' scripts/test-installer.sh scripts/test-release-tools.sh scripts/te
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling_checks 'installer release'
 scope=$("$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
-assert_scope "$scope" tooling_checks 'package installer benchmark release orchestration focused branch workflows'
+assert_scope "$scope" tooling_checks 'package installer benchmark release orchestration focused branch workflows devtools'
 
 printf '%s\n' scripts/test-release-tools.sh scripts/test-installer.sh >"$paths"
 reverse_scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
@@ -794,7 +806,7 @@ for fallback_path in nix/python-dist.nix unknown-input scripts/unmapped-tool.py;
       esac
       scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
       assert_scope "$scope" tooling true
-      assert_scope "$scope" tooling_checks 'benchmark branch focused installer orchestration package release workflows'
+      assert_scope "$scope" tooling_checks 'benchmark branch devtools focused installer orchestration package release workflows'
     done
   done
 done

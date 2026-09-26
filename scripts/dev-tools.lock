@@ -1,0 +1,55 @@
+# Development and CI tools pinned for scripts/dev-tools.sh.
+#
+# Fields: tool version platform sha256 url bin
+# `bin` is the directory, relative to the unpacked archive, that goes on PATH.
+# A URL that is not a .tar.gz archive is a single executable named after the
+# tool and placed in `bin`. Every tool lists linux-x86_64, linux-aarch64,
+# macos-arm64, and macos-x86_64. Use official upstream release artifacts only.
+
+# ShellCheck: sha256 from GitHub's release asset digests, confirmed by
+# downloading and hashing (the project publishes no checksum file).
+shellcheck 0.11.0 linux-x86_64 b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6 https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz shellcheck-v0.11.0
+shellcheck 0.11.0 linux-aarch64 68a8133197a50beb8803f8d42f9908d1af1c5540d4bb05fdfca8c1fa47decefc https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.aarch64.tar.gz shellcheck-v0.11.0
+shellcheck 0.11.0 macos-arm64 339b930feb1ea764467013cc1f72d09cd6b869ebf1013296ba9055ab2ffbd26f https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.darwin.aarch64.tar.gz shellcheck-v0.11.0
+shellcheck 0.11.0 macos-x86_64 c2c15e08df0e8fbc374c335b230a7ee958c313fa5714817a59aa59f1aa594f51 https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.darwin.x86_64.tar.gz shellcheck-v0.11.0
+
+# jq: sha256 from the release's sha256sum.txt.
+jq 1.8.2 linux-x86_64 b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64 bin
+jq 1.8.2 linux-aarch64 8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309 https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-arm64 bin
+jq 1.8.2 macos-arm64 2d75340ba57a4b4b4c8708a21c2dc8e958a48aaa8bba13b27f77f6e4c0eca07e https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-macos-arm64 bin
+jq 1.8.2 macos-x86_64 e94b266e3c26690550006abe63152b782280f4e14374accdf04cbde844f00bc0 https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-macos-amd64 bin
+
+# mdBook: sha256 from GitHub's release asset digests, confirmed by downloading
+# and hashing (the project publishes no checksum file). Linux ARM is musl-only.
+mdbook 0.5.4 linux-x86_64 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7 https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz .
+mdbook 0.5.4 linux-aarch64 753e5c5c363ee8a56972344dcf91466f005a51db84a7aeffe427ae3ef83d6d44 https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-aarch64-unknown-linux-musl.tar.gz .
+mdbook 0.5.4 macos-arm64 03e8a6d8b13a2971e0b3280affd03b388373c1485e26f73407c3a76b0b1838df https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-aarch64-apple-darwin.tar.gz .
+mdbook 0.5.4 macos-x86_64 a47d7bf0d5d670cff9ee6cce95537cbeb62dc10704d9e7131ffbd13e2b59a5de https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-apple-darwin.tar.gz .
+
+# uv: sha256 from each asset's published .sha256 file.
+uv 0.11.6 linux-x86_64 0c6bab77a67a445dc849ed5e8ee8d3cb333b6e2eba863643ce1e228075f27943 https://github.com/astral-sh/uv/releases/download/0.11.6/uv-x86_64-unknown-linux-gnu.tar.gz uv-x86_64-unknown-linux-gnu
+uv 0.11.6 linux-aarch64 d5be4bf7015ea000378cb3c3aba53ba81a8673458ace9c7fa25a0be005b74802 https://github.com/astral-sh/uv/releases/download/0.11.6/uv-aarch64-unknown-linux-gnu.tar.gz uv-aarch64-unknown-linux-gnu
+uv 0.11.6 macos-arm64 4b69a4e366ec38cd5f305707de95e12951181c448679a00dce2a78868dfc9f5b https://github.com/astral-sh/uv/releases/download/0.11.6/uv-aarch64-apple-darwin.tar.gz uv-aarch64-apple-darwin
+uv 0.11.6 macos-x86_64 8e0ed5035eaa28c7c8cd2a46b5b9a05bfff1ef01dbdc090a010eb8fdf193a457 https://github.com/astral-sh/uv/releases/download/0.11.6/uv-x86_64-apple-darwin.tar.gz uv-x86_64-apple-darwin
+
+# Python: installed by the pinned uv with `uv python install`. uv verifies the
+# python-build-standalone download against checksums built into that uv
+# release, so the uv pin fixes the exact interpreter build. uv 0.11.6 offers
+# 3.13.13 as its newest 3.13 release.
+python 3.13.13 linux-x86_64 - uv cpython-3.13.13-linux-x86_64-gnu/bin
+python 3.13.13 linux-aarch64 - uv cpython-3.13.13-linux-aarch64-gnu/bin
+python 3.13.13 macos-arm64 - uv cpython-3.13.13-macos-aarch64-none/bin
+python 3.13.13 macos-x86_64 - uv cpython-3.13.13-macos-x86_64-none/bin
+
+# Node.js: sha256 from https://nodejs.org/dist/v22.23.3/SHASUMS256.txt.
+# The JavaScript SDK supports Node >=22 and is tested on that release line.
+node 22.23.3 linux-x86_64 1084aa36196bba4c3a5e69a1ee388a6e4ff729dad09445fbcd434b28fe3c24af https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.gz node-v22.23.3-linux-x64/bin
+node 22.23.3 linux-aarch64 5ced2d48d1d7198739b7f86804de0171aefb6823b684b12341d3321afc3cb0b2 https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-arm64.tar.gz node-v22.23.3-linux-arm64/bin
+node 22.23.3 macos-arm64 23b25245dcfb9af7262f8ff142e9e2e0af025368117329e7a7458a51e5922f53 https://nodejs.org/dist/v22.23.3/node-v22.23.3-darwin-arm64.tar.gz node-v22.23.3-darwin-arm64/bin
+node 22.23.3 macos-x86_64 8a677b0219178efd6eb0e475457c4afb452b521a92f6e67845a73bd85727f2a8 https://nodejs.org/dist/v22.23.3/node-v22.23.3-darwin-x64.tar.gz node-v22.23.3-darwin-x64/bin
+
+# Go: sha256 from https://go.dev/dl/?mode=json. sdk/go/go.mod requires 1.26.
+go 1.26.8 linux-x86_64 d0f743b33e8d8945e6b1f432edd15785c70507121d6e2a723b21285eddf8b57b https://go.dev/dl/go1.26.8.linux-amd64.tar.gz go/bin
+go 1.26.8 linux-aarch64 211ffced9dcb9633a55eac6364816ec0ddd951389a740e88fa8b3337971bdda0 https://go.dev/dl/go1.26.8.linux-arm64.tar.gz go/bin
+go 1.26.8 macos-arm64 a012b25b571bd0138a03dcd25375ceba866fe5ca822f426d2c66a4de56fd3f4b https://go.dev/dl/go1.26.8.darwin-arm64.tar.gz go/bin
+go 1.26.8 macos-x86_64 186be014105aa6542b767d2c6ed5cca10a0214bdff809ef1724022a8c7894150 https://go.dev/dl/go1.26.8.darwin-amd64.tar.gz go/bin

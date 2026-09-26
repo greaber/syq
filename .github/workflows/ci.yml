@@ -55,6 +55,15 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/dev-tools.sh github jq python
       - name: Classify changed paths
         id: changes
         env:
@@ -91,6 +100,25 @@ jobs:
           needs.scope.outputs.mapping_docs == 'true'
         with:
           persist-credentials: false
+      - name: Cache pinned development tools
+        if: >-
+          needs.scope.outputs.native == 'true' ||
+          needs.scope.outputs.tooling == 'true' ||
+          needs.scope.outputs.shellcheck == 'true' ||
+          needs.scope.outputs.mapping_docs == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+      - name: Install pinned development tools
+        if: >-
+          needs.scope.outputs.native == 'true' ||
+          needs.scope.outputs.tooling == 'true' ||
+          needs.scope.outputs.shellcheck == 'true' ||
+          needs.scope.outputs.mapping_docs == 'true'
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/dev-tools.sh github shellcheck jq python
       - name: Show Linux trial hardware
         if: inputs.linux_trial == 'github' || inputs.linux_trial == 'namespace'
         run: |
@@ -213,6 +241,10 @@ jobs:
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' branch ')
         run: scripts/test-branch-status.sh
+      - name: Test development tool setup
+        if: >-
+          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' devtools ')
+        run: scripts/test-dev-tools.sh
       - name: Validate workflow syntax
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' workflows ')
@@ -248,6 +280,19 @@ jobs:
         if: needs.scope.outputs[format('{0}_sdk', matrix.sdk)] == 'true'
         with:
           persist-credentials: false
+      - name: Cache pinned development tools
+        if: needs.scope.outputs[format('{0}_sdk', matrix.sdk)] == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: dev-tools-${{ runner.os }}-${{ runner.arch }}-${{ matrix.sdk }}-${{ hashFiles('scripts/dev-tools.lock', 'scripts/dev-tools.sh') }}
+      - name: Install pinned development tools
+        if: needs.scope.outputs[format('{0}_sdk', matrix.sdk)] == 'true'
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: >-
+          scripts/dev-tools.sh github
+          ${{ matrix.sdk == 'python' && 'uv python jq' || matrix.sdk == 'javascript' && 'node' || 'go' }}
       - name: Cache Cargo dependencies and build output
         if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -261,15 +306,6 @@ jobs:
             cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
             cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
             cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
-      - id: python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
-        with:
-          python-version: ">=3.13.4 <3.14"
-          check-latest: true
-      - name: Install pinned Python tooling
-        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
-        run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
       - name: Require the matching Python SDK for the latest syq release
         if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
         env:
@@ -294,7 +330,6 @@ jobs:
       - name: Test and package Python SDK
         if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
         env:
-          UV_PYTHON: ${{ steps.python.outputs.python-path }}
           PYTHONPATH: sdk/python/src
           SYQ_CANDIDATE_EXECUTABLE: ${{ github.workspace }}/target/debug/syq
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/syq-sdk-python
@@ -330,11 +365,6 @@ jobs:
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: matrix.sdk == 'javascript' && needs.scope.outputs.javascript_sdk == 'true'
-        with:
-          node-version: "22.x"
-          package-manager-cache: false
       - name: Test and package JavaScript SDK
         if: matrix.sdk == 'javascript' && needs.scope.outputs.javascript_sdk == 'true'
         working-directory: sdk/js
@@ -342,11 +372,6 @@ jobs:
           npm ci --ignore-scripts
           npm test
           npm pack --dry-run
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        if: matrix.sdk == 'go' && needs.scope.outputs.go_sdk == 'true'
-        with:
-          go-version: "1.26.x"
-          cache: false
       - name: Format, vet, and test Go SDK
         if: matrix.sdk == 'go' && needs.scope.outputs.go_sdk == 'true'
         working-directory: sdk/go

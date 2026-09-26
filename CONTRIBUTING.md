@@ -123,6 +123,29 @@ and comparison. The tag must contain the `python-dist` recipe.
 and `sdk/python/native-source.json` pins the native source. Installing a source
 archive uses maturin and does not require Nix.
 
+## Development tools
+
+Rust is pinned by `rust-toolchain.toml` and installed by rustup. The other
+tools used by tests, lint, and the docs build are pinned in
+`scripts/dev-tools.lock`: ShellCheck, jq, mdBook, uv, Python, Node.js, and Go.
+Install them and put them first on `PATH` in your current shell:
+
+```sh
+scripts/dev-tools.sh install
+eval "$(scripts/dev-tools.sh env)"
+```
+
+Pass tool names to use only some of them, for example
+`scripts/dev-tools.sh env python jq`. Downloads are checked against the pinned
+SHA-256 sums; uv installs Python using the checksums built into the pinned uv.
+Tools are kept in `~/.cache/syq/tools` (or `$XDG_CACHE_HOME/syq/tools`) and
+shared by every checkout; set `SYQ_TOOLS_DIR` to use another directory. CI
+runs the same script. `env` also sets `UV_PYTHON` to the pinned Python and
+`GOTOOLCHAIN=local` so Go does not download a different toolchain.
+The script needs only `sh`, `curl`, `tar`, and `sha256sum` or `shasum`.
+Building upstream rsync for the conformance tests also needs autoconf,
+automake, and a C compiler from your system.
+
 ## Before a pull request
 
 Choose checks using [AGENTS.md](AGENTS.md#verification). For Rust changes,
@@ -143,7 +166,7 @@ and `SYQ_TEST_BUCKET` set. It creates and removes a unique test prefix in the
 existing bucket. See `python3 tests/object-storage/benchmark.py --help` for
 benchmark options.
 
-For docs, run `python3 scripts/check-doc-links.py` and build with mdBook.
+For docs, run `python3 scripts/check-doc-links.py` and build with the pinned mdBook.
 The published site defaults to the latest stable release, with tagged versions
 and `master` available through the documentation selector. Archives start at
 v0.2.0, the first release containing the mdBook sources. Each version uses its
