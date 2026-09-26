@@ -308,6 +308,47 @@ fn native_copies_need_no_writable_source_or_home() {
     assert_eq!(fs::read_dir(t.path("home/.config")).unwrap().count(), 0);
 }
 
+// A stale TMPDIR, such as a deleted job directory, must not stop a copy. Syq
+// keeps its private sockets in /tmp instead, on both ends of the connection.
+#[test]
+fn copies_use_tmp_when_tmpdir_is_missing() {
+    let t = Tmp::new();
+    fake_ssh(&t);
+    write(&t.path("source/file"), b"stale TMPDIR");
+    for route in ["local", "push", "pull"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args([
+                "cp",
+                "--no-progress",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+            ])
+            .env("TMPDIR", t.path("missing"))
+            .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", t.path("home/.config"))
+            .env("PATH", format!("{}:/usr/bin:/bin", t.s("bin")))
+            .env("FAKE_REMOTE_HOME", t.path("home"))
+            .env("FAKE_REMOTE_BIN", t.path("bin"))
+            .env("FAKE_RSH_LOG", t.path("ssh.log"));
+        if route == "pull" {
+            command.args(["--from", "host"]);
+        }
+        command.args(["--srcs-in", &t.s("source")]);
+        if route == "push" {
+            command.args(["--to", "host"]);
+        }
+        command.args(["--into", &t.s(&format!("destination-{route}"))]);
+        let output = command.run().unwrap();
+        assert_output_ok(&output);
+        assert_eq!(
+            read(&t.path(&format!("destination-{route}/file"))),
+            b"stale TMPDIR"
+        );
+    }
+    assert!(!t.path("missing").exists());
+}
+
 // Several content sources map onto the destination root; the last one's
 // metadata wins, as for any other directory.
 #[test]

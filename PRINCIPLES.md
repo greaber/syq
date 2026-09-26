@@ -28,11 +28,17 @@ recovery records, and completion caches, to help performance, including for the
 current operation. That state is optional: when syq cannot read or write it,
 copying and removal still succeed.
 
-The one accepted exception is installing a missing SSH helper, which needs
-somewhere writable on the server. The helper has to live somewhere, and syq
-cannot assume a writable temporary directory either. When the server's home is
-unwritable, install syq there separately and use `--syq-path` or
-`--no-bootstrap`.
+Two exceptions are accepted. Installing a missing SSH helper needs somewhere
+writable on the server. The helper has to live somewhere, and syq cannot assume
+a writable temporary directory either. When the server's home is unwritable,
+install syq there separately and use `--syq-path` or `--no-bootstrap`.
+
+Copies also need a writable temporary directory, `TMPDIR` or else `/tmp`, on
+each machine that reads or writes files. Syq keeps a private socket there so
+its processes can share the files and directories a copy has opened. This is
+tolerated for practical reasons rather than required: removing it would mean
+changing how those processes find each other, which was not worth the work
+while no one needed it (September 2026).
 
 Why: this state exists to make syq faster. It should never be the reason a
 copy or removal fails.

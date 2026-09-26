@@ -102,6 +102,41 @@ fn multiplexed_worker_refusal_falls_back_to_independent_ssh() {
     );
 }
 
+// Persistence only saves logins, so a setting syq cannot use must not stop an
+// SSH copy. The copy warns and uses a connection for this run only.
+#[test]
+fn unusable_persistence_setting_falls_back_to_a_per_run_connection() {
+    let t = Tmp::new();
+    fake_ssh_rejecting_multiplexed_workers(&t);
+    write(&t.path("src"), b"without persistence");
+    write(&t.path("config/syq/persistence.json"), b"not valid JSON");
+    let remote = format!("fake:{}", t.s("dst"));
+
+    let out = compat_command()
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-no-tcp", "-a", "--performance-tuning", "workers=1"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("PATH", format!("{}:/usr/bin:/bin", t.s("bin")))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
+        .run()
+        .unwrap();
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"without persistence");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("continuing without persistence"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!t.runtime().exists());
+}
+
 #[test]
 fn local_copy_does_not_read_the_global_persistence_configuration() {
     let t = Tmp::new();

@@ -69,6 +69,19 @@ fn unregister_signal_cleanup(path: &Path) {
     }
 }
 
+/// Create a private directory in `TMPDIR`, or in `/tmp` when `TMPDIR` names
+/// another location that cannot be used, such as a deleted job directory.
+pub(crate) fn private_temp_dir(prefix: &str) -> io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    builder.tempdir().or_else(|error| {
+        if std::env::temp_dir() == Path::new("/tmp") {
+            return Err(error);
+        }
+        builder.tempdir_in("/tmp").map_err(|_| error)
+    })
+}
+
 pub(crate) struct PrivateBrokerConfig<'a> {
     pub(crate) directory_prefix: &'a str,
     pub(crate) socket_name: &'a str,
@@ -127,12 +140,12 @@ impl PrivateBroker {
         if config.max_connections == 0 {
             bail!("private broker needs at least one connection slot");
         }
-        let mut builder = tempfile::Builder::new();
-        builder.prefix(config.directory_prefix);
         let socket_dir = if in_current_dir {
-            builder.tempdir_in(".")
+            tempfile::Builder::new()
+                .prefix(config.directory_prefix)
+                .tempdir_in(".")
         } else {
-            builder.tempdir()
+            private_temp_dir(config.directory_prefix)
         }
         .context("create private broker directory")?;
         std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
