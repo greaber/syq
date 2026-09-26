@@ -484,17 +484,17 @@ impl Planner<'_> {
         }
     }
 
-    pub(super) fn assert_mutation_root(&mut self) -> Result<()> {
+    pub(super) fn assert_mutation_root(&mut self) -> Result<Option<Entry>> {
         let (dev, ino) = match self.mutation_root_condition {
             TargetCondition::Matches { dev, ino }
             | TargetCondition::MatchesFingerprint { dev, ino, .. } => (dev, ino),
-            TargetCondition::Any | TargetCondition::Absent => return Ok(()),
+            TargetCondition::Any | TargetCondition::Absent => return Ok(None),
         };
         let current = stat_many(self.dst, vec![self.dst_root.clone()], false)?
             .pop()
             .flatten();
         match current {
-            Some(entry) if entry.dev == dev && entry.ino == ino => Ok(()),
+            Some(entry) if entry.dev == dev && entry.ino == ino => Ok(Some(entry)),
             _ => bail!(
                 "target {} changed after the placement precondition was checked",
                 display(&self.dst_root)
@@ -1576,7 +1576,7 @@ impl Planner<'_> {
         if self.collision {
             return Ok(());
         }
-        self.assert_mutation_root()?;
+        let root_entry = self.assert_mutation_root()?;
         let opts = self.opts;
         let Mapped {
             directory_expression_sources,
@@ -1595,7 +1595,16 @@ impl Planner<'_> {
         // metadata so they can't disagree.
         if !dirs.is_empty() {
             let stats = if self.destination_tree_known_missing {
-                vec![None; dirs.len()]
+                // Preflight can create the root before this batch. Reuse its
+                // identity check so an implicit parent is not sent as an
+                // absent-only mkdir after we have already created it.
+                dirs.iter()
+                    .map(|(path, _, _)| {
+                        (path == &self.dst_root)
+                            .then(|| root_entry.clone())
+                            .flatten()
+                    })
+                    .collect()
             } else if self.destination_children_known_missing {
                 self.stat_fresh_descendants(dirs.iter().map(|(path, _, _)| path))?
             } else if let Some(stats) = dir_stats {
