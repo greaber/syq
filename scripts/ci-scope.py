@@ -7,13 +7,14 @@ Prints `key=value` lines for $GITHUB_OUTPUT. SYQ_TEST_CHANGED_PATHS_FILE
 replaces the event with a list of changed paths for tests.
 """
 from fnmatch import fnmatchcase
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 
-from tooling import JqError, captured, command, exit_on_failure, get, load_file, require
+from tooling import ToolError, output, report_errors
 
 SCRIPTS = Path(os.path.abspath(__file__)).parent
 ALL_TOOLING = "package installer benchmark release orchestration focused branch workflows setup"
@@ -41,86 +42,81 @@ def matches(path, *patterns):
     return any(fnmatchcase(path, pattern) for pattern in patterns)
 
 
-def event_has(event, key):
-    """jq's `has(key)`: false for null, an error for other non-objects."""
-    if event is None:
-        return False
-    if not isinstance(event, dict):
-        raise JqError(5, f"cannot check whether {type(event).__name__} has a key")
-    return key in event
+def git(*args):
+    return output("git", *args).strip()
 
 
-def git_succeeds(*args):
-    return subprocess.run(["git", *args], stdout=subprocess.DEVNULL,
+def commit_exists(commit):
+    return subprocess.run(["git", "cat-file", "-e", f"{commit}^{{commit}}"],
                           stderr=subprocess.DEVNULL).returncode == 0
 
 
-def changed_paths_from_event(event_path):
-    """Return (changed paths, base, head), or an exit status after output."""
+def read_event(event_path):
     try:
-        event = load_file(event_path)
-    except JqError as error:
-        if error.status != 4:
-            raise
-        # jq printed no event name for an empty file.
-        print(f"unsupported GitHub event in {event_path}", file=sys.stderr)
-        return 1
-    if event_has(event, "pull_request"):
-        base = captured(require(get(event, "pull_request", "base", "sha")))
-        head = captured(require(get(event, "pull_request", "head", "sha")))
-        diff_range = f"{base}...{head}"
-    elif event_has(event, "before"):
-        base = captured(require(get(event, "before")))
-        head = captured(require(get(event, "after")))
-        if re.fullmatch(r"0+", base):
-            run_everything()
-            print("CI scope: new branch or incomplete push history; running every check",
-                  file=sys.stderr)
-            return 0
-        diff_range = f"{base}..{head}"
-    else:
-        # A generated SDK follow-up uses a workflow dispatch because GitHub does
-        # not trigger push workflows for merges made with GITHUB_TOKEN. It passes
-        # the checked-out merge commit so this path has the same precise scope as
-        # a normal push. Other manual runs retain the full-suite default.
-        scope_commit = os.environ.get("SYQ_CI_SCOPE_COMMIT", "")
-        if not scope_commit:
-            run_everything()
-            print("CI scope: manual run; running every check", file=sys.stderr)
-            return 0
-        if not re.fullmatch(r"[0-9a-f]{40}", scope_commit):
-            print(f"invalid CI scope commit: {scope_commit}", file=sys.stderr)
-            return 2
-        head = command("git", "rev-parse", "HEAD").rstrip("\n")
-        if head != scope_commit:
-            print(f"CI scope commit {scope_commit} is not checked out (found {head})",
-                  file=sys.stderr)
-            return 1
-        base = command("git", "rev-parse", f"{head}^").rstrip("\n")
-        diff_range = f"{base}..{head}"
-    if not git_succeeds("cat-file", "-e", f"{base}^{{commit}}"):
-        print(f"CI scope base commit is unavailable: {base}", file=sys.stderr)
-        return 1
-    if not git_succeeds("cat-file", "-e", f"{head}^{{commit}}"):
-        print(f"CI scope head commit is unavailable: {head}", file=sys.stderr)
-        return 1
+        with open(event_path, encoding="utf-8") as source:
+            event = json.load(source)
+    except ValueError as error:
+        raise ToolError(f"cannot read GitHub event {event_path}: {error}") from None
+    if not isinstance(event, dict):
+        raise ToolError(f"unsupported GitHub event in {event_path}")
+    return event
+
+
+def changed_paths_from_event(event):
+    """Return (changed paths, base, head), or None after printing a full scope."""
+    try:
+        if "pull_request" in event:
+            base = event["pull_request"]["base"]["sha"]
+            head = event["pull_request"]["head"]["sha"]
+            diff_range = f"{base}...{head}"
+        elif "before" in event:
+            base, head = event["before"], event["after"]
+            if re.fullmatch(r"0+", base):
+                run_everything()
+                print("CI scope: new branch or incomplete push history; running every check",
+                      file=sys.stderr)
+                return None
+            diff_range = f"{base}..{head}"
+        else:
+            # A generated SDK follow-up uses a workflow dispatch because GitHub does
+            # not trigger push workflows for merges made with GITHUB_TOKEN. It passes
+            # the checked-out merge commit so this path has the same precise scope as
+            # a normal push. Other manual runs retain the full-suite default.
+            scope_commit = os.environ.get("SYQ_CI_SCOPE_COMMIT", "")
+            if not scope_commit:
+                run_everything()
+                print("CI scope: manual run; running every check", file=sys.stderr)
+                return None
+            if not re.fullmatch(r"[0-9a-f]{40}", scope_commit):
+                raise ToolError(f"invalid CI scope commit: {scope_commit}", 2)
+            head = git("rev-parse", "HEAD")
+            if head != scope_commit:
+                raise ToolError(f"CI scope commit {scope_commit} is not checked out (found {head})")
+            base = git("rev-parse", f"{head}^")
+            diff_range = f"{base}..{head}"
+    except (KeyError, TypeError):
+        raise ToolError("the GitHub event has no usable commit range") from None
+    if not isinstance(base, str) or not isinstance(head, str):
+        raise ToolError("the GitHub event has no usable commit range")
+    if not commit_exists(base):
+        raise ToolError(f"CI scope base commit is unavailable: {base}")
+    if not commit_exists(head):
+        raise ToolError(f"CI scope head commit is unavailable: {head}")
     # Classify both sides of a rename so moving an affected input into an
     # otherwise inert directory cannot hide its former dependency boundary.
-    changed = command("git", "diff", "--no-renames", "--name-only", diff_range).rstrip("\n")
-    return changed, base, head
+    return git("diff", "--no-renames", "--name-only", diff_range), base, head
 
 
 def main():
-    event_path = (sys.argv[1] if len(sys.argv) > 1 else "") or os.environ.get("GITHUB_EVENT_PATH", "")
+    event_path = (sys.argv[1] if len(sys.argv) > 1 else "") or os.environ.get("GITHUB_EVENT_PATH")
     base = head = ""
     changed_paths_file = os.environ.get("SYQ_TEST_CHANGED_PATHS_FILE", "")
     if changed_paths_file:
         try:
-            changed_paths = Path(changed_paths_file).read_text().rstrip("\n")
+            changed_paths = Path(changed_paths_file).read_text()
         except OSError as error:
-            print(f"cannot read {changed_paths_file}: {error}", file=sys.stderr)
-            return 1
-    elif event_path and os.path.isfile(event_path) and scheduled(event_path):
+            raise ToolError(f"cannot read {changed_paths_file}: {error.strerror}") from None
+    elif event_path and os.path.isfile(event_path) and "schedule" in read_event(event_path):
         nightly = subprocess.run([sys.executable, str(SCRIPTS / "nightly-ci.py")])
         if nightly.returncode == 0:
             run_everything()
@@ -132,9 +128,9 @@ def main():
     elif os.environ.get("SYQ_CI_DOCUMENTATION_ONLY", "") == "true":
         changed_paths = DOCUMENTATION_PATHS
     elif event_path and os.path.isfile(event_path):
-        result = changed_paths_from_event(event_path)
-        if isinstance(result, int):
-            return result
+        result = changed_paths_from_event(read_event(event_path))
+        if result is None:
+            return 0
         changed_paths, base, head = result
     else:
         print(f"usage: {sys.argv[0]} GITHUB_EVENT_PATH", file=sys.stderr)
@@ -155,13 +151,6 @@ def main():
           file=sys.stderr)
     print('sdk_matrix=["python"]' if selection["python_sdk"] else 'sdk_matrix=["none"]')
     return 0
-
-
-def scheduled(event_path):
-    try:
-        return event_has(load_file(event_path), "schedule")
-    except (JqError, OSError, UnicodeDecodeError):
-        return False
 
 
 def classify(paths, preparation_only):
@@ -326,4 +315,4 @@ def classify(paths, preparation_only):
 
 
 if __name__ == "__main__":
-    sys.exit(exit_on_failure(main))
+    sys.exit(report_errors(main))

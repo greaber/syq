@@ -9,13 +9,13 @@ emits its first sample before finishing is a race, and a stream with no
 progress records is itself a real possible stream.
 """
 import datetime
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 
-from tooling import dumps, get, load_stream
 
 REPOSITORY = Path(os.path.abspath(__file__)).parent.parent
 OUT = REPOSITORY / "tests/fixtures/automation"
@@ -32,18 +32,18 @@ MAPPING_MANIFEST = "\n".join([
 
 
 def normalize(raw, fixture):
+    records = [json.loads(line) for line in Path(raw).read_text(encoding="utf-8").splitlines()
+               if line.strip()]
     output = []
-    kept = [record for record in load_stream(Path(raw).read_text(encoding="utf-8"))
-            if get(record, "type") != "progress"]
-    for seq, record in enumerate(kept):
+    for seq, record in enumerate(record for record in records if record.get("type") != "progress"):
         record["seq"] = seq
         if "elapsed_ms" in record:
             record["elapsed_ms"] = 0
-        if get(record, "type") == "run":
+        if record.get("type") == "run":
             record["run_id"] = "6465616462656566000000000000cafe"
             record["started_at"] = 1756800000
             record["syq_version"] = "0.0.0"
-        output.append(dumps(record) + "\n")
+        output.append(json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n")
     (OUT / fixture).write_text("".join(output), encoding="utf-8")
 
 

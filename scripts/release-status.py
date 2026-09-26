@@ -7,260 +7,190 @@ Without a tag, report the version in Cargo.toml.
 """
 import base64
 import binascii
-from fnmatch import fnmatchcase
+import json
 import re
 import shutil
 import subprocess
 import sys
+import tomllib
 
-from tooling import (JqError, alt, captured, cargo_version, command, dumps, exit_on_failure,
-                     get, is_number, items, iterate, join, load_file, loads, require, text,
-                     truthy)
+from tooling import ToolError, cargo_version, json_output, report_errors
 
 REPOSITORY = "greaber/syq"
 HOMEBREW_REPOSITORY = "greaber/homebrew-tap"
 
 
-def succeeds(*args):
-    """stdout of a command whose failure is an ordinary result, else None."""
+def optional_json(*args):
+    """The JSON printed by a command whose failure is an ordinary result, else None."""
     completed = subprocess.run(list(args), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                text=True)
-    return None if completed.returncode else completed.stdout
-
-
-def holds(predicate):
+    if completed.returncode:
+        return None
     try:
-        return truthy(predicate())
-    except JqError:
-        return False
-
-
-def first(values):
-    """jq's `first // null` over an array."""
-    return alt(values[0] if values else None, None)
-
-
-def flatten(value):
-    if not isinstance(value, list):
-        raise JqError(5, "cannot flatten a non-array")
-    result = []
-    for item in value:
-        result.extend(flatten(item) if isinstance(item, list) else [item])
-    return result
-
-
-def version_of(path):
-    try:
-        return cargo_version(path)
-    except OSError as error:
-        print(f"sed: can't read {path}: {error.strerror}", file=sys.stderr)
-        raise JqError(2) from None
-
-
-def argjson(value_text):
-    """A value printed by `jq -r` and read back by `jq --argjson`."""
-    try:
-        return loads(value_text)
-    except JqError:
-        raise JqError(2, f"invalid JSON text passed to --argjson: {value_text}") from None
+        return json.loads(completed.stdout)
+    except ValueError:
+        return None
 
 
 def tag_status(tag):
-    references = loads(command("gh", "api", f"repos/{REPOSITORY}/git/matching-refs/tags/{tag}"))
-    reference = first([item for item in iterate(references)
-                       if get(item, "ref") == f"refs/tags/{tag}"])
+    """(commit, state) of the remote tag."""
+    references = json_output("gh", "api", f"repos/{REPOSITORY}/git/matching-refs/tags/{tag}")
+    reference = next((item for item in references if item.get("ref") == f"refs/tags/{tag}"), None)
     if reference is None:
-        return "", "missing"
-    object_type = captured(require(get(reference, "object", "type")))
-    object_sha = captured(require(get(reference, "object", "sha")))
-    if object_type == "tag":
-        tag_object = loads(command("gh", "api", f"repos/{REPOSITORY}/git/tags/{object_sha}"))
-        actual_tag = captured(require(get(tag_object, "tag")))
-        target_type = captured(require(get(tag_object, "object", "type")))
-        target_sha = captured(require(get(tag_object, "object", "sha")))
-        verified = (get(tag_object, "verification", "verified") is True
-                    and get(tag_object, "verification", "reason") == "valid")
-        if actual_tag != tag:
-            return "", "name-mismatch"
-        if target_type != "commit":
-            return "", "invalid-target"
-        return target_sha, "verified" if verified else "unverified"
-    if object_type == "commit":
-        return object_sha, "lightweight"
-    return "", "invalid-target"
+        return None, "missing"
+    target = reference.get("object") or {}
+    if target.get("type") == "commit":
+        return target.get("sha"), "lightweight"
+    if target.get("type") != "tag":
+        return None, "invalid-target"
+    tag_object = json_output("gh", "api", f"repos/{REPOSITORY}/git/tags/{target.get('sha')}")
+    if tag_object.get("tag") != tag:
+        return None, "name-mismatch"
+    if (tag_object.get("object") or {}).get("type") != "commit":
+        return None, "invalid-target"
+    verification = tag_object.get("verification") or {}
+    verified = verification.get("verified") is True and verification.get("reason") == "valid"
+    return tag_object["object"].get("sha"), "verified" if verified else "unverified"
 
 
-def interpolate(value):
-    return text(value)
+def github_release(tag):
+    pages = json_output("gh", "api", "--paginate", "--slurp",
+                        f"repos/{REPOSITORY}/releases?per_page=100")
+    release = next((release for page in pages for release in page
+                    if release.get("tag_name") == tag), None)
+    if release is None:
+        return {"state": "missing", "immutable": False, "url": None}
+    return {"state": "draft" if release.get("draft") else "published",
+            "immutable": bool(release.get("immutable")), "url": release.get("html_url")}
 
 
-def concat(prefix, value):
-    if not isinstance(value, str):
-        raise JqError(5, f"cannot add a string and {type(value).__name__}")
-    return prefix + value
+def release_runs(tag, tag_commit):
+    runs = json_output("gh", "run", "list", "--repo", REPOSITORY, "--workflow", "release.yml",
+                       "--branch", tag, "--limit", "20", "--json",
+                       "conclusion,databaseId,event,headSha,status,url,workflowName")
+    if tag_commit:
+        runs = [run for run in runs if run.get("headSha") == tag_commit]
+    for run in runs:
+        pending = optional_json("gh", "api",
+                                f"repos/{REPOSITORY}/actions/runs/{run['databaseId']}"
+                                "/pending_deployments")
+        run["pending_environments"] = (None if pending is None else
+                                       [(item.get("environment") or {}).get("name")
+                                        for item in pending])
+    return runs
+
+
+def publications(tag):
+    version = tag.removeprefix("v")
+    crates_state = "unknown"
+    crates = optional_json("curl", "--fail", "--silent", "--show-error", "--location", "--proto",
+                           "=https", "--proto-redir", "=https", "--user-agent",
+                           "syq-release-status (https://github.com/greaber/syq)",
+                           "https://crates.io/api/v1/crates/syq")
+    if crates is not None:
+        published = any(item.get("num") == version for item in crates.get("versions") or [])
+        crates_state = "published" if published else "missing"
+
+    # The SDK version that pins this syq release, when the checkout's SDK does.
+    pypi_version = None
+    try:
+        with open("sdk/python/src/syq/syq-release-manifest.json", encoding="utf-8") as source:
+            mapped = json.load(source).get("tag") == tag
+    except (OSError, ValueError, AttributeError):
+        mapped = False
+    if mapped:
+        with open("sdk/python/pyproject.toml", "rb") as source:
+            pypi_version = tomllib.load(source)["project"]["version"]
+    pypi_state = "unknown"
+    pypi = optional_json("curl", "--fail", "--silent", "--show-error", "--location", "--proto",
+                         "=https", "--proto-redir", "=https", "https://pypi.org/pypi/syq/json")
+    if pypi is not None:
+        if pypi_version:
+            files = (pypi.get("releases") or {}).get(pypi_version)
+            pypi_state = "published" if files else "missing"
+        else:
+            pypi_state = "unmapped"
+            pypi_version = (pypi.get("info") or {}).get("version")
+
+    homebrew_state = "unknown"
+    formula = optional_json("gh", "api", f"repos/{HOMEBREW_REPOSITORY}/contents/Formula/syq.rb")
+    if formula is not None:
+        try:
+            content = base64.b64decode(formula["content"].replace("\n", ""))
+        except (KeyError, AttributeError, binascii.Error, ValueError):
+            raise ToolError("cannot read the Homebrew formula") from None
+        homebrew_state = "published" if f"/{tag}/".encode() in content else "missing"
+    return {"crates_io": {"version": version, "state": crates_state},
+            "pypi": {"version": pypi_version, "state": pypi_state},
+            "homebrew": {"tag": tag, "state": homebrew_state}}
+
+
+def status(tag):
+    tag_commit, tag_state = tag_status(tag)
+    release = github_release(tag)
+    runs = release_runs(tag, tag_commit)
+    published = publications(tag)
+    return {
+        "repository": REPOSITORY, "tag": tag, "tag_commit": tag_commit, "tag_state": tag_state,
+        "github_release": release, "release_runs": runs, "publications": published,
+        "complete": (tag_state == "verified" and release["state"] == "published"
+                     and release["immutable"]
+                     and any(run.get("status") == "completed" and run.get("conclusion") == "success"
+                             for run in runs)
+                     and all(item["state"] == "published" for item in published.values())),
+    }
+
+
+def human(result):
+    release, published = result["github_release"], result["publications"]
+    lines = [
+        f"Release {result['tag']}",
+        f"  tag:       {result['tag_state']}"
+        + (f" at {result['tag_commit']}" if result["tag_commit"] else ""),
+        f"  GitHub:    {release['state']}" + (" (immutable)" if release["immutable"] else ""),
+        f"  crates.io: {published['crates_io']['state']}",
+        f"  PyPI SDK:  {published['pypi']['state']}"
+        + (f" ({published['pypi']['version']})" if published["pypi"]["version"] else ""),
+        f"  Homebrew:  {published['homebrew']['state']}",
+        "  complete:  " + ("yes" if result["complete"] else "no"),
+    ]
+    if not result["release_runs"]:
+        lines.append("  runs:       none")
+    for run in result["release_runs"]:
+        environments = run["pending_environments"]
+        pending = ("unknown" if environments is None
+                   else ", ".join(name or "" for name in environments) or "none")
+        conclusion = f"/{run['conclusion']}" if run.get("conclusion") else ""
+        lines.append(f"  run {run.get('databaseId')}: {run.get('status')}{conclusion}, "
+                     f"pending environments: {pending}\n    {run.get('url')}")
+    return "\n".join(lines)
 
 
 def main():
-    json_output = False
-    tag = ""
+    json_report = False
+    tag = None
     for argument in sys.argv[1:]:
         if argument == "--json":
-            json_output = True
-        elif fnmatchcase(argument, "v[0-9]*.[0-9]*.[0-9]*"):
+            json_report = True
+        elif re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", argument):
             if tag:
-                print("only one tag may be supplied", file=sys.stderr)
-                return 2
+                raise ToolError("only one tag may be supplied", 2)
             tag = argument
         else:
-            print(f"usage: {sys.argv[0]} [--json] [vMAJOR.MINOR.PATCH]", file=sys.stderr)
-            return 2
-    if not tag:
-        tag = "v" + version_of("Cargo.toml")
+            raise ToolError(f"usage: {sys.argv[0]} [--json] [vMAJOR.MINOR.PATCH]", 2)
+    tag = tag or "v" + cargo_version("Cargo.toml")
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
-        print(f"invalid release tag: {tag}", file=sys.stderr)
-        return 2
-    version = tag[1:]
+        raise ToolError(f"invalid release tag: {tag}", 2)
     for tool in ("gh", "curl"):
         if not shutil.which(tool):
-            print(f"release status needs {tool}", file=sys.stderr)
-            return 1
-
-    tag_commit, tag_state = tag_status(tag)
-
-    releases = loads(command("gh", "api", "--paginate", "--slurp",
-                             f"repos/{REPOSITORY}/releases?per_page=100"))
-    release = first([item for item in flatten(releases) if get(item, "tag_name") == tag])
-    github_state = "missing"
-    github_url = ""
-    github_immutable = "false"
-    if release is not None:
-        github_url = captured(get(release, "html_url"))
-        github_immutable = captured(alt(get(release, "immutable"), False))
-        github_state = "draft" if captured(get(release, "draft")) == "true" else "published"
-
-    runs = loads(command("gh", "run", "list", "--repo", REPOSITORY, "--workflow", "release.yml",
-                         "--branch", tag, "--limit", "20", "--json",
-                         "conclusion,databaseId,event,headSha,status,url,workflowName"))
-    if tag_commit:
-        runs = [run for run in iterate(runs) if get(run, "headSha") == tag_commit]
+            raise ToolError(f"release status needs {tool}")
     try:
-        listed_runs = iterate(runs)
-    except JqError:
-        listed_runs = []
-    runs_with_environments = []
-    for run in listed_runs:
-        run_id = captured(require(get(run, "databaseId")))
-        pending = succeeds("gh", "api", f"repos/{REPOSITORY}/actions/runs/{run_id}/pending_deployments")
-        if pending is None:
-            environments = None
-        else:
-            environments = [get(item, "environment", "name") for item in iterate(loads(pending))]
-        if not isinstance(run, dict):
-            raise JqError(5, "cannot add an object to a non-object run")
-        runs_with_environments.append({**run, "pending_environments": environments})
-
-    crates_state = "unknown"
-    crates = succeeds("curl", "--fail", "--silent", "--show-error", "--location", "--proto",
-                      "=https", "--proto-redir", "=https", "--user-agent",
-                      "syq-release-status (https://github.com/greaber/syq)",
-                      "https://crates.io/api/v1/crates/syq")
-    if crates is not None:
-        published = holds(lambda: any(get(item, "num") == version
-                                      for item in items(get(loads(crates), "versions"))))
-        crates_state = "published" if published else "missing"
-
-    pypi_state = "unknown"
-    pypi_version = ""
-    try:
-        mapped = alt(get(load_file("sdk/python/src/syq/syq-release-manifest.json"), "tag"), None)
-        mapped_tag = "" if mapped is None else captured(mapped)
-    except (JqError, OSError, UnicodeDecodeError):
-        mapped_tag = ""
-    if mapped_tag == tag:
-        pypi_version = version_of("sdk/python/pyproject.toml")
-    pypi = succeeds("curl", "--fail", "--silent", "--show-error", "--location", "--proto",
-                    "=https", "--proto-redir", "=https", "https://pypi.org/pypi/syq/json")
-    if pypi is not None:
-        if pypi_version:
-            def released():
-                files = get(loads(pypi), "releases", pypi_version)
-                return length(files) > 0
-            pypi_state = "published" if holds(released) else "missing"
-        else:
-            pypi_state = "unmapped"
-            found = alt(get(loads(pypi), "info", "version"), None)
-            pypi_version = "" if found is None else captured(found)
-
-    homebrew_state = "unknown"
-    formula_json = succeeds("gh", "api", f"repos/{HOMEBREW_REPOSITORY}/contents/Formula/syq.rb")
-    if formula_json is not None:
-        content = captured(require(get(loads(formula_json), "content")))
-        try:
-            formula = base64.b64decode(content.replace("\n", ""))
-        except (binascii.Error, ValueError):
-            print("error: the Homebrew formula is not valid base64", file=sys.stderr)
-            return 1
-        homebrew_state = "published" if f"/{tag}/".encode() in formula else "missing"
-
-    github_immutable = argjson(github_immutable)
-    result = {
-        "repository": REPOSITORY, "tag": tag,
-        "tag_commit": tag_commit or None,
-        "tag_state": tag_state,
-        "github_release": {"state": github_state, "immutable": github_immutable,
-                           "url": github_url or None},
-        "release_runs": runs_with_environments,
-        "publications": {
-            "crates_io": {"version": version, "state": crates_state},
-            "pypi": {"version": pypi_version or None, "state": pypi_state},
-            "homebrew": {"tag": tag, "state": homebrew_state},
-        },
-    }
-    result["complete"] = (
-        tag_state == "verified" and github_state == "published" and truthy(github_immutable)
-        and any(get(run, "status") == "completed" and get(run, "conclusion") == "success"
-                for run in runs_with_environments)
-        and crates_state == "published" and pypi_state == "published"
-        and homebrew_state == "published")
-
-    if json_output:
-        print(dumps(result, indent=2))
-        return 0
-    lines = [
-        f"Release {tag}",
-        f"  tag:       {tag_state}" + (f" at {tag_commit}" if tag_commit else ""),
-        f"  GitHub:    {github_state}" + (" (immutable)" if truthy(github_immutable) else ""),
-        f"  crates.io: {crates_state}",
-        f"  PyPI SDK:  {pypi_state}" + (f" ({pypi_version})" if pypi_version else ""),
-        f"  Homebrew:  {homebrew_state}",
-        "  complete:  " + ("yes" if result["complete"] else "no"),
-    ]
-    if not runs_with_environments:
-        lines.append("  runs:       none")
-    for run in runs_with_environments:
-        conclusion = get(run, "conclusion")
-        environments = run["pending_environments"]
-        if environments is None:
-            pending = "unknown"
-        else:
-            pending = join(environments, ", ") or "none"
-        lines.append(f"  run {interpolate(get(run, 'databaseId'))}: {interpolate(get(run, 'status'))}"
-                     + (concat("/", conclusion) if truthy(conclusion) else "")
-                     + f", pending environments: {pending}\n    {interpolate(get(run, 'url'))}")
-    print("\n".join(lines))
+        result = status(tag)
+    except (AttributeError, KeyError, TypeError, OSError, ValueError) as error:
+        raise ToolError(f"unexpected GitHub or registry response ({error!r})") from None
+    print(json.dumps(result, indent=2) if json_report else human(result))
     return 0
 
 
-def length(value):
-    """jq's `length`."""
-    if value is None:
-        return 0
-    if isinstance(value, bool):
-        raise JqError(5, "boolean has no length")
-    if is_number(value):
-        return abs(value)
-    return len(value)
-
-
 if __name__ == "__main__":
-    sys.exit(exit_on_failure(main))
+    sys.exit(report_errors(main))

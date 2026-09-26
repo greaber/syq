@@ -7,6 +7,7 @@ Usage: scripts/verify-crates-io-package.py VERSION CRATE_FILE
 For tests, SYQ_TEST_CRATES_IO_RESPONSE and SYQ_TEST_CRATES_IO_STATUS replace
 the registry request with a response file and HTTP status.
 """
+import json
 import os
 import re
 import shutil
@@ -14,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 
-from tooling import JqError, captured, exit_on_failure, get, items, loads, require, sha256_file, text, truthy
+from tooling import sha256_file
 
 
 def fail(message):
@@ -22,12 +23,13 @@ def fail(message):
     return 1
 
 
-def field(response, *path):
-    """`jq -er PATH` of the response, or None when jq would fail."""
+def version_field(response, name):
+    """A string field of the crates.io response's version, or None."""
     try:
-        return captured(require(get(loads(response), *path)))
-    except JqError:
+        value = json.loads(response)["version"][name]
+    except (ValueError, KeyError, TypeError):
         return None
+    return value if isinstance(value, str) and value else None
 
 
 def main():
@@ -74,18 +76,19 @@ def main():
     if status != "200":
         print(f"crates.io returned HTTP {status} for syq {version}", file=sys.stderr)
         try:
-            details = [get(error, "detail") for error in items(get(loads(response), "errors"))]
-            for detail in details:
-                if truthy(detail):
-                    print(text(detail), file=sys.stderr)
-        except JqError:
-            pass
+            errors = json.loads(response).get("errors") or []
+            details = [error.get("detail") for error in errors if isinstance(error, dict)]
+        except (ValueError, AttributeError, TypeError):
+            details = []
+        for detail in details:
+            if detail:
+                print(detail, file=sys.stderr)
         return 1
 
-    published_version = field(response, "version", "num")
+    published_version = version_field(response, "num")
     if published_version is None:
         return fail("crates.io response has no version number")
-    published_checksum = field(response, "version", "checksum")
+    published_checksum = version_field(response, "checksum")
     if published_checksum is None:
         return fail("crates.io response has no package checksum")
     if published_version != version:
@@ -101,4 +104,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(exit_on_failure(main))
+    sys.exit(main())

@@ -6,13 +6,14 @@ Usage: scripts/package-release.py vVERSION DIST_DIR
 """
 import difflib
 from fnmatch import fnmatchcase
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 
-from tooling import cargo_version, dumps, exit_on_failure, sha256_file
+from tooling import cargo_version, report_errors, sha256_file
 
 SCRIPTS = Path(os.path.abspath(__file__)).parent
 TARGETS = {
@@ -45,12 +46,7 @@ def main():
     if not os.path.isdir(dist):
         print(f"missing distribution directory: {dist}", file=sys.stderr)
         return 1
-    cargo_toml = SCRIPTS.parent / "Cargo.toml"
-    try:
-        package_version = cargo_version(cargo_toml)
-    except OSError as error:
-        print(f"sed: can't read {cargo_toml}: {error.strerror}", file=sys.stderr)
-        return 2
+    package_version = cargo_version(SCRIPTS.parent / "Cargo.toml")
     if version != package_version:
         print(f"tag {tag} does not match Cargo.toml version {package_version}", file=sys.stderr)
         return 1
@@ -80,7 +76,7 @@ def main():
     descriptor, manifest_core = tempfile.mkstemp()
     try:
         with os.fdopen(descriptor, "w") as output:
-            output.write(dumps(core, indent=2, sort_keys=True) + "\n")
+            output.write(json.dumps(core, indent=2, sort_keys=True) + "\n")
         installer = os.path.join(dist, "install.sh")
         formula = os.path.join(dist, "syq.rb")
         run(SCRIPTS / "generate-installer.py", manifest_core, installer)
@@ -96,7 +92,7 @@ def main():
         "signature_scheme": "ed25519-jcs-v1",
     })
     with open(os.path.join(dist, "syq-release-manifest.json"), "w") as output:
-        output.write(dumps(manifest, indent=2, sort_keys=True) + "\n")
+        output.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
     # Anything unexpected here indicates a partial or contaminated release job.
     expected = sorted([name for asset in TARGETS.values()
@@ -114,4 +110,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(exit_on_failure(main))
+    sys.exit(report_errors(main))

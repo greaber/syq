@@ -7,7 +7,7 @@ Usage: scripts/generate-homebrew-formula.py MANIFEST OUTPUT
 import re
 import sys
 
-from tooling import captured, exit_on_failure, get, load_file, require
+from tooling import ToolError, load_release_manifest, report_errors
 
 DOWNLOAD_BASE = "https://dl.syq.christmas"
 
@@ -53,25 +53,20 @@ def main():
         print(f"usage: {sys.argv[0]} MANIFEST OUTPUT", file=sys.stderr)
         return 2
     manifest_path, output = sys.argv[1:]
-    try:
-        manifest = load_file(manifest_path)
-    except OSError as error:
-        print(f"jq: error: Could not open {manifest_path}: {error.strerror}", file=sys.stderr)
-        return 2
-    values = {
-        "VERSION": captured(require(get(manifest, "version"))),
-        "TAG": captured(require(get(manifest, "tag"))),
-        "REPOSITORY": captured(require(get(manifest, "repository"))),
-        "DOWNLOAD_BASE": DOWNLOAD_BASE,
-    }
-    if values["REPOSITORY"] != "https://github.com/greaber/syq":
-        print("unexpected repository", file=sys.stderr)
-        return 1
+    manifest = load_release_manifest(manifest_path)
+    values = {"VERSION": manifest["version"], "TAG": manifest["tag"],
+              "REPOSITORY": manifest["repository"], "DOWNLOAD_BASE": DOWNLOAD_BASE}
     for name, target in [("LINUX_X86", "linux-x86_64"), ("LINUX_ARM", "linux-aarch64"),
                          ("MAC_X86", "macos-x86_64"), ("MAC_ARM", "macos-arm64")]:
-        binary = get(manifest, "artifacts", target, "binary")
-        values[f"{name}_ASSET"] = captured(require(get(binary, "name")))
-        values[f"{name}_HASH"] = captured(require(get(binary, "sha256")))
+        try:
+            binary = manifest["artifacts"][target]["binary"]
+            values[f"{name}_ASSET"], values[f"{name}_HASH"] = binary["name"], binary["sha256"]
+        except (KeyError, TypeError):
+            raise ToolError(f"release manifest has no binary for {target}") from None
+        asset, digest = values[f"{name}_ASSET"], values[f"{name}_HASH"]
+        if not (isinstance(asset, str) and re.fullmatch(r"[A-Za-z0-9._-]+", asset)
+                and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise ToolError(f"invalid binary metadata for {target}")
     formula = re.sub(r"@([A-Z0-9_]+)@", lambda match: values[match.group(1)], FORMULA)
     with open(output, "w", encoding="utf-8", newline="") as destination:
         destination.write(formula)
@@ -79,4 +74,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(exit_on_failure(main))
+    sys.exit(report_errors(main))

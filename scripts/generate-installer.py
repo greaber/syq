@@ -9,8 +9,7 @@ import re
 import subprocess
 import sys
 
-from tooling import (JqError, captured, exit_on_failure, get, is_number, load_file, require,
-                     test)
+from tooling import ToolError, load_release_manifest, report_errors
 
 DOWNLOAD_BASE = "https://dl.syq.christmas"
 TARGETS = {
@@ -147,16 +146,18 @@ esac
 '''
 
 
-def valid_archive(manifest, target):
-    """The archive metadata check, failing on anything jq would reject."""
+def archive_fields(manifest, target):
+    """The name, SHA-256, and size of a target's archive, after validation."""
     try:
-        archive = get(manifest, "artifacts", target, "archive")
-        size = get(archive, "size")
-        return (test(get(archive, "name"), r"^[A-Za-z0-9._-]+$")
-                and test(get(archive, "sha256"), r"^[0-9a-f]{64}$")
-                and is_number(size) and float(size) > 0)
-    except JqError:
-        return False
+        archive = manifest["artifacts"][target]["archive"]
+        name, sha256, size = archive["name"], archive["sha256"], archive["size"]
+    except (KeyError, TypeError):
+        name = sha256 = size = None
+    if not (isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9._-]+", name)
+            and isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256)
+            and type(size) is int and size > 0):
+        raise ToolError(f"invalid archive metadata for {target}")
+    return name, sha256, str(size)
 
 
 def main():
@@ -164,28 +165,13 @@ def main():
         print(f"usage: {sys.argv[0]} MANIFEST OUTPUT", file=sys.stderr)
         return 2
     manifest_path, output = sys.argv[1:]
-    try:
-        manifest = load_file(manifest_path)
-    except OSError as error:
-        print(f"jq: error: Could not open {manifest_path}: {error.strerror}", file=sys.stderr)
-        return 2
-    version = captured(require(get(manifest, "version")))
-    tag = captured(require(get(manifest, "tag")))
-    repository = captured(require(get(manifest, "repository")))
-    if repository != "https://github.com/greaber/syq":
-        print("unexpected repository", file=sys.stderr)
-        return 1
-    for target in TARGETS:
-        if not valid_archive(manifest, target):
-            print(f"invalid archive metadata for {target}", file=sys.stderr)
-            return 1
-
-    values = {"VERSION": version, "DOWNLOAD_BASE": DOWNLOAD_BASE, "TAG": tag}
+    manifest = load_release_manifest(manifest_path)
+    table = [(pattern, *archive_fields(manifest, target)) for target, pattern in TARGETS.items()]
+    values = {"VERSION": manifest["version"], "DOWNLOAD_BASE": DOWNLOAD_BASE,
+              "TAG": manifest["tag"]}
     script = re.sub(r"@(VERSION|DOWNLOAD_BASE|TAG)@", lambda match: values[match.group(1)], HEAD)
-    for target, pattern in TARGETS.items():
-        archive = get(manifest, "artifacts", target, "archive")
-        fields = [captured(get(archive, key)) for key in ("name", "sha256", "size")]
-        script += "{}) archive='{}'; expected_sha='{}'; expected_size='{}' ;;\n".format(pattern, *fields)
+    for row in table:
+        script += "{}) archive='{}'; expected_sha='{}'; expected_size='{}' ;;\n".format(*row)
     script += TAIL
     with open(output, "w", encoding="utf-8", newline="") as destination:
         destination.write(script)
@@ -194,4 +180,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(exit_on_failure(main))
+    sys.exit(report_errors(main))
