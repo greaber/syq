@@ -65,8 +65,11 @@ objects.
 - **Updates:** `--only-new`, `--into-new`, and `--as-new` protect individual
   objects against concurrent creation. Prefix checks are not transactional.
   `--inplace` and SSH/S3 combinations are unsupported.
-- **Recovery:** rerun an interrupted copy to reuse multipart work. If you abandon
-  an upload, remove its unfinished parts with provider tools or a lifecycle rule.
+- **Recovery:** rerun an interrupted copy to reuse multipart work. Recovery records
+  are stored in the local user cache. If that cache cannot be written, the copy
+  continues with a warning, but unsaved progress cannot be reused on a later run.
+  If you abandon an upload, remove its unfinished parts with provider tools or a
+  lifecycle rule.
 
 <a id="copy-between-buckets-or-prefixes"></a>
 
