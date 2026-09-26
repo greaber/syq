@@ -237,6 +237,77 @@ fn readonly_root_copies_and_reruns() {
     assert_eq!(read(&t.path("dst/f")), b"data");
 }
 
+#[test]
+fn native_copies_need_no_writable_source_or_home() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    write(&t.path("source/nested/file"), b"read-only source");
+    for directory in ["home", "home/.cache", "home/.config"] {
+        fs::create_dir_all(t.path(directory)).unwrap();
+    }
+    fs::set_permissions(
+        t.path("source/nested/file"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    for directory in [
+        "source/nested",
+        "source",
+        "home/.cache",
+        "home/.config",
+        "home",
+    ] {
+        fs::set_permissions(t.path(directory), fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    for route in ["local", "push", "pull"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args([
+                "cp",
+                "--no-progress",
+                "--no-tcp",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--rsh",
+                ssh.to_str().unwrap(),
+                "--performance-tuning",
+                "workers=1",
+            ])
+            .env("HOME", t.path("home"))
+            .env("XDG_CACHE_HOME", t.path("home/.cache"))
+            .env("XDG_CONFIG_HOME", t.path("home/.config"))
+            .env("FAKE_REMOTE_HOME", t.path("home"))
+            .env("FAKE_REMOTE_BIN", t.path("bin"))
+            .env("FAKE_RSH_LOG", t.path("ssh.log"));
+        if route == "pull" {
+            command.args(["--from", "host"]);
+        }
+        command.args(["--srcs-in", &t.s("source")]);
+        if route == "push" {
+            command.args(["--to", "host"]);
+        }
+        command.args(["--into", &t.s(&format!("destination-{route}"))]);
+        let output = command.run().unwrap();
+        assert_output_ok(&output);
+        assert_eq!(
+            read(&t.path(&format!("destination-{route}/nested/file"))),
+            b"read-only source"
+        );
+    }
+    assert_eq!(read(&t.path("source/nested/file")), b"read-only source");
+    assert_eq!(listing(&t.path("source")), ["nested", "nested/file"]);
+    assert_eq!(
+        fs::metadata(t.path("source/nested/file")).unwrap().mode() & 0o777,
+        0o444
+    );
+    assert_eq!(
+        fs::metadata(t.path("source")).unwrap().mode() & 0o777,
+        0o555
+    );
+    assert_eq!(fs::read_dir(t.path("home/.cache")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(t.path("home/.config")).unwrap().count(), 0);
+}
+
 // Several content sources map onto the destination root; the last one's
 // metadata wins, as for any other directory.
 #[test]

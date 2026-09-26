@@ -19,6 +19,9 @@ mod map;
 #[path = "s3/expressions.rs"]
 mod expressions;
 
+#[path = "s3/recovery.rs"]
+mod recovery;
+
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -202,6 +205,17 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault.starts_with("recovery-upload-") {
+        recovery::serve_upload(
+            &mut socket,
+            fault,
+            method,
+            first.split_whitespace().nth(1).unwrap(),
+            &headers,
+            &gate,
+        );
+        return;
+    }
     if fault.starts_with("mapping-plan-") {
         let path = first.split_whitespace().nth(1).unwrap();
         if method == "HEAD" {
