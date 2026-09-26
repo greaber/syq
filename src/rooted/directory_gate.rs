@@ -196,6 +196,27 @@ mod tests {
     }
 
     #[test]
+    fn burst_scope_is_thread_local_and_restores_admission_after_unwind() {
+        let root = RootIdentity { dev: 9, ino: 7 };
+        let parent = vec![b"burst".to_vec()];
+        assert!(acquire(root, &parent).0.is_some());
+        let outer = Burst::enter();
+        assert!(acquire(root, &parent).0.is_none());
+        std::thread::scope(|scope| {
+            scope.spawn(|| assert!(acquire(root, &parent).0.is_some()));
+        });
+        assert!(std::panic::catch_unwind(|| {
+            let _inner = Burst::enter();
+            assert!(acquire(root, &parent).0.is_none());
+            panic!("mutation failed");
+        })
+        .is_err());
+        assert!(acquire(root, &parent).0.is_none());
+        drop(outer);
+        assert!(acquire(root, &parent).0.is_some());
+    }
+
+    #[test]
     fn errors_and_panics_release_permits() {
         let gate = Arc::new(Gate::default());
         let fail = || -> Result<(), ()> {
