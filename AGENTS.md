@@ -385,9 +385,9 @@ known about it.
   workflows still run from the runner image. Use portable shell only for code
   that runs on users' machines or arbitrary hosts (the generated installer and
   `scripts/try-benchmark.sh`), code that must run before pinned tools exist
-  (`scripts/setup.sh` and the release runners' Nix and build steps), the
-  real-SSH container scripts, and trivial glue. The user chose this in 2026-09
-  because the CI and release scripts had grown too complex for Bash; do not
+  (`scripts/setup.sh`), the real-SSH container scripts, and thin wrappers that
+  only run other commands, such as the release runners' Nix and build steps.
+  CI and release tooling is too complex to maintain well in Bash, so do not
   spend effort on Bash 3.2 compatibility for development scripts.
 - Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
   sync. A behavior change lands in `docs/reference.md` (or the topical
