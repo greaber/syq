@@ -2455,3 +2455,59 @@ fn checksum_inplace_compares_before_writing_over_ssh_and_tcp() {
         }
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn empty_remote_directory_skips_redundant_destination_batch_lookup() {
+    for (populated, predicate) in [(false, false), (true, false), (false, true)] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        write(&t.path("src/nested/one"), b"one");
+        write(&t.path("src/two"), b"two");
+        fs::create_dir(t.path("dst")).unwrap();
+        if populated {
+            write(&t.path("dst/sentinel"), b"keep");
+        }
+        write(&t.path("lookups"), b"");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--srcs-in",
+            &t.s("src"),
+            "--to",
+            "host",
+            "--into",
+            &t.s("dst"),
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--no-tcp",
+            "--no-progress",
+        ]);
+        if predicate {
+            command.args(["--copy-if", "not dst.exists"]);
+        }
+        let output = command
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("SYQ_TEST_DESTINATION_LOOKUPS", t.path("lookups"))
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst/nested/one")), b"one");
+        assert_eq!(read(&t.path("dst/two")), b"two");
+        if populated {
+            assert_eq!(read(&t.path("dst/sentinel")), b"keep");
+        }
+        let lookups = fs::read_to_string(t.path("lookups")).unwrap();
+        assert_eq!(
+            lookups.lines().any(|line| line.starts_with("batch ")),
+            populated || predicate,
+            "populated={populated}, predicate={predicate}: {lookups}"
+        );
+    }
+}
