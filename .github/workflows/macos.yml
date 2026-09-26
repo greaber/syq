@@ -80,6 +80,15 @@ jobs:
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github jq python
       - name: Run the exact test
         shell: bash
         env:
@@ -116,6 +125,15 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github jq python
       - id: changes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -173,6 +191,15 @@ jobs:
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-suite-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github jq uv python node go
       - name: Show toolchain and environment
         run: |
           rustc --version
@@ -185,23 +212,10 @@ jobs:
         run: cargo test --locked --all-targets --no-fail-fast
       - name: Build the candidate syq executable
         run: cargo build --locked --bin syq
-      - id: python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ">=3.13.4 <3.14"
-          check-latest: true
-      - name: Install pinned Python tooling
-        env:
-          SETUP_PYTHON: ${{ steps.python.outputs.python-path }}
-        run: |
-          "$SETUP_PYTHON" -m venv "$RUNNER_TEMP/syq-python-tools"
-          "$RUNNER_TEMP/syq-python-tools/bin/python" -m pip install --disable-pip-version-check --no-deps uv==0.11.6
-          echo "$RUNNER_TEMP/syq-python-tools/bin" >> "$GITHUB_PATH"
       - name: Use Homebrew OpenSSL for Ed25519 signing
         run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
       - name: Test and package Python SDK
         env:
-          UV_PYTHON: ${{ steps.python.outputs.python-path }}
           PYTHONPATH: sdk/python/src
           SYQ_CANDIDATE_EXECUTABLE: ${{ github.workspace }}/target/debug/syq
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/syq-sdk-python
@@ -234,20 +248,12 @@ jobs:
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22.x"
-          package-manager-cache: false
       - name: Test and package JavaScript SDK
         working-directory: sdk/js
         run: |
           npm ci --ignore-scripts
           npm test
           npm pack --dry-run
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.26.x"
-          cache: false
       - name: Format, vet, and test Go SDK
         working-directory: sdk/go
         run: |
@@ -313,6 +319,15 @@ jobs:
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
             cargo-macos-clone-benchmark-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
       - name: Measure APFS cloning
         run: |
           cargo build --release --locked --bin syq

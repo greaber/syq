@@ -7,7 +7,7 @@ changed_paths=
 full_suite=false
 integration_targets=
 tooling_checks=
-all_tooling="package installer benchmark release orchestration focused branch workflows"
+all_tooling="package installer benchmark release orchestration focused branch workflows setup"
 
 run_everything() {
   printf '%s\n' \
@@ -205,6 +205,17 @@ while IFS= read -r path; do
       ;;
     tests/real-ssh/*)
       ;;
+    scripts/setup.lock)
+      # Pinned tools run the Rust, SDK, conformance, and tooling tests.
+      native=true
+      python_sdk=true
+      javascript_sdk=true
+      go_sdk=true
+      path_tooling=true
+      shellcheck=true
+      mapping_docs=true
+      conformance=true
+      ;;
     scripts/*|deny.toml)
       path_tooling=true
       ;;
@@ -243,6 +254,12 @@ while IFS= read -r path; do
       ;;
     scripts/branch-status.sh|scripts/test-branch-status.sh)
       path_tooling_checks+=" branch"
+      ;;
+    scripts/setup.sh|scripts/test-setup.sh)
+      path_tooling_checks+=" setup"
+      ;;
+    scripts/setup.lock)
+      path_tooling_checks+=" $all_tooling"
       ;;
     scripts/verify-release-ci.sh)
       path_tooling_checks+=" release orchestration"
