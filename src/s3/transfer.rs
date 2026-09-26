@@ -138,6 +138,7 @@ struct PreparedUpload {
     multipart: Option<PreparedMultipart>,
 }
 struct PreparedMultipart {
+    recorded: bool,
     upload: UploadState,
     uploaded: HashMap<i32, (String, Option<String>, Option<u64>)>,
 }
@@ -286,9 +287,20 @@ impl Engine {
                     }
                 })
                 .await?;
-                self.prepare_pruning(&prune).await?;
-                self.finish_authorization().await?;
+                let authorized = async {
+                    self.prepare_pruning(&prune).await?;
+                    self.finish_authorization().await
+                }
+                .await;
                 let prepared = std::mem::take(&mut *prepared.lock().await);
+                if let Err(error) = authorized {
+                    for (_, _, _, _, work) in &prepared {
+                        if let UploadPreparation::Ready(work) = work {
+                            self.abort_unrecorded_preparation(work).await;
+                        }
+                    }
+                    return Err(error);
+                }
                 let workers =
                     self.object_workers(prepared.iter().map(|(_, _, _, _, work)| match work {
                         UploadPreparation::Ready(work) => work.size,
@@ -298,7 +310,6 @@ impl Engine {
                 parallel(prepared, workers, |(key, label, kind, expected, work)| {
                     let engine = self.clone();
                     async move {
-                        engine.check_cancelled()?;
                         let result = engine.execute_upload(work).await;
                         engine.settle(&label, &key, kind, &result, expected.as_ref());
                         Ok(result.ok().flatten())
@@ -913,7 +924,10 @@ impl Engine {
             must_be_new,
             multipart,
         };
-        self.authorize_upload(&prepared).await?;
+        if let Err(error) = self.authorize_upload(&prepared).await {
+            self.abort_unrecorded_preparation(&prepared).await;
+            return Err(error);
+        }
         Ok(UploadPreparation::Ready(Box::new(prepared)))
     }
 
@@ -992,111 +1006,54 @@ impl Engine {
             self.tuning.requests.completed(size);
             self.progress.add_bytes(size);
         } else {
-            let PreparedMultipart { upload, uploaded } =
-                multipart.context("multipart preparation missing")?;
-            let state = State::open(&self.identity(&source.key, "upload"))?;
-            let saved: Option<UploadState> = state.load()?;
-            anyhow::ensure!(
-                saved
-                    .as_ref()
-                    .is_some_and(|saved| saved.upload_id == upload.upload_id
-                        && saved.digest == upload.digest),
-                "upload recovery changed during preparation; rerun the copy"
-            );
-            let saved_parts = Mutex::new(upload.completed.clone());
-            // Stop admitting parts on failure, but drain requests already in flight.
-            let failed = std::sync::atomic::AtomicBool::new(false);
-            let completed = stream::iter(checksums.into_iter().enumerate())
-                .take_while(|_| std::future::ready(!failed.load(Relaxed)))
-                .map(|(index, checksum)| {
-                    let source = &source;
-                    let upload = &upload;
-                    let uploaded = &uploaded;
-                    let saved_parts = &saved_parts;
-                    let state = &state;
-                    async move {
-                        let number = index as i32 + 1;
-                        let offset = index as u64 * part_size;
-                        let length = part_size.min(size - offset);
-                        if let Some((etag, old_checksum, old_length)) = uploaded.get(&number) {
-                            let matches = match algorithm {
-                                Algorithm::Sha256 => old_checksum.as_ref() == Some(&checksum),
-                                // An ETag is opaque. Reuse only an acknowledged
-                                // part from this exact source/recovery record.
-                                Algorithm::Md5 => {
-                                    upload.acknowledged_part(number, etag, &checksum, length)
-                                }
-                            };
-                            if matches && *old_length == Some(length) {
-                                self.progress.bytes_unchanged.fetch_add(length, Relaxed);
-                                return Ok(CompletedPart::builder()
-                                    .part_number(number)
-                                    .e_tag(etag)
-                                    .set_checksum_sha256(
-                                        algorithm.is_sha256().then(|| checksum.clone()),
-                                    )
-                                    .build());
-                            }
-                        }
-                        let _slot = self.tuning.requests.acquire().await;
-                        let sync_file = self.tuning.local_latency().then(|| {
-                            crate::s3::upload_http::FileBody::new(source.clone(), offset, length)
-                        });
-                        let mut attempt = 0;
-                        loop {
-                            self.check_cancelled()?;
-                            let body = if sync_file.is_some() {
-                                crate::s3::upload_http::body(length)
-                            } else {
-                                file_body(source, offset, length).await?
-                            };
-                            self.pace(length).await?;
-                            let request = self
-                                .client
-                                .upload_part()
-                                .bucket(&self.options.bucket)
-                                .key(&source.key)
-                                .upload_id(&upload.upload_id)
-                                .part_number(number)
-                                .body(body)
-                                .content_length(length as i64)
-                                .set_checksum_sha256(
-                                    algorithm.is_sha256().then(|| checksum.clone()),
-                                )
-                                .set_content_md5(
-                                    (algorithm == Algorithm::Md5).then(|| checksum.clone()),
-                                )
-                                .customize()
-                                .config_override(super::client::without_sdk_retries())
-                                .disable_payload_signing();
-                            let request = if let Some(file) = &sync_file {
-                                request.interceptor(file.clone())
-                            } else {
-                                request
-                            };
-                            let result = request.send().await;
-                            if let Some(file) = &sync_file {
-                                file.drain().await;
-                            }
-                            match result {
-                                Ok(output) => {
-                                    let etag = output.e_tag().context("S3 part omitted ETag")?;
-                                    if algorithm == Algorithm::Md5 {
-                                        let mut parts = saved_parts.lock().await;
-                                        parts.insert(
-                                            number,
-                                            UploadedPart {
-                                                etag: etag.into(),
-                                                checksum: checksum.clone(),
-                                                length,
-                                            },
-                                        );
-                                        let mut record = upload.clone();
-                                        record.completed = parts.clone();
-                                        state.save(&record)?;
+            let PreparedMultipart {
+                recorded,
+                upload,
+                uploaded,
+            } = multipart.context("multipart preparation missing")?;
+            let state = if recorded {
+                let state = State::open(&self.identity(&source.key, "upload"))?;
+                let saved: Option<UploadState> = state.load()?;
+                anyhow::ensure!(
+                    saved
+                        .as_ref()
+                        .is_some_and(|saved| saved.upload_id == upload.upload_id
+                            && saved.digest == upload.digest),
+                    "upload recovery changed during preparation; rerun the copy"
+                );
+                state
+            } else {
+                // This upload has never been published in the recovery cache.
+                // Its in-memory ID suffices; no process can resume it from disk.
+                State::without_cache()
+            };
+            let result: Result<()> = async {
+                let saved_parts = Mutex::new(upload.completed.clone());
+                // Stop admitting parts on failure, but drain requests already in flight.
+                let failed = std::sync::atomic::AtomicBool::new(false);
+                let completed = stream::iter(checksums.into_iter().enumerate())
+                    .take_while(|_| std::future::ready(!failed.load(Relaxed)))
+                    .map(|(index, checksum)| {
+                        let source = &source;
+                        let upload = &upload;
+                        let uploaded = &uploaded;
+                        let saved_parts = &saved_parts;
+                        let state = &state;
+                        async move {
+                            let number = index as i32 + 1;
+                            let offset = index as u64 * part_size;
+                            let length = part_size.min(size - offset);
+                            if let Some((etag, old_checksum, old_length)) = uploaded.get(&number) {
+                                let matches = match algorithm {
+                                    Algorithm::Sha256 => old_checksum.as_ref() == Some(&checksum),
+                                    // An ETag is opaque. Reuse only an acknowledged
+                                    // part from this exact source/recovery record.
+                                    Algorithm::Md5 => {
+                                        upload.acknowledged_part(number, etag, &checksum, length)
                                     }
-                                    self.tuning.requests.completed(length);
-                                    self.progress.add_bytes(length);
+                                };
+                                if matches && *old_length == Some(length) {
+                                    self.progress.bytes_unchanged.fetch_add(length, Relaxed);
                                     return Ok(CompletedPart::builder()
                                         .part_number(number)
                                         .e_tag(etag)
@@ -1105,53 +1062,163 @@ impl Engine {
                                         )
                                         .build());
                                 }
-                                Err(e) if retryable(&e) && attempt < self.options.retries => {
-                                    super::backoff(attempt).await;
-                                    attempt += 1;
+                            }
+                            let _slot = self.tuning.requests.acquire().await;
+                            let sync_file = self.tuning.local_latency().then(|| {
+                                crate::s3::upload_http::FileBody::new(
+                                    source.clone(),
+                                    offset,
+                                    length,
+                                )
+                            });
+                            let mut attempt = 0;
+                            loop {
+                                self.check_cancelled()?;
+                                let body = if sync_file.is_some() {
+                                    crate::s3::upload_http::body(length)
+                                } else {
+                                    file_body(source, offset, length).await?
+                                };
+                                self.pace(length).await?;
+                                let request = self
+                                    .client
+                                    .upload_part()
+                                    .bucket(&self.options.bucket)
+                                    .key(&source.key)
+                                    .upload_id(&upload.upload_id)
+                                    .part_number(number)
+                                    .body(body)
+                                    .content_length(length as i64)
+                                    .set_checksum_sha256(
+                                        algorithm.is_sha256().then(|| checksum.clone()),
+                                    )
+                                    .set_content_md5(
+                                        (algorithm == Algorithm::Md5).then(|| checksum.clone()),
+                                    )
+                                    .customize()
+                                    .config_override(super::client::without_sdk_retries())
+                                    .disable_payload_signing();
+                                let request = if let Some(file) = &sync_file {
+                                    request.interceptor(file.clone())
+                                } else {
+                                    request
+                                };
+                                let result = request.send().await;
+                                if let Some(file) = &sync_file {
+                                    file.drain().await;
                                 }
-                                Err(e) => {
-                                    return Err(e.into_service_error())
-                                        .context("upload part; rerun the command to resume")
+                                match result {
+                                    Ok(output) => {
+                                        let etag =
+                                            output.e_tag().context("S3 part omitted ETag")?;
+                                        if algorithm == Algorithm::Md5 {
+                                            let mut parts = saved_parts.lock().await;
+                                            parts.insert(
+                                                number,
+                                                UploadedPart {
+                                                    etag: etag.into(),
+                                                    checksum: checksum.clone(),
+                                                    length,
+                                                },
+                                            );
+                                            let mut record = upload.clone();
+                                            record.completed = parts.clone();
+                                            state.save(&record)?;
+                                        }
+                                        self.tuning.requests.completed(length);
+                                        self.progress.add_bytes(length);
+                                        return Ok(CompletedPart::builder()
+                                            .part_number(number)
+                                            .e_tag(etag)
+                                            .set_checksum_sha256(
+                                                algorithm.is_sha256().then(|| checksum.clone()),
+                                            )
+                                            .build());
+                                    }
+                                    Err(e) if retryable(&e) && attempt < self.options.retries => {
+                                        super::backoff(attempt).await;
+                                        attempt += 1;
+                                    }
+                                    Err(e) => {
+                                        return Err(e.into_service_error())
+                                            .context("upload part; rerun the command to resume")
+                                    }
                                 }
                             }
                         }
-                    }
-                })
-                .buffer_unordered(self.part_workers())
-                .inspect(|result| {
-                    if result.is_err() {
-                        failed.store(true, Relaxed);
-                    }
-                })
-                .collect::<Vec<Result<_>>>()
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            self.check_cancelled()?;
-            source.check(&source.open()?)?;
-            let mut completed = completed;
-            completed.sort_by_key(|p| p.part_number());
-            self.client
-                .complete_multipart_upload()
-                .bucket(&self.options.bucket)
-                .key(&source.key)
-                .upload_id(&upload.upload_id)
-                .multipart_upload(
-                    CompletedMultipartUpload::builder()
-                        .set_parts(Some(completed))
-                        .build(),
-                )
-                .set_if_none_match(must_be_new.then(|| "*".into()))
-                .send()
-                .await
-                .map_err(|e| e.into_service_error())
-                .context("complete multipart upload; rerun the command to recover")?;
+                    })
+                    .buffer_unordered(self.part_workers())
+                    .inspect(|result| {
+                        if result.is_err() {
+                            failed.store(true, Relaxed);
+                        }
+                    })
+                    .collect::<Vec<Result<_>>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()?;
+                self.check_cancelled()?;
+                source.check(&source.open()?)?;
+                let mut completed = completed;
+                completed.sort_by_key(|p| p.part_number());
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&self.options.bucket)
+                    .key(&source.key)
+                    .upload_id(&upload.upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .set_parts(Some(completed))
+                            .build(),
+                    )
+                    .set_if_none_match(must_be_new.then(|| "*".into()))
+                    .send()
+                    .await
+                    .map_err(|e| e.into_service_error())
+                    .context("complete multipart upload; rerun the command to recover")?;
+                Ok(())
+            }
+            .await;
+            if result.is_err() && !state.has_record() {
+                self.abort_unrecorded_upload(&source.key, &upload.upload_id)
+                    .await;
+            }
+            result?;
             state.clear()?;
         }
         if source.kind() == ObjectKind::File {
             source.check(&source.open()?)?;
         }
         Ok(Some(size))
+    }
+    async fn abort_unrecorded_preparation(&self, prepared: &PreparedUpload) {
+        if let Some(multipart) = &prepared.multipart {
+            if !multipart.recorded {
+                self.abort_unrecorded_upload(&prepared.source.key, &multipart.upload.upload_id)
+                    .await;
+            }
+        }
+    }
+    async fn abort_unrecorded_upload(&self, key: &str, upload_id: &str) {
+        if let Err(error) = self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.options.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+        {
+            if error
+                .raw_response()
+                .is_none_or(|r| r.status().as_u16() != 404)
+            {
+                crate::output::diagnostic!(
+                    "syq: warning: failed to abort unfinished upload {key:?} without a recovery record: {}",
+                    error.into_service_error()
+                );
+            }
+        }
     }
     async fn prepare_multipart(
         &self,
@@ -1284,8 +1351,11 @@ impl Engine {
             }
             record
         };
-        drop(state);
-        Ok(PreparedMultipart { upload, uploaded })
+        Ok(PreparedMultipart {
+            recorded: state.has_record(),
+            upload,
+            uploaded,
+        })
     }
 
     async fn download_plan(&self, destination_prefix: &str) -> Result<DownloadPlan> {
@@ -2100,6 +2170,15 @@ impl Engine {
         } else {
             self.new_download_state(root, &job.path, &object, &state)?
         };
+        let _cleanup = if state.has_record() {
+            None
+        } else {
+            Some(PartialCleanup {
+                root,
+                path: RelativePath::new(record.partial.as_bytes())?,
+                identity: (record.dev, record.ino),
+            })
+        };
         let range_algorithm = record.hash_algorithm;
         let record = Arc::new(Mutex::new(record));
         let file = Arc::new(file);
@@ -2532,8 +2611,8 @@ fn remove_partial(root: &Root, record: &DownloadState) -> Result<()> {
     Ok(())
 }
 
-// Single-request downloads have no reusable completed ranges. Remove their
-// temporary file on failure or cancellation, including a dropped future.
+// Downloads without a recovery record have no reusable saved progress. Remove
+// their temporary file on failure or cancellation, including a dropped future.
 struct PartialCleanup<'a> {
     root: &'a Root,
     path: RelativePath,
