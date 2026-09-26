@@ -109,6 +109,10 @@ class ForwardSignals:
         sys.stdout.flush()
         self.child = subprocess.Popen(list(args), stdout=subprocess.PIPE if capture else None,
                                       text=True, **kwargs)
+        # A signal that arrived while the child was starting found no child
+        # to forward to; pass it on now instead of letting the child run on.
+        if self.received is not None:
+            self.child.send_signal(self.received)
         try:
             captured, _ = self.child.communicate()
         finally:

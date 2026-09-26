@@ -230,7 +230,9 @@ jobs:
       - name: Test release orchestration
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' orchestration ')
-        run: scripts/test-release-orchestration.py
+        run: |
+          scripts/test-release-orchestration.py
+          scripts/test-tooling.py
       - name: Test focused check dispatch
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' focused ')

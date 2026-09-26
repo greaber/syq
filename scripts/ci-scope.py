@@ -290,6 +290,10 @@ def classify(paths, preparation_only):
             # Retain broad coverage for tooling whose ownership is not yet mapped,
             # including the shared scripts/tooling.py module.
             path_tooling_checks += ALL_TOOLING.split()
+        # Workflows, the release skill, and release docs name scripts by path;
+        # check those references whenever a script is added, renamed, or removed.
+        if matches(path, "scripts/*") and "workflows" not in path_tooling_checks:
+            path_tooling_checks.append("workflows")
         # Apply fallback to this path before combining it with other selections.
         if path_tooling and not path_tooling_checks:
             path_tooling_checks = ALL_TOOLING.split()

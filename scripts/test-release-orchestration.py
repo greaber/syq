@@ -176,15 +176,17 @@ class PathScopeTests(Scratch):
         self.assertScope(self.scope(event=dispatch), sdk_matrix='["python"]')
 
     def test_tooling_changes_select_their_own_suites(self):
-        # Tooling changes select their own suites, without product builds.
-        for path, checks in [("scripts/test-release-tools.py", "release"),
-                             ("scripts/test-installer.py", "installer"),
-                             ("scripts/test-try-benchmark.py", "benchmark"),
-                             ("scripts/test-run-focused-check.py", "focused"),
-                             ("scripts/test-branch-status.py", "branch"),
-                             ("scripts/setup.sh", "setup"),
-                             ("scripts/test-setup.sh", "setup"),
-                             ("scripts/test-release-orchestration.py", "orchestration"),
+        # Tooling changes select their own suites, without product builds. Any
+        # script change also checks the script references in workflows and docs.
+        for path, checks in [("scripts/test-release-tools.py", "release workflows"),
+                             ("scripts/test-installer.py", "installer workflows"),
+                             ("scripts/test-try-benchmark.py", "benchmark workflows"),
+                             ("scripts/test-run-focused-check.py", "focused workflows"),
+                             ("scripts/test-branch-status.py", "branch workflows"),
+                             ("scripts/setup.sh", "setup workflows"),
+                             ("scripts/test-setup.sh", "setup workflows"),
+                             ("scripts/test-release-orchestration.py",
+                              "orchestration workflows"),
                              (".github/workflows/macos.yml", "orchestration workflows"),
                              (".github/workflows/ci.yml", "orchestration workflows"),
                              ("scripts/check-script-references.py",
@@ -193,14 +195,16 @@ class PathScopeTests(Scratch):
                 scope = self.scope(path)
                 self.assertScope(scope, tooling_checks=checks)
                 self.assertAll(scope, ["native", "sdks", "conformance", "macos"], "false")
+        self.assertScope(self.scope("scripts/rsync-compat.py"), conformance="true",
+                         tooling_checks="workflows")
         scope = self.scope("scripts/test-installer.py", "scripts/test-release-tools.py",
                            "scripts/test-installer.py")
-        self.assertScope(scope, tooling_checks="installer release")
+        self.assertScope(scope, tooling_checks="installer release workflows")
         dispatch = self.event("workflow-dispatch-event.json", DISPATCH_EVENT)
         self.assertScope(self.scope(event=dispatch), tooling_checks=(
             "package installer benchmark release orchestration focused branch workflows setup"))
         reverse = self.scope("scripts/test-release-tools.py", "scripts/test-installer.py")
-        self.assertScope(reverse, tooling_checks="installer release")
+        self.assertScope(reverse, tooling_checks="installer release workflows")
         self.assertScope(self.scope("build.rs"), tooling_checks="package", native="true")
 
     def test_mapped_path_never_suppresses_fallback(self):
