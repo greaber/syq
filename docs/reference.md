@@ -267,8 +267,9 @@ follows the block-reuse policy.
 
 A copy may temporarily make a newly created directory writable while filling it.
 After interruption, syq cannot distinguish that directory from a pre-existing
-writable directory. Without `--copy-metadata=permissions`, a retry may therefore
-leave different directory permissions than an uninterrupted copy.
+writable directory. A retry treats it as an existing container, so its permissions
+and modification time may differ from an uninterrupted copy. Explicit
+`--copy-metadata=permissions,mtime` makes those attributes match the source.
 
 Partial files may remain after a successful retry. To remove them:
 
