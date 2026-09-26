@@ -956,14 +956,14 @@ fn run_remote(
         remote.push(format!("--resource-limits={limits}"));
     }
 
-    for (enabled, option) in [
-        (args.ignore_existing, "--only-new"),
-        (args.existing, "--only-existing"),
-        (args.update, "--skip-newer"),
-    ] {
-        if enabled {
-            remote.push(option.into());
-        }
+    if let Some(policy) = args.if_exists {
+        remote.push(format!("--if-exists={}", policy.as_str()));
+    }
+    if args.resume {
+        remote.push("--resume".into());
+    }
+    if args.existing {
+        remote.push("--only-existing".into());
     }
     if let Some(expression) = &args.where_expression {
         remote.push(format!("--where={expression}"));
@@ -990,14 +990,14 @@ fn run_remote(
     for line in &args.ignore_lines {
         remote.push(format!("--ignore={line}"));
     }
-    if !args.times {
-        remote.push("--preserve=-mtime".into());
+    if args.copy_mtime_metadata {
+        remote.push("--copy-metadata=mtime".into());
     }
     if args.acls {
-        remote.push("--preserve=acls".into());
+        remote.push("--copy-metadata=acls".into());
     }
     if args.xattrs {
-        remote.push("--preserve=xattrs".into());
+        remote.push("--copy-metadata=xattrs".into());
     }
     if args.sparse {
         remote.push("--sparse".into());
@@ -1006,23 +1006,23 @@ fn run_remote(
         remote.push("--open-noatime".into());
     }
     if args.crtimes {
-        remote.push("--preserve=crtimes".into());
+        remote.push("--copy-metadata=crtimes".into());
     }
     if args.atimes > 0 {
-        remote.push("--preserve=atimes".into());
+        remote.push("--copy-metadata=atimes".into());
     }
 
     if args.hardlinks {
-        remote.push("--preserve=hardlinks".into());
+        remote.push("--copy-metadata=hardlinks".into());
     }
     if args.perms {
-        remote.push("--preserve=permissions".into());
+        remote.push("--copy-metadata=permissions".into());
     }
     if args.owner || args.group {
-        remote.push("--preserve=ownership".into());
+        remote.push("--copy-metadata=ownership".into());
     }
     if args.devices {
-        remote.push("--preserve=specials".into());
+        remote.push("--copy-metadata=specials".into());
     }
     if let Some(tuning) = args.tuning_options {
         remote.push(format!("--performance-tuning={tuning}"));

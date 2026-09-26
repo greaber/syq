@@ -13,6 +13,7 @@ use std::{
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Policy {
     pub preserve: u8,
+    pub if_exists: Option<crate::cli::IfExists>,
     pub restore_named_mtime: bool,
     pub skip_newer: bool,
     pub specials: bool,
@@ -21,11 +22,12 @@ pub(crate) struct Policy {
 impl Policy {
     pub fn new(args: &Args) -> Self {
         Self {
+            if_exists: args.if_exists,
             preserve: if args.perms { flags::MODE } else { 0 }
                 | if args.owner { flags::OWNER } else { 0 }
                 | if args.group { flags::GROUP } else { 0 }
                 | if args.times { flags::TIMES } else { 0 },
-            restore_named_mtime: !args.no_preserve_mtime,
+            restore_named_mtime: true,
             skip_newer: args.update,
             specials: args.devices,
             overrides: None,
@@ -33,21 +35,21 @@ impl Policy {
     }
     pub fn source(self, meta: Option<Meta>) -> Result<()> {
         ensure!(!self.skip_newer || meta.is_some(),
-            "--skip-newer requires a regular-file source timestamp; pipes, sockets, and devices have no payload timestamp");
+            "--if-exists=update-if-older requires a regular-file source timestamp; pipes, sockets, and devices have no payload timestamp");
         ensure!((self.preserve == 0 && !self.specials) || meta.is_some(),
-            "--preserve requires regular-file source metadata; a byte stream cannot preserve a pipe, socket, or device node");
+            "--copy-metadata requires regular-file source metadata; a byte stream cannot preserve a pipe, socket, or device node");
         Ok(())
     }
     pub fn output(self, regular: bool) -> Result<()> {
         ensure!(self.preserve == 0 || regular,
-            "--preserve requires a regular-file destination; an output pipe, socket, or device cannot carry file metadata");
+            "--copy-metadata requires a regular-file destination; an output pipe, socket, or device cannot carry file metadata");
         Ok(())
     }
     pub fn newer(self, source: Option<Meta>, destination: Option<Meta>) -> bool {
         self.skip_newer
-            && source
-                .zip(destination)
-                .is_some_and(|(src, dst)| (dst.mtime, dst.mtime_nsec) > (src.mtime, src.mtime_nsec))
+            && source.zip(destination).is_some_and(|(src, dst)| {
+                (dst.mtime, dst.mtime_nsec) >= (src.mtime, src.mtime_nsec)
+            })
     }
     pub fn apply(self, file: &File, source: Option<Meta>) -> Result<()> {
         if let Some(meta) = source {

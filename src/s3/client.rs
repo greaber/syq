@@ -1236,6 +1236,74 @@ pub(super) fn from_get(
     Ok(object)
 }
 
+/// Update supported file attributes without dropping unrelated object headers.
+/// The same request description is used while authorizing and while executing.
+pub(super) fn metadata_update_request(
+    bucket: &str,
+    key: &str,
+    head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+    metadata: HashMap<String, String>,
+) -> Result<super::authorization::Unsigned> {
+    let encode = |text: &str| {
+        percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC).to_string()
+    };
+    let mut request = super::authorization::Unsigned::new("PUT", key)
+        .header(
+            "x-amz-copy-source",
+            &format!("{}/{}", encode(bucket), encode(key)),
+        )
+        .header(
+            "x-amz-copy-source-if-match",
+            head.e_tag().context("S3 omitted destination ETag")?,
+        )
+        .header("x-amz-metadata-directive", "REPLACE")
+        .header("x-amz-tagging-directive", "COPY");
+    for (name, value) in metadata {
+        request = request.header(&format!("x-amz-meta-{name}"), &value);
+    }
+    for (name, value) in [
+        ("content-type", head.content_type()),
+        ("content-encoding", head.content_encoding()),
+        ("content-language", head.content_language()),
+        ("content-disposition", head.content_disposition()),
+        ("cache-control", head.cache_control()),
+        ("expires", head.expires_string()),
+        (
+            "x-amz-website-redirect-location",
+            head.website_redirect_location(),
+        ),
+    ] {
+        if let Some(value) = value {
+            request = request.header(name, value);
+        }
+    }
+    Ok(request)
+}
+
+pub(super) async fn copy_metadata(
+    client: &Client,
+    bucket: &str,
+    update: super::authorization::Unsigned,
+) -> Result<()> {
+    client
+        .copy_object()
+        .bucket(bucket)
+        .key(&update.key)
+        .copy_source(update.headers["x-amz-copy-source"].clone())
+        .customize()
+        .map_request(move |mut request| {
+            for (name, value) in &update.headers {
+                request
+                    .headers_mut()
+                    .try_insert(name.clone(), value.clone())?;
+            }
+            Ok::<_, aws_smithy_runtime_api::http::HttpError>(request)
+        })
+        .send()
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

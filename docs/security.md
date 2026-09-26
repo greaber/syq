@@ -86,8 +86,8 @@ even without `--inplace`.
 
 **Permissions supplied by the source.** Path protection does not decide
 whether copied permissions are appropriate. For example,
-`--preserve=permissions` can make a copied file writable by everyone or
-preserve its set-user-ID bit; `--preserve=ownership` can give it to the account
+`--copy-metadata=permissions` can make a copied file writable by everyone or
+preserve its set-user-ID bit; `--copy-metadata=ownership` can give it to the account
 identified by the source's user ID. When running as root, those choices can
 grant other users access or privileges. Enable these options only when you
 trust the source's ownership and permission settings.

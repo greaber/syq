@@ -704,7 +704,13 @@ pub(crate) async fn connect(
                 scopes,
             })
         })
-        .transpose()?;
+        .transpose()?
+        .or_else(|| {
+            (options.route == super::Route::Upload).then(|| ReadAccess {
+                bucket: options.bucket.clone(),
+                scopes: scopes.clone(),
+            })
+        });
     let request = Request {
         bucket: options.bucket.clone(),
         endpoint: options.endpoint.clone(),

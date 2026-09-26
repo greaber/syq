@@ -56,7 +56,7 @@ def main():
             else:
                 args = ["syq", "cp", "--performance-tuning", "workers=1", "--performance-tuning", "copy-path=ranges", str(source), "--as", str(destination)]
                 if interface == "native-owner":
-                    args.extend(["--preserve", "ownership,permissions"])
+                    args.extend(["--copy-metadata", "ownership,permissions"])
             args.append("--no-progress")
             ready = root / f"partial-ready-{interface}"
             continuation = root / f"partial-continue-{interface}"
@@ -84,7 +84,7 @@ def main():
             partial.chmod(0o666)
             with partial.open("rb") as held:
                 old = os.fstat(held.fileno())
-                run(args)
+                run(args + ([] if interface == "rsync" else ["--resume"]))
                 published = destination.stat()
                 assert (published.st_dev, published.st_ino) != (old.st_dev, old.st_ino)
                 assert published.st_uid == (0 if interface == "native" else 1000)
@@ -131,7 +131,7 @@ def main():
         target = root / "noatime-user"
         target.mkdir()
         os.chown(target, 1000, 1000)
-        result = run(["runuser", "-u", "syq", "--", "syq", "cp", "--open-noatime", "--preserve=atimes", str(foreign), "--as", str(target / "copied")], capture_output=True, text=True)
+        result = run(["runuser", "-u", "syq", "--", "syq", "cp", "--open-noatime", "--copy-metadata=atimes", str(foreign), "--as", str(target / "copied")], capture_output=True, text=True)
         assert "--open-noatime unavailable" in result.stderr, result.stderr
         assert (target / "copied").read_bytes() == foreign.read_bytes()
         print("Nonowner no-atime reads warn and complete", flush=True)

@@ -1034,7 +1034,7 @@ def parse_args() -> argparse.Namespace:
         metavar="SECONDS",
         help="per-test timeout passed to the upstream runner (default: 300)",
     )
-    parser.add_argument("--preserve-scratch", action="store_true")
+    parser.add_argument("--copy-metadata-scratch", action="store_true")
     parser.add_argument("--ledger-only", action="store_true")
     parser.add_argument("--update-ledger", action="store_true")
     parser.add_argument(
@@ -1159,7 +1159,7 @@ def main() -> int:
             str(args.jobs),
         ]
         if args.preserve_scratch:
-            runner_args.append("--preserve-scratch")
+            runner_args.append("--copy-metadata-scratch")
         runner_args.extend(test["name"] for test in selected)
         env = os.environ.copy()
         env["scratchbase"] = str(scratch)

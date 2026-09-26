@@ -34,7 +34,7 @@ stream endpoint in place of either tagged pathname:
 Blank lines still count toward indices. An optional source `size` promises the
 exact byte count; a mismatch fails the entry before publication. `kind` can be
 omitted or `file`. `expected_hash` checks the transferred bytes. Explicit
-`metadata` applies to a named destination without requiring `--preserve`.
+`metadata` applies to a named destination without requiring `--copy-metadata`.
 
 Syq reads and validates the whole manifest before copying. This catches malformed
 entries, duplicate destinations, and conflicts with declared file kinds. As with

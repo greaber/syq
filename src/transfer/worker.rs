@@ -51,8 +51,8 @@ impl Worker {
 
     pub(super) fn run(&mut self) -> Result<()> {
         let r = (|| {
-            configure_hashing(&mut *self.src, self.opts.hash_policy)?;
-            configure_hashing(&mut *self.dst, self.opts.hash_policy)?;
+            configure_hashing(&mut *self.src, self.opts.hash_policy, self.opts.resume)?;
+            configure_hashing(&mut *self.dst, self.opts.hash_policy, self.opts.resume)?;
             if self.progress.observations.enabled.load(Relaxed) {
                 let actor = self.progress.observations.workers.actor("worker");
                 self.src
@@ -770,6 +770,26 @@ impl Worker {
         let size = job.entry.size;
         let opts = self.opts.clone();
         let _ = &opts;
+
+        if self.opts.protects_existing_contents() && job.dst_entry.is_some() {
+            self.sched.ranges_ready(idx, vec![]);
+            anyhow::ensure!(
+                self.opts.if_exists != Some(crate::cli::IfExists::Error),
+                "destination already exists: {} (--if-exists=error)",
+                job.rel
+            );
+            let diff = self.diff_final_and_hold(&job)?;
+            anyhow::ensure!(
+                diff.ranges.is_empty() && diff.held_len == Some(size),
+                "destination contents differ: {} (--if-exists=error-if-different)",
+                job.rel
+            );
+            self.finish_matched_basis(idx, &job)?;
+            job.done.store(size, Relaxed);
+            self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+            self.progress.bytes_total.fetch_sub(size, Relaxed);
+            return self.finish_matched_file(idx);
+        }
 
         match self.try_expected_match(idx, &job) {
             Ok(true) => {
@@ -2054,6 +2074,11 @@ impl Worker {
                 return Err(error);
             }
         };
+        anyhow::ensure!(
+            matched || !self.opts.protects_existing_contents() || job.dst_entry.is_none(),
+            "destination contents differ: {} (--if-exists=error-if-different)",
+            job.rel
+        );
         if self.opts.hardlinks && job.entry.nlink > 1 {
             self.opts.hardlink_completions.lock().unwrap().insert(
                 idx,

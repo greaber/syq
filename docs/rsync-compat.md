@@ -44,7 +44,7 @@ for its default and allowed range. Values outside that range are rejected.
 `-H` preserves hardlinks between selected regular files. Linux copies also support
 `-A` for POSIX ACLs and `-X` for extended attributes. `-S` turns written zero
 ranges into sparse holes. See the
-[preservation rules and limits](reference.md#preserve-metadata).
+[preservation rules and limits](reference.md#copy-metadata).
 
 ## Unsupported features
 

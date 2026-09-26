@@ -447,18 +447,18 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
         } else {
             exact_head
         };
-        // Match pathname S3 copies, which compare whole seconds.
+        // Match pathname S3 copies, keeping the destination on timestamp ties.
         if let Some(head) = head {
             let stored = client::Metadata::decode(head.metadata())?;
-            let mtime =
-                stored.map_or_else(|| head.last_modified().map_or(0, |t| t.secs()), |m| m.mtime);
-            if mtime
-                > plan
-                    .source_meta
-                    .as_ref()
-                    .context("missing source timestamp")?
-                    .mtime
-            {
+            let mtime = stored.map_or_else(
+                || (head.last_modified().map_or(0, |t| t.secs()), 0),
+                |m| (m.mtime, m.nsec),
+            );
+            let source = plan
+                .source_meta
+                .as_ref()
+                .context("missing source timestamp")?;
+            if mtime >= (source.mtime, source.mtime_nsec) {
                 report.skip();
             }
         }
@@ -545,23 +545,42 @@ async fn upload(
         crate::descriptor_copy::fd::await_commit(commit).await?;
         let hash = digest(algorithm, &first.bytes);
         let _request = plan.session.requests.acquire().await?;
-        client
+        let published = client
             .put_object()
-            .set_metadata(metadata)
+            .set_metadata(metadata.clone())
             .bucket(&options.bucket)
             .key(&plan.key)
             .set_checksum_sha256(algorithm.is_sha256().then_some(hash.clone()))
-            .set_content_md5((algorithm == Algorithm::Md5).then_some(hash))
+            .set_content_md5((algorithm == Algorithm::Md5).then_some(hash.clone()))
             .set_if_none_match(
                 (plan.placement.existence == crate::cli::Existence::New
-                    || plan.controls.report.only_new)
-                    .then(|| "*".into()),
+                    || plan.controls.report.only_new
+                    || protects_existing(plan))
+                .then(|| "*".into()),
             )
             .body(ByteStream::from(first.bytes))
             .send()
-            .await
-            .map_err(|e| e.into_service_error())
-            .context("upload object")?;
+            .await;
+        drop(_request);
+        if let Err(error) = published {
+            if protects_existing(plan)
+                && plan.placement.existence != crate::cli::Existence::New
+                && error
+                    .raw_response()
+                    .is_some_and(|r| r.status().as_u16() == 412)
+            {
+                accept_existing(
+                    client,
+                    plan,
+                    algorithm,
+                    &[(hash, length)],
+                    metadata.as_ref(),
+                )
+                .await?;
+            } else {
+                return Err(error.into_service_error()).context("upload object");
+            }
+        }
         controls.add_bytes(length);
         return Ok(());
     }
@@ -571,7 +590,7 @@ async fn upload(
         let request = plan.session.requests.acquire().await?;
         let created = client
             .create_multipart_upload()
-            .set_metadata(metadata)
+            .set_metadata(metadata.clone())
             .bucket(&options.bucket)
             .key(&plan.key)
             .set_checksum_algorithm(
@@ -629,32 +648,178 @@ async fn upload(
         completed.push(part);
     }
     check.finish()?;
-    completed.sort_by_key(|p| p.part_number());
+    completed.sort_by_key(|p| p.0.part_number());
     crate::descriptor_copy::fd::await_commit(commit).await?;
     let _request = plan.session.requests.acquire().await?;
-    client
+    let published = client
         .complete_multipart_upload()
         .bucket(&options.bucket)
         .key(&plan.key)
         .upload_id(&id)
         .set_if_none_match(
             (plan.placement.existence == crate::cli::Existence::New
-                || plan.controls.report.only_new)
-                .then(|| "*".into()),
+                || plan.controls.report.only_new
+                || protects_existing(plan))
+            .then(|| "*".into()),
         )
         .multipart_upload(
             CompletedMultipartUpload::builder()
-                .set_parts(Some(completed))
+                .set_parts(Some(completed.iter().map(|p| p.0.clone()).collect()))
                 .build(),
         )
         .send()
-        .await
-        .map_err(|e| e.into_service_error())
-        .context(
-            "complete multipart upload (destination may have completed if the response was lost)",
-        )?;
+        .await;
+    drop(_request);
+    if let Err(error) = published {
+        if protects_existing(plan)
+            && plan.placement.existence != crate::cli::Existence::New
+            && error
+                .raw_response()
+                .is_some_and(|r| r.status().as_u16() == 412)
+        {
+            let hashes = completed
+                .iter()
+                .map(|(_, hash, length)| (hash.clone(), *length))
+                .collect::<Vec<_>>();
+            accept_existing(client, plan, algorithm, &hashes, metadata.as_ref()).await?;
+            plan.session.abort(&plan.key, &id).await?;
+        } else {
+            return Err(error.into_service_error()).context("complete multipart upload (destination may have completed if the response was lost)");
+        }
+    }
     *upload_id = None;
     Ok(())
+}
+
+fn protects_existing(plan: &Plan<'_>) -> bool {
+    matches!(
+        plan.controls.metadata.if_exists,
+        Some(crate::cli::IfExists::ErrorIfDifferent | crate::cli::IfExists::Error)
+    )
+}
+
+async fn accept_existing(
+    client: &Client,
+    plan: &Plan<'_>,
+    algorithm: Algorithm,
+    parts: &[(String, u64)],
+    desired: Option<&std::collections::HashMap<String, String>>,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    anyhow::ensure!(
+        plan.controls.metadata.if_exists != Some(crate::cli::IfExists::Error),
+        "destination already exists: {} (--if-exists=error)",
+        plan.key
+    );
+    let _request = plan.session.requests.acquire().await?;
+    let object = client
+        .get_object()
+        .bucket(&plan.options.bucket)
+        .key(&plan.key)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        object.content_length() == Some(parts.iter().map(|(_, len)| *len as i64).sum()),
+        "destination contents differ: {} (--if-exists=error-if-different)",
+        plan.key
+    );
+    anyhow::ensure!(
+        client::Metadata::decode(object.metadata())?
+            .is_none_or(|m| m.kind == client::ObjectKind::File),
+        "destination object is not a regular file"
+    );
+    let etag = object
+        .e_tag()
+        .context("S3 omitted destination ETag")?
+        .to_owned();
+    let mut input = object.body.into_async_read();
+    let mut buffer = vec![0u8; 64 * 1024];
+    for (expected, length) in parts {
+        let mut remaining = *length;
+        let mut hash = algorithm.hasher();
+        while remaining > 0 {
+            let n = remaining.min(buffer.len() as u64) as usize;
+            input.read_exact(&mut buffer[..n]).await?;
+            hash.update(&buffer[..n]);
+            remaining -= n as u64;
+        }
+        anyhow::ensure!(
+            &hash.finish() == expected,
+            "destination contents differ: {} (--if-exists=error-if-different)",
+            plan.key
+        );
+    }
+    drop(input);
+    drop(_request);
+    if metadata_update_flags(plan) != 0 {
+        let _request = plan.session.requests.acquire().await?;
+        let head = client::head_output(client, &plan.options.bucket, &plan.key, None)
+            .await?
+            .context("S3 destination disappeared before metadata update")?;
+        anyhow::ensure!(
+            head.e_tag() == Some(&etag),
+            "S3 destination changed before metadata update"
+        );
+        if let Some(update) = metadata_update_request(plan, &head, desired)? {
+            client::copy_metadata(client, &plan.options.bucket, update).await?;
+        }
+    }
+    Ok(())
+}
+
+fn metadata_update_flags(plan: &Plan<'_>) -> u8 {
+    let policy = plan.controls.metadata;
+    policy.preserve | policy.overrides.map_or(0, |m| m.apply_flags())
+}
+
+fn metadata_update_request(
+    plan: &Plan<'_>,
+    head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+    desired: Option<&std::collections::HashMap<String, String>>,
+) -> Result<Option<super::authorization::Unsigned>> {
+    let flags = metadata_update_flags(plan);
+    if flags == 0 {
+        return Ok(None);
+    }
+    let source = client::Metadata::decode(desired)?.context("missing requested source metadata")?;
+    let mut metadata = head.metadata().cloned().unwrap_or_default();
+    let mut stored = client::Metadata::decode(Some(&metadata))?.unwrap_or(client::Metadata {
+        kind: client::ObjectKind::File,
+        mode: 0o666,
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+        mtime: head.last_modified().map_or(0, |t| t.secs()),
+        nsec: 0,
+        hash: None,
+        hash_algorithm: Default::default(),
+    });
+    anyhow::ensure!(
+        stored.kind == client::ObjectKind::File,
+        "destination object is not a regular file"
+    );
+    if flags & crate::proto::flags::TIMES != 0 {
+        stored.mtime = source.mtime;
+        stored.nsec = source.nsec;
+    }
+    if flags & crate::proto::flags::MODE != 0 {
+        stored.mode = source.mode;
+    }
+    if flags & crate::proto::flags::OWNER != 0 {
+        stored.uid = source.uid;
+    }
+    if flags & crate::proto::flags::GROUP != 0 {
+        stored.gid = source.gid;
+    }
+    metadata.extend(stored.encode());
+    if head.metadata() == Some(&metadata) {
+        return Ok(None);
+    }
+    Ok(Some(client::metadata_update_request(
+        &plan.options.bucket,
+        &plan.key,
+        head,
+        metadata,
+    )?))
 }
 
 async fn upload_part(
@@ -664,7 +829,7 @@ async fn upload_part(
     number: i32,
     data: Part,
     algorithm: Algorithm,
-) -> Result<CompletedPart> {
+) -> Result<(CompletedPart, String, u64)> {
     let controls = plan.controls;
     let length = data.bytes.len() as u64;
     plan.session.pace(length).await;
@@ -684,11 +849,15 @@ async fn upload_part(
         .map_err(|e| e.into_service_error())
         .context("upload stream part")?;
     controls.add_bytes(length);
-    Ok(CompletedPart::builder()
-        .part_number(number)
-        .e_tag(output.e_tag().context("S3 part omitted ETag")?)
-        .set_checksum_sha256(algorithm.is_sha256().then_some(hash))
-        .build())
+    Ok((
+        CompletedPart::builder()
+            .part_number(number)
+            .e_tag(output.e_tag().context("S3 part omitted ETag")?)
+            .set_checksum_sha256(algorithm.is_sha256().then_some(hash.clone()))
+            .build(),
+        hash,
+        length,
+    ))
 }
 
 async fn download(

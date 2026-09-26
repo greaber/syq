@@ -177,7 +177,7 @@ path = "/tmp/syq-real-ssh/stream 'with spaces'"
 import re
 for transport, extra in (("EncryptedTcp", []), ("Ssh", ["--no-tcp"])):
     parallel = [*controls, "--performance-tuning", "workers=2", "--resource-limits", "bandwidth=8M", *extra]
-    policy = '--only-new' if transport == 'EncryptedTcp' else '--only-existing'
+    policy = '--if-exists=keep' if transport == 'EncryptedTcp' else '--only-existing'
     upload = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as', path, policy, *parallel],
                             input=payload, capture_output=True, check=True, timeout=60)
     result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1', *parallel],
@@ -198,11 +198,11 @@ result = subprocess.run(['syq', 'cp', '--from', 'destination', '--root', '/tmp/s
                          '../dev-helper-upload.txt', '--as-fd', '1'], capture_output=True, timeout=30)
 assert result.returncode != 0, result.stderr
 # Empty EOF must publish an empty file rather than leave the previous object.
-subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination', '--as-existing', path], input=b'', check=True, timeout=30)
+subprocess.run(['syq', 'cp', '--if-exists=update', '--src-fd', '0', '--to', 'destination', '--as-existing', path], input=b'', check=True, timeout=30)
 result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'], stdout=subprocess.PIPE, check=True, timeout=30)
 assert result.stdout == b''
 subprocess.run(['bash', '-c',
-                'syq cp --src <(printf "local producer") --to destination --as "$1"',
+                'syq cp --if-exists=update --src <(printf "local producer") --to destination --as "$1"',
                 'stream-test', path], check=True, timeout=30)
 result = subprocess.run(['syq', 'cp', '--from', 'destination', path, '--as-fd', '1'],
                         stdout=subprocess.PIPE, check=True, timeout=30)
@@ -210,7 +210,7 @@ assert result.stdout == b'local producer'
 # A preview or skip must finish even with an open, quiet input pipe.
 import json, os, tempfile
 with tempfile.TemporaryDirectory(prefix='syq-stream-results-') as directory:
-    for index, options in enumerate((['--only-new', '--as', path],
+    for index, options in enumerate((['--if-exists=keep', '--as', path],
                                     ['--only-existing', '--as', '/tmp/syq-real-ssh/preview-missing/object'],
                                     ['--dry-run', '--as', '/tmp/syq-real-ssh/preview-missing/object'])):
         read_fd, write_fd = os.pipe()
@@ -235,7 +235,7 @@ for commit in (b'', b'C'):
     os.close(write_fd)
     try:
         result = subprocess.run(['syq', 'cp', '--src-fd', '0', '--to', 'destination',
-                                 '--as', path, '--stream-commit-fd', str(read_fd)],
+                                 '--as', path, '--if-exists=update', '--stream-commit-fd', str(read_fd)],
                                 input=payload, pass_fds=(read_fd,), timeout=60,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     finally:
@@ -289,12 +289,12 @@ python3 /usr/local/libexec/syq-test-receiver-revoke.py --no-tcp
 printf 'case: long receiver home supports explicit SSH and blocked-TCP fallback\n'
 ssh longhome@destination 'test "${#HOME}" -gt 36; mkdir -p /tmp/syq-long-home'
 make_tree source /tmp/syq-real-ssh/long-home-source long-home
-syq cp --no-progress --no-tcp --performance-tuning workers=2 --preserve=permissions \
+syq cp --no-progress --no-tcp --performance-tuning workers=2 --copy-metadata=permissions \
     --from source --srcs-in /tmp/syq-real-ssh/long-home-source \
     --to longhome@destination --into /tmp/syq-long-home/explicit
 assert_same_tree source /tmp/syq-real-ssh/long-home-source \
     longhome@destination /tmp/syq-long-home/explicit long-home-explicit
-syq cp --no-progress --performance-tuning workers=2 --preserve=permissions \
+syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \
     --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
     --from source --srcs-in /tmp/syq-real-ssh/long-home-source \
     --to longhome@destination --into /tmp/syq-long-home/fallback
@@ -374,13 +374,13 @@ with tempfile.TemporaryDirectory(prefix='syq-hardlinks-') as scratch:
     os.link(source / 'a', source / 'b')
     for label, transport in [('ssh', ['--no-tcp']), ('tcp', [])]:
         destination = '/tmp/syq-real-ssh/hardlinks-' + label
-        command = ['syq', 'cp', '--preserve=hardlinks', '--srcs-in', str(source), '--to', 'destination', '--into', destination, *transport]
+        command = ['syq', 'cp', '--copy-metadata=hardlinks', '--srcs-in', str(source), '--to', 'destination', '--into', destination, *transport]
         subprocess.run(command, check=True, timeout=30)
         subprocess.run(command, check=True, timeout=30)
         (source / 'a').write_bytes(b'changed payload')
-        subprocess.run([*command, '--inplace'], check=True, timeout=30)
+        subprocess.run([*command, '--if-exists=update', '--inplace'], check=True, timeout=30)
         pull = Path(scratch) / label
-        subprocess.run(['syq', 'cp', '--preserve=hardlinks', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30)
+        subprocess.run(['syq', 'cp', '--copy-metadata=hardlinks', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30)
         assert (pull / 'a').read_bytes() == b'changed payload'
         assert (pull / 'b').read_bytes() == b'changed payload'
         assert (pull / 'a').stat().st_ino == (pull / 'b').stat().st_ino
@@ -466,7 +466,7 @@ python3 /usr/local/libexec/syq-test-storage-authorization.py
 printf 'case: explicit automatic approval supports unattended copies\n'
 syq persist receive on --auto-approve-root "$receive_root"
 syq persist receive wait source --timeout 30
-ssh source 'test -z "${SSH_AUTH_SOCK:-}"; SYQ_TEST_REQUIRE_TCP=1 syq cp --performance-tuning workers=2 --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
+ssh source 'test -z "${SSH_AUTH_SOCK:-}"; SYQ_TEST_REQUIRE_TCP=1 syq cp --performance-tuning workers=2 --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
 remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.manifest
 (
     cd "$receive_root/first"
@@ -480,7 +480,7 @@ ssh source 'syq cp --no-tcp /tmp/syq-real-ssh/return-source/subdir/chunks.bin --
 cmp "$receive_root/first/subdir/chunks.bin" "$receive_root/ssh-copy"
 ssh source 'syq cp --dry-run --hash --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first --results-fd 3 3>&1 1>/dev/null' > /tmp/syq-return-preview.ndjson
 assert_preview_counts /tmp/syq-return-preview.ndjson 0 3
-ssh source 'syq cp --only-new /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as first/message.txt'
+ssh source 'syq cp --if-exists=keep /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as first/message.txt'
 
 ssh source 'python3 /usr/local/libexec/syq-test-restricted-mapping.py named'
 
@@ -553,7 +553,7 @@ fi
 return_copy_pid=
 test ! -e "$receive_root/interrupted"
 ssh source 'syq persist destinations wait laptop --timeout 30'
-ssh source 'SYQ_TEST_REQUIRE_TCP=1 syq cp /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted'
+ssh source 'SYQ_TEST_REQUIRE_TCP=1 syq cp --resume /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted'
 ssh source 'cat /tmp/syq-real-ssh/return-source/resume.bin' | cmp - "$receive_root/interrupted"
 test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*' | wc -l)" -eq 1
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-reconnect'
@@ -840,7 +840,7 @@ for small_case in unchanged updated; do
     if [ "$small_case" = updated ]; then
         printf 'changed payload\n' >>"$small_source"
     fi
-    if ! SYQ_DEBUG=1 syq cp --no-progress --results "$small_results" \
+    if ! SYQ_DEBUG=1 syq cp --if-exists=update --no-progress --results "$small_results" \
         "$small_source" --to source --into /tmp/syq-real-ssh/small-destination \
         2>"$small_debug"; then
         cat "$small_debug" >&2
@@ -868,7 +868,7 @@ done
 
 printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
 make_tree source /tmp/syq-real-ssh/protected-source protected
-if protected_output=$(syq cp --no-progress --performance-tuning workers=2 --preserve=permissions \
+if protected_output=$(syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \
     --from source --srcs-in /tmp/syq-real-ssh/protected-source \
     --to destination --into /home/syq/.ssh/sender-controlled 2>&1); then
     echo 'copy into the restricted receiver control plane unexpectedly succeeded' >&2
@@ -895,7 +895,7 @@ python3 /usr/local/libexec/syq-test-receiver-revoke.py
 
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
-syq cp --no-progress --performance-tuning workers=2 --preserve=permissions --tcp-congestion cubic \
+syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions --tcp-congestion cubic \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 assert_same_tree \
@@ -936,13 +936,13 @@ ssh destination 'printf destination > /tmp/syq-real-ssh/direct-destination/polic
 ssh source 'mkdir -p /tmp/syq-real-ssh/direct-source/policy-dir/new; chmod 750 /tmp/syq-real-ssh/direct-source/policy-dir /tmp/syq-real-ssh/direct-source/policy-dir/new'
 ssh destination 'mkdir -p /tmp/syq-real-ssh/direct-destination/policy-dir; chmod 711 /tmp/syq-real-ssh/direct-destination/policy-dir'
 
-syq cp --only-new --preserve=permissions --no-progress --performance-tuning workers=2 \
+syq cp --if-exists=keep --copy-metadata=permissions --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = destination; test "$(cat /tmp/syq-real-ssh/direct-destination/policy-new)" = new; rm /tmp/syq-real-ssh/direct-destination/policy-new'
 ssh destination 'test "$(stat -c %a /tmp/syq-real-ssh/direct-destination/policy-dir)" = 711; test "$(stat -c %a /tmp/syq-real-ssh/direct-destination/policy-dir/new)" = 750'
 
-syq cp --only-existing --no-progress --performance-tuning workers=2 \
+syq cp --if-exists=update --only-existing --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = source; test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
@@ -954,7 +954,7 @@ assert_preview_counts /tmp/syq-missing-preview.ndjson 1 3
 ssh destination 'test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
 ssh source 'touch -m -d @1600000000 /tmp/syq-real-ssh/direct-source/policy-file'
 ssh destination 'printf newer > /tmp/syq-real-ssh/direct-destination/policy-file; touch -m -d @1700000000 /tmp/syq-real-ssh/direct-destination/policy-file'
-syq cp --skip-newer --no-progress --performance-tuning workers=2 \
+syq cp --if-exists=update-if-older --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
@@ -982,7 +982,7 @@ for preservation in default permissions; do
     # shellcheck disable=SC2029
     ssh destination "mkdir -p $destination/old; chmod 2775 $destination; chmod 2555 $destination/old"
     set --
-    if [ "$preservation" = permissions ]; then set -- --preserve=permissions; fi
+    if [ "$preservation" = permissions ]; then set -- --copy-metadata=permissions; fi
     syq cp "$@" --from source --srcs-in /tmp/syq-real-ssh/expression-modes \
         --to destination --into "$destination" --coordinate-at src --no-progress \
         --where "src.kind = 'file'" --copy-if "src.kind != 'dir'"
@@ -993,7 +993,7 @@ done
 
 printf 'case: destination firewall triggers automatic TCP fallback to SSH\n'
 make_tree source /tmp/syq-real-ssh/firewall-source firewall
-syq cp --no-progress --performance-tuning workers=2 --preserve=permissions \
+syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \
     --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
     --from source --srcs-in /tmp/syq-real-ssh/firewall-source \
     --to destination --into /tmp/syq-real-ssh/firewall-destination
@@ -1004,7 +1004,7 @@ assert_same_tree \
 
 printf 'case: source coordinator with constrained agent and SSH data channels\n'
 make_tree source /tmp/syq-real-ssh/ssh-source ssh
-syq cp --no-progress --no-tcp --performance-tuning workers=2 --preserve=permissions \
+syq cp --no-progress --no-tcp --performance-tuning workers=2 --copy-metadata=permissions \
     --from source --srcs-in /tmp/syq-real-ssh/ssh-source \
     --to destination --into /tmp/syq-real-ssh/ssh-destination
 assert_same_tree \
@@ -1024,7 +1024,7 @@ ssh destination 'test ! -e /tmp/syq-real-ssh/no-route-destination'
 
 printf 'case: destination coordinator with the reversed constrained-agent edge\n'
 make_tree source /tmp/syq-real-ssh/pull-source pull
-syq cp --no-progress --no-tcp --performance-tuning workers=2 --preserve=permissions \
+syq cp --no-progress --no-tcp --performance-tuning workers=2 --copy-metadata=permissions \
     --peer-auth broker --coordinate-at dst \
     --from source --srcs-in /tmp/syq-real-ssh/pull-source \
     --to destination --into /tmp/syq-real-ssh/pull-destination
@@ -1037,7 +1037,7 @@ printf 'case: local coordinator relaying between two SSH endpoints\n'
 make_tree source /tmp/syq-real-ssh/relay-source relay
 trace=/tmp/syq-real-ssh-ssh.trace
 rm -f "$trace"
-syq cp --no-progress --no-tcp --performance-tuning workers=2 --preserve=permissions \
+syq cp --no-progress --no-tcp --performance-tuning workers=2 --copy-metadata=permissions \
     --coordinate-at local \
     --from source --srcs-in /tmp/syq-real-ssh/relay-source \
     --to destination --into /tmp/syq-real-ssh/relay-destination

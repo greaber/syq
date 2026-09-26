@@ -19,6 +19,9 @@ mod map;
 #[path = "s3/expressions.rs"]
 mod expressions;
 
+#[path = "s3/existing_policy.rs"]
+mod existing_policy;
+
 #[path = "s3/recovery.rs"]
 mod recovery;
 
@@ -205,6 +208,16 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault == "existing-policy" {
+        existing_policy::serve(
+            &mut socket,
+            method,
+            first.split_whitespace().nth(1).unwrap(),
+            &headers,
+            &gate,
+        );
+        return;
+    }
     if fault.starts_with("recovery-upload-") {
         recovery::serve_upload(
             &mut socket,
@@ -475,7 +488,7 @@ fn serve(
                 ),
                 "{path}"
             );
-            assert!(!headers.contains_key("if-none-match"));
+            assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
             assert_eq!(headers["x-amz-copy-source-if-match"], "\"source\"");
             if fault.ends_with("changed") {
                 reply(
@@ -750,7 +763,7 @@ fn serve(
             assert_eq!(headers.get("expires").map(String::as_str), Some("0"));
             reply(&mut socket, 200, &[], b"<InitiateMultipartUploadResult><UploadId>owned</UploadId></InitiateMultipartUploadResult>", false);
         } else if multipart && method == "POST" {
-            assert!(!headers.contains_key("if-none-match"));
+            assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
             let length: usize = headers["content-length"].parse().unwrap();
             let mut body = vec![0; length];
             socket.read_exact(&mut body).unwrap();
@@ -866,10 +879,10 @@ fn serve(
                     );
                 }
             } else {
-                if fault == "server-copy-only-new" {
-                    assert_eq!(headers["if-none-match"], "*");
-                } else {
+                if fault.starts_with("server-copy-compare-") {
                     assert!(!headers.contains_key("if-none-match"));
+                } else {
+                    assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
                 }
                 assert_eq!(headers["x-amz-website-redirect-location"], "/new-location");
                 assert!(
@@ -2071,7 +2084,14 @@ fn s3_fast_queued_ranges_preserve_bytes_and_fail_without_publication() {
         std::fs::write(temp.path().join("download"), b"original").unwrap();
         let output = server.cp(
             temp.path(),
-            &["--from", "s3://bucket", "data", "--as", "download"],
+            &[
+                "--if-exists=update",
+                "--from",
+                "s3://bucket",
+                "data",
+                "--as",
+                "download",
+            ],
         );
         assert_eq!(
             output.status.success(),
@@ -2315,7 +2335,7 @@ fn s3_temporary_name_replacement_cannot_redirect_metadata() {
                     "object",
                     "--as",
                     "result",
-                    "--preserve=permissions",
+                    "--copy-metadata=permissions",
                 ],
             )
         });
@@ -2370,6 +2390,7 @@ fn s3_service_profile_endpoints_keep_recovery_separate() {
         .unwrap();
         let output = server
             .command(temp.path())
+            .arg("--resume")
             .env("AWS_CONFIG_FILE", &config)
             .args([
                 "--integrity-checking=transfer=blake3",
@@ -2408,6 +2429,7 @@ fn s3_unreadable_recovery_record_is_named_and_stale_temporaries_are_removed() {
         server.cp(
             temp.path(),
             &[
+                "--resume",
                 "--integrity-checking=transfer=blake3",
                 "--from",
                 "s3://bucket",
@@ -2464,6 +2486,7 @@ fn s3_expected_hash_checks_single_and_multipart_before_publication() {
                 &[
                     "--mapping",
                     &expected_mapping(temp.path(), "object", "result", &expected),
+                    "--if-exists=update",
                     "--from",
                     "s3://bucket",
                     "--into",
@@ -2497,6 +2520,7 @@ fn s3_expected_hash_checks_unchanged_destination_and_recovers_corruption() {
     let args = [
         "--mapping",
         &expected_mapping(temp.path(), "object", "result", &expected),
+        "--if-exists=update",
         "--from",
         "s3://bucket",
         "--into",
@@ -2741,6 +2765,7 @@ fn s3_review_upload_hash_compares_objects_without_matching_stored_digest() {
         let output = server.cp(
             temp.path(),
             &[
+                "--if-exists=update",
                 "--integrity-checking",
                 &format!("compare={algorithm}"),
                 "source",
@@ -3047,6 +3072,7 @@ fn s3_download_retries_share_one_budget_across_statuses_and_error_codes() {
             .args([
                 "--s3-endpoint",
                 &server.address,
+                "--if-exists=update",
                 "--from",
                 "s3://bucket",
                 "object",
@@ -4099,7 +4125,7 @@ fn server_copy_compares_remote_checksums_etags_and_metadata_without_body_reads()
         ("server-copy-compare-checksum", 2),
         ("server-copy-compare-composite", 3),
         ("server-copy-compare-conflict", 3),
-        ("server-copy-compare-metadata", 3),
+        ("server-copy-compare-metadata", 2),
         ("server-copy-compare-unavailable", 4),
         ("server-copy-compare-bad-request", 4),
         ("server-copy-compare-unsupported", 3),
@@ -4109,6 +4135,7 @@ fn server_copy_compares_remote_checksums_etags_and_metadata_without_body_reads()
         let output = server.cp(
             temp.path(),
             &[
+                "--if-exists=update",
                 "--from",
                 "s3://source",
                 "original",
@@ -4170,7 +4197,7 @@ fn server_copy_only_new_uses_a_conditional_write() {
             "s3://destination",
             "--as",
             "copied",
-            "--only-new",
+            "--if-exists=keep",
         ],
     );
     assert!(output.status.success(), "{}", output_text(&output));
@@ -4238,7 +4265,7 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
                 "--into",
                 "copied",
                 "--dry-run",
-                "--only-new",
+                "--if-exists=keep",
             ];
         }
         if fault.contains("storage-class") {
@@ -4275,7 +4302,7 @@ fn server_copy_automatic_sizing_uses_one_copy_request() {
 #[test]
 fn server_copy_prune_protects_keys_under_skip_options() {
     for (fault, option) in [
-        ("server-tree-skipped", "--only-new"),
+        ("server-tree-skipped", "--if-exists=keep"),
         ("server-tree-missing", "--only-existing"),
     ] {
         let server = Server::start(fault);
@@ -4684,13 +4711,13 @@ fn skipped_download_markers_do_not_count_as_unchanged_files() {
 #[test]
 fn skipped_download_symlinks_use_the_kind_known_from_selection() {
     for (selection, flag) in [
-        ("exact", "--only-new"),
+        ("exact", "--if-exists=keep"),
         ("mapping", "--only-existing"),
         ("prefix", "--only-existing"),
     ] {
         let server = Server::start("symlink-transfer-denied");
         let temp = crate::test_support::tempdir().unwrap();
-        if flag == "--only-new" {
+        if flag == "--if-exists=keep" {
             std::fs::create_dir(temp.path().join("out")).unwrap();
             std::os::unix::fs::symlink("target", temp.path().join("out/original")).unwrap();
         }
@@ -4774,6 +4801,7 @@ fn download_directory_to_root_keeps_root_metadata() {
     let output = server.cp(
         temp.path(),
         &[
+            "--copy-metadata=mtime",
             "--from",
             "s3://source",
             "--src-dir",
@@ -4821,6 +4849,7 @@ fn s3_mapping_metadata_uses_existing_requests_for_upload_and_download() {
         let output = server.cp(
             temp.path(),
             &[
+                "--if-exists=update",
                 "--mapping",
                 "mapping",
                 endpoint,

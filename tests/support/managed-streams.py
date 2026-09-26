@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory() as temp:
             os.write(write_fd, commit)
             os.close(write_fd)
             try:
-                result = subprocess.run([syq, 'cp', '--src-fd', '0', '--as', str(target),
+                result = subprocess.run([syq, 'cp', '--if-exists=update', '--src-fd', '0', '--as', str(target),
                                          '--stream-commit-fd', str(read_fd)], input=payload,
                                         pass_fds=(read_fd,), env=env, timeout=15,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)

@@ -603,7 +603,13 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     write(&t.path("referent"), b"old");
     symlink("referent", t.path("exact-link")).unwrap();
 
-    run_native_ok(&["cp", &t.s("source"), "--as-existing", &t.s("exact-link")]);
+    run_native_ok(&[
+        "cp",
+        "--if-exists=update",
+        &t.s("source"),
+        "--as-existing",
+        &t.s("exact-link"),
+    ]);
     assert_eq!(read(&t.path("exact-link")), b"new");
     assert_eq!(read(&t.path("referent")), b"old");
     assert!(!t.path("exact-link").is_symlink());
@@ -613,6 +619,7 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     symlink("referent", t.path("exact-link")).unwrap();
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--follow",
         &t.s("source"),
         "--as-existing",
@@ -625,6 +632,7 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     symlink("never-created", t.path("dangling-existing-link")).unwrap();
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--follow",
         &t.s("source"),
         "--as-existing",
@@ -636,6 +644,7 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     symlink("also-never-created", t.path("dangling-new-link")).unwrap();
     let refused = native_syq(&[
         "cp",
+        "--if-exists=update",
         "--follow",
         &t.s("source"),
         "--as-new",
@@ -655,6 +664,7 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     .unwrap();
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--follow",
         &t.s("source"),
         "--as-existing",
@@ -672,6 +682,7 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     symlink(&absolute_referent, t.path("links/absolute-link")).unwrap();
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--follow",
         &t.s("source"),
         "--as-existing",
@@ -688,6 +699,7 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     .unwrap();
     let refused = native_syq(&[
         "cp",
+        "--if-exists=update",
         "--follow",
         &t.s("source"),
         "--as-new",
@@ -699,7 +711,13 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
 
     fs::create_dir(t.path("real-parent")).unwrap();
     symlink("real-parent", t.path("parent-link")).unwrap();
-    let refused = native_syq(&["cp", &t.s("source"), "--as", &t.s("parent-link/exact-name")]);
+    let refused = native_syq(&[
+        "cp",
+        "--if-exists=update",
+        &t.s("source"),
+        "--as",
+        &t.s("parent-link/exact-name"),
+    ]);
     assert!(!refused.status.success());
     let stderr = stderr_of(&refused);
     assert!(
@@ -709,6 +727,7 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     assert!(!t.path("real-parent/exact-name").exists());
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--follow-dst",
         &t.s("source"),
         "--as",
@@ -720,6 +739,7 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     symlink("source-tree", t.path("source-tree-link")).unwrap();
     let refused = native_syq(&[
         "cp",
+        "--if-exists=update",
         "--follow",
         "--src-dir",
         &t.s("source-tree"),
@@ -736,6 +756,7 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     symlink("real-container", t.path("container-link")).unwrap();
     let refused = native_syq(&[
         "cp",
+        "--if-exists=update",
         &t.s("source"),
         "--into-existing",
         &t.s("container-link"),
@@ -744,6 +765,7 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     assert!(!t.path("real-container/source").exists());
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--follow",
         &t.s("source"),
         "--into-existing",
@@ -1896,7 +1918,14 @@ fn partial_candidates_do_not_break_empty_replacement_or_unchanged_files() {
             );
             write(&t.path(candidate), b"stale");
             let before = fs::metadata(t.path("out")).unwrap().ino();
-            run_native_ok(&["cp", "--hash", &t.s("src"), "--as", &t.s("out")]);
+            run_native_ok(&[
+                "cp",
+                "--if-exists=update",
+                "--hash",
+                &t.s("src"),
+                "--as",
+                &t.s("out"),
+            ]);
             assert_eq!(read(&t.path("out")), source);
             if !empty {
                 assert_eq!(fs::metadata(t.path("out")).unwrap().ino(), before);

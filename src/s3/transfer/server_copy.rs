@@ -51,14 +51,6 @@ fn full_checksum_match(a: &HeadObjectOutput, b: &HeadObjectOutput) -> Option<boo
     found.then_some(true)
 }
 
-fn unchanged(source: &Object, old: &Object, a: &HeadObjectOutput, b: &HeadObjectOutput) -> bool {
-    source.kind() == old.kind()
-        && source.size == old.size
-        && same_metadata(a, b)
-        && full_checksum_match(a, b)
-            .unwrap_or_else(|| source.etag == old.etag || source.metadata.is_some())
-}
-
 fn copy_destination_key(job: &Download) -> String {
     if client::is_directory_marker(&job.key, job.size) {
         format!("{}/", job.path)
@@ -361,28 +353,95 @@ impl Engine {
         {
             return Ok(CopyPreparation::Skipped);
         }
-        let source_time = source.metadata.as_ref().map_or(source.mtime, |m| m.mtime);
+        anyhow::ensure!(
+            source.kind() == ObjectKind::Dir
+                || existing.is_none()
+                || self.args.if_exists != Some(crate::cli::IfExists::Error),
+            "destination already exists: {key} (--if-exists=error)"
+        );
+        let source_time = source
+            .metadata
+            .as_ref()
+            .map_or((source.mtime, 0), |m| (m.mtime, m.nsec));
+        let mut matching_contents = false;
         if let Some((old, old_head)) = &existing {
-            let old_time = old.metadata.as_ref().map_or(old.mtime, |m| m.mtime);
-            if self.args.update && old_time > source_time {
+            let old_time = old
+                .metadata
+                .as_ref()
+                .map_or((old.mtime, 0), |m| (m.mtime, m.nsec));
+            if self.args.update && source.kind() != ObjectKind::Dir && old_time >= source_time {
                 return Ok(CopyPreparation::Skipped);
             }
-            let same = if explicit.flags() == 0 {
-                unchanged(&source, old, &source_head, old_head)
-            } else {
-                // Supplied timestamps cannot establish content identity. Reuse
-                // provider identity/checksums already returned by these HEADs.
-                source.kind() == old.kind()
-                    && source.size == old.size
-                    && same_metadata(&desired_head, old_head)
-                    && full_checksum_match(&source_head, old_head)
+            matching_contents = source.kind() == old.kind()
+                && source.size == old.size
+                && (source.kind() == ObjectKind::Dir
+                    || source
+                        .metadata
+                        .as_ref()
+                        .zip(old.metadata.as_ref())
+                        .is_some_and(|(a, b)| {
+                            a.hash.is_some()
+                                && a.hash_algorithm == b.hash_algorithm
+                                && a.hash == b.hash
+                        })
+                    || full_checksum_match(&source_head, old_head)
                         .unwrap_or(source.etag == old.etag)
-            };
-            if same {
-                self.progress
-                    .bytes_unchanged
-                    .fetch_add(source.size, Relaxed);
-                return Ok(CopyPreparation::Skipped);
+                    || (!self.args.checksum
+                        && source.metadata.is_some()
+                        && old.metadata.is_some()
+                        && source_time == old_time
+                        && explicit.mtime.is_none()));
+            anyhow::ensure!(
+                source.kind() == ObjectKind::Dir
+                    || matching_contents
+                    || !self.args.protects_existing_contents(),
+                "cannot establish matching destination contents: {key} (--if-exists=error-if-different)"
+            );
+            if matching_contents {
+                desired_head = old_head.clone();
+                let flags = self.args.matching_meta_flags() | explicit.apply_flags();
+                if flags != 0 {
+                    let mut metadata = old.metadata.clone().unwrap_or(Metadata {
+                        kind: old.kind(),
+                        mode: if old.kind() == ObjectKind::Dir {
+                            0o777
+                        } else {
+                            0o666
+                        },
+                        uid: unsafe { libc::geteuid() },
+                        gid: unsafe { libc::getegid() },
+                        mtime: old_time.0,
+                        nsec: old_time.1,
+                        hash: None,
+                        hash_algorithm: HashAlgorithm::Blake3,
+                    });
+                    if let Some(src) = &source.metadata {
+                        if self.args.perms {
+                            metadata.mode = src.mode;
+                        }
+                        if self.args.owner {
+                            metadata.uid = src.uid;
+                        }
+                        if self.args.group {
+                            metadata.gid = src.gid;
+                        }
+                    }
+                    if self.args.copy_mtime_metadata {
+                        metadata.mtime = source_time.0;
+                        metadata.nsec = source_time.1;
+                    }
+                    metadata.override_with(&explicit);
+                    desired_head
+                        .metadata
+                        .get_or_insert_with(Default::default)
+                        .extend(metadata.encode());
+                }
+                if same_metadata(&desired_head, old_head) {
+                    self.progress
+                        .bytes_unchanged
+                        .fetch_add(source.size, Relaxed);
+                    return Ok(CopyPreparation::Skipped);
+                }
             }
         }
         if self.args.dry_run {
@@ -391,7 +450,9 @@ impl Engine {
         }
         self.check_cancelled()?;
         let copy_source = encoded_source(source_bucket, &source);
-        let must_be_new = self.args.ignore_existing || self.args.target_existence == Existence::New;
+        let must_be_new = self.args.ignore_existing
+            || self.args.target_existence == Existence::New
+            || (self.args.protects_existing_contents() && existing.is_none());
         let multipart = if source.size > self.copy_request_limit(source.size) {
             Some(
                 self.prepare_multipart_copy(&source, desired_head.clone(), &key)
@@ -407,7 +468,7 @@ impl Engine {
             key,
             copy_source,
             must_be_new,
-            explicit: explicit.flags() != 0,
+            explicit: explicit.flags() != 0 || matching_contents,
             multipart,
         };
         if let Err(error) = self.authorize_copy(&prepared).await {

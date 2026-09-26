@@ -58,15 +58,19 @@ objects.
 - **Metadata:** syq stores timestamps, permissions, ownership, and symlinks in
   object metadata or contents. Downloads restore symlinks and set filesystem
   modification time from the stored source time, falling back to S3 Last-Modified
-  when unavailable. `--preserve=-mtime` disables setting that filesystem time;
-  `--preserve=permissions,ownership` also restores permissions and ownership.
-  These options control filesystem restoration; uploads and server-side copies
-  still retain source metadata. Special files are unsupported.
-- **Updates:** `--only-new`, `--into-new`, and `--as-new` protect individual
+  when unavailable. Existing files with matching contents keep their time unless
+  `--copy-metadata=mtime` requests a metadata update;
+  `--copy-metadata=permissions,ownership` also restores permissions and ownership.
+  New or changed uploads and server-side copies retain source metadata. On
+  matching contents, only explicitly selected attributes are updated. Special
+  files are unsupported.
+- **Updates:** `--if-exists=keep`, `--into-new`, and `--as-new` protect individual
   objects against concurrent creation. Prefix checks are not transactional.
   `--inplace` and SSH/S3 combinations are unsupported.
-- **Recovery:** rerun an interrupted copy to reuse multipart work. Recovery records
-  are stored in the local user cache. If that cache cannot be used, for example
+- **Recovery:** `--resume` reuses multipart work and prepares checkpoints for
+  another interruption. Without it, ordinary copies do not use the recovery
+  cache; adding it after an interruption restarts unfinished objects. Recovery
+  records are stored in the local user cache and removed on success. If that cache cannot be used, for example
   because it is read-only or belongs to another user, the copy continues with a
   warning, but unsaved progress cannot be reused on a later run.
   If you abandon an upload, remove its unfinished parts with provider tools or a
@@ -77,9 +81,15 @@ objects.
 ## Copies between S3 buckets
 
 Bucket-to-bucket copies run within one service, using the same endpoint, region,
-and credentials. They preserve metadata and tags. Changes to tags, encryption,
-or storage class alone do not trigger a copy. Content hashing and expected hashes
-are unsupported on this route.
+and credentials. New or changed copies retain source metadata and tags. For
+unchanged contents, only `--copy-metadata` selections trigger metadata updates;
+changes to tags, encryption, or storage class alone do not trigger a copy.
+
+The default existing-file policy requires matching stored size/time, whole-file
+hashes, provider checksums, or ETags. If those cannot establish equality, the
+copy reports an error; use `--if-exists=update` to allow replacement. Syq does not
+download both bodies to compare them on this route. `--hash` and expected hashes
+are unsupported.
 
 ## Authorize from your laptop
 
@@ -107,7 +117,7 @@ With `--src-fd` or `--as-fd`, `cp` transfers one exact UTF-8 key's raw contents
 instead of selecting a prefix tree. Keys are literal unless a download uses
 `--cwd` or `--root`; those options resolve the source relative to a prefix using
 the usual S3 path rules. Regular-file uploads store syq's file metadata. Output
-descriptors receive raw bytes; use `--preserve` to apply attributes to a regular
+descriptors receive raw bytes; use `--copy-metadata` to apply attributes to a regular
 output file. Pipes carry only bytes. No local temporary file is created. See
 [File descriptors](commands/cp.md#file-descriptors) for command examples.
 

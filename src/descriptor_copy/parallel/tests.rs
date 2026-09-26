@@ -4,6 +4,7 @@ use std::{fs::File, io::Write, os::fd::AsRawFd};
 fn arguments(path: &std::path::Path, upload: bool) -> Args {
     let mut argv = vec![
         "cp".into(),
+        "--if-exists=update".into(),
         "--quiet".into(),
         "--no-tcp".into(),
         "--performance-tuning".into(),

@@ -965,6 +965,8 @@ mod confinement;
 mod copy;
 #[path = "local/data_safety.rs"]
 mod data_safety;
+#[path = "local/existing_policy.rs"]
+mod existing_policy;
 #[path = "local/fifo.rs"]
 mod fifo;
 #[path = "local/hardlinks.rs"]

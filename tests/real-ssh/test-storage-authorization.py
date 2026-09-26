@@ -201,6 +201,24 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             headers, body = checks.request('GET', prefix+'/small-copy')
             assert body == b'small copy'
             assert {k.lower(): v for k, v in headers.items()}['x-amz-meta-example'] == 'kept'
+            print('case: approved metadata-only updates keep contents and unrelated headers', flush=True)
+            metadata_source = remote_root+'/metadata-source'
+            run('ssh', 'source', shlex.join(['python3', '-c',
+                "from pathlib import Path; import os; p=Path(%r); p.write_bytes(b'small copy'); os.utime(p,(123,123))" % metadata_source]))
+            for descriptor in [False, True]:
+                key = prefix+('/metadata-stream' if descriptor else '/metadata-file')
+                checks.request('PUT', key, b'small copy', headers={
+                    'x-amz-meta-example': 'kept', 'content-type': 'text/plain'})
+                source_args = ['--src-fd', '0'] if descriptor else [metadata_source]
+                copy([*source_args, '--to', 's3://syq-storage-test', '--as', key,
+                      '--copy-metadata=mtime'], disconnect=False,
+                     redirection=(' < '+metadata_source) if descriptor else '')
+                headers, body = checks.request('GET', key)
+                headers = {k.lower(): v for k, v in headers.items()}
+                assert body == b'small copy'
+                assert headers['x-amz-meta-example'] == 'kept', headers
+                assert headers['content-type'] == 'text/plain', headers
+                assert headers['x-amz-meta-syq-mtime'] == '123', headers
             print('case: mixed paths and callbacks share one offline approval', flush=True)
             copy(['--to', 's3://syq-storage-test', '--into', prefix+'/mixed'], mapping='upload')
             for name in ['ordinary', 'known', 'unknown']:
@@ -237,7 +255,7 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
                     assert checks.request('GET', marker)[1] == b''
                 assert checks.request('GET', neighbor)[1] == b'keep'
             print('case: interrupted multipart work resumes after a fresh approval', flush=True)
-            resumed = [remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/resumed']
+            resumed = ['--resume', remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/resumed']
             copy(resumed, interrupt=True)
             # Inspect the known recovery upload directly. Bucket-wide unfinished
             # upload listings are not consistent across S3-compatible providers.

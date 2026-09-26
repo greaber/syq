@@ -1210,7 +1210,7 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
         "source",
         "--to",
         "backup",
-        "--skip-newer",
+        "--if-exists=update-if-older",
         "--results",
         "result.ndjson",
     ]);
@@ -1232,7 +1232,7 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
     for extra in [
         vec!["--auth-from", "ssh"],
         vec!["--no-tcp"],
-        vec!["--preserve", "ownership"],
+        vec!["--copy-metadata", "ownership"],
         vec!["--inplace"],
         vec!["--prune", "--into", "out"],
         vec!["--into", "~//archive"],

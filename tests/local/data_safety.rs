@@ -15,7 +15,14 @@ fn native_copy_detects_subsecond_and_older_timestamp_edits() {
         let t = Tmp::new();
         write(&t.path("src/file"), &vec![b'a'; size]);
         timestamp(&t.path("src/file"), 1_700_000_000, 100_000_000);
-        let args = ["cp", "--srcs-in", &t.s("src"), "--into", &t.s("dst")];
+        let args = [
+            "cp",
+            "--if-exists=update",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+        ];
         run_native_ok(&args);
         for (byte, seconds, nanos) in [
             (b'b', 1_700_000_000, 200_000_000),
@@ -350,7 +357,8 @@ fn directory_type_conflicts_preserve_destination_and_prevent_prune() {
                     }
                     let before = fs::symlink_metadata(t.path("dst/item")).unwrap();
                     let out = if native {
-                        let mut args = vec!["cp", "--prune", "--preserve=permissions", "--srcs-in"];
+                        let mut args =
+                            vec!["cp", "--prune", "--copy-metadata=permissions", "--srcs-in"];
                         let src = t.s("src");
                         let dst = t.s("dst");
                         args.extend([&src, "--into", &dst]);
@@ -469,6 +477,7 @@ fn resume_accepts_pre_path_hash_partial_filename() {
     fs::set_permissions(&partial, fs::Permissions::from_mode(0o600)).unwrap();
     run_native_ok(&[
         "cp",
+        "--resume",
         "--results",
         &t.s("results"),
         "--performance-tuning=copy-path=ranges",

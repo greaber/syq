@@ -178,9 +178,9 @@ def check():
         os.utime(src / 'script', ns=(1_600_000_001_123456789, 1_600_000_001_123456789))
         remote = 's3://' + BUCKET
         placement = PREFIX + '/roundtrip'
-        run([src, '--to', remote, '--into', placement, '--preserve=permissions'])
+        run([src, '--to', remote, '--into', placement, '--copy-metadata=permissions'])
         dst = root / 'download'
-        run(['--from', remote, placement + '/source', '--into', dst, '--preserve=permissions'])
+        run(['--from', remote, placement + '/source', '--into', dst, '--copy-metadata=permissions'])
         restored = dst / 'source'
         for path in src.iterdir():
             actual = restored / path.name
@@ -196,7 +196,7 @@ def check():
         assert_comparison(root / 'matching.ndjson', changed=0, unchanged=4)
         owned = root / 'owned'
         owned.mkdir()
-        run(['--from', remote, placement + '/source', '--as', owned, '--preserve=ownership'])
+        run(['--from', remote, placement + '/source', '--as', owned, '--copy-metadata=ownership'])
         assert owned.stat().st_uid == src.stat().st_uid
         assert owned.stat().st_gid == src.stat().st_gid
 
@@ -208,7 +208,7 @@ def check():
         (restored / 'script').write_bytes(b'local edits')
         run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--dry-run'])
         assert (restored / 'script').read_bytes() == b'local edits'
-        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--only-new'])
+        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--if-exists=keep'])
         assert (restored / 'script').read_bytes() == b'local edits'
         run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--dry-run', '--hash', '--results', root / 'different.ndjson'])
         changes = assert_comparison(root / 'different.ndjson', changed=1, unchanged=0)

@@ -1379,6 +1379,8 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
     let canonical = dir.path().canonicalize().unwrap();
     let prefix = canonical.as_os_str().as_bytes().to_vec();
     let request = SmallCopyRequest {
+        if_exists: crate::cli::IfExists::Update,
+        matching_flags: flags::TIMES,
         hash_policy: Default::default(),
         copy_if: None,
         directory: prefix.clone(),
@@ -1493,6 +1495,8 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
         let (files, contents) = files.into_iter().unzip();
         (
             SmallCopyRequest {
+                if_exists: crate::cli::IfExists::Update,
+                matching_flags: flags::TIMES,
                 hash_policy: Default::default(),
                 copy_if: None,
                 directory,
@@ -1616,6 +1620,8 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
 
 fn offered_small_copy(prefix: &[u8], names: &[&[u8]]) -> SmallCopyRequest {
     SmallCopyRequest {
+        if_exists: crate::cli::IfExists::Update,
+        matching_flags: flags::TIMES,
         hash_policy: crate::hashing::HashPolicy {
             transfer_integrity: true,
             ..Default::default()

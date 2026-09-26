@@ -256,7 +256,7 @@ fn fatal_deferred_metadata_error_leaves_final_incomplete_counts() {
             "src",
             "--as",
             "dst",
-            "--preserve",
+            "--copy-metadata",
             "permissions",
             "--progress",
             "--resource-limits",

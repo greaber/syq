@@ -88,10 +88,11 @@ In addition to the shared arguments above, it accepts:
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune`, `dry_run`, `hash` | Boolean: mirror, preview, or compare content |
 | `integrity_checking` | Comma-separated string, e.g. `"transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
-| `only_new` | Boolean: copy missing entries without replacing existing ones |
+| `if_exists` | `"error-if-different"` (default), `"error"`, `"keep"`, `"update"`, or `"update-if-older"` |
+| `resume` | Boolean: reuse interrupted work and prepare recovery checkpoints |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
-| `preserve` | Preservation string or iterable: `mtime` (on by default), `-mtime` (opt out), `times` (alias for `mtime`), `permissions`, `ownership`, `specials`, `hardlinks`, `acls`, `xattrs`, `atimes`, `crtimes`; see [filesystem preservation](https://greaber.github.io/syq/reference.html#preserve-metadata) for platform and route support |
+| `copy_metadata` | Metadata string or iterable; applies even on unchanged files: `mtime`, `times` (alias for `mtime`), `permissions`, `ownership`, `specials`, `hardlinks`, `acls`, `xattrs`, `atimes`, `crtimes`; see [filesystem preservation](https://greaber.github.io/syq/reference.html#preserve-metadata) for platform and route support |
 | `open_noatime` | Boolean: request file reads without access-time updates; warns and continues if unavailable |
 | `sparse` | Boolean: turn written zero ranges into sparse holes on filesystem destinations |
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
@@ -151,7 +152,7 @@ them. Choose at most one, as with `cp`. These bases belong to the source
 endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
 `syq_path`, `pscope`, `no_bootstrap`, `no_compress`, `no_tcp`, `tcp_plain`,
 `tcp_ports`, `tcp_congestion`, `auth_from` (S3), `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
-`performance_tuning`, `resource_limits`, `integrity_checking`, `only_new`,
+`performance_tuning`, `resource_limits`, `integrity_checking`, `if_exists`,
 `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
 and `timeout` with the same meanings as `cp`.
 See the CLI stream reference for the applicable tuning and integrity controls.
@@ -194,12 +195,12 @@ need their own final publication step after all object transfers succeed.
 
 Writers normally return while destination setup continues, so opening several
 writers lets their connections start concurrently. Setup errors can surface at
-`write()` or `commit()`. With `only_new=True` or `dry_run=True`,
+`write()` or `commit()`. With `if_exists="keep"` or `dry_run=True`,
 opening waits for the destination decision (also for options inherited from the
 environment). Check `output.skipped` before producing data:
 
 ```python
-with client.open_writer(to="server", as_="archive.tar", only_new=True) as output:
+with client.open_writer(to="server", as_="archive.tar", if_exists="keep") as output:
     if not output.skipped:
         produce_archive(output)
 ```
@@ -411,7 +412,7 @@ cooperate with cancellation. Do not retain the supplied file object after return
 publication. `MappingEntry.size` remains informational. `expected_hash` checks
 the bytes during transfer on every backend; it adds no second download. Without
 an expectation or requested integrity check, no extra whole-stream hash is made.
-`metadata` sets attributes on named destinations without `preserve`. Source
+`metadata` sets attributes on named destinations without `copy_metadata`. Source
 callbacks have no file metadata to preserve. S3 stores explicit attributes in
 syq's existing object metadata format; omitted attributes use new-file defaults.
 
@@ -499,7 +500,7 @@ The keyword-only fields are `mode`, `uid`, `gid`, `mtime`, and `mtime_nsec`,
 all optional integers. `mode` contains permission bits only; `uid` and `gid`
 are numeric IDs. Times use Unix seconds plus optional nanoseconds. Supplying
 `mtime` without `mtime_nsec` uses zero nanoseconds. Omitted attributes follow
-normal copy behavior. Explicit attributes do not require `preserve`, except
+normal copy behavior. Explicit attributes do not require `copy_metadata`, except
 where a restricted receiver's signed grant needs the corresponding permission.
 The [mapping reference](https://greaber.github.io/syq/mappings.html#the-format) describes backend behavior.
 

@@ -136,6 +136,7 @@ struct PreparedUpload {
     metadata: Metadata,
     must_be_new: bool,
     multipart: Option<PreparedMultipart>,
+    metadata_update: Option<super::authorization::Unsigned>,
 }
 struct PreparedMultipart {
     recorded: bool,
@@ -405,6 +406,7 @@ impl Engine {
                     &self.args,
                     *mode,
                     *explicit,
+                    mode.is_none(),
                 )?;
             }
         }
@@ -524,6 +526,14 @@ impl Engine {
         }
         self.check_cancelled()
     }
+    fn recovery_state(&self, identity: &[u8]) -> Result<State> {
+        if self.args.resume {
+            State::open(identity)
+        } else {
+            Ok(State::without_cache())
+        }
+    }
+
     fn identity(&self, key: &str, extra: &str) -> Vec<u8> {
         let mut hash = blake3::Hasher::new();
         for header in &self.options.headers {
@@ -636,6 +646,22 @@ impl Engine {
             })
     }
 
+    fn upload_requested_metadata_matches(&self, source: &Source, object: &Object) -> bool {
+        let explicit = source.metadata.unwrap_or_default();
+        let desired = source.metadata(None);
+        let flags = self.args.matching_meta_flags() | explicit.apply_flags();
+        if flags == 0 {
+            return true;
+        }
+        object.metadata.as_ref().is_some_and(|m| {
+            (flags & crate::proto::flags::TIMES == 0
+                || (m.mtime, m.nsec) == (desired.mtime, desired.nsec))
+                && (flags & crate::proto::flags::MODE == 0 || m.mode == desired.mode)
+                && (flags & crate::proto::flags::OWNER == 0 || m.uid == desired.uid)
+                && (flags & crate::proto::flags::GROUP == 0 || m.gid == desired.gid)
+        })
+    }
+
     async fn prepare_upload(self: &Arc<Self>, source: Source) -> Result<UploadPreparation> {
         let expected_hash = source.expected_hash.as_ref().filter(|_| !self.args.dry_run);
         let existing = if self
@@ -667,9 +693,21 @@ impl Engine {
             return Ok(UploadPreparation::Skipped);
         }
 
+        anyhow::ensure!(
+            source.kind() == ObjectKind::Dir
+                || existing.is_none()
+                || self.args.if_exists != Some(crate::cli::IfExists::Error),
+            "destination already exists: {} (--if-exists=error)",
+            source.key
+        );
         if self.args.update
+            && source.kind() != ObjectKind::Dir
             && existing.as_ref().is_some_and(|o| {
-                o.metadata.as_ref().map_or(o.mtime, |m| m.mtime) > source.meta.mtime
+                let time = o
+                    .metadata
+                    .as_ref()
+                    .map_or((o.mtime, 0), |m| (m.mtime, m.nsec));
+                time >= (source.meta.mtime, source.meta.mtime_nsec)
             })
         {
             return Ok(UploadPreparation::Skipped);
@@ -679,6 +717,17 @@ impl Engine {
         } else {
             source.meta.len
         };
+        let protected_existing = self.args.protects_existing_contents()
+            && existing.is_some()
+            && source.kind() != ObjectKind::Dir;
+        anyhow::ensure!(
+            !protected_existing
+                || existing
+                    .as_ref()
+                    .is_some_and(|o| o.kind() == source.kind() && o.size == size),
+            "destination contents differ: {} (--if-exists=error-if-different)",
+            source.key
+        );
         let whole_algorithm = expected_hash.map(|d| d.algorithm).or_else(|| {
             if self.args.transfer_integrity {
                 Some(self.args.transfer_hash_type.unwrap_or_default())
@@ -705,6 +754,8 @@ impl Engine {
             self.progress.bytes_unchanged.fetch_add(size, Relaxed);
             return Ok(UploadPreparation::Skipped);
         }
+        let whole_algorithm =
+            whole_algorithm.or_else(|| protected_existing.then_some(self.args.hash_algorithm));
         let part_size = self.part_size(size);
         if part_size > 5 * 1024 * 1024 * 1024 {
             bail!("file exceeds the S3 multipart size limit");
@@ -862,48 +913,83 @@ impl Engine {
         let mut metadata = source.metadata(whole_digest.clone());
         metadata.hash_algorithm = whole_algorithm.unwrap_or(HashAlgorithm::Blake3);
         let digest = upload_identity(algorithm, size, part_size, &checksums);
-        let mut unchanged = existing.as_ref().is_some_and(|o| {
-            self.upload_metadata_matches(&source, size, o)
-                && o.metadata.as_ref().is_some_and(|m| {
-                    self.args.checksum
-                        || (whole_digest.is_none() && can_compare_time)
-                        || (whole_digest.is_some()
-                            && m.hash == whole_digest
-                            && m.hash_algorithm == metadata.hash_algorithm)
-                })
+        let mut same_contents = existing.as_ref().is_some_and(|o| {
+            o.kind() == source.kind()
+                && o.size == size
+                && (source.kind() == ObjectKind::Dir
+                    || (can_compare_time
+                        && o.metadata.as_ref().is_some_and(|m| {
+                            (m.mtime, m.nsec) == (source.meta.mtime, source.meta.mtime_nsec)
+                        })))
         });
-        let comparison_digest = if self.args.checksum {
-            if whole_algorithm == Some(self.args.hash_algorithm) {
-                whole_digest.clone()
-            } else {
-                let source = source.clone();
-                let algorithm = self.args.hash_algorithm;
-                Some(
-                    tokio::task::spawn_blocking(move || {
-                        local::hash_file_as(source.open()?, algorithm)
-                    })
-                    .await??,
-                )
-            }
-        } else {
-            None
-        };
-        if self.args.checksum {
+        if source.kind() != ObjectKind::Dir
+            && (self.args.checksum || (protected_existing && !same_contents))
+        {
             if let Some(object) = &existing {
-                unchanged = unchanged
-                    && self
-                        .remote_hash_as(object, self.args.hash_algorithm)
-                        .await?
-                        == *comparison_digest.as_ref().unwrap();
+                let algorithm = self.args.hash_algorithm;
+                let source_hash = if whole_algorithm == Some(algorithm) {
+                    whole_digest.clone().unwrap()
+                } else {
+                    let source = source.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if source.kind() == ObjectKind::File {
+                            local::hash_file_as(source.open()?, algorithm)
+                        } else {
+                            Ok(Digest::hash_bytes(algorithm, &source.bytes()?).value)
+                        }
+                    })
+                    .await??
+                };
+                let destination_hash = match object
+                    .metadata
+                    .as_ref()
+                    .filter(|m| m.hash_algorithm == algorithm)
+                    .and_then(|m| m.hash.clone())
+                {
+                    Some(hash) => hash,
+                    None => self.remote_hash_as(object, algorithm).await?,
+                };
+                same_contents = object.kind() == source.kind()
+                    && object.size == size
+                    && source_hash == destination_hash;
             }
         }
-
-        if unchanged && expected_hash.is_some() {
-            unchanged = self
+        if same_contents && expected_hash.is_some() {
+            same_contents = self
                 .verify_expected_remote(existing.as_ref().unwrap(), expected_hash)
                 .await
                 .is_ok();
         }
+        anyhow::ensure!(
+            !protected_existing || same_contents,
+            "destination contents differ: {} (--if-exists=error-if-different)",
+            source.key
+        );
+        if same_contents {
+            if let Some(old) = existing.as_ref().and_then(|o| o.metadata.as_ref()) {
+                metadata.hash = old.hash.clone();
+                metadata.hash_algorithm = old.hash_algorithm;
+                let flags = self.args.matching_meta_flags()
+                    | source.metadata.map_or(0, |m| m.apply_flags());
+                if flags & crate::proto::flags::TIMES == 0 {
+                    metadata.mtime = old.mtime;
+                    metadata.nsec = old.nsec;
+                }
+                if flags & crate::proto::flags::MODE == 0 {
+                    metadata.mode = old.mode;
+                }
+                if flags & crate::proto::flags::OWNER == 0 {
+                    metadata.uid = old.uid;
+                }
+                if flags & crate::proto::flags::GROUP == 0 {
+                    metadata.gid = old.gid;
+                }
+            }
+        }
+        let unchanged = same_contents
+            && existing
+                .as_ref()
+                .is_some_and(|o| self.upload_requested_metadata_matches(&source, o));
         if unchanged {
             self.progress.bytes_unchanged.fetch_add(size, Relaxed);
             return Ok(UploadPreparation::Skipped);
@@ -912,8 +998,30 @@ impl Engine {
             self.progress.add_bytes(size);
             return Ok(UploadPreparation::Preview(size));
         }
-        let must_be_new = self.args.ignore_existing || self.args.target_existence == Existence::New;
-        let multipart = if size > part_size && small.is_none() {
+        let must_be_new = self.args.ignore_existing
+            || self.args.target_existence == Existence::New
+            || (self.args.protects_existing_contents() && existing.is_none());
+        let metadata_update = if same_contents {
+            let head = client::head_output(&self.client, &self.options.bucket, &source.key, None)
+                .await?
+                .context("S3 destination disappeared before metadata update")?;
+            anyhow::ensure!(
+                Some(&head.e_tag().unwrap_or_default().to_owned())
+                    == existing.as_ref().map(|o| &o.etag),
+                "S3 destination changed before metadata update"
+            );
+            let mut fields = head.metadata().cloned().unwrap_or_default();
+            fields.extend(metadata.encode());
+            Some(client::metadata_update_request(
+                &self.options.bucket,
+                &source.key,
+                &head,
+                fields,
+            )?)
+        } else {
+            None
+        };
+        let multipart = if metadata_update.is_none() && size > part_size && small.is_none() {
             Some(
                 self.prepare_multipart(&source, digest, part_size, &metadata, algorithm)
                     .await?,
@@ -931,6 +1039,7 @@ impl Engine {
             metadata,
             must_be_new,
             multipart,
+            metadata_update,
         };
         if let Err(error) = self.authorize_upload(&prepared).await {
             self.abort_unrecorded_preparation(&prepared).await;
@@ -950,6 +1059,14 @@ impl Engine {
             UploadPreparation::Preview(size) => return Ok(Some(size)),
             UploadPreparation::Ready(prepared) => *prepared,
         };
+        if let Some(update) = &prepared.metadata_update {
+            let _slot = self.tuning.requests.acquire().await;
+            client::copy_metadata(&self.client, &self.options.bucket, update.clone()).await?;
+            self.progress
+                .bytes_unchanged
+                .fetch_add(prepared.size, Relaxed);
+            return Ok(Some(0));
+        }
         let PreparedUpload {
             source,
             size,
@@ -960,6 +1077,7 @@ impl Engine {
             metadata,
             must_be_new,
             multipart,
+            metadata_update: _,
         } = prepared;
         let _interval = self.progress.copying_interval();
         if size <= part_size || small.is_some() {
@@ -1020,7 +1138,7 @@ impl Engine {
                 uploaded,
             } = multipart.context("multipart preparation missing")?;
             let state = if recorded {
-                let state = State::open(&self.identity(&source.key, "upload"))?;
+                let state = self.recovery_state(&self.identity(&source.key, "upload"))?;
                 let saved: Option<UploadState> = state.load()?;
                 anyhow::ensure!(
                     saved
@@ -1236,7 +1354,7 @@ impl Engine {
         metadata: &Metadata,
         algorithm: Algorithm,
     ) -> Result<PreparedMultipart> {
-        let state = State::open(&self.identity(&source.key, "upload"))?;
+        let state = self.recovery_state(&self.identity(&source.key, "upload"))?;
         let mut previous: Option<UploadState> = state.load()?;
         if let Some(old) = &previous {
             if old.schema != old.algorithm.schema() {
@@ -1989,7 +2107,17 @@ impl Engine {
             ObjectKind::Symlink => crate::proto::Kind::Symlink,
         })?;
         metadata.override_with(&explicit);
-        if self.args.update && existing.is_some_and(|m| m.is_file() && m.mtime > source_time.0) {
+        anyhow::ensure!(
+            object.kind() == ObjectKind::Dir
+                || existing.is_none()
+                || self.args.if_exists != Some(crate::cli::IfExists::Error),
+            "destination already exists: {} (--if-exists=error)",
+            job.path
+        );
+        if self.args.update
+            && object.kind() != ObjectKind::Dir
+            && existing.is_some_and(|m| !m.is_dir() && (m.mtime, m.mtime_nsec) >= source_time)
+        {
             return Ok(None);
         }
         if let Some(m) = existing {
@@ -2039,6 +2167,11 @@ impl Engine {
             }
             let same = existing.is_some_and(|m| m.is_symlink()) && root.read_link(&path)? == bytes;
 
+            anyhow::ensure!(
+                same || existing.is_none() || !self.args.protects_existing_contents(),
+                "destination contents differ: {} (--if-exists=error-if-different)",
+                job.path
+            );
             if !self.args.dry_run {
                 root.create_missing_parents(&path, 0o777)?;
                 if !same {
@@ -2049,7 +2182,7 @@ impl Engine {
                     }
                     self.progress.symlinks_created.fetch_add(1, Relaxed);
                 }
-                local::apply_metadata(root, &path, &metadata, &self.args, None, explicit)?;
+                local::apply_metadata(root, &path, &metadata, &self.args, None, explicit, !same)?;
             }
             if same {
                 return Ok(None);
@@ -2075,6 +2208,21 @@ impl Engine {
             }
         }
 
+        if !unchanged && self.args.protects_existing_contents() {
+            if let Some(current) = existing {
+                anyhow::ensure!(
+                    current.is_file() && current.len == object.size,
+                    "destination contents differ: {} (--if-exists=error-if-different)",
+                    job.path
+                );
+                unchanged = self.verify_download(root, &path, &object).await?;
+                anyhow::ensure!(
+                    unchanged,
+                    "destination contents differ: {} (--if-exists=error-if-different)",
+                    job.path
+                );
+            }
+        }
         if unchanged && expected_hash.is_some() {
             unchanged = self
                 .verify_expected_local(root, &path, expected_hash)
@@ -2088,7 +2236,7 @@ impl Engine {
                     && metadata.mode & 0o7777 != current.mode & 0o7777)
                     || ((self.args.owner || explicit.uid.is_some()) && metadata.uid != current.uid)
                     || ((self.args.group || explicit.gid.is_some()) && metadata.gid != current.gid)
-                    || ((self.args.times || explicit.mtime.is_some())
+                    || ((self.args.copy_mtime_metadata || explicit.mtime.is_some())
                         && (metadata.mtime, metadata.nsec) != (current.mtime, current.mtime_nsec));
                 if differs {
                     if self.args.verbose > 0 {
@@ -2116,6 +2264,7 @@ impl Engine {
                     &self.args,
                     existing.map(|m| m.mode & 0o7777),
                     explicit,
+                    false,
                 )?;
             }
             self.progress
@@ -2147,7 +2296,7 @@ impl Engine {
             root.identity().ino,
             job.path
         );
-        let state = State::open(&self.identity(&object.key, &extra))?;
+        let state = self.recovery_state(&self.identity(&object.key, &extra))?;
         let mut saved: Option<DownloadState> = state.load()?;
         if let Some(old) = &saved {
             if old.schema != 1 && old.schema != 2 {
@@ -2239,13 +2388,15 @@ impl Engine {
                             length,
                             initial,
                             slot,
-                            Some(range_algorithm),
+                            state.can_checkpoint().then_some(range_algorithm),
                         )
                         .await?;
-                    output.finish().await?;
-                    let mut record = record.lock().await;
-                    record.parts.insert(index, hash);
-                    state.save(&*record)?;
+                    if state.can_checkpoint() {
+                        output.finish().await?;
+                        let mut record = record.lock().await;
+                        record.parts.insert(index, hash);
+                        state.save(&*record)?;
+                    }
                     Ok(())
                 }
             })
@@ -2287,7 +2438,10 @@ impl Engine {
             explicit,
         )?;
         let m = file.metadata()?;
-        if self.args.ignore_existing || self.args.target_existence == Existence::New {
+        if self.args.ignore_existing
+            || self.args.target_existence == Existence::New
+            || self.args.protects_existing_contents()
+        {
             root.publish_new_regular(&partial_path, &path, (m.dev(), m.ino()))?;
         } else {
             root.rename_regular_if_same(&partial_path, &path, (m.dev(), m.ino()))?;
@@ -2407,7 +2561,10 @@ impl Engine {
             self.check_cancelled()?;
             local::apply_file_metadata(&file, metadata, &self.args, mode, explicit)?;
             let m = file.metadata()?;
-            if self.args.ignore_existing || self.args.target_existence == Existence::New {
+            if self.args.ignore_existing
+                || self.args.target_existence == Existence::New
+                || self.args.protects_existing_contents()
+            {
                 root.publish_new_regular(&partial, path, (m.dev(), m.ino()))?;
             } else {
                 root.rename_regular_if_same(&partial, path, (m.dev(), m.ino()))?;

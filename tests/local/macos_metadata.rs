@@ -425,7 +425,7 @@ fn acl_staging_is_private_before_small_and_ranged_writes() {
                 if native {
                     command.args([
                         "cp",
-                        "--preserve=acls",
+                        "--copy-metadata=acls",
                         &t.s("source"),
                         "--as",
                         &t.s("destination/file"),
@@ -497,7 +497,7 @@ fn acl_restoration_failure_cannot_be_accepted_as_a_content_match() {
         chmod(&t.path("source"), &["+a", "user:nobody deny read"]);
         let args = [
             "cp",
-            "--preserve=acls",
+            "--copy-metadata=acls",
             "--performance-tuning=copy-path=ranges,workers=1",
             &t.s("source"),
             "--as",

@@ -70,8 +70,9 @@ impl Session {
             return Ok(Some(Prepared::Preview));
         }
         let metadata = upload_metadata(plan);
-        let new =
-            plan.placement.existence == crate::cli::Existence::New || plan.controls.report.only_new;
+        let new = plan.placement.existence == crate::cli::Existence::New
+            || plan.controls.report.only_new
+            || protects_existing(plan);
         let mut put = Unsigned::new("PUT", &plan.key);
         if let Some(metadata) = &metadata {
             for (name, value) in metadata {
@@ -82,6 +83,20 @@ impl Session {
             put = put.header("if-none-match", "*");
         }
         let mut requests = vec![put];
+        if protects_existing(plan) && plan.placement.existence != crate::cli::Existence::New {
+            requests.push(Unsigned::new("GET", &plan.key));
+            if metadata_update_flags(plan) != 0 {
+                requests.push(Unsigned::new("HEAD", &plan.key));
+                let _request = self.requests.acquire().await?;
+                if let Some(head) =
+                    client::head_output(&self.client, &self.options.bucket, &plan.key, None).await?
+                {
+                    if let Some(update) = metadata_update_request(plan, &head, metadata.as_ref())? {
+                        requests.push(update);
+                    }
+                }
+            }
+        }
         let count = size.map_or(10_000, |size| size.div_ceil(self.options.part_size).max(1));
         anyhow::ensure!(
             count <= 10_000,
@@ -195,7 +210,15 @@ pub(super) async fn connect(
             key: target.trim_end_matches('/').into(),
             descendants: true,
         }],
-        source: None,
+        // Reading this destination is already in the upload scope. Reuse the
+        // existing source scope to authorize metadata-only self copies too.
+        source: upload.then(|| crate::s3::authorization::ReadAccess {
+            bucket: options.bucket.clone(),
+            scopes: vec![Scope {
+                key: target.trim_end_matches('/').into(),
+                descendants: true,
+            }],
+        }),
         removal: None,
         acl: crate::s3::authorization::acl_headers(options),
         upload: upload && !args.dry_run,

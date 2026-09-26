@@ -107,7 +107,7 @@ class MappingStreamCopies(unittest.TestCase):
         target = self.root / "existing"
         target.write_bytes(b"old")
         entries = [syq.MappingEntry(produce, "existing")]
-        result = self.client.cp(mapping=entries, into=self.root, only_new=True)
+        result = self.client.cp(mapping=entries, into=self.root, if_exists="keep")
         self.assertEqual(result.files_excluded, 1)
         self.client.cp(mapping=entries, into=self.root, dry_run=True)
         with self.assertRaises(syq.SyqOperationError):

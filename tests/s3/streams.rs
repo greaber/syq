@@ -90,3 +90,8 @@ fn size_filters_select_without_consuming_input() {
 fn file_descriptors_preserve_metadata_and_skip_newer_objects() {
     scenario("file-metadata");
 }
+
+#[test]
+fn existing_stream_destinations_obey_policy() {
+    scenario("existing-policy");
+}

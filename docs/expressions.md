@@ -9,7 +9,7 @@ syq cp --srcs-in project --into backup \
   --where 'src.kind = "file" and src.size between 1MiB and 100MiB'
 
 # Add missing entries and update files whose source is newer.
-syq cp --srcs-in project --into backup \
+syq cp --if-exists=update --srcs-in project --into backup \
   --copy-if 'not dst.exists or src.mtime > dst.mtime'
 
 # Select recent JPEGs, using the existing ignore rules too.
@@ -25,7 +25,7 @@ is available only for `cp`. Neither applies to descriptor or pipe copies.
 `--where` accepts only `src` fields. `--copy-if` accepts both `src` and `dst`:
 `dst` always names the destination chosen by the copy's placement or mapping.
 Both options must pass when present. Existing policies such as
-`--only-new` also apply. Each expression option can be supplied once; combine
+`--if-exists=keep` also apply. Each expression option can be supplied once; combine
 conditions with `and` and `or`.
 
 A true expression allows the copy to proceed through its normal comparison.
@@ -43,7 +43,7 @@ selected as usual.
 To select JPEGs and also copy all directory entries, including empty directories:
 
 ```sh
-syq cp --srcs-in photos --into archive --preserve=permissions \
+syq cp --srcs-in photos --into archive --copy-metadata=permissions \
   --where 'src.kind = "dir" or src.extension = "jpg"'
 ```
 

@@ -498,7 +498,26 @@ pub(super) fn apply_metadata(
     args: &Args,
     existing_mode: Option<u32>,
     explicit: crate::mapping::Metadata,
+    copied: bool,
 ) -> Result<()> {
+    if metadata.kind == super::client::ObjectKind::File && !copied {
+        let flags = args.matching_meta_flags() | explicit.apply_flags();
+        if flags == 0 {
+            return Ok(());
+        }
+        return crate::fsops::set_meta_file(
+            &root.open_regular_read(path)?,
+            &crate::proto::Meta {
+                inode_metadata: None,
+                mode: metadata.mode,
+                uid: metadata.uid,
+                gid: metadata.gid,
+                mtime: metadata.mtime,
+                mtime_nsec: metadata.nsec,
+            },
+            flags,
+        );
+    }
     if metadata.kind == super::client::ObjectKind::File {
         return apply_file_metadata(
             &root.open_regular_read(path)?,
@@ -515,7 +534,9 @@ pub(super) fn apply_metadata(
             (args.group || explicit.gid.is_some()).then_some(metadata.gid),
         )?;
     }
-    if metadata.kind != super::client::ObjectKind::Symlink {
+    if metadata.kind != super::client::ObjectKind::Symlink
+        && (copied || args.perms || explicit.mode.is_some())
+    {
         let file = if metadata.kind == super::client::ObjectKind::Dir {
             root.open_directory(path)?
         } else {
@@ -528,7 +549,7 @@ pub(super) fn apply_metadata(
         };
         crate::fsops::set_mode_handle(&file, mode)?;
     }
-    if args.times || explicit.mtime.is_some() {
+    if (copied && args.times) || args.copy_mtime_metadata || explicit.mtime.is_some() {
         root.set_times(
             path,
             &[

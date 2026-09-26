@@ -450,6 +450,7 @@ pub struct FsOps {
     /// controller's decision to repair or accept that exact inode.
     held_basis: Option<HeldBasis>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
+    reuse_partials: bool,
     partial_directory_order: VecDeque<FileLocation>,
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
@@ -633,6 +634,7 @@ impl FsOps {
             fd_order: Vec::new(),
             held_basis: None,
             partial_candidates: HashMap::new(),
+            reuse_partials: true,
             partial_directory_order: VecDeque::new(),
             prepared_small_copy: None,
             operator_selection: None,
@@ -889,6 +891,17 @@ impl FsOps {
                     })
             })
             .collect();
+        if request.if_exists == crate::cli::IfExists::Error
+            && destinations
+                .iter()
+                .zip(&permitted)
+                .any(|(entry, permitted)| *permitted && entry.is_some())
+        {
+            return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                anchor,
+                outcome: SmallCopyOutcome::UnsupportedTarget,
+            }));
+        }
         let ticket = self.descriptor_session.register(selection.directory)?;
         let directory = self.descriptor_session.acquire(&ticket)?;
         self.install_destination(directory, &request.request_prefix)?;
@@ -1014,6 +1027,20 @@ impl FsOps {
             }
         }
 
+        if request.if_exists == crate::cli::IfExists::ErrorIfDifferent
+            && destinations
+                .iter()
+                .zip(&unchanged)
+                .any(|(destination, same)| destination.is_some() && !same)
+        {
+            return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                anchor,
+                outcome: SmallCopyOutcome::StagingFailed(wire_error(&anyhow::anyhow!(
+                    "destination contents differ (--if-exists=error-if-different)"
+                ))),
+            }));
+        }
+
         // Stage everything before publishing any final files. A staging
         // failure keeps all sidecars for the fallback engine to resume.
         let mut staged = Vec::with_capacity(request.files.len());
@@ -1088,7 +1115,15 @@ impl FsOps {
                             &item.partial,
                             &item.target,
                             &item.file,
-                            TargetCondition::Any,
+                            if matches!(
+                                request.if_exists,
+                                crate::cli::IfExists::Error
+                                    | crate::cli::IfExists::ErrorIfDifferent
+                            ) {
+                                TargetCondition::Absent
+                            } else {
+                                TargetCondition::Any
+                            },
                         )
                         .err()
                         .map(|error| wire_error(&error)),
@@ -1096,7 +1131,7 @@ impl FsOps {
                     None => {
                         let stat = destination.expect("unchanged file has a destination");
                         let mut repair = if matched_content.is_some() {
-                            request.flags & flags::TIMES
+                            request.matching_flags & flags::TIMES
                         } else {
                             0
                         };
@@ -1993,7 +2028,7 @@ impl FsOps {
                     }
                 }
             }
-            Request::ConfigureHashing(_)
+            Request::ConfigureHashing { .. }
             | Request::Hello { .. }
             | Request::TcpListen { .. }
             | Request::ListDir { .. }

@@ -314,7 +314,8 @@ fn completed_download_releases_blocking_capacity_for_secondary_hash() {
             .unwrap();
         let data = b"verified through two distinct algorithms";
         let outcome = runtime.block_on(async {
-            let engine = planning_engine(&["--integrity-checking=transfer=blake3"]);
+            let engine =
+                planning_engine(&["--if-exists=update", "--integrity-checking=transfer=blake3"]);
             let root = Root::open(dir.path()).unwrap();
             let path = RelativePath::new(b"destination").unwrap();
             let expected = Digest::hash_bytes(HashAlgorithm::Sha256, data);

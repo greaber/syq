@@ -43,6 +43,37 @@ pub enum SourceSelection {
     Directory,
 }
 
+/// Policy for a selected destination entry that already exists. Directories
+/// remain containers; comparison is independent of permission to replace bytes.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+pub enum IfExists {
+    /// Accept matching contents; report an error for different contents.
+    #[default]
+    ErrorIfDifferent,
+    /// Report an error for every existing destination leaf.
+    Error,
+    /// Leave existing entries and their metadata alone.
+    Keep,
+    /// Update contents when they differ and apply requested metadata.
+    Update,
+    /// Update only when the destination is strictly older; keep ties.
+    UpdateIfOlder,
+}
+
+impl IfExists {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ErrorIfDifferent => "error-if-different",
+            Self::Error => "error",
+            Self::Keep => "keep",
+            Self::Update => "update",
+            Self::UpdateIfOlder => "update-if-older",
+        }
+    }
+}
+
 /// Endpoint that owns the transfer coordinator for a native copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum CoordinateAt {
@@ -75,9 +106,13 @@ pub struct Args {
     pub(crate) stream_concurrency: usize,
     #[arg(skip)]
     pub(crate) stream_preserve_times: bool,
-    /// Explicit opt-out also applies to named descriptor destinations.
+    /// Whether native copies explicitly reconcile mtime on unchanged entries.
     #[arg(skip)]
-    pub(crate) no_preserve_mtime: bool,
+    pub(crate) copy_mtime_metadata: bool,
+    #[arg(skip)]
+    pub(crate) if_exists: Option<IfExists>,
+    #[arg(skip)]
+    pub(crate) resume: bool,
     #[arg(skip)]
     pub(crate) results_override: Option<std::sync::Arc<crate::results::ResultsWriter>>,
     #[arg(skip)]
@@ -742,13 +777,8 @@ impl Args {
 
     pub(crate) fn warn_unsupported_options(&self) {
         let mut options = Vec::new();
-        if self.interface == Interface::NativeCp {
-            if self.existing {
-                options.push("--only-existing");
-            }
-            if self.update {
-                options.push("--skip-newer");
-            }
+        if self.interface == Interface::NativeCp && self.existing {
+            options.push("--only-existing");
         }
         if self
             .integrity_checking
@@ -776,6 +806,22 @@ impl Args {
             requested.min(usize::from(crate::delegation::MAX_CONNECTIONS))
         } else {
             requested
+        }
+    }
+
+    pub(crate) fn protects_existing_contents(&self) -> bool {
+        matches!(
+            self.if_exists,
+            Some(IfExists::ErrorIfDifferent | IfExists::Error)
+        )
+    }
+
+    pub(crate) fn matching_meta_flags(&self) -> u8 {
+        let flags = self.meta_flags();
+        if self.interface == Interface::NativeCp && !self.copy_mtime_metadata {
+            flags & !crate::proto::flags::TIMES
+        } else {
+            flags
         }
     }
 
@@ -1088,15 +1134,15 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
-    /// Copy entries found missing; keep metadata of entries found present; adding children requires write access
-    #[arg(long = "only-new", conflicts_with_all = ["existing", "update", "inplace"])]
-    ignore_existing: bool,
+    /// How to handle existing destination files; directories remain containers
+    #[arg(long, value_enum, value_name = "POLICY", default_value_t = IfExists::ErrorIfDifferent)]
+    if_exists: IfExists,
+    /// Resume an interrupted copy and save recovery checkpoints where supported
+    #[arg(long)]
+    resume: bool,
     /// Update only entries already present; create no missing entries or directories
-    #[arg(long = "only-existing", hide = true, conflicts_with_all = ["ignore_existing", "into_new", "as_new"])]
+    #[arg(long = "only-existing", hide = true, conflicts_with_all = ["into_new", "as_new"])]
     existing: bool,
-    /// Skip regular files newer at the destination; non-directory type replacements still occur
-    #[arg(long = "skip-newer", hide = true, conflicts_with_all = ["ignore_existing", "inplace"])]
-    update: bool,
     /// Select source entries with a typed expression; unselected directories remain traversable
     #[arg(long = "where", value_name = "EXPR")]
     where_expression: Option<String>,
@@ -1131,9 +1177,9 @@ struct NativeCopyOperationalArgs {
     /// Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order)
     #[arg(long, value_name = "FILE")]
     ignore_from: Vec<OsString>,
-    /// Preserve selected filesystem metadata or copy special files (repeatable/comma-separated)
+    /// Match selected source metadata, including on unchanged files (repeatable/comma-separated)
     #[arg(long, value_name = "FEATURE", value_delimiter = ',')]
-    preserve: Vec<NativePreserve>,
+    copy_metadata: Vec<NativeCopyMetadata>,
     /// Request reads without access-time updates; warn and continue if unavailable
     #[arg(long)]
     open_noatime: bool,
@@ -1262,13 +1308,10 @@ struct NativeRemoteArgs {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum NativePreserve {
-    /// Preserve modification times (already the default for named destinations)
+enum NativeCopyMetadata {
+    /// Match source modification times, including on unchanged files
     #[value(alias = "times")]
     Mtime,
-    /// Leave filesystem modification times as produced by writing
-    #[value(name = "-mtime")]
-    NoMtime,
     /// Preserve permission bits
     Permissions,
     /// Preserve owner and group IDs
@@ -1356,9 +1399,9 @@ struct NativeCopyFields {
 #[command(
     name = "syq cp",
     version,
-    about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.\nExplicit local pipe sources and --src-fd FD read raw bytes; --as-fd FD writes them.",
-    before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
-    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve=-mtime to disable restoring modification times. Use --preserve to add permissions, ownership, hardlinks, access and birth times, ACLs and xattrs, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --preserve=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --preserve; pipes have no source metadata. Output descriptors receive source timestamps only with --preserve=mtime. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
+    about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively and symlinks as symlinks. Creating or updating\ncontents sets the source modification time. Use --copy-metadata to match selected metadata even on unchanged files. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Existing files with different contents cause an error; --if-exists selects another policy.\nSource arguments must precede destination arguments.\nExplicit local pipe sources and --src-fd FD read raw bytes; --as-fd FD writes them.",
+    before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --copy-metadata=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
+    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Existing files with different contents cause an error; --if-exists selects another policy.\n\nNative copies recurse and copy symlinks as symlinks. Creating or updating file contents sets the source modification time. Use --copy-metadata to apply selected metadata even when contents already match. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --copy-metadata=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --copy-metadata; pipes have no source metadata. Output descriptors receive source timestamps only with --copy-metadata=mtime. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]\n       syq cp [OPTIONS] --src-fd FD --as PATH\n       syq cp [OPTIONS] SOURCE --as-fd FD"
 )]
 struct NativeCopyCommand {
@@ -1719,8 +1762,8 @@ fn selected_stream_source(
         || copy.delegated_operands_b64
         || copy
             .operational
-            .preserve
-            .contains(&NativePreserve::Specials)
+            .copy_metadata
+            .contains(&NativeCopyMetadata::Specials)
     {
         return Ok(None);
     }
@@ -1790,10 +1833,9 @@ fn parse_descriptor_copy(
         if !matches!(
             id.as_str(),
             "src_fd"
-                | "update"
-                | "preserve"
+                | "if_exists"
+                | "copy_metadata"
                 | "dry_run"
-                | "ignore_existing"
                 | "existing"
                 | "results"
                 | "results_fd"
@@ -1848,8 +1890,8 @@ fn parse_descriptor_copy(
     }
     let copy = parsed.copy;
     anyhow::ensure!(
-        copy.as_fd.is_none() || !copy.operational.update,
-        "--skip-newer cannot be used with --as-fd; use --as PATH so syq can check the destination before opening it (shell redirection may already have truncated it)"
+        copy.as_fd.is_none() || copy.operational.if_exists != IfExists::UpdateIfOlder,
+        "--if-exists=update-if-older cannot be used with --as-fd; use --as PATH so syq can check the destination before opening it (shell redirection may already have truncated it)"
     );
     validate_native_results_fd(copy.results_output.results_fd)?;
     for payload in [copy.as_fd, copy.stream_commit_fd].into_iter().flatten() {
@@ -2215,12 +2257,11 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.stream_concurrency = usize::from(copy.stream_concurrency.unwrap_or(4));
     args.stream_preserve_times = copy
         .operational
-        .preserve
+        .copy_metadata
         .iter()
         .rev()
         .find_map(|p| match p {
-            NativePreserve::Mtime => Some(true),
-            NativePreserve::NoMtime => Some(false),
+            NativeCopyMetadata::Mtime => Some(true),
             _ => None,
         })
         .unwrap_or(false);
@@ -2286,7 +2327,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     }
     if let Some(options) = &args.s3 {
         if args.devices {
-            bail!("--preserve=specials is not supported for S3 copies");
+            bail!("--copy-metadata=specials is not supported for S3 copies");
         }
         if options.route.is_server_copy() && (args.checksum || args.transfer_integrity) {
             bail!("S3-to-S3 copies stay server-side; content hash and verification options require reading object contents and are not supported");
@@ -2725,16 +2766,16 @@ fn apply_native_copy_operational(
         hash,
         where_expression,
         copy_if,
-        ignore_existing,
+        if_exists,
+        resume,
         existing,
-        update,
         no_compress,
         integrity_checking_arg,
         resource_limits_arg,
         stats,
         ignore,
         ignore_from,
-        preserve,
+        copy_metadata,
         open_noatime,
         sparse,
         inplace,
@@ -2750,9 +2791,19 @@ fn apply_native_copy_operational(
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
-    args.ignore_existing = ignore_existing;
+    args.resume = resume;
+    args.if_exists = Some(if resume && if_exists == IfExists::Error {
+        IfExists::ErrorIfDifferent
+    } else {
+        if_exists
+    });
+    args.ignore_existing = if_exists == IfExists::Keep;
+    anyhow::ensure!(
+        !(existing && if_exists == IfExists::Keep),
+        "--only-existing cannot combine with --if-exists=keep"
+    );
     args.existing = existing;
-    args.update = update;
+    args.update = if_exists == IfExists::UpdateIfOlder;
     args.no_compress = no_compress;
     if no_compress {
         args.compress = false;
@@ -2763,33 +2814,36 @@ fn apply_native_copy_operational(
     args.pending_ignore_inputs = ordered_ignore_inputs(&ignore, &ignore_from, matches);
     args.ignore = ignore;
     args.ignore_from = ignore_from;
+    anyhow::ensure!(
+        !inplace || !matches!(if_exists, IfExists::Keep | IfExists::UpdateIfOlder),
+        "--inplace cannot combine with --if-exists=keep or --if-exists=update-if-older"
+    );
     args.inplace = inplace;
+    if resume && args.target_existence == Existence::New {
+        args.target_existence = Existence::Any;
+    }
     args.open_noatime = open_noatime;
     args.sparse = sparse;
-    for attribute in preserve {
+    for attribute in copy_metadata {
         match attribute {
-            NativePreserve::Mtime => {
+            NativeCopyMetadata::Mtime => {
                 args.times = true;
-                args.no_preserve_mtime = false;
+                args.copy_mtime_metadata = true;
             }
-            NativePreserve::NoMtime => {
-                args.times = false;
-                args.no_preserve_mtime = true;
-            }
-            NativePreserve::Permissions => args.perms = true,
-            NativePreserve::Ownership => {
+            NativeCopyMetadata::Permissions => args.perms = true,
+            NativeCopyMetadata::Ownership => {
                 args.owner = true;
                 args.group = true;
             }
-            NativePreserve::Specials => args.devices = true,
-            NativePreserve::Hardlinks => args.hardlinks = true,
-            NativePreserve::Acls => {
+            NativeCopyMetadata::Specials => args.devices = true,
+            NativeCopyMetadata::Hardlinks => args.hardlinks = true,
+            NativeCopyMetadata::Acls => {
                 args.acls = true;
                 args.perms = true;
             }
-            NativePreserve::Xattrs => args.xattrs = true,
-            NativePreserve::Atimes => args.atimes = 1,
-            NativePreserve::Crtimes => args.crtimes = true,
+            NativeCopyMetadata::Xattrs => args.xattrs = true,
+            NativeCopyMetadata::Atimes => args.atimes = 1,
+            NativeCopyMetadata::Crtimes => args.crtimes = true,
         }
     }
     if (args.hardlinks

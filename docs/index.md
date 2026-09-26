@@ -5,7 +5,7 @@
 
 Copy, reorganize, and remove files across local filesystems, remote machines,
 and S3-compatible storage. Choose which files to copy and
-where they should land, preview the changes, and rerun interrupted copies to resume.
+where they should land, preview the changes, and add `--resume` when retrying interrupted copies.
 
 <nav class="landing-actions" aria-label="Explore syq">
 <a class="landing-primary" href="install.html">Install syq</a>

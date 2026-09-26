@@ -87,7 +87,8 @@ Use `--dry-run --hash` to compare without copying:
 syq cp --dry-run --hash --srcs-in project --into backup
 ```
 
-Differences appear as planned changes. For machine-readable output, add
+With the default existing-file policy, differences report errors. Add
+`--if-exists=update` to show them as planned updates instead. For machine-readable output, add
 [`--results`](automation.md); for two servers, see
 [remote comparisons](remote-reference.md#verification).
 

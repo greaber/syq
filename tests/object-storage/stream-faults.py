@@ -51,6 +51,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         STATE['requests'] += 1
+        if CASE == 'existing-policy':
+            self.reply(200, headers={'ETag': '"original"', **STATE.get('metadata', {})}, length=len(STATE['existing']))
+            return
         if ((CASE == 'preview-results' and self.path.endswith('/missing'))
                 or (CASE == 'file-metadata' and STATE.get('missing_object'))):
             self.reply(404)
@@ -63,6 +66,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         STATE['requests'] += 1
+        if CASE == 'existing-policy':
+            if 'list-type=2' in self.path:
+                self.reply(200, b'<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>')
+            else:
+                STATE['reads'] = STATE.get('reads', 0) + 1
+                self.reply(200, STATE['existing'], {'ETag': '"original"', **STATE.get('metadata', {})})
+            return
+
         if CASE in ('preview-results', 'file-metadata') and 'list-type=2' in self.path:
             STATE['lists'] = STATE.get('lists', 0) + 1
             child = b'<Contents><Key>object/child</Key><Size>1</Size></Contents>' if STATE.get('prefix_exists') else b''
@@ -91,6 +102,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_PUT(self):
         data = self.body()
+        if CASE == 'existing-policy' and self.headers.get('x-amz-copy-source'):
+            assert self.headers['x-amz-copy-source-if-match'] == '"original"'
+            assert self.headers['x-amz-meta-other'] == 'keep'
+            assert self.headers['Content-Type'] == 'application/example'
+            assert self.headers['x-amz-meta-syq-mode'] == str(0o640)
+            assert self.headers['x-amz-meta-syq-mtime'] == '20'
+            STATE['metadata_changed'] = True
+            self.reply(200, b'<CopyObjectResult><ETag>updated</ETag></CopyObjectResult>')
+            return
+        if CASE == 'existing-policy' and 'partNumber=' not in self.path and self.headers.get('If-None-Match') == '*':
+            self.reply(412, b'<Error><Code>PreconditionFailed</Code></Error>')
+            return
         # Validate the checksum independently of syq's code.
         assert self.headers['x-amz-checksum-sha256'] == base64.b64encode(hashlib.sha256(data).digest()).decode()
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -118,11 +141,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.body()
         if 'uploadId=' in self.path:
+            if CASE == 'existing-policy' and self.headers.get('If-None-Match') == '*':
+                self.reply(412, b'<Error><Code>PreconditionFailed</Code></Error>')
+                return
             STATE['published'] = b''.join(STATE['parts'][n] for n in sorted(STATE['parts']))
             STATE['completed'] = True
             self.reply(200, b'<CompleteMultipartUploadResult><ETag>"done"</ETag></CompleteMultipartUploadResult>')
         else:
-            STATE['metadata'] = {k.lower(): v for k, v in self.headers.items() if k.lower().startswith('x-amz-meta-')}
+            if CASE != 'existing-policy':
+                STATE['metadata'] = {k.lower(): v for k, v in self.headers.items() if k.lower().startswith('x-amz-meta-')}
             self.reply(200, b'<InitiateMultipartUploadResult><UploadId>owned</UploadId></InitiateMultipartUploadResult>')
 
     def do_DELETE(self):
@@ -195,7 +222,33 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
     get = base + ['--from', 's3://bucket', 'object']
     put = base + ['--to', 's3://bucket', '--as', 'object']
     try:
-        if CASE == 'mapping-callbacks':
+        if CASE == 'existing-policy':
+            for payload in (b'stored', DATA):
+                STATE.update(existing=payload, metadata={}, published=None)
+                success(run(put, input=payload, env=env))
+                assert STATE['published'] is None
+                failure(run(put, input=b'x' * len(payload), env=env))
+                assert STATE['published'] is None
+                before = STATE.get('reads', 0)
+                failure(run(put + ['--if-exists=error'], input=payload, env=env))
+                assert STATE.get('reads', 0) == before
+                success(run(put + ['--if-exists=update'], input=b'x' * len(payload), env=env))
+                assert STATE['published'] == b'x' * len(payload)
+            STATE.update(existing=b'stored', metadata={
+                'Content-Type': 'application/example', 'x-amz-meta-other': 'keep',
+                'x-amz-meta-syq-format': '1', 'x-amz-meta-syq-kind': 'file',
+                'x-amz-meta-syq-mode': str(0o640), 'x-amz-meta-syq-uid': str(os.geteuid()),
+                'x-amz-meta-syq-gid': str(os.getegid()), 'x-amz-meta-syq-mtime': '10',
+                'x-amz-meta-syq-mtime-nsec': '0'}, published=None)
+            source = Path(temp) / 'source'
+            source.write_bytes(b'stored')
+            os.utime(source, (20, 20))
+            with source.open('rb') as stream:
+                success(run(put + ['--copy-metadata=mtime'], stdin=stream, env=env))
+            assert STATE.get('metadata_changed')
+            assert STATE['published'] is None
+            failure(run(base + ['--to', 's3://bucket', '--as-new', 'object'], input=b'stored', env=env))
+        elif CASE == 'mapping-callbacks':
             import syq
             sdk = syq.Client(executable=SYQ, env=env, timeout=15)
             options = dict(s3_endpoint=f'http://127.0.0.1:{server.server_port}', s3_region='us-east-1',
@@ -254,7 +307,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
             records = [json.loads(line) for line in results.read_text().splitlines()]
             assert records[-1]['bytes_total_known'] is False
             assert not STATE['completed'] and not STATE['parts']
-            for flag, key in [('--only-new', 'object'), ('--only-existing', 'missing')]:
+            for flag, key in [('--if-exists=keep', 'object'), ('--only-existing', 'missing')]:
                 results = Path(temp) / (flag + '.json')
                 response = run(base + ['--src', str(fifo), '--to', 's3://bucket', '--as', key,
                                       flag, '--results', str(results)], env=env)
@@ -265,7 +318,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
             response = run(put + ['--only-existing'], input=b'updated', env=env)
             success(response)
             assert STATE['published'] == b'updated'
-            response = run(base + ['--to', 's3://bucket', '--as', 'missing', '--only-new'],
+            response = run(base + ['--to', 's3://bucket', '--as', 'missing', '--if-exists=keep'],
                            input=b'created', env=env)
             success(response)
             assert STATE['published'] == b'created'
@@ -294,7 +347,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 assert STATE['metadata'] == stored, STATE['metadata']
             output_path = Path(temp) / 'output'
             with output_path.open('w+b') as output:
-                for preserve in ([], ['--preserve=permissions,ownership'], ['--preserve=times']):
+                for preserve in ([], ['--copy-metadata=permissions,ownership'], ['--copy-metadata=times']):
                     output.seek(0)
                     os.fchmod(output.fileno(), 0o600)
                     os.utime(output.fileno(), ns=(stamp, stamp))
@@ -303,34 +356,34 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                     success(response)
                     assert output_path.read_bytes() == DATA
                     meta = os.fstat(output.fileno())
-                    if preserve == ['--preserve=times']:
+                    if preserve == ['--copy-metadata=times']:
                         assert meta.st_mtime_ns == stamp, meta.st_mtime_ns
                     else:
                         assert meta.st_mtime_ns > stamp, meta.st_mtime_ns
-                    expected_mode = 0o751 if preserve == ['--preserve=permissions,ownership'] else 0o600
+                    expected_mode = 0o751 if preserve == ['--copy-metadata=permissions,ownership'] else 0o600
                     assert meta.st_mode & 0o7777 == expected_mode
                 output.seek(0)
                 os.utime(output.fileno(), ns=(stamp, stamp + 2_000_000_000))
                 before = dict(STATE['gets'])
                 requests = STATE['requests']
-                response = run(get + ['--as-fd', str(output.fileno()), '--skip-newer'],
+                response = run(get + ['--as-fd', str(output.fileno()), '--if-exists=update-if-older'],
                                pass_fds=(output.fileno(),), env=env)
                 assert response.returncode == 2, response.stderr
-                assert b'--skip-newer cannot be used with --as-fd' in response.stderr
+                assert b'--if-exists=update-if-older cannot be used with --as-fd' in response.stderr
                 assert b'use --as PATH' in response.stderr
                 assert output.tell() == 0 and STATE['gets'] == before
                 assert STATE['requests'] == requests and output_path.read_bytes() == DATA
             STATE['metadata']['x-amz-meta-syq-mtime'] = '1600000002'
             for preview in ([], ['--dry-run']):
                 with source.open('rb') as stream:
-                    response = run(put + ['--skip-newer', *preview], stdin=stream, env=env)
+                    response = run(put + ['--if-exists=update-if-older', *preview], stdin=stream, env=env)
                     success(response)
                     assert b'Skipped' in response.stderr and stream.tell() == 0
             # Timestamp selection concerns the exact object. A sibling prefix
             # must neither add a LIST nor prevent creation of that object.
             source.write_bytes(b'prefix can coexist')
             STATE.update(missing_object=True, prefix_exists=True)
-            for options in ([], ['--skip-newer']):
+            for options in ([], ['--if-exists=update-if-older']):
                 requests = STATE['requests']
                 lists = STATE.get('lists', 0)
                 with source.open('rb') as stream:
@@ -342,7 +395,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
             # An explicit placement condition still checks the prefix and
             # fails without consuming the source.
             with source.open('rb') as stream:
-                response = run(base + ['--to', 's3://bucket', '--as-new', 'object', '--skip-newer'], stdin=stream, env=env)
+                response = run(base + ['--to', 's3://bucket', '--as-new', 'object', '--if-exists=update-if-older'], stdin=stream, env=env)
                 failure(response)
                 assert b'existence condition failed' in response.stderr
                 assert stream.tell() == 0
@@ -362,7 +415,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                     assert os.fstat(output.fileno()).st_mtime_ns > stamp
             with output_path.open('w+b') as output:
                 before = dict(STATE['gets'])
-                response = run(get + ['--as-fd', str(output.fileno()), '--preserve=times'],
+                response = run(get + ['--as-fd', str(output.fileno()), '--copy-metadata=times'],
                                pass_fds=(output.fileno(),), env=env)
                 failure(response)
                 assert not output_path.read_bytes() and STATE['gets'] == before
@@ -370,14 +423,14 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
             # without syq attributes.
             STATE['metadata'] = {}
             with output_path.open('w+b') as output:
-                response = run(get + ['--as-fd', str(output.fileno()), '--preserve=times'],
+                response = run(get + ['--as-fd', str(output.fileno()), '--copy-metadata=times'],
                                pass_fds=(output.fileno(),), env=env)
                 success(response)
                 assert os.fstat(output.fileno()).st_mtime_ns == 1_600_000_000_000_000_000
             fifo = Path(temp) / 'pipe'
             os.mkfifo(fifo)
             before = STATE['requests']
-            response = run(base + ['--src', str(fifo), '--to', 's3://bucket', '--as', 'object', '--skip-newer'], env=env)
+            response = run(base + ['--src', str(fifo), '--to', 's3://bucket', '--as', 'object', '--if-exists=update-if-older'], env=env)
             failure(response)
             assert b'regular-file source timestamp' in response.stderr
             assert STATE['requests'] == before

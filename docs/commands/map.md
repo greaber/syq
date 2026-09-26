@@ -140,12 +140,12 @@ Optional fields are `mode` (permission bits, 0–4095), numeric `uid` and `gid`,
 A supplied `mtime` defaults to zero fractional seconds. Omitted attributes
 follow normal copy behavior; the top-level `mtime` remains informational.
 
-Explicit attributes apply without `--preserve`. Ownership requests fail if the
+Explicit attributes apply without `--copy-metadata`. Ownership requests fail if the
 filesystem refuses them; symlinks cannot have a requested `mode`.
 S3 uploads store the attributes in syq object metadata; downloads apply them
 to the filesystem. S3-to-S3 copies keep other object metadata and stay server-side.
-Restricted receivers also require matching `--preserve` permissions in the signed
-grant. Selection rules such as `--only-new` still take precedence. Supplied
+Restricted receivers also require matching `--copy-metadata` permissions in the signed
+grant. Selection rules such as `--if-exists=keep` still take precedence. Supplied
 timestamps disable the size/time shortcut for those entries. Use `--hash` to
 compare contents when repeating a copy with a fixed destination timestamp.
 Older binaries that do not support `metadata` or `s3_last_modified` reject those
@@ -175,7 +175,7 @@ directories count against the receiver's entry limit. Each line can be up to
 manifest-size limit. Missing parent directories are created; a file or symlink
 blocking a parent must be moved or removed before retrying.
 
-`kind: "special"` checks the source type; add `--preserve=specials` to copy those
+`kind: "special"` checks the source type; add `--copy-metadata=specials` to copy those
 entries. Use `--mapping -` for a pipeline; a named FIFO manifest requires Linux
 with procfs.
 

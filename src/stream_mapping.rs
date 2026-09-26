@@ -346,7 +346,7 @@ fn validate(args: &Args, manifest: &manifest::Manifest) -> Result<()> {
         }
         if entry.dst.callback() {
             metadata.output(false)?;
-            ensure!(!args.update, "--skip-newer requires a named destination; a callback consumer has no destination timestamp");
+            ensure!(!args.update, "--if-exists=update-if-older requires a named destination; a callback consumer has no destination timestamp");
         }
     }
     Ok(())

@@ -26,6 +26,9 @@ impl Engine {
         if self.authorization.is_none() {
             return Ok(());
         }
+        if let Some(update) = &prepared.metadata_update {
+            return self.authorize_requests(vec![update.clone()]).await;
+        }
         let key = &prepared.source.key;
         let mut requests = vec![Unsigned::new("HEAD", key)];
         let checksum = |request: Unsigned, index: usize, length: u64| {

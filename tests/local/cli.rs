@@ -49,15 +49,34 @@ fn native_copy_enforces_placement_preconditions_before_mutation() {
     write(&t.path("occupied/keep"), b"keep");
 
     for args in [
-        vec!["cp", &t.s("src"), "--into-new", &t.s("occupied")],
         vec![
             "cp",
+            "--if-exists=update",
+            &t.s("src"),
+            "--into-new",
+            &t.s("occupied"),
+        ],
+        vec![
+            "cp",
+            "--if-exists=update",
             &t.s("src"),
             "--into-existing",
             &t.s("missing-container"),
         ],
-        vec!["cp", &t.s("src"), "--as-new", &t.s("occupied/keep")],
-        vec!["cp", &t.s("src"), "--as-existing", &t.s("missing-exact")],
+        vec![
+            "cp",
+            "--if-exists=update",
+            &t.s("src"),
+            "--as-new",
+            &t.s("occupied/keep"),
+        ],
+        vec![
+            "cp",
+            "--if-exists=update",
+            &t.s("src"),
+            "--as-existing",
+            &t.s("missing-exact"),
+        ],
     ] {
         let out = native_syq(&args);
         assert!(!out.status.success(), "unexpected success for {args:?}");
@@ -68,19 +87,32 @@ fn native_copy_enforces_placement_preconditions_before_mutation() {
 
     write(&t.path("existing-exact"), b"old");
     let before = fs::metadata(t.path("existing-exact")).unwrap();
-    run_native_ok(&["cp", &t.s("src"), "--as-existing", &t.s("existing-exact")]);
+    run_native_ok(&[
+        "cp",
+        "--if-exists=update",
+        &t.s("src"),
+        "--as-existing",
+        &t.s("existing-exact"),
+    ]);
     let after = fs::metadata(t.path("existing-exact")).unwrap();
     assert_eq!(read(&t.path("existing-exact")), b"source");
     assert_ne!((after.dev(), after.ino()), (before.dev(), before.ino()));
 
     let missing_source_target = t.s("missing-source-target");
-    let missing_source = native_syq(&["cp", &t.s("absent"), "--into-new", &missing_source_target]);
+    let missing_source = native_syq(&[
+        "cp",
+        "--if-exists=update",
+        &t.s("absent"),
+        "--into-new",
+        &missing_source_target,
+    ]);
     assert!(!missing_source.status.success());
     assert!(!Path::new(&missing_source_target).exists());
 
     let contents_target = t.s("bad-contents-target");
     let not_a_directory = native_syq(&[
         "cp",
+        "--if-exists=update",
         "--srcs-in",
         &t.s("src"),
         "--into-new",
@@ -189,7 +221,7 @@ fn native_comparison_blocks_reuse_only_verified_matching_bytes() {
     write(&t.path("dst"), &original);
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
-            "cp",
+            "cp", "--if-exists=update",
             "--hash",
             "--stats",
             "--performance-tuning=comparison-block-size=64K,request-size=4M,copy-path=ranges,block-reuse=on",
@@ -354,6 +386,7 @@ fn native_copy_supports_all_six_placements() {
     ] {
         run_native_ok(&[
             "cp",
+            "--if-exists=update",
             "--src",
             &t.s(&format!("sources/{source}")),
             placement,
@@ -693,7 +726,11 @@ fn native_local_exact_bare_home_expands_before_identity_check() {
 
 #[test]
 fn native_overwrite_policies_apply_per_entry() {
-    for policy in ["--only-new", "--only-existing", "--skip-newer"] {
+    for policy in [
+        "--if-exists=keep",
+        "--only-existing",
+        "--if-exists=update-if-older",
+    ] {
         let t = Tmp::new();
         write(&t.path("src/present"), b"source");
         write(&t.path("src/new"), b"new");
@@ -707,6 +744,11 @@ fn native_overwrite_policies_apply_per_entry() {
         let out = native_syq(&[
             "cp",
             policy,
+            if policy == "--only-existing" {
+                "--if-exists=update"
+            } else {
+                "--no-progress"
+            },
             "--srcs-in",
             &t.s("src"),
             "--into",
@@ -714,10 +756,14 @@ fn native_overwrite_policies_apply_per_entry() {
         ]);
         assert_eq!(
             out.status.code(),
-            Some(if policy == "--skip-newer" { 23 } else { 0 }),
+            Some(if policy == "--if-exists=update-if-older" {
+                23
+            } else {
+                0
+            }),
             "{out:?}"
         );
-        if policy == "--skip-newer" {
+        if policy == "--if-exists=update-if-older" {
             assert!(stderr_of(&out).contains("cannot replace non-directory"));
         }
         let updates = policy == "--only-existing";
@@ -753,10 +799,10 @@ fn native_copy_policy_conflicts_refuse_before_writing() {
     let t = Tmp::new();
     write(&t.path("source"), b"source");
     for pair in [
-        ["--only-new", "--only-existing"],
-        ["--only-new", "--skip-newer"],
-        ["--only-new", "--inplace"],
-        ["--skip-newer", "--inplace"],
+        ["--if-exists=keep", "--only-existing"],
+        ["--if-exists=keep", "--if-exists=update-if-older"],
+        ["--if-exists=keep", "--inplace"],
+        ["--if-exists=update-if-older", "--inplace"],
     ] {
         let out = native_syq(&[
             "cp",
@@ -905,7 +951,7 @@ fn stream_placement_and_source_roots() {
             .env("HOME", &t.0)
             .env("FAKE_REMOTE_HOME", &t.0)
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
-            .args(["cp", "--rsh"])
+            .args(["cp", "--if-exists=update", "--rsh"])
             .arg(&rsh)
             .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
             .args(args)
@@ -1087,14 +1133,16 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
     };
     // Inherited policies follow the same validation as explicit arguments,
     // including when the output descriptor is a pipe.
-    for inherited in ["", "--skip-newer"] {
+    for inherited in ["", "--if-exists=update-if-older"] {
         let mut args = vec!["--src-fd", "0", "--as-fd", "1"];
         if inherited.is_empty() {
-            args.push("--skip-newer");
+            args.push("--if-exists=update-if-older");
         }
         let result = cp(&args, inherited);
         assert_eq!(result.status.code(), Some(2), "{}", stderr_of(&result));
-        assert!(stderr_of(&result).contains("--skip-newer cannot be used with --as-fd"));
+        assert!(
+            stderr_of(&result).contains("--if-exists=update-if-older cannot be used with --as-fd")
+        );
         assert!(stderr_of(&result).contains("use --as PATH"));
         assert!(result.stdout.is_empty());
     }
@@ -1288,9 +1336,9 @@ fn stream_file_metadata_and_newer_selection() {
             }
             let mut args = vec!["--src-fd", "0"];
             args.extend(&endpoint);
-            args.extend(["--as", target]);
+            args.extend(["--as", target, "--if-exists=update"]);
             if preserve {
-                args.push("--preserve=permissions,ownership");
+                args.push("--copy-metadata=permissions,ownership");
             }
             let result = cp(&args, None);
             assert!(result.status.success(), "{}", stderr_of(&result));
@@ -1306,7 +1354,7 @@ fn stream_file_metadata_and_newer_selection() {
         for preview in [false, true] {
             let mut args = vec!["--src-fd", "0"];
             args.extend(&endpoint);
-            args.extend(["--as", target, "--skip-newer"]);
+            args.extend(["--as", target, "--if-exists=update-if-older"]);
             if preview {
                 args.push("--dry-run");
             }
@@ -1344,7 +1392,7 @@ fn stream_file_metadata_and_newer_selection() {
         output.set_modified(source_time).unwrap();
         output.rewind().unwrap();
         input.try_clone().unwrap().rewind().unwrap();
-        args.push("--preserve=permissions,ownership");
+        args.push("--copy-metadata=permissions,ownership");
         let result = cp(&args, Some(&output));
         assert!(result.status.success(), "{}", stderr_of(&result));
         let meta = output.metadata().unwrap();
@@ -1352,7 +1400,7 @@ fn stream_file_metadata_and_newer_selection() {
         assert!(meta.modified().unwrap() > source_time);
         output.rewind().unwrap();
         input.try_clone().unwrap().rewind().unwrap();
-        args.push("--preserve=times");
+        args.push("--copy-metadata=times");
         let result = cp(&args, Some(&output));
         assert!(result.status.success(), "{}", stderr_of(&result));
         check("output", 0o751);
@@ -1361,12 +1409,14 @@ fn stream_file_metadata_and_newer_selection() {
             .unwrap();
         input.try_clone().unwrap().rewind().unwrap();
         output.rewind().unwrap();
-        args.push("--skip-newer");
+        args.push("--if-exists=update-if-older");
         let before = read(&t.path("output"));
         let connections = read(&t.path("rsh.log"));
         let result = cp(&args, Some(&output));
         assert_eq!(result.status.code(), Some(2), "{}", stderr_of(&result));
-        assert!(stderr_of(&result).contains("--skip-newer cannot be used with --as-fd"));
+        assert!(
+            stderr_of(&result).contains("--if-exists=update-if-older cannot be used with --as-fd")
+        );
         assert!(stderr_of(&result).contains("use --as PATH"));
         assert!(!stderr_of(&result).contains("Skipped"));
         assert_eq!(read(&t.path("output")), before);
@@ -1384,7 +1434,7 @@ fn stream_file_metadata_and_newer_selection() {
         let before = read(&t.path("output"));
         let mut args = vec!["source", "--as-fd", "1"];
         if preserve_times {
-            args.push("--preserve=times");
+            args.push("--copy-metadata=times");
         }
         let result = cp(&args, Some(&output));
         assert!(result.status.success(), "{}", stderr_of(&result));
@@ -1400,7 +1450,7 @@ fn stream_file_metadata_and_newer_selection() {
         }
     }
     input.try_clone().unwrap().rewind().unwrap();
-    let result = cp(&["source", "--as-fd", "1", "--preserve=times"], None);
+    let result = cp(&["source", "--as-fd", "1", "--copy-metadata=times"], None);
     assert!(!result.status.success());
     assert!(stderr_of(&result).contains("requires a regular-file destination"));
     assert!(result.stdout.is_empty());
@@ -1489,12 +1539,26 @@ fn stream_previews_and_results_do_not_consume_payload() {
         }
     }
     for (index, args) in [
-        vec!["pipe", "--as", "payload", "--only-new"],
+        vec!["pipe", "--as", "payload", "--if-exists=keep"],
         vec!["pipe", "--as", "missing/skipped", "--only-existing"],
-        vec!["pipe", "--to", "fixture", "--as", "payload", "--only-new"],
-        vec!["--src-fd", "0", "--as", ".", "--only-new"],
-        vec!["--src-fd", "0", "--as-fd", "1", "--only-new"],
-        vec!["--from", "fixture", "payload", "--as-fd", "1", "--only-new"],
+        vec![
+            "pipe",
+            "--to",
+            "fixture",
+            "--as",
+            "payload",
+            "--if-exists=keep",
+        ],
+        vec!["--src-fd", "0", "--as", ".", "--if-exists=keep"],
+        vec!["--src-fd", "0", "--as-fd", "1", "--if-exists=keep"],
+        vec![
+            "--from",
+            "fixture",
+            "payload",
+            "--as-fd",
+            "1",
+            "--if-exists=keep",
+        ],
     ]
     .into_iter()
     .enumerate()
@@ -1514,10 +1578,10 @@ fn stream_previews_and_results_do_not_consume_payload() {
             .any(|r| r["type"] == "stream_result" && r["disposition"] == "skipped"));
     }
     for flag in [
-        "--skip-newer",
-        "--preserve=times",
-        "--preserve=permissions",
-        "--preserve=ownership",
+        "--if-exists=update-if-older",
+        "--copy-metadata=times",
+        "--copy-metadata=permissions",
+        "--copy-metadata=ownership",
     ] {
         let output = cp(&["pipe", "--as", "missing/metadata", flag]);
         assert!(!output.status.success());
@@ -1528,9 +1592,9 @@ fn stream_previews_and_results_do_not_consume_payload() {
         );
         assert!(!t.path("missing").exists());
     }
-    let output = cp(&["pipe", "--as-fd", "1", "--skip-newer"]);
+    let output = cp(&["pipe", "--as-fd", "1", "--if-exists=update-if-older"]);
     assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
-    assert!(stderr_of(&output).contains("--skip-newer cannot be used with --as-fd"));
+    assert!(stderr_of(&output).contains("--if-exists=update-if-older cannot be used with --as-fd"));
     assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 0);
     let failed = cp(&[
         "pipe",
@@ -1611,16 +1675,22 @@ fn unsupported_copy_controls_warn_without_changing_behavior() {
     set_mtime(&t.path("source"), 1_600_000_000);
     for (option, copied, unsupported) in [
         ("--only-existing", true, true),
-        ("--skip-newer", false, true),
+        ("--if-exists=update-if-older", false, false),
         ("--integrity-checking=compare=md5", true, true),
         ("--integrity-checking=compare=size-mtime", true, true),
         ("--hash", true, false),
-        ("--only-new", false, false),
+        ("--if-exists=keep", false, false),
         ("--integrity-checking=transfer=sha256", true, false),
     ] {
         write(&t.path("destination"), b"old");
         set_mtime(&t.path("destination"), 1_700_000_000);
-        let output = native_syq(&["cp", option, &t.s("source"), "--as", &t.s("destination")]);
+        let source = t.s("source");
+        let destination = t.s("destination");
+        let mut args = vec!["cp", option, &source, "--as", &destination];
+        if !option.starts_with("--if-exists=") {
+            args.push("--if-exists=update");
+        }
+        let output = native_syq(&args);
         assert_output_ok(&output);
         assert_eq!(
             stderr_of(&output).contains("unsupported and may be removed without notice"),

@@ -233,6 +233,9 @@ fn pipeline_worker(
         },
         benchmark: None,
         flags: 0,
+        matching_flags: 0,
+        resume: true,
+        if_exists: None,
         recursive: true,
         links: false,
         perms: false,
@@ -566,7 +569,10 @@ fn range_mismatch_aborts_worker_with_both_pipelines_outstanding() {
                 );
                 let source = src.lock().unwrap();
                 assert_eq!(source.received, 3 + usize::from(streaming));
-                assert!(matches!(source.requests[0], Request::ConfigureHashing(_)));
+                assert!(matches!(
+                    source.requests[0],
+                    Request::ConfigureHashing { .. }
+                ));
                 assert_eq!(source.replies.len(), 3);
                 if streaming {
                     assert_eq!(source.requests.len(), 2);
@@ -583,7 +589,7 @@ fn range_mismatch_aborts_worker_with_both_pipelines_outstanding() {
                 assert_eq!(destination.received, 1 + usize::from(!queued_range));
                 assert!(matches!(
                     destination.requests[0],
-                    Request::ConfigureHashing(_)
+                    Request::ConfigureHashing { .. }
                 ));
                 assert_eq!(
                     destination.replies.len(),

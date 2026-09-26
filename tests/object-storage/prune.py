@@ -73,11 +73,11 @@ def check():
         (modes / 'keep').write_bytes(b'keep')
         modes.chmod(0o555)
         mode_prefix = c.PREFIX + '/modes'
-        c.run(['--preserve=permissions', modes, '--to', remote, '--as', mode_prefix])
+        c.run(['--copy-metadata=permissions', modes, '--to', remote, '--as', mode_prefix])
         mode_dst = root / 'mode-dst'
         mode_dst.mkdir()
         (mode_dst / 'extra').write_bytes(b'extra')
-        c.run(['--preserve=permissions', '--from', remote, mode_prefix, '--as', mode_dst, '--prune'])
+        c.run(['--copy-metadata=permissions', '--from', remote, mode_prefix, '--as', mode_dst, '--prune'])
         assert not (mode_dst / 'extra').exists()
         assert mode_dst.stat().st_mode & 0o777 == 0o555
         mode_dst.chmod(0o755)
@@ -111,7 +111,7 @@ def check():
         for name in ['a-alias', 'z-alias']:
             os.link(aliases / 'keep', aliases / name)
         (aliases / 'extra').write_bytes(b'extra')
-        c.run(['--from', remote, '--srcs-in', mode_prefix, '--into', aliases, '--prune', '--only-new'])
+        c.run(['--from', remote, '--srcs-in', mode_prefix, '--into', aliases, '--prune', '--if-exists=keep'])
         assert (aliases / 'a-alias').exists() and (aliases / 'z-alias').exists()
         assert not (aliases / 'extra').exists()
 
@@ -163,8 +163,8 @@ def check():
         failed = c.run(download, ok=False, capture=True)
         assert 'skipping deletions' in failed.stderr
         assert (dst / 'extra').exists()
-        # --only-new protects the entire skipped destination entry.
-        c.run(download + ['--only-new'])
+        # --if-exists=keep protects the entire skipped destination entry.
+        c.run(download + ['--if-exists=keep'])
         assert (dst / 'keep/obstacle').exists()
         (dst / 'extra').write_bytes(b'must stay')
         # A missing S3 prefix also must never empty a local tree.

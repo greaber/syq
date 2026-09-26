@@ -38,12 +38,12 @@ try:
     filtered = run(['syq', 'map', '--from', 'source', '--srcs-in', root,
                     '--where', 'src.kind = "file"'])
     assert len(filtered.stdout.splitlines()) == 1
-    for option in ['mtime', '-mtime']:
+    for option in ['default', 'mtime']:
         destination = '/tmp/syq-real-ssh/mtime-' + option
         run(['syq', 'cp', '--from', 'source', '-C', root, '--src', 'photos/line\n%2F+',
-             '--to', 'destination', '--as', destination, '--preserve=' + option])
+             '--to', 'destination', '--as', destination, *(['--copy-metadata=mtime'] if option == 'mtime' else [])])
         observed = run(['ssh', 'destination', 'stat', '-c', '%Y', destination])
-        assert (int(observed.stdout) == 123) == (option == 'mtime'), observed.stdout
+        assert int(observed.stdout) == 123, observed.stdout
         run(['ssh', 'destination', 'rm', destination])
     generated = run(['syq', 'map', '--from', 'source', '--srcs-in', root])
     entries = [json.loads(line) for line in generated.stdout.splitlines()]
@@ -55,7 +55,7 @@ try:
         manifest.write_text(''.join(json.dumps(entry)+'\n' for entry in entries))
         destination = Path(tmp)/'out'
         run(['syq', 'cp', '--from', 'source', '-C', root, '--mapping', str(manifest),
-             '--into', str(destination), '--preserve', 'specials', '-q'])
+             '--into', str(destination), '--copy-metadata', 'specials', '-q'])
         assert (destination/'renamed/photos/line\n%2F+').read_bytes() == b'photo'
         assert (destination/'renamed/link').is_symlink()
         assert (destination/'renamed/empty').is_dir()

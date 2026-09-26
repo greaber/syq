@@ -10,7 +10,7 @@ fn native_preserve_specials_copies_or_visibly_skips_socket_nodes() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--preserve=specials",
+            "--copy-metadata=specials",
             "--srcs-in",
             &t.s("src"),
             "--into",
@@ -492,8 +492,8 @@ fn native_only_new_stamps_its_new_destination_root() {
         let extra = t.s("extra");
         let mut args = vec![
             "cp",
-            "--only-new",
-            "--preserve=permissions",
+            "--if-exists=keep",
+            "--copy-metadata=permissions",
             "--srcs-in",
             &src,
             "--into",
@@ -539,7 +539,7 @@ fn native_only_new_later_sources_stamp_directories_created_by_this_copy() {
         let destination = t.s(dst);
         let mut args = vec![
             "cp",
-            "--preserve=permissions",
+            "--copy-metadata=permissions",
             "--srcs-in",
             &a,
             "--srcs-in",
@@ -548,7 +548,7 @@ fn native_only_new_later_sources_stamp_directories_created_by_this_copy() {
             &destination,
         ];
         if only_new {
-            args.insert(1, "--only-new");
+            args.insert(1, "--if-exists=keep");
         }
         run_native_ok(&args);
         for dir in [dst.to_owned(), format!("{dst}/shared")] {
@@ -599,7 +599,7 @@ fn native_mtime_uses_destination_decimal_precision() {
                 .set_times(fs::FileTimes::new().set_modified(time))
                 .unwrap();
         }
-        run_native_ok(&["cp", &t.s("src"), "--as", &t.s("dst")]);
+        run_native_ok(&["cp", "--if-exists=update", &t.s("src"), "--as", &t.s("dst")]);
         assert_eq!(
             read(&t.path("dst")),
             if skipped { b"old" } else { b"new" },
@@ -607,7 +607,14 @@ fn native_mtime_uses_destination_decimal_precision() {
         );
         if skipped {
             // Content verification must bypass the inferred-precision shortcut.
-            run_native_ok(&["cp", "--hash", &t.s("src"), "--as", &t.s("dst")]);
+            run_native_ok(&[
+                "cp",
+                "--if-exists=update",
+                "--hash",
+                &t.s("src"),
+                "--as",
+                &t.s("dst"),
+            ]);
             assert_eq!(read(&t.path("dst")), b"new");
         }
     }
@@ -844,7 +851,7 @@ fn repeated_atimes_and_native_noatime_leave_source_file_access_time_unchanged() 
         .args([
             "cp",
             "--open-noatime",
-            "--preserve=atimes",
+            "--copy-metadata=atimes",
             "--srcs-in",
             &t.s("src"),
             "--into",
@@ -938,7 +945,7 @@ fn birth_times_reject_linux_destination_before_creation() {
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--preserve=crtimes",
+            "--copy-metadata=crtimes",
             &t.s("source"),
             "--as",
             &t.s("native-copy"),
@@ -1044,7 +1051,7 @@ fn access_time_of_explicit_symlink_is_captured_before_reading_its_target() {
             Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([
                     "cp",
-                    "--preserve=atimes",
+                    "--copy-metadata=atimes",
                     &t.s("link"),
                     "--as",
                     &t.s("native-link"),
@@ -1156,6 +1163,7 @@ fn check_new_readonly_inplace_copy(native: bool, fallback: bool, umask: libc::mo
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command.args([
             "cp",
+            "--if-exists=update",
             "--no-tcp",
             "--srcs-in",
             &t.s("src"),
@@ -1281,52 +1289,24 @@ fn rsync_new_remote_files_use_receiver_umask() {
 }
 
 #[test]
-fn native_mtime_opt_out_keeps_write_times_and_other_preservation() {
+fn native_mtime_metadata_is_explicit_on_unchanged_files() {
     let t = Tmp::new();
-    write(&t.path("src/nested/file"), b"contents");
-    fs::create_dir_all(t.path("src/empty")).unwrap();
-    std::os::unix::fs::symlink("nested/file", t.path("src/link")).unwrap();
-    for path in [
-        "src",
-        "src/nested",
-        "src/nested/file",
-        "src/empty",
-        "src/link",
-    ] {
-        set_mtime(&t.path(path), 123);
-    }
-    fs::set_permissions(t.path("src/nested/file"), fs::Permissions::from_mode(0o600)).unwrap();
-    for (dest, option, preserved) in [
-        ("default", "--preserve=permissions", true),
-        ("disabled", "--preserve=permissions,-mtime", false),
-    ] {
-        run_native_ok(&["cp", &t.s("src"), "--as", &t.s(dest), option]);
-        for path in ["", "/nested", "/nested/file", "/empty", "/link"] {
-            let m = fs::symlink_metadata(t.path(&format!("{dest}{path}"))).unwrap();
-            assert_eq!(m.mtime() == 123, preserved, "{dest}{path}");
-        }
-        assert_eq!(
-            fs::metadata(t.path(&format!("{dest}/nested/file")))
-                .unwrap()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-    // Content-based no-op copies must not restore the disabled timestamp either.
-    set_mtime(&t.path("disabled/nested/file"), 456);
+    write(&t.path("src/file"), b"contents");
+    set_mtime(&t.path("src/file"), 123);
+    run_native_ok(&["cp", &t.s("src/file"), "--as", &t.s("dst/file")]);
+    assert_eq!(fs::metadata(t.path("dst/file")).unwrap().mtime(), 123);
+    set_mtime(&t.path("dst/file"), 456);
+    let inode = fs::metadata(t.path("dst/file")).unwrap().ino();
+    run_native_ok(&["cp", &t.s("src/file"), "--as", &t.s("dst/file"), "--hash"]);
+    assert_eq!(fs::metadata(t.path("dst/file")).unwrap().mtime(), 456);
+    assert_eq!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
     run_native_ok(&[
         "cp",
-        &t.s("src/nested/file"),
+        &t.s("src/file"),
         "--as",
-        &t.s("disabled/nested/file"),
+        &t.s("dst/file"),
         "--hash",
-        "--preserve=-mtime",
+        "--copy-metadata=mtime",
     ]);
-    assert_eq!(
-        fs::metadata(t.path("disabled/nested/file"))
-            .unwrap()
-            .mtime(),
-        456
-    );
+    assert_eq!(fs::metadata(t.path("dst/file")).unwrap().mtime(), 123);
 }

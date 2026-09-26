@@ -2162,7 +2162,7 @@ impl RestrictedAuthority {
     ) -> Result<()> {
         self.check_deadline()?;
         match request {
-            Request::ConfigureHashing(policy) => {
+            Request::ConfigureHashing { policy, .. } => {
                 if *policy != self.hash_policy() {
                     bail!("hash policy differs from the authorized copy");
                 }

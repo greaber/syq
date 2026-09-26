@@ -23,7 +23,7 @@
     {
       "id": "contents",
       "title": "Copy its contents",
-      "command": "syq cp --srcs-in project --to server --into /backup",
+      "command": "syq cp --if-exists=update --srcs-in project --to server --into /backup",
       "description": "Copies the contents directly into /backup. index.html is updated; notes.txt stays.",
       "after": {
         "index.html": "updated home page\n",
@@ -46,7 +46,7 @@
     {
       "id": "mirror",
       "title": "Mirror its contents",
-      "command": "syq cp --prune --max-delete 10 --srcs-in project --to server --into /backup",
+      "command": "syq cp --if-exists=update --prune --max-delete 10 --srcs-in project --to server --into /backup",
       "description": "Updates /backup to match project. index.html is updated and notes.txt is removed.",
       "after": {
         "index.html": "updated home page\n",
