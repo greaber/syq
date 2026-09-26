@@ -68,7 +68,7 @@ Keep an administrative session open. See [OpenSSH's settings](https://man.openbs
 
 ## Tune XFS storage
 
-### Compare allocation-group counts
+### Choose an allocation-group count
 
 XFS divides storage into allocation groups, each with its own allocation
 metadata. More groups can let concurrent file creation and block allocation
@@ -78,13 +78,17 @@ spread across independent locks. Inspect `agcount` and `agsize` with:
 xfs_info /srv/data
 ```
 
-When preparing a new filesystem for concurrent copies on fast storage, include
-512 groups in a comparison with the default and a smaller count such as 32.
-Treat 512 as a candidate, not a default for every server: at a fixed filesystem
-size, more groups mean smaller groups and more per-group metadata. Large files
-may need more extents, and fragmented or nearly full filesystems can require
-more searching. Compare both large-file copies and many small files, including
-flush time and the occupancy at which the server will normally operate.
+For a new XFS filesystem on fast SSD storage used for concurrent file transfers,
+we recommend 512 allocation groups as a starting point. The useful count depends
+on filesystem size and workload. At a fixed size, more groups mean smaller
+groups and more per-group metadata. Large files may need more extents, and
+fragmented or nearly full filesystems can require more searching. A different
+count alone is not a reason to reformat an existing filesystem that performs
+well.
+
+When comparing configurations, measure command-completion time. If you also
+measure the time to flush pending writes to storage, report it separately:
+faster flushing does not necessarily mean the copy command finishes sooner.
 
 Choose the count when creating the filesystem with `mkfs.xfs -d agcount=512`.
 For a device you intend to format, preview the proposed geometry without
@@ -172,7 +176,8 @@ restore the larger target after deleting or moving enough data. Released
 headroom can be consumed again, so it buys time rather than solving continued
 growth.
 
-Compare write and copy-plus-flush times before adopting a larger reserve. XFS
+Compare command-completion time before adopting a larger reserve, and report
+any subsequent flush time separately. XFS
 reduces speculative preallocation near its available-space limit, and a larger
 reserve makes that behavior start at a lower physical occupancy. A reserve
 preserves allocation choices but does not guarantee unchanged throughput near
