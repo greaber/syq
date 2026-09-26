@@ -227,7 +227,8 @@ class ReleaseToolTests(unittest.TestCase):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         openssl("pkey", "-in", str(key), "-pubout", "-out", str(public))
         key_b64 = openssl("base64", "-A", "-in", str(key)).decode().rstrip("\n")
-        env = dict(os.environ, SYQ_RELEASE_SIGNING_KEY_PEM_B64=key_b64,
+        # A secret set from a file keeps its trailing newline.
+        env = dict(os.environ, SYQ_RELEASE_SIGNING_KEY_PEM_B64=key_b64 + "\n",
                    SYQ_RELEASE_PUBLIC_KEY=public_key_b64(key))
         manifest = first / "syq-release-manifest.json"
         subprocess.run([str(SCRIPTS / "sign-release-manifest.py"), str(manifest), CANONICALIZER],

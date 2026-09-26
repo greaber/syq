@@ -77,7 +77,9 @@ def sign(manifest_path, canonicalizer, signing_key_b64, public_key_b64):
     if manifest is None:
         raise SigningError("release manifest is not unsigned ed25519-jcs-v1 metadata")
 
-    private_pem = decode("SYQ_RELEASE_SIGNING_KEY_PEM_B64", signing_key_b64)
+    # A secret stored from a file often ends in a newline; base64 never
+    # contains whitespace, so ignore it as `openssl base64 -d -A` did.
+    private_pem = decode("SYQ_RELEASE_SIGNING_KEY_PEM_B64", "".join(signing_key_b64.split()))
     if len(decode("SYQ_RELEASE_PUBLIC_KEY", public_key_b64)) != 32:
         raise SigningError("SYQ_RELEASE_PUBLIC_KEY must encode exactly 32 bytes")
     public_pem = openssl("pkey", "-pubout", data=private_pem)
