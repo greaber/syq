@@ -78,21 +78,29 @@ spread across independent locks. Inspect `agcount` and `agsize` with:
 xfs_info /srv/data
 ```
 
-For a new XFS filesystem on fast SSD storage used for concurrent file transfers,
-we recommend 512 allocation groups as a starting point. The useful count depends
-on filesystem size and workload. At a fixed size, more groups mean smaller
-groups and more per-group metadata. Large files may need more extents, and
-fragmented or nearly full filesystems can require more searching. A different
-count alone is not a reason to reformat an existing filesystem that performs
-well.
+Some systems create XFS filesystems with only four allocation groups by
+default; the default depends on device size and storage geometry. Four groups
+can leave substantial performance on the table for concurrent transfers on
+fast SSD storage, so it is worth testing a higher count when creating a new
+filesystem.
+
+In our concurrent-copy tests, a wide range of higher counts performed
+similarly. For example, 512 worked well, but there was nothing special about
+that number. Differences were often marginal, and tradeoffs became more
+apparent in extreme conditions such as a nearly full filesystem.
+
+At a fixed filesystem size, more groups mean smaller groups and more per-group
+metadata. Large files may need more extents, and fragmented or nearly full
+filesystems can require more searching. Choose based on your filesystem size
+and workload; a different count alone is not a reason to reformat an existing
+filesystem that performs well.
 
 When comparing configurations, measure command-completion time. If you also
 measure the time to flush pending writes to storage, report it separately:
 faster flushing does not necessarily mean the copy command finishes sooner.
 
-Choose the count when creating the filesystem with `mkfs.xfs -d agcount=512`.
-For a device you intend to format, preview the proposed geometry without
-writing it:
+Choose the count when creating the filesystem. For example, to preview a
+512-group layout on a device you intend to format, without writing it:
 
 ```sh
 sudo mkfs.xfs -N -d agcount=512 /dev/your-empty-device
