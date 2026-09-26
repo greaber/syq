@@ -1,12 +1,37 @@
 # Developing syq
 
-## Build and try a remote copy
+## Set up a checkout
 
-Install Rust with rustup, Git, and a C compiler, then:
+Install Git, [rustup](https://rustup.rs), and a C compiler (on macOS,
+`xcode-select --install`; on Debian or Ubuntu,
+`sudo apt-get install build-essential curl git`). Then, in a fresh clone:
 
 ```sh
 git clone https://github.com/greaber/syq.git
 cd syq
+scripts/setup.sh
+eval "$(scripts/setup.sh env)"
+```
+
+`scripts/setup.sh` checks those prerequisites, installs the Rust toolchain
+from `rust-toolchain.toml` with rustfmt and clippy, and installs the tools
+pinned in `scripts/setup.lock`: ShellCheck, jq, mdBook, uv, Python, Node.js,
+and Go. Downloads are checked against the pinned SHA-256 sums; uv installs
+Python using the checksums built into the pinned uv. Tools are kept in
+`~/.cache/syq/tools` (or
+`$XDG_CACHE_HOME/syq/tools`) and shared by every checkout; set
+`SYQ_TOOLS_DIR` to use another directory. Running the script again installs
+only what is missing.
+
+The `eval` line puts the pinned tools first on `PATH` in the current shell;
+repeat it in each new shell. It also sets `UV_PYTHON` to the pinned Python and
+`GOTOOLCHAIN=local` so Go does not download a different toolchain. Pass tool
+names to select only some of them, for example `scripts/setup.sh env python jq`.
+CI runs the same script.
+
+## Build and try a remote copy
+
+```sh
 cargo build --locked --release
 ./target/release/syq cp data --to server --into /tmp/syq-dev-copy
 ```
@@ -143,7 +168,7 @@ and `SYQ_TEST_BUCKET` set. It creates and removes a unique test prefix in the
 existing bucket. See `python3 tests/object-storage/benchmark.py --help` for
 benchmark options.
 
-For docs, run `python3 scripts/check-doc-links.py` and build with mdBook.
+For docs, run `python3 scripts/check-doc-links.py` and build with the pinned mdBook.
 The published site defaults to the latest stable release, with tagged versions
 and `master` available through the documentation selector. Archives start at
 v0.2.0, the first release containing the mdBook sources. Each version uses its
