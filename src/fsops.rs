@@ -608,7 +608,14 @@ impl FsOps {
             // An optional ownership optimization must not invalidate roots the
             // caller already holds when thread/socket resources are exhausted.
             match executor::Executor::start(self) {
-                Ok(executor) => self.data_executor = executor,
+                Ok(Some(executor)) => {
+                    self.data_executor = Some(executor);
+                    // Stream reads, writes, and rebinds now run in the executor.
+                    // Retaining the owner's copy would pin the initial file
+                    // even after the executor unbinds it while idle.
+                    self.stream_worker = None;
+                }
+                Ok(None) => {}
                 Err(error) => {
                     if crate::output::debug() {
                         crate::output::diagnostic!(

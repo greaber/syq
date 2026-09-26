@@ -367,7 +367,8 @@ impl Pool {
             assigned.push(index);
         }
         let mut result = inspect_descriptor_children(root, directory, parent, own);
-        let mut replies: Vec<Option<Inspected>> = (0..assigned.len()).map(|_| None).collect();
+        let mut replies: Vec<Option<Result<Inspected>>> =
+            (0..assigned.len()).map(|_| None).collect();
         for _ in &assigned {
             match self.event()? {
                 Event::Stats(index, entries) => {
@@ -376,14 +377,16 @@ impl Pool {
                         .position(|worker| *worker == index)
                         .context("unexpected stat executor")?;
                     anyhow::ensure!(replies[position].is_none(), "duplicate stat reply");
-                    replies[position] = Some(entries?);
+                    // Drain every assigned reply before returning a helper's
+                    // error, so the next dispatch cannot consume stale results.
+                    replies[position] = Some(entries);
                 }
                 Event::Failed(index) => anyhow::bail!("scan executor {index} panicked"),
                 _ => anyhow::bail!("unexpected scan event during stat dispatch"),
             }
         }
         for entries in replies {
-            result.extend(entries.unwrap());
+            result.extend(entries.unwrap()?);
         }
         Ok(result)
     }
@@ -565,6 +568,88 @@ mod tests {
             assert_eq!(relative, join(b"selected", &names[index]));
             assert_eq!(result.unwrap().0.size, 8);
         }
+    }
+
+    #[test]
+    fn stat_error_drains_other_helpers_before_next_inspection() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let names: Vec<_> = (0..96)
+            .map(|index| format!("f{index:03}").into_bytes())
+            .collect();
+        for name in &names {
+            fs::write(
+                temporary.path().join(std::ffi::OsStr::from_bytes(name)),
+                b"file",
+            )
+            .unwrap();
+        }
+        let root = Arc::new(Root::from_directory(File::open(temporary.path()).unwrap()).unwrap());
+        let held = File::open(temporary.path()).unwrap();
+        let mut pool = Pool::default();
+        pool.cannot_grow = true;
+        let (sent, received) = mpsc::channel();
+        let mut signal = Some(sent);
+        let mut wait = Some(received);
+        for index in 0..2 {
+            let root = root.clone();
+            let (commands, incoming) = mpsc::sync_channel(1);
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            let events = pool.output.clone();
+            let mut signal = if index == 0 { signal.take() } else { None };
+            let mut wait = if index == 1 { wait.take() } else { None };
+            // Scripted helpers inject one handoff error before the other
+            // helper replies, then serve the next inspection normally.
+            let thread = std::thread::spawn(move || {
+                while let Ok(Command::Stat { parent, names }) = incoming.recv() {
+                    let directory = receive_directory(&receiver).unwrap();
+                    if let Some(signal) = signal.take() {
+                        events
+                            .send(Event::Stats(
+                                index,
+                                Err(anyhow::anyhow!("injected stat handoff error")),
+                            ))
+                            .unwrap();
+                        signal.send(()).unwrap();
+                    } else {
+                        if let Some(wait) = wait.take() {
+                            wait.recv().unwrap();
+                        }
+                        let entries =
+                            inspect_descriptor_children(&root, &directory, &parent, &names);
+                        if events.send(Event::Stats(index, Ok(entries))).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            pool.workers.push(Worker {
+                commands: Some(commands),
+                socket: Some(sender),
+                thread: Some(thread),
+                retained: 0,
+            });
+        }
+        let error = match pool.inspect(&root, &options(), &held, b"failed", &names, None) {
+            Err(error) => error,
+            Ok(_) => panic!("injected failure was not reported"),
+        };
+        assert!(error.to_string().contains("injected stat handoff error"));
+        let next = pool
+            .inspect(&root, &options(), &held, b"next", &names, None)
+            .unwrap();
+        assert_eq!(next.len(), names.len());
+        for (index, (path, entry)) in next.into_iter().enumerate() {
+            assert_eq!(
+                path,
+                join(b"next", &names[index]),
+                "stale reply crossed the inspection boundary"
+            );
+            assert_eq!(entry.unwrap().0.size, 4);
+        }
+        assert!(matches!(
+            pool.events.as_ref().unwrap().try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]

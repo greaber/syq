@@ -348,6 +348,54 @@ mod tests {
     }
 
     #[test]
+    fn idle_stream_executor_does_not_pin_aborted_first_file() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let path = temporary.path().join("staging");
+        let file = File::create(&path).unwrap();
+        // flock follows the open file description through dup/SCM_RIGHTS.
+        // A separately opened probe can acquire it only after every duplicate
+        // of the original description has been released.
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let probe = File::open(&path).unwrap();
+        let slot = DescriptorSessionSlot::default();
+        let ticket = slot.register_stream(file, true).unwrap();
+        let settings = crate::descriptor_copy::Settings::default();
+        let role = ConnectionRole::StreamWorker {
+            ticket: ticket.clone(),
+            settings,
+        };
+        let mut ops = FsOps::with_descriptor_session(slot.clone());
+        ops.initialize_stream(&ticket, settings).unwrap();
+        ops.start_data_executor(&role).unwrap();
+        assert!(
+            ops.data_executor.is_some(),
+            "test requires the private executor path"
+        );
+        slot.release_stream(&ticket);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1
+        );
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+
+        assert!(matches!(
+            ops.handle_in_place(&mut Request::BindStream(None)),
+            Response::Ok
+        ));
+        assert_eq!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "idle connection still pins its initial stream file"
+        );
+        // Keep the connection/executor alive through the assertion above.
+        drop(ops);
+    }
+
+    #[test]
     fn executor_errors_do_not_poison_later_files() {
         let temporary = crate::test_support::tempdir().unwrap();
         let (mut ops, _session) = setup(temporary.path());

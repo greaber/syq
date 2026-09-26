@@ -19,6 +19,7 @@ pub mod enrollment;
 mod expression;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod fs_executor;
+#[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod fsops;
 mod hashing;
 mod help;
