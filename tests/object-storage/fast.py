@@ -108,10 +108,10 @@ try:
             expected=scenario in ("upload","upload-delayed","upload-single","upload-single-delayed","download")
             assert (code==0)==expected,(scenario,code,err.decode())
             if scenario in ("upload-failure","upload-interrupted"):
-                assert not any(e[0]=="abort" for e in events),events
+                assert any(e[0]=="abort" for e in events),events
                 assert not any(e[0]=="complete" for e in events),events
                 assert sorted(e[2] for e in events if e[0]=="put-start")==sorted(e[2] for e in events if e[0]=="put-end"),events
-                assert list((root/"cache"/"syq"/"s3").glob("*.json"))
+                assert not list((root/"cache"/"syq"/"s3").glob("*.json"))
             if scenario.startswith("upload-single"):
                 assert not any(e[0] in ("create","complete","abort") for e in events),events
                 assert any(e[0]=="put-end" for e in events),events

@@ -128,12 +128,12 @@ def check():
         (dst / 'recovery/.syq-swap-123-4/data').write_bytes(b'recover')
         download = ['--from', remote, '--srcs-in', prefix, '--into', dst,
                     '--prune', '--ignore', 'ignored/', '--ignore', 'small']
-        c.run(download + ['--dry-run'])
+        c.run(download + ['--if-exists=update', '--dry-run'])
         assert (dst / 'extra').exists() and not (dst / 'keep').exists()
-        limited = c.run(download + ['--max-delete', '2'], ok=False, capture=True)
+        limited = c.run(download + ['--if-exists=update', '--max-delete', '2'], ok=False, capture=True)
         assert limited.returncode == 25, limited.stderr
         assert (dst / 'extra').exists()
-        c.run(download + ['--max-delete', '3'])
+        c.run(download + ['--if-exists=update', '--max-delete', '3'])
         assert not (dst / 'extra').exists() and not (dst / 'old').exists()
         assert (dst / 'keep').read_bytes() == b'keep'
         assert (dst / 'small').read_bytes() == b'original'

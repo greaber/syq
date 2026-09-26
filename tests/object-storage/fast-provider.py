@@ -36,7 +36,7 @@ with tempfile.TemporaryDirectory(prefix='syq-fast-check-') as tmp:
         assert not list((cache/'syq'/'s3').glob('*.json'))
         assert not list(target.glob('.syq-s3-*'))
         # Compare objects without stored hashes, including same-size corruption.
-        comparison = ('--dry-run', '--hash', '--from', 's3://'+c.BUCKET,
+        comparison = ('--if-exists=update', '--dry-run', '--hash', '--from', 's3://'+c.BUCKET,
                       '--srcs-in', c.PREFIX, '--into', target)
         run(*comparison, '--results', root/'matching.ndjson')
         c.assert_comparison(root/'matching.ndjson', changed=0, unchanged=len(expected))
