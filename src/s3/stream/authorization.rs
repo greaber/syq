@@ -20,6 +20,12 @@ impl Session {
             return Ok(());
         };
         for request in &mut requests {
+            // Use the same canonical fields as the executing HTTP transport.
+            // Content headers still travel with metadata updates, but are not
+            // part of this authorization lookup key.
+            request
+                .headers
+                .retain(|name, _| crate::s3::authorization::signed_header(name, &request.method));
             request.bucket =
                 (self.options.bucket != authorization.bucket).then(|| self.options.bucket.clone());
             for super::super::Header(name, value) in &self.options.headers {

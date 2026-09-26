@@ -228,7 +228,7 @@ impl Engine {
         self.uploads.cancel();
         // Drain started requests, including synchronous file bodies, before exit.
         let _ = work.await;
-        bail!("S3 copy {interrupted}; rerun the command to continue")
+        bail!("S3 copy {interrupted}; rerun with --resume to continue")
     }
     fn check_cancelled(&self) -> Result<()> {
         anyhow::ensure!(!self.cancelled.load(Relaxed), "S3 copy cancelled");
@@ -1332,6 +1332,14 @@ impl Engine {
             .bucket(&self.options.bucket)
             .key(key)
             .upload_id(upload_id)
+            .customize()
+            .config_override(
+                client::without_sdk_retries().timeout_config(
+                    aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                        .operation_timeout(std::time::Duration::from_secs(15))
+                        .build(),
+                ),
+            )
             .send()
             .await
         {
