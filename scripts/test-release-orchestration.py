@@ -186,7 +186,9 @@ class PathScopeTests(Scratch):
                              ("scripts/test-setup.sh", "setup"),
                              ("scripts/test-release-orchestration.py", "orchestration"),
                              (".github/workflows/macos.yml", "orchestration workflows"),
-                             (".github/workflows/ci.yml", "orchestration workflows")]:
+                             (".github/workflows/ci.yml", "orchestration workflows"),
+                             ("scripts/check-script-references.py",
+                              "orchestration workflows")]:
             with self.subTest(path=path):
                 scope = self.scope(path)
                 self.assertScope(scope, tooling_checks=checks)

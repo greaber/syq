@@ -248,7 +248,8 @@ def classify(paths, preparation_only):
             # Unknown inputs fail safe until their dependency boundary is explicit.
             native = python_sdk = path_tooling = shellcheck = mapping_docs = conformance = True
 
-        if matches(path, ".github/workflows/*", "scripts/check-workflows.py"):
+        if matches(path, ".github/workflows/*", "scripts/check-workflows.py",
+                   "scripts/check-script-references.py"):
             path_tooling_checks += ["workflows", "orchestration"]
         elif matches(path, "Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
             if not preparation_only:

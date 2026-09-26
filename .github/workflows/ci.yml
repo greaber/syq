@@ -243,10 +243,12 @@ jobs:
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' setup ')
         run: scripts/test-setup.sh
-      - name: Validate workflow syntax
+      - name: Validate workflow syntax and script references
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' workflows ')
-        run: scripts/check-workflows.py
+        run: |
+          scripts/check-workflows.py
+          scripts/check-script-references.py
       - name: Lint tracked shell scripts
         if: >-
           needs.scope.outputs.tooling == 'true' ||
