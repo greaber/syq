@@ -355,6 +355,10 @@ known about it.
 
 ## Working on syq
 
+- [`PRINCIPLES.md`](PRINCIPLES.md) records the user's core product principles.
+  Check a design against it before implementing, and raise any conflict first.
+  Only the user decides its contents; propose a change in a pull request and
+  say so at the top.
 - `README.md` and the documents under `docs/` are the user-facing contract;
   `README.md` is a brief front door and `docs/` is the source of the
   documentation site published with GitHub Pages (mdBook, configured by
@@ -401,11 +405,6 @@ known about it.
 - Use [the docs audit skill](.agents/skills/syq-docs-audit/SKILL.md) for requested
   editorial audits and during release preparation. An audit can identify a
   product question without changing runtime behavior to simplify its explanation.
-- Keep the selected data route fixed. TCP may fall back to SSH between the
-  same endpoints, but failure must never silently relay file data through the
-  invoking or authorizing machine. Relaying requires an explicit route choice.
-- Copy failures must be visible. Do not make an incomplete or truncated result
-  look successful.
 - Exercise copy, resume, verification, and removal behavior in disposable
   temporary directories. Treat `syq --rm`, remote destinations, bootstrap
   installation, and operations on real user data as potentially destructive.

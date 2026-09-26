@@ -30,7 +30,8 @@ EXAMPLE_PAGES = {"docs/mappings.md", "docs/automation.md", "docs/commands/map.md
 
 
 def prose(path):
-    return (path in {'README.md', 'CHANGELOG.md', 'RELEASING.md', 'CONTRIBUTING.md', 'AGENTS.md'}
+    return (path in {'README.md', 'CHANGELOG.md', 'RELEASING.md', 'CONTRIBUTING.md', 'AGENTS.md',
+                     'PRINCIPLES.md'}
             or path.startswith('.github/release-notes/') and path.endswith('.md')
             or path.startswith('docs/') and path.endswith('.md') and path not in EXAMPLE_PAGES)
 
