@@ -45,7 +45,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          scripts/verify-release-tag.sh \
+          scripts/verify-release-tag.py \
             "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" master \
             rust,sdks,macos,linux-arm64,conformance
 
@@ -99,7 +99,7 @@ jobs:
           name: source-crate
           path: ${{ runner.temp }}/source-crate
       - name: Require identical source-package bytes before any publication
-        run: scripts/verify-prepared-crate.sh "$GITHUB_REF_NAME" "$RUNNER_TEMP/source-crate"
+        run: scripts/verify-prepared-crate.py "$GITHUB_REF_NAME" "$RUNNER_TEMP/source-crate"
       - name: Download every target
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -111,13 +111,13 @@ jobs:
       - name: Restore canonicalizer permission
         run: chmod 755 dist/syq-linux-x86_64
       - name: Build and validate release metadata
-        run: scripts/package-release.sh "$GITHUB_REF_NAME" dist
+        run: scripts/package-release.py "$GITHUB_REF_NAME" dist
       - name: Sign release manifest and verify the configured key
         env:
           SYQ_RELEASE_PUBLIC_KEY: ${{ vars.SYQ_RELEASE_PUBLIC_KEY }}
           SYQ_RELEASE_SIGNING_KEY_PEM_B64: ${{ secrets.SYQ_RELEASE_SIGNING_KEY_PEM_B64 }}
         run: |
-          scripts/sign-release-manifest.sh \
+          scripts/sign-release-manifest.py \
             dist/syq-release-manifest.json dist/syq-linux-x86_64
       - name: Verify final release inventory
         shell: bash
@@ -149,7 +149,7 @@ jobs:
             echo "Draft $GITHUB_REF_NAME already exists; inspect and remove it before retrying." >&2
             exit 1
           }
-          scripts/verify-release-assets.sh "$GITHUB_REF_NAME" dist
+          scripts/verify-release-assets.py "$GITHUB_REF_NAME" dist
           echo 'published=true' >> "$GITHUB_OUTPUT"
       - name: Attest all release files
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
@@ -171,7 +171,7 @@ jobs:
             --title "syq ${GITHUB_REF_NAME#v}" --generate-notes \
             --notes "$(cat "$release_notes")"
           gh release upload "$GITHUB_REF_NAME" dist/*
-          scripts/verify-release-assets.sh "$GITHUB_REF_NAME" dist
+          scripts/verify-release-assets.py "$GITHUB_REF_NAME" dist
           gh release edit "$GITHUB_REF_NAME" --draft=false
       - name: Check whether crates.io already has this exact package
         id: crates_io_state
@@ -179,7 +179,7 @@ jobs:
         run: |
           set -euo pipefail
           version=${GITHUB_REF_NAME#v}
-          if scripts/verify-crates-io-package.sh \
+          if scripts/verify-crates-io-package.py \
             "$version" "target/package/syq-$version.crate"; then
             echo 'published=true' >> "$GITHUB_OUTPUT"
           else
@@ -201,7 +201,7 @@ jobs:
         shell: bash
         run: |
           version=${GITHUB_REF_NAME#v}
-          scripts/verify-crates-io-package.sh \
+          scripts/verify-crates-io-package.py \
             "$version" "target/package/syq-$version.crate"
       - name: Check out project-owned tap
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

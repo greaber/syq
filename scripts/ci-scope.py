@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""Classify a GitHub Actions change set for post-merge and manual validation.
+
+Usage: scripts/ci-scope.py [GITHUB_EVENT_PATH]
+
+Prints `key=value` lines for $GITHUB_OUTPUT. SYQ_TEST_CHANGED_PATHS_FILE
+replaces the event with a list of changed paths for tests.
+"""
+from fnmatch import fnmatchcase
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+from tooling import JqError, captured, command, exit_on_failure, get, load_file, require
+
+SCRIPTS = Path(os.path.abspath(__file__)).parent
+ALL_TOOLING = "package installer benchmark release orchestration focused branch workflows setup"
+DOCUMENTATION_PATHS = "docs/mappings.md\ndocs/automation.md\ndocs/commands/map.md"
+
+
+def run_everything():
+    print("\n".join([
+        "native=true",
+        "sdks=true",
+        "python_sdk=true",
+        "tooling=true",
+        f"tooling_checks={ALL_TOOLING}",
+        "shellcheck=true",
+        "mapping_docs=true",
+        "conformance=true",
+        "macos=true",
+        "linux_arm64=true",
+        "full_suite=true",
+        'sdk_matrix=["python"]',
+    ]))
+
+
+def matches(path, *patterns):
+    return any(fnmatchcase(path, pattern) for pattern in patterns)
+
+
+def event_has(event, key):
+    """jq's `has(key)`: false for null, an error for other non-objects."""
+    if event is None:
+        return False
+    if not isinstance(event, dict):
+        raise JqError(5, f"cannot check whether {type(event).__name__} has a key")
+    return key in event
+
+
+def git_succeeds(*args):
+    return subprocess.run(["git", *args], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+
+def changed_paths_from_event(event_path):
+    """Return (changed paths, base, head), or an exit status after output."""
+    try:
+        event = load_file(event_path)
+    except JqError as error:
+        if error.status != 4:
+            raise
+        # jq printed no event name for an empty file.
+        print(f"unsupported GitHub event in {event_path}", file=sys.stderr)
+        return 1
+    if event_has(event, "pull_request"):
+        base = captured(require(get(event, "pull_request", "base", "sha")))
+        head = captured(require(get(event, "pull_request", "head", "sha")))
+        diff_range = f"{base}...{head}"
+    elif event_has(event, "before"):
+        base = captured(require(get(event, "before")))
+        head = captured(require(get(event, "after")))
+        if re.fullmatch(r"0+", base):
+            run_everything()
+            print("CI scope: new branch or incomplete push history; running every check",
+                  file=sys.stderr)
+            return 0
+        diff_range = f"{base}..{head}"
+    else:
+        # A generated SDK follow-up uses a workflow dispatch because GitHub does
+        # not trigger push workflows for merges made with GITHUB_TOKEN. It passes
+        # the checked-out merge commit so this path has the same precise scope as
+        # a normal push. Other manual runs retain the full-suite default.
+        scope_commit = os.environ.get("SYQ_CI_SCOPE_COMMIT", "")
+        if not scope_commit:
+            run_everything()
+            print("CI scope: manual run; running every check", file=sys.stderr)
+            return 0
+        if not re.fullmatch(r"[0-9a-f]{40}", scope_commit):
+            print(f"invalid CI scope commit: {scope_commit}", file=sys.stderr)
+            return 2
+        head = command("git", "rev-parse", "HEAD").rstrip("\n")
+        if head != scope_commit:
+            print(f"CI scope commit {scope_commit} is not checked out (found {head})",
+                  file=sys.stderr)
+            return 1
+        base = command("git", "rev-parse", f"{head}^").rstrip("\n")
+        diff_range = f"{base}..{head}"
+    if not git_succeeds("cat-file", "-e", f"{base}^{{commit}}"):
+        print(f"CI scope base commit is unavailable: {base}", file=sys.stderr)
+        return 1
+    if not git_succeeds("cat-file", "-e", f"{head}^{{commit}}"):
+        print(f"CI scope head commit is unavailable: {head}", file=sys.stderr)
+        return 1
+    # Classify both sides of a rename so moving an affected input into an
+    # otherwise inert directory cannot hide its former dependency boundary.
+    changed = command("git", "diff", "--no-renames", "--name-only", diff_range).rstrip("\n")
+    return changed, base, head
+
+
+def main():
+    event_path = (sys.argv[1] if len(sys.argv) > 1 else "") or os.environ.get("GITHUB_EVENT_PATH", "")
+    base = head = ""
+    changed_paths_file = os.environ.get("SYQ_TEST_CHANGED_PATHS_FILE", "")
+    if changed_paths_file:
+        try:
+            changed_paths = Path(changed_paths_file).read_text().rstrip("\n")
+        except OSError as error:
+            print(f"cannot read {changed_paths_file}: {error}", file=sys.stderr)
+            return 1
+    elif event_path and os.path.isfile(event_path) and scheduled(event_path):
+        nightly = subprocess.run([sys.executable, str(SCRIPTS / "nightly-ci.py")])
+        if nightly.returncode == 0:
+            run_everything()
+            return 0
+        if nightly.returncode != 3:
+            return nightly.returncode
+        # No changed test inputs: emit the ordinary all-false scope below.
+        changed_paths = "README.md"
+    elif os.environ.get("SYQ_CI_DOCUMENTATION_ONLY", "") == "true":
+        changed_paths = DOCUMENTATION_PATHS
+    elif event_path and os.path.isfile(event_path):
+        result = changed_paths_from_event(event_path)
+        if isinstance(result, int):
+            return result
+        changed_paths, base, head = result
+    else:
+        print(f"usage: {sys.argv[0]} GITHUB_EVENT_PATH", file=sys.stderr)
+        return 2
+
+    preparation_only = bool(base and head) and subprocess.run([
+        sys.executable, str(SCRIPTS / "release_test_inputs.py"), head, "--native",
+        "--equivalent-to", base]).returncode == 0
+    selection = classify(changed_paths.split("\n"), preparation_only)
+
+    print(f"tooling_checks={selection['tooling_checks']}")
+    keys = ["native", "sdks", "python_sdk", "tooling", "shellcheck", "mapping_docs",
+            "conformance", "macos", "linux_arm64", "full_suite"]
+    for key in keys:
+        print(f"{key}={str(selection[key]).lower()}")
+    print(f"integration_targets={selection['integration_targets']}")
+    print("CI scope: " + " ".join(f"{key}={str(selection[key]).lower()}" for key in keys),
+          file=sys.stderr)
+    print('sdk_matrix=["python"]' if selection["python_sdk"] else 'sdk_matrix=["none"]')
+    return 0
+
+
+def scheduled(event_path):
+    try:
+        return event_has(load_file(event_path), "schedule")
+    except (JqError, OSError, UnicodeDecodeError):
+        return False
+
+
+def classify(paths, preparation_only):
+    native = sdks = python_sdk = tooling = shellcheck = mapping_docs = False
+    conformance = macos = linux_arm64 = full_suite = False
+    integration_targets = []
+    tooling_checks = []
+    saw_path = False
+    for path in paths:
+        if not path:
+            continue
+        saw_path = True
+        path_tooling = False
+        path_tooling_checks = []
+        # Shell lint is cheap and independent of the path's product surface.
+        # Keep it selected even when the rules below deliberately ignore the path.
+        if path.endswith(".sh"):
+            shellcheck = True
+
+        for patterns, target in [
+            (("tests/local.rs", "tests/local/*"), "local"),
+            (("tests/help.rs", "tests/help/*"), "help"),
+            (("tests/output.rs", "tests/output/*"), "output"),
+            (("tests/update.rs", "tests/update/*"), "update"),
+            (("tests/return_handoff.rs", "tests/return_handoff/*"), "return_handoff"),
+            (("tests/s3.rs", "tests/s3/*"), "s3"),
+            (("tests/build_identity.rs",), "build_identity"),
+            (("tests/temp_paths.rs",), "temp_paths"),
+            (("tests/macos_exfat.rs",), "macos_exfat"),
+            (("tests/support/*", "tests/fixtures/*"), "all"),
+        ]:
+            if matches(path, *patterns):
+                integration_targets.append(target)
+                break
+
+        if matches(path, "sdk/README.md", "sdk/RELEASING.md", "sdk/python/README-PYTHON.md",
+                   "sdk/python/NATIVE_API.md", "sdk/python/API_DESIGN.md"):
+            # These are prose, not executable SDK test inputs. Keep the exception
+            # explicit: native-api.json is compiled into Rust, and files elsewhere
+            # in an SDK (including future Markdown fixtures) still select its tests.
+            pass
+        elif matches(path, "book.toml", "theme/*", ".agents/*"):
+            # Documentation rendering and agent guidance do not affect the product
+            # suites. Pages validates the book/theme; shell files still get linted.
+            pass
+        elif path == "sdk/python/native-api.json":
+            # This SDK-owned specification is compiled into the Rust CLI.
+            native = python_sdk = True
+        elif matches(path, "sdk/python/*"):
+            python_sdk = True
+        elif matches(path, "sdk/*"):
+            # Files shared across sdk/ can affect the Python SDK.
+            python_sdk = True
+        elif matches(path, "MAPPINGS.md", "docs/mappings.md", "docs/automation.md",
+                     "docs/commands/map.md"):
+            # The documented jq programs are executable integration-test inputs.
+            mapping_docs = True
+        elif matches(path, "tests/rsync-compat/*", "scripts/rsync-compat.py"):
+            conformance = True
+        elif matches(path, "tests/fixtures/*"):
+            # The same protocol fixtures are consumed by Rust and Python tests.
+            native = python_sdk = True
+        elif matches(path, "Cargo.toml", "Cargo.lock"):
+            if not preparation_only:
+                native = True
+        elif matches(path, "src/*macos*", "tests/macos*"):
+            native = macos = True
+        elif matches(path, "rust-toolchain.toml", "build.rs", "src/*", "tests/*.rs", "schemas/*"):
+            native = True
+        elif matches(path, ".github/workflows/*"):
+            path_tooling = True
+        elif matches(path, "nix/python-dist.nix", "scripts/build-python-dist.sh",
+                     "scripts/package-python-wheel.py", "scripts/pin-python-native-source.py",
+                     "scripts/normalize-python-wheel.py", "scripts/check-python-api-sync.py",
+                     "scripts/normalize-python-sdist.py", "scripts/check-python-wheel.py",
+                     "scripts/stage-python-sdk.py", "scripts/prepare-python-sdk-release.py",
+                     "scripts/run-generated-sdk-post-merge-ci.py", "scripts/select-trusted-pr.jq",
+                     "scripts/test-python-sdk-release-tools.py",
+                     "scripts/test-python-release-preparation.py"):
+            path_tooling = python_sdk = True
+        elif matches(path, "scripts/generate-homebrew-formula.py", "scripts/test-homebrew-formula.py",
+                     "scripts/generate-installer.py", "scripts/test-installer.py"):
+            path_tooling = True
+        elif matches(path, "tests/real-ssh/*"):
+            pass
+        elif path == "scripts/setup.lock":
+            # Pinned tools run the Rust, SDK, conformance, and tooling tests.
+            native = python_sdk = path_tooling = shellcheck = mapping_docs = conformance = True
+        elif matches(path, "scripts/*", "deny.toml"):
+            path_tooling = True
+        elif matches(path, "*.md", "docs/*", ".github/ISSUE_TEMPLATE/*", ".github/dependabot.yml",
+                     "LICENSE", ".gitignore", ".claude/*"):
+            pass
+        else:
+            # Unknown inputs fail safe until their dependency boundary is explicit.
+            native = python_sdk = path_tooling = shellcheck = mapping_docs = conformance = True
+
+        if matches(path, ".github/workflows/*", "scripts/check-workflows.py"):
+            path_tooling_checks += ["workflows", "orchestration"]
+        elif matches(path, "Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
+            if not preparation_only:
+                path_tooling_checks.append("package")
+        elif matches(path, "scripts/test-cargo-package.py", "build.rs", "src/identity.rs",
+                     "tests/build_identity.rs"):
+            path_tooling_checks.append("package")
+        elif matches(path, "scripts/generate-installer.py", "scripts/test-installer.py"):
+            path_tooling_checks.append("installer")
+        elif matches(path, "scripts/try-benchmark*", "scripts/test-try-benchmark.py"):
+            path_tooling_checks.append("benchmark")
+        elif matches(path, "scripts/run-focused-check.py", "scripts/test-run-focused-check.py"):
+            path_tooling_checks.append("focused")
+        elif matches(path, "scripts/branch-status.py", "scripts/test-branch-status.py"):
+            path_tooling_checks.append("branch")
+        elif matches(path, "scripts/setup.sh", "scripts/test-setup.sh"):
+            path_tooling_checks.append("setup")
+        elif path == "scripts/setup.lock":
+            path_tooling_checks += ALL_TOOLING.split()
+        elif path == "scripts/verify-release-ci.py":
+            path_tooling_checks += ["release", "orchestration"]
+        elif matches(path, "scripts/test-release-tools.py", "scripts/package-release.py",
+                     "scripts/verify-crates-io-package.py", "scripts/verify-release-*",
+                     "scripts/generate-release-*", "scripts/sign-release-*"):
+            path_tooling_checks.append("release")
+        elif matches(path, "scripts/ci-scope.py", "scripts/*release-orchestration*",
+                     "scripts/release-preflight.py", "scripts/release-status.py",
+                     "scripts/release-readiness.py", "scripts/release-timings.py",
+                     "scripts/release_test_inputs.py", "scripts/release-tag-signers",
+                     "scripts/find-release-build.py", "scripts/nightly-ci.py",
+                     "scripts/test-release-readiness.py", "scripts/test-release-timings.py",
+                     "scripts/test-release-test-inputs.py", "scripts/test-find-release-build.py",
+                     "scripts/test-nightly-ci.py", "scripts/*generated-sdk-post-merge-ci.py"):
+            path_tooling_checks.append("orchestration")
+        elif path == "scripts/rsync-compat.py":
+            pass
+        elif matches(path, "scripts/*", "deny.toml"):
+            # Retain broad coverage for tooling whose ownership is not yet mapped,
+            # including the shared scripts/tooling.py module.
+            path_tooling_checks += ALL_TOOLING.split()
+        # Apply fallback to this path before combining it with other selections.
+        if path_tooling and not path_tooling_checks:
+            path_tooling_checks = ALL_TOOLING.split()
+        tooling_checks += path_tooling_checks
+
+    if not saw_path:
+        native = python_sdk = shellcheck = mapping_docs = conformance = True
+        tooling_checks = ALL_TOOLING.split()
+
+    # Sort and deduplicate so equivalent selections share a cancellation group.
+    checks = " ".join(sorted(set(tooling_checks)))
+    if checks:
+        tooling = True
+    if python_sdk:
+        sdks = True
+    return {
+        "tooling_checks": checks, "native": native, "sdks": sdks, "python_sdk": python_sdk,
+        "tooling": tooling, "shellcheck": shellcheck, "mapping_docs": mapping_docs,
+        "conformance": conformance, "macos": macos, "linux_arm64": linux_arm64,
+        "full_suite": full_suite,
+        # Canonicalize selections so equivalent changes share a cancellation group.
+        "integration_targets": " ".join(sorted(set(integration_targets))),
+    }
+
+
+if __name__ == "__main__":
+    sys.exit(exit_on_failure(main))

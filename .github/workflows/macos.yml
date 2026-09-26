@@ -1,6 +1,6 @@
 name: macOS suite
 
-# The complete native and SDK test suites, clippy, and release shell suites on
+# The complete native and SDK test suites, clippy, and release tooling suites on
 # macOS. Automated validation runs after merges to master and on demand, not
 # on pull requests.
 on:
@@ -139,7 +139,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          scope=$(scripts/ci-scope.sh "$GITHUB_EVENT_PATH")
+          scope=$(scripts/ci-scope.py "$GITHUB_EVENT_PATH")
           # ci-scope output is a machine-readable boolean contract.
           needed=false
           # Only explicit macOS changes select this platform after a merge.
@@ -223,7 +223,7 @@ jobs:
         run: |
           SYQ_CANDIDATE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           export SYQ_CANDIDATE_VERSION
-          scripts/test-python-sdk-release-tools.sh
+          scripts/test-python-sdk-release-tools.py
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
           export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
           RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
@@ -250,14 +250,14 @@ jobs:
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
       - name: Test interactive benchmark with system Bash
         run: python3 scripts/test-try-benchmark.py
-      - name: Release shell suites
+      - name: Release tooling suites
         run: |
           status=0
           for suite in \
-            scripts/test-release-tools.sh \
-            scripts/test-release-orchestration.sh \
-            scripts/test-installer.sh \
-            scripts/test-homebrew-formula.sh
+            scripts/test-release-tools.py \
+            scripts/test-release-orchestration.py \
+            scripts/test-installer.py \
+            scripts/test-homebrew-formula.py
           do
             echo "=== $suite"
             if ! "$suite"; then

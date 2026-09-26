@@ -39,7 +39,7 @@ jobs:
       - name: Compile and validate the source package once
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          scripts/prepare-release-crate.sh "v$version" "$RUNNER_TEMP/source-crate"
+          scripts/prepare-release-crate.py "v$version" "$RUNNER_TEMP/source-crate"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: source-crate

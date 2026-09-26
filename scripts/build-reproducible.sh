@@ -1,6 +1,7 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Build the host's standalone release artifact from the checked-in Nix lock.
-set -euo pipefail
+# POSIX sh: release runners on every platform run this without pinned tools.
+set -eu
 if [ "$#" -ne 1 ]; then
   echo "usage: $0 DIST_DIR" >&2
   exit 2
@@ -44,9 +45,11 @@ else
     echo 'Release executable unexpectedly links to the Nix store.' >&2
     exit 1
   fi
-  minimum=$(otool -l "$dist/$asset" | awk '$1 == "cmd" { command = $2 }
+  # Keep otool out of a pipeline so its failure stops the build.
+  otool -l "$dist/$asset" > "$work/load-commands"
+  minimum=$(awk '$1 == "cmd" { command = $2 }
     (command == "LC_BUILD_VERSION" && $1 == "minos") ||
-    (command == "LC_VERSION_MIN_MACOSX" && $1 == "version") { print $2 }')
+    (command == "LC_VERSION_MIN_MACOSX" && $1 == "version") { print $2 }' "$work/load-commands")
   if [ "$(uname -m)" = arm64 ]; then
     test "$minimum" = 11.0 || { echo "Expected macOS 11.0, got $minimum" >&2; exit 1; }
     codesign --verify "$dist/$asset"

@@ -88,19 +88,19 @@ class InputsTests(unittest.TestCase):
         head = self.prepare()
         event = self.root / '.git/event.json'
         event.write_text(json.dumps({'before': self.base, 'after': head}))
-        output = subprocess.check_output([SCRIPTS / 'ci-scope.sh', event], text=True)
+        output = subprocess.check_output([SCRIPTS / 'ci-scope.py', event], text=True)
         self.assertIn('native=false\n', output)
         Path('docs').mkdir()
         Path('docs/automation.md').write_text('updated executable example')
         event.write_text(json.dumps({'before': self.base, 'after': self.commit()}))
-        output = subprocess.check_output([SCRIPTS / 'ci-scope.sh', event], text=True)
+        output = subprocess.check_output([SCRIPTS / 'ci-scope.py', event], text=True)
         self.assertIn('native=false\n', output)
         self.assertIn('mapping_docs=true\n', output)
         self.assertIn('macos=false\n', output)
         p = Path('Cargo.toml')
         p.write_text(p.read_text().replace('example = "1.0"', 'example = "2.0"'))
         event.write_text(json.dumps({'before': self.base, 'after': self.commit()}))
-        output = subprocess.check_output([SCRIPTS / 'ci-scope.sh', event], text=True)
+        output = subprocess.check_output([SCRIPTS / 'ci-scope.py', event], text=True)
         self.assertIn('native=true\n', output)
 
     def test_certification_reuse_does_not_hide_newer_failure_or_pending_run(self):
@@ -133,7 +133,7 @@ else:
 ''')
         gh.chmod(0o755)
         env = {**os.environ, 'PATH': str(fakebin) + os.pathsep + os.environ['PATH'], 'BASE': self.base}
-        cmd = [SCRIPTS / 'verify-release-ci.sh', '--json', 'greaber/syq', head]
+        cmd = [SCRIPTS / 'verify-release-ci.py', '--json', 'greaber/syq', head]
         result = subprocess.run(cmd, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(all(w['evidence_commit'] == self.base for w in json.loads(result.stdout)['workflows']))
@@ -178,11 +178,11 @@ else:
         for page in ['docs/mappings.md', 'docs/automation.md', 'docs/commands/map.md']:
             paths = self.root / '.git/changed-paths'
             paths.write_text(page + '\n')
-            output = subprocess.check_output([SCRIPTS / 'ci-scope.sh'], text=True,
+            output = subprocess.check_output([SCRIPTS / 'ci-scope.py'], text=True,
                 env={**os.environ, 'SYQ_TEST_CHANGED_PATHS_FILE': str(paths)})
             self.assertIn('native=false\n', output)
             self.assertIn('mapping_docs=true\n', output)
-        output = subprocess.check_output([SCRIPTS / 'ci-scope.sh'], text=True,
+        output = subprocess.check_output([SCRIPTS / 'ci-scope.py'], text=True,
             env={**os.environ, 'SYQ_CI_DOCUMENTATION_ONLY':'true'})
         self.assertIn('native=false\n', output)
         self.assertIn('mapping_docs=true\n', output)

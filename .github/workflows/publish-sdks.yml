@@ -37,7 +37,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          scripts/verify-release-tag.sh \
+          scripts/verify-release-tag.py \
             "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" master sdks
       - name: Require Python tag version to match package
         if: startsWith(github.ref, 'refs/tags/sdk-python-v')

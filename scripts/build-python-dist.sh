@@ -1,6 +1,7 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Build exactly the Python artifacts used by publishing, without publishing.
-set -euo pipefail
+# POSIX sh: release runners on every platform run this without pinned tools.
+set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 dist=${1:?usage: scripts/build-python-dist.sh OUTPUT_DIRECTORY}
