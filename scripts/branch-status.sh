@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Report the state of the current task branch: the worktree, the branch's
-# pull request, and the latest post-merge CI runs on master. Its output is
-# what a status report or review request should state.
+# pull request, and the latest post-merge and nightly CI runs on master. Its
+# output is what a status report or review request should state.
 #
 # Fetches origin's master, since a local master branch is updated only by
 # manual pulls and says nothing about current master. Otherwise only reads git
@@ -9,7 +9,7 @@
 # clippy, unit tests) in this worktree.
 #
 # Exit status: 0 when nothing needs attention; 1 when master's latest
-# post-merge run failed, the GitHub head is stale or unrelated, or a --check
+# post-merge or nightly run failed, the GitHub head is stale or unrelated, or a --check
 # step failed or changed worktree status; 2 on usage/tooling errors or HEAD
 # moving during checks (stderr diagnostic, no report, even with --json).
 # Pull-request checks are reported but do not gate handoff or merging.
@@ -62,12 +62,12 @@ master_sha=$(git rev-parse "$master_ref")
 master_short=$(git rev-parse --short "$master_ref")
 read -r ahead_of_master behind_master < <(git rev-list --left-right --count "HEAD...$master_ref")
 
-# Latest post-merge run of each workflow on master.
-master_runs='[]'
-for workflow in "${workflows[@]}"; do
-  if ! runs=$(gh run list --repo "$repository" --workflow "$workflow" --branch master --event push --limit 1 \
+# Latest run of a workflow on master for one trigger; sets run and state.
+latest_run() {
+  local workflow=$1 event=$2 kind=$3 runs status conclusion
+  if ! runs=$(gh run list --repo "$repository" --workflow "$workflow" --branch master --event "$event" --limit 1 \
       --json headSha,status,conclusion,url,createdAt,databaseId); then
-    echo "could not list $workflow runs on master" >&2
+    echo "could not list $workflow $kind runs on master" >&2
     exit 2
   fi
   run=$(jq -c 'first // null' <<<"$runs")
@@ -79,12 +79,24 @@ for workflow in "${workflows[@]}"; do
   fi
   case "$state" in
     success) ;;
-    missing) warn "$workflow has no post-merge run on master" ;;
+    missing) warn "$workflow has no $kind run on master" ;;
     queued|in_progress|pending|waiting|requested) ;;
-    *) warn "master is red: $workflow $state at $(jq -r '.headSha[0:7]' <<<"$run") $(jq -r .url <<<"$run")" ;;
+    *) warn "master is red: $workflow $kind $state at $(jq -r '.headSha[0:7]' <<<"$run") $(jq -r .url <<<"$run")" ;;
   esac
-  master_runs=$(jq -c --arg workflow "$workflow" --arg state "$state" --argjson run "$run" \
-    '. + [{workflow:$workflow, state:$state, run:$run}]' <<<"$master_runs")
+}
+
+# Post-merge runs select checks from the changed paths, so a later success
+# need not rerun an earlier failure. The nightly run covers the full suite
+# whenever test inputs changed since its last success.
+master_runs='[]'
+for workflow in "${workflows[@]}"; do
+  latest_run "$workflow" push post-merge
+  push_run=$run push_state=$state
+  latest_run "$workflow" schedule nightly
+  master_runs=$(jq -c --arg workflow "$workflow" --arg state "$push_state" --argjson run "$push_run" \
+    --arg nightly_state "$state" --argjson nightly_run "$run" \
+    '. + [{workflow:$workflow, state:$state, run:$run, nightly:{state:$nightly_state, run:$nightly_run}}]' \
+    <<<"$master_runs")
 done
 
 # The pull request for this branch, if any.
@@ -206,17 +218,19 @@ else
 fi
 echo "Master:   $master_short from $master_ref (branch is ahead $ahead_of_master, behind $behind_master)"
 echo
-echo "Master CI (latest post-merge run per workflow):"
+echo "Master CI (latest post-merge run per workflow, then its latest nightly full suite):"
+print_run() {
+  local label=$1 state=$2 run=$3
+  if [ "$run" = null ]; then
+    printf '  %-16s %-12s (no run)\n' "$label" "$state"
+  else
+    printf '  %-16s %-12s %s  %s\n' "$label" "$state" "$(jq -r '.headSha[0:7]' <<<"$run")" "$(jq -r .url <<<"$run")"
+  fi
+}
 while IFS= read -r entry; do
   [ -n "$entry" ] || continue
-  workflow=$(jq -r .workflow <<<"$entry")
-  state=$(jq -r .state <<<"$entry")
-  if [ "$(jq -r .run <<<"$entry")" = null ]; then
-    printf '  %-16s %-12s (no run)\n' "$workflow" "$state"
-  else
-    printf '  %-16s %-12s %s  %s\n' "$workflow" "$state" \
-      "$(jq -r '.run.headSha[0:7]' <<<"$entry")" "$(jq -r .run.url <<<"$entry")"
-  fi
+  print_run "$(jq -r .workflow <<<"$entry")" "$(jq -r .state <<<"$entry")" "$(jq -c .run <<<"$entry")"
+  print_run '  nightly' "$(jq -r .nightly.state <<<"$entry")" "$(jq -c .nightly.run <<<"$entry")"
 done < <(jq -c '.[]' <<<"$master_runs")
 echo
 if [ "$pr" = null ]; then

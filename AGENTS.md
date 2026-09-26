@@ -158,11 +158,14 @@ the conversation instead.
   request, before asking for review, and before merging, and include its output
   in the report. It fetches `origin/master` and prints the branch SHA,
   cleanliness, and position relative to it, the pull request's GitHub head and
-  check results, and the latest post-merge `ci`, `rsync-compat`, and `macos`
-  runs on `master`. Pull requests do not start automated test workflows and
-  branch protection does not require test status contexts. Any pull-request
-  check results are informational. A red `master` run makes the script exit 1;
-  report it to the user even when the current task did not cause it. `--check`
+  check results, and the latest post-merge and nightly `ci`, `rsync-compat`,
+  and `macos` runs on `master`. Post-merge runs select checks by changed
+  paths, so a green one does not show that an earlier failure was fixed; the
+  nightly run executes the full suite when test inputs changed. Pull requests
+  do not start automated test workflows and branch protection does not require
+  test status contexts. Any pull-request check results are informational. A
+  red post-merge or nightly `master` run makes the script exit 1; report it to
+  the user even when the current task did not cause it. `--check`
   also runs the Rust baseline below, and `--json` prints the same facts for
   scripting.
 - Before removing a worktree or branch, require a clean worktree, no retained

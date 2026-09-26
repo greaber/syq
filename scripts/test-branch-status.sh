@@ -19,13 +19,15 @@ case "$1:$2" in
   run:list)
     shift 2
     workflow=
+    event=
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --workflow) workflow=$2; shift 2 ;;
+        --event) event=$2; shift 2 ;;
         *) shift ;;
       esac
     done
-    cat "$SYQ_TEST_RUNS_DIR/$workflow.json"
+    cat "$SYQ_TEST_RUNS_DIR/$workflow.$event.json"
     ;;
   pr:list)
     if [ "${SYQ_TEST_PR_JSON:-}" = FAIL ]; then
@@ -61,14 +63,19 @@ git init -q --bare -b master "$origin"
 git -C "$repo" push -q "$origin" master
 git -C "$repo" remote add origin "$origin"
 
+# Post-merge (push) runs by default; pass schedule for the nightly run.
 set_run() {
-  local workflow=$1 status=$2 conclusion=$3
-  jq -cn --arg sha "$master_sha" --arg status "$status" --arg conclusion "$conclusion" --arg workflow "$workflow" \
+  local workflow=$1 status=$2 conclusion=$3 event=${4:-push}
+  jq -cn --arg sha "$master_sha" --arg status "$status" --arg conclusion "$conclusion" \
+    --arg url "https://example.invalid/$workflow/$event" \
     '[{headSha:$sha, status:$status, conclusion:(if $conclusion == "" then null else $conclusion end),
-       url:("https://example.invalid/" + $workflow), createdAt:"2026-01-01T00:00:00Z", databaseId:1}]' \
-    > "$runs_dir/$workflow.json"
+       url:$url, createdAt:"2026-01-01T00:00:00Z", databaseId:1}]' \
+    > "$runs_dir/$workflow.$event.json"
 }
-for workflow in ci.yml rsync-compat.yml macos.yml; do set_run "$workflow" completed success; done
+for workflow in ci.yml rsync-compat.yml macos.yml; do
+  set_run "$workflow" completed success
+  set_run "$workflow" completed success schedule
+done
 
 pr_json_for_run=
 run_status() {
@@ -176,7 +183,7 @@ expect_no_output WARNING
 set_run macos.yml completed failure
 expect_exit 1 run_status
 expect_output 'macos.yml        failure'
-expect_output "WARNING: master is red: macos.yml failure at ${master_sha:0:7} https://example.invalid/macos.yml"
+expect_output "WARNING: master is red: macos.yml post-merge failure at ${master_sha:0:7} https://example.invalid/macos.yml/push"
 
 # A run still in progress is neither green nor an alert.
 set_run macos.yml in_progress ''
@@ -184,6 +191,23 @@ expect_exit 0 run_status
 expect_output 'macos.yml        in_progress'
 expect_no_output WARNING
 set_run macos.yml completed success
+
+# A green post-merge run can skip checks that the red nightly full suite ran.
+set_run rsync-compat.yml completed failure schedule
+expect_exit 1 run_status
+expect_output 'rsync-compat.yml success'
+expect_output "  nightly        failure      ${master_sha:0:7}  https://example.invalid/rsync-compat.yml/schedule"
+expect_output "WARNING: master is red: rsync-compat.yml nightly failure at ${master_sha:0:7}"
+expect_exit 1 run_status --json
+jq -e '.master_ci[1].state == "success" and .master_ci[1].nightly.state == "failure"
+  and .exit_status == 1' "$work/out" >/dev/null
+
+# A nightly run in progress is not an alert either.
+set_run rsync-compat.yml in_progress '' schedule
+expect_exit 0 run_status
+expect_output '  nightly        in_progress'
+expect_no_output WARNING
+set_run rsync-compat.yml completed success schedule
 
 # Master comes from a fresh fetch, not a stale local branch or tracking ref.
 git -C "$repo" push -q origin "$previous_sha:refs/heads/master"
@@ -214,6 +238,7 @@ jq -e --arg head "$head_sha" --arg master "$master_sha" '
   .worktree.branch == "task" and .worktree.head == $head and .worktree.clean == true
   and .worktree.master == $master and .worktree.ahead_of_master == 2 and .worktree.behind_master == 0
   and (.master_ci | map(.state)) == ["success", "success", "success"]
+  and (.master_ci | map(.nightly.state)) == ["success", "success", "success"]
   and .pull_request.number == 7 and .pull_request_head == "matches"
   and .warnings == [] and .exit_status == 0' "$work/out" >/dev/null
 set_run ci.yml completed failure
