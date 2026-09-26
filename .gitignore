@@ -1,5 +1,4 @@
 /target
-/sdk/js/node_modules/
 /sdk/python/.venv/
 /sdk/python/src/*.egg-info/
 __pycache__/

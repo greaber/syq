@@ -37,7 +37,7 @@ assert_scope() {
 }
 
 scope_keys=(
-  native sdks python_sdk javascript_sdk go_sdk tooling shellcheck mapping_docs
+  native sdks python_sdk tooling shellcheck mapping_docs
   conformance macos linux_arm64 full_suite
 )
 
@@ -46,7 +46,6 @@ for path in \
   README.md \
   sdk/README.md sdk/RELEASING.md \
   sdk/python/README-PYTHON.md sdk/python/NATIVE_API.md sdk/python/API_DESIGN.md \
-  sdk/js/README.md sdk/go/README.md \
   book.toml theme/head.hbs theme/docs.css theme/copy-demo.js \
   .agents/skills/syq-release/SKILL.md \
   .agents/skills/syq-release/agents/openai.yaml
@@ -73,20 +72,6 @@ scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" native false
 assert_scope "$scope" sdks true
 assert_scope "$scope" python_sdk true
-assert_scope "$scope" javascript_sdk false
-assert_scope "$scope" go_sdk false
-printf 'sdk/js/src/index.js\n' >"$paths"
-scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-assert_scope "$scope" sdks true
-assert_scope "$scope" python_sdk false
-assert_scope "$scope" javascript_sdk true
-assert_scope "$scope" go_sdk false
-printf 'sdk/go/client.go\n' >"$paths"
-scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-assert_scope "$scope" sdks true
-assert_scope "$scope" python_sdk false
-assert_scope "$scope" javascript_sdk false
-assert_scope "$scope" go_sdk true
 printf 'sdk/python/native-api.json\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" native true
@@ -143,7 +128,7 @@ assert_scope "$scope" native false
 printf '.github/workflows/ci.yml\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
-for key in native sdks python_sdk javascript_sdk go_sdk shellcheck mapping_docs conformance macos linux_arm64 full_suite; do
+for key in native sdks python_sdk shellcheck mapping_docs conformance macos linux_arm64 full_suite; do
   assert_scope "$scope" "$key" false
 done
 printf '.github/workflows/rsync-compat.yml\n' >"$paths"
@@ -160,7 +145,7 @@ assert_scope "$scope" native false
 # Pinned tool versions run everything that uses those tools.
 printf 'scripts/setup.lock\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-for key in native sdks python_sdk javascript_sdk go_sdk tooling shellcheck mapping_docs conformance; do
+for key in native sdks python_sdk tooling shellcheck mapping_docs conformance; do
   assert_scope "$scope" "$key" true
 done
 assert_scope "$scope" tooling_checks 'benchmark branch focused installer orchestration package release setup workflows'
@@ -182,7 +167,7 @@ assert_scope "$scope" native true
 assert_scope "$scope" sdks true
 assert_scope "$scope" python_sdk true
 assert_scope "$scope" shellcheck true
-for key in javascript_sdk go_sdk tooling mapping_docs conformance macos linux_arm64 full_suite; do
+for key in tooling mapping_docs conformance macos linux_arm64 full_suite; do
   assert_scope "$scope" "$key" false
 done
 
@@ -247,7 +232,7 @@ jq -n --arg before "$scope_head" --arg after "$advanced_base" \
   '{before:$before,after:$after}' >"$push_event"
 scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$push_event")
 assert_scope "$scope" native true
-for key in sdks python_sdk javascript_sdk go_sdk conformance macos linux_arm64 full_suite; do
+for key in sdks python_sdk conformance macos linux_arm64 full_suite; do
   assert_scope "$scope" "$key" false
 done
 
@@ -337,7 +322,7 @@ scope=$(cd "$scope_repo" && \
 assert_scope "$scope" native false
 assert_scope "$scope" sdks true
 assert_scope "$scope" python_sdk true
-for key in javascript_sdk go_sdk tooling shellcheck mapping_docs conformance macos linux_arm64 full_suite; do
+for key in tooling shellcheck mapping_docs conformance macos linux_arm64 full_suite; do
   assert_scope "$scope" "$key" false
 done
 expect_failure 'is not checked out' env \
@@ -749,19 +734,15 @@ printf '%s\n' tests/support/temp.rs >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" integration_targets all
 
-# Only affected languages become matrix jobs; the no-work case keeps one stub.
-for language in python javascript go; do
-  directory=$language
-  [ "$language" != javascript ] || directory=js
-  printf '%s\n' "sdk/$directory/source" >"$paths"
-  scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-  assert_scope "$scope" sdk_matrix "[\"$language\"]"
-done
+# The SDK matrix runs Python when it is affected; the no-work case keeps one stub.
+printf '%s\n' sdk/python/source >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" sdk_matrix '["python"]'
 printf '%s\n' src/main.rs >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" sdk_matrix '["none"]'
 scope=$("$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
-assert_scope "$scope" sdk_matrix '["python","javascript","go"]'
+assert_scope "$scope" sdk_matrix '["python"]'
 
 # Tooling changes select their own suites, without product builds.
 for fixture in \

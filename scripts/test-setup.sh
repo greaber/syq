@@ -31,7 +31,7 @@ awk '
   }
   $5 == "uv" && $4 != "-" { printf "line %d: uv installs need no sha256\n", NR; bad = 1 }
   $5 != "uv" && (length($4) != 64 || $4 ~ /[^0-9a-f]/) { printf "line %d: invalid sha256\n", NR; bad = 1 }
-  $5 != "uv" && $5 !~ "^https://(github[.]com/(koalaman/shellcheck|jqlang/jq|rust-lang/mdBook|astral-sh/uv)/releases/download/|nodejs[.]org/dist/|go[.]dev/dl/)" {
+  $5 != "uv" && $5 !~ "^https://(github[.]com/(koalaman/shellcheck|jqlang/jq|rust-lang/mdBook|astral-sh/uv)/releases/download/|nodejs[.]org/dist/)" {
     printf "line %d: unexpected download location\n", NR; bad = 1
   }
   {

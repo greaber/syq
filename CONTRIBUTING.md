@@ -15,8 +15,8 @@ eval "$(scripts/setup.sh env)"
 
 `scripts/setup.sh` checks those prerequisites, installs the Rust toolchain
 from `rust-toolchain.toml` with rustfmt and clippy, and installs the tools
-pinned in `scripts/setup.lock`: ShellCheck, jq, mdBook, uv, Python, Node.js,
-and Go. Downloads are checked against the pinned SHA-256 sums; uv installs
+pinned in `scripts/setup.lock`: ShellCheck, jq, mdBook, uv, Python, and
+Node.js. Downloads are checked against the pinned SHA-256 sums; uv installs
 Python using the checksums built into the pinned uv. Tools are kept in
 `~/.cache/syq/tools` (or
 `$XDG_CACHE_HOME/syq/tools`) and shared by every checkout; set
@@ -24,8 +24,7 @@ Python using the checksums built into the pinned uv. Tools are kept in
 only what is missing.
 
 The `eval` line puts the pinned tools first on `PATH` in the current shell;
-repeat it in each new shell. It also sets `UV_PYTHON` to the pinned Python and
-`GOTOOLCHAIN=local` so Go does not download a different toolchain. Pass tool
+repeat it in each new shell. It also sets `UV_PYTHON` to the pinned Python. Pass tool
 names to select only some of them, for example `scripts/setup.sh env python jq`.
 CI runs the same script.
 

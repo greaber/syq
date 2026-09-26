@@ -235,14 +235,11 @@ fi
 
 path=
 uv_python=
-go_toolchain=
 for tool in "$@"; do
   directory=$(bin_directory "$tool")
   path=$path$directory:
   case "$tool" in
     python) uv_python=$directory/python3 ;;
-    # Fail instead of silently downloading a different Go toolchain.
-    go) go_toolchain=local ;;
   esac
 done
 
@@ -259,9 +256,6 @@ EOF
     if [ -n "$uv_python" ]; then
       printf 'export UV_PYTHON=%s\n' "$(shell_quote "$uv_python")"
     fi
-    if [ -n "$go_toolchain" ]; then
-      printf 'export GOTOOLCHAIN=%s\n' "$go_toolchain"
-    fi
     ;;
   github)
     [ -n "${GITHUB_PATH:-}" ] && [ -n "${GITHUB_ENV:-}" ] ||
@@ -269,9 +263,6 @@ EOF
     for tool in "$@"; do bin_directory "$tool" >> "$GITHUB_PATH"; done
     if [ -n "$uv_python" ]; then
       printf 'UV_PYTHON=%s\n' "$uv_python" >> "$GITHUB_ENV"
-    fi
-    if [ -n "$go_toolchain" ]; then
-      printf 'GOTOOLCHAIN=%s\n' "$go_toolchain" >> "$GITHUB_ENV"
     fi
     ;;
 esac

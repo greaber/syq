@@ -23,7 +23,7 @@ release and ends on completion or cancellation.
 
 Default destinations are the syq GitHub release, crates.io, Homebrew, and the
 matching Python SDK on PyPI. Python preparation and publication are required
-phases of the same release; JavaScript and Go SDK releases remain separate.
+phases of the same release.
 Preserve protections and secret boundaries. Report concrete credential,
 required-review, or product-decision blockers; do not bypass them.
 
