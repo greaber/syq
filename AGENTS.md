@@ -504,9 +504,11 @@ arguments or add follow flags merely to make a fixture pass.
 
 Pre-merge validation should provide proportionate confidence in the change,
 not duplicate the post-merge suites or full release validation. Occasional
-temporary breakage on `master` is accepted to avoid repeatedly paying for
-broad checks on narrow changes; `master` is not a published release. Use that
-tradeoff when selecting checks, while giving
+temporary breakage on `master` is accepted so that narrow changes do not wait
+on broad checks and development keeps moving; `master` is not a published
+release. Nightly runs, which include both local suites below, catch much of
+what narrower pre-merge checks miss, usually within a day. Use that tradeoff
+when selecting checks, while giving
 potential data loss, authorization, and compatibility failures the targeted
 coverage their consequences warrant. Keep the release validation gates intact.
 When CI fails, first distinguish product defects from test, fixture, and runner
@@ -545,7 +547,7 @@ holds the shared helpers and `tests/local/<topic>.rs` the tests, named
 `<topic>::<test>`); those tests invoke the built binary against temporary trees. Run `cargo test --locked --all-targets` before
 handoff when a change is broad, crosses subsystem boundaries, changes shared
 test infrastructure, or leaves meaningful uncertainty about the affected
-surface. Do not run unrelated suites merely because they exist.
+surface.
 
 For one exact Rust unit test, use
 `cargo test --locked --bin syq 'module::tests::name' -- --exact`; for an
@@ -597,23 +599,32 @@ platform. It does not produce full-suite release certification. Monitor the
 returned run with `gh run watch <run-id> --exit-status`. Leaving `test_name`
 empty selects the full workflow; use that only when broad validation is needed.
 
-Run the three-container OpenSSH suite when changes materially affect
-connection setup, helper bootstrap, authentication or authorization, remote
-process lifecycle, transport behavior, or remote coordinator placement:
+Two local suites cover behavior that the Rust targets cannot reach:
 
 ```bash
 scripts/test-real-ssh.py
+scripts/test-s3.py
 ```
 
-It is not part of `cargo test` or post-merge CI; full nightly and manual
-`ci.yml` runs include it and `scripts/test-s3.sh`. See
-`tests/real-ssh/README.md` for its isolation and coverage.
+- `scripts/test-real-ssh.py` runs the candidate build through live OpenSSH
+  clients and servers in three containers. See `tests/real-ssh/README.md` for
+  its isolation and coverage.
+- `scripts/test-s3.py` runs against a disposable local S3 server in Docker and
+  takes about a minute after the build. It covers S3 upload, download, and
+  server copy, expressions, directory markers, pruning, streams, and listing.
 
-Choose this check by behavioral impact, not merely by which file changed.
+Run a local suite when its scenarios exercise the behavior you changed. Decide
+from the suite's scenarios, not from which files changed: copy planning,
+expression and selection semantics, directory creation, and restricted-receiver
+behavior reach both suites even when no SSH or S3 code changed. When a suite is
+relevant, run all of it at the final commit before handoff. Its cases interact,
+so hand-picked cases can miss regressions. Neither suite is part of `cargo test` or post-merge CI; full nightly
+and manual `ci.yml` runs include both.
+
 Small review fixes to diagnostics, documentation, or isolated validation checks
 can use focused tests when those tests adequately exercise the change. Batch
 related fixes before running the full suite. After a successful run, inspect
-the intervening changes before repeating it; rerun when they affect the SSH
+the intervening changes before repeating it; rerun when they affect the suite's
 scenarios or leave meaningful uncertainty that focused tests cannot resolve.
 Report the SHA of the last successful full run, the checks on the current SHA,
 and why a repeat was unnecessary. Do not describe an earlier run as testing the
@@ -623,7 +634,8 @@ evidence rules under release tag lifecycle.
 Pull requests do not start automated test workflows. The agent remains
 responsible for selecting checks under the rules above, choosing integration tests,
 and reporting exactly what was and was not verified before review. Post-merge
-workflows select affected areas; nightly runs execute the complete
-suites when test inputs have changed. Full validation remains required before
+workflows select affected areas and do not run the local suites; nightly runs
+execute the complete suites, including both local suites, when test inputs
+have changed. Full validation remains required before
 release. Pay particular attention to remote, TCP, platform-specific,
 and performance behavior when choosing local checks.
