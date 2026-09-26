@@ -64,11 +64,13 @@ def check():
         checks.request('PUT', prefix + '/nested/', b'')
         marker_copy = checks.PREFIX + '/markers'
         marker_predicate = "src.kind = 'dir' and src.name = 'nested' and src.path = 'nested'"
+        # --where selects directories too, so admit only the marker and let
+        # --copy-if decide it independently of the objects beneath it.
         checks.run(['--from', remote, '--srcs-in', prefix, '--to', remote, '--into', marker_copy,
-                    '--where', 'false', '--copy-if', marker_predicate])
+                    '--where', "src.kind = 'dir'", '--copy-if', marker_predicate])
         assert set(checks.listing(marker_copy + '/')) == {marker_copy + '/nested/'}
         checks.run(['--from', remote, '--srcs-in', prefix, '--into', root / 'marker-download',
-                    '--where', 'false', '--copy-if', marker_predicate])
+                    '--where', "src.kind = 'dir'", '--copy-if', marker_predicate])
         assert (root / 'marker-download/nested').is_dir()
         assert not (root / 'marker-download/nested/keep').exists()
         # Provider objects have no Unix owner metadata; test null deliberately.
