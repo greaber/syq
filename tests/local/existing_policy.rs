@@ -204,3 +204,36 @@ fn previous_partials_are_used_only_with_resume() {
         );
     }
 }
+
+#[test]
+fn resume_accepts_a_previously_created_new_root_and_completed_leaves() {
+    for placement in ["--as-new", "--into-new"] {
+        let t = Tmp::new();
+        write(&t.path("src/nested/completed"), b"already copied");
+        write(&t.path("src/remaining"), b"not yet copied");
+        let relative = if placement == "--as-new" {
+            "dst"
+        } else {
+            "dst/src"
+        };
+        write(
+            &t.path(&format!("{relative}/nested/completed")),
+            b"already copied",
+        );
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let mut command = vec!["cp", &src, placement, &dst, "--if-exists=error"];
+        assert!(!native_syq(&command).status.success());
+        command.push("--resume");
+        let output = native_syq(&command);
+        assert_output_ok(&output);
+        assert_eq!(
+            read(&t.path(&format!("{relative}/nested/completed"))),
+            b"already copied"
+        );
+        assert_eq!(
+            read(&t.path(&format!("{relative}/remaining"))),
+            b"not yet copied"
+        );
+    }
+}
