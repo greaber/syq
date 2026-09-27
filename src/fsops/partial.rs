@@ -243,6 +243,9 @@ impl FsOps {
     /// Bounded, best-effort discovery using equality on the readable prefix.
     /// A truncated prefix is currently indistinguishable from a full basename.
     pub(super) fn candidate_partials(&mut self, target: &RootedTarget) -> Vec<PathBytes> {
+        if !self.reuse_partials {
+            return Vec::new();
+        }
         let label = target.relative.to_path_buf();
         let parent = label.parent().unwrap_or_else(|| Path::new(""));
         let basename = label.file_name().unwrap_or_default().as_bytes();
@@ -1917,8 +1920,9 @@ impl FsOps {
                     Response::Ok
                 })
             }
-            Request::ConfigureHashing(policy) => {
+            Request::ConfigureHashing { policy, resume } => {
                 self.hash_policy = *policy;
+                self.reuse_partials = *resume;
                 Ok(Response::Ok)
             }
             Request::ValidateDigest {

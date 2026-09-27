@@ -774,9 +774,10 @@ class NativeClientTests(unittest.TestCase):
         )
 
     def test_copy_metadata_and_existing_policy(self) -> None:
-        self.client.cp(src="source", into="target", copy_metadata=["permissions", "mtime"], if_exists="update")
+        self.client.cp(src="source", into="target", copy_metadata=["permissions", "mtime"], if_exists="update", resume=True)
         self.assertIn("--copy-metadata", self.argv())
         self.assertIn("--if-exists=update", self.argv())
+        self.assertIn("--resume", self.argv())
         with self.assertRaises(syq.SyqInvocationError):
             self.client.cp(src="source", into="target", copy_metadata="-mtime")
 

@@ -996,7 +996,10 @@ pub enum WireRequest<Data> {
         guard: Option<ContainerGuard>,
     },
     // Append new variants: released completion payloads retain their indexes.
-    ConfigureHashing(crate::hashing::HashPolicy),
+    ConfigureHashing {
+        policy: crate::hashing::HashPolicy,
+        resume: bool,
+    },
     ValidateDigest {
         path: PathBytes,
         expected: crate::hashing::ExpectedHashes,
@@ -1160,7 +1163,7 @@ impl Request {
     pub(crate) fn allowed_on_source_worker(&self) -> bool {
         matches!(
             self,
-            Request::ConfigureHashing(_)
+            Request::ConfigureHashing { .. }
                 | Request::ConfigurePreservation { .. }
                 | Request::Scan { .. }
                 | Request::StatMany { .. }

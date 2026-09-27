@@ -214,6 +214,7 @@ fn hash_policy_expected_hash_covers_resumed_bytes_after_algorithm_change() {
     );
     run_native_ok(&[
         "cp",
+        "--resume",
         "--mapping",
         &super::hashing::expected_mapping(&t, "source", "destination", Some(&expected)),
         "-C",

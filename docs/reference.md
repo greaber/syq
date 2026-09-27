@@ -252,15 +252,16 @@ Ignored paths are also protected from pruning.
 
 ## Resume an interrupted copy
 
-Rerunning a copy can reuse completed files and matching parts of interrupted
-files. Placement conditions and `--if-exists` apply on every run. A `-new`
-placement or `--if-exists=error` can therefore prevent a retry once entries have
-been created. Partial-file resume is independent of
+Rerun the same command with `--resume`. Syq accepts completed files and can reuse
+matching parts of interrupted files. Ordinary copies do not search for earlier
+partials or prepare S3 recovery checkpoints. With `--resume`, S3 copies also save
+checkpoints for another interruption; an unfinished object without a checkpoint
+restarts. Partial-file resume is independent of
 [`block-reuse`](tuning.md#compare-block-reuse-with-full-replacement), which controls
 comparison against an existing final destination. Unless `--inplace` is selected,
 syq assembles each updated file beside the destination and replaces it when
 complete. With `--inplace`, interrupted bytes are in the final file itself.
-With the default existing-file policy, a retry rejects a differing final file:
+With the default existing-file policy, `--resume` rejects a differing final file:
 it cannot distinguish incomplete output from a pre-existing file that must remain
 untouched. Changing to `--if-exists=update` authorizes updates to all differing
 selected files; it does not preserve the original policy. Reusing matching parts

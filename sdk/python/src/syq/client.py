@@ -637,6 +637,7 @@ def _copy_arguments(
     dry_run: bool,
     hash: bool,
     if_exists: str | None,
+    resume: bool,
     only_existing: bool,
     no_compress: bool,
     resource_limits: str | None,
@@ -736,6 +737,8 @@ def _copy_arguments(
     if command == "cp":
         if if_exists is not None:
             argv.append(f"--if-exists={if_exists}")
+        if resume:
+            argv.append("--resume")
     if only_existing:
         argv.append("--only-existing")
     if no_compress:
@@ -1238,6 +1241,7 @@ class Client:
         hash: bool = False,
         integrity_checking: str | None = None,
         if_exists: str | None = None,
+        resume: bool = False,
         only_existing: bool = False,
         where: str | None = None,
         copy_if: str | None = None,
@@ -1318,6 +1322,7 @@ class Client:
             hash=hash,
             integrity_checking=integrity_checking,
             if_exists=if_exists,
+            resume=resume,
             only_existing=only_existing,
             where=where,
             copy_if=copy_if,
@@ -1543,6 +1548,7 @@ class Client:
             dry_run=False,
             hash=False,
             if_exists=None,
+            resume=False,
             only_existing=False,
             no_compress=False,
             resource_limits=None,

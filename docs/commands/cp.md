@@ -63,6 +63,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Accept matching contents; report an error for different contents<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Update only when the destination is strictly older; keep ties<br><br>[default: error-if-different] |
+| `--resume` | Resume an interrupted copy and save recovery checkpoints where supported |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
@@ -175,9 +176,9 @@ files inside it. `--if-exists=keep` can add children to an existing directory, b
 does not change that directory's permissions to make it writable.
 
 `--if-exists=keep` and `update-if-older` cannot combine with `--inplace`: an
-interrupted write could leave a file that a retry skips. The default policy
-rejects differing final contents, including incomplete output from an interrupted
-in-place copy. Changing to `--if-exists=update`
+interrupted write could leave a file that a retry skips. With the default policy,
+`--resume` rejects a differing final file because it cannot distinguish incomplete
+output from a protected pre-existing file. Changing to `--if-exists=update`
 authorizes updates to all differing selected files. Restricted receivers also
 reject `--as-new --inplace`, because direct writes do not enforce that destination
 condition. S3 and named receiving destinations do not support `--inplace`; see
@@ -220,11 +221,10 @@ replace an entry safely; the old entry is kept.
 ## Copying and failures
 
 Syq can copy files while it scans the source. If scanning or copying fails,
-completed files remain and the command reports failure. A retry can reuse
-completed files and recoverable partials. Placement conditions and the selected
-existing-file policy still apply: a `-new` placement or `--if-exists=error` can
-reject entries created by the earlier attempt. See
-[resuming a copy](../reference.md#resume-an-interrupted-copy).
+completed files remain and the command reports failure. Retry with `--resume` to reuse
+completed files and recoverable partials. Completed files are accepted even with
+`--if-exists=error`, and a `-new` placement root created by the earlier attempt
+may already exist. Keep the original source, destination, and other options.
 
 ## Metadata details
 

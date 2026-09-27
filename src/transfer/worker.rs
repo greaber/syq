@@ -51,8 +51,8 @@ impl Worker {
 
     pub(super) fn run(&mut self) -> Result<()> {
         let r = (|| {
-            configure_hashing(&mut *self.src, self.opts.hash_policy)?;
-            configure_hashing(&mut *self.dst, self.opts.hash_policy)?;
+            configure_hashing(&mut *self.src, self.opts.hash_policy, self.opts.resume)?;
+            configure_hashing(&mut *self.dst, self.opts.hash_policy, self.opts.resume)?;
             if self.progress.observations.enabled.load(Relaxed) {
                 let actor = self.progress.observations.workers.actor("worker");
                 self.src

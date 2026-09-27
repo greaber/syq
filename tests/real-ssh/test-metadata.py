@@ -174,7 +174,7 @@ def failed_copies():
                     metadata(source / 'file', b'after failure')
                     retry = command.copy()
                     retry[retry.index('--syq-path') + 1] = '/usr/local/bin/syq'
-                    subprocess.run(retry, check=True, timeout=60, env=env)
+                    subprocess.run([*retry, "--resume"], check=True, timeout=60, env=env)
                     verify(source, destination)
             print(f'case: {label} interrupted metadata copy resumes', flush=True)
             metadata(source / 'file', b'before interruption')
@@ -217,7 +217,7 @@ print(any(f.open('rb').read(4 << 20) == {data[:256]!r} * (4 * 4096) for f in p.g
             assert not {'file', 'alias'} & snapshot(destination).keys()
             metadata(source / 'file', b'after interruption')
             results = Path(temporary) / (label + '.ndjson')
-            subprocess.run([*command, '--results', str(results)], check=True, timeout=60, env=env)
+            subprocess.run([*command, '--resume', '--results', str(results)], check=True, timeout=60, env=env)
             terminal = json.loads(results.read_text().splitlines()[-1])
             assert terminal['status'] == 'success', terminal
             assert 0 < terminal['bytes_transferred'] < len(data), terminal

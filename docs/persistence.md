@@ -31,7 +31,7 @@ connections, with `syq persist off`.
 
 Receiving reconnects after a network interruption or laptop sleep; other SSH
 connections reopen on their next use. An interrupted copy still needs to be
-rerun to resume. After rebooting, run `syq persist connect server` again.
+rerun with `--resume` to recover partial work. After rebooting, run `syq persist connect server` again.
 
 See [Persistence details](persistence-reference.md) for troubleshooting,
 upgrading, and isolated connections for scripts, or [`syq persist`](commands/persist.md)

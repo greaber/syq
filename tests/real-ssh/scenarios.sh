@@ -553,7 +553,7 @@ fi
 return_copy_pid=
 test ! -e "$receive_root/interrupted"
 ssh source 'syq persist destinations wait laptop --timeout 30'
-ssh source 'SYQ_TEST_REQUIRE_TCP=1 syq cp /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted'
+ssh source 'SYQ_TEST_REQUIRE_TCP=1 syq cp --resume /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted'
 ssh source 'cat /tmp/syq-real-ssh/return-source/resume.bin' | cmp - "$receive_root/interrupted"
 test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*' | wc -l)" -eq 1
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-reconnect'

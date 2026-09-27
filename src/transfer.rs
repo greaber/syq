@@ -134,6 +134,7 @@ pub struct Opts {
     local_copy_fd_budget: bool,
     pub flags: u8,
     pub matching_flags: u8,
+    pub resume: bool,
     pub if_exists: Option<crate::cli::IfExists>,
     pub recursive: bool,
     pub links: bool,
@@ -218,7 +219,13 @@ impl Opts {
     }
 
     fn file_difference_message(&self, path: &str) -> String {
-        format!("destination contents differ: {path} (--if-exists=error-if-different)")
+        if self.resume && self.inplace {
+            format!(
+                "cannot resume {path} under the selected existing-file policy: syq cannot distinguish an incomplete in-place output from a pre-existing file that must remain untouched"
+            )
+        } else {
+            format!("destination contents differ: {path} (--if-exists=error-if-different)")
+        }
     }
 
     fn inode_metadata_differs(&self, path: &[u8], source: &Entry, destination: &Entry) -> bool {
@@ -427,6 +434,7 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
             transfer_integrity: args.transfer_integrity,
             transfer_hash_type: args.transfer_hash_type,
         },
+        args.resume || args.interface == Interface::Rsync,
     )?;
     configure_preservation(
         &mut *connection,
@@ -462,9 +470,13 @@ fn configure_preservation(
     Ok(())
 }
 
-fn configure_hashing(connection: &mut dyn Conn, policy: crate::hashing::HashPolicy) -> Result<()> {
+fn configure_hashing(
+    connection: &mut dyn Conn,
+    policy: crate::hashing::HashPolicy,
+    resume: bool,
+) -> Result<()> {
     ok(
-        connection.call(Request::ConfigureHashing(policy))?,
+        connection.call(Request::ConfigureHashing { policy, resume })?,
         "configure hashing",
     )?;
     Ok(())
@@ -823,7 +835,7 @@ fn attempt_small_copy(
                     len: entry.size as u32,
                 })
                 .collect();
-            configure_hashing(&mut *reader, opts.hash_policy)?;
+            configure_hashing(&mut *reader, opts.hash_policy, opts.resume)?;
             if let Some(actor) = &native_actor {
                 if reader
                     .observe(&progress.observations, actor, true, 0)
@@ -1658,6 +1670,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .then(|| Mutex::new(crate::transfer_tuning::BenchmarkStats::default())),
         flags: args.meta_flags(),
         matching_flags: args.matching_meta_flags(),
+        resume: args.resume || args.interface == Interface::Rsync,
         if_exists: args.if_exists,
         recursive: args.recursive,
         links: args.links,
@@ -2219,7 +2232,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 print_benchmark_observations(&opts);
                 return Ok(code);
             }
-            SmallCopy::Declined => configure_hashing(&mut *dst_ctl, opts.hash_policy)?,
+            SmallCopy::Declined => configure_hashing(&mut *dst_ctl, opts.hash_policy, opts.resume)?,
             SmallCopy::Reconnect => dst_ctl = connect_ctl(&dst_ep, &args)?,
         }
     }

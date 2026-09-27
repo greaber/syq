@@ -126,7 +126,7 @@ def assert_comparison(path, *, changed, unchanged):
 
 def interrupted(args, threshold=5*1024*1024):
     reader, writer = os.pipe()
-    command=[SYQ,'cp','--no-progress','--results-fd',str(writer),'--performance-tuning=s3-part-size=5M,s3-parts-per-object=1,s3-retries=1','--resource-limits=bandwidth=1MiB']
+    command=[SYQ,'cp','--resume','--no-progress','--results-fd',str(writer),'--performance-tuning=s3-part-size=5M,s3-parts-per-object=1,s3-retries=1','--resource-limits=bandwidth=1MiB']
     for name,value in HEADERS.items(): command+=['--s3-header',name+': '+value]
     process=subprocess.Popen(command+list(map(str,args)),stdout=subprocess.DEVNULL,stderr=None,pass_fds=(writer,),start_new_session=True)
     os.close(writer)
@@ -296,7 +296,7 @@ def check():
         _, parts=request('GET', upload_key, query={'uploadId': upload_id})
         assert b'<Part>' in parts, 'interrupted upload has no completed parts'
         result_file=root/'upload-result.jsonl'
-        run([src/'large','--to',remote,'--as',upload_key,'--results',result_file])
+        run(['--resume',src/'large','--to',remote,'--as',upload_key,'--results',result_file])
         terminal=json.loads(result_file.read_text().splitlines()[-1])
         assert terminal['bytes_transferred'] < (src/'large').stat().st_size, terminal
         _, body=request('GET',upload_key)
@@ -305,7 +305,7 @@ def check():
         interrupted(['--from',remote,upload_key,'--as',download_path])
         assert not download_path.exists(), 'partial download became visible at final name'
         result_file=root/'download-result.jsonl'
-        run(['--from',remote,upload_key,'--as',download_path,'--results',result_file])
+        run(['--resume','--from',remote,upload_key,'--as',download_path,'--results',result_file])
         terminal=json.loads(result_file.read_text().splitlines()[-1])
         assert terminal['bytes_transferred'] < (src/'large').stat().st_size, terminal
         assert download_path.read_bytes()==(src/'large').read_bytes()
@@ -317,7 +317,7 @@ def check():
         OWNED_UPLOADS.add((expired_key, expired_id))
         request('DELETE', expired_key, query={'uploadId': expired_id})
         os.utime(src / 'large', ns=(1_500_000_000_000000000, 1_500_000_000_000000000))
-        run([src / 'large', '--to', remote, '--as', expired_key])
+        run(['--resume', src / 'large', '--to', remote, '--as', expired_key])
         _, body = request('GET', expired_key)
         assert body == (src / 'large').read_bytes()
         print('S3 roundtrip, interoperability, metadata, mapping, policies, path confinement, and resume passed', flush=True)

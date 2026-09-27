@@ -3885,13 +3885,19 @@ fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
         policy,
         expected_hash: Some(expected.clone()),
     });
-    let mut accepted = Request::ConfigureHashing(policy);
+    let mut accepted = Request::ConfigureHashing {
+        policy,
+        resume: true,
+    };
     authority.authorize(&mut accepted, false).unwrap();
-    let mut changed = Request::ConfigureHashing(HashPolicy {
-        transfer_integrity: true,
-        transfer_hash_type: None,
-        ..policy
-    });
+    let mut changed = Request::ConfigureHashing {
+        resume: true,
+        policy: HashPolicy {
+            transfer_integrity: true,
+            transfer_hash_type: None,
+            ..policy
+        },
+    };
     assert!(authority.authorize(&mut changed, false).is_err());
     let mut finish = Request::FinishBasis {
         expected_hash: None,
