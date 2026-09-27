@@ -35,7 +35,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         id: changes
-        run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
+        run: scripts/ci-scope.py "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
   conformance_platforms:
     # Cancel only matching automatic checks; manual runs keep a unique group.

@@ -3,9 +3,11 @@ set -eu
 
 endpoint() {
     test -r /run/lab/authorized_keys
+    # The mounted key keeps the host account's UID, which may belong to any
+    # account in this image. sshd's StrictModes accepts a root-owned copy.
+    install -m 0644 -o root -g root /run/lab/authorized_keys /etc/ssh/lab_authorized_keys
     install -d -m 0700 -o syq -g syq /home/syq/.ssh
-    # The mounted public key belongs to UID 1000. Give the second test account
-    # its own correctly owned copy for sshd's StrictModes checks.
+    # Give the second test account its own correctly owned copy as well.
     long_home=$(getent passwd longhome | cut -d: -f6)
     install -d -m 0700 -o longhome -g syq "$long_home/.ssh"
     install -m 0600 -o longhome -g syq /run/lab/authorized_keys "$long_home/.ssh/authorized_keys"

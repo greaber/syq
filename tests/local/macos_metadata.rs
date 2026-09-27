@@ -78,7 +78,14 @@ fn chmod(path: &Path, arguments: &[&str]) {
     assert_output_ok(&output);
 }
 fn acl(path: &Path) -> Vec<String> {
-    let output = Command::new("/bin/ls").arg("-lde").arg(path).run().unwrap();
+    // -n prints each entry's stored principal GUID. Name rendering depends on
+    // directory-service lookups, which can fail briefly on a freshly booted
+    // host and make identical ACLs compare unequal.
+    let output = Command::new("/bin/ls")
+        .arg("-lden")
+        .arg(path)
+        .run()
+        .unwrap();
     assert_output_ok(&output);
     String::from_utf8(output.stdout)
         .unwrap()

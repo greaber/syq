@@ -159,8 +159,9 @@ cargo test --bin syq
 ```
 
 Run integration tests for the affected behavior. Use
-[`scripts/test-real-ssh.sh`](tests/real-ssh/README.md) for SSH integration and
-`scripts/test-s3.sh` for isolated MinIO tests. To test another provider, run
+[`scripts/test-real-ssh.py`](tests/real-ssh/README.md) for SSH integration and
+`scripts/test-s3.py` for isolated tests against a local S3 server (PGSTY Silo,
+a maintained fork of the MinIO server). To test another provider, run
 `python3 tests/object-storage/check.py target/debug/syq` with
 `AWS_ENDPOINT_URL_S3`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 and `SYQ_TEST_BUCKET` set. It creates and removes a unique test prefix in the

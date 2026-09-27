@@ -533,6 +533,21 @@ pub(super) fn is_directory_marker(key: &str, size: u64) -> bool {
     size == 0 && key.ends_with('/')
 }
 
+/// syq stores directories only as markers, and files and symlinks never under
+/// marker-shaped keys. Listings rely on this to classify markers without HEAD.
+fn check_marker_kind(key: &str, size: u64, metadata: Option<&Metadata>) -> Result<()> {
+    match (metadata.map(|m| m.kind), is_directory_marker(key, size)) {
+        (Some(ObjectKind::Dir), false) => bail!("invalid syq directory marker"),
+        (Some(kind @ (ObjectKind::File | ObjectKind::Symlink)), true) => {
+            bail!(
+                "invalid syq {} object under directory-marker key {key}",
+                kind.as_str()
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
 impl Object {
     pub(super) fn expression_file(&self) -> crate::expression::File {
         crate::expression::File {
@@ -634,11 +649,7 @@ pub(super) fn from_head(
     )?;
     let etag = output.e_tag().context("S3 HEAD omitted ETag")?.to_owned();
     let metadata = Metadata::decode(output.metadata())?;
-    if metadata.as_ref().is_some_and(|m| m.kind == ObjectKind::Dir)
-        && !is_directory_marker(key, size)
-    {
-        bail!("invalid syq directory marker");
-    }
+    check_marker_kind(key, size, metadata.as_ref())?;
     Ok(Object {
         key: key.to_owned(),
         size,
@@ -1230,9 +1241,7 @@ pub(super) fn from_get(
         metadata: Metadata::decode(output.metadata())?,
         mtime: output.last_modified().map_or(0, |t| t.secs()),
     };
-    if object.kind() == ObjectKind::Dir && !is_directory_marker(key, size) {
-        bail!("invalid syq directory marker");
-    }
+    check_marker_kind(key, size, object.metadata.as_ref())?;
     Ok(object)
 }
 
@@ -1369,6 +1378,40 @@ mod tests {
                     directory
                 ),
                 "{rules:?} {key} directory={directory}"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_keys_hold_only_directories() {
+        let values = HashMap::from([
+            ("syq-format", "1"),
+            ("syq-kind", "file"),
+            ("syq-mode", "420"),
+            ("syq-uid", "0"),
+            ("syq-gid", "0"),
+            ("syq-mtime", "1700000000"),
+            ("syq-mtime-nsec", "0"),
+        ])
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let mut metadata = Metadata::decode(Some(&values)).unwrap().unwrap();
+        assert!(check_marker_kind("d/", 0, None).is_ok());
+        assert!(check_marker_kind("f", 0, None).is_ok());
+        for (key, size, kind, valid) in [
+            ("d/", 0, ObjectKind::Dir, true),
+            ("d", 0, ObjectKind::Dir, false),
+            ("d/", 0, ObjectKind::File, false),
+            ("d/", 0, ObjectKind::Symlink, false),
+            ("f", 0, ObjectKind::File, true),
+            ("l", 4, ObjectKind::Symlink, true),
+        ] {
+            metadata.kind = kind;
+            assert_eq!(
+                check_marker_kind(key, size, Some(&metadata)).is_ok(),
+                valid,
+                "{key} {size} {kind:?}"
             );
         }
     }

@@ -30,25 +30,29 @@ done
 # only the debug tuner's sample clock and cap traffic to keep this lab bounded.
 # These are correctness checks, not performance measurements.
 for benchmark_mode in push pull; do
-    benchmark_history="$home/benchmark-tuning-$benchmark_mode.sqlite"
-    SYQ_TUNING_HISTORY="$benchmark_history" SYQ_TEST_TUNE_SAMPLE_MS=100 \
+    benchmark_cache="$home/benchmark-tuning-$benchmark_mode.json"
+    SYQ_TUNING_CACHE="$benchmark_cache" SYQ_TEST_TUNE_SAMPLE_MS=100 \
         bash /usr/local/libexec/syq-try-benchmark --yes \
         --mode "$benchmark_mode" --host destination --workload small --size quick \
         --tool syq --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's" \
         -- --no-tcp --resource-limits bandwidth=2M
-    python3 - "$benchmark_history" "$benchmark_mode" <<'PY_HISTORY'
-import json, os, subprocess, sys
-history = subprocess.run(
-    ['syq', 'tuning-cache', 'export'], check=True, capture_output=True, text=True,
-    env={**os.environ, 'SYQ_TUNING_HISTORY': sys.argv[1]},
-)
-records = [json.loads(line) for line in history.stdout.splitlines()]
-starts = [record['event']['data'] for record in records
-          if record['type'] == 'event' and record['event']['kind'] == 'starting_count']
-assert any(start['reason'] == 'history' and start['workers'] >= 1 for start in starts), starts
-print('Verified a learned starting count for', sys.argv[2])
-PY_HISTORY
-    rm -f "$benchmark_history" "$benchmark_history-wal" "$benchmark_history-shm"
+    # Tuning history lives beside the cache path; export is its supported reader.
+    SYQ_TUNING_CACHE="$benchmark_cache" syq tuning-cache export |
+        python3 -c '
+import json, sys
+runs, starts = {}, {}
+for line in sys.stdin:
+    record = json.loads(line)
+    if record["type"] == "transfer":
+        runs[record["run"]["id"]] = record["run"]
+    elif record["event"]["kind"] == "starting_count":
+        starts[record["run"]] = record["event"]["data"]
+scored = max(runs)
+start = starts.get(scored) or {}
+assert start.get("reason") == "history", [(run_id, starts.get(run_id)) for run_id in sorted(runs)]
+print("Verified the scored copy started from learned tuning history:", start["workers"], "workers")
+'
+    rm -f "$benchmark_cache" "$benchmark_cache.lock" "${benchmark_cache%.json}".history-v1.sqlite*
 done
 test -z "$(find "$benchmark_parent" -mindepth 1 -print)"
 ssh destination 'test -z "$(find "/tmp/benchmark scratch'"'"'s" -mindepth 1 -print)"'

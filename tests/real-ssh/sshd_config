@@ -15,7 +15,7 @@ UsePAM no
 UseDNS no
 
 AllowUsers syq longhome
-AuthorizedKeysFile .ssh/authorized_keys /run/lab/authorized_keys
+AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/lab_authorized_keys
 StrictModes yes
 AllowAgentForwarding yes
 AllowTcpForwarding no

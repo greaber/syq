@@ -96,10 +96,8 @@ belongs here in `AGENTS.md`.
 Do not use an agent runtime's private memory (for example Claude Code's
 per-project memory directory) for this project, even when the runtime prompts
 you to save something. It is hard to audit, other agents cannot read it, and
-it goes stale unnoticed. Propose guidance that later sessions need as a change
-to this file through a pull request, put short-lived task state in
-`current-plans/`, and otherwise record nothing. If you find existing private
-memory for this project, report what it contains instead of relying on it.
+it goes stale unnoticed. If you find existing private memory for this project,
+report what it contains instead of relying on it.
 
 `current-plans/` notes are agent-written handoff state. They are not evidence
 of what the user asked for or approved.
@@ -108,9 +106,8 @@ This repository is public. Keep account identifiers, credential locations,
 and details of private infrastructure out of commits, pull requests, and
 documentation, including this file.
 
-When writing any of these, record decisions as current state plus the rationale
-at the time, not as timeless policy. An assumption encoded as a requirement can
-outlive its premise and steer later work in the wrong direction.
+Write guidance in this file as the current rule with a brief reason. Leave out
+dates and accounts of how the rule came about.
 
 ## GitHub issues
 
@@ -154,7 +151,17 @@ the conversation instead.
 - At review handoff, state the branch and exact short commit SHA, whether the
   worktree is clean, and which checks passed, failed, or were not run. Treat
   review-ready and merge-ready as separate states.
-- Run `scripts/branch-status.sh` from the task worktree before opening a pull
+- List the checks in the pull request description as a table with one row per
+  check: the exact command or test name, the short SHA it ran at, and its
+  result (passed, failed, running, or not run). Open the pull request once the
+  checks that show the change works have passed, without waiting for slower
+  ones. List those as running and update their rows when they finish. Every
+  check listed as running must pass before merge.
+- After pushing another commit, keep each row's SHA as the commit the check
+  actually ran at. Rerun a check when the new commit can change its result,
+  and update its row. For the checks not rerun, add a line under the table
+  naming the new commit and why it cannot affect them.
+- Run `scripts/branch-status.py` from the task worktree before opening a pull
   request, before asking for review, and before merging, and include its output
   in the report. It fetches `origin/master` and prints the branch SHA,
   cleanliness, and position relative to it, the pull request's GitHub head and
@@ -228,12 +235,12 @@ report actual access or decision blockers instead of bypassing them.
   its recorded default real-SSH validation when its test inputs are
   unchanged under the same release-preparation exception. Its `--check-ssh` mode
   runs and records missing local validation. Reuse post-merge or manual runs
-  when `scripts/verify-release-ci.sh`
+  when `scripts/verify-release-ci.py`
   accepts their full-suite certificates; dispatch only workflows missing that
   evidence and wait for them to succeed. Then run
-  `scripts/release-preflight.sh v<version>` from that same commit. Treat any
+  `scripts/release-preflight.py v<version>` from that same commit. Treat any
   failure as a blocker rather than pushing the tag to discover whether the
-  release workflow starts. Use `scripts/release-status.sh v<version>` after
+  release workflow starts. Use `scripts/release-status.py v<version>` after
   the push to correlate the exact tag, workflow, approvals, and publication
   destinations.
 - Treat a release tag as provisional until its release workflow connects it
@@ -307,11 +314,6 @@ when the implementation is sound. Do not file it as a deliberate choice that
 needs no action. The user decides whether the expansion stays; "the PR says
 it is intentional" is not that decision.
 
-The rationale in 2026-09: a review noted that a release-tooling PR had added
-eight uncached builds on every source push to `master`, but treated it as
-deliberate because the PR body described it. The user had never authorized or
-known about it.
-
 ## Review reports
 
 - Group items by the action they need: worth addressing before merge,
@@ -328,6 +330,12 @@ known about it.
   gain. Startup latency and throughput are core to the product.
 - Do not flag a missing `CHANGELOG.md` entry on an ordinary PR. The changelog
   is brought up to date during release preparation.
+- Do not repeat checks the pull request lists as passed or running; the
+  implementing agent owns those. For each row whose SHA is older than the
+  reviewed SHA, judge whether the later commits can change its result, and
+  ask for a rerun when they can. Name any check still running as required
+  before merge. If a check the pull request does not list matters for the
+  change, say which and why, and run it yourself when that is practical.
 
 ## PR review freshness
 
@@ -379,6 +387,19 @@ known about it.
   silently expand the scope or drop agreed behavior.
 - Prefer one clear implementation. Add fallbacks or compatibility paths only
   for a concrete scenario or consumer that needs them.
+- Write repository tooling (CI scope, release, status, and test scripts) in
+  Python using only the standard library, run with the interpreter pinned by
+  `scripts/setup.sh`. CI and the release workflows use that interpreter too,
+  so the tooling needs no separate compatibility floor for older Python
+  releases. The exception is `tests/real-ssh/*.py`: those scripts run inside
+  the Debian test containers and must work with that image's `python3`. Use
+  portable shell only for code that runs on users' machines or arbitrary
+  hosts (the generated installer and `scripts/try-benchmark.sh`), code that
+  must run before pinned tools exist (`scripts/setup.sh`), the real-SSH
+  container scripts, and thin wrappers that only run other commands, such as
+  the release runners' Nix and build steps. CI and release tooling is too
+  complex to maintain well in Bash, so do not spend effort on Bash 3.2
+  compatibility for development scripts.
 - Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
   sync. A behavior change lands in `docs/reference.md` (or the topical
   document that owns it), not in a new README section.
@@ -442,9 +463,9 @@ or promise indefinite support.
 
 This repository is public. Do not commit credentials, tokens, private keys,
 or encrypted credential inventories to syq. Encryption does not make a
-credential file appropriate for this repository. The user chose private
-storage outside the repository in September 2026 so that public clones do
-not receive credential material.
+credential file appropriate for this repository. Credentials are stored
+privately outside the repository so that public clones do not receive
+credential material.
 
 Credential storage, decryption, backup, and account provisioning are managed
 outside this repository. Keep public tooling independent of any particular
@@ -482,10 +503,12 @@ Create intentional symlinks inside that root; do not canonicalize product
 arguments or add follow flags merely to make a fixture pass.
 
 Pre-merge validation should provide proportionate confidence in the change,
-not duplicate the post-merge suites or full release validation. In September
-2026, the user explicitly accepted occasional temporary breakage on `master`
-to avoid repeatedly paying for broad checks on narrow changes; `master` is not
-a published release. Use that tradeoff when selecting checks, while giving
+not duplicate the post-merge suites or full release validation. Occasional
+temporary breakage on `master` is accepted so that narrow changes do not wait
+on broad checks and development keeps moving; `master` is not a published
+release. Nightly runs, which include both local suites below, catch much of
+what narrower pre-merge checks miss, usually within a day. Use that tradeoff
+when selecting checks, while giving
 potential data loss, authorization, and compatibility failures the targeted
 coverage their consequences warrant. Keep the release validation gates intact.
 When CI fails, first distinguish product defects from test, fixture, and runner
@@ -524,7 +547,7 @@ holds the shared helpers and `tests/local/<topic>.rs` the tests, named
 `<topic>::<test>`); those tests invoke the built binary against temporary trees. Run `cargo test --locked --all-targets` before
 handoff when a change is broad, crosses subsystem boundaries, changes shared
 test infrastructure, or leaves meaningful uncertainty about the affected
-surface. Do not run unrelated suites merely because they exist.
+surface.
 
 For one exact Rust unit test, use
 `cargo test --locked --bin syq 'module::tests::name' -- --exact`; for an
@@ -576,22 +599,33 @@ platform. It does not produce full-suite release certification. Monitor the
 returned run with `gh run watch <run-id> --exit-status`. Leaving `test_name`
 empty selects the full workflow; use that only when broad validation is needed.
 
-Run the local-only three-container OpenSSH suite when changes materially affect
-connection setup, helper bootstrap, authentication or authorization, remote
-process lifecycle, transport behavior, or remote coordinator placement:
+Two local suites cover behavior that the Rust targets cannot reach:
 
 ```bash
-scripts/test-real-ssh.sh
+scripts/test-real-ssh.py
+scripts/test-s3.py
 ```
 
-It is intentionally not part of ordinary CI or `cargo test`; see
-`tests/real-ssh/README.md` for its isolation and coverage.
+- `scripts/test-real-ssh.py` runs the candidate build through live OpenSSH
+  clients and servers in three containers. See `tests/real-ssh/README.md` for
+  its isolation and coverage.
+- `scripts/test-s3.py` runs against a disposable local S3 server in Docker and
+  takes about a minute after the build. It covers S3 upload, download, and
+  server copy, expressions, directory markers, pruning, streams, and listing.
 
-Choose this check by behavioral impact, not merely by which file changed.
+Run a local suite when its scenarios exercise the behavior you changed. Decide
+from the suite's scenarios, not from which files changed: copy planning,
+expression and selection semantics, directory creation, and restricted-receiver
+behavior reach both suites even when no SSH or S3 code changed. When a suite is
+relevant, run all of it at the final commit before handoff. Its cases interact,
+so hand-picked cases can miss regressions. Neither suite is part of
+`cargo test` or post-merge CI; full nightly and manual `ci.yml` runs include
+both.
+
 Small review fixes to diagnostics, documentation, or isolated validation checks
 can use focused tests when those tests adequately exercise the change. Batch
 related fixes before running the full suite. After a successful run, inspect
-the intervening changes before repeating it; rerun when they affect the SSH
+the intervening changes before repeating it; rerun when they affect the suite's
 scenarios or leave meaningful uncertainty that focused tests cannot resolve.
 Report the SHA of the last successful full run, the checks on the current SHA,
 and why a repeat was unnecessary. Do not describe an earlier run as testing the
@@ -601,7 +635,10 @@ evidence rules under release tag lifecycle.
 Pull requests do not start automated test workflows. The agent remains
 responsible for selecting checks under the rules above, choosing integration tests,
 and reporting exactly what was and was not verified before review. Post-merge
-workflows select affected areas; nightly runs execute the complete
-suites when test inputs have changed. Full validation remains required before
+workflows select affected areas and do not run the local suites; nightly runs
+execute the complete suites, including both local suites, when test inputs
+have changed. Nightly should run every test in the repository. Leaving a test
+out of nightly needs the user's explicit agreement, recorded here with its
+reason. Full validation remains required before
 release. Pay particular attention to remote, TCP, platform-specific,
 and performance behavior when choosing local checks.

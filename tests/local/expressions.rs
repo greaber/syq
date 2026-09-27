@@ -27,7 +27,7 @@ fn selection_traverses_unselected_directories_and_protects_pruning() {
 }
 
 #[test]
-fn excluded_directories_allow_pruning_only_destination_children() {
+fn filtered_pruning_removes_only_destination_only_children() {
     for predicate in ["false", "src.name = 'selected'"] {
         let t = Tmp::new();
         write(&t.path("src/nested/excluded"), b"source");
@@ -90,44 +90,6 @@ fn excluded_directories_allow_pruning_only_destination_children() {
         // An excluded source leaf still protects a destination directory
         // occupying that name, including its otherwise unknown descendants.
         assert_eq!(read(&t.path("dst/leaf/extra")), b"protected subtree");
-    }
-}
-
-#[test]
-fn skipped_leaf_protection_survives_an_excluded_directory_at_the_same_name() {
-    for reverse in [false, true] {
-        for special in [false, true] {
-            let t = Tmp::new();
-            fs::create_dir_all(t.path("directory/shared")).unwrap();
-            let predicate = if special {
-                fs::create_dir_all(t.path("leaf")).unwrap();
-                mkfifo(&t.path("leaf/shared"));
-                // Selected, but copying special nodes was not requested.
-                "src.kind != 'dir'"
-            } else {
-                write(&t.path("leaf/shared"), b"excluded source file");
-                "false"
-            };
-            write(&t.path("dst/shared/extra"), b"protected subtree");
-            let (first, second) = if reverse {
-                ("leaf", "directory")
-            } else {
-                ("directory", "leaf")
-            };
-            run_native_ok(&[
-                "cp",
-                "--srcs-in",
-                &t.s(first),
-                "--srcs-in",
-                &t.s(second),
-                "--into",
-                &t.s("dst"),
-                "--where",
-                predicate,
-                "--prune",
-            ]);
-            assert_eq!(read(&t.path("dst/shared/extra")), b"protected subtree");
-        }
     }
 }
 
@@ -360,7 +322,56 @@ fn expressions_reject_streams_and_copy_if_rejects_inplace() {
 }
 
 #[test]
-fn where_selects_directories_and_copy_if_controls_their_metadata() {
+fn leaf_filters_keep_directory_metadata_and_empty_directories() {
+    use std::os::unix::fs::MetadataExt;
+    let t = Tmp::new();
+    write(&t.path("src/photos/2024/big.jpg"), &[0; 2048]);
+    write(&t.path("src/photos/small.txt"), b"x");
+    fs::create_dir_all(t.path("src/empty")).unwrap();
+    for (path, mode) in [
+        ("src/photos/2024", 0o700),
+        ("src/photos", 0o750),
+        ("src/empty", 0o710),
+    ] {
+        fs::set_permissions(t.path(path), fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let old = libc::timespec {
+        tv_sec: 1_577_836_800,
+        tv_nsec: 0,
+    };
+    for path in ["src/photos/2024", "src/photos", "src/empty"] {
+        let path = std::ffi::CString::new(t.s(path)).unwrap();
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), [old, old].as_ptr(), 0) },
+            0
+        );
+    }
+    for expression in ["src.size > 1KiB", "src.extension = 'jpg'"] {
+        let dst = format!("dst-{}", expression.len());
+        run_native_ok(&[
+            "cp",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s(&dst),
+            "--copy-metadata=permissions",
+            "--where",
+            expression,
+        ]);
+        assert!(t.path(&format!("{dst}/photos/2024/big.jpg")).is_file());
+        assert!(!t.path(&format!("{dst}/photos/small.txt")).exists());
+        // Every directory fails these predicates, yet keeps its source
+        // metadata, and the empty one is still copied.
+        for (path, mode) in [("photos/2024", 0o700), ("photos", 0o750), ("empty", 0o710)] {
+            let metadata = fs::metadata(t.path(&format!("{dst}/{path}"))).unwrap();
+            assert_eq!(metadata.mode() & 0o777, mode, "{expression}: {path}");
+            assert_eq!(metadata.mtime(), old.tv_sec, "{expression}: {path}");
+        }
+    }
+}
+
+#[test]
+fn where_filters_leaves_and_copy_if_controls_directory_metadata() {
     let t = Tmp::new();
     write(&t.path("src/private/keep.jpg"), b"selected");
     write(&t.path("src/private/skip.txt"), b"excluded");
@@ -376,7 +387,7 @@ fn where_selects_directories_and_copy_if_controls_their_metadata() {
             &t.s("dst"),
             "--copy-metadata=permissions",
             "--where",
-            "src.kind = 'dir' or src.extension = 'jpg'",
+            "src.extension = 'jpg'",
         ]);
         assert_eq!(
             fs::metadata(t.path("dst/private")).unwrap().mode() & 0o777,
@@ -398,7 +409,7 @@ fn where_selects_directories_and_copy_if_controls_their_metadata() {
         &t.s("dst"),
         "--copy-metadata=permissions",
         "--where",
-        "src.kind = 'dir' or src.extension = 'jpg'",
+        "src.extension = 'jpg'",
         "--copy-if",
         "src.kind != 'dir'",
     ]);
@@ -420,7 +431,7 @@ fn where_selects_directories_and_copy_if_controls_their_metadata() {
     ]);
     assert_eq!(
         fs::metadata(t.path("dst/private")).unwrap().mode() & 0o777,
-        0o755
+        0o700
     );
 }
 
@@ -461,7 +472,9 @@ fn merged_directories_keep_each_sources_expression_result() {
 fn unselected_containers_use_receiver_umask_and_inheritance() {
     for remote in [false, true] {
         for umask in [0o002, 0o077] {
-            for filter in ["--where", "--copy-if"] {
+            // --where does not apply to directories; only --copy-if can
+            // leave them with receiver defaults.
+            for filter in ["--copy-if"] {
                 let t = Tmp::new();
                 let rsh = fake_rsh(&t);
                 let script = fs::read_to_string(&rsh).unwrap();
@@ -611,34 +624,6 @@ fn destination_inspection_errors_are_not_missing_entries() {
             Path::new("destination-target")
         );
     }
-}
-
-#[test]
-fn later_selected_directory_supplies_metadata_for_an_implicit_parent() {
-    let t = Tmp::new();
-    write(&t.path("first/shared/one"), b"one");
-    write(&t.path("second/shared/two"), b"two");
-    fs::set_permissions(t.path("first/shared"), fs::Permissions::from_mode(0o750)).unwrap();
-    fs::set_permissions(t.path("second/shared"), fs::Permissions::from_mode(0o700)).unwrap();
-    run_native_ok(&[
-        "cp",
-        "--srcs-in",
-        &t.s("first"),
-        "--srcs-in",
-        &t.s("second"),
-        "--into",
-        &t.s("dst"),
-        "--prune",
-        "--copy-metadata=permissions",
-        "--where",
-        "src.kind != 'dir' or src.mode = 0o700",
-    ]);
-    assert_eq!(read(&t.path("dst/shared/one")), b"one");
-    assert_eq!(read(&t.path("dst/shared/two")), b"two");
-    assert_eq!(
-        fs::metadata(t.path("dst/shared")).unwrap().mode() & 0o777,
-        0o700
-    );
 }
 
 #[cfg(debug_assertions)]

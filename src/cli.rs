@@ -1143,7 +1143,7 @@ struct NativeCopyOperationalArgs {
     /// Update only entries already present; create no missing entries or directories
     #[arg(long = "only-existing", hide = true, conflicts_with_all = ["into_new", "as_new"])]
     existing: bool,
-    /// Select source entries with a typed expression; unselected directories remain traversable
+    /// Select non-directory source entries with a typed expression; directories follow normal copy rules
     #[arg(long = "where", value_name = "EXPR")]
     where_expression: Option<String>,
     /// Update only entries satisfying a source/destination expression

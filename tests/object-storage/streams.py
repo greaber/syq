@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream interoperability against the disposable bucket selected by test-s3.sh."""
+"""Stream interoperability against the disposable bucket selected by test-s3.py."""
 import os
 import hashlib
 from pathlib import Path

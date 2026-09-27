@@ -125,7 +125,7 @@ Exit 0 means the candidate is ready for preflight, 1 means work is missing, and
 2 means inspection failed. The report includes the candidate SHA, remote master,
 local real-SSH evidence, all three CI certifications, and next actions. It is
 read-only unless `--check-ssh` is supplied. It never tags, publishes, dispatches
-CI, or merges a PR. If the requested tag exists, inspect `release-status.sh`
+CI, or merges a PR. If the requested tag exists, inspect `release-status.py`
 and resume or verify that release rather than preparing another version.
 
 For an already-prepared version with matching evidence, start at step 2. A new
@@ -158,7 +158,7 @@ release request does not require another preparation PR or another test run.
    remain readable. Dirty runs cannot certify a release. A deliberately rerun
    check invalidates its earlier receipt before execution, so failure cannot leave stale success.
    These are local maintainer records, not portable CI certificates. An
-   independent clone needs its own check. `scripts/test-real-ssh.sh` remains
+   independent clone needs its own check. `scripts/test-real-ssh.py` remains
    available for development checks without release recording.
 
 2. Once the release commit is the exact `master` tip, start the release binary
@@ -190,7 +190,7 @@ release request does not require another preparation PR or another test run.
 
    ```sh
    candidate=$(git rev-parse HEAD)
-   scripts/verify-release-ci.sh greaber/syq "$candidate"
+   scripts/verify-release-ci.py greaber/syq "$candidate"
    ```
 
    A successful full nightly or manual run is reusable. Each workflow records a
@@ -227,8 +227,8 @@ release request does not require another preparation PR or another test run.
    needed runs succeed, repeat verification and run the read-only preflight:
 
    ```sh
-   scripts/verify-release-ci.sh greaber/syq "$candidate"
-   scripts/release-preflight.sh v0.1.9
+   scripts/verify-release-ci.py greaber/syq "$candidate"
+   scripts/release-preflight.py v0.1.9
    ```
 
    It accepts a clean task branch or detached checkout at the pinned candidate,
@@ -287,8 +287,8 @@ release request does not require another preparation PR or another test run.
    Track the complete state at any time with:
 
    ```sh
-   scripts/release-status.sh v0.1.9
-   scripts/release-status.sh --json v0.1.9
+   scripts/release-status.py v0.1.9
+   scripts/release-status.py --json v0.1.9
    scripts/release-timings.py v0.1.9
    ```
 
@@ -361,7 +361,7 @@ linting, and unit tests, plus directly edited integration-test targets; SDK chan
 rsync compatibility changes run Linux conformance. Explicit macOS source,
 or test changes select the Apple Silicon suite. Workflow changes select workflow
 lint and orchestration fixtures, without selecting product suites. Tooling
-changes select their owning test scripts where mapped in `scripts/ci-scope.sh`;
+changes select their owning test scripts where mapped in `scripts/ci-scope.py`;
 unmapped tooling retains the broad tooling checks. Cargo package identity is
 checked for packaging inputs and full runs, rather than every tooling edit.
 Matching automatic jobs cancel superseded work only when their selected checks
@@ -373,8 +373,12 @@ The comparison uses the same version/prose exclusions as release evidence;
 executable documentation changes still count. The first nightly run executes
 all suites, and a failed nightly is retried on subsequent nights. Unchanged
 inputs only run the small scope checks. Full runs include SDKs, both rsync
-platforms, Linux ARM64, Intel macOS compilation/updater tests, and the complete
-Apple Silicon suite. Intel compilation/updater checks use unoptimized binaries
+platforms, Linux ARM64, Intel macOS compilation/updater tests, the complete
+Apple Silicon suite with its root-only and live-network tests, the disposable
+S3 suite, every real-SSH suite and profile, the documentation checks, and the
+compatibility checks against released binaries. These nightly-only `ci.yml`
+jobs are outside `release-certification`, but a failure in any of them fails
+the `ci.yml` run, so that run cannot serve as release evidence. Intel compilation/updater checks use unoptimized binaries
 without debug information; the shipped release binaries remain optimized.
 Focused Intel checks use that same test profile and Cargo cache. Manual runs remain available at any time and are not
 cancelled by new pushes.
@@ -402,6 +406,11 @@ extracts and compiles the crate once, using a separate reusable target directory
 It clears only syq's own build outputs before compiling: normalized archive
 mtimes cannot prove unchanged source or VCS identity across cached packages.
 
+Release and publishing jobs install the tools pinned in `scripts/setup.lock`
+afresh on every run instead of restoring them from a cache. `scripts/setup.sh`
+verifies a download's checksum but trusts a tool that is already installed, so
+a restored cache would bypass that check. The downloads are small.
+
 The checked-in classifier uses each push's exact diff. Documentation-only
 changes select no test jobs unless a document is consumed by a test or
 generator. Unknown paths fail safe by selecting every affected suite. Manual
@@ -419,7 +428,7 @@ notarization in the macOS build jobs before advertising that path.
 
 ### Python distribution inputs
 
-Python release preparation runs `scripts/pin-python-native-source.sh` after
+Python release preparation runs `scripts/pin-python-native-source.py` after
 updating the embedded release manifest. It resolves that release tag to a commit
 and records its source-tree hash in `sdk/python/native-source.json`. When
 preparing the SDK manually, run that command with Nix installed and the native

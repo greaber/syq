@@ -1,5 +1,5 @@
 //! Network fault tests use a local independent HTTP fixture. Real S3 protocol
-//! and signature interoperability are exercised by scripts/test-s3.sh.
+//! and signature interoperability are exercised by scripts/test-s3.py.
 #[allow(dead_code)]
 #[path = "../src/process.rs"]
 mod process;

@@ -36,10 +36,14 @@ jobs:
             cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
             cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
             cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Install pinned tools without a cache
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
       - name: Compile and validate the source package once
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          scripts/prepare-release-crate.sh "v$version" "$RUNNER_TEMP/source-crate"
+          scripts/prepare-release-crate.py "v$version" "$RUNNER_TEMP/source-crate"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: source-crate
@@ -62,6 +66,11 @@ jobs:
           persist-credentials: false
       - name: Install checksum-pinned Nix
         run: scripts/install-nix-ci.sh
+      - name: Install pinned tools without a cache
+        if: matrix.platform.name == 'syq-linux-x86_64'
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
       - name: Check dependency cache invalidation
         if: matrix.platform.name == 'syq-linux-x86_64'
         run: python3 scripts/test-release-dependency-cache.py

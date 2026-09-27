@@ -68,7 +68,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SYQ_CI_DOCUMENTATION_ONLY: ${{ inputs.documentation_only }}
           SYQ_CI_SCOPE_COMMIT: ${{ inputs.scope_commit }}
-        run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
+        run: scripts/ci-scope.py "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
   rust:
     # Cancel only matching automatic checks; manual runs keep a unique group.
@@ -207,11 +207,11 @@ jobs:
       - name: Test Cargo package identity
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' package ')
-        run: scripts/test-cargo-package.sh
+        run: scripts/test-cargo-package.py
       - name: Test installer tooling
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' installer ')
-        run: scripts/test-installer.sh
+        run: scripts/test-installer.py
       - name: Test interactive benchmark
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' benchmark ')
@@ -223,14 +223,16 @@ jobs:
           TOOLING_CHECKS: ${{ needs.scope.outputs.tooling_checks }}
         run: |
           if [[ " $TOOLING_CHECKS " == *" package "* ]]; then
-            scripts/test-release-tools.sh --syq "$GITHUB_WORKSPACE/target/package-identity/debug/syq"
+            scripts/test-release-tools.py --syq "$GITHUB_WORKSPACE/target/package-identity/debug/syq"
           else
-            scripts/test-release-tools.sh
+            scripts/test-release-tools.py
           fi
       - name: Test release orchestration
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' orchestration ')
-        run: scripts/test-release-orchestration.sh
+        run: |
+          scripts/test-release-orchestration.py
+          scripts/test-tooling.py
       - name: Test focused check dispatch
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' focused ')
@@ -238,15 +240,17 @@ jobs:
       - name: Test branch status tooling
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' branch ')
-        run: scripts/test-branch-status.sh
+        run: scripts/test-branch-status.py
       - name: Test the development setup
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' setup ')
         run: scripts/test-setup.sh
-      - name: Validate workflow syntax
+      - name: Validate workflow syntax and script references
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' workflows ')
-        run: scripts/check-workflows.sh
+        run: |
+          scripts/check-workflows.py
+          scripts/check-script-references.py
       - name: Lint tracked shell scripts
         if: >-
           needs.scope.outputs.tooling == 'true' ||
@@ -334,7 +338,7 @@ jobs:
         run: |
           SYQ_CANDIDATE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           export SYQ_CANDIDATE_VERSION
-          scripts/test-python-sdk-release-tools.sh
+          scripts/test-python-sdk-release-tools.py
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
           export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
           RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
@@ -414,6 +418,26 @@ jobs:
             cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - if: needs.scope.outputs.linux_arm64 == 'true'
         run: cargo check --locked --all-targets
+      # Release jobs install these on this platform; verify the pinned ARM
+      # downloads without a cache so full and nightly runs catch a bad pin.
+      - name: Install and check every pinned tool
+        if: needs.scope.outputs.linux_arm64 == 'true'
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: |
+          set -euo pipefail
+          scripts/setup.sh install
+          eval "$(scripts/setup.sh env)"
+          awk '!/^#/ && NF && !seen[$1]++ { print $1, $2 }' scripts/setup.lock |
+            while read -r tool version; do
+              command=$tool
+              if [ "$tool" = python ]; then command=python3; fi
+              location=$(command -v "$command")
+              actual=$("$command" --version)
+              echo "$tool $version: $location: $actual"
+              case "$location" in "$SYQ_TOOLS_DIR"/*) ;; *) exit 1 ;; esac
+              case "$actual" in *"$version"*) ;; *) exit 1 ;; esac
+            done
 
   # An actual Intel runner catches host-architecture cfg and libc differences
   # before the release workflow builds its x86-64 artifact. Keep this on full
@@ -457,7 +481,7 @@ jobs:
         run: cargo test --locked --test update
 
   # Preserve the `macos` check for Intel. Apple Silicon is certified once by
-  # the full macos.yml workflow, required separately by verify-release-ci.sh.
+  # the full macos.yml workflow, required separately by verify-release-ci.py.
   macos:
     needs: [scope, macos_intel]
     if: always() && needs.macos_intel.result != 'cancelled' && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
@@ -481,6 +505,178 @@ jobs:
           (needs.scope.outputs.full_suite != 'true' ||
            needs.macos_intel.result == 'success')
         run: echo 'Required macOS validation succeeded.'
+
+  # These suites need Docker, released binaries, Nix, or other setup that the
+  # rust job does not have. They run only in full nightly and manual suites,
+  # and the full-suite ci.yml run that certifies a release includes them.
+  object-storage:
+    needs: scope
+    if: >-
+      inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
+      needs.scope.result == 'success' &&
+      needs.scope.outputs.native == 'true' &&
+      needs.scope.outputs.full_suite == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
+      - name: Cache Cargo dependencies and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ci-object-storage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-ci-object-storage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-ci-object-storage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Test against a disposable S3 server
+        run: scripts/test-s3.py
+      - name: Test the S3 suite runner and benchmark command policy
+        if: ${{ !cancelled() }}
+        run: |
+          python3 tests/object-storage/test-runner.py
+          python3 tests/object-storage/test_benchmark.py
+
+  real-ssh:
+    needs: scope
+    if: >-
+      inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
+      needs.scope.result == 'success' &&
+      needs.scope.outputs.native == 'true' &&
+      needs.scope.outputs.full_suite == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
+      # Later suites reuse the first build's Docker layers. Each suite runs even
+      # when an earlier one failed, and any failure fails the job.
+      - name: Test the core suite through real OpenSSH
+        run: scripts/test-real-ssh.py
+      - name: Test the core suite with one session per SSH connection
+        if: ${{ !cancelled() }}
+        run: scripts/test-real-ssh.py --profile max-sessions-1
+      - name: Test storage authorization through real OpenSSH
+        if: ${{ !cancelled() }}
+        run: scripts/test-real-ssh.py --suite storage
+      - name: Test metadata recovery through real OpenSSH
+        if: ${{ !cancelled() }}
+        run: scripts/test-real-ssh.py --suite metadata
+      - name: Test the interactive benchmark against a real remote
+        if: ${{ !cancelled() }}
+        run: scripts/test-real-ssh.py --suite benchmark
+      - name: Keep real-SSH diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: real-ssh-diagnostics
+          path: target/real-ssh.*/compose.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  repository-checks:
+    needs: scope
+    if: >-
+      inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
+      needs.scope.result == 'success' &&
+      needs.scope.outputs.native == 'true' &&
+      needs.scope.outputs.full_suite == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-repository-checks-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python node mdbook
+      - name: Cache Cargo dependencies and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ci-repository-checks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-ci-repository-checks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-ci-repository-checks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Test agent coordination commands
+        run: python3 scripts/test-agent-coordination.py
+      # The ignored Linux tests are timing and simulation reports. The v0.3.2
+      # replay check needs an agreed fix before it can run here.
+      - name: Run ignored Linux tests
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo test --locked --all-targets -- --ignored
+          --skip transfer::tests::existing_destination_setup_replays_on_v032_receiver
+      - name: Check tool comparison examples
+        if: ${{ !cancelled() }}
+        run: python3 scripts/test-tool-examples.py
+      - name: Check documentation links and version selection
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check-doc-links.py
+          python3 scripts/test-doc-site.py
+          node --test scripts/test-doc-selector.cjs
+      - name: Check compatibility with released receivers and clients
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin syq
+          candidate="$GITHUB_WORKSPACE/target/debug/syq"
+          released="$RUNNER_TEMP/released"
+          for version in 0.4.0 0.5.2 0.6.0; do
+            mkdir -p "$released/$version"
+            gh release download "v$version" --repo "$GITHUB_REPOSITORY" \
+              --pattern syq-linux-x86_64 --pattern syq-linux-x86_64.sha256 \
+              --dir "$released/$version"
+            (cd "$released/$version" && sha256sum --check syq-linux-x86_64.sha256)
+            chmod +x "$released/$version/syq-linux-x86_64"
+          done
+          python3 tests/receive-control-compat.py \
+            --old "$released/0.4.0/syq-linux-x86_64" --candidate "$candidate"
+          python3 tests/receiver_identity_compat.py \
+            "$candidate" "$released/0.5.2/syq-linux-x86_64"
+          python3 tests/receive-policy-compat.py \
+            --old "$released/0.6.0/syq-linux-x86_64" --candidate "$candidate"
+      - name: Install checksum-pinned Nix
+        if: ${{ !cancelled() }}
+        run: scripts/install-nix-ci.sh
+      - name: Check release dependency cache invalidation
+        if: ${{ !cancelled() }}
+        run: python3 scripts/test-release-dependency-cache.py
 
   # A skipped certificate cannot certify successful selective stubs.
   release-certification:

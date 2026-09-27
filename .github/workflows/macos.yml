@@ -1,6 +1,6 @@
 name: macOS suite
 
-# The complete native and SDK test suites, clippy, and release shell suites on
+# The complete native and SDK test suites, clippy, and release tooling suites on
 # macOS. Automated validation runs after merges to master and on demand, not
 # on pull requests.
 on:
@@ -139,7 +139,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          scope=$(scripts/ci-scope.sh "$GITHUB_EVENT_PATH")
+          scope=$(scripts/ci-scope.py "$GITHUB_EVENT_PATH")
           # ci-scope output is a machine-readable boolean contract.
           needed=false
           # Only explicit macOS changes select this platform after a merge.
@@ -210,6 +210,36 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Native tests
         run: cargo test --locked --all-targets --no-fail-fast
+      # These ignored tests need the runner's live network or root. Nightly and
+      # manual suites run them; post-merge runs skip them.
+      - name: Tests that need a live network or root
+        if: github.event_name != 'push'
+        run: |
+          set -euo pipefail
+          executable() {
+            cargo test --locked "$@" --no-run --message-format=json |
+              python3 -c 'import json, sys; print(*[m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("executable") and m.get("profile", {}).get("test")])'
+          }
+          unit=$(executable --bin syq)
+          local_tests=$(executable --test local)
+          # An exact filter that matches nothing would still exit 0.
+          run_exact() {
+            local as_root=$1 binary=$2 name=$3
+            "$binary" "$name" --exact --ignored --list | grep -Fx -- "$name: test" >/dev/null ||
+              { echo "Exact test not found: $name" >&2; exit 1; }
+            if [[ "$as_root" == root ]]; then
+              sudo -n env PATH="$PATH" "$binary" "$name" --exact --ignored
+            else
+              "$binary" "$name" --exact --ignored
+            fi
+          }
+          run_exact user "$unit" tune::network::macos::tests::native_router_fingerprint
+          for test in \
+            macos_metadata::acl_restoration_failure_cannot_be_accepted_as_a_content_match \
+            macos_metadata::acl_staging_stays_private_when_ownership_changes
+          do
+            run_exact root "$local_tests" "$test"
+          done
       - name: Build the candidate syq executable
         run: cargo build --locked --bin syq
       - name: Use Homebrew OpenSSL for Ed25519 signing
@@ -223,7 +253,7 @@ jobs:
         run: |
           SYQ_CANDIDATE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           export SYQ_CANDIDATE_VERSION
-          scripts/test-python-sdk-release-tools.sh
+          scripts/test-python-sdk-release-tools.py
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
           export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
           RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
@@ -250,14 +280,14 @@ jobs:
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
       - name: Test interactive benchmark with system Bash
         run: python3 scripts/test-try-benchmark.py
-      - name: Release shell suites
+      - name: Release tooling suites
         run: |
           status=0
           for suite in \
-            scripts/test-release-tools.sh \
-            scripts/test-release-orchestration.sh \
-            scripts/test-installer.sh \
-            scripts/test-homebrew-formula.sh
+            scripts/test-release-tools.py \
+            scripts/test-release-orchestration.py \
+            scripts/test-installer.py \
+            scripts/test-homebrew-formula.py
           do
             echo "=== $suite"
             if ! "$suite"; then

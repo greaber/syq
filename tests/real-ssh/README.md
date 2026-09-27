@@ -1,6 +1,6 @@
 # Real-SSH integration tests
 
-This local-only suite runs the candidate syq build through live OpenSSH clients
+This suite runs the candidate syq build through live OpenSSH clients
 and servers. Docker Compose creates three containers on an internal network:
 
 ```text
@@ -21,31 +21,35 @@ to SSH data connections.
 Run the suite from any syq checkout:
 
 ```sh
-scripts/test-real-ssh.sh
+scripts/test-real-ssh.py
 ```
 
-The suite also runs a pinned MinIO fixture on the runner. Storage checks approve
+Full nightly and manual `ci.yml` runs run the core suite in both SSH profiles
+and the storage, metadata, and benchmark suites below on GitHub's Linux runner.
+Pull requests and post-merge runs do not.
+
+The suite also runs a pinned local S3 server fixture on the runner: PGSTY Silo,
+a maintained fork of the MinIO server. Storage checks approve
 requests through the return connection and disconnect receiving before uploads
 and downloads finish. The source has no storage credentials. To run only these
 checks:
 
 ```sh
-scripts/test-real-ssh.sh --suite storage
+scripts/test-real-ssh.py --suite storage
 ```
 
 To check metadata reconciliation and interrupted or failed copies over SSH and
 TCP, without running the other scenarios:
 
 ```sh
-scripts/test-real-ssh.sh --suite metadata
+scripts/test-real-ssh.py --suite metadata
 ```
 
 These checks inspect remote contents, modes, ownership, timestamps, ACLs,
 xattrs, and hardlink relationships directly after recovery.
 
-The host runner requires Bash 4 or newer. In particular, the Bash 3.2 shipped
-with macOS is not supported; install a current Bash and invoke the script with
-it when running the lab on macOS.
+The host runner is a Python script. Run it with the Python installed by
+`scripts/setup.sh`.
 
 Use the alternate destination sshd profile to exercise syq's fallback from a
 rejected multiplexed worker channel to independent SSH connections. The
@@ -54,7 +58,7 @@ requires evidence of both a rejected real OpenSSH multiplexed attempt and a
 successful `ControlPath=none` retry:
 
 ```sh
-scripts/test-real-ssh.sh --profile max-sessions-1
+scripts/test-real-ssh.py --profile max-sessions-1
 ```
 
 OpenSSH normally hides this condition by opening an independent connection
@@ -122,7 +126,7 @@ The experimental streaming path also runs over TCP and SSH, with push, pull,
 source/destination coordination and a local relay. Each streaming copy has a
 25-second deadline and is compared byte for byte, including a signed receiver.
 
-This suite is intentionally outside `cargo test` and CI. Use the
+This suite is outside `cargo test` and post-merge CI. Use the
 [verification guidance](../../AGENTS.md#verification) to decide when a change
 needs the full suite or focused tests, and run it before cutting a release.
 For release preparation, use
@@ -154,7 +158,7 @@ unreachable data ports, and revocation followed by an approved retry.
 The benchmark-script integration checks run separately:
 
 ```sh
-scripts/test-real-ssh.sh --suite benchmark
+scripts/test-real-ssh.py --suite benchmark
 ```
 
 Run these when changing `scripts/try-benchmark.sh` or interfaces it uses, such

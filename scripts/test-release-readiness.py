@@ -44,7 +44,7 @@ class ReleaseTests(unittest.TestCase):
     def record(self, script="exit 0\n"):
         lab = self.root / "lab"
         lab.mkdir(exist_ok=True)
-        runner = lab / "test-real-ssh.sh"
+        runner = lab / "test-real-ssh.py"
         runner.write_text("#!/usr/bin/env bash\nset -eu\n" + script)
         runner.chmod(0o755)
         real_run = readiness.run
@@ -153,8 +153,8 @@ else:
         env = {**os.environ, "PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
                "FIXTURE_TARGET": str(target)}
         prepared = self.root / "prepared"
-        subprocess.run([str(SCRIPTS / "prepare-release-crate.sh"), "v9.9.9", str(prepared)], env=env, check=True)
-        command = [str(SCRIPTS / "verify-prepared-crate.sh"), "v9.9.9", str(prepared)]
+        subprocess.run([str(SCRIPTS / "prepare-release-crate.py"), "v9.9.9", str(prepared)], env=env, check=True)
+        command = [str(SCRIPTS / "verify-prepared-crate.py"), "v9.9.9", str(prepared)]
         subprocess.run(command, env=env, check=True)
         result = subprocess.run(command, env={**env, "FIXTURE_BYTES": "different"}, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
