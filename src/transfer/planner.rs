@@ -488,9 +488,20 @@ impl Planner<'_> {
             | TargetCondition::MatchesFingerprint { dev, ino, .. } => (dev, ino),
             TargetCondition::Any | TargetCondition::Absent => return Ok(()),
         };
-        let current = stat_many(self.dst, vec![self.dst_root.clone()], false)?
-            .pop()
-            .flatten();
+        // Only identity matters here. A plain lookup avoids the rich-metadata
+        // capture that preserving ACLs or xattrs adds to ordinary stats: its
+        // change guard trips on entries this copy's workers are adding to the
+        // root while later batches are still being planned.
+        let current = match ok(
+            self.dst.call(Request::PruneLookup {
+                paths: vec![self.dst_root.clone()],
+                guard: None,
+            })?,
+            "inspect destination root",
+        )? {
+            Response::Stats(mut entries) if entries.len() == 1 => entries.pop().flatten(),
+            other => bail!("unexpected destination inspection response {other:?}"),
+        };
         match current {
             Some(entry) if entry.dev == dev && entry.ino == ino => Ok(()),
             _ => bail!(
