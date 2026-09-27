@@ -78,7 +78,7 @@ def check_ssh():
         "host": platform.platform(), "docker": run("docker", "--version"),
         "compose": run("docker", "compose", "version"),
     }
-    subprocess.run([str(SCRIPTS / "test-real-ssh.sh")], check=True, stdout=sys.stderr)
+    subprocess.run([str(SCRIPTS / "test-real-ssh.py")], check=True, stdout=sys.stderr)
     if clean_candidate() != (commit, tree):
         raise ValueError("checkout changed during real-SSH validation; no evidence recorded")
     receipt.update(result="success", completed_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
@@ -104,7 +104,7 @@ def readiness(tag):
     remote_tag = run("git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}")
     if local_tag.returncode == 0 or remote_tag:
         missing("the requested tag already exists; inspect or resume it, do not choose another version",
-                f"scripts/release-status.sh {tag}")
+                f"scripts/release-status.py {tag}")
         return {"schema": 1, "tag": tag, "commit": commit, "remote_master": None,
                 "ready": False, "ssh": None, "ci": None, "missing": issues,
                 "next_action": issues[0]["next_action"]}
@@ -138,7 +138,7 @@ def readiness(tag):
     if not evidence:
         missing("default real-SSH validation is missing for these test inputs",
                 f"scripts/release-readiness.py {tag} --check-ssh")
-    ci = subprocess.run([str(SCRIPTS / "verify-release-ci.sh"), "--json", REPOSITORY, commit],
+    ci = subprocess.run([str(SCRIPTS / "verify-release-ci.py"), "--json", REPOSITORY, commit],
                         capture_output=True, text=True)
     if ci.returncode not in (0, 1):
         raise ValueError("CI inspection failed: " + ci.stderr.strip())
@@ -153,7 +153,7 @@ def readiness(tag):
             missing(workflow["message"], action)
     return {"schema": 1, "tag": tag, "commit": commit, "remote_master": master,
             "ready": not issues, "ssh": evidence, "ci": certification, "missing": issues,
-            "next_action": issues[0]["next_action"] if issues else f"scripts/release-preflight.sh {tag}"}
+            "next_action": issues[0]["next_action"] if issues else f"scripts/release-preflight.py {tag}"}
 
 
 def main():

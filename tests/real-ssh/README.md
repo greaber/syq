@@ -21,7 +21,7 @@ to SSH data connections.
 Run the suite from any syq checkout:
 
 ```sh
-scripts/test-real-ssh.sh
+scripts/test-real-ssh.py
 ```
 
 The suite also runs a pinned MinIO fixture on the runner. Storage checks approve
@@ -30,22 +30,21 @@ and downloads finish. The source has no storage credentials. To run only these
 checks:
 
 ```sh
-scripts/test-real-ssh.sh --suite storage
+scripts/test-real-ssh.py --suite storage
 ```
 
 To check metadata reconciliation and interrupted or failed copies over SSH and
 TCP, without running the other scenarios:
 
 ```sh
-scripts/test-real-ssh.sh --suite metadata
+scripts/test-real-ssh.py --suite metadata
 ```
 
 These checks inspect remote contents, modes, ownership, timestamps, ACLs,
 xattrs, and hardlink relationships directly after recovery.
 
-The host runner requires Bash 4 or newer. In particular, the Bash 3.2 shipped
-with macOS is not supported; install a current Bash and invoke the script with
-it when running the lab on macOS.
+The host runner is a Python script. Run it with Python 3.12 or newer, such as
+the interpreter installed by `scripts/setup.sh`.
 
 Use the alternate destination sshd profile to exercise syq's fallback from a
 rejected multiplexed worker channel to independent SSH connections. The
@@ -54,7 +53,7 @@ requires evidence of both a rejected real OpenSSH multiplexed attempt and a
 successful `ControlPath=none` retry:
 
 ```sh
-scripts/test-real-ssh.sh --profile max-sessions-1
+scripts/test-real-ssh.py --profile max-sessions-1
 ```
 
 OpenSSH normally hides this condition by opening an independent connection
@@ -154,7 +153,7 @@ unreachable data ports, and revocation followed by an approved retry.
 The benchmark-script integration checks run separately:
 
 ```sh
-scripts/test-real-ssh.sh --suite benchmark
+scripts/test-real-ssh.py --suite benchmark
 ```
 
 Run these when changing `scripts/try-benchmark.sh` or interfaces it uses, such

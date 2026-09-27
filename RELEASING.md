@@ -125,7 +125,7 @@ Exit 0 means the candidate is ready for preflight, 1 means work is missing, and
 2 means inspection failed. The report includes the candidate SHA, remote master,
 local real-SSH evidence, all three CI certifications, and next actions. It is
 read-only unless `--check-ssh` is supplied. It never tags, publishes, dispatches
-CI, or merges a PR. If the requested tag exists, inspect `release-status.sh`
+CI, or merges a PR. If the requested tag exists, inspect `release-status.py`
 and resume or verify that release rather than preparing another version.
 
 For an already-prepared version with matching evidence, start at step 2. A new
@@ -158,7 +158,7 @@ release request does not require another preparation PR or another test run.
    remain readable. Dirty runs cannot certify a release. A deliberately rerun
    check invalidates its earlier receipt before execution, so failure cannot leave stale success.
    These are local maintainer records, not portable CI certificates. An
-   independent clone needs its own check. `scripts/test-real-ssh.sh` remains
+   independent clone needs its own check. `scripts/test-real-ssh.py` remains
    available for development checks without release recording.
 
 2. Once the release commit is the exact `master` tip, start the release binary
@@ -190,7 +190,7 @@ release request does not require another preparation PR or another test run.
 
    ```sh
    candidate=$(git rev-parse HEAD)
-   scripts/verify-release-ci.sh greaber/syq "$candidate"
+   scripts/verify-release-ci.py greaber/syq "$candidate"
    ```
 
    A successful full nightly or manual run is reusable. Each workflow records a
@@ -227,8 +227,8 @@ release request does not require another preparation PR or another test run.
    needed runs succeed, repeat verification and run the read-only preflight:
 
    ```sh
-   scripts/verify-release-ci.sh greaber/syq "$candidate"
-   scripts/release-preflight.sh v0.1.9
+   scripts/verify-release-ci.py greaber/syq "$candidate"
+   scripts/release-preflight.py v0.1.9
    ```
 
    It accepts a clean task branch or detached checkout at the pinned candidate,
@@ -287,8 +287,8 @@ release request does not require another preparation PR or another test run.
    Track the complete state at any time with:
 
    ```sh
-   scripts/release-status.sh v0.1.9
-   scripts/release-status.sh --json v0.1.9
+   scripts/release-status.py v0.1.9
+   scripts/release-status.py --json v0.1.9
    scripts/release-timings.py v0.1.9
    ```
 
@@ -361,7 +361,7 @@ linting, and unit tests, plus directly edited integration-test targets; SDK chan
 rsync compatibility changes run Linux conformance. Explicit macOS source,
 or test changes select the Apple Silicon suite. Workflow changes select workflow
 lint and orchestration fixtures, without selecting product suites. Tooling
-changes select their owning test scripts where mapped in `scripts/ci-scope.sh`;
+changes select their owning test scripts where mapped in `scripts/ci-scope.py`;
 unmapped tooling retains the broad tooling checks. Cargo package identity is
 checked for packaging inputs and full runs, rather than every tooling edit.
 Matching automatic jobs cancel superseded work only when their selected checks
@@ -419,7 +419,7 @@ notarization in the macOS build jobs before advertising that path.
 
 ### Python distribution inputs
 
-Python release preparation runs `scripts/pin-python-native-source.sh` after
+Python release preparation runs `scripts/pin-python-native-source.py` after
 updating the embedded release manifest. It resolves that release tag to a commit
 and records its source-tree hash in `sdk/python/native-source.json`. When
 preparing the SDK manually, run that command with Nix installed and the native

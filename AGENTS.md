@@ -154,7 +154,7 @@ the conversation instead.
 - At review handoff, state the branch and exact short commit SHA, whether the
   worktree is clean, and which checks passed, failed, or were not run. Treat
   review-ready and merge-ready as separate states.
-- Run `scripts/branch-status.sh` from the task worktree before opening a pull
+- Run `scripts/branch-status.py` from the task worktree before opening a pull
   request, before asking for review, and before merging, and include its output
   in the report. It fetches `origin/master` and prints the branch SHA,
   cleanliness, and position relative to it, the pull request's GitHub head and
@@ -228,12 +228,12 @@ report actual access or decision blockers instead of bypassing them.
   its recorded default real-SSH validation when its test inputs are
   unchanged under the same release-preparation exception. Its `--check-ssh` mode
   runs and records missing local validation. Reuse post-merge or manual runs
-  when `scripts/verify-release-ci.sh`
+  when `scripts/verify-release-ci.py`
   accepts their full-suite certificates; dispatch only workflows missing that
   evidence and wait for them to succeed. Then run
-  `scripts/release-preflight.sh v<version>` from that same commit. Treat any
+  `scripts/release-preflight.py v<version>` from that same commit. Treat any
   failure as a blocker rather than pushing the tag to discover whether the
-  release workflow starts. Use `scripts/release-status.sh v<version>` after
+  release workflow starts. Use `scripts/release-status.py v<version>` after
   the push to correlate the exact tag, workflow, approvals, and publication
   destinations.
 - Treat a release tag as provisional until its release workflow connects it
@@ -379,6 +379,16 @@ known about it.
   silently expand the scope or drop agreed behavior.
 - Prefer one clear implementation. Add fallbacks or compatibility paths only
   for a concrete scenario or consumer that needs them.
+- Write repository tooling (CI scope, release, status, and test scripts) in
+  Python using only the standard library, run with the interpreter pinned by
+  `scripts/setup.sh`. Keep it compatible with Python 3.12, which the release
+  workflows still run from the runner image. Use portable shell only for code
+  that runs on users' machines or arbitrary hosts (the generated installer and
+  `scripts/try-benchmark.sh`), code that must run before pinned tools exist
+  (`scripts/setup.sh`), the real-SSH container scripts, and thin wrappers that
+  only run other commands, such as the release runners' Nix and build steps.
+  CI and release tooling is too complex to maintain well in Bash, so do not
+  spend effort on Bash 3.2 compatibility for development scripts.
 - Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
   sync. A behavior change lands in `docs/reference.md` (or the topical
   document that owns it), not in a new README section.
@@ -581,7 +591,7 @@ connection setup, helper bootstrap, authentication or authorization, remote
 process lifecycle, transport behavior, or remote coordinator placement:
 
 ```bash
-scripts/test-real-ssh.sh
+scripts/test-real-ssh.py
 ```
 
 It is intentionally not part of ordinary CI or `cargo test`; see

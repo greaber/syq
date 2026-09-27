@@ -125,9 +125,9 @@ class Tests(unittest.TestCase):
         build = workflow.with_name("reproducible-builds.yml").read_text()
         crate = build.split("  source-crate:\n", 1)[1].split("  build:\n", 1)[0]
         self.assertNotIn("    needs:", crate)
-        self.assertIn('scripts/prepare-release-crate.sh "v$version"', crate)
+        self.assertIn('scripts/prepare-release-crate.py "v$version"', crate)
         self.assertIn('name: source-crate', crate)
-        self.assertIn('scripts/verify-prepared-crate.sh "$GITHUB_REF_NAME"', release)
+        self.assertIn('scripts/verify-prepared-crate.py "$GITHUB_REF_NAME"', release)
 
 
 
@@ -187,8 +187,8 @@ class PythonTests(Tests):
         self.assertIn('test "$GITHUB_SHA" = "$CANDIDATE_COMMIT"', workflow)
         prepare = (root / ".github/workflows/prepare-python-sdk.yml").read_text()
         self.assertLess(prepare.index("gh workflow run publish-sdks.yml"),
-                        prepare.index("scripts/run-generated-sdk-post-merge-ci.sh"))
-        self.assertLess(prepare.index("scripts/run-generated-sdk-post-merge-ci.sh"),
+                        prepare.index("scripts/run-generated-sdk-post-merge-ci.py"))
+        self.assertLess(prepare.index("scripts/run-generated-sdk-post-merge-ci.py"),
                         prepare.index("python3 scripts/find-release-build.py"))
         self.assertLess(prepare.index("python3 scripts/find-release-build.py"),
                         prepare.index('git push origin --delete "$branch"'))
