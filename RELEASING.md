@@ -374,9 +374,11 @@ executable documentation changes still count. The first nightly run executes
 all suites, and a failed nightly is retried on subsequent nights. Unchanged
 inputs only run the small scope checks. Full runs include SDKs, both rsync
 platforms, Linux ARM64, Intel macOS compilation/updater tests, the complete
-Apple Silicon suite, the disposable MinIO suite, and the real-SSH core suite.
-The MinIO and real-SSH jobs are outside `release-certification`, but a failure
-in either fails the `ci.yml` run, so that run cannot serve as release evidence. Intel compilation/updater checks use unoptimized binaries
+Apple Silicon suite with its root-only and live-network tests, the disposable
+S3 suite, every real-SSH suite and profile, the documentation checks, and the
+compatibility checks against released binaries. These nightly-only `ci.yml`
+jobs are outside `release-certification`, but a failure in any of them fails
+the `ci.yml` run, so that run cannot serve as release evidence. Intel compilation/updater checks use unoptimized binaries
 without debug information; the shipped release binaries remain optimized.
 Focused Intel checks use that same test profile and Cargo cache. Manual runs remain available at any time and are not
 cancelled by new pushes.

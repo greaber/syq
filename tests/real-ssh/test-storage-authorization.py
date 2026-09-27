@@ -132,8 +132,8 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
                       AWS_EC2_METADATA_DISABLED='true')
     os.environ.pop('AWS_SESSION_TOKEN', None)
     environment = dict(os.environ, MINIO_ROOT_USER='syq-test-user', MINIO_ROOT_PASSWORD='syq-test-password')
-    with (root/'minio.log').open('w+') as log:
-        minio = subprocess.Popen(['/usr/local/libexec/syq-test-minio', 'server', '--address', ':9100',
+    with (root/'s3-server.log').open('w+') as log:
+        s3_server = subprocess.Popen(['/usr/local/libexec/syq-test-s3-server', 'server', '--address', ':9100',
                                   '--console-address', ':9101', str(root/'data')],
                                  env=environment, stdout=log, stderr=log, start_new_session=True)
         credentials = Path.home()/'.aws'/'credentials'
@@ -156,7 +156,7 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
                 print('Waiting for storage fixture:', last, flush=True)
                 time.sleep(1)
             else:
-                raise AssertionError('MinIO readiness deadline: '+last)
+                raise AssertionError('S3 server readiness deadline: '+last)
             sys.argv = [sys.argv[0], '/usr/local/bin/syq']
             spec = importlib.util.spec_from_file_location('storage_checks', '/usr/local/libexec/syq-storage-check.py')
             checks = importlib.util.module_from_spec(spec)
@@ -280,7 +280,7 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             copy(['--mapping', remote_root+'/mapping', '--cwd', prefix, '--from', 's3://syq-storage-test', '--into', remote_root+'/mapping-copy'], disconnect=False)
             assert run('ssh', 'source', shlex.join(['cat', remote_root+'/mapping-copy/mapped'])) == 'small'
             if endpoint.startswith('http://'):
-                # Only the disposable MinIO fixture owns bucket configuration.
+                # Only the disposable S3 server fixture owns bucket configuration.
                 # Live-provider runs leave existing bucket settings untouched.
                 print('case: cross-bucket copies and permanent version removal', flush=True)
                 original_bucket = checks.BUCKET
@@ -295,7 +295,7 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
                     checks.request('PUT', data=b'<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>', query={'versioning': ''})
                     print('case: exact directory-marker version removal preserves its trailing slash', flush=True)
                     marker = prefix+'/marker/'
-                    # Pinned MinIO exposes directory markers as the null
+                    # The pinned S3 server exposes directory markers as the null
                     # version even when the bucket has versioning enabled.
                     checks.request('PUT', marker, b'')
                     marker_version = 'null'
@@ -348,13 +348,13 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
                     checks.clean()
             finally:
                 credentials.unlink(missing_ok=True)
-                os.killpg(minio.pid, signal.SIGTERM)
+                os.killpg(s3_server.pid, signal.SIGTERM)
                 try:
-                    minio.wait(timeout=10)
+                    s3_server.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    os.killpg(minio.pid, signal.SIGKILL)
-                    minio.wait(timeout=5)
-                if minio.returncode not in (0, -signal.SIGTERM):
+                    os.killpg(s3_server.pid, signal.SIGKILL)
+                    s3_server.wait(timeout=5)
+                if s3_server.returncode not in (0, -signal.SIGTERM):
                     log.seek(0)
                     print(log.read(), flush=True)
     connect()

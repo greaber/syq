@@ -20,7 +20,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --locked --bin syq \
     && cp target/debug/syq /tmp/syq-other-build
 
-FROM quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e AS storage-fixture
+# PGSTY Silo, a maintained community fork of the MinIO server.
+FROM docker.io/pgsty/silo@sha256:b616a0cf8cb281e7e6bb3c9b1fb53875b4016a2878223925541c18f82d6c5ca3 AS storage-fixture
 
 FROM debian:bookworm-slim
 
@@ -56,7 +57,7 @@ RUN useradd --uid 1001 --gid syq --create-home --shell /bin/sh \
         --home-dir /home/syq-real-ssh-long-account-home-for-restricted-worker-paths longhome \
     && passwd --delete longhome
 
-COPY --from=storage-fixture /usr/bin/minio /usr/local/libexec/syq-test-minio
+COPY --from=storage-fixture /usr/bin/silo /usr/local/libexec/syq-test-s3-server
 COPY tests/object-storage/check.py /usr/local/libexec/syq-storage-check.py
 COPY tests/real-ssh/test-storage-authorization.py /usr/local/libexec/syq-test-storage-authorization.py
 COPY tests/real-ssh/storage-streams.py /usr/local/libexec/syq-storage-streams.py

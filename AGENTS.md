@@ -636,6 +636,8 @@ responsible for selecting checks under the rules above, choosing integration tes
 and reporting exactly what was and was not verified before review. Post-merge
 workflows select affected areas and do not run the local suites; nightly runs
 execute the complete suites, including both local suites, when test inputs
-have changed. Full validation remains required before
+have changed. Nightly should run every test in the repository. Leaving a test
+out of nightly needs the user's explicit agreement, recorded here with its
+reason. Full validation remains required before
 release. Pay particular attention to remote, TCP, platform-specific,
 and performance behavior when choosing local checks.
