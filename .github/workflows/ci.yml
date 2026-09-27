@@ -639,6 +639,9 @@ jobs:
       - name: Check tool comparison examples
         if: ${{ !cancelled() }}
         run: python3 scripts/test-tool-examples.py
+      - name: Check that automation fixtures match real output
+        if: ${{ !cancelled() }}
+        run: python3 scripts/regen-automation-fixtures.py --check
       - name: Check documentation links and version selection
         if: ${{ !cancelled() }}
         run: |
