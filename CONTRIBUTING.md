@@ -107,10 +107,13 @@ CARGO_PROFILE_RELEASE_STRIP=none cargo build --locked --release
 ```
 
 The same override works with `python -m pip install ./sdk/python`.
-`cargo build --locked` includes line-number debug information, assertions, and
-overflow checks at optimization level 1. For full debugger variable information,
-set `CARGO_PROFILE_DEV_DEBUG=full`; for easier stepping, also set
-`CARGO_PROFILE_DEV_OPT_LEVEL=0`. BLAKE3 remains optimized at level 3.
+`cargo build --locked` includes assertions and overflow checks at optimization
+level 1, without debug information. Panic messages still name the file and
+line; backtraces show function names only. For file and line numbers in
+backtraces, set `CARGO_PROFILE_DEV_DEBUG=line-tables-only`; for debugger
+variable information, set `CARGO_PROFILE_DEV_DEBUG=full`, and for easier
+stepping also `CARGO_PROFILE_DEV_OPT_LEVEL=0`. BLAKE3 remains optimized at
+level 3.
 
 ## Reproduce a release binary
 
