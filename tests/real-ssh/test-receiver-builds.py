@@ -97,6 +97,17 @@ print(json.dumps([hashlib.sha256((Path({root!r})/name).read_bytes()).hexdigest()
     copy(1, "after-revoke")
     run(programs[1], "receiver", "revoke", bytes(record_b["id"]).hex())
     assert not enrollments(root)
+    for record in [record_a, record_b]:
+        # Other scopes may share this build's executable. Once none do, the
+        # last revoker removes it, including a legacy receiver left by an old client.
+        remote(f"""
+import json
+from pathlib import Path
+receiver = Path({record['receiver_path']!r})
+state = Path({record['remote_home']!r}) / '.local/share/syq/restricted'
+references = [json.loads(p.read_bytes())['receiver_path'] for p in state.glob('*/config.json')]
+assert str(receiver) in references or not receiver.exists(), receiver
+""")
     print("Receiver build isolation, concurrency, refresh, and revocation passed:", identities, flush=True)
 
 
