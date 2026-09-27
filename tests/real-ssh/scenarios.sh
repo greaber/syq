@@ -1175,8 +1175,6 @@ assert_same_tree source /tmp/syq-real-ssh/tuning-batches \
     destination /tmp/syq-real-ssh/tuning-batches tuning-batches
 
 # Final checks after every selected case.
-# The full suite has already turned persistence off; a subset may leave it on.
-syq persist off >/dev/null
 if ssh source 'pgrep -x syq >/dev/null' || ssh destination 'pgrep -x syq >/dev/null'; then
     echo 'a remote syq process survived the attached test suite' >&2
     exit 1
