@@ -154,6 +154,16 @@ the conversation instead.
 - At review handoff, state the branch and exact short commit SHA, whether the
   worktree is clean, and which checks passed, failed, or were not run. Treat
   review-ready and merge-ready as separate states.
+- List the checks in the pull request description as a table with one row per
+  check: the exact command or test name, the short SHA it ran at, and its
+  result (passed, failed, running, or not run). Open the pull request once the
+  checks that show the change works have passed, without waiting for slower
+  ones. List those as running and update their rows when they finish. Every
+  check listed as running must pass before merge.
+- After pushing another commit, keep each row's SHA as the commit the check
+  actually ran at. Rerun a check when the new commit can change its result,
+  and update its row. For the checks not rerun, add a line under the table
+  naming the new commit and why it cannot affect them.
 - Run `scripts/branch-status.py` from the task worktree before opening a pull
   request, before asking for review, and before merging, and include its output
   in the report. It fetches `origin/master` and prints the branch SHA,
@@ -328,6 +338,12 @@ known about it.
   gain. Startup latency and throughput are core to the product.
 - Do not flag a missing `CHANGELOG.md` entry on an ordinary PR. The changelog
   is brought up to date during release preparation.
+- Do not repeat checks the pull request lists as passed or running; the
+  implementing agent owns those. For each row whose SHA is older than the
+  reviewed SHA, judge whether the later commits can change its result, and
+  ask for a rerun when they can. Name any check still running as required
+  before merge. If a check the pull request does not list matters for the
+  change, say which and why, and run it yourself when that is practical.
 
 ## PR review freshness
 
