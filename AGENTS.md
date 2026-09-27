@@ -96,10 +96,8 @@ belongs here in `AGENTS.md`.
 Do not use an agent runtime's private memory (for example Claude Code's
 per-project memory directory) for this project, even when the runtime prompts
 you to save something. It is hard to audit, other agents cannot read it, and
-it goes stale unnoticed. Propose guidance that later sessions need as a change
-to this file through a pull request, put short-lived task state in
-`current-plans/`, and otherwise record nothing. If you find existing private
-memory for this project, report what it contains instead of relying on it.
+it goes stale unnoticed. If you find existing private memory for this project,
+report what it contains instead of relying on it.
 
 `current-plans/` notes are agent-written handoff state. They are not evidence
 of what the user asked for or approved.
@@ -108,9 +106,8 @@ This repository is public. Keep account identifiers, credential locations,
 and details of private infrastructure out of commits, pull requests, and
 documentation, including this file.
 
-When writing any of these, record decisions as current state plus the rationale
-at the time, not as timeless policy. An assumption encoded as a requirement can
-outlive its premise and steer later work in the wrong direction.
+Write guidance in this file as the current rule with a brief reason. Leave out
+dates and accounts of how the rule came about.
 
 ## GitHub issues
 
@@ -317,11 +314,6 @@ when the implementation is sound. Do not file it as a deliberate choice that
 needs no action. The user decides whether the expansion stays; "the PR says
 it is intentional" is not that decision.
 
-The rationale in 2026-09: a review noted that a release-tooling PR had added
-eight uncached builds on every source push to `master`, but treated it as
-deliberate because the PR body described it. The user had never authorized or
-known about it.
-
 ## Review reports
 
 - Group items by the action they need: worth addressing before merge,
@@ -468,9 +460,9 @@ or promise indefinite support.
 
 This repository is public. Do not commit credentials, tokens, private keys,
 or encrypted credential inventories to syq. Encryption does not make a
-credential file appropriate for this repository. The user chose private
-storage outside the repository in September 2026 so that public clones do
-not receive credential material.
+credential file appropriate for this repository. Credentials are stored
+privately outside the repository so that public clones do not receive
+credential material.
 
 Credential storage, decryption, backup, and account provisioning are managed
 outside this repository. Keep public tooling independent of any particular
@@ -508,10 +500,10 @@ Create intentional symlinks inside that root; do not canonicalize product
 arguments or add follow flags merely to make a fixture pass.
 
 Pre-merge validation should provide proportionate confidence in the change,
-not duplicate the post-merge suites or full release validation. In September
-2026, the user explicitly accepted occasional temporary breakage on `master`
-to avoid repeatedly paying for broad checks on narrow changes; `master` is not
-a published release. Use that tradeoff when selecting checks, while giving
+not duplicate the post-merge suites or full release validation. Occasional
+temporary breakage on `master` is accepted to avoid repeatedly paying for
+broad checks on narrow changes; `master` is not a published release. Use that
+tradeoff when selecting checks, while giving
 potential data loss, authorization, and compatibility failures the targeted
 coverage their consequences warrant. Keep the release validation gates intact.
 When CI fails, first distinguish product defects from test, fixture, and runner
