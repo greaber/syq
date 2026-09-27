@@ -234,8 +234,12 @@ jobs:
             fi
           }
           run_exact user "$unit" tune::network::macos::tests::native_router_fingerprint
-          run_exact root "$local_tests" \
+          for test in \
+            macos_metadata::acl_restoration_failure_cannot_be_accepted_as_a_content_match \
             macos_metadata::acl_staging_stays_private_when_ownership_changes
+          do
+            run_exact root "$local_tests" "$test"
+          done
       - name: Build the candidate syq executable
         run: cargo build --locked --bin syq
       - name: Use Homebrew OpenSSL for Ed25519 signing
