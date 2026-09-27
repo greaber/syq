@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Test release preparation equivalence and certification selection."""
+from support import SCRIPTS
+
 import json
 import os
 from pathlib import Path
@@ -10,7 +12,6 @@ from unittest.mock import patch
 
 from release_test_inputs import fingerprint, candidates
 
-SCRIPTS = Path(__file__).resolve().parent
 
 
 class InputsTests(unittest.TestCase):

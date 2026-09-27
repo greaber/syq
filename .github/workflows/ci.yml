@@ -107,7 +107,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python${{ needs.scope.outputs.full_suite == 'true' && '-node' || '' }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         if: >-
           needs.scope.outputs.native == 'true' ||
@@ -116,7 +116,11 @@ jobs:
           needs.scope.outputs.mapping_docs == 'true'
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/setup.sh github shellcheck jq python
+        run: |
+          scripts/setup.sh github shellcheck jq python
+          if [[ "${{ needs.scope.outputs.full_suite }}" == true ]]; then
+            scripts/setup.sh github node
+          fi
       - name: Show Linux trial hardware
         if: inputs.linux_trial == 'github' || inputs.linux_trial == 'namespace'
         run: |
@@ -204,47 +208,63 @@ jobs:
           (needs.scope.outputs.native != 'true' ||
            needs.scope.outputs.full_suite != 'true')
         run: cargo test --locked --test local _md_
+      - name: Test every repository tooling script
+        if: needs.scope.outputs.full_suite == 'true'
+        run: scripts/run-tooling-tests.py
       - name: Test Cargo package identity
         if: >-
+          needs.scope.outputs.full_suite != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' package ')
-        run: scripts/test-cargo-package.py
+        run: tests/tooling/test-cargo-package.py
       - name: Test installer tooling
         if: >-
+          needs.scope.outputs.full_suite != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' installer ')
-        run: scripts/test-installer.py
+        run: tests/tooling/test-installer.py
       - name: Test interactive benchmark
         if: >-
+          needs.scope.outputs.full_suite != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' benchmark ')
-        run: python3 scripts/test-try-benchmark.py
+        run: python3 tests/tooling/test-try-benchmark.py
       - name: Test release tooling
         if: >-
+          needs.scope.outputs.full_suite != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' release ')
         env:
           TOOLING_CHECKS: ${{ needs.scope.outputs.tooling_checks }}
         run: |
           if [[ " $TOOLING_CHECKS " == *" package "* ]]; then
-            scripts/test-release-tools.py --syq "$GITHUB_WORKSPACE/target/package-identity/debug/syq"
+            tests/tooling/test-release-tools.py --syq "$GITHUB_WORKSPACE/target/package-identity/debug/syq"
           else
-            scripts/test-release-tools.py
+            tests/tooling/test-release-tools.py
           fi
       - name: Test release orchestration
         if: >-
+          needs.scope.outputs.full_suite != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' orchestration ')
         run: |
-          scripts/test-release-orchestration.py
-          scripts/test-tooling.py
+          tests/tooling/test-release-orchestration.py
+          tests/tooling/test-tooling.py
+          python3 tests/tooling/test-tooling-discovery.py
+          tests/tooling/test-generated-sdk-post-merge-ci.py
+          tests/tooling/test-release-readiness.py
+          tests/tooling/test-release-timings.py
+          tests/tooling/test-find-release-build.py
       - name: Test focused check dispatch
         if: >-
+          needs.scope.outputs.full_suite != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' focused ')
-        run: python3 scripts/test-run-focused-check.py
+        run: python3 tests/tooling/test-run-focused-check.py
       - name: Test branch status tooling
         if: >-
+          needs.scope.outputs.full_suite != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' branch ')
-        run: scripts/test-branch-status.py
+        run: tests/tooling/test-branch-status.py
       - name: Test the development setup
         if: >-
+          needs.scope.outputs.full_suite != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' setup ')
-        run: scripts/test-setup.sh
+        run: tests/tooling/test-setup.sh
       - name: Validate workflow syntax and script references
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' workflows ')
@@ -338,7 +358,7 @@ jobs:
         run: |
           SYQ_CANDIDATE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           export SYQ_CANDIDATE_VERSION
-          scripts/test-python-sdk-release-tools.py
+          tests/tooling/test-python-sdk-release-tools.py
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
           export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
           RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
@@ -630,24 +650,16 @@ jobs:
           restore-keys: |
             cargo-ci-repository-checks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
             cargo-ci-repository-checks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
-      - name: Test agent coordination commands
-        run: python3 scripts/test-agent-coordination.py
       # The ignored Linux tests are timing and simulation reports.
       - name: Run ignored Linux tests
         if: ${{ !cancelled() }}
         run: cargo test --locked --all-targets -- --ignored
-      - name: Check tool comparison examples
-        if: ${{ !cancelled() }}
-        run: python3 scripts/test-tool-examples.py
       - name: Check that automation fixtures match real output
         if: ${{ !cancelled() }}
         run: python3 scripts/regen-automation-fixtures.py --check
-      - name: Check documentation links and version selection
+      - name: Check documentation links
         if: ${{ !cancelled() }}
-        run: |
-          python3 scripts/check-doc-links.py
-          python3 scripts/test-doc-site.py
-          node --test scripts/test-doc-selector.cjs
+        run: python3 scripts/check-doc-links.py
       - name: Check compatibility with released receivers and clients
         if: ${{ !cancelled() }}
         env:

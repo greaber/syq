@@ -4,6 +4,8 @@
 Every GitHub, registry, and remote-Git response comes from fakes; nothing here
 creates a tag, a publication, or a CI run.
 """
+from support import ROOT, SCRIPTS
+
 import base64
 import json
 import os
@@ -14,8 +16,6 @@ import sys
 import tempfile
 import unittest
 
-SCRIPTS = Path(__file__).resolve().parent
-ROOT = SCRIPTS.parent
 SCOPE_KEYS = ["native", "sdks", "python_sdk", "tooling", "shellcheck", "mapping_docs",
               "conformance", "macos", "linux_arm64", "full_suite"]
 ALL_TOOLING = "benchmark branch focused installer orchestration package release setup workflows"
@@ -115,6 +115,10 @@ class PathScopeTests(Scratch):
         self.assertScope(self.scope("sdk/python/native-api.json"),
                          native="true", sdks="true", python_sdk="true")
 
+    def test_new_tooling_tests_do_not_select_product_suites(self):
+        self.assertScope(self.scope("tests/tooling/test-new.py"), tooling="true",
+                         native="false", sdks="false", conformance="false")
+
     def test_python_sdk_tooling(self):
         for path in ["nix/python-dist.nix", "scripts/build-python-dist.sh",
                      "scripts/package-python-wheel.py", "scripts/pin-python-native-source.py",
@@ -122,7 +126,7 @@ class PathScopeTests(Scratch):
                      "scripts/normalize-python-sdist.py", "scripts/check-python-wheel.py",
                      "scripts/stage-python-sdk.py", "scripts/prepare-python-sdk-release.py",
                      "scripts/run-generated-sdk-post-merge-ci.py", "scripts/select-trusted-pr.jq",
-                     "scripts/test-python-sdk-release-tools.py",
+                     "tests/tooling/test-python-sdk-release-tools.py",
                      "scripts/verify-python-release-preparation.py"]:
             with self.subTest(path=path):
                 self.assertScope(self.scope(path), tooling="true", sdks="true",
@@ -137,7 +141,7 @@ class PathScopeTests(Scratch):
             with self.subTest(path=path):
                 self.assertScope(self.scope(path), shellcheck="true", tooling="false",
                                  native="false")
-        self.assertScope(self.scope("scripts/test-installer.py"), tooling="true", native="false")
+        self.assertScope(self.scope("tests/tooling/test-installer.py"), tooling="true", native="false")
         scope = self.scope(".github/workflows/ci.yml")
         self.assertScope(scope, tooling="true")
         self.assertAll(scope, ["native", "sdks", "python_sdk", "shellcheck", "mapping_docs",
@@ -178,14 +182,14 @@ class PathScopeTests(Scratch):
     def test_tooling_changes_select_their_own_suites(self):
         # Tooling changes select their own suites, without product builds. Any
         # script change also checks the script references in workflows and docs.
-        for path, checks in [("scripts/test-release-tools.py", "release workflows"),
-                             ("scripts/test-installer.py", "installer workflows"),
-                             ("scripts/test-try-benchmark.py", "benchmark workflows"),
-                             ("scripts/test-run-focused-check.py", "focused workflows"),
-                             ("scripts/test-branch-status.py", "branch workflows"),
+        for path, checks in [("tests/tooling/test-release-tools.py", "release workflows"),
+                             ("tests/tooling/test-installer.py", "installer workflows"),
+                             ("tests/tooling/test-try-benchmark.py", "benchmark workflows"),
+                             ("tests/tooling/test-run-focused-check.py", "focused workflows"),
+                             ("tests/tooling/test-branch-status.py", "branch workflows"),
                              ("scripts/setup.sh", "setup workflows"),
-                             ("scripts/test-setup.sh", "setup workflows"),
-                             ("scripts/test-release-orchestration.py",
+                             ("tests/tooling/test-setup.sh", "setup workflows"),
+                             ("tests/tooling/test-release-orchestration.py",
                               "orchestration workflows"),
                              (".github/workflows/macos.yml", "orchestration workflows"),
                              (".github/workflows/ci.yml", "orchestration workflows"),
@@ -197,20 +201,20 @@ class PathScopeTests(Scratch):
                 self.assertAll(scope, ["native", "sdks", "conformance", "macos"], "false")
         self.assertScope(self.scope("scripts/rsync-compat.py"), conformance="true",
                          tooling_checks="workflows")
-        scope = self.scope("scripts/test-installer.py", "scripts/test-release-tools.py",
-                           "scripts/test-installer.py")
+        scope = self.scope("tests/tooling/test-installer.py", "tests/tooling/test-release-tools.py",
+                           "tests/tooling/test-installer.py")
         self.assertScope(scope, tooling_checks="installer release workflows")
         dispatch = self.event("workflow-dispatch-event.json", DISPATCH_EVENT)
         self.assertScope(self.scope(event=dispatch), tooling_checks=(
             "package installer benchmark release orchestration focused branch workflows setup"))
-        reverse = self.scope("scripts/test-release-tools.py", "scripts/test-installer.py")
+        reverse = self.scope("tests/tooling/test-release-tools.py", "tests/tooling/test-installer.py")
         self.assertScope(reverse, tooling_checks="installer release workflows")
         self.assertScope(self.scope("build.rs"), tooling_checks="package", native="true")
 
     def test_mapped_path_never_suppresses_fallback(self):
         # A mapped path must never suppress another path's broad tooling fallback.
         for fallback in ["nix/python-dist.nix", "unknown-input", "scripts/unmapped-tool.py"]:
-            for mapped in [".github/workflows/ci.yml", "scripts/test-installer.py"]:
+            for mapped in [".github/workflows/ci.yml", "tests/tooling/test-installer.py"]:
                 for paths in ([fallback], [fallback, mapped], [mapped, fallback]):
                     with self.subTest(paths=paths):
                         scope = self.scope(*paths)
@@ -367,7 +371,7 @@ class EventScopeTests(Scratch):
                 ("false", ["docs/mappings.md", "src/main.rs"]),
                 ("false", ["sdk/python/native-api.json"]),
                 ("false", ["sdk/python/src/syq/client.py"]),
-                ("false", ["scripts/test-installer.py"]),
+                ("false", ["tests/tooling/test-installer.py"]),
                 ("false", [".github/workflows/macos.yml"]),
                 ("true", ["src/tune/network/macos.rs"]),
                 ("true", ["tests/macos_exfat.rs"]),
@@ -381,12 +385,7 @@ class EventScopeTests(Scratch):
 
 class NestedSuiteTests(unittest.TestCase):
     def run_suite(self, name, **env):
-        subprocess.run([sys.executable, str(SCRIPTS / name)], env=dict(BASE_ENV, **env), check=True)
-
-    def test_generated_sdk_dispatch(self):
-        # Exercise dispatch identity, stale ref recovery, and exact-commit SDK gating.
-        subprocess.run([str(SCRIPTS / "test-generated-sdk-post-merge-ci.py")], env=BASE_ENV,
-                       check=True)
+        subprocess.run([sys.executable, str(Path(__file__).with_name(name))], env=dict(BASE_ENV, **env), check=True)
 
     def test_release_test_inputs_under_the_nightly_environment(self):
         # Exercise the nested fixtures under the environment that exposed the leak.
@@ -398,12 +397,6 @@ class NestedSuiteTests(unittest.TestCase):
                            GITHUB_EVENT_NAME="schedule", GITHUB_REPOSITORY="example/repo",
                            GITHUB_REF_NAME="master",
                            GITHUB_WORKFLOW_REF="example/repo/.github/workflows/ci.yml@refs/heads/master")
-
-    def test_release_readiness_timings_and_build_selection(self):
-        for name in ["test-release-readiness.py", "test-release-timings.py",
-                     "test-find-release-build.py"]:
-            with self.subTest(name=name):
-                self.run_suite(name)
 
     def test_nightly_ignores_inherited_overrides(self):
         self.run_suite("test-nightly-ci.py", SYQ_TEST_CHANGED_PATHS_FILE="/nonexistent-inherited-path",
