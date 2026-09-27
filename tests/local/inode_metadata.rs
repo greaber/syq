@@ -901,7 +901,7 @@ fn remote_pull_with_xattrs_tolerates_its_own_writes_to_the_destination_root() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--preserve=xattrs",
+            "--copy-metadata=xattrs",
             "--from",
             "host",
             "--srcs-in",
