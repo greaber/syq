@@ -95,3 +95,84 @@ fn packaged_provenance_and_helper_selection() {
         String::from_utf8_lossy(&output.stderr).contains("must match the source package version")
     );
 }
+
+#[test]
+fn watched_inputs_exist_outside_packages_and_nonce_builds() {
+    use std::{fs, path::Path, process::Command};
+    let root = crate::test_support::tempdir().unwrap();
+    let package = root.path().join("package");
+    fs::create_dir_all(package.join("src")).unwrap();
+    fs::write(package.join("src/lib.rs"), "").unwrap();
+    let run = || {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "emit_build_script", "--nocapture"])
+            .current_dir(&package)
+            .env("SYQ_BUILD_SCRIPT_TEST", "1")
+            .env("CARGO_MANIFEST_DIR", &package)
+            .env("CARGO_PKG_VERSION", "0.6.0")
+            .env("GIT_CEILING_DIRECTORIES", root.path())
+            .env_remove("SYQ_HELPER_RELEASE")
+            .env_remove("SYQ_RELEASE_BUILD")
+            .capture_output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let watched = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter_map(|line| line.strip_prefix("cargo::rerun-if-changed="))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    // Without Git or provenance each build gets a nonce, so the script must
+    // rerun every time: the absent provenance file stays watched.
+    let text = run();
+    assert!(
+        text.contains("SYQ_BUILD_IDENTITY=v0.6.0+dev.source."),
+        "{text}"
+    );
+    assert!(
+        watched(&text).contains(&".cargo_vcs_info.json".to_owned()),
+        "{text}"
+    );
+
+    // In a checkout, every watched path exists, so an unchanged tree does
+    // not rerun the script and recompile.
+    let git = |args: &[&str]| {
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid"
+            ])
+            .args(args)
+            .current_dir(&package)
+            .status_guarded()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "checkout"]);
+    let text = run();
+    assert!(text.contains("SYQ_BUILD_IDENTITY=v0.6.0+dev."), "{text}");
+    assert!(!text.contains("+dev.source."), "{text}");
+    let paths = watched(&text);
+    assert!(paths.contains(&"src".to_owned()), "{text}");
+    assert!(paths.iter().any(|path| path.ends_with("HEAD")), "{text}");
+    for path in &paths {
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            package.join(path)
+        };
+        assert!(
+            path.exists(),
+            "watched path {} is missing:\n{text}",
+            path.display()
+        );
+    }
+}
