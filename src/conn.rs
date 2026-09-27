@@ -907,6 +907,10 @@ impl Drop for RemoteConn {
         if !self.dead {
             let _ = self.w.write_msg(&Request::Shutdown);
         }
+        // Close our end of the request stream. A peer that could not act on
+        // Shutdown, such as an incompatible helper still reading a frame,
+        // exits on EOF; while ssh's stdin stays open, waiting for it hangs.
+        self.w = FrameWriter::new(Box::new(std::io::sink()), false);
         if self.detached {
             // Closing the pipes is the whole teardown: the remote exits on
             // Shutdown or EOF, and waiting for its exit status would cost

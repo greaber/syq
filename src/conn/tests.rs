@@ -1085,6 +1085,42 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
 }
 
 #[test]
+fn dropping_a_pipe_connection_closes_stdin_before_waiting_for_the_peer() {
+    // A peer that cannot parse Shutdown, such as an incompatible helper still
+    // waiting for the rest of a frame, exits only when its input ends.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "cat >/dev/null"])
+        .stdin(Stdio::piped())
+        .spawn_guarded()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let conn = RemoteConn {
+        observation: Default::default(),
+        child: Some(child),
+        w: FrameWriter::new(Box::new(stdin), false),
+        rx: None,
+        reader: None,
+        label: "pipe teardown test".into(),
+        dead: false,
+        rpc_observation: None,
+        write_stream: None,
+        peer: None,
+        tcp_socket: None,
+        named_socket: None,
+        multiplexed_ssh: false,
+        detached: false,
+    };
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(conn);
+        let _ = done.send(());
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("dropping the connection waited for a peer whose input was still open");
+}
+
+#[test]
 fn tuning_pipeline_drains_responses_while_sending_large_requests() {
     use std::os::unix::net::UnixStream;
     // Even a one-deep file pipeline must accommodate control batches.
