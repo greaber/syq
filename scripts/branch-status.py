@@ -26,6 +26,7 @@ recently merged branch failed, the GitHub head is stale or unrelated, or a
 HEAD moving during checks (stderr diagnostic, no report, even with --json).
 The pull request's check rollup is informational.
 """
+from concurrent.futures import ThreadPoolExecutor
 import json
 import shutil
 import subprocess
@@ -83,12 +84,22 @@ def ahead_behind(range_):
     return int(ahead), int(behind)
 
 
-def latest_run(workflow, event, kind, warn):
-    """The latest run of a workflow on master for one trigger, and its state."""
+def in_parallel(calls):
+    """The results of independent GitHub lookups, in order."""
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return [future.result() for future in [pool.submit(call) for call in calls]]
+
+
+def master_run(workflow, event):
+    """The latest run of a workflow on master for one trigger."""
     runs = json_output("gh", "run", "list", "--repo", REPOSITORY, "--workflow", workflow,
                        "--branch", "master", "--event", event, "--limit", "1", "--json",
                        "headSha,status,conclusion,url,createdAt,databaseId", status=2)
-    run = runs[0] if runs else None
+    return runs[0] if runs else None
+
+
+def run_state(workflow, run, kind, warn):
+    """A master run's state, warning when it is missing or red."""
     state = "missing"
     if run:
         if run.get("status") == "completed":
@@ -100,24 +111,51 @@ def latest_run(workflow, event, kind, warn):
     elif state != "success" and state not in UNFINISHED:
         warn(f"master is red: {workflow} {kind} {state} at {(run.get('headSha') or '')[:7]} "
              f"{run.get('url')}")
-    return run, state
+    return state
 
 
-def dispatched_runs():
-    """Recent manually dispatched runs of the branch workflows, on any branch."""
-    runs = []
-    for workflow in BRANCH_WORKFLOWS:
-        for run in json_output("gh", "run", "list", "--repo", REPOSITORY, "--workflow", workflow,
-                               "--event", "workflow_dispatch", "--limit", str(DISPATCHED_RUNS),
-                               "--json", "databaseId,headBranch,headSha,createdAt,status,"
-                               "conclusion,url", status=2):
-            runs.append(dict(run, workflow=workflow))
-    return runs
+def dispatched_runs(workflow):
+    """Recent manually dispatched runs of a branch workflow, on any branch."""
+    return [dict(run, workflow=workflow) for run in json_output(
+        "gh", "run", "list", "--repo", REPOSITORY, "--workflow", workflow, "--event",
+        "workflow_dispatch", "--limit", str(DISPATCHED_RUNS), "--json",
+        "databaseId,headBranch,headSha,createdAt,status,conclusion,url", status=2)]
+
+
+def merged_pull_requests():
+    try:
+        return [pr for pr in json_output(
+            "gh", "pr", "list", "--repo", REPOSITORY, "--state", "merged", "--limit",
+            str(MERGED_PULL_REQUESTS), "--json", "number,url,headRefName,mergedAt,isCrossRepository",
+            status=2) if not pr.get("isCrossRepository")]
+    except ToolError:
+        raise ToolError("could not list merged pull requests", 2) from None
+
+
+def open_pull_request(branch):
+    """The branch's open pull request; an empty list means none, a failure is an error."""
+    try:
+        prs = json_output("gh", "pr", "list", "--repo", REPOSITORY, "--head", branch, "--state",
+                          "open", "--limit", "1", "--json",
+                          "number,url,state,isDraft,baseRefName,headRefOid,reviewDecision,"
+                          "mergeStateStatus,statusCheckRollup", status=2)
+    except ToolError:
+        raise ToolError(f"could not look up the pull request for {branch}", 2) from None
+    return prs[0] if prs else None
 
 
 def run_jobs(run):
     return json_output("gh", "run", "view", str(run.get("databaseId")), "--repo", REPOSITORY,
                        "--json", "jobs", status=2).get("jobs") or []
+
+
+def undecided(runs):
+    """A branch's runs from the first failed or unfinished one on, oldest first;
+    only these can hold a failure that no later run passed."""
+    runs = sorted(runs, key=lambda run: run.get("createdAt") or "")
+    first = next((index for index, run in enumerate(runs) if run.get("status") != "completed"
+                  or run.get("conclusion") in FAILED), len(runs))
+    return runs[first:]
 
 
 def branch_runs(runs, branch, merged, until=None):
@@ -129,23 +167,17 @@ def branch_runs(runs, branch, merged, until=None):
             and since < (run.get("createdAt") or "") and (until is None or run["createdAt"] <= until)]
 
 
-def branch_checks(runs):
-    """Failed checks that no later run passed, and the runs still in progress."""
-    runs = sorted(runs, key=lambda run: run.get("createdAt") or "")
-    running = [run for run in runs if run.get("status") != "completed"]
-    # Only runs from the first failed or unfinished one on can hold a failure.
-    first = next((index for index, run in enumerate(runs) if run.get("status") != "completed"
-                  or run.get("conclusion") in FAILED), len(runs))
+def failed_checks(runs, jobs):
+    """Failed checks that no later run passed, given each undecided run's jobs."""
     latest = {}
-    for run in runs[first:]:
-        for job in run_jobs(run):
+    for run in undecided(runs):
+        for job in jobs[run.get("databaseId")]:
             if job.get("conclusion") in FAILED + ("success",):
                 latest[run["workflow"], job.get("name")] = job, run
-    failed = [{"workflow": workflow, "job": name, "conclusion": job.get("conclusion"),
-               "head": run.get("headSha") or "", "url": job.get("url") or run.get("url")}
-              for (workflow, name), (job, run) in latest.items()
-              if job.get("conclusion") in FAILED]
-    return failed, running
+    return [{"workflow": workflow, "job": name, "conclusion": job.get("conclusion"),
+             "head": run.get("headSha") or "", "url": job.get("url") or run.get("url")}
+            for (workflow, name), (job, run) in latest.items()
+            if job.get("conclusion") in FAILED]
 
 
 def latest_full_run(workflow):
@@ -198,26 +230,25 @@ def report(json_report, check):
     # Post-merge runs select checks from the changed paths, so a later success
     # need not rerun an earlier failure. The nightly run covers the full suite
     # whenever test inputs changed since its last success.
+    lookups = [lambda: open_pull_request(branch) if branch != "HEAD" else None,
+               merged_pull_requests]
+    lookups += [lambda workflow=workflow, event=event: master_run(workflow, event)
+                for workflow in WORKFLOWS for event in ("push", "schedule")]
+    lookups += [lambda workflow=workflow: dispatched_runs(workflow)
+                for workflow in BRANCH_WORKFLOWS]
+    results = in_parallel(lookups)
+    pr, merged = results[:2]
+    latest = iter(results[2:2 + 2 * len(WORKFLOWS)])
+    runs = [run for workflow_runs in results[2 + 2 * len(WORKFLOWS):] for run in workflow_runs]
     master_runs = []
     for workflow in WORKFLOWS:
-        push_run, push_state = latest_run(workflow, "push", "post-merge", warn)
-        nightly_run, nightly_state = latest_run(workflow, "schedule", "nightly", warn)
-        master_runs.append({"workflow": workflow, "state": push_state, "run": push_run,
-                            "nightly": {"state": nightly_state, "run": nightly_run}})
+        push_run, nightly_run = next(latest), next(latest)
+        master_runs.append({
+            "workflow": workflow, "state": run_state(workflow, push_run, "post-merge", warn),
+            "run": push_run, "nightly": {
+                "state": run_state(workflow, nightly_run, "nightly", warn), "run": nightly_run}})
 
-    # The pull request for this branch, if any.
-    # An empty list means no open pull request; a failed command is an error.
-    pr = None
     pr_head_relation = "none"
-    if branch != "HEAD":
-        try:
-            prs = json_output("gh", "pr", "list", "--repo", REPOSITORY, "--head", branch, "--state",
-                              "open", "--limit", "1", "--json",
-                              "number,url,state,isDraft,baseRefName,headRefOid,reviewDecision,"
-                              "mergeStateStatus,statusCheckRollup", status=2)
-        except ToolError:
-            raise ToolError(f"could not look up the pull request for {branch}", 2) from None
-        pr = prs[0] if prs else None
     if pr:
         pr_head, number = pr.get("headRefOid") or "", pr.get("number")
         if pr_head == head_sha:
@@ -233,38 +264,43 @@ def report(json_report, check):
             warn(f"PR #{number} head {pr_head[:7]} is not related to local {short_sha}")
 
     # Failed dispatched checks on this branch, and those merged branches left behind.
-    try:
-        merged = [pr for pr in json_output(
-            "gh", "pr", "list", "--repo", REPOSITORY, "--state", "merged", "--limit",
-            str(MERGED_PULL_REQUESTS), "--json", "number,url,headRefName,mergedAt,isCrossRepository",
-            status=2) if not pr.get("isCrossRepository")]
-    except ToolError:
-        raise ToolError("could not list merged pull requests", 2) from None
-    runs = dispatched_runs()
-    branch_failed, branch_running = [], []
-    if branch != "HEAD":
-        branch_failed, branch_running = branch_checks(branch_runs(runs, branch, merged))
+    # A merged branch needs its jobs read only while its failing workflows have
+    # had no full run on master since the merge.
+    own_runs = branch_runs(runs, branch, merged) if branch != "HEAD" else []
+    merged_runs = [(merged_pr, branch_runs(runs, merged_pr.get("headRefName"), merged,
+                                           merged_pr.get("mergedAt") or ""))
+                   for merged_pr in merged]
+    clearing = sorted({workflow for _, pr_runs in merged_runs for run in undecided(pr_runs)
+                       for workflow in CLEARED_BY[run["workflow"]]})
+    full_runs = dict(zip(clearing, in_parallel(
+        [lambda workflow=workflow: latest_full_run(workflow) for workflow in clearing])))
+
+    def cleared(workflow, merged_at):
+        return all(full_runs.get(name, "") > merged_at for name in CLEARED_BY[workflow])
+
+    merged_runs = [(merged_pr, [run for run in pr_runs if not cleared(
+        run["workflow"], merged_pr.get("mergedAt") or "")]) for merged_pr, pr_runs in merged_runs]
+    undecided_runs = {run.get("databaseId"): run
+                      for pr_runs in [own_runs] + [pr_runs for _, pr_runs in merged_runs]
+                      for run in undecided(pr_runs)}
+    jobs = dict(zip(undecided_runs, in_parallel(
+        [lambda run=run: run_jobs(run) for run in undecided_runs.values()])))
+    branch_failed = failed_checks(own_runs, jobs)
+    branch_running = sorted((run for run in own_runs if run.get("status") != "completed"),
+                            key=lambda run: run.get("createdAt") or "")
     for entry in branch_failed:
         warn(f"{entry['workflow']} {entry['job']} {entry['conclusion']} at {entry['head'][:7]} on "
              f"this branch, and no later run passed it; merge only if the user says to "
              f"{entry['url']}")
     merged_failed = []
-    full_runs = {}
-    for merged_pr in merged:
-        merged_at = merged_pr.get("mergedAt") or ""
-        failed, _ = branch_checks(branch_runs(runs, merged_pr.get("headRefName"), merged, merged_at))
-        for entry in failed:
-            clearing = CLEARED_BY[entry["workflow"]]
-            for workflow in clearing:
-                if workflow not in full_runs:
-                    full_runs[workflow] = latest_full_run(workflow)
-            if all(full_runs[workflow] > merged_at for workflow in clearing):
-                continue
+    for merged_pr, pr_runs in merged_runs:
+        for entry in failed_checks(pr_runs, jobs):
             merged_failed.append(dict(entry, number=merged_pr.get("number"),
                                       pull_request=merged_pr.get("url")))
             warn(f"#{merged_pr.get('number')} merged with {entry['workflow']} {entry['job']} "
                  f"{entry['conclusion']} at {entry['head'][:7]}, and no full run of "
-                 f"{' and '.join(clearing)} on master has passed since {entry['url']}")
+                 f"{' and '.join(CLEARED_BY[entry['workflow']])} on master has passed since "
+                 f"{entry['url']}")
 
     checks = []
     if check:
