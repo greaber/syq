@@ -107,7 +107,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python${{ needs.scope.outputs.full_suite == 'true' && '-node' || '' }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         if: >-
           needs.scope.outputs.native == 'true' ||
