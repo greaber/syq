@@ -253,7 +253,7 @@ jobs:
         run: |
           SYQ_CANDIDATE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           export SYQ_CANDIDATE_VERSION
-          scripts/test-python-sdk-release-tools.py
+          tests/tooling/test-python-sdk-release-tools.py
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
           export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
           RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
@@ -279,14 +279,18 @@ jobs:
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
       - name: Test interactive benchmark with system Bash
-        run: python3 scripts/test-try-benchmark.py
+        run: python3 tests/tooling/test-try-benchmark.py
       - name: Release tooling suites
         run: |
           status=0
           for suite in \
-            scripts/test-release-tools.py \
-            scripts/test-release-orchestration.py \
-            scripts/test-installer.py \
+            tests/tooling/test-release-tools.py \
+            tests/tooling/test-release-orchestration.py \
+            tests/tooling/test-generated-sdk-post-merge-ci.py \
+            tests/tooling/test-release-readiness.py \
+            tests/tooling/test-release-timings.py \
+            tests/tooling/test-find-release-build.py \
+            tests/tooling/test-installer.py \
             scripts/test-homebrew-formula.py
           do
             echo "=== $suite"

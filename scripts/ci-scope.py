@@ -228,18 +228,18 @@ def classify(paths, preparation_only):
                      "scripts/normalize-python-sdist.py", "scripts/check-python-wheel.py",
                      "scripts/stage-python-sdk.py", "scripts/prepare-python-sdk-release.py",
                      "scripts/run-generated-sdk-post-merge-ci.py", "scripts/select-trusted-pr.jq",
-                     "scripts/test-python-sdk-release-tools.py",
+                     "tests/tooling/test-python-sdk-release-tools.py",
                      "scripts/verify-python-release-preparation.py"):
             path_tooling = python_sdk = True
         elif matches(path, "scripts/generate-homebrew-formula.py", "scripts/test-homebrew-formula.py",
-                     "scripts/generate-installer.py", "scripts/test-installer.py"):
+                     "scripts/generate-installer.py", "tests/tooling/test-installer.py"):
             path_tooling = True
         elif matches(path, "tests/real-ssh/*"):
             pass
         elif path == "scripts/setup.lock":
             # Pinned tools run the Rust, SDK, conformance, and tooling tests.
             native = python_sdk = path_tooling = shellcheck = mapping_docs = conformance = True
-        elif matches(path, "scripts/*", "deny.toml"):
+        elif matches(path, "scripts/*", "tests/tooling/*", "deny.toml"):
             path_tooling = True
         elif matches(path, "*.md", "docs/*", ".github/ISSUE_TEMPLATE/*", ".github/dependabot.yml",
                      "LICENSE", ".gitignore", ".claude/*"):
@@ -254,45 +254,47 @@ def classify(paths, preparation_only):
         elif matches(path, "Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
             if not preparation_only:
                 path_tooling_checks.append("package")
-        elif matches(path, "scripts/test-cargo-package.py", "build.rs", "src/identity.rs",
+        elif matches(path, "tests/tooling/test-cargo-package.py", "build.rs", "src/identity.rs",
                      "tests/build_identity.rs"):
             path_tooling_checks.append("package")
-        elif matches(path, "scripts/generate-installer.py", "scripts/test-installer.py"):
+        elif matches(path, "scripts/generate-installer.py", "tests/tooling/test-installer.py"):
             path_tooling_checks.append("installer")
-        elif matches(path, "scripts/try-benchmark*", "scripts/test-try-benchmark.py"):
+        elif matches(path, "scripts/try-benchmark*", "tests/tooling/test-try-benchmark.py"):
             path_tooling_checks.append("benchmark")
-        elif matches(path, "scripts/run-focused-check.py", "scripts/test-run-focused-check.py"):
+        elif matches(path, "scripts/run-focused-check.py", "tests/tooling/test-run-focused-check.py"):
             path_tooling_checks.append("focused")
-        elif matches(path, "scripts/branch-status.py", "scripts/test-branch-status.py"):
+        elif matches(path, "scripts/branch-status.py", "tests/tooling/test-branch-status.py"):
             path_tooling_checks.append("branch")
-        elif matches(path, "scripts/setup.sh", "scripts/test-setup.sh"):
+        elif matches(path, "scripts/setup.sh", "tests/tooling/test-setup.sh"):
             path_tooling_checks.append("setup")
         elif path == "scripts/setup.lock":
             path_tooling_checks += ALL_TOOLING.split()
         elif path == "scripts/verify-release-ci.py":
             path_tooling_checks += ["release", "orchestration"]
-        elif matches(path, "scripts/test-release-tools.py", "scripts/package-release.py",
+        elif matches(path, "tests/tooling/test-release-tools.py", "scripts/package-release.py",
                      "scripts/verify-crates-io-package.py", "scripts/verify-release-*",
                      "scripts/generate-release-*", "scripts/sign-release-*"):
             path_tooling_checks.append("release")
         elif matches(path, "scripts/ci-scope.py", "scripts/*release-orchestration*",
+                     "tests/tooling/test-release-orchestration.py",
+                     "tests/tooling/test-generated-sdk-post-merge-ci.py",
                      "scripts/release-preflight.py", "scripts/release-status.py",
                      "scripts/release-readiness.py", "scripts/release-timings.py",
                      "scripts/release_test_inputs.py", "scripts/release-tag-signers",
                      "scripts/find-release-build.py", "scripts/nightly-ci.py",
-                     "scripts/test-release-readiness.py", "scripts/test-release-timings.py",
-                     "scripts/test-release-test-inputs.py", "scripts/test-find-release-build.py",
-                     "scripts/test-nightly-ci.py", "scripts/*generated-sdk-post-merge-ci.py"):
+                     "tests/tooling/test-release-readiness.py", "tests/tooling/test-release-timings.py",
+                     "tests/tooling/test-release-test-inputs.py", "tests/tooling/test-find-release-build.py",
+                     "tests/tooling/test-nightly-ci.py", "scripts/*generated-sdk-post-merge-ci.py"):
             path_tooling_checks.append("orchestration")
         elif path == "scripts/rsync-compat.py":
             pass
-        elif matches(path, "scripts/*", "deny.toml"):
+        elif matches(path, "scripts/*", "tests/tooling/*", "deny.toml"):
             # Retain broad coverage for tooling whose ownership is not yet mapped,
             # including the shared scripts/tooling.py module.
             path_tooling_checks += ALL_TOOLING.split()
         # Workflows, the release skill, and release docs name scripts by path;
         # check those references whenever a script is added, renamed, or removed.
-        if matches(path, "scripts/*") and "workflows" not in path_tooling_checks:
+        if matches(path, "scripts/*", "tests/tooling/*") and "workflows" not in path_tooling_checks:
             path_tooling_checks.append("workflows")
         # Apply fallback to this path before combining it with other selections.
         if path_tooling and not path_tooling_checks:

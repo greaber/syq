@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Exercise reusable evidence and package handoff using disposable repositories."""
+from support import SCRIPTS
+
 import importlib.util
 import json
 import os
@@ -9,7 +11,6 @@ import tempfile
 import unittest
 from unittest import mock
 
-SCRIPTS = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("readiness", SCRIPTS / "release-readiness.py")
 readiness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(readiness)
