@@ -165,7 +165,7 @@ a maintained fork of the MinIO server). To test another provider, run
 `python3 tests/object-storage/check.py target/debug/syq` with
 `AWS_ENDPOINT_URL_S3`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 and `SYQ_TEST_BUCKET` set. It creates and removes a unique test prefix in the
-existing bucket. See `python3 tests/object-storage/benchmark.py --help` for
+existing bucket. See `python3 scripts/benchmark-s3.py --help` for
 benchmark options.
 
 For docs, run `python3 scripts/check-doc-links.py` and build with the pinned mdBook.

@@ -229,7 +229,7 @@ def classify(paths, preparation_only):
                      "scripts/stage-python-sdk.py", "scripts/prepare-python-sdk-release.py",
                      "scripts/run-generated-sdk-post-merge-ci.py", "scripts/select-trusted-pr.jq",
                      "scripts/test-python-sdk-release-tools.py",
-                     "scripts/test-python-release-preparation.py"):
+                     "scripts/verify-python-release-preparation.py"):
             path_tooling = python_sdk = True
         elif matches(path, "scripts/generate-homebrew-formula.py", "scripts/test-homebrew-formula.py",
                      "scripts/generate-installer.py", "scripts/test-installer.py"):
