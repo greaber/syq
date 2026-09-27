@@ -136,7 +136,7 @@ struct PreparedUpload {
     metadata: Metadata,
     must_be_new: bool,
     multipart: Option<PreparedMultipart>,
-    metadata_update: Option<super::authorization::Unsigned>,
+    metadata_update: Option<super::metadata_copy::Prepared>,
 }
 struct PreparedMultipart {
     recorded: bool,
@@ -623,19 +623,13 @@ impl Engine {
         }
         Ok(())
     }
-    fn upload_metadata_matches(&self, source: &Source, size: u64, object: &Object) -> bool {
-        let explicit = source.metadata.unwrap_or_default();
-        let desired = source.metadata(None);
+    fn upload_contents_match(&self, source: &Source, size: u64, object: &Object) -> bool {
         object.kind() == source.kind()
             && object.size == size
-            && object.metadata.as_ref().is_some_and(|m| {
-                (m.mtime, m.nsec) == (desired.mtime, desired.nsec)
-                    && (!(self.args.perms || explicit.mode.is_some()) || m.mode == desired.mode)
-                    && (!(self.args.owner || self.args.group || explicit.uid.is_some())
-                        || m.uid == desired.uid)
-                    && (!(self.args.owner || self.args.group || explicit.gid.is_some())
-                        || m.gid == desired.gid)
-            })
+            && (source.kind() == ObjectKind::Dir
+                || object.metadata.as_ref().is_some_and(|m| {
+                    (m.mtime, m.nsec) == (source.meta.mtime, source.meta.mtime_nsec)
+                }))
     }
 
     fn upload_requested_metadata_matches(&self, source: &Source, object: &Object) -> bool {
@@ -652,6 +646,89 @@ impl Engine {
                 && (flags & crate::proto::flags::OWNER == 0 || m.uid == desired.uid)
                 && (flags & crate::proto::flags::GROUP == 0 || m.gid == desired.gid)
         })
+    }
+
+    async fn prepare_accepted_upload(
+        self: &Arc<Self>,
+        source: Source,
+        object: &Object,
+    ) -> Result<UploadPreparation> {
+        let size = object.size;
+        if self.upload_requested_metadata_matches(&source, object) {
+            self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+            return Ok(UploadPreparation::Skipped);
+        }
+        if self.args.dry_run {
+            self.progress.add_bytes(size);
+            return Ok(UploadPreparation::Preview(size));
+        }
+        let desired = source.metadata(None);
+        let flags =
+            self.args.matching_meta_flags() | source.metadata.map_or(0, |m| m.apply_flags());
+        let _slot = self.tuning.requests.acquire().await;
+        let head = client::head_output(&self.client, &self.options.bucket, &source.key, None)
+            .await?
+            .context("S3 destination disappeared before metadata update")?;
+        anyhow::ensure!(
+            head.e_tag() == Some(&object.etag),
+            "S3 destination changed before metadata update"
+        );
+        let mut metadata = object.metadata.clone().unwrap_or(Metadata {
+            kind: object.kind(),
+            mode: if object.kind() == ObjectKind::Dir {
+                0o777
+            } else {
+                0o666
+            },
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            mtime: object.mtime,
+            nsec: 0,
+            hash: None,
+            hash_algorithm: HashAlgorithm::Blake3,
+        });
+        if flags & crate::proto::flags::TIMES != 0 {
+            metadata.mtime = desired.mtime;
+            metadata.nsec = desired.nsec;
+        }
+        if flags & crate::proto::flags::MODE != 0 {
+            metadata.mode = desired.mode;
+        }
+        if flags & crate::proto::flags::OWNER != 0 {
+            metadata.uid = desired.uid;
+        }
+        if flags & crate::proto::flags::GROUP != 0 {
+            metadata.gid = desired.gid;
+        }
+        let mut fields = head.metadata().cloned().unwrap_or_default();
+        fields.extend(metadata.encode());
+        let update = super::metadata_copy::Prepared::prepare(
+            &self.client,
+            &self.options.bucket,
+            &source.key,
+            &head,
+            fields,
+            self.part_size(size),
+            self.copy_request_limit(size),
+        )
+        .await?;
+        drop(_slot);
+        if let Err(error) = self.authorize_requests(update.requests()).await {
+            update.abort(&self.client, &self.options.bucket).await;
+            return Err(error);
+        }
+        Ok(UploadPreparation::Ready(Box::new(PreparedUpload {
+            source,
+            size,
+            part_size: self.part_size(size),
+            algorithm: Algorithm::for_endpoint(self.options.endpoint.as_deref()),
+            checksums: Vec::new(),
+            small: None,
+            metadata,
+            must_be_new: false,
+            multipart: None,
+            metadata_update: Some(update),
+        })))
     }
 
     async fn prepare_upload(self: &Arc<Self>, source: Source) -> Result<UploadPreparation> {
@@ -734,7 +811,7 @@ impl Engine {
             && can_compare_time
             && existing
                 .as_ref()
-                .is_some_and(|o| self.upload_metadata_matches(&source, size, o))
+                .is_some_and(|o| self.upload_contents_match(&source, size, o))
         {
             if source.kind() == ObjectKind::File {
                 // Opening validates the pinned scan identity without reading the
@@ -743,8 +820,9 @@ impl Engine {
             } else {
                 source.bytes()?;
             }
-            self.progress.bytes_unchanged.fetch_add(size, Relaxed);
-            return Ok(UploadPreparation::Skipped);
+            return self
+                .prepare_accepted_upload(source, existing.as_ref().unwrap())
+                .await;
         }
         let whole_algorithm =
             whole_algorithm.or_else(|| protected_existing.then_some(self.args.hash_algorithm));
@@ -958,47 +1036,9 @@ impl Engine {
             source.key
         );
         if same_contents {
-            if let Some(object) = &existing {
-                let old = object.metadata.clone().unwrap_or(Metadata {
-                    kind: object.kind(),
-                    mode: if object.kind() == ObjectKind::Dir {
-                        0o777
-                    } else {
-                        0o666
-                    },
-                    uid: unsafe { libc::geteuid() },
-                    gid: unsafe { libc::getegid() },
-                    mtime: object.mtime,
-                    nsec: 0,
-                    hash: None,
-                    hash_algorithm: HashAlgorithm::Blake3,
-                });
-                metadata.hash = old.hash.clone();
-                metadata.hash_algorithm = old.hash_algorithm;
-                let flags = self.args.matching_meta_flags()
-                    | source.metadata.map_or(0, |m| m.apply_flags());
-                if flags & crate::proto::flags::TIMES == 0 {
-                    metadata.mtime = old.mtime;
-                    metadata.nsec = old.nsec;
-                }
-                if flags & crate::proto::flags::MODE == 0 {
-                    metadata.mode = old.mode;
-                }
-                if flags & crate::proto::flags::OWNER == 0 {
-                    metadata.uid = old.uid;
-                }
-                if flags & crate::proto::flags::GROUP == 0 {
-                    metadata.gid = old.gid;
-                }
-            }
-        }
-        let unchanged = same_contents
-            && existing
-                .as_ref()
-                .is_some_and(|o| self.upload_requested_metadata_matches(&source, o));
-        if unchanged {
-            self.progress.bytes_unchanged.fetch_add(size, Relaxed);
-            return Ok(UploadPreparation::Skipped);
+            return self
+                .prepare_accepted_upload(source, existing.as_ref().unwrap())
+                .await;
         }
         if self.args.dry_run {
             self.progress.add_bytes(size);
@@ -1007,27 +1047,7 @@ impl Engine {
         let must_be_new = self.args.ignore_existing
             || self.args.target_existence == Existence::New
             || (self.args.protects_existing_contents() && existing.is_none());
-        let metadata_update = if same_contents {
-            let head = client::head_output(&self.client, &self.options.bucket, &source.key, None)
-                .await?
-                .context("S3 destination disappeared before metadata update")?;
-            anyhow::ensure!(
-                Some(&head.e_tag().unwrap_or_default().to_owned())
-                    == existing.as_ref().map(|o| &o.etag),
-                "S3 destination changed before metadata update"
-            );
-            let mut fields = head.metadata().cloned().unwrap_or_default();
-            fields.extend(metadata.encode());
-            Some(client::metadata_update_request(
-                &self.options.bucket,
-                &source.key,
-                &head,
-                fields,
-            )?)
-        } else {
-            None
-        };
-        let multipart = if metadata_update.is_none() && size > part_size && small.is_none() {
+        let multipart = if size > part_size && small.is_none() {
             Some(
                 self.prepare_multipart(&source, digest, part_size, &metadata, algorithm)
                     .await?,
@@ -1045,7 +1065,7 @@ impl Engine {
             metadata,
             must_be_new,
             multipart,
-            metadata_update,
+            metadata_update: None,
         };
         if let Err(error) = self.authorize_upload(&prepared).await {
             self.abort_unrecorded_preparation(&prepared).await;
@@ -1066,8 +1086,18 @@ impl Engine {
             UploadPreparation::Ready(prepared) => *prepared,
         };
         if let Some(update) = &prepared.metadata_update {
-            let _slot = self.tuning.requests.acquire().await;
-            client::copy_metadata(&self.client, &self.options.bucket, update.clone()).await?;
+            update
+                .execute(
+                    &self.client,
+                    &self.options.bucket,
+                    self.part_workers(),
+                    || async {
+                        let slot = self.tuning.requests.acquire().await;
+                        self.check_cancelled()?;
+                        Ok(slot)
+                    },
+                )
+                .await?;
             self.progress
                 .bytes_unchanged
                 .fetch_add(prepared.size, Relaxed);
@@ -1324,6 +1354,9 @@ impl Engine {
         Ok(Some(size))
     }
     async fn abort_unrecorded_preparation(&self, prepared: &PreparedUpload) {
+        if let Some(update) = &prepared.metadata_update {
+            update.abort(&self.client, &self.options.bucket).await;
+        }
         if let Some(multipart) = &prepared.multipart {
             if !multipart.recorded {
                 self.abort_unrecorded_upload(&prepared.source.key, &multipart.upload.upload_id)

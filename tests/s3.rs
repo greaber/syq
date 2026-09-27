@@ -19,6 +19,9 @@ mod map;
 #[path = "s3/expressions.rs"]
 mod expressions;
 
+#[path = "s3/metadata_updates.rs"]
+mod metadata_updates;
+
 #[path = "s3/existing_policy.rs"]
 mod existing_policy;
 
@@ -298,6 +301,17 @@ fn serve(
             ],
             data,
             method == "HEAD",
+        );
+        return;
+    }
+    if fault.starts_with("metadata-update-") {
+        metadata_updates::serve(
+            &mut socket,
+            fault,
+            method,
+            first.split_whitespace().nth(1).unwrap(),
+            &headers,
+            &gate,
         );
         return;
     }

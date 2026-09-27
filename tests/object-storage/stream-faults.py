@@ -52,7 +52,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         STATE['requests'] += 1
         if CASE == 'existing-policy':
-            self.reply(200, headers={'ETag': '"original"', **STATE.get('metadata', {})}, length=len(STATE['existing']))
+            self.reply(200, headers={'ETag': '"original"', 'x-amz-tagging-count': '0', **STATE.get('metadata', {})}, length=len(STATE['existing']))
             return
         if ((CASE == 'preview-results' and self.path.endswith('/missing'))
                 or (CASE == 'file-metadata' and STATE.get('missing_object'))):
@@ -104,6 +104,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         data = self.body()
         if CASE == 'existing-policy' and self.headers.get('x-amz-copy-source'):
             assert self.headers['x-amz-copy-source-if-match'] == '"original"'
+            assert urllib.parse.unquote(self.headers['x-amz-copy-source']) == 'bucket/object'
+            if 'partNumber=' in self.path:
+                assert 'uploadId=metadata' in self.path
+                assert self.headers['x-amz-copy-source-range'].startswith('bytes=')
+                STATE['copied_parts'] = STATE.get('copied_parts', 0) + 1
+                self.reply(200, b'<CopyPartResult><ETag>copied</ETag></CopyPartResult>')
+                return
             assert self.headers['x-amz-meta-other'] == 'keep'
             assert self.headers['Content-Type'] == 'application/example'
             assert self.headers['x-amz-meta-syq-mode'] == str(0o640)
@@ -140,6 +147,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self.body()
+        if CASE == 'existing-policy' and 'uploadId=metadata' in self.path:
+            assert self.headers['If-Match'] == '"original"'
+            assert STATE['copied_parts'] == 2
+            STATE['metadata_changed'] = True
+            self.reply(200, b'<CompleteMultipartUploadResult><ETag>updated</ETag></CompleteMultipartUploadResult>')
+            return
+        if CASE == 'existing-policy' and self.headers.get('x-amz-meta-other'):
+            assert self.headers['x-amz-meta-other'] == 'keep'
+            assert self.headers['Content-Type'] == 'application/example'
+            assert self.headers['x-amz-meta-syq-mode'] == str(0o640)
+            assert self.headers['x-amz-meta-syq-mtime'] == '20'
+            self.reply(200, b'<InitiateMultipartUploadResult><UploadId>metadata</UploadId></InitiateMultipartUploadResult>')
+            return
         if 'uploadId=' in self.path:
             if CASE == 'existing-policy' and self.headers.get('If-None-Match') == '*':
                 self.reply(412, b'<Error><Code>PreconditionFailed</Code></Error>')
@@ -234,19 +254,20 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 assert STATE.get('reads', 0) == before
                 success(run(put + ['--if-exists=update'], input=b'x' * len(payload), env=env))
                 assert STATE['published'] == b'x' * len(payload)
-            STATE.update(existing=b'stored', metadata={
-                'Content-Type': 'application/example', 'x-amz-meta-other': 'keep',
-                'x-amz-meta-syq-format': '1', 'x-amz-meta-syq-kind': 'file',
-                'x-amz-meta-syq-mode': str(0o640), 'x-amz-meta-syq-uid': str(os.geteuid()),
-                'x-amz-meta-syq-gid': str(os.getegid()), 'x-amz-meta-syq-mtime': '10',
-                'x-amz-meta-syq-mtime-nsec': '0'}, published=None)
-            source = Path(temp) / 'source'
-            source.write_bytes(b'stored')
-            os.utime(source, (20, 20))
-            with source.open('rb') as stream:
-                success(run(put + ['--copy-metadata=mtime'], stdin=stream, env=env))
-            assert STATE.get('metadata_changed')
-            assert STATE['published'] is None
+            for payload in (b'stored', DATA):
+                STATE.update(existing=payload, metadata={
+                    'Content-Type': 'application/example', 'x-amz-meta-other': 'keep',
+                    'x-amz-meta-syq-format': '1', 'x-amz-meta-syq-kind': 'file',
+                    'x-amz-meta-syq-mode': str(0o640), 'x-amz-meta-syq-uid': str(os.geteuid()),
+                    'x-amz-meta-syq-gid': str(os.getegid()), 'x-amz-meta-syq-mtime': '10',
+                    'x-amz-meta-syq-mtime-nsec': '0'}, published=None, metadata_changed=False, copied_parts=0)
+                source = Path(temp) / 'source'
+                source.write_bytes(payload)
+                os.utime(source, (20, 20))
+                with source.open('rb') as stream:
+                    success(run(put + ['--copy-metadata=mtime'], stdin=stream, env=env))
+                assert STATE.get('metadata_changed')
+                assert STATE['published'] is None
             failure(run(base + ['--to', 's3://bucket', '--as-new', 'object'], input=b'stored', env=env))
         elif CASE == 'mapping-callbacks':
             import syq

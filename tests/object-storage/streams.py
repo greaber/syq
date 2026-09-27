@@ -43,7 +43,12 @@ def main():
             actual = stream(['--from', bucket, key,
                              '--resource-limits', 's3-requests=1'])
             assert actual == data, name
-            print('Stream round trip:', name, flush=True)
+            # Default conditional writes must accept identical bytes and protect
+            # an existing object from different input, including multipart input.
+            stream(['--to', bucket, '--as', key], input=data)
+            stream(['--to', bucket, '--as', key], input=b'x' * max(1, len(data)), success=False)
+            assert check.request('GET', key)[1] == data
+            print('Stream round trip and default existing-file policy:', name, flush=True)
         # Placement constraints retain the raw-object upload contract.
         for name, data in [('empty', b''), ('small', b'new'), ('multipart', b'x' * (6 << 20))]:
             key = check.PREFIX + '/placement-' + name

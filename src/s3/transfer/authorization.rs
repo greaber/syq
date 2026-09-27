@@ -33,7 +33,7 @@ impl Engine {
             return Ok(());
         }
         if let Some(update) = &prepared.metadata_update {
-            return self.authorize_requests(vec![update.clone()]).await;
+            return self.authorize_requests(update.requests()).await;
         }
         let key = &prepared.source.key;
         let mut requests = vec![Unsigned::new("HEAD", key)];

@@ -512,15 +512,8 @@ impl Sessions {
             return;
         };
         for (_, prepared) in prepared {
-            if let Ok(crate::s3::stream::Prepared::Upload {
-                key, id: Some(id), ..
-            }) = prepared
-            {
-                if let Err(error) = session.abort(&key, &id).await {
-                    crate::output::diagnostic!(
-                        "syq: unused stream upload cleanup failed for {key:?}: {error}"
-                    );
-                }
+            if let Ok(prepared) = prepared {
+                session.abort_prepared(&prepared).await;
             }
         }
     }

@@ -327,7 +327,10 @@ in-place writes with other copy policies.
 Creating a named file or updating its contents sets its modification time to
 the source time. Accepting unchanged contents leaves destination metadata alone.
 Use `--copy-metadata=mtime` to make modification times match even on unchanged
-files. Other metadata can be selected the same way, for example
+files. If identical files have different modification times, accepting them can
+require reading their full contents again on each run, including downloading an
+S3 object when no usable stored hash is available. Copying `mtime` lets later
+runs use the size/time comparison. Other metadata can be selected the same way, for example
 `--copy-metadata=permissions,ownership`. `times` remains an alias for `mtime`.
 Explicit mapping `metadata.mtime` also sets the requested destination time.
 

@@ -227,7 +227,7 @@ pub(crate) fn run(
         let prepared = session.prepare(&plan, size).await?;
         if let Some(authorization) = authorization {
             if let Err(error) = authorization.finish().await {
-                if let Some(Prepared::Upload { id: Some(id), .. }) = &prepared { let _ = session.abort(&plan.key, id).await; }
+                if let Some(prepared) = &prepared { session.abort_prepared(prepared).await; }
                 return Err(error);
             }
         }
@@ -269,6 +269,12 @@ async fn execute(
     let controls = plan.controls;
     let mut upload_id = match &prepared {
         Some(Prepared::Upload { id, .. }) => id.clone(),
+        _ => None,
+    };
+    let mut metadata_update = match &prepared {
+        Some(Prepared::Upload {
+            metadata_update, ..
+        }) => metadata_update.clone(),
         _ => None,
     };
     let mut _object = None;
@@ -330,7 +336,16 @@ async fn execute(
                     descriptor
                 }
             };
-            upload(client, plan, descriptor, &mut upload_id, commit, prepared).await
+            upload(
+                client,
+                plan,
+                descriptor,
+                &mut upload_id,
+                commit,
+                prepared,
+                &mut metadata_update,
+            )
+            .await
         };
         tokio::select! {
             result = operation => result,
@@ -358,6 +373,9 @@ async fn execute(
                 crate::output::diagnostic!("syq cp: could not confirm multipart cleanup; inspect incomplete uploads for this object");
             }
         }
+    }
+    if let Some(update) = metadata_update {
+        update.abort(client, &plan.options.bucket).await;
     }
     for retired in retirements {
         retired.wait().await;
@@ -516,6 +534,7 @@ async fn upload(
     upload_id: &mut Option<String>,
     commit: Option<Descriptor>,
     prepared: Option<Prepared>,
+    metadata_update: &mut Option<Box<super::metadata_copy::Prepared>>,
 ) -> Result<()> {
     let controls = plan.controls;
     let options = &plan.options;
@@ -575,6 +594,7 @@ async fn upload(
                     algorithm,
                     &[(hash, length)],
                     metadata.as_ref(),
+                    metadata_update,
                 )
                 .await?;
             } else {
@@ -681,7 +701,15 @@ async fn upload(
                 .iter()
                 .map(|(_, hash, length)| (hash.clone(), *length))
                 .collect::<Vec<_>>();
-            accept_existing(client, plan, algorithm, &hashes, metadata.as_ref()).await?;
+            accept_existing(
+                client,
+                plan,
+                algorithm,
+                &hashes,
+                metadata.as_ref(),
+                metadata_update,
+            )
+            .await?;
             plan.session.abort(&plan.key, &id).await?;
         } else {
             return Err(error.into_service_error()).context("complete multipart upload (destination may have completed if the response was lost)");
@@ -704,6 +732,7 @@ async fn accept_existing(
     algorithm: Algorithm,
     parts: &[(String, u64)],
     desired: Option<&std::collections::HashMap<String, String>>,
+    metadata_update: &mut Option<Box<super::metadata_copy::Prepared>>,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
     anyhow::ensure!(
@@ -760,8 +789,43 @@ async fn accept_existing(
             head.e_tag() == Some(&etag),
             "S3 destination changed before metadata update"
         );
-        if let Some(update) = metadata_update_request(plan, &head, desired)? {
-            client::copy_metadata(client, &plan.options.bucket, update).await?;
+        if let Some(fields) = metadata_update_fields(plan, &head, desired)? {
+            if let Some(update) = metadata_update.as_ref() {
+                anyhow::ensure!(
+                    update.matches(&etag),
+                    "S3 destination changed after metadata preparation"
+                );
+            } else {
+                anyhow::ensure!(
+                    plan.session.authorization.is_none(),
+                    "S3 destination changed after metadata preparation"
+                );
+                *metadata_update = Some(Box::new(
+                    super::metadata_copy::Prepared::prepare(
+                        client,
+                        &plan.options.bucket,
+                        &plan.key,
+                        &head,
+                        fields,
+                        plan.options.part_size,
+                        metadata_copy_limit(plan),
+                    )
+                    .await?,
+                ));
+            }
+            drop(_request);
+            let result = metadata_update
+                .as_ref()
+                .unwrap()
+                .execute(
+                    client,
+                    &plan.options.bucket,
+                    plan.options.concurrency,
+                    || async { Ok(plan.session.requests.acquire().await?) },
+                )
+                .await;
+            metadata_update.take();
+            result?;
         }
     }
     Ok(())
@@ -772,11 +836,21 @@ fn metadata_update_flags(plan: &Plan<'_>) -> u8 {
     policy.preserve | policy.overrides.map_or(0, |m| m.apply_flags())
 }
 
-fn metadata_update_request(
+fn metadata_copy_limit(plan: &Plan<'_>) -> u64 {
+    if plan.options.automatic_part_size {
+        super::metadata_copy::SINGLE_LIMIT
+    } else {
+        plan.options
+            .part_size
+            .min(super::metadata_copy::SINGLE_LIMIT)
+    }
+}
+
+fn metadata_update_fields(
     plan: &Plan<'_>,
     head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
     desired: Option<&std::collections::HashMap<String, String>>,
-) -> Result<Option<super::authorization::Unsigned>> {
+) -> Result<Option<std::collections::HashMap<String, String>>> {
     let flags = metadata_update_flags(plan);
     if flags == 0 {
         return Ok(None);
@@ -814,12 +888,7 @@ fn metadata_update_request(
     if head.metadata() == Some(&metadata) {
         return Ok(None);
     }
-    Ok(Some(client::metadata_update_request(
-        &plan.options.bucket,
-        &plan.key,
-        head,
-        metadata,
-    )?))
+    Ok(Some(metadata))
 }
 
 async fn upload_part(

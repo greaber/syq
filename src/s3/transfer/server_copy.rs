@@ -121,6 +121,7 @@ enum CopyPreparation {
     Skipped,
     Preview(u64),
     Ready(Box<PreparedCopy>),
+    Metadata(Box<super::super::metadata_copy::Prepared>),
 }
 struct PreparedCopy {
     source: Object,
@@ -233,8 +234,12 @@ impl Engine {
             .await;
             if let Err(error) = finish {
                 for (_, work) in &prepared {
-                    if let CopyPreparation::Ready(work) = work {
-                        self.abort_prepared_copy(work).await;
+                    match work {
+                        CopyPreparation::Ready(work) => self.abort_prepared_copy(work).await,
+                        CopyPreparation::Metadata(work) => {
+                            work.abort(&self.client, &self.options.bucket).await
+                        }
+                        _ => {}
                     }
                 }
                 return Err(error);
@@ -449,6 +454,26 @@ impl Engine {
             return Ok(CopyPreparation::Preview(source.size));
         }
         self.check_cancelled()?;
+        if matching_contents {
+            let old_head = &existing.as_ref().unwrap().1;
+            let _slot = self.tuning.requests.acquire().await;
+            let update = super::super::metadata_copy::Prepared::prepare(
+                &self.client,
+                &self.options.bucket,
+                &key,
+                old_head,
+                desired_head.metadata().cloned().unwrap_or_default(),
+                self.part_size(source.size),
+                self.copy_request_limit(source.size),
+            )
+            .await?;
+            drop(_slot);
+            if let Err(error) = self.authorize_requests(update.requests()).await {
+                update.abort(&self.client, &self.options.bucket).await;
+                return Err(error);
+            }
+            return Ok(CopyPreparation::Metadata(Box::new(update)));
+        }
         let copy_source = encoded_source(source_bucket, &source);
         let must_be_new = self.args.ignore_existing
             || self.args.target_existence == Existence::New
@@ -487,6 +512,24 @@ impl Engine {
             CopyPreparation::Skipped => return Ok(None),
             CopyPreparation::Preview(size) => return Ok(Some(size)),
             CopyPreparation::Ready(work) => work,
+            CopyPreparation::Metadata(update) => {
+                update
+                    .execute(
+                        &self.client,
+                        &self.options.bucket,
+                        self.part_workers(),
+                        || async {
+                            let slot = self.tuning.requests.acquire().await;
+                            self.check_cancelled()?;
+                            Ok(slot)
+                        },
+                    )
+                    .await?;
+                self.progress
+                    .bytes_unchanged
+                    .fetch_add(update.size, Relaxed);
+                return Ok(Some(0));
+            }
         };
         if let Err(error) = self.check_cancelled() {
             self.abort_prepared_copy(&work).await;
