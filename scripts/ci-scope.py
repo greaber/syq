@@ -5,6 +5,11 @@ Usage: scripts/ci-scope.py [GITHUB_EVENT_PATH]
 
 Prints `key=value` lines for $GITHUB_OUTPUT. SYQ_TEST_CHANGED_PATHS_FILE
 replaces the event with a list of changed paths for tests.
+
+SYQ_CI_SUITES, set from ci.yml's `suites` dispatch input, selects named suites
+instead of classifying paths; see SUITES below. Each selected suite's job then
+shares a cancellation group with the same suite on the same branch, so a later
+selection of that suite replaces an earlier run.
 """
 from fnmatch import fnmatchcase
 import json
@@ -19,10 +24,38 @@ from tooling import ToolError, output, report_errors
 SCRIPTS = Path(os.path.abspath(__file__)).parent
 ALL_TOOLING = "package installer benchmark release orchestration focused branch workflows setup"
 DOCUMENTATION_PATHS = "docs/mappings.md\ndocs/automation.md\ndocs/commands/map.md"
+REAL_SSH = {
+    "real-ssh-core": {"suite": "core", "profile": "default"},
+    # The one-session profile changes only the destination's sshd, so it skips
+    # the cases that never contact the destination.
+    "real-ssh-max-sessions-1": {"suite": "core", "profile": "max-sessions-1",
+                                "skip": "tests/real-ssh/max-sessions-1.skip"},
+    "real-ssh-metadata": {"suite": "metadata", "profile": "default"},
+    "real-ssh-benchmark": {"suite": "benchmark", "profile": "default"},
+}
+# Suites that ci.yml's `suites` input can select, as the scope outputs each sets.
+SUITES = {
+    "rust": {"native": True, "integration_targets": "all"},
+    "tooling": {"tooling": True, "tooling_checks": ALL_TOOLING},
+    "shellcheck": {"shellcheck": True},
+    "mapping-docs": {"mapping_docs": True},
+    "python-sdk": {"sdks": True, "python_sdk": True},
+    "linux-arm64": {"linux_arm64": True},
+    "macos-intel": {"macos": True, "macos_intel": True},
+    "s3": {"s3": True},
+    "repository-checks": {"repository_checks": True},
+    **{name: {"real_ssh": [entry]} for name, entry in REAL_SSH.items()},
+    "real-ssh": {"real_ssh": list(REAL_SSH.values())},
+}
 
 
 def run_everything():
     print("\n".join([
+        "suite_selection=false",
+        "s3=true",
+        "repository_checks=true",
+        "macos_intel=true",
+        f"real_ssh_matrix={json.dumps(list(REAL_SSH.values()))}",
         "native=true",
         "sdks=true",
         "python_sdk=true",
@@ -107,9 +140,47 @@ def changed_paths_from_event(event):
     return git("diff", "--no-renames", "--name-only", diff_range), base, head
 
 
+def select_suites(names):
+    """Print the scope for suites named in ci.yml's `suites` dispatch input."""
+    if os.environ.get("SYQ_CI_SCOPE_COMMIT") or os.environ.get("SYQ_CI_DOCUMENTATION_ONLY") == "true":
+        raise ToolError("suites cannot be combined with scope_commit or documentation_only", 2)
+    # Release evidence uses the latest ci.yml run on a master commit, so a partial
+    # run there would hide a full one. Selected suites are for task branches.
+    if os.environ.get("GITHUB_REF") == "refs/heads/master":
+        raise ToolError("run selected suites on a task branch, not master", 2)
+    unknown = [name for name in names if name not in SUITES]
+    if unknown:
+        raise ToolError(f"unknown suite: {' '.join(unknown)} (choose from {' '.join(SUITES)})", 2)
+    selection = {"native": False, "sdks": False, "python_sdk": False, "tooling": False,
+                 "shellcheck": False, "mapping_docs": False, "linux_arm64": False,
+                 "macos": False, "macos_intel": False, "s3": False, "repository_checks": False,
+                 "integration_targets": "", "tooling_checks": "", "real_ssh": []}
+    for name in names:
+        for key, value in SUITES[name].items():
+            if key == "real_ssh":
+                selection[key] += value
+            elif isinstance(value, str):
+                selection[key] = value
+            else:
+                selection[key] = True
+    # Keep the matrix in a fixed order so equal selections share cancellation groups.
+    selected_real_ssh = selection.pop("real_ssh")
+    real_ssh = [entry for entry in REAL_SSH.values() if entry in selected_real_ssh]
+    for key, value in selection.items():
+        print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
+    print(f"real_ssh_matrix={json.dumps(real_ssh)}")
+    print("suite_selection=true\nconformance=false\nfull_suite=false")
+    print('sdk_matrix=["python"]' if selection["python_sdk"] else 'sdk_matrix=["none"]')
+    print(f"CI scope: selected suites {' '.join(names)}", file=sys.stderr)
+    return 0
+
+
 def main():
     event_path = (sys.argv[1] if len(sys.argv) > 1 else "") or os.environ.get("GITHUB_EVENT_PATH")
     base = head = ""
+    suites = os.environ.get("SYQ_CI_SUITES", "").replace(",", " ").split()
+    if suites:
+        return select_suites(suites)
     changed_paths_file = os.environ.get("SYQ_TEST_CHANGED_PATHS_FILE", "")
     if changed_paths_file:
         try:
@@ -147,6 +218,9 @@ def main():
     for key in keys:
         print(f"{key}={str(selection[key]).lower()}")
     print(f"integration_targets={selection['integration_targets']}")
+    # Only full runs and selected suites run these.
+    print("suite_selection=false\ns3=false\nrepository_checks=false\nmacos_intel=false\n"
+          "real_ssh_matrix=[]")
     print("CI scope: " + " ".join(f"{key}={str(selection[key]).lower()}" for key in keys),
           file=sys.stderr)
     print('sdk_matrix=["python"]' if selection["python_sdk"] else 'sdk_matrix=["none"]')

@@ -46,6 +46,8 @@ permissions:
 
 jobs:
   focused-test:
+    # scripts/branch-status.py identifies a check by its job name.
+    name: focused-test (${{ inputs.test_target || 'syq' }}, ${{ inputs.test_name }})
     if: github.event_name == 'workflow_dispatch' && inputs.test_name != ''
     runs-on: ${{ inputs.runner != 'github' && 'namespace-profile-syq-macos' || 'macos-26' }}
     timeout-minutes: 30

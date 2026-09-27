@@ -24,6 +24,13 @@ on:
         description: Commit whose diff determines the selected checks
         required: false
         type: string
+      suites:
+        description: >-
+          Run only these suites on a task branch (space-separated; see SUITES in
+          scripts/ci-scope.py). A later run of the same suite on the branch
+          cancels this one.
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -48,6 +55,11 @@ jobs:
       linux_arm64: ${{ steps.changes.outputs.linux_arm64 }}
       full_suite: ${{ steps.changes.outputs.full_suite }}
       integration_targets: ${{ steps.changes.outputs.integration_targets }}
+      suite_selection: ${{ steps.changes.outputs.suite_selection }}
+      s3: ${{ steps.changes.outputs.s3 }}
+      repository_checks: ${{ steps.changes.outputs.repository_checks }}
+      macos_intel: ${{ steps.changes.outputs.macos_intel }}
+      real_ssh_matrix: ${{ steps.changes.outputs.real_ssh_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -68,16 +80,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SYQ_CI_DOCUMENTATION_ONLY: ${{ inputs.documentation_only }}
           SYQ_CI_SCOPE_COMMIT: ${{ inputs.scope_commit }}
+          SYQ_CI_SUITES: ${{ inputs.suites }}
         run: scripts/ci-scope.py "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
   rust:
-    # Cancel only matching automatic checks; manual runs keep a unique group.
+    # Cancel only matching automatic checks and later selections of the same
+    # suite on the same branch; other manual runs keep a unique group.
     concurrency:
       # Full native suites already include tooling, shell lint, and mapping tests.
-      group: ${{ github.workflow }}-rust-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.integration_targets }}-${{ needs.scope.outputs.tooling_checks }}-${{ needs.scope.outputs.native == 'true' && needs.scope.outputs.full_suite == 'true' && 'full' || format('{0}-{1}-{2}-{3}-{4}', needs.scope.outputs.native, needs.scope.outputs.tooling, needs.scope.outputs.shellcheck, needs.scope.outputs.mapping_docs, needs.scope.outputs.full_suite) }}
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      group: ${{ github.workflow }}-rust-${{ github.event_name == 'push' && github.ref || needs.scope.outputs.suite_selection == 'true' && format('{0}-selected', github.ref) || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.integration_targets }}-${{ needs.scope.outputs.tooling_checks }}-${{ needs.scope.outputs.native == 'true' && needs.scope.outputs.full_suite == 'true' && 'full' || format('{0}-{1}-{2}-{3}-{4}', needs.scope.outputs.native, needs.scope.outputs.tooling, needs.scope.outputs.shellcheck, needs.scope.outputs.mapping_docs, needs.scope.outputs.full_suite) }}
+      cancel-in-progress: ${{ github.event_name == 'push' || needs.scope.outputs.suite_selection == 'true' }}
     needs: scope
-    if: always()
+    # Selected suites skip unselected jobs instead of recording stub successes.
+    if: >-
+      always() &&
+      (needs.scope.outputs.suite_selection != 'true' ||
+       needs.scope.outputs.native == 'true' ||
+       needs.scope.outputs.tooling == 'true' ||
+       needs.scope.outputs.shellcheck == 'true' ||
+       needs.scope.outputs.mapping_docs == 'true')
     runs-on: ${{ inputs.linux_trial != 'github' && format('namespace-profile-syq-linux;github.run-id={0}', github.run_id) || 'ubuntu-24.04' }}
     steps:
       - name: Require successful path classification
@@ -284,12 +305,15 @@ jobs:
       fail-fast: false
       matrix:
         sdk: ${{ fromJSON(needs.scope.outputs.sdk_matrix || '["none"]') }}
-    # Cancel only matching automatic checks; manual runs keep a unique group.
+    # Cancel only matching automatic checks and later selections of the same
+    # suite on the same branch; other manual runs keep a unique group.
     concurrency:
-      group: ${{ github.workflow }}-sdks-${{ matrix.sdk }}-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.python_sdk }}
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      group: ${{ github.workflow }}-sdks-${{ matrix.sdk }}-${{ github.event_name == 'push' && github.ref || needs.scope.outputs.suite_selection == 'true' && format('{0}-selected', github.ref) || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.python_sdk }}
+      cancel-in-progress: ${{ github.event_name == 'push' || needs.scope.outputs.suite_selection == 'true' }}
     needs: scope
-    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
+    if: >-
+      always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
+      (needs.scope.outputs.suite_selection != 'true' || needs.scope.outputs.python_sdk == 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Require successful path classification
@@ -391,7 +415,9 @@ jobs:
   # preflight. A successful subset cannot hide a failed/cancelled matrix job.
   sdks:
     needs: [scope, sdk-languages]
-    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
+    if: >-
+      always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
+      needs.scope.outputs.suite_selection != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Require successful SDK validation
@@ -405,12 +431,15 @@ jobs:
   # The release workflow builds on this runner; libc field types differ from
   # x86-64 (st_nlink is u32 here), so include it in full validation.
   linux-arm64:
-    # Cancel only matching automatic checks; manual runs keep a unique group.
+    # Cancel only matching automatic checks and later selections of the same
+    # suite on the same branch; other manual runs keep a unique group.
     concurrency:
-      group: ${{ github.workflow }}-linux-arm64-${{ github.event_name == 'push' && github.ref || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.linux_arm64 }}
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      group: ${{ github.workflow }}-linux-arm64-${{ github.event_name == 'push' && github.ref || needs.scope.outputs.suite_selection == 'true' && format('{0}-selected', github.ref) || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.linux_arm64 }}
+      cancel-in-progress: ${{ github.event_name == 'push' || needs.scope.outputs.suite_selection == 'true' }}
     needs: scope
-    if: always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
+    if: >-
+      always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
+      (needs.scope.outputs.suite_selection != 'true' || needs.scope.outputs.linux_arm64 == 'true')
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Require successful path classification
@@ -463,16 +492,16 @@ jobs:
   # before the release workflow builds its x86-64 artifact. Keep this on full
   # nightly and manual runs.
   macos_intel:
-    # Cancel only matching automatic checks; manual runs keep a unique group.
+    # Cancel only matching automatic checks and later selections of the same
+    # suite on the same branch; other manual runs keep a unique group.
     concurrency:
-      group: ${{ github.workflow }}-macos_intel-${{ github.event_name == 'push' && github.ref || github.run_id }}
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      group: ${{ github.workflow }}-macos_intel-${{ github.event_name == 'push' && github.ref || needs.scope.outputs.suite_selection == 'true' && format('{0}-selected', github.ref) || github.run_id }}
+      cancel-in-progress: ${{ github.event_name == 'push' || needs.scope.outputs.suite_selection == 'true' }}
     needs: scope
     if: >-
       inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
       needs.scope.result == 'success' &&
-      needs.scope.outputs.macos == 'true' &&
-      needs.scope.outputs.full_suite == 'true'
+      needs.scope.outputs.macos_intel == 'true'
     runs-on: macos-26-intel
     env:
       # This job checks compilation and updater behavior, not copy throughput.
@@ -502,7 +531,10 @@ jobs:
   # the full macos.yml workflow, required separately by verify-release-ci.py.
   macos:
     needs: [scope, macos_intel]
-    if: always() && needs.macos_intel.result != 'cancelled' && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'
+    if: >-
+      always() && needs.macos_intel.result != 'cancelled' &&
+      inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
+      needs.scope.outputs.suite_selection != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Require successful path classification
@@ -525,15 +557,18 @@ jobs:
         run: echo 'Required macOS validation succeeded.'
 
   # These suites need Docker, released binaries, Nix, or other setup that the
-  # rust job does not have. They run only in full nightly and manual suites,
-  # and the full-suite ci.yml run that certifies a release includes them.
+  # rust job does not have. They run in full nightly and manual suites, and
+  # when selected on a task branch; the full-suite ci.yml run that certifies a
+  # release includes them.
   object-storage:
+    concurrency:
+      group: ${{ github.workflow }}-object-storage-${{ needs.scope.outputs.suite_selection == 'true' && github.ref || github.run_id }}
+      cancel-in-progress: ${{ needs.scope.outputs.suite_selection == 'true' }}
     needs: scope
     if: >-
       inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
       needs.scope.result == 'success' &&
-      needs.scope.outputs.native == 'true' &&
-      needs.scope.outputs.full_suite == 'true'
+      needs.scope.outputs.s3 == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -575,8 +610,7 @@ jobs:
     if: >-
       inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
       needs.scope.result == 'success' &&
-      needs.scope.outputs.native == 'true' &&
-      needs.scope.outputs.full_suite == 'true'
+      needs.scope.outputs.real_ssh_matrix != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -620,29 +654,22 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # The core suite also runs the storage checks. The one-session profile skips
-  # the cases that never contact the destination, whose sshd it changes.
+  # The core suite also runs the storage checks. scripts/ci-scope.py defines
+  # the matrix, including the cases the one-session profile skips.
   real-ssh:
+    concurrency:
+      group: ${{ github.workflow }}-real-ssh-${{ matrix.suite }}-${{ matrix.profile }}-${{ needs.scope.outputs.suite_selection == 'true' && github.ref || github.run_id }}
+      cancel-in-progress: ${{ needs.scope.outputs.suite_selection == 'true' }}
     needs: [scope, real-ssh-lab]
     if: >-
       inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
       needs.scope.result == 'success' &&
-      needs.scope.outputs.native == 'true' &&
-      needs.scope.outputs.full_suite == 'true'
+      needs.scope.outputs.real_ssh_matrix != '[]'
     name: real-ssh (${{ matrix.suite }}, ${{ matrix.profile }})
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - suite: core
-            profile: default
-          - suite: core
-            profile: max-sessions-1
-            skip: tests/real-ssh/max-sessions-1.skip
-          - suite: metadata
-            profile: default
-          - suite: benchmark
-            profile: default
+        include: ${{ fromJSON(needs.scope.outputs.real_ssh_matrix) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -682,12 +709,14 @@ jobs:
           retention-days: 14
 
   repository-checks:
+    concurrency:
+      group: ${{ github.workflow }}-repository-checks-${{ needs.scope.outputs.suite_selection == 'true' && github.ref || github.run_id }}
+      cancel-in-progress: ${{ needs.scope.outputs.suite_selection == 'true' }}
     needs: scope
     if: >-
       inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
       needs.scope.result == 'success' &&
-      needs.scope.outputs.native == 'true' &&
-      needs.scope.outputs.full_suite == 'true'
+      needs.scope.outputs.repository_checks == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

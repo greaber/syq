@@ -31,12 +31,17 @@ on:
         description: Timeout in minutes
         type: string
         default: "15"
+      label:
+        description: Names this check in its job name (the helper passes a script digest)
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   check:
+    # scripts/branch-status.py identifies a check by its job name.
+    name: check (${{ inputs.runner }}, ${{ inputs.provider }}${{ inputs.label && format(', {0}', inputs.label) || '' }})
     runs-on: ${{ inputs.provider == 'namespace' && (inputs.runner == 'macos' && 'namespace-profile-syq-macos' || format('namespace-profile-syq-linux;github.run-id={0}', github.run_id)) || (inputs.runner == 'macos-intel' && 'macos-26-intel' || inputs.runner == 'macos' && 'macos-26' || 'ubuntu-24.04') }}
     timeout-minutes: ${{ fromJSON(inputs.timeout) }}
     steps:
