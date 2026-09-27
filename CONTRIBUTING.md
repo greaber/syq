@@ -107,9 +107,10 @@ CARGO_PROFILE_RELEASE_STRIP=none cargo build --locked --release
 ```
 
 The same override works with `python -m pip install ./sdk/python`.
-`cargo build --locked` includes debug symbols, assertions, and overflow checks
-at optimization level 1. For easier stepping, set `CARGO_PROFILE_DEV_OPT_LEVEL=0`;
-BLAKE3 remains optimized at level 3.
+`cargo build --locked` includes line-number debug information, assertions, and
+overflow checks at optimization level 1. For full debugger variable information,
+set `CARGO_PROFILE_DEV_DEBUG=full`; for easier stepping, also set
+`CARGO_PROFILE_DEV_OPT_LEVEL=0`. BLAKE3 remains optimized at level 3.
 
 ## Reproduce a release binary
 

@@ -70,7 +70,14 @@ fn registration_retries_socket_timeout_but_not_peer_rejection() {
                 let _ = stopped.recv_timeout(Duration::from_secs(15));
             }
         });
-        let result = register("laptop", &path, "test-credential");
+        // The handshake timeout is injected so an unanswered handshake fails
+        // quickly through the same real Unix socket timeout.
+        let result = register(
+            "laptop",
+            &path,
+            "test-credential",
+            Duration::from_millis(200),
+        );
         let _ = stop.send(());
         peer.join().unwrap();
         if reject {

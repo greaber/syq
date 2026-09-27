@@ -651,7 +651,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cargo build --locked --bin syq
+          # Reuse the binary the ignored-test step built for the integration
+          # tests. A plain `cargo build` resolves dependency features without
+          # dev-dependencies and would rebuild every dependency; this is a
+          # no-op after that step and still rebuilds a stale cached binary.
+          cargo test --locked --all-targets --no-run
           candidate="$GITHUB_WORKSPACE/target/debug/syq"
           released="$RUNNER_TEMP/released"
           for version in 0.4.0 0.5.2 0.6.0; do
