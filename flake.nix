@@ -45,6 +45,9 @@
               root = ./.;
               fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./build.rs ./src ];
             };
+            # Intel macOS keeps the ordinary release profile: its runners are the
+            # slowest, and whole-program optimization would lengthen every release.
+            CARGO_PROFILE = if system == "x86_64-darwin" then "release" else "dist";
             cargoExtraArgs = "--locked --bin syq";
             # The ordinary test suites run separately; this derivation produces
             # the distributable executable and checks its release identity.
@@ -83,7 +86,7 @@
               (builtins.readFile ./Cargo.lock));
             cargoVendorDir = craneLib.vendorCargoDeps { src = releaseArgs.src; };
             # Only release dependencies are needed, not cargo-check metadata.
-            buildPhaseCargoCommand = "cargo build --release --locked --bin syq";
+            buildPhaseCargoCommand = "cargoWithProfile build --locked --bin syq";
           });
           release = craneLib.buildPackage (releaseArgs // {
             cargoArtifacts = release-deps;

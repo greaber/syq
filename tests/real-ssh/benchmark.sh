@@ -14,8 +14,9 @@ for benchmark_mode in push pull; do
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
 done
 # Automatic sizing uses the real terminal timing from each remote direction.
+# A one-second target still grows the dataset, keeping the lab quick.
 for benchmark_mode in push pull; do
-    bash /usr/local/libexec/syq-try-benchmark --yes \
+    SYQ_BENCHMARK_TEST_SIZING_MS=1000 bash /usr/local/libexec/syq-try-benchmark --yes \
         --mode "$benchmark_mode" --host destination --workload small --size auto --warmup off \
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
 done
@@ -28,7 +29,8 @@ for benchmark_mode in push pull; do
 done
 # A new route can learn during warm-up before the first scored copy. Speed up
 # only the debug tuner's sample clock and cap traffic to keep this lab bounded.
-# These are correctness checks, not performance measurements.
+# Keep the default warm-up target: in this lab, learning needs more than 30 s
+# of copying. These are correctness checks, not performance measurements.
 for benchmark_mode in push pull; do
     benchmark_cache="$home/benchmark-tuning-$benchmark_mode.json"
     SYQ_TUNING_CACHE="$benchmark_cache" SYQ_TEST_TUNE_SAMPLE_MS=100 \

@@ -48,14 +48,26 @@ pub(crate) fn main() {
 }
 
 fn register_inputs(packaged: bool) {
-    println!("cargo::rerun-if-changed=.cargo_vcs_info.json");
+    // Cargo treats a watched path that does not exist as always changed.
     if packaged {
         // Track the extracted source, but never consult an enclosing checkout.
+        println!("cargo::rerun-if-changed=.cargo_vcs_info.json");
         println!("cargo::rerun-if-changed=src");
         println!("cargo::rerun-if-changed=build.rs");
         println!("cargo::rerun-if-changed=Cargo.toml");
         println!("cargo::rerun-if-changed=Cargo.lock");
         return;
+    }
+    if git_revision().is_none() {
+        // Without packaged provenance or a commit, the identity contains a
+        // per-build nonce. Watching the absent provenance file reruns this
+        // script for every build, so changed sources never keep an earlier
+        // build's identity.
+        println!("cargo::rerun-if-changed=.cargo_vcs_info.json");
+        return;
+    }
+    if fs::metadata(".cargo_vcs_info.json").is_ok() {
+        println!("cargo::rerun-if-changed=.cargo_vcs_info.json");
     }
     if let Ok(output) = Command::new("git")
         .args([
@@ -77,24 +89,37 @@ fn register_inputs(packaged: bool) {
             }
         }
     }
-    for git_path in [
-        git(&["rev-parse", "--git-path", "HEAD"]),
-        git(&["rev-parse", "--git-path", "index"]),
-        git(&["symbolic-ref", "-q", "HEAD"])
-            .and_then(|name| git(&["rev-parse", "--git-path", &name])),
-    ]
-    .into_iter()
-    .flatten()
+    // A new untracked source file is not in the list above; the directory
+    // scan catches it before it can be compiled under an older identity.
+    if fs::metadata("src").is_ok() {
+        println!("cargo::rerun-if-changed=src");
+    }
+    // HEAD and the index change on checkout and staging. A commit updates the
+    // branch's loose ref, or its reflog when the ref is packed; repositories
+    // using the reftable format keep every ref in the reftable directory.
+    let branch = git(&["symbolic-ref", "-q", "HEAD"]);
+    let log = branch.as_ref().map(|name| format!("logs/{name}"));
+    for git_path in ["HEAD", "index", "packed-refs", "reftable"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(branch)
+        .chain(log)
+        .filter_map(|name| git(&["rev-parse", "--git-path", &name]))
+        .filter(|path| fs::metadata(path).is_ok())
     {
         println!("cargo::rerun-if-changed={git_path}");
     }
 }
 
+fn git_revision() -> Option<String> {
+    git(&["rev-parse", "--short=12", "HEAD"])
+        .filter(|value| value.len() == 12 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 fn development_identity(release_identity: &str, packaged: Option<String>) -> String {
     let is_packaged = packaged.is_some();
     let revision = packaged
-        .or_else(|| git(&["rev-parse", "--short=12", "HEAD"]))
-        .filter(|value| value.len() == 12 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .or_else(git_revision)
         .unwrap_or_else(|| format!("source.{}", build_nonce()));
     let dirty = (!is_packaged)
         .then(working_tree_hash)

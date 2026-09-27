@@ -86,6 +86,9 @@ serde_json = "1"
 # Keep CPU-heavy copies practical in development and test builds.
 [profile.dev]
 opt-level = 1
+# Debug information makes the binary several times larger and slows tests
+# that copy, hash, or install it. Panic messages keep their file and line.
+debug = 0
 
 [profile.release]
 opt-level = 3
@@ -93,6 +96,13 @@ lto = "thin"
 codegen-units = 4
 debug = 0
 strip = "symbols"
+
+# Published executables: whole-program optimization makes them smaller, at the
+# cost of a slower final link than ordinary release builds need.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 [dev-dependencies]
 cc = "1"

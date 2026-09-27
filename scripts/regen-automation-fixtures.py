@@ -9,7 +9,9 @@ whether a fast run emits its first sample before finishing is a race, and a
 stream with no progress records is itself a real possible stream.
 
 With --check, regenerate into a temporary directory and fail if the result
-differs from the committed fixtures, leaving them untouched.
+differs from the committed fixtures, leaving them untouched. With --no-build,
+use the existing target/debug/syq instead of building it first, as CI does
+after building the test binaries.
 """
 import datetime
 import difflib
@@ -91,14 +93,20 @@ def stale(regenerated):
 
 def main():
     global output_directory
-    if sys.argv[1:] not in ([], ["--check"]):
-        sys.exit("usage: scripts/regen-automation-fixtures.py [--check]")
-    check = sys.argv[1:] == ["--check"]
+    arguments = sys.argv[1:]
+    if any(argument not in ("--check", "--no-build") for argument in arguments) or \
+            len(set(arguments)) != len(arguments):
+        sys.exit("usage: scripts/regen-automation-fixtures.py [--check] [--no-build]")
+    check = "--check" in arguments
     if check:
         checked = tempfile.TemporaryDirectory()
         output_directory = Path(checked.name)
-    subprocess.run(["cargo", "build", "--quiet", "--manifest-path", str(REPOSITORY / "Cargo.toml")],
-                   check=True)
+    if "--no-build" in arguments:
+        if not SYQ.is_file():
+            sys.exit(f"--no-build: {SYQ} does not exist")
+    else:
+        subprocess.run(["cargo", "build", "--quiet", "--manifest-path", str(REPOSITORY / "Cargo.toml")],
+                       check=True)
     OUT.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as work:
         work = Path(work)
