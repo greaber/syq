@@ -319,10 +319,12 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
 pub(crate) fn root() -> Command {
     configure(Command::new("syq")
         .about("Copy files and directories locally or over SSH")
-        .override_usage("syq <COMMAND> [OPTIONS]\n       syq --self-update")
+        .override_usage("syq [--use-version VERSION] <COMMAND> [OPTIONS]\n       syq --self-update")
         .before_help("Examples:\n  syq cp photos --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq map photos --as archive/photos")
         .arg(Arg::new("version").short('V').long("version").action(ArgAction::Version).help("Print version"))
         .version(env!("CARGO_PKG_VERSION"))
+        .arg(Arg::new("use_version").long("use-version").value_name("VERSION")
+            .help("Run an exact official release, downloading it if needed (place before COMMAND)"))
         .arg(Arg::new("self_update").long("self-update").action(ArgAction::SetTrue)
             .help("Install the newest signed release (standalone installs); Homebrew: brew upgrade syq"))
         .disable_help_subcommand(true)

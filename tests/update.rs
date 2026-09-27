@@ -69,6 +69,13 @@ struct UpdateFixture {
 
 impl UpdateFixture {
     fn new(release_version: &str, executable_identity: &str) -> Self {
+        let replacement = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq {release_version}' ;;\n  --build-identity) echo '{executable_identity}' ;;\n  *) exit 2 ;;\nesac\n"
+        );
+        Self::with_program(release_version, replacement.as_bytes())
+    }
+
+    fn with_program(release_version: &str, replacement: &[u8]) -> Self {
         let temp = TempDir::new();
         let installed = temp.path("bin/syq");
         fs::create_dir_all(installed.parent().unwrap()).unwrap();
@@ -78,10 +85,6 @@ impl UpdateFixture {
 
         let target = release_target();
         let asset = format!("syq-{target}");
-        let replacement = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq {release_version}' ;;\n  --build-identity) echo '{executable_identity}' ;;\n  *) exit 2 ;;\nesac\n"
-        );
-        let replacement = replacement.as_bytes();
         let archive_path = temp.path(&format!("fixtures/{asset}.gz"));
         fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
         let mut encoder = GzEncoder::new(File::create(&archive_path).unwrap(), Compression::best());
@@ -145,6 +148,7 @@ impl UpdateFixture {
         Command::new(executable)
             .args(arguments)
             .env("XDG_CONFIG_HOME", &self.config)
+            .env("XDG_CACHE_HOME", self.temp.path("cache"))
             .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &self.public_key)
             .env("SYQ_TEST_RELEASE_BUILD", "1")
             .env(
@@ -625,4 +629,102 @@ fn custom_build_does_not_inherit_upstream_update_ownership() {
             fixture.assert_original_unchanged();
         }
     }
+}
+
+#[test]
+fn use_version_downloads_exact_release_and_reuses_it_offline() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let run =
+        || fixture.command_at_args(&fixture.installed, &["--use-version", "0.7.0", "--version"]);
+    let first = run();
+    assert_success(&first);
+    assert_eq!(first.stdout, b"syq 0.7.0\n");
+    fs::remove_dir_all(fixture.temp.path("fixtures")).unwrap();
+    let cached = run();
+    assert_success(&cached);
+    assert_eq!(cached.stdout, first.stdout);
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
+    assert!(!fixture
+        .installed
+        .with_file_name(".syq-install.json")
+        .exists());
+}
+
+#[test]
+fn use_version_preserves_raw_arguments_environment_input_and_exit_status() {
+    use std::os::unix::ffi::OsStringExt;
+    use std::process::Stdio;
+    let fixture = UpdateFixture::with_program(
+        "0.7.0",
+        b"#!/bin/sh\ncase \"$1\" in\n--version) echo 'syq 0.7.0'; exit ;;\n--build-identity) echo 'v0.7.0'; exit ;;\nesac\nprintf '%s\\0' \"$@\"\nprintf '%s\\0' \"$SYQ_CP_OPTIONS\"\ncat\nexit 23\n",
+    );
+    // Populate the verified cache, then invoke it without any download fixtures.
+    let _ = fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0"]);
+    fs::remove_dir_all(fixture.temp.path("fixtures")).unwrap();
+    let raw = std::ffi::OsString::from_vec(b"name-\xff".to_vec());
+    let mut child = Command::new(&fixture.installed)
+        .args(["--use-version=0.7.0", "cp", "--future-option", "two words"])
+        .arg(raw)
+        .env("SYQ_CP_OPTIONS", "--future-environment-option")
+        .env("XDG_CACHE_HOME", fixture.temp.path("cache"))
+        .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn_guarded()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"input bytes")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(23), "{out:?}");
+    assert_eq!(
+        out.stdout,
+        b"cp\0--future-option\0two words\0name-\xff\0--future-environment-option\0input bytes"
+    );
+}
+
+#[test]
+fn use_version_rejects_wrong_release_and_corrupt_cached_manifest() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let wrong = fixture.command_at_args(&fixture.installed, &["--use-version=0.7.1", "--version"]);
+    assert_failure_contains(&wrong, "but 0.7.1 was requested");
+    assert_success(
+        &fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]),
+    );
+    let manifest = fixture.temp.path(&format!(
+        "cache/syq/helpers/v0.7.0/{}/syq-release-manifest.json",
+        release_target()
+    ));
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    value["version"] = "0.7.1".into();
+    fs::write(manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let out = fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
+    assert_failure_contains(&out, "signature verification failed");
+}
+
+#[test]
+fn use_version_repairs_corrupt_cached_binary_from_verified_release() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let run = || fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
+    assert_success(&run());
+    let cached = fixture.temp.path(&format!(
+        "cache/syq/helpers/v0.7.0/{}/syq",
+        release_target()
+    ));
+    fs::write(cached, b"corrupt").unwrap();
+    let out = run();
+    assert_success(&out);
+    assert_eq!(out.stdout, b"syq 0.7.0\n");
+}
+
+#[test]
+fn use_version_rejects_a_signed_executable_with_wrong_identity() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0+dev.other");
+    let out = fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
+    assert_failure_contains(&out, "unexpected build identity");
 }

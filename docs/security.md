@@ -135,7 +135,8 @@ on a network you trust.
 Official releases provide executables for each supported operating system and
 CPU architecture. They are published as GitHub release assets and served
 through `dl.syq.christmas`. An installed syq downloads them for explicit
-self-updates and, when needed, to install a matching helper on an SSH server.
+self-updates, explicit `--use-version` selections, and, when needed, to install
+a matching helper on an SSH server.
 Remote helpers use the same release as the client, even when the server needs
 a different platform's executable.
 

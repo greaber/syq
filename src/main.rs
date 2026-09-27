@@ -70,6 +70,7 @@ mod transfer_observations;
 mod transfer_tuning;
 mod tune;
 mod update;
+mod use_version;
 mod wire_budget;
 mod write_gate;
 
@@ -150,11 +151,18 @@ fn max_files_per_process() -> Option<libc::rlim_t> {
 }
 
 fn main() {
+    let argv = match use_version::enter(std::env::args_os().collect()) {
+        Ok(argv) => argv,
+        Err(error) => {
+            crate::output::diagnostic!("syq: {error:#}");
+            std::process::exit(1);
+        }
+    };
     let environment_options = cli::EnvironmentOptions::take_from_environment();
     tune_allocator();
     raise_nofile();
     fsops::capture_process_umask();
-    let mut argv = match destination::handoff::enter(std::env::args_os().collect()) {
+    let mut argv = match destination::handoff::enter(argv) {
         Ok(argv) => argv,
         Err(error) => {
             crate::output::diagnostic!("syq: {error:#}");

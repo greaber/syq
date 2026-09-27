@@ -16,7 +16,7 @@ and `...` allows repetition.
 
 <!-- CLI: syq -->
 ```text
-syq <COMMAND> [OPTIONS]
+syq [--use-version VERSION] <COMMAND> [OPTIONS]
 syq --self-update
 ```
 
@@ -38,6 +38,7 @@ syq --self-update
 
 | Argument / option | Meaning |
 |---|---|
+| `--use-version <VERSION>` | Run an exact official release, downloading it if needed (place before COMMAND) |
 | `--self-update` | Install the newest signed release (standalone installs); Homebrew: brew upgrade syq |
 
 **Help and version**
