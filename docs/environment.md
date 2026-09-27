@@ -49,7 +49,6 @@ Default locations include:
 | `~/.config/syq/install.json`, `last-update-check` | Install receipt and update-check timing |
 | `$XDG_RUNTIME_DIR/syq-persist-UID/` | Persistent connection sockets |
 | `~/.syq-destinations-v3/` | Registered receiving names on a server |
-| `~/.local/state/syq/restricted/` | Local receiver keys and enrollment metadata; build-specific enrollments are under `builds/` |
 | `~/.local/share/syq/restricted/` | Receiver enrollment state |
 
 Copies can proceed when optional caches cannot be written. Persistent

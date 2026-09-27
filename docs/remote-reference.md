@@ -23,28 +23,17 @@ Use a real directory, not a symlink. Transfers cannot overwrite the receiver's
 SSH configuration, programs, or enrollment state. Manage that state with
 `syq receiver` commands; it is not a disposable cache.
 
-Each build uses its own receiver executable and restricted SSH key. An eligible
-copy installs the matching receiver automatically when that build has no
-enrollment for the destination. This needs ordinary SSH access from your local
-machine, directly or through the source server. Dry runs never install it;
-use `syq receiver enroll hostB:/destination` first.
-
-Different releases can copy concurrently without replacing one another's
-receiver. Development builds with different build identities are separate too.
-Older enrollments and their replay records remain in place. `syq receiver list`
-includes all compatible enrollments, with the build identity in its last column
-(`legacy` for enrollments created before build-specific selection). Revoke an
-unused enrollment by its ID; revocation stops its active copies and removes its
-executable when no other enrollment uses it.
-
-Repeating `enroll` refreshes the current build's receiver while preserving its
-keys and replay records. A pending enrollment can be retried or revoked. Revoke
-and enroll again to rotate its receipt key. See
-[access management](remote-to-remote.md#first-copy-and-access-management)
+Repeating `enroll` updates the receiver to match your local build. A pending
+enrollment can be retried or revoked. Revoke and enroll again to rotate its
+receipt key. Revocation stops active receivers before removing their state;
+see [access management](remote-to-remote.md#first-copy-and-access-management)
 for interruption and retry behavior.
 
-Older clients retain their existing receiver behavior. They use the legacy
-shared executable and cannot select the new build-specific enrollments.
+Stop active copies before upgrading: replacing the executable does not update
+running receivers. Repeat `syq receiver enroll hostB:/destination` afterward
+to refresh the installed receiver. Compatible enrollment keys and replay records
+are preserved. Different client builds cannot share one installed receiver
+concurrently; each needs a matching receiver.
 
 An incompatible enrollment requires fresh setup, which needs ordinary SSH
 access. Eligible copies install it automatically, or you can use `enroll`.

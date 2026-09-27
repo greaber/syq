@@ -106,53 +106,7 @@ pub(super) fn install_state_paths(
 }
 
 pub(super) fn receiver_install_path(home: &Path) -> PathBuf {
-    receiver_path_for_build(home, crate::identity::build())
-}
-
-pub(super) fn receiver_path_for_build(home: &Path, identity: &str) -> PathBuf {
-    let digest = blake3::hash(identity.as_bytes());
-    home.join(".local/libexec")
-        .join(format!("syq-receiver-{digest}"))
-}
-
-fn managed_receiver_path(home: &Path, receiver: &Path) -> bool {
-    if receiver.parent() != Some(home.join(".local/libexec").as_path()) {
-        return false;
-    }
-    let Some(name) = receiver.file_name().and_then(OsStr::to_str) else {
-        return false;
-    };
-    name == "syq-receiver"
-        || name.strip_prefix("syq-receiver-").is_some_and(|digest| {
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-}
-
-// A receiver executable can be shared by several scopes for the same build.
-// Unknown state keeps it in place; cleanup must never break another enrollment.
-fn receiver_is_referenced(state_base: &Path, receiver: &Path) -> Result<bool> {
-    let entries = match fs::read_dir(state_base) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error).context("inspect remaining receiver enrollments"),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let config = delegation::read_private_regular(
-            &entry.path().join("config.json"),
-            "receiver configuration",
-            MAX_STATE_FILE,
-        )
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<ReceiverEnrollment>(&bytes).ok());
-        if config.is_none_or(|config| Path::new(&config.receiver_path) == receiver) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    home.join(".local/libexec/syq-receiver")
 }
 
 pub(super) fn receiver_control_paths(
@@ -193,12 +147,8 @@ pub(super) fn receiver_control_paths(
 pub(super) fn materialize_receiver(home: &Path, contents: &[u8]) -> Result<PathBuf> {
     let directory_path = ensure_directory_chain(home, &[".local", "libexec"])?;
     let directory = open_directory(&directory_path)?;
+    atomic_replace_executable_locked(&directory, "syq-receiver", contents)?;
     let receiver = receiver_install_path(home);
-    let name = receiver
-        .file_name()
-        .and_then(OsStr::to_str)
-        .context("receiver filename")?;
-    atomic_replace_executable_locked(&directory, name, contents)?;
     delegation::validate_regular_executable(&receiver, "restricted receiver")?;
     Ok(receiver)
 }
@@ -463,12 +413,6 @@ pub(super) fn revoke_for_account(
         }
         Err(error) => return Err(error).context("inspect restricted receiver state"),
     };
-    if !managed_receiver_path(home, &receiver_path) {
-        bail!(
-            "refusing to remove unexpected restricted receiver path {}",
-            receiver_path.display()
-        );
-    }
     let enrollment_key = EnrollmentPublicKey::parse(&request.public_key)?;
     let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &enrollment_key)?;
     // Validate the shared state chain before removing the credential. The
@@ -490,26 +434,37 @@ pub(super) fn revoke_for_account(
     }
     let last_enrollment =
         !contains_managed_enrollment(&updated) && directory_is_empty(&state_base)?;
-    if !receiver_is_referenced(&state_base, &receiver_path)? {
-        match fs::symlink_metadata(&receiver_path) {
+    if last_enrollment {
+        let installed_receiver = receiver_install_path(home);
+        if receiver_path != installed_receiver {
+            bail!(
+                "refusing to remove unexpected restricted receiver path {}",
+                receiver_path.display()
+            );
+        }
+        remove_final_enrollment_state_directories(home)?;
+        match fs::symlink_metadata(&installed_receiver) {
             Ok(_) => {
-                delegation::validate_regular_executable(&receiver_path, "restricted receiver")?;
-                fs::remove_file(&receiver_path).with_context(|| {
+                delegation::validate_regular_executable(
+                    &installed_receiver,
+                    "restricted receiver",
+                )?;
+                fs::remove_file(&installed_receiver).with_context(|| {
                     format!(
-                        "remove unused restricted receiver {}",
-                        receiver_path.display()
+                        "remove final restricted receiver {}",
+                        installed_receiver.display()
                     )
                 })?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(error).with_context(|| format!("inspect {}", receiver_path.display()))
+                return Err(error)
+                    .with_context(|| format!("inspect {}", installed_receiver.display()))
             }
         }
-    }
-    if last_enrollment {
-        remove_final_enrollment_state_directories(home)?;
-        // General account directories are not owned by an enrollment.
+        // `.local`, `share`, and `libexec` are general account directories.
+        // Without a durable record proving syq created them, preserve them
+        // even when the final enrollment leaves them empty.
     }
     drop(directory);
     println!("revoked {}", request.id);

@@ -11,11 +11,7 @@ pub(super) fn store_pending_enrollment(
     pending: &PendingEnrollment,
     private_key: &PrivateKey,
 ) -> Result<PathBuf> {
-    // Older clients scan only the immediate enrollment directories. Keep
-    // build-specific enrollments below a separate directory so those clients
-    // cannot accidentally select or refresh one belonging to a newer build.
-    let base = local_state_base()?.join("builds");
-    ensure_directory(&base, 0o700)?;
+    let base = local_state_base()?;
     let directory = base.join(pending.id.to_string());
     ensure_directory(&directory, 0o700)?;
     store_pending_files(&directory, pending, private_key)?;
@@ -54,33 +50,18 @@ pub(super) fn complete_local_enrollment(
     remove_leaf_locked(&directory, "pending.json")
 }
 
-fn local_enrollment_directories() -> Result<Vec<PathBuf>> {
+pub(super) fn load_local_enrollments() -> Result<Vec<(LocalEnrollment, PathBuf)>> {
     let base = local_state_base()?;
-    enrollment_directories(&base)
-}
-
-fn enrollment_directories(base: &Path) -> Result<Vec<PathBuf>> {
-    let mut directories = Vec::new();
-    for parent in [base.to_path_buf(), base.join("builds")] {
-        if !parent.try_exists()? {
+    let mut enrollments = Vec::new();
+    for entry in fs::read_dir(&base).with_context(|| format!("list {}", base.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
             continue;
         }
-        delegation::validate_private_directory_path(&parent)?;
-        for entry in fs::read_dir(&parent).with_context(|| format!("list {}", parent.display()))? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir()
-                && delegation::validate_private_directory_path(&entry.path()).is_ok()
-            {
-                directories.push(entry.path());
-            }
+        let directory = entry.path();
+        if delegation::validate_private_directory_path(&directory).is_err() {
+            continue;
         }
-    }
-    Ok(directories)
-}
-
-pub(super) fn load_local_enrollments() -> Result<Vec<(LocalEnrollment, PathBuf)>> {
-    let mut enrollments = Vec::new();
-    for directory in local_enrollment_directories()? {
         let metadata_path = directory.join("metadata.json");
         let Ok(encoded) = delegation::read_private_regular(
             &metadata_path,
@@ -93,9 +74,7 @@ pub(super) fn load_local_enrollments() -> Result<Vec<(LocalEnrollment, PathBuf)>
             continue;
         };
         if metadata.version == CONFIG_VERSION
-            && directory
-                .file_name()
-                .is_some_and(|name| metadata.id.to_string() == name.to_string_lossy())
+            && metadata.id.to_string() == entry.file_name().to_string_lossy()
         {
             enrollments.push((metadata, directory));
         }
@@ -104,8 +83,17 @@ pub(super) fn load_local_enrollments() -> Result<Vec<(LocalEnrollment, PathBuf)>
 }
 
 pub(super) fn load_pending_enrollments() -> Result<Vec<(PendingEnrollment, PathBuf)>> {
+    let base = local_state_base()?;
     let mut enrollments = Vec::new();
-    for directory in local_enrollment_directories()? {
+    for entry in fs::read_dir(&base).with_context(|| format!("list {}", base.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let directory = entry.path();
+        if delegation::validate_private_directory_path(&directory).is_err() {
+            continue;
+        }
         let metadata_path = directory.join("pending.json");
         let Ok(encoded) = delegation::read_private_regular(
             &metadata_path,
@@ -118,9 +106,7 @@ pub(super) fn load_pending_enrollments() -> Result<Vec<(PendingEnrollment, PathB
             continue;
         };
         if metadata.version == CONFIG_VERSION
-            && directory
-                .file_name()
-                .is_some_and(|name| metadata.id.to_string() == name.to_string_lossy())
+            && metadata.id.to_string() == entry.file_name().to_string_lossy()
         {
             enrollments.push((metadata, directory));
         }
@@ -365,11 +351,7 @@ pub(super) fn enroll(
 
     let mut active = None;
     for (metadata, directory) in load_local_enrollments()? {
-        if metadata.build_identity.as_deref() == Some(crate::identity::build())
-            && metadata.host == host
-            && metadata.port == port
-            && metadata.target_login == login
-        {
+        if metadata.host == host && metadata.port == port && metadata.target_login == login {
             if let Some(canonical_destination) =
                 destination_for(&metadata, requested_destination.as_bytes())?
             {
@@ -393,8 +375,7 @@ pub(super) fn enroll(
         load_pending_enrollments()?
             .into_iter()
             .find(|(pending, _)| {
-                pending.build_identity.as_deref() == Some(crate::identity::build())
-                    && pending.host == host
+                pending.host == host
                     && pending.port == port
                     && pending.target_login == login
                     && pending.requested_destination == requested_destination
@@ -407,7 +388,6 @@ pub(super) fn enroll(
             let private_key = load_private_key(&directory)?;
             let pending = PendingEnrollment {
                 version: CONFIG_VERSION,
-                build_identity: Some(crate::identity::build().to_owned()),
                 id: metadata.id,
                 host: metadata.host,
                 port: metadata.port,
@@ -425,7 +405,6 @@ pub(super) fn enroll(
             let private_key = generate_enrollment_key(id)?;
             let pending = PendingEnrollment {
                 version: CONFIG_VERSION,
-                build_identity: Some(crate::identity::build().to_owned()),
                 id,
                 host: host.to_owned(),
                 port,
@@ -463,7 +442,6 @@ pub(super) fn enroll(
     };
     let metadata = LocalEnrollment {
         version: CONFIG_VERSION,
-        build_identity: Some(crate::identity::build().to_owned()),
         id: pending.id,
         host: host.to_owned(),
         port,

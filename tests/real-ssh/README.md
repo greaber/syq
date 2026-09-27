@@ -106,8 +106,7 @@ helper, so the check exercises real OpenSSH environment forwarding.
 
 The smoke suite currently covers rejection of a restricted destination that
 overlaps the receiver's SSH control plane, source-side direct coordination with
-automatic enrollment and concurrent copies with independent receivers for different
-builds, preservation of replay records across refresh, and enrollment over encrypted TCP with an approved
+automatic restricted-destination enrollment over encrypted TCP with an approved
 congestion algorithm, firewall-triggered fallback to restricted SSH workers,
 explicitly selected restricted SSH data channels (including receivers with long
 account-home paths for both SSH modes), destination-side coordination through

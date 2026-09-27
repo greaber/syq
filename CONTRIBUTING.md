@@ -76,9 +76,8 @@ The rsync spellings are `--rsync-path` and `--syq-no-bootstrap`.
 ## Direct server-to-server copies
 
 Follow the [remote-copy prerequisites](docs/remote-to-remote.md#what-you-need).
-The first copy with each build enrolls a matching receiver automatically. Builds
-with different identities keep separate enrollments and executables. To enroll
-explicitly, or refresh the current build's receiver:
+The first copy can enroll a destination automatically. To enroll explicitly,
+or update an existing receiver after rebuilding:
 
 ```sh
 ./target/release/syq receiver enroll hostB:/tmp/syq-dev-copy
