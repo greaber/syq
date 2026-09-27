@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Exercise complete release assembly and Ed25519 signing with small stand-in
 binaries. Optionally reuse a candidate already built by the caller:
-scripts/test-release-tools.py --syq /absolute/path/to/syq
+tests/tooling/test-release-tools.py --syq /absolute/path/to/syq
 """
+from support import SCRIPTS
+
 import copy
 import hashlib
 import json
@@ -16,7 +18,6 @@ import unittest
 
 from tooling import cargo_version
 
-SCRIPTS = Path(os.path.abspath(__file__)).parent
 REPOSITORY = SCRIPTS.parent
 
 VERSION = cargo_version(REPOSITORY / "Cargo.toml")
@@ -408,7 +409,7 @@ def main():
     arguments = sys.argv[1:]
     if arguments and arguments[0] == "--syq":
         if len(arguments) < 2:
-            print("usage: scripts/test-release-tools.py [--syq PATH]", file=sys.stderr)
+            print("usage: tests/tooling/test-release-tools.py [--syq PATH]", file=sys.stderr)
             sys.exit(2)
         CANONICALIZER = arguments[1]
         if not os.path.isfile(CANONICALIZER) or not os.access(CANONICALIZER, os.X_OK):

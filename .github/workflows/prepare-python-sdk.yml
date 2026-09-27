@@ -72,7 +72,7 @@ jobs:
             echo 'changed=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          scripts/test-python-sdk-release-tools.py
+          tests/tooling/test-python-sdk-release-tools.py
           gh release download "$(jq -er .tag "$RELEASE_MANIFEST")" \
             --pattern syq-linux-x86_64 --dir "$RUNNER_TEMP/syq-release"
           uv sync --project sdk/python --frozen --no-install-project

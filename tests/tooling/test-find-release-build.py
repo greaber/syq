@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Release binary reuse must be exact, complete, and publication-gated."""
+from support import ROOT, SCRIPTS
+
 import contextlib
 import importlib.util
 import io
@@ -11,7 +13,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location("builds", Path(__file__).with_name("find-release-build.py"))
+spec = importlib.util.spec_from_file_location("builds", SCRIPTS / "find-release-build.py")
 builds = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builds)
 
@@ -98,7 +100,7 @@ class Tests(unittest.TestCase):
                         watch_status=1)
 
     def test_candidate_artifacts_can_be_replaced_by_deliberate_job_retry(self):
-        root = Path(__file__).resolve().parent.parent
+        root = ROOT
         native = (root / ".github/workflows/reproducible-builds.yml").read_text()
         python = (root / ".github/workflows/publish-sdks.yml").read_text()
         for text, name in ((native, "source-crate"),
@@ -110,7 +112,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.select([])[0], "")
 
     def test_publication_requires_verification_and_either_build_path(self):
-        workflow = Path(__file__).resolve().parent.parent / ".github/workflows/release.yml"
+        workflow = ROOT / ".github/workflows/release.yml"
         text = workflow.read_text()
         release = text.split("  release:\n", 1)[1]
         for condition in ("needs.verify-tag.result == 'success'",
@@ -143,7 +145,7 @@ class PythonTests(Tests):
             "path": ".github/workflows/publish-sdks.yml"} | changes))
 
     def test_shared_tag_gate_rejects_package_version_mismatch(self):
-        root = Path(__file__).resolve().parent.parent
+        root = ROOT
         workflow = (root / ".github/workflows/publish-sdks.yml").read_text()
         gate = workflow.split("  verify-tag:\n", 1)[1].split("  candidate-python:\n", 1)[0]
         step = gate.split("      - name: Require Python tag version to match package\n", 1)[1]
@@ -175,7 +177,7 @@ class PythonTests(Tests):
             {"name": name, "expired": False} for name in builds.ASSETS])[0], "")
 
     def test_publication_requires_verification_and_either_build_path(self):
-        root = Path(__file__).resolve().parent.parent
+        root = ROOT
         workflow = (root / ".github/workflows/publish-sdks.yml").read_text()
         publish = workflow.split("  publish-python:\n", 1)[1]
         for condition in ("needs.verify-tag.result == 'success'",

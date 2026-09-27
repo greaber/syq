@@ -2,7 +2,7 @@
 """Check that workflows and release instructions name scripts that exist.
 
 Scans .github/workflows/*.yml, .agents/skills/, RELEASING.md, and
-sdk/RELEASING.md for `scripts/...` paths. Every referenced file must be
+sdk/RELEASING.md for `scripts/...` and `tests/tooling/...` paths. Every referenced file must be
 tracked. A script run directly as a command in a workflow or a Markdown code
 block, rather than through an interpreter such as `python3 scripts/x.py`, must
 also be committed as executable with a `#!` line. Release workflows run only
@@ -14,14 +14,14 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-REFERENCE = re.compile(r"(?<![\w./-])scripts/[\w./-]*[\w]")
+REFERENCE = re.compile(r"(?<![\w./-])(?:scripts|tests/tooling)/[\w./-]*[\w]")
 # Text before a reference that makes it the command being run.
 COMMAND_START = re.compile(r"(^|[;&|(!]|\b(?:then|do|if|run:|-))\s*$")
 INTERPRETERS = re.compile(r"\b(?:python3?|bash|sh|-f|--script)\s+$")
 
 
 def tracked_modes():
-    listing = subprocess.run(["git", "ls-files", "-s", "--", "scripts"], cwd=ROOT, check=True,
+    listing = subprocess.run(["git", "ls-files", "-s", "--", "scripts", "tests/tooling"], cwd=ROOT, check=True,
                              stdout=subprocess.PIPE, text=True).stdout
     modes = {}
     for line in listing.splitlines():

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Generate the formula in a path Homebrew recognizes as a tap and run its
 native style/parser checks. Intended for the disposable macOS CI runner."""
+from support import SCRIPTS
+
 import json
 import os
 from pathlib import Path
@@ -10,7 +12,6 @@ import sys
 import tempfile
 import unittest
 
-SCRIPTS = Path(os.path.abspath(__file__)).parent
 
 
 class HomebrewFormulaTests(unittest.TestCase):

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Exercise scripts/branch-status.py against a scratch repository and a fake gh
 that serves controlled run and pull-request JSON."""
+from support import SCRIPTS
+
 import json
 import os
 from pathlib import Path
@@ -8,7 +10,6 @@ import subprocess
 import tempfile
 import unittest
 
-SCRIPTS = Path(__file__).resolve().parent
 STATUS = SCRIPTS / "branch-status.py"
 
 FAKE_GH = """#!/bin/sh

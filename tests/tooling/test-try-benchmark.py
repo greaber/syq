@@ -4,6 +4,8 @@
 Remote tests here fake only SSH and syq; rsync still runs its real client/server
 protocol. tests/real-ssh additionally exercises real syq over real OpenSSH.
 """
+from support import SCRIPTS
+
 import json
 import os
 from pathlib import Path
@@ -17,7 +19,7 @@ import tempfile
 import time
 import unittest
 
-SCRIPT = Path(__file__).resolve().with_name('try-benchmark.sh')
+SCRIPT = SCRIPTS / 'try-benchmark.sh'
 FAKE_SYQ = r'''#!/usr/bin/env python3
 import json, os, pathlib, shutil, subprocess, sys, time
 args=sys.argv[1:]

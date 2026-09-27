@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Exercise public commands with real processes, Git worktrees and disposable state."""
+from support import SCRIPTS
+
 import json
 import os
 from pathlib import Path
@@ -13,7 +15,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-SCRIPT = Path(__file__).resolve().with_name('agent-coordination.py')
+SCRIPT = SCRIPTS / 'agent-coordination.py'
 sys.path.insert(0, str(SCRIPT.parent))
 from coordination.store import Store
 
