@@ -374,7 +374,7 @@ impl Engine {
                 .metadata
                 .as_ref()
                 .map_or((old.mtime, 0), |m| (m.mtime, m.nsec));
-            if self.args.update && source.kind() != ObjectKind::Dir && old_time >= source_time {
+            if self.args.update && source.kind() != ObjectKind::Dir && old_time > source_time {
                 return Ok(CopyPreparation::Skipped);
             }
             matching_contents = source.kind() == old.kind()

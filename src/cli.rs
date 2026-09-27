@@ -49,7 +49,7 @@ pub enum SourceSelection {
     Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize,
 )]
 pub enum IfExists {
-    /// Accept matching contents; report an error for different contents.
+    /// Reject detected content differences; trusts matching size and mtime unless --hash is set.
     ErrorIfDifferent,
     /// Report an error for every existing destination leaf.
     Error,
@@ -58,7 +58,7 @@ pub enum IfExists {
     /// Update contents when they differ and apply requested metadata.
     #[default]
     Update,
-    /// Update only when the destination is strictly older; keep ties.
+    /// Keep newer destinations; otherwise update differing contents.
     UpdateIfOlder,
 }
 
@@ -2108,9 +2108,27 @@ fn parse_descriptor_copy(
 fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
-    let matches = crate::help::filesystem(NativeCopyCommand::command())
-        .try_get_matches_from(full_argv)
-        .unwrap_or_else(|error| error.exit());
+    let mut command = crate::help::filesystem(NativeCopyCommand::command());
+    let matches = command.try_get_matches_from_mut(full_argv).unwrap_or_else(|error| {
+        // Use the parser's classification, so a filename or an option value
+        // that happens to spell an old flag remains an ordinary operand.
+        if error.kind() == clap::error::ErrorKind::UnknownArgument {
+            if let Some(clap::error::ContextValue::String(argument)) =
+                error.get(clap::error::ContextKind::InvalidArg)
+            {
+                let message = match argument.as_str() {
+                    "--only-new" => Some("--only-new was removed; use --if-exists=keep"),
+                    "--skip-newer" => Some("--skip-newer was removed; use --if-exists=update-if-older"),
+                    "--preserve" => Some("--preserve was removed; use --copy-metadata to select metadata. The former --preserve=-mtime has no replacement: creating or updating file contents sets the source mtime"),
+                    _ => None,
+                };
+                if let Some(message) = message {
+                    command.error(error.kind(), message).exit();
+                }
+            }
+        }
+        error.exit()
+    });
     validate_native_copy_argument_order(&matches)?;
     let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
     let stream = selected_stream_source(&parsed.copy)?;

@@ -1832,11 +1832,7 @@ impl Planner<'_> {
         let dst_newer = opts.update
             && dst_entry.as_ref().is_some_and(|d| {
                 (d.kind == Kind::File || opts.if_exists.is_some())
-                    && if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder) {
-                        (d.mtime, d.mtime_nsec) >= (e.mtime, e.mtime_nsec)
-                    } else {
-                        (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
-                    }
+                    && (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
             });
         if dst_newer {
             self.progress.files_excluded.fetch_add(1, Relaxed);
@@ -2059,7 +2055,7 @@ impl Planner<'_> {
         if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder)
             && dst_entry
                 .as_ref()
-                .is_some_and(|d| (d.mtime, d.mtime_nsec) >= (e.mtime, e.mtime_nsec))
+                .is_some_and(|d| (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec))
         {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;
@@ -2174,7 +2170,7 @@ impl Planner<'_> {
         if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder)
             && dst_entry
                 .as_ref()
-                .is_some_and(|d| (d.mtime, d.mtime_nsec) >= (e.mtime, e.mtime_nsec))
+                .is_some_and(|d| (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec))
         {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;

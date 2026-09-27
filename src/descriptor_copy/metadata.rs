@@ -47,9 +47,9 @@ impl Policy {
     }
     pub fn newer(self, source: Option<Meta>, destination: Option<Meta>) -> bool {
         self.skip_newer
-            && source.zip(destination).is_some_and(|(src, dst)| {
-                (dst.mtime, dst.mtime_nsec) >= (src.mtime, src.mtime_nsec)
-            })
+            && source
+                .zip(destination)
+                .is_some_and(|(src, dst)| (dst.mtime, dst.mtime_nsec) > (src.mtime, src.mtime_nsec))
     }
     pub fn apply(self, file: &File, source: Option<Meta>) -> Result<()> {
         if let Some(meta) = source {

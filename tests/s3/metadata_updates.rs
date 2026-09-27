@@ -26,6 +26,29 @@ pub(super) fn serve(
                     }
                     .into(),
                 ),
+                (
+                    "x-amz-storage-class".into(),
+                    if source {
+                        "STANDARD"
+                    } else {
+                        "REDUCED_REDUNDANCY"
+                    }
+                    .into(),
+                ),
+                ("x-amz-server-side-encryption".into(), "aws:kms".into()),
+                (
+                    "x-amz-server-side-encryption-aws-kms-key-id".into(),
+                    if source {
+                        "source-key"
+                    } else {
+                        "destination-key"
+                    }
+                    .into(),
+                ),
+                (
+                    "x-amz-server-side-encryption-bucket-key-enabled".into(),
+                    "false".into(),
+                ),
                 ("Content-Type".into(), "application/example".into()),
                 ("Content-Encoding".into(), "identity".into()),
                 ("Content-Language".into(), "en".into()),
@@ -120,6 +143,13 @@ pub(super) fn serve(
 
 fn check_metadata(headers: &std::collections::HashMap<String, String>) {
     for (name, value) in [
+        ("x-amz-storage-class", "REDUCED_REDUNDANCY"),
+        ("x-amz-server-side-encryption", "aws:kms"),
+        (
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            "destination-key",
+        ),
+        ("x-amz-server-side-encryption-bucket-key-enabled", "false"),
         ("content-type", "application/example"),
         ("content-encoding", "identity"),
         ("content-language", "en"),

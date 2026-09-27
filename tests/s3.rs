@@ -656,6 +656,8 @@ fn serve(
                         "Content-Length".into(),
                         if fault == "server-copy-automatic" {
                             (32 * 1024 * 1024).to_string()
+                        } else if fault == "server-copy-compare-time-tie" && !source {
+                            "3".into()
                         } else if multipart {
                             (6 * 1024 * 1024).to_string()
                         } else {
@@ -719,6 +721,19 @@ fn serve(
                 }
                 if fault.ends_with("tags-denied") || fault.ends_with("-known-unsupported") {
                     fields.push(("x-amz-tagging-count".into(), "1".into()));
+                }
+                if fault == "server-copy-compare-time-tie" {
+                    for (name, value) in [
+                        ("format", "1"),
+                        ("kind", "file"),
+                        ("mode", "420"),
+                        ("uid", "0"),
+                        ("gid", "0"),
+                        ("mtime", "10"),
+                        ("mtime-nsec", "0"),
+                    ] {
+                        fields.push((format!("x-amz-meta-syq-{name}"), value.into()));
+                    }
                 }
                 if fault == "server-copy-compare-metadata" {
                     fields.push((
@@ -4160,6 +4175,31 @@ fn server_copy_compares_remote_checksums_etags_and_metadata_without_body_reads()
         assert!(output.status.success(), "{fault}: {}", output_text(&output));
         assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
     }
+}
+
+#[test]
+fn server_copy_update_if_older_copies_different_sizes_on_a_tie() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let server = Server::start("server-copy-compare-time-tie");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--if-exists=update-if-older",
+            "--from",
+            "s3://source",
+            "original",
+            "--to",
+            "s3://destination",
+            "--as",
+            "copied",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(
+        server.requests.load(Ordering::Relaxed),
+        3,
+        "two HEADs and one copy"
+    );
 }
 
 #[test]

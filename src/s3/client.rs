@@ -1278,6 +1278,23 @@ pub(super) fn metadata_update_request(
         ("cache-control", head.cache_control()),
         ("expires", head.expires_string()),
         (
+            "x-amz-storage-class",
+            head.storage_class().map(|v| v.as_str()),
+        ),
+        (
+            "x-amz-server-side-encryption",
+            head.server_side_encryption().map(|v| v.as_str()),
+        ),
+        (
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            head.ssekms_key_id(),
+        ),
+        (
+            "x-amz-server-side-encryption-bucket-key-enabled",
+            head.bucket_key_enabled()
+                .map(|v| if v { "true" } else { "false" }),
+        ),
+        (
             "x-amz-website-redirect-location",
             head.website_redirect_location(),
         ),
@@ -1315,6 +1332,50 @@ pub(super) async fn copy_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn metadata_update_keeps_reported_storage_and_encryption_settings() {
+        use aws_sdk_s3::{
+            operation::head_object::HeadObjectOutput,
+            types::{ServerSideEncryption, StorageClass},
+        };
+        for (encryption, bucket_key) in [
+            (None, None),
+            (Some(ServerSideEncryption::Aes256), None),
+            (Some(ServerSideEncryption::AwsKms), Some(false)),
+            (Some(ServerSideEncryption::AwsKms), Some(true)),
+        ] {
+            let head = HeadObjectOutput::builder()
+                .e_tag("destination")
+                .storage_class(StorageClass::IntelligentTiering)
+                .set_server_side_encryption(encryption.clone())
+                .set_bucket_key_enabled(bucket_key)
+                .build();
+            let request =
+                super::metadata_update_request("bucket", "key", &head, Default::default()).unwrap();
+            assert_eq!(
+                request.headers["x-amz-storage-class"],
+                "INTELLIGENT_TIERING"
+            );
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-amz-server-side-encryption")
+                    .map(String::as_str),
+                encryption.as_ref().map(|v| v.as_str())
+            );
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-amz-server-side-encryption-bucket-key-enabled")
+                    .map(String::as_str),
+                bucket_key.map(|v| if v { "true" } else { "false" })
+            );
+            assert!(!request
+                .headers
+                .contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
+        }
+    }
+
     #[test]
     fn exclusion_identifies_first_pruned_ancestor_and_preserves_negations() {
         use super::{exclusion, Exclusion};
