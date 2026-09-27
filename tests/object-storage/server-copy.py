@@ -81,7 +81,7 @@ def check():
             assert headers.get('x-amz-website-redirect-location') == source_headers.get('x-amz-website-redirect-location')
             _, tags = c.request('GET', name + '-copy', query={'tagging': ''})
             assert b'server-copy' in tags
-        # Metadata-only changes must propagate even with matching body ETags.
+        # Matching contents keep metadata that was not explicitly selected.
         name = c.PREFIX + '/metadata-change'
         args = ['--from', remote, name, '--to', remote, '--as', name + '-copy']
         c.request('PUT', name, b'same body', headers={'x-amz-meta-owner': 'before'})
@@ -89,7 +89,7 @@ def check():
         c.request('PUT', name, b'same body', headers={'x-amz-meta-owner': 'after'})
         c.run(args)
         headers, _ = c.request('HEAD', name + '-copy')
-        assert {k.lower(): v for k, v in headers.items()}['x-amz-meta-owner'] == 'after'
+        assert {k.lower(): v for k, v in headers.items()}['x-amz-meta-owner'] == 'before'
         # An existing destination prefix does not prohibit its exact object key.
         target = c.PREFIX + '/coexisting'
         c.request('PUT', target + '/child', b'keep')
@@ -131,7 +131,7 @@ def check():
         refused = c.run([source / 'link', '--to', remote, '--as-existing', empty],
                         ok=False, capture=True)
         assert 'prefix, not an object' in refused.stderr, refused.stderr
-        c.run([source / 'link', '--to', remote, '--as-existing', bare])
+        c.run([source / 'link', '--to', remote, '--as-existing', bare, '--if-exists=update'])
         assert c.request('GET', bare)[1] == b'small + %.txt'
         mirror = c.PREFIX + '/prune-file-descendants'
         stale = mirror + '/a/stale'

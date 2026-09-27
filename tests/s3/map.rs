@@ -435,23 +435,23 @@ fn s3_mapping_predicates_read_metadata_only_when_needed() {
 }
 
 #[test]
-fn s3_null_mtime_keeps_download_fallback_and_supports_opt_out() {
+fn s3_null_mtime_keeps_download_fallback_with_optional_explicit_metadata() {
     use std::os::unix::fs::MetadataExt;
     let temp = test_support::tempdir().unwrap();
     let server = MapServer::new("plain");
-    for (name, preserve) in [("default", "mtime"), ("disabled", "-mtime")] {
+    for (name, preserve) in [
+        ("default", "--no-progress"),
+        ("explicit", "--copy-metadata=mtime"),
+    ] {
         let destination = temp.path().join(name);
-        let output = server.command(temp.path(), &["cp", "--from", "s3://bucket", "-C", "prefix", "--src-non-dir", "nested/line\n%2F+", "--as", destination.to_str().unwrap(), "--where", "src.mtime is null and src.s3_last_modified = timestamp('2026-01-01T00:00:00Z')", &format!("--preserve={preserve}")]).capture_output().unwrap();
+        let output = server.command(temp.path(), &["cp", "--from", "s3://bucket", "-C", "prefix", "--src-non-dir", "nested/line\n%2F+", "--as", destination.to_str().unwrap(), "--where", "src.mtime is null and src.s3_last_modified = timestamp('2026-01-01T00:00:00Z')", preserve]).capture_output().unwrap();
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(std::fs::read(&destination).unwrap(), b"data");
-        assert_eq!(
-            std::fs::metadata(&destination).unwrap().mtime() == 1767225600,
-            name == "default"
-        );
+        assert_eq!(std::fs::metadata(&destination).unwrap().mtime(), 1767225600);
     }
     server.requests.lock().unwrap().clear();
     let destination = temp.path().join("default");

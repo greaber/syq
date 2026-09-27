@@ -41,6 +41,7 @@ fn filtered_pruning_removes_only_destination_only_children() {
         write(&t.path("dst/leaf/extra"), b"protected subtree");
         run_native_ok(&[
             "cp",
+            "--if-exists=update",
             "--srcs-in",
             &t.s("src"),
             "--into",
@@ -65,6 +66,7 @@ fn filtered_pruning_removes_only_destination_only_children() {
         assert_eq!(read(&t.path("dst/empty/extra")), b"remove");
         run_native_ok(&[
             "cp",
+            "--if-exists=update",
             "--srcs-in",
             &t.s("src"),
             "--into",
@@ -103,11 +105,12 @@ fn destination_conditions_apply_before_content_and_metadata_updates() {
     fs::set_permissions(t.path("dst/keep"), fs::Permissions::from_mode(0o644)).unwrap();
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--srcs-in",
         &t.s("src"),
         "--into",
         &t.s("dst"),
-        "--preserve=permissions",
+        "--copy-metadata=permissions",
         "--copy-if",
         "not dst.exists or (src.kind = 'file' and dst.kind = 'file' and src.size > dst.size)",
     ]);
@@ -168,6 +171,7 @@ fn dry_run_and_hash_comparison_respect_eligibility() {
     write(&t.path("dst/a"), b"old");
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--srcs-in",
         &t.s("src"),
         "--into",
@@ -179,6 +183,7 @@ fn dry_run_and_hash_comparison_respect_eligibility() {
     assert_eq!(read(&t.path("dst/a")), b"old");
     let out = native_syq(&[
         "cp",
+        "--if-exists=update",
         "--srcs-in",
         &t.s("src"),
         "--into",
@@ -193,6 +198,7 @@ fn dry_run_and_hash_comparison_respect_eligibility() {
     assert_eq!(read(&t.path("dst/a")), b"old");
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--srcs-in",
         &t.s("src"),
         "--into",
@@ -260,7 +266,7 @@ fn remote_push_and_pull_apply_expressions_over_ssh_and_tcp() {
             write(&t.path("src/nested/tiny"), b"x");
             write(&t.path("dst/nested/keep"), b"old");
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_syq"));
-            cmd.arg("cp");
+            cmd.args(["cp", "--if-exists=update"]);
             if pull {
                 cmd.args(["--from", "127.0.0.1"]);
             }
@@ -348,7 +354,7 @@ fn leaf_filters_keep_directory_metadata_and_empty_directories() {
             &t.s("src"),
             "--into",
             &t.s(&dst),
-            "--preserve=permissions",
+            "--copy-metadata=permissions",
             "--where",
             expression,
         ]);
@@ -379,7 +385,7 @@ fn where_filters_leaves_and_copy_if_controls_directory_metadata() {
             &t.s("src"),
             "--into",
             &t.s("dst"),
-            "--preserve=permissions",
+            "--copy-metadata=permissions",
             "--where",
             "src.extension = 'jpg'",
         ]);
@@ -401,7 +407,7 @@ fn where_filters_leaves_and_copy_if_controls_directory_metadata() {
         &t.s("src"),
         "--into",
         &t.s("dst"),
-        "--preserve=permissions",
+        "--copy-metadata=permissions",
         "--where",
         "src.extension = 'jpg'",
         "--copy-if",
@@ -417,7 +423,7 @@ fn where_filters_leaves_and_copy_if_controls_directory_metadata() {
         &t.s("src"),
         "--into",
         &t.s("dst"),
-        "--preserve=permissions",
+        "--copy-metadata=permissions",
         "--where",
         "false",
         "--copy-if",
@@ -450,7 +456,7 @@ fn merged_directories_keep_each_sources_expression_result() {
         &t.s("second"),
         "--into",
         &t.s("dst"),
-        "--preserve=permissions",
+        "--copy-metadata=permissions",
         "--copy-if",
         "src.kind = 'file' or src.mode = 0o750",
     ]);
@@ -502,7 +508,7 @@ fn unselected_containers_use_receiver_umask_and_inheritance() {
                         &t.s("dst"),
                         filter,
                         "src.kind = 'file'",
-                        "--preserve=permissions",
+                        "--copy-metadata=permissions",
                         "--no-progress",
                     ])
                     .env("FAKE_REMOTE_HOME", t.path("remote-home"))
@@ -554,7 +560,7 @@ fn unselected_readonly_containers_reopen_and_restore_their_modes() {
         "--copy-if",
         "src.kind != 'dir'",
         "--prune",
-        "--preserve=permissions",
+        "--copy-metadata=permissions",
     ]);
     let mode = fs::metadata(t.path("dst/nested")).unwrap().mode() & 0o7777;
     fs::set_permissions(t.path("dst/nested"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -589,7 +595,7 @@ fn destination_inspection_errors_are_not_missing_entries() {
             "src.kind = 'symlink'",
             "--copy-if",
             "dst.exists",
-            "--only-new",
+            "--if-exists=keep",
             "--no-progress",
         ]);
         if remote {
@@ -689,7 +695,7 @@ fn tiny_expression_pushes_use_fused_copy_and_preserve_excluded_files() {
                 "src.name != 'skip' and src.kind = 'file'",
                 "--copy-if",
                 "not dst.exists or src.size > dst.size",
-                "--preserve=permissions",
+                "--copy-metadata=permissions",
                 "--results",
                 &results,
                 "--rsh",
@@ -746,6 +752,7 @@ fn tiny_copy_if_sees_original_source_and_renamed_destination() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
+            "--if-exists=update",
             &t.s("original"),
             "--to",
             "host",
@@ -837,6 +844,7 @@ fn remote_copy_if_batches_directory_and_leaf_observations() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
+            "--if-exists=update",
             "--srcs-in",
             &t.s("src"),
             "--to",

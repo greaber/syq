@@ -104,7 +104,7 @@ class HashArgumentsTests(unittest.TestCase):
         self.client = syq.Client(executable=self.executable, env={**os.environ, "SYQ_FAKE_ARGV": str(self.log)})
 
     def test_unsupported_copy_controls_warn(self):
-        for options in ({"only_existing": True}, {"skip_newer": True},
+        for options in ({"only_existing": True},
                         {"integrity_checking": "compare=md5"}):
             with self.subTest(options=options), self.assertWarnsRegex(FutureWarning, "unsupported.*removed"):
                 self.client.cp("source", as_="destination", **options)
@@ -163,7 +163,7 @@ class CandidateHashingTests(unittest.TestCase):
             original = (root / "destination").stat()
             (root / "destination").write_bytes(b"bad")
             os.utime(root / "destination", ns=(original.st_atime_ns, original.st_mtime_ns))
-            result = client.cp(mapping=[syq.MappingEntry("source", "destination", expected_hash=expected)], cwd="src", into=".")
+            result = client.cp(mapping=[syq.MappingEntry("source", "destination", expected_hash=expected)], cwd="src", into=".", if_exists="update")
             self.assertIs(result.status, syq.OperationStatus.SUCCESS)
             self.assertEqual((root / "destination").read_bytes(), b"abc")
             events = []
@@ -200,7 +200,7 @@ class CandidateHashingTests(unittest.TestCase):
             os.utime(root / "destination", ns=(source.st_atime_ns, source.st_mtime_ns))
             client = syq.Client(executable=os.environ["SYQ_CANDIDATE_EXECUTABLE"], process_cwd=root)
             events = []
-            result = client.cp("source", as_="destination", dry_run=True, hash=True,
+            result = client.cp("source", as_="destination", if_exists="update", dry_run=True, hash=True,
                                on_event=events.append)
             self.assertEqual(result.files_unchanged, 1)
             self.assertEqual(result.files_transferred, 0)
@@ -208,7 +208,7 @@ class CandidateHashingTests(unittest.TestCase):
             (root / "destination").write_bytes(b"bad")
             os.utime(root / "destination", ns=(source.st_atime_ns, source.st_mtime_ns))
             events.clear()
-            result = client.cp("source", as_="destination", dry_run=True, hash=True,
+            result = client.cp("source", as_="destination", if_exists="update", dry_run=True, hash=True,
                                on_event=events.append)
             self.assertIs(result.status, syq.OperationStatus.SUCCESS)
             self.assertEqual(result.files_transferred, 1)

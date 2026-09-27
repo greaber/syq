@@ -516,7 +516,7 @@ fn native_copy_policies_lower_to_the_shared_engine() {
         "*.tmp",
         "--ignore",
         "!keep.tmp",
-        "--preserve=permissions,ownership,specials",
+        "--copy-metadata=permissions,ownership,specials",
         "--inplace",
         "source",
         "--into",
@@ -914,7 +914,7 @@ fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
     acls.normalize();
     assert!(acls.acls && acls.perms);
     let native = parse_native_copy(&argv(&[
-        "--preserve=hardlinks,acls,xattrs,atimes,crtimes",
+        "--copy-metadata=hardlinks,acls,xattrs,atimes,crtimes",
         "--open-noatime",
         "--sparse",
         "source",
@@ -933,10 +933,10 @@ fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
             && native.sparse
     );
     for option in [
-        "--preserve=acls",
-        "--preserve=xattrs",
-        "--preserve=atimes",
-        "--preserve=crtimes",
+        "--copy-metadata=acls",
+        "--copy-metadata=xattrs",
+        "--copy-metadata=atimes",
+        "--copy-metadata=crtimes",
         "--open-noatime",
         "--sparse",
     ] {
@@ -957,26 +957,28 @@ fn inode_preservation_is_explicit_and_rejects_nonfilesystem_routes() {
 }
 
 #[test]
-fn native_mtime_preservation_is_default_and_last_explicit_setting_wins() {
-    for (options, expected, explicit) in [
-        (vec![], true, false),
-        (vec!["--preserve=mtime"], true, true),
-        (vec!["--preserve=times"], true, true), // released spelling
-        (vec!["--preserve=permissions,-mtime"], false, false),
-        (vec!["--preserve=mtime,-mtime"], false, false),
-        (vec!["--preserve=-mtime", "--preserve=mtime"], true, true),
-        (vec!["--preserve=times", "--preserve=-mtime"], false, false),
+fn native_mtime_matching_is_explicit_and_has_no_opt_out() {
+    for (options, explicit) in [
+        (vec![], false),
+        (vec!["--copy-metadata=mtime"], true),
+        (vec!["--copy-metadata=times"], true),
     ] {
         let mut command = options.clone();
         command.extend(["source", "--as", "destination"]);
         let args = parse_native_copy(&argv(&command)).unwrap();
-        assert_eq!(args.times, expected, "{options:?}");
-        assert_eq!(args.stream_preserve_times, explicit, "{options:?}");
+        assert!(args.times);
+        assert_eq!(args.copy_mtime_metadata, explicit);
+        assert_eq!(args.stream_preserve_times, explicit);
+        assert_eq!(
+            args.matching_meta_flags() & crate::proto::flags::TIMES != 0,
+            explicit
+        );
     }
     for option in [
-        "--preserve=-permissions",
-        "--preserve=-times",
-        "--preserve=-ownership",
+        "--copy-metadata=-mtime",
+        "--preserve=mtime",
+        "--only-new",
+        "--skip-newer",
     ] {
         assert!(NativeCopyCommand::try_parse_from([
             "syq cp",

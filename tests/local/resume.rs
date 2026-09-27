@@ -161,6 +161,7 @@ fn hash_policy_inplace_mismatch_reports_changed_contents() {
     let inode = fs::metadata(t.path("destination")).unwrap().ino();
     let output = native_syq(&[
         "cp",
+        "--if-exists=update",
         "--inplace",
         "--mapping",
         &super::hashing::expected_mapping(
@@ -250,6 +251,7 @@ fn copy_paths_inplace_preserve_hardlinks() {
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
+                "--if-exists=update",
                 &t.s("source"),
                 "--as",
                 &t.s("destination"),
@@ -1232,6 +1234,7 @@ fn native_inplace_exdev_fallback_preserves_hardlink_aliases() {
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
+            "--if-exists=update",
             "--inplace",
             "--src",
             &t.s("src"),
@@ -1835,6 +1838,7 @@ fn concurrent_small_pushes_publish_independent_files() {
             command
                 .args([
                     "cp",
+                    "--if-exists=update",
                     "--syq-path",
                     env!("CARGO_BIN_EXE_syq"),
                     "--no-progress",
@@ -1941,6 +1945,7 @@ fn concurrent_default_tree_copies_keep_every_file_whole() {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
+                "--if-exists=update",
                 "--no-progress",
                 "--srcs-in",
                 &t.s(source),

@@ -20,6 +20,7 @@ struct Follower {
     dst: PathBytes,
     rel: PathBytes,
     destination: Option<(u64, u64)>,
+    compare_before_link: bool,
 }
 
 struct ReadyGroup {
@@ -84,7 +85,12 @@ impl Planner<'_> {
                 self.collision = true;
                 return;
             }
+            let compare_before_link = self.opts.protects_existing_contents()
+                && destination.as_ref().is_some_and(|d| {
+                    self.opts.checksum || !self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d)
+                });
             group.followers.push(Follower {
+                compare_before_link,
                 src: leaf.src,
                 source: leaf.source,
                 dst: leaf.dst,
@@ -103,7 +109,7 @@ impl Planner<'_> {
                 followers: Vec::new(),
             });
         } else if self.opts.dry_run
-            && (!self.opts.checksum
+            && (!(self.opts.checksum || self.opts.protects_existing_contents())
                 || destination
                     .as_ref()
                     .is_none_or(|d| d.kind != Kind::File || d.size != leaf.e.size))
@@ -234,6 +240,9 @@ impl Planner<'_> {
             if let Some(preview) = &group.preview {
                 let (representative, published) = &**preview;
                 for follower in &group.followers {
+                    if !self.check_hardlink_contents(source, follower)? {
+                        continue;
+                    }
                     self.preview_hardlink(
                         follower,
                         &representative.dst,
@@ -296,6 +305,44 @@ impl Planner<'_> {
         Ok(())
     }
 
+    fn check_hardlink_contents(
+        &mut self,
+        source: &mut dyn Conn,
+        follower: &Follower,
+    ) -> Result<bool> {
+        if !follower.compare_before_link {
+            return Ok(true);
+        }
+        let source_hash = ok(
+            source.call(Request::FileHash {
+                path: follower.src.clone(),
+                source: Some(follower.source.clone()),
+                guard: None,
+            })?,
+            "hash hardlink source",
+        )?;
+        let destination_hash = ok(
+            self.dst.call(Request::FileHash {
+                path: follower.dst.clone(),
+                source: None,
+                guard: self.container_guard.clone(),
+            })?,
+            "hash hardlink destination",
+        )?;
+        let same = matches!((source_hash, destination_hash),
+            (Response::FileHash { size: left_size, hash: left }, Response::FileHash { size: right_size, hash: right })
+            if left_size == right_size && left == right);
+        if !same {
+            self.hardlink_failure(
+                follower,
+                self.opts
+                    .file_difference_message(&display(&follower.rel))
+                    .into(),
+            );
+        }
+        Ok(same)
+    }
+
     fn complete_link_batch(
         &mut self,
         source: &mut dyn Conn,
@@ -317,6 +364,9 @@ impl Planner<'_> {
         let mut operations = Vec::new();
         let mut pending = Vec::new();
         for (index, &(group, follower)) in links.iter().enumerate() {
+            if !self.check_hardlink_contents(source, follower)? {
+                continue;
+            }
             if self.opts.dry_run {
                 self.preview_hardlink(follower, &group.job.dst, group.published);
                 continue;
@@ -470,7 +520,8 @@ impl Worker {
                 path: job.dst.clone(),
                 copy_id: self.copy_id(),
                 meta,
-                flags: self.publication_flags(job),
+                flags: (self.publication_flags(job) & !flags::TIMES)
+                    | (self.opts.matching_flags_for(&job.rel_bytes) & flags::TIMES),
                 condition: job.target_condition,
                 guard: job.container_guard.clone(),
             })?,

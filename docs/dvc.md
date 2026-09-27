@@ -64,7 +64,7 @@ def object_path(md5):
 
 # Remote to cache: the same path on both sides.
 downloads = [MappingEntry(src=object_path(md5), dst=object_path(md5)) for md5 in missing_from_cache]
-client.cp(mapping=downloads, from_="s3://my-bucket", into=".dvc/cache", only_new=True)
+client.cp(mapping=downloads, from_="s3://my-bucket", into=".dvc/cache", if_exists="keep")
 
 # Cache to workspace: each object gets the name recorded in its .dvc file.
 checkout = [MappingEntry(src=object_path(md5), dst=path) for path, md5 in tracked_files]
@@ -73,7 +73,7 @@ client.cp(mapping=checkout, cwd=".dvc/cache", into=".")
 
 Each list is a [mapping](mappings.md): pairs of source and destination paths
 that syq copies in one run. A push is the first copy in reverse, and
-`only_new` makes it skip objects the remote already has. With `--verify`,
+`if_exists="keep"` makes it skip objects the remote already has. With `--verify`,
 download mappings carry the expected MD5 so syq can check the completed file
 before adding it to the cache. Older DVC text objects can use a newline-normalized
 MD5; the script checks those after download and removes mismatches. Files already

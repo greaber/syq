@@ -7,6 +7,12 @@ impl Engine {
             return Ok(());
         };
         for request in &mut requests {
+            // Use the same canonical fields as the executing HTTP transport.
+            // Content headers still travel with metadata updates, but are not
+            // part of this authorization lookup key.
+            request
+                .headers
+                .retain(|name, _| crate::s3::authorization::signed_header(name, &request.method));
             for super::super::Header(name, value) in &self.options.headers {
                 if crate::s3::authorization::signed_header(name, &request.method) {
                     request.headers.insert(name.clone(), value.clone());
@@ -25,6 +31,9 @@ impl Engine {
     pub(super) async fn authorize_upload(&self, prepared: &PreparedUpload) -> Result<()> {
         if self.authorization.is_none() {
             return Ok(());
+        }
+        if let Some(update) = &prepared.metadata_update {
+            return self.authorize_requests(update.requests()).await;
         }
         let key = &prepared.source.key;
         let mut requests = vec![Unsigned::new("HEAD", key)];

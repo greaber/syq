@@ -204,7 +204,7 @@ impl Request {
                         .any(|scope| prefix == &scope.key || scope.contains_prefix(prefix))
                 })
         } else if query.contains_key("tagging") {
-            source
+            (source || (destination && self.upload && !self.create_only))
                 && request.method == "GET"
                 && query
                     .keys()
@@ -257,11 +257,8 @@ impl Request {
             !request
                 .headers
                 .keys()
-                .any(
-                    |h| (h.starts_with("x-amz-copy-source") && self.source.is_none())
-                        || ((h.starts_with("x-amz-grant-") || h == "x-amz-acl")
-                            && self.acl.get(h) != request.headers.get(h))
-                ),
+                .any(|h| (h.starts_with("x-amz-grant-") || h == "x-amz-acl")
+                    && self.acl.get(h) != request.headers.get(h)),
             "storage ACL or copy headers are outside the approved permissions"
         );
         if let Some(encoded) = request.headers.get("x-amz-copy-source") {
@@ -272,10 +269,12 @@ impl Request {
                 .split_once('/')
                 .context("invalid storage copy source")?;
             anyhow::ensure!(
-                self.source
-                    .as_ref()
-                    .is_some_and(|source| source.bucket == bucket
-                        && source.scopes.iter().any(|scope| scope.contains(key))),
+                (bucket == self.bucket && key == request.key && !self.create_only)
+                    || self
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.bucket == bucket
+                            && source.scopes.iter().any(|scope| scope.contains(key))),
                 "storage copy source is outside the approved paths"
             );
             anyhow::ensure!(

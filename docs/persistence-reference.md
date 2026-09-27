@@ -139,7 +139,7 @@ falling back to SSH when TCP is unreachable. `--no-tcp` forces SSH;
 The receiving connection must stay open throughout the copy.
 
 Copies support directories, symlinks, modification times, filters, hashing,
-resume, mappings, `--preserve=permissions`, and the
+resume, mappings, `--copy-metadata=permissions`, and the
 [overwrite policies](reference.md#choose-which-existing-files-to-update).
 Ownership preservation, special-file preservation, and `--inplace` are
 unsupported. Timestamp comparisons trust the source's reported modification

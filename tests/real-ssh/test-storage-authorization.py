@@ -201,6 +201,25 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             headers, body = checks.request('GET', prefix+'/small-copy')
             assert body == b'small copy'
             assert {k.lower(): v for k, v in headers.items()}['x-amz-meta-example'] == 'kept'
+            print('case: approved metadata-only updates keep contents and unrelated headers', flush=True)
+            metadata_source = remote_root+'/metadata-source'
+            for payload in [b'small copy', b'x'*(5*1024*1024+1)]:
+                run('ssh', 'source', shlex.join(['python3', '-c',
+                    "from pathlib import Path; import os; p=Path(%r); p.write_bytes(b'small copy' if %d==10 else b'x'*%d); os.utime(p,(123,123))" % (metadata_source, len(payload), len(payload))]))
+                for descriptor in [False, True]:
+                    key = prefix+('/metadata-stream' if descriptor else '/metadata-file')+('-multipart' if len(payload)>5*1024*1024 else '')
+                    checks.request('PUT', key, payload, headers={
+                        'x-amz-meta-example': 'kept', 'content-type': 'text/plain'})
+                    source_args = ['--src-fd', '0'] if descriptor else [metadata_source]
+                    copy([*source_args, '--to', 's3://syq-storage-test', '--as', key,
+                          '--copy-metadata=mtime', '--if-exists=error-if-different'], disconnect=False,
+                         redirection=(' < '+metadata_source) if descriptor else '')
+                    headers, body = checks.request('GET', key)
+                    headers = {k.lower(): v for k, v in headers.items()}
+                    assert body == payload
+                    assert headers['x-amz-meta-example'] == 'kept', headers
+                    assert headers['content-type'] == 'text/plain', headers
+                    assert headers['x-amz-meta-syq-mtime'] == '123', headers
             print('case: mixed paths and callbacks share one offline approval', flush=True)
             copy(['--to', 's3://syq-storage-test', '--into', prefix+'/mixed'], mapping='upload')
             for name in ['ordinary', 'known', 'unknown']:

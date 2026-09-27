@@ -178,9 +178,9 @@ def check():
         os.utime(src / 'script', ns=(1_600_000_001_123456789, 1_600_000_001_123456789))
         remote = 's3://' + BUCKET
         placement = PREFIX + '/roundtrip'
-        run([src, '--to', remote, '--into', placement, '--preserve=permissions'])
+        run([src, '--to', remote, '--into', placement, '--copy-metadata=permissions'])
         dst = root / 'download'
-        run(['--from', remote, placement + '/source', '--into', dst, '--preserve=permissions'])
+        run(['--from', remote, placement + '/source', '--into', dst, '--copy-metadata=permissions'])
         restored = dst / 'source'
         for path in src.iterdir():
             actual = restored / path.name
@@ -196,7 +196,7 @@ def check():
         assert_comparison(root / 'matching.ndjson', changed=0, unchanged=4)
         owned = root / 'owned'
         owned.mkdir()
-        run(['--from', remote, placement + '/source', '--as', owned, '--preserve=ownership'])
+        run(['--from', remote, placement + '/source', '--as', owned, '--copy-metadata=ownership'])
         assert owned.stat().st_uid == src.stat().st_uid
         assert owned.stat().st_gid == src.stat().st_gid
 
@@ -206,11 +206,11 @@ def check():
         assert {k.lower(): v for k, v in hdr.items()}['x-amz-meta-syq-format'] == '1'
         # Existing outputs remain intact on a dry run and no recovery data is created.
         (restored / 'script').write_bytes(b'local edits')
-        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--dry-run'])
+        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--if-exists=update', '--dry-run'])
         assert (restored / 'script').read_bytes() == b'local edits'
-        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--only-new'])
+        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--if-exists=keep'])
         assert (restored / 'script').read_bytes() == b'local edits'
-        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--dry-run', '--hash', '--results', root / 'different.ndjson'])
+        run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--if-exists=update', '--dry-run', '--hash', '--results', root / 'different.ndjson'])
         changes = assert_comparison(root / 'different.ndjson', changed=1, unchanged=0)
         assert changes[0]['dst']['value'] == 'script', changes
         assert (restored / 'script').read_bytes() == b'local edits'
@@ -253,7 +253,7 @@ def check():
         (root / 'expected').write_bytes(b'keep on mismatch')
         entry['expected_hash']['value'] = '0' * 32
         mapping.write_text(json.dumps(entry) + '\n')
-        run(['--from', remote, '--mapping', mapping, '--into', root], ok=False)
+        run(['--from', remote, '--mapping', mapping, '--into', root, '--if-exists=update'], ok=False)
         assert (root / 'expected').read_bytes() == b'keep on mismatch'
         # Directory entries in a mapping are explicit, not recursive selectors.
         manifest = root / 'tree-map.jsonl'

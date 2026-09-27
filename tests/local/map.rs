@@ -561,7 +561,7 @@ fn native_map_exposes_source_and_manifest_options() {
         "bandwidth=--stats",
         "--ignore",
         "--ignore-from",
-        "--preserve",
+        "--copy-metadata",
         "--inplace",
         "--receiver-max-entries",
         "--receiver-max-bytes",
@@ -1390,7 +1390,7 @@ fn native_cp_mapping_restores_only_reopened_implicit_parents() {
             let before = fs::metadata(t.path("dst/parent")).unwrap();
             let mut args = vec!["--mapping", "-", "-C", "src", "--into", "dst", "-q"];
             if preserve {
-                args.push("--preserve=permissions");
+                args.push("--copy-metadata=permissions");
             }
             let out = syq_cp_in(
                 &t.path(""),
@@ -1531,8 +1531,8 @@ fn native_cp_mapping_cross_chunk_directory_upgrade_emits_one_trace() {
             "-",
             "--into",
             "dst",
-            "--only-new",
-            "--preserve=permissions",
+            "--if-exists=keep",
+            "--copy-metadata=permissions",
             "-q",
         ],
         Some(manifest.as_bytes()),
@@ -1615,7 +1615,16 @@ fn native_mapping_destination_metadata_keeps_source_identity_and_repairs_attribu
         entry.to_string()
     })
     .join("\n");
-    let args = ["--mapping", "-", "-C", "src", "--into", "dst", "-q"];
+    let args = [
+        "--if-exists=update",
+        "--mapping",
+        "-",
+        "-C",
+        "src",
+        "--into",
+        "dst",
+        "-q",
+    ];
     assert_output_ok(&syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes())));
     for name in ["dir/small", "large", "dir", "link"] {
         let actual = fs::symlink_metadata(t.path(&format!("dst/{name}"))).unwrap();
@@ -1957,7 +1966,7 @@ fn native_cp_mapping_implicit_parents_keep_default_group_permissions() {
         &t.s("mapping"),
         "--into",
         &t.s("dst"),
-        "--preserve=permissions",
+        "--copy-metadata=permissions",
     ]);
     unsafe {
         command.pre_exec(|| {

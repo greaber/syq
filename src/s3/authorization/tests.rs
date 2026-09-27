@@ -408,3 +408,37 @@ fn signer_rejects_caller_supplied_host() {
         Some("storage.example")
     );
 }
+
+#[test]
+fn uploads_can_update_their_own_metadata_but_cannot_copy_other_destination_keys() {
+    let mut permission = approval();
+    permission.create_only = false;
+    let copy = Unsigned::new("PUT", "allowed/a").header("x-amz-copy-source", "fixture/allowed/a");
+    permission.permits(&copy).unwrap();
+    permission
+        .permits(
+            &copy
+                .clone()
+                .query("uploadId", "id")
+                .query("partNumber", "1"),
+        )
+        .unwrap();
+    permission
+        .permits(&Unsigned::new("GET", "allowed/a").query("tagging", ""))
+        .unwrap();
+    for source in ["fixture/allowed/b", "fixture/outside", "another/allowed/a"] {
+        assert!(permission
+            .permits(&copy.clone().header("x-amz-copy-source", source))
+            .is_err());
+    }
+    assert!(permission
+        .permits(&Unsigned::new("GET", "outside").query("tagging", ""))
+        .is_err());
+    permission.create_only = true;
+    assert!(permission
+        .permits(&copy.header("if-none-match", "*"))
+        .is_err());
+    assert!(permission
+        .permits(&Unsigned::new("GET", "allowed/a").query("tagging", ""))
+        .is_err());
+}

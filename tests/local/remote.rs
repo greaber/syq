@@ -322,7 +322,7 @@ fn native_remote_destination_socket_policy_uses_handshake_capability() {
                 "--no-tcp",
                 "--performance-tuning",
                 "workers=1",
-                "--preserve=specials",
+                "--copy-metadata=specials",
             ])
             .args(["--srcs-in", &t.s("src"), "--to", "fake", "--into"])
             .arg(t.path(destination))
@@ -1101,7 +1101,7 @@ fn auto_streaming_preserves_shortcuts_and_streams_remote_large_files() {
                 "--no-progress",
                 "--no-tcp",
                 "--stats",
-                "--preserve=permissions",
+                "--copy-metadata=permissions",
                 "-v",
                 "--performance-tuning",
                 &format!("copy-path={mode},request-size=1M"),
@@ -1236,7 +1236,7 @@ fn streaming_copies_local_trees_and_remote_ranges() {
                 "--performance-tuning",
                 &format!("workers={workers}"),
                 "--no-progress",
-                "--preserve=permissions",
+                "--copy-metadata=permissions",
                 "-v",
                 "--tcp-ports",
                 EPHEMERAL_TCP_PORTS,
@@ -1722,7 +1722,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     let original_inode = fs::metadata(t.path("dst/keep")).unwrap().ino();
 
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["cp", "--rsh"])
+        .args(["cp", "--if-exists=update", "--rsh"])
         .arg(&rsh)
         .args([
             "--tcp-ports",
@@ -1738,7 +1738,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "--to",
             "fake",
             "--ignore=*.tmp",
-            "--preserve=permissions",
+            "--copy-metadata=permissions",
             "--inplace",
             "--prune",
             "--max-delete=1",
@@ -1771,7 +1771,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
         "--follow-dst",
         "--root",
         "--ignore=*.tmp",
-        "--preserve=permissions",
+        "--copy-metadata=permissions",
         "--inplace",
         "--prune",
         "--max-delete=1",
@@ -2103,7 +2103,11 @@ fn native_remote_to_remote_carries_any_path_bytes_directly() {
 
 #[test]
 fn native_direct_remote_forwards_overwrite_policies() {
-    for policy in ["--only-new", "--only-existing", "--skip-newer"] {
+    for policy in [
+        "--if-exists=keep",
+        "--only-existing",
+        "--if-exists=update-if-older",
+    ] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
         let helper = cached_remote_helper(&t);
@@ -2129,6 +2133,11 @@ fn native_direct_remote_forwards_overwrite_policies() {
                 "--into",
                 &t.s("dst"),
                 policy,
+                if policy == "--only-existing" {
+                    "--if-exists=update"
+                } else {
+                    "--no-progress"
+                },
                 "-q",
             ])
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
@@ -2147,7 +2156,7 @@ fn native_direct_remote_forwards_overwrite_policies() {
         );
         assert_eq!(
             t.path("dst/new").exists(),
-            matches!(policy, "--only-new" | "--skip-newer")
+            matches!(policy, "--if-exists=keep" | "--if-exists=update-if-older")
         );
         assert!(fs::read_to_string(t.path("rsh.log"))
             .unwrap()

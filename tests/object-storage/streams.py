@@ -43,7 +43,15 @@ def main():
             actual = stream(['--from', bucket, key,
                              '--resource-limits', 's3-requests=1'])
             assert actual == data, name
-            print('Stream round trip:', name, flush=True)
+            # Explicit protection must accept identical bytes and reject
+            # different input, including multipart input. Default copies update.
+            stream(['--to', bucket, '--as', key, '--if-exists=error-if-different'], input=data)
+            replacement = b'x' * max(1, len(data))
+            stream(['--to', bucket, '--as', key, '--if-exists=error-if-different'], input=replacement, success=False)
+            assert check.request('GET', key)[1] == data
+            stream(['--to', bucket, '--as', key], input=replacement)
+            assert check.request('GET', key)[1] == replacement
+            print('Stream round trip and existing-file policies:', name, flush=True)
         # Placement constraints retain the raw-object upload contract.
         for name, data in [('empty', b''), ('small', b'new'), ('multipart', b'x' * (6 << 20))]:
             key = check.PREFIX + '/placement-' + name
@@ -51,7 +59,7 @@ def main():
             stream(['--to', bucket, '--as-new', key], input=data)
             stream(['--to', bucket, '--as-new', key], input=b'no', success=False)
             assert check.request('GET', key)[1] == data
-            stream(['--to', bucket, '--as-existing', key], input=b'updated')
+            stream(['--to', bucket, '--as-existing', key, '--if-exists=update'], input=b'updated')
             assert stream(['--from', bucket, '--root', check.PREFIX, 'placement-' + name]) == b'updated'
             assert stream(['--from', bucket, '--cwd', check.PREFIX, 'placement-' + name]) == b'updated'
         stream(['--from', bucket, '--root', check.PREFIX, '../outside'], success=False)

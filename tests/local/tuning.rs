@@ -309,7 +309,7 @@ fn tuning_options_force_ranges_for_small_and_whole_local_files() {
             "workers=2",
             "-v",
             "--no-progress",
-            "--preserve=permissions",
+            "--copy-metadata=permissions",
         ])
         .run()
         .unwrap();
@@ -524,7 +524,7 @@ fn tuning_options_batch_limits_include_the_first_file() {
                 "workers=1",
                 "-v",
                 "--no-progress",
-                "--preserve=permissions",
+                "--copy-metadata=permissions",
             ])
             .run()
             .unwrap();
@@ -833,6 +833,7 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
             .current_dir(t.path("remote-home"))
             .args([
                 "cp",
+                "--if-exists=update",
                 "--syq-path",
                 env!("CARGO_BIN_EXE_syq"),
                 "--no-progress",
@@ -1016,7 +1017,7 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
         &[
             "--as",
             &t.s("dest-fast/renamed.txt"),
-            "--preserve=permissions",
+            "--copy-metadata=permissions",
         ],
     );
     let (engine, engine_records) = push(
@@ -1026,7 +1027,7 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
         &[
             "--as",
             &t.s("dest-engine/renamed.txt"),
-            "--preserve=permissions",
+            "--copy-metadata=permissions",
         ],
     );
     assert_output_ok(&fast);

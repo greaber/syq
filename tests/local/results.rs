@@ -638,7 +638,7 @@ fn fresh_shared_directory_is_reported_created_only_once() {
                 "-q",
             ];
             if only_new {
-                args.push("--only-new");
+                args.push("--if-exists=keep");
             }
             let output = syq_cp_in(&t.path(""), &args, None);
             assert_output_ok(&output);

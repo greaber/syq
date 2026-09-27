@@ -86,8 +86,8 @@ even without `--inplace`.
 
 **Permissions supplied by the source.** Path protection does not decide
 whether copied permissions are appropriate. For example,
-`--preserve=permissions` can make a copied file writable by everyone or
-preserve its set-user-ID bit; `--preserve=ownership` can give it to the account
+`--copy-metadata=permissions` can make a copied file writable by everyone or
+preserve its set-user-ID bit; `--copy-metadata=ownership` can give it to the account
 identified by the source's user ID. When running as root, those choices can
 grant other users access or privileges. Enable these options only when you
 trust the source's ownership and permission settings.
@@ -129,6 +129,13 @@ SSH or syq's direct TCP connections.
 `--tcp-plain` disables this protection for TCP: someone on the network can
 read or alter the traffic, including its authentication token. Use it only
 on a network you trust.
+
+Storage upload approvals include reading object contents and metadata within
+the approved destination paths, for comparisons with existing files. When
+updates are allowed, they also permit reading destination tags and copying an
+object onto itself to update metadata. They do not authorize copying a different
+destination object as the source; bucket-to-bucket copies require a separate
+approved source scope. Upload approval is not a write-only grant.
 
 ## Downloaded executables
 

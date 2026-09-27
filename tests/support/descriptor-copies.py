@@ -20,14 +20,14 @@ CHILDREN = []
 
 
 def run(args, **kwargs):
-    result = subprocess.run([SYQ, 'cp', *args], stdout=subprocess.PIPE,
+    result = subprocess.run([SYQ, 'cp', '--if-exists=update', *args], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, timeout=30, env=ENV, **kwargs)
     assert result.returncode == 0, result.stderr.decode(errors='replace')
     return result.stdout
 
 
 def fail(args, **kwargs):
-    result = subprocess.run([SYQ, 'cp', *args], stdout=subprocess.PIPE,
+    result = subprocess.run([SYQ, 'cp', '--if-exists=update', *args], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, timeout=15, env=ENV, **kwargs)
     assert result.returncode != 0, args
     return result
@@ -99,17 +99,18 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                 assert file.tell() == len(DATA) + 6
                 assert fcntl.fcntl(file, fcntl.F_GETFL) == before
             assert output_path.read_bytes() == b'prefix' + DATA + b'x' * 8
-            # Explicit mtime opt-out also controls a named descriptor destination.
+            # Named descriptor destinations use source mtime on creation;
+            # selecting mtime explicitly has the same effect on fresh files.
             small = directory / 'timestamp-source'
             small.write_bytes(b'timestamps')
             os.utime(small, (123, 123))
-            for preserve in ('mtime', '-mtime'):
-                dated = directory / ('timestamp-' + preserve)
+            for explicit in (False, True):
+                dated = directory / ('timestamp-' + str(explicit))
                 with small.open('rb') as file:
                     run([*options, '--src-fd', str(file.fileno()), *destination,
-                         '--as', str(dated), '--preserve=' + preserve], pass_fds=(file.fileno(),))
+                         '--as', str(dated), *(['--copy-metadata=mtime'] if explicit else [])], pass_fds=(file.fileno(),))
                 assert dated.read_bytes() == b'timestamps'
-                assert (dated.stat().st_mtime_ns == 123_000_000_000) == (preserve == 'mtime')
+                assert dated.stat().st_mtime_ns == 123_000_000_000
             # Cancellation while awaiting input keeps the old destination and
             # removes staging, without changing a shared socket's flags.
             for nonblocking in (False, True):
@@ -117,7 +118,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                 with a, b:
                     a.setblocking(not nonblocking)
                     before = fcntl.fcntl(a, fcntl.F_GETFL)
-                    command = [SYQ, 'cp', *options, '--src-fd', str(a.fileno()), *destination, '--as', str(target)]
+                    command = [SYQ, 'cp', '--if-exists=update', *options, '--src-fd', str(a.fileno()), *destination, '--as', str(target)]
                     child = subprocess.Popen(command, pass_fds=(a.fileno(),), stdout=subprocess.PIPE,
                                              stderr=subprocess.PIPE, env=ENV, start_new_session=True)
                     CHILDREN.append(child)
@@ -131,7 +132,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                     wait_for(lambda: not list(target.parent.glob('.syq-stream-*')),
                              f'staging cleanup (remote={ssh}, nonblocking={nonblocking})')
             # Broken consumers fail. Remote path sources remain regular files.
-            child = subprocess.Popen([SYQ, 'cp', *options, *source, str(target), '--as-fd', '1'],
+            child = subprocess.Popen([SYQ, 'cp', '--if-exists=update', *options, *source, str(target), '--as-fd', '1'],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV, start_new_session=True)
             CHILDREN.append(child)
             child.stdout.close()
@@ -162,7 +163,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
             # A shell descriptor path is consumed locally before starting the
             # SSH helper; its generated number never becomes a destination name.
             command = ['bash', '-c',
-                'exec "$1" cp --src <(printf "process substitution") "${@:2}"',
+                'exec "$1" cp --if-exists=update --src <(printf "process substitution") "${@:2}"',
                 'descriptor-test', SYQ, *options, *destination, '--as', str(target)]
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     env=ENV, timeout=15)
@@ -188,7 +189,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                 assert not mixed.exists()
 
             # A reader waiting for the first FIFO writer can be cancelled.
-            child = subprocess.Popen([SYQ, 'cp', '--src', str(fifo), *destination,
+            child = subprocess.Popen([SYQ, 'cp', '--if-exists=update', '--src', str(fifo), *destination,
                                      *options, '--as', str(target)], stderr=subprocess.PIPE,
                                      env=ENV, start_new_session=True)
             CHILDREN.append(child)
@@ -199,7 +200,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
             assert target.read_bytes() == b'process substitution'
             # Explicit node preservation and recursive scans don't consume FIFOs.
             node = directory / 'node'
-            run(['--src-non-dir', str(fifo), '--as', str(node), '--preserve=specials'])
+            run(['--src-non-dir', str(fifo), '--as', str(node), '--copy-metadata=specials'])
             assert stat.S_ISFIFO(node.stat().st_mode)
             tree = directory / 'tree'
             tree.mkdir()
@@ -214,7 +215,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
         inherited_target.write_bytes(b'old')
         for options, diagnostic in (('--performance-tuning batch-files=1', b'batch-files'),):
             result = subprocess.run(
-                [SYQ, 'cp', '--src-fd', '0', '--as', str(inherited_target)],
+                [SYQ, 'cp', '--if-exists=update', '--src-fd', '0', '--as', str(inherited_target)],
                 input=b'new', stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=15, env={**ENV, 'SYQ_CP_OPTIONS': options})
             assert result.returncode == 2, result.stderr
@@ -225,14 +226,14 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
             assert explicit.stderr == result.stderr, (explicit.stderr, result.stderr)
             assert inherited_target.read_bytes() == b'old'
         result = subprocess.run(
-            [SYQ, 'cp', '--src-fd', '0', '--as', str(inherited_target)],
+            [SYQ, 'cp', '--if-exists=update', '--src-fd', '0', '--as', str(inherited_target)],
             input=b'new', stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=15, env={**ENV, 'SYQ_CP_OPTIONS': '--quiet --no-compress'})
         assert result.returncode == 0, result.stderr
         assert inherited_target.read_bytes() == b'new'
         # A producer can wait for a downstream response without filling a
         # transfer block or closing its output first.
-        child = subprocess.Popen([SYQ, 'cp', '--src-fd', '0', '--as-fd', '1'],
+        child = subprocess.Popen([SYQ, 'cp', '--if-exists=update', '--src-fd', '0', '--as-fd', '1'],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, env=ENV, start_new_session=True)
         CHILDREN.append(child)

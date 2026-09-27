@@ -68,7 +68,7 @@ fn hardlinks_reconcile_independent_matching_files_and_preserve_defaults() {
     );
     run_native_ok(&[
         "cp",
-        "--preserve=hardlinks,permissions",
+        "--copy-metadata=hardlinks,permissions",
         "--srcs-in",
         &t.s("src"),
         "--into",
@@ -184,7 +184,7 @@ fn hardlink_mapping_conflicting_metadata_fails_before_payload_copy() {
         let output = syq_cp_in(
             &t.path(""),
             &[
-                "--preserve=hardlinks",
+                "--copy-metadata=hardlinks",
                 "--mapping",
                 "-",
                 "-C",
@@ -342,7 +342,8 @@ fn hardlink_hash_assertions_accept_omitted_repeated_and_mixed_algorithms() {
             }
             let manifest = hash_manifest(&hashes);
             let mut args = vec![
-                "--preserve=hardlinks",
+                "--if-exists=update",
+                "--copy-metadata=hardlinks",
                 "--mapping",
                 "-",
                 "-C",
@@ -426,7 +427,8 @@ fn hardlink_hash_conflicts_and_failed_alias_assertions_do_not_publish_the_group(
             let output = syq_cp_in(
                 &t.path(""),
                 &[
-                    "--preserve=hardlinks",
+                    "--if-exists=update",
+                    "--copy-metadata=hardlinks",
                     "--mapping",
                     "-",
                     "-C",
@@ -480,7 +482,8 @@ fn hardlink_mixed_hashes_cross_transports_and_recover_lost_publication_reply() {
                     command.args(["--from", "fake"]);
                 }
                 command.args([
-                    "--preserve=hardlinks",
+                    "--if-exists=update",
+                    "--copy-metadata=hardlinks",
                     "--mapping",
                     &t.s("mapping.ndjson"),
                     "-C",

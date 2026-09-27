@@ -31,11 +31,11 @@ def successful_copies():
         for label, transport in [('ssh', ['--no-tcp']), ('tcp', [])]:
             env = dict(os.environ, SYQ_TEST_REQUIRE_TCP='1') if label == 'tcp' else None
             destination = '/tmp/syq-real-ssh/inode-metadata-' + label
-            push = ['syq', 'cp', '--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse', '--srcs-in', str(source), '--to', 'destination', '--into', destination, *transport]
+            push = ['syq', 'cp', '--copy-metadata=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse', '--srcs-in', str(source), '--to', 'destination', '--into', destination, *transport]
             subprocess.run(push, check=True, timeout=30, env=env)
             subprocess.run(push, check=True, timeout=30, env=env)
             pull = root / label
-            subprocess.run(['syq', 'cp', '--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30, env=env)
+            subprocess.run(['syq', 'cp', '--copy-metadata=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30, env=env)
             assert (source / 'file').stat().st_atime_ns == expected_atime
             assert (pull / 'file').stat().st_atime_ns == expected_atime
             copied = (pull / 'file').stat()
@@ -51,9 +51,9 @@ def successful_copies():
             os.removexattr(pull / 'file','user.empty')
             os.removexattr(pull / 'file','system.posix_acl_access')
             os.removexattr(pull,'system.posix_acl_default')
-            subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse','--srcs-in',str(pull),'--to','destination','--into',destination,*transport],check=True,timeout=30,env=env)
+            subprocess.run(['syq','cp','--copy-metadata=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse','--srcs-in',str(pull),'--to','destination','--into',destination,*transport],check=True,timeout=30,env=env)
             verify = root / (label + '-reconciled')
-            subprocess.run(['syq','cp','--preserve=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse','--from','destination','--srcs-in',destination,'--into',str(verify),*transport],check=True,timeout=30,env=env)
+            subprocess.run(['syq','cp','--copy-metadata=hardlinks,acls,xattrs,atimes', '--open-noatime', '--sparse','--from','destination','--srcs-in',destination,'--into',str(verify),*transport],check=True,timeout=30,env=env)
             assert (verify / 'file').stat().st_atime_ns == expected_atime
             assert 'user.empty' not in os.listxattr(verify / 'file')
             assert 'system.posix_acl_access' not in os.listxattr(verify / 'file')
@@ -68,11 +68,11 @@ def successful_copies():
             file.write_bytes(b'data')
             os.setxattr(file, 'user.rich', value)
         remote = '/tmp/syq-real-ssh/rich-metadata'
-        command = ['syq', 'cp', '--preserve=xattrs', '--srcs-in', str(rich), '--to', 'destination', '--into', remote, '--no-tcp']
+        command = ['syq', 'cp', '--copy-metadata=xattrs', '--srcs-in', str(rich), '--to', 'destination', '--into', remote, '--no-tcp']
         subprocess.run(command, check=True, timeout=90)
         subprocess.run(command, check=True, timeout=90)
         copied = root / 'rich-copy'
-        subprocess.run(['syq', 'cp', '--preserve=xattrs', '--from', 'destination', '--srcs-in', remote, '--into', str(copied), '--no-tcp'], check=True, timeout=90)
+        subprocess.run(['syq', 'cp', '--copy-metadata=xattrs', '--from', 'destination', '--srcs-in', remote, '--into', str(copied), '--no-tcp'], check=True, timeout=90)
         for index in range(5000):
             assert os.getxattr(copied / str(index), 'user.rich') == value
 
@@ -156,11 +156,11 @@ def failed_copies():
                     script = '#!/bin/sh\nexport SYQ_TEST_FAIL_XATTR=' + shlex.quote(attribute) + \
                         '\nexec /usr/local/bin/syq "$@"\n'
                     remote(f'from pathlib import Path; w=Path({wrapper!r}); w.write_text({script!r}); w.chmod(0o755)')
-                    command = ['syq', 'cp', '--preserve=permissions,ownership,hardlinks,acls,xattrs',
+                    command = ['syq', 'cp', '--copy-metadata=permissions,ownership,hardlinks,acls,xattrs',
                         '--srcs-in', str(source), '--to', 'destination', '--into', destination,
                         '--syq-path', wrapper, '--performance-tuning=workers=1', '--no-progress', *transport]
                     if inplace:
-                        command.append('--inplace')
+                        command.extend(['--if-exists=update', '--inplace'])
                     result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, env=env)
                     assert result.returncode != 0, result.stdout
                     assert 'injected attribute reconciliation failure' in result.stdout, result.stdout
@@ -179,7 +179,7 @@ def failed_copies():
             print(f'case: {label} interrupted metadata copy resumes', flush=True)
             metadata(source / 'file', b'before interruption')
             destination = root + '/interrupted-' + label
-            command = ['syq', 'cp', '--preserve=permissions,ownership,hardlinks,acls,xattrs',
+            command = ['syq', 'cp', '--copy-metadata=permissions,ownership,hardlinks,acls,xattrs',
                 '--srcs-in', str(source), '--to', 'destination', '--into', destination,
                 '--performance-tuning=workers=1,comparison-block-size=1M', '--no-progress', *transport]
             with tempfile.TemporaryFile() as log:

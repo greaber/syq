@@ -416,11 +416,11 @@ fn command_reference_matches_public_help() {
 fn unsupported_native_controls_are_hidden_from_help_and_completion() {
     for flag in ["--help", "--help-all"] {
         let text = help(&["cp", flag]);
-        for hidden in ["--only-existing", "--skip-newer", "compare="] {
+        for hidden in ["--only-existing", "--skip-newer", "--only-new", "compare="] {
             assert!(!text.contains(hidden), "{hidden}: {text}");
         }
         if flag == "--help-all" {
-            assert!(text.contains("--only-new"));
+            assert!(text.contains("--if-exists"));
         }
     }
     let rsync = help(&["rsync", "--help-all"]);
@@ -439,8 +439,11 @@ fn unsupported_native_controls_are_hidden_from_help_and_completion() {
         ]);
         assert!(output.status.success(), "{output:?}");
         let text = String::from_utf8(output.stdout).unwrap();
-        assert!(text.contains("--only-new"), "{shell}: {text}");
+        assert!(text.contains("--if-exists"), "{shell}: {text}");
         assert!(!text.contains("--only-existing"), "{shell}: {text}");
-        assert!(!text.contains("--skip-newer"), "{shell}: {text}");
+        assert!(
+            !text.contains("--if-exists=update-if-older"),
+            "{shell}: {text}"
+        );
     }
 }

@@ -131,6 +131,8 @@ pub struct Opts {
     /// Settled before sharing these options; clone claims must fit preflight.
     local_copy_fd_budget: bool,
     pub flags: u8,
+    pub matching_flags: u8,
+    pub if_exists: Option<crate::cli::IfExists>,
     pub recursive: bool,
     pub links: bool,
     pub perms: bool,
@@ -198,6 +200,25 @@ impl Opts {
                 .map_or(0, |m| m.apply_flags())
     }
 
+    fn matching_flags_for(&self, path: &[u8]) -> u8 {
+        self.matching_flags
+            | self
+                .mapping_metadata
+                .get(path)
+                .map_or(0, |m| m.apply_flags())
+    }
+
+    fn protects_existing_contents(&self) -> bool {
+        matches!(
+            self.if_exists,
+            Some(crate::cli::IfExists::ErrorIfDifferent | crate::cli::IfExists::Error)
+        )
+    }
+
+    fn file_difference_message(&self, path: &str) -> String {
+        format!("destination contents differ: {path} (--if-exists=error-if-different)")
+    }
+
     fn inode_metadata_differs(&self, path: &[u8], source: &Entry, destination: &Entry) -> bool {
         source.inode_metadata.is_some()
             && self.metadata_for(path, source).inode_metadata != destination.inode_metadata
@@ -205,7 +226,7 @@ impl Opts {
 
     fn metadata_fix_flags(&self, path: &[u8], source: &Entry, destination: &Entry) -> u8 {
         let source = self.metadata_for(path, source);
-        let flags = self.flags_for(path);
+        let flags = self.matching_flags_for(path);
         let mut changes = 0;
         if flags & flags::TIMES != 0
             && (source.mtime != destination.mtime
@@ -742,6 +763,8 @@ fn attempt_small_copy(
         })
         .collect();
     let request = SmallCopyRequest {
+        if_exists: args.if_exists.unwrap_or(crate::cli::IfExists::Update),
+        matching_flags: opts.matching_flags,
         hash_policy: opts.hash_policy,
         copy_if: args
             .copy_if
@@ -1588,7 +1611,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             for (_, entry) in entries {
                 if let Some(metadata) = entry.metadata {
                     anyhow::ensure!(metadata.flags() & !args.meta_flags() == 0,
-                        "mapping metadata on a restricted receiver requires matching --preserve options in the signed grant");
+                        "mapping metadata on a restricted receiver requires matching --copy-metadata options in the signed grant");
                 }
             }
         }
@@ -1632,6 +1655,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             && (args.stats || args.verbose > 0 || debug()))
         .then(|| Mutex::new(crate::transfer_tuning::BenchmarkStats::default())),
         flags: args.meta_flags(),
+        matching_flags: args.matching_meta_flags(),
+        if_exists: args.if_exists,
         recursive: args.recursive,
         links: args.links,
         perms: args.perms,
@@ -3020,7 +3045,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         blocked_mapping_parents: std::collections::HashSet::new(),
         implicit_restorations: Vec::new(),
         // Deferred root creation must succeed before mapped entries are applied.
-        created_dirs: if create_root && opts.preserve_existing_directory_metadata {
+        created_dirs: if create_root {
             std::collections::HashSet::from([dst_root.clone()])
         } else {
             std::collections::HashSet::new()

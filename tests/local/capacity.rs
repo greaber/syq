@@ -113,6 +113,7 @@ fn capacity_failure_reports_other_settled_apply_outcomes_before_aborting() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
+            "--if-exists=update",
             "--srcs-in",
             "src",
             "--into-existing",

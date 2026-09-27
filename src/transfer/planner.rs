@@ -482,11 +482,11 @@ impl Planner<'_> {
         }
     }
 
-    pub(super) fn assert_mutation_root(&mut self) -> Result<()> {
+    pub(super) fn assert_mutation_root(&mut self) -> Result<Option<Entry>> {
         let (dev, ino) = match self.mutation_root_condition {
             TargetCondition::Matches { dev, ino }
             | TargetCondition::MatchesFingerprint { dev, ino, .. } => (dev, ino),
-            TargetCondition::Any | TargetCondition::Absent => return Ok(()),
+            TargetCondition::Any | TargetCondition::Absent => return Ok(None),
         };
         // Only identity matters here. A plain lookup avoids the rich-metadata
         // capture that preserving ACLs or xattrs adds to ordinary stats: its
@@ -503,7 +503,7 @@ impl Planner<'_> {
             other => bail!("unexpected destination inspection response {other:?}"),
         };
         match current {
-            Some(entry) if entry.dev == dev && entry.ino == ino => Ok(()),
+            Some(entry) if entry.dev == dev && entry.ino == ino => Ok(Some(entry)),
             _ => bail!(
                 "target {} changed after the placement precondition was checked",
                 display(&self.dst_root)
@@ -1558,7 +1558,7 @@ impl Planner<'_> {
         if self.collision {
             return Ok(());
         }
-        self.assert_mutation_root()?;
+        let root_entry = self.assert_mutation_root()?;
         let opts = self.opts;
         let Mapped {
             directory_expression_sources,
@@ -1577,7 +1577,16 @@ impl Planner<'_> {
         // metadata so they can't disagree.
         if !dirs.is_empty() {
             let stats = if self.destination_tree_known_missing {
-                vec![None; dirs.len()]
+                // Preflight can create the root before this batch. Reuse its
+                // identity check so an implicit parent is not sent as an
+                // absent-only mkdir after we have already created it.
+                dirs.iter()
+                    .map(|(path, _, _)| {
+                        (path == &self.dst_root)
+                            .then(|| root_entry.clone())
+                            .flatten()
+                    })
+                    .collect()
             } else if self.destination_children_known_missing {
                 self.stat_fresh_descendants(dirs.iter().map(|(path, _, _)| path))?
             } else if let Some(stats) = dir_stats {
@@ -1763,6 +1772,10 @@ impl Planner<'_> {
             && dst_entry
                 .as_ref()
                 .is_some_and(|d| d.dev == e.dev && d.ino == e.ino);
+        if same_file && opts.if_exists == Some(crate::cli::IfExists::Error) {
+            self.existing_conflict(&dst_path, &dst_rel, "destination already exists");
+            return;
+        }
         if same_file {
             if !opts.quiet {
                 self.progress.eprintln(&format!(
@@ -1794,12 +1807,36 @@ impl Planner<'_> {
         if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref()) {
             return;
         }
+        if opts.if_exists == Some(crate::cli::IfExists::Error) && dst_entry.is_some() {
+            self.existing_conflict(&dst_path, &dst_rel, "destination already exists");
+            return;
+        }
+        if opts.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)
+            && dst_entry
+                .as_ref()
+                .is_some_and(|d| d.kind != Kind::File || d.size != e.size)
+        {
+            if dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File) {
+                self.report_existing_conflict(
+                    &dst_rel,
+                    &opts.file_difference_message(&display(&dst_path)),
+                );
+            } else {
+                self.existing_conflict(&dst_path, &dst_rel, "destination contents differ");
+            }
+            return;
+        }
         let same = dst_entry
             .as_ref()
             .is_some_and(|d| opts.metadata_matches(&dst_rel, &e, d));
         let dst_newer = opts.update
             && dst_entry.as_ref().is_some_and(|d| {
-                d.kind == Kind::File && (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
+                (d.kind == Kind::File || opts.if_exists.is_some())
+                    && if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder) {
+                        (d.mtime, d.mtime_nsec) >= (e.mtime, e.mtime_nsec)
+                    } else {
+                        (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
+                    }
             });
         if dst_newer {
             self.progress.files_excluded.fetch_add(1, Relaxed);
@@ -1865,7 +1902,7 @@ impl Planner<'_> {
             self.progress.files_unchanged.fetch_add(1, Relaxed);
             self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
         } else if opts.dry_run
-            && opts.checksum
+            && (opts.checksum || opts.protects_existing_contents())
             && dst_entry
                 .as_ref()
                 .is_some_and(|d| d.kind == Kind::File && d.size == e.size)
@@ -1946,15 +1983,11 @@ impl Planner<'_> {
         ops: &mut LeafOps,
     ) {
         let requested = self.opts.mapping_metadata.get(rel);
-        if requested.is_none() && source.inode_metadata.is_none() {
+        let flags = self.opts.matching_flags_for(rel);
+        if flags == 0 && source.inode_metadata.is_none() {
             return;
         }
         let meta = self.opts.metadata_for(rel, source);
-        let flags = if source.inode_metadata.is_some() {
-            self.opts.flags_for(rel)
-        } else {
-            requested.map_or(0, |r| r.apply_flags())
-        };
         // Explicit nanoseconds must be attempted even if preservation's quick
         // comparison would tolerate truncation by the destination filesystem.
         let time_differs = requested.is_some_and(|r| r.mtime.is_some())
@@ -2023,11 +2056,34 @@ impl Planner<'_> {
         if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref()) {
             return;
         }
+        if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder)
+            && dst_entry
+                .as_ref()
+                .is_some_and(|d| (d.mtime, d.mtime_nsec) >= (e.mtime, e.mtime_nsec))
+        {
+            self.progress.files_excluded.fetch_add(1, Relaxed);
+            return;
+        }
         let target = e.link.clone().unwrap_or_default();
         let same = dst_entry
             .as_ref()
             .is_some_and(|d| d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..]));
 
+        if dst_entry.is_some()
+            && (opts.if_exists == Some(crate::cli::IfExists::Error)
+                || (!same && opts.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)))
+        {
+            self.existing_conflict(
+                &dst_path,
+                &dst_rel,
+                if same {
+                    "destination already exists"
+                } else {
+                    "destination contents differ"
+                },
+            );
+            return;
+        }
         if same {
             self.plan_explicit_leaf_metadata(
                 &dst_path,
@@ -2084,7 +2140,7 @@ impl Planner<'_> {
         leaf_ops.ops.push(Op::Symlink {
             path: dst_path.clone(),
             target,
-            condition: self.exact_condition_for(&dst_path),
+            condition: self.leaf_condition_for(&dst_path, dst_entry.as_ref()),
         });
         leaf_ops.ops.push(Op::SetMeta {
             // Apply runs successful leaf creation/replacement
@@ -2115,9 +2171,32 @@ impl Planner<'_> {
         if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref()) {
             return;
         }
+        if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder)
+            && dst_entry
+                .as_ref()
+                .is_some_and(|d| (d.mtime, d.mtime_nsec) >= (e.mtime, e.mtime_nsec))
+        {
+            self.progress.files_excluded.fetch_add(1, Relaxed);
+            return;
+        }
         let same = dst_entry
             .as_ref()
             .is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
+        if dst_entry.is_some()
+            && (opts.if_exists == Some(crate::cli::IfExists::Error)
+                || (!same && opts.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)))
+        {
+            self.existing_conflict(
+                &dst_path,
+                &dst_rel,
+                if same {
+                    "destination already exists"
+                } else {
+                    "destination contents differ"
+                },
+            );
+            return;
+        }
         if same {
             self.plan_explicit_leaf_metadata(
                 &dst_path,
@@ -2175,7 +2254,7 @@ impl Planner<'_> {
             path: dst_path.clone(),
             mode: e.mode,
             rdev: e.rdev,
-            condition: self.exact_condition_for(&dst_path),
+            condition: self.leaf_condition_for(&dst_path, dst_entry.as_ref()),
         });
         let mut meta = opts.metadata_for(&dst_rel, &e);
         let mut flags = opts.flags_for(&dst_rel);
@@ -2350,6 +2429,7 @@ impl Planner<'_> {
                 self.collision = true;
                 return Ok(None);
             }
+            self.created_dirs.insert(self.dst_root.clone());
             self.progress.directories_created.fetch_add(1, Relaxed);
             if opts.verbose > 0 {
                 self.progress
@@ -2386,10 +2466,7 @@ impl Planner<'_> {
                 let preexisting = existing_dirs.contains(name);
                 let succeeded = err.is_none();
                 let created = succeeded && !preexisting;
-                if created
-                    && (opts.preserve_existing_directory_metadata
-                        || self.destination_children_known_missing)
-                {
+                if created {
                     self.created_dirs.insert(name.clone());
                 }
                 let os_kind = err.as_ref().and_then(wire_os_kind);
@@ -2453,7 +2530,11 @@ impl Planner<'_> {
     fn trace_dry_run_dirs(&mut self, planned: &[PlannedDir], dst_root: &[u8]) {
         let opts = self.opts;
         for (p, dst_rel, e, destination) in planned {
-            let meta_flags = opts.flags_for(dst_rel);
+            let meta_flags = if destination.is_some() {
+                opts.matching_flags_for(dst_rel)
+            } else {
+                opts.flags_for(dst_rel)
+            };
             let meta = opts.metadata_for(dst_rel, e);
             match destination {
                 None => {
@@ -2557,7 +2638,7 @@ impl Planner<'_> {
                     self.implicit_restorations.push((
                         p.clone(),
                         existing.meta(),
-                        if opts.restricted_receiver {
+                        if opts.restricted_receiver && !opts.perms {
                             flags::RECEIVER_MODE
                         } else {
                             flags::MODE
@@ -2573,7 +2654,11 @@ impl Planner<'_> {
             }
             let depth = p.iter().filter(|&&c| c == b'/').count();
             let mut meta = opts.metadata_for(dst_rel, e);
-            let mut flags = opts.flags_for(dst_rel);
+            let mut flags = if s.is_some() && !self.created_dirs.contains(p) {
+                opts.matching_flags_for(dst_rel)
+            } else {
+                opts.flags_for(dst_rel)
+            };
             // Without -p, existing directories retain their mode and
             // new directories receive the source mode through the
             // receiving side's umask. Only a signed receiver needs to
@@ -3076,7 +3161,7 @@ impl Planner<'_> {
         dst_entry: Option<Entry>,
     ) -> usize {
         let (src, source) = source_path;
-        let target_condition = self.exact_condition_for(&dst);
+        let target_condition = self.leaf_condition_for(&dst, dst_entry.as_ref());
         let src_rel = self.mapping_source_rel(&rel_bytes);
         let creation_mode = self.creation_mode(&dst, &entry);
         self.progress.files_total.fetch_add(1, Relaxed);
@@ -3101,6 +3186,44 @@ impl Planner<'_> {
                 src_rel,
             },
         })
+    }
+
+    fn leaf_condition_for(&self, path: &[u8], destination: Option<&Entry>) -> TargetCondition {
+        let placement = self.exact_condition_for(path);
+        if placement == TargetCondition::Any
+            && destination.is_none()
+            && self.opts.protects_existing_contents()
+        {
+            TargetCondition::Absent
+        } else {
+            placement
+        }
+    }
+
+    fn existing_conflict(&self, path: &[u8], rel: &[u8], reason: &str) {
+        let message = format!(
+            "{reason}: {} (--if-exists={})",
+            display(path),
+            self.opts.if_exists.unwrap().as_str()
+        );
+        self.report_existing_conflict(rel, &message);
+    }
+
+    fn report_existing_conflict(&self, rel: &[u8], message: &str) {
+        self.progress.error(&format!("syq: {message}"));
+        if !self.opts.dry_run {
+            self.emit_entry_failed(
+                FailedEntry {
+                    dst: rel,
+                    src: self.mapping_source_rel(rel).as_deref(),
+                    kind: None,
+                },
+                "no",
+                "conflict",
+                None,
+                message,
+            );
+        }
     }
 
     /// --ignore-existing / --existing for a leaf, given what's on the destination.

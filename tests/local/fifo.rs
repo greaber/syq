@@ -165,7 +165,7 @@ fn fifo_node_operations_do_not_connect_a_producer() {
             }
             "copy-node" => {
                 command
-                    .args(["cp", "--preserve=specials"])
+                    .args(["cp", "--copy-metadata=specials"])
                     .arg(&fifo)
                     .arg("--as")
                     .arg(t.path("dst"));

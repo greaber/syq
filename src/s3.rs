@@ -10,6 +10,7 @@ mod dns;
 pub(crate) mod listing;
 mod local;
 pub(crate) mod map;
+mod metadata_copy;
 mod remove;
 pub(crate) use remove::RemoveFlags;
 mod prune;

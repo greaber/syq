@@ -10,6 +10,7 @@ fn native_as_existing_updates_a_same_type_symlink() {
 
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--src",
         &t.s("source-link"),
         "--as-existing",
@@ -34,6 +35,7 @@ fn native_inplace_updates_the_existing_inode_without_a_sidecar() {
 
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--inplace",
         "--srcs-in",
         &t.s("src"),
@@ -520,7 +522,7 @@ fn sparse_updates_recover_batched_reads_and_writes_without_losing_unchanged_byte
         write(&t.path("dst"), &original);
         let marker = t.path("drop-once");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
-        command.args(["cp", "--hash", "--stats", "--no-progress", "--rsh", rsh.to_str().unwrap(), "--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-tcp", "--performance-tuning=comparison-block-size=64K,request-size=4M,copy-path=ranges,workers=1"]);
+        command.args(["cp", "--if-exists=update", "--hash", "--stats", "--no-progress", "--rsh", rsh.to_str().unwrap(), "--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-tcp", "--performance-tuning=comparison-block-size=64K,request-size=4M,copy-path=ranges,workers=1"]);
         if pull {
             command.args(["--from", "fake"]);
         }
@@ -567,7 +569,11 @@ fn copy_paths_copy_and_update_with_both_interfaces() {
                     &format!("--performance-tuning=copy-path={engine}"),
                 ]);
                 if interface == "cp" {
-                    command.args(["--hash", "--preserve=permissions"]);
+                    command.args([
+                        "--hash",
+                        "--if-exists=update",
+                        "--copy-metadata=permissions,mtime",
+                    ]);
                     command.args(["--srcs-in", &t.s("source"), "--into", &t.s("destination")]);
                 } else {
                     command.args(["-a", "--checksum", &t.s("source/"), &t.s("destination")]);

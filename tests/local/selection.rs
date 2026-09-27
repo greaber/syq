@@ -236,7 +236,8 @@ fn native_preserve_policy_controls_permissions_and_special_files() {
 
     run_native_ok(&[
         "cp",
-        "--preserve=permissions,specials",
+        "--if-exists=update",
+        "--copy-metadata=permissions,specials",
         "--srcs-in",
         &t.s("src"),
         "--into-existing",
@@ -300,6 +301,7 @@ fn native_cp_with_prune_removes_only_target_extras_after_copy() {
 
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--prune",
         "--srcs-in",
         &t.s("src"),
@@ -490,6 +492,7 @@ fn native_cp_with_prune_matches_rsync_delete() {
     run_ok(&["-rlt", "--delete", &t.s("src/"), &t.s("rsync/")]);
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--prune",
         "--srcs-in",
         &t.s("src"),
@@ -554,6 +557,7 @@ fn native_cp_with_prune_keeps_placement_siblings_and_honors_max_delete() {
     write(&t.path("named/outside"), b"outside");
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--prune",
         "--src",
         &t.s("source/tree"),
@@ -566,6 +570,7 @@ fn native_cp_with_prune_keeps_placement_siblings_and_honors_max_delete() {
     write(&t.path("contents/extra"), b"extra");
     let refused = native_syq(&[
         "cp",
+        "--if-exists=update",
         "--prune",
         "--max-delete",
         "0",
@@ -1735,7 +1740,12 @@ fn native_only_new_preserves_existing_directory_metadata() {
             assert_output_ok(&map);
             write(&t.path("mapping"), &map.stdout);
         }
-        let mut args = vec!["cp", "--only-new", "--preserve=permissions", "--cwd"];
+        let mut args = vec![
+            "cp",
+            "--if-exists=keep",
+            "--copy-metadata=permissions",
+            "--cwd",
+        ];
         let base = t.s("src");
         let manifest = t.s("mapping");
         let dest = t.s("dst");
@@ -1795,7 +1805,14 @@ fn directory_dry_run_uses_destination_timestamp_precision() {
         }
         let out = syq_cp_in(
             &t.path(""),
-            &["src", "--as", "dst", "--dry-run", "-v"],
+            &[
+                "src",
+                "--as",
+                "dst",
+                "--copy-metadata=mtime",
+                "--dry-run",
+                "-v",
+            ],
             None,
         );
         assert_output_ok(&out);

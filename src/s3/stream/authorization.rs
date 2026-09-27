@@ -11,6 +11,7 @@ pub(crate) enum Prepared {
         key: String,
         metadata: Option<HashMap<String, String>>,
         id: Option<String>,
+        metadata_update: Option<Box<super::super::metadata_copy::Prepared>>,
     },
 }
 
@@ -20,6 +21,12 @@ impl Session {
             return Ok(());
         };
         for request in &mut requests {
+            // Use the same canonical fields as the executing HTTP transport.
+            // Content headers still travel with metadata updates, but are not
+            // part of this authorization lookup key.
+            request
+                .headers
+                .retain(|name, _| crate::s3::authorization::signed_header(name, &request.method));
             request.bucket =
                 (self.options.bucket != authorization.bucket).then(|| self.options.bucket.clone());
             for super::super::Header(name, value) in &self.options.headers {
@@ -70,8 +77,9 @@ impl Session {
             return Ok(Some(Prepared::Preview));
         }
         let metadata = upload_metadata(plan);
-        let new =
-            plan.placement.existence == crate::cli::Existence::New || plan.controls.report.only_new;
+        let new = plan.placement.existence == crate::cli::Existence::New
+            || plan.controls.report.only_new
+            || protects_existing(plan);
         let mut put = Unsigned::new("PUT", &plan.key);
         if let Some(metadata) = &metadata {
             for (name, value) in metadata {
@@ -82,6 +90,21 @@ impl Session {
             put = put.header("if-none-match", "*");
         }
         let mut requests = vec![put];
+        let mut metadata_update = None;
+        if protects_existing(plan) && plan.placement.existence != crate::cli::Existence::New {
+            requests.push(Unsigned::new("GET", &plan.key));
+            if metadata_update_flags(plan) != 0 {
+                requests.push(Unsigned::new("HEAD", &plan.key));
+                let _request = self.requests.acquire().await?;
+                if let Some(head) =
+                    client::head_output(&self.client, &self.options.bucket, &plan.key, None).await?
+                {
+                    if let Some(fields) = metadata_update_fields(plan, &head, metadata.as_ref())? {
+                        metadata_update = Some((head, fields));
+                    }
+                }
+            }
+        }
         let count = size.map_or(10_000, |size| size.div_ceil(self.options.part_size).max(1));
         anyhow::ensure!(
             count <= 10_000,
@@ -124,7 +147,40 @@ impl Session {
         } else {
             None
         };
+        let metadata_update = if let Some((head, fields)) = metadata_update {
+            let result = async {
+                let _request = self.requests.acquire().await?;
+                super::super::metadata_copy::Prepared::prepare(
+                    &self.client,
+                    &self.options.bucket,
+                    &plan.key,
+                    &head,
+                    fields,
+                    self.options.part_size,
+                    metadata_copy_limit(plan),
+                )
+                .await
+            }
+            .await;
+            match result {
+                Ok(update) => {
+                    requests.extend(update.requests());
+                    Some(Box::new(update))
+                }
+                Err(error) => {
+                    if let Some(id) = &id {
+                        let _ = self.abort(&plan.key, id).await;
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         if let Err(error) = self.authorize(requests).await {
+            if let Some(update) = &metadata_update {
+                update.abort(&self.client, &self.options.bucket).await;
+            }
             if let Some(id) = &id {
                 let _ = self.abort(&plan.key, id).await;
             }
@@ -134,7 +190,25 @@ impl Session {
             key: plan.key.clone(),
             metadata,
             id,
+            metadata_update,
         }))
+    }
+
+    pub(crate) async fn abort_prepared(&self, prepared: &Prepared) {
+        if let Prepared::Upload {
+            key,
+            id,
+            metadata_update,
+            ..
+        } = prepared
+        {
+            if let Some(id) = id {
+                let _ = self.abort(key, id).await;
+            }
+            if let Some(update) = metadata_update {
+                update.abort(&self.client, &self.options.bucket).await;
+            }
+        }
     }
 
     pub(crate) async fn prepare_callback(

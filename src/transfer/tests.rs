@@ -232,6 +232,8 @@ fn pipeline_worker(
         },
         benchmark: None,
         flags: 0,
+        matching_flags: 0,
+        if_exists: None,
         recursive: true,
         links: false,
         perms: false,

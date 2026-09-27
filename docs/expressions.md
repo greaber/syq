@@ -26,7 +26,7 @@ is available only for `cp`. Neither applies to descriptor or pipe copies.
 `--where` accepts only `src` fields. `--copy-if` accepts both `src` and `dst`:
 `dst` always names the destination chosen by the copy's placement or mapping.
 For non-directory entries, both options must pass when present. Existing policies such as
-`--only-new` also apply. Each expression option can be supplied once; combine
+`--if-exists=keep` also apply. Each expression option can be supplied once; combine
 conditions with `and` and `or`.
 
 A true expression allows the copy to proceed through its normal comparison.
@@ -34,13 +34,13 @@ It does not force a rewrite of an unchanged file. Use `--hash` when contents
 must be compared even if size and modification time match.
 
 `--where` does not filter directories. They are copied as in an unfiltered
-copy, with their usual metadata and any `--preserve=FEATURE` controls, and they
+copy, with their usual metadata and any `--copy-metadata=FEATURE` controls, and they
 are created even when none of their contents are selected. For example, this
 copies JPEGs while keeping the permissions and modification times of the
 directories around them:
 
 ```sh
-syq cp --srcs-in photos --into archive --preserve=permissions \
+syq cp --srcs-in photos --into archive --copy-metadata=permissions,mtime \
   --where 'src.extension = "jpg"'
 ```
 

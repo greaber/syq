@@ -55,7 +55,7 @@ def hashing(root, source, temporary):
     for name, flags in [("encrypted", []), ("plain", ["--tcp-plain"])]:
         print(f"hash policy: ordinary {name} TCP", flush=True)
         destination = root + "/hash-" + name
-        command = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=1", "-C", str(local.parent), "--mapping", "-", "--to", "destination", "--into", root,
+        command = ["syq", "cp", "--if-exists=update", "--no-progress", "--performance-tuning", "workers=1", "-C", str(local.parent), "--mapping", "-", "--to", "destination", "--into", root,
                    "--integrity-checking", "compare=xxh3-128", "--integrity-checking=transfer=blake3", "--performance-tuning", "copy-path=ranges"] + flags
         run(command, data=manifest([(local.name, "hash-" + name, "file")], {"algorithm": "sha256", "value": sha256}))
         results = str(Path(temporary) / ("hash-repeat-" + name + ".ndjson"))
@@ -87,7 +87,7 @@ def hashing(root, source, temporary):
     destination = root + "/hash-signed"
     expected = {"algorithm": "md5", "value": hashlib.md5(b"mapped contents").hexdigest()}
     selected = [("file", "checked", "file")]
-    command = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=1", "--from", "source", "-C", source,
+    command = ["syq", "cp", "--if-exists=update", "--no-progress", "--performance-tuning", "workers=1", "--from", "source", "-C", source,
                "--mapping", "-", "--to", "destination", "--into", destination,
                "--integrity-checking", "compare=xxh3-128", "--integrity-checking=transfer=blake3"]
     run(command, data=manifest(selected, expected))
@@ -145,44 +145,44 @@ def direct():
         selected["metadata"] = {"mode": 0o640, "mtime": 123, "mtime_nsec": 456, "uid": owner[0], "gid": owner[1]}
         metadata_manifest = (json.dumps(selected) + "\n").encode()
         destination = root + "/metadata"
-        command = prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--no-tcp"]
+        command = prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--no-tcp", "--if-exists=update"]
         refused = run(command, data=metadata_manifest, expected=1)
-        assert b"matching --preserve options" in refused.stderr, refused.stderr
-        run(command + ["--preserve=permissions,ownership"], data=metadata_manifest)
+        assert b"matching --copy-metadata options" in refused.stderr, refused.stderr
+        run(command + ["--copy-metadata=permissions,ownership"], data=metadata_manifest)
         ssh("destination", f"from pathlib import Path; p=Path({destination!r})/'file'; assert p.read_bytes()==b'mapped contents'; s=p.stat(); assert s.st_mode & 0o7777==0o640; assert s.st_mtime_ns==123000000456")
         local_source = Path(temporary) / "metadata-source"
         local_source.mkdir()
         (local_source / "file").write_bytes(b'ordinary mapping')
-        run(["syq", "cp", "--no-progress", "-C", str(local_source), "--mapping", "-", "--to", "destination", "--into", destination, "--no-tcp"], data=metadata_manifest)
+        run(["syq", "cp", "--if-exists=update", "--no-progress", "-C", str(local_source), "--mapping", "-", "--to", "destination", "--into", destination, "--no-tcp"], data=metadata_manifest)
         ssh("destination", f"from pathlib import Path; p=Path({destination!r})/'file'; assert p.read_bytes()==b'ordinary mapping'; s=p.stat(); assert s.st_mode & 0o7777==0o640; assert s.st_mtime_ns==123000000456")
         if owner[0] != 0:
             selected["metadata"]["uid"] = 4294967294
             denied_manifest = (json.dumps(selected) + "\n").encode()
-            run(command + ["--preserve=permissions,ownership"], data=denied_manifest, expected=23)
+            run(command + ["--copy-metadata=permissions,ownership"], data=denied_manifest, expected=23)
             ssh("destination", f"from pathlib import Path; assert (Path({destination!r})/'file').read_bytes()==b'ordinary mapping'")
         destination = root + "/tcp"
         matching_preview(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--coordinate-at", "local"], data=contents, files=1)
         # Selection uses source mtimes; --only-existing remains independently enforced.
         ssh("destination", f"from pathlib import Path; import os; p=Path({destination!r})/'nested'/'renamed'; p.write_bytes(b'newer destination'); os.utime(p,(1700000000,1700000000))")
         updating = manifest([("file", "nested/renamed", "file"), ("file", "nested/missing", "file")])
-        run(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--skip-newer", "--only-existing"], data=updating)
+        run(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--if-exists=update-if-older", "--only-existing"], data=updating)
         ssh("destination", f"from pathlib import Path; p=Path({destination!r}); assert (p/'nested'/'renamed').read_bytes()==b'newer destination'; assert not (p/'nested'/'missing').exists()")
-        run(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--skip-newer"], data=updating)
+        run(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--if-exists=update-if-older"], data=updating)
         ssh("destination", f"from pathlib import Path; p=Path({destination!r}); assert (p/'nested'/'renamed').read_bytes()==b'newer destination'; assert (p/'nested'/'missing').read_bytes()==b'mapped contents'")
         ssh("destination", f"import os; os.utime({destination + '/nested/renamed'!r},(1500000000,1500000000))")
-        run(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--skip-newer"], data=updating)
+        run(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--if-exists=update-if-older"], data=updating)
         ssh("destination", f"from pathlib import Path; assert Path({destination + '/nested/renamed'!r}).read_bytes()==b'mapped contents'")
         # PR #275's only-new policy also preserves existing directory metadata.
         only_new = root + "/only-new"
         ssh("destination", f"from pathlib import Path; import os; p=Path({only_new!r}); p.mkdir(); (p/'kept').write_bytes(b'keep destination'); (p/'directory').mkdir(); (p/'directory').chmod(0o555); os.utime(p/'directory',(1500000000,1500000000))")
         selected = manifest([("file", "kept", "file"), ("file", "fresh", "file"), ("directory", "directory", "dir")])
-        run(prefix + ["--mapping", "-", "--to", "destination", "--into", only_new, "--only-new"], data=selected)
+        run(prefix + ["--mapping", "-", "--to", "destination", "--into", only_new, "--if-exists=keep"], data=selected)
         ssh("destination", f"from pathlib import Path; p=Path({only_new!r}); assert (p/'kept').read_bytes()==b'keep destination'; assert (p/'fresh').read_bytes()==b'mapped contents'; d=(p/'directory').stat(); assert d.st_mode & 0o777 == 0o555; assert d.st_mtime_ns==1500000000000000000; (p/'directory').chmod(0o755)")
         # Implicit parents reopen only as needed, then recover receiver modes.
-        for extra in [[], ["--only-existing"], ["--preserve=permissions"]]:
-            readonly = root + "/readonly-" + str(len(extra)) + ("-p" if "--preserve=permissions" in extra else "")
+        for extra in [[], ["--only-existing"], ["--copy-metadata=permissions"]]:
+            readonly = root + "/readonly-" + str(len(extra)) + ("-p" if "--copy-metadata=permissions" in extra else "")
             ssh("destination", f"from pathlib import Path; p=Path({readonly!r}); (p/'parent').mkdir(parents=True); (p/'parent'/'item').write_bytes(b'old'); (p/'parent').chmod(0o2550)")
-            run(prefix + ["--mapping", "-", "--to", "destination", "--into", readonly, "--no-tcp"] + extra,
+            run(prefix + ["--mapping", "-", "--to", "destination", "--into", readonly, "--no-tcp", "--if-exists=update"] + extra,
                 data=manifest([("file", "parent/item", "file")]))
             ssh("destination", f"from pathlib import Path; p=Path({readonly!r})/'parent'; assert (p/'item').read_bytes()==b'mapped contents'; assert p.stat().st_mode & 0o7777 == 0o2550; p.chmod(0o755)")
         # An untouched writable parent needs no chmod (ctime must stay intact).
@@ -216,7 +216,7 @@ def direct():
         assert len(large) > 1024 * 1024
         print("mapping route: large SSH manifest", flush=True)
         results_path = Path(temporary) / "results-large.ndjson"
-        result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--preserve=permissions", "--results", str(results_path)], data=large, expected=23)
+        result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--copy-metadata=permissions", "--results", str(results_path)], data=large, expected=23)
         assert result.stderr.count(b"blocks an implicit mapping parent") == 2, result.stderr
         records = [json.loads(line) for line in results_path.read_text().splitlines()]
         assert records[-1]["status"] == "partial", records[-1]
@@ -226,7 +226,7 @@ def direct():
         # Once the fixture obstruction is removed, the late explicit entry
         # supplies directory metadata after all 10,000 mapped files are copied.
         results_path = Path(temporary) / "results-large-unblocked.ndjson"
-        result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--preserve=permissions", "--results", str(results_path)], data=large, expected=23)
+        result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--copy-metadata=permissions", "--results", str(results_path)], data=large, expected=23)
         assert result.stderr.count(b"blocks an implicit mapping parent") == 2, result.stderr
         assert b"cannot replace non-directory" not in result.stderr, result.stderr
         records = [json.loads(line) for line in results_path.read_text().splitlines()]
@@ -241,7 +241,7 @@ def named():
     prefix = ["syq", "cp", "--no-progress", "-C", source, "--mapping", "-", "--to", "@laptop", "--into", "mapped-return"]
     run(prefix, data=contents)
     matching_preview(prefix, data=contents, files=1)
-    run(prefix + ["--skip-newer", "--only-existing"], data=contents)
+    run(prefix + ["--if-exists=update-if-older", "--only-existing"], data=contents)
     # Here the source-side caller receives coordinator operation records, so
     # a parent obstruction must produce a retryable per-entry failure too.
     blocked = manifest([("message.txt", "nested/renamed/child", "file"), ("message.txt", "nested/good", "file")])

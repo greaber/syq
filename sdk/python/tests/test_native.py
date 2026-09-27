@@ -294,7 +294,7 @@ class NativeClientTests(unittest.TestCase):
             pscope="-scope",
             ignore=["*.tmp", "cache/"],
             ignore_from="ignore.txt",
-            preserve=["times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes"],
+            copy_metadata=["times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes"],
             open_noatime=True,
             sparse=True,
             inplace=True,
@@ -324,7 +324,7 @@ class NativeClientTests(unittest.TestCase):
             "--hash", "--no-compress", "--resource-limits", "--performance-tuning",
             "--receiver-max-entries", "--receiver-max-bytes",
             "--receiver-receipt", "--ignore", "--ignore-from",
-            "--preserve", "times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes",
+            "--copy-metadata", "times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes",
             "--open-noatime",
             "--sparse",
             "--inplace",
@@ -773,11 +773,12 @@ class NativeClientTests(unittest.TestCase):
             ["--ignore-from", "rules", "--ignore", "!keep.tmp"],
         )
 
-    def test_mtime_opt_out_is_an_attached_option_value(self) -> None:
-        self.client.cp(src="source", into="target", preserve=["permissions", "-mtime"])
-        self.assertIn("--preserve=-mtime", self.argv())
+    def test_copy_metadata_and_existing_policy(self) -> None:
+        self.client.cp(src="source", into="target", copy_metadata=["permissions", "mtime"], if_exists="update")
+        self.assertIn("--copy-metadata", self.argv())
+        self.assertIn("--if-exists=update", self.argv())
         with self.assertRaises(syq.SyqInvocationError):
-            self.client.cp(src="source", into="target", preserve="-permissions")
+            self.client.cp(src="source", into="target", copy_metadata="-mtime")
 
     def test_map_is_streaming_typed_and_context_managed(self) -> None:
         with self.client.map(

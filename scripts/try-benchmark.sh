@@ -282,14 +282,14 @@ warm_up() {
 
 copy_with() {
     local tool=$1 source=$2 destination=$3
-    local command=() syq_options=(--preserve=permissions --stats --results "$local_root/trial.json")
+    local command=() syq_options=(--copy-metadata=permissions --stats --results "$local_root/trial.json")
     $show_syq_summary || syq_options+=(--suppress-summary)
     # Always suppress the tiny setup copy's summary, keeping bootstrap
     # diagnostics and authentication prompts live. Supported
     # by the released v0.3.2 CLI as well as current builds.
-    [[ ${4:-} != setup ]] || syq_options=(--preserve=permissions --suppress-summary --no-progress)
-    [[ ${4:-} != calibration ]] || syq_options=(--preserve=permissions --suppress-summary --results "$local_root/calibration.json")
-    [[ ${4:-} != warmup ]] || syq_options=(--preserve=permissions --suppress-summary --results "$local_root/warmup.json")
+    [[ ${4:-} != setup ]] || syq_options=(--copy-metadata=permissions --suppress-summary --no-progress)
+    [[ ${4:-} != calibration ]] || syq_options=(--copy-metadata=permissions --suppress-summary --results "$local_root/calibration.json")
+    [[ ${4:-} != warmup ]] || syq_options=(--copy-metadata=permissions --suppress-summary --results "$local_root/warmup.json")
     if $has_syq_options; then syq_options+=("${syq_extra[@]}"); fi
     case $tool in
         syq)

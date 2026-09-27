@@ -62,7 +62,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 | Argument / option | Meaning |
 |---|---|
-| `--only-new` | Copy entries found missing; keep metadata of entries found present; adding children requires write access |
+| `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Accept matching contents; report an error for different contents<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Update only when the destination is strictly older; keep ties<br><br>[default: update] |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
@@ -75,7 +75,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow` | Follow symlinks in all directly supplied filesystem paths |
 | `--follow-src` | Follow symlinks in directly supplied source paths |
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
-| `--preserve <FEATURE>` | Preserve selected filesystem metadata or copy special files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Preserve modification times (already the default for named destinations)<br>- -mtime: Leave filesystem modification times as produced by writing<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination |
+| `--copy-metadata <FEATURE>` | Match selected source metadata, including on unchanged files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Match source modification times, including on unchanged files<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination |
 | `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
 | `--sparse` | Turn written zero ranges into sparse holes |
 
@@ -162,14 +162,25 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 ## Update policies
 
+The default `--if-exists=update` updates existing files when their contents
+differ. Use `error-if-different` to accept matching contents and reject differences,
+`error` to require every selected file to be absent, `keep` to leave existing
+files untouched, or `update-if-older` to update strictly older destinations.
+Equal timestamps keep the destination. These choices do not change whether
+size/time or hashes are used for comparison. See
+[existing-file policies](../reference.md#choose-which-existing-files-to-update).
+
 `--into-existing` requires the destination directory to exist but allows new
-files inside it. `--only-new` can add children to an existing directory, but
+files inside it. `--if-exists=keep` can add children to an existing directory, but
 does not change that directory's permissions to make it writable.
 
-`--only-new` cannot combine with `--inplace`: an interrupted write could leave
-a file that a retry skips. Restricted receivers also reject `--as-new --inplace`,
-because direct writes do not enforce that destination condition. S3 and named
-receiving destinations do not support `--inplace`; see
+`--if-exists=keep` and `update-if-older` cannot combine with `--inplace`: an
+interrupted write could leave a file that a retry skips. With
+`--if-exists=error-if-different`, a retry rejects differing final contents,
+including incomplete output from an interrupted in-place copy. The default
+`update` policy can repair that incomplete file. Restricted receivers also
+reject `--as-new --inplace`, because direct writes do not enforce that destination
+condition. S3 and named receiving destinations do not support `--inplace`; see
 [Copy limits](../persistence-reference.md#copy-limits).
 
 These policies do not disable requested pruning. Descriptor-specific
@@ -193,7 +204,8 @@ deleted as extras.
 
 If the source has both `Report.txt` and `report.txt`, a case-insensitive
 destination cannot store both. Syq does not check for that before copying,
-and one file can replace the other. The same problem applies to distinct
+and a later file can replace the earlier one or, with a protective existing-file
+policy, report a conflict. The same problem applies to distinct
 Unicode spellings that the destination treats as one name. Rename the source
 entries or use a destination that can distinguish them. Unsupported names
 are reported as copy errors.
@@ -208,18 +220,22 @@ replace an entry safely; the old entry is kept.
 ## Copying and failures
 
 Syq can copy files while it scans the source. If scanning or copying fails,
-completed files remain and the command reports failure. Retrying can reuse
-completed files and resumable partials.
+completed files remain and the command reports failure. A retry can reuse
+completed files and recoverable partials. Placement conditions and the selected
+existing-file policy still apply: a `-new` placement or `--if-exists=error` can
+reject entries created by the earlier attempt. See
+[resuming a copy](../reference.md#resume-an-interrupted-copy).
 
 ## Metadata details
 
 Source setuid, setgid, and sticky bits are not copied without
-`--preserve=permissions`. Ownership uses numeric IDs. On macOS, an existing
+`--copy-metadata=permissions`. Ownership uses numeric IDs. On macOS, an existing
 destination directory must be readable before syq can temporarily repair
 missing write or search permission.
 
-Modification times are preserved for named file destinations. Output
-descriptors require explicit `--preserve=mtime`; see below.
+Creating or updating named file contents sets the source modification time.
+Unchanged contents require `--copy-metadata=mtime` to update their timestamp. Output
+descriptors require explicit `--copy-metadata=mtime`; see below.
 
 ## File descriptors
 
@@ -240,14 +256,14 @@ A named pipe can use `--into`: `syq cp incoming.fifo --into saved` waits for a
 writer, then saves its bytes as the regular file `saved/incoming.fifo`.
 A symlink to a pipe requires `--follow-src`. Selecting a pipe alongside other
 sources, including through a shell glob, is an error. Directory copies never
-read pipes; `--preserve=specials` copies the pipe itself.
+read pipes; `--copy-metadata=specials` copies the pipe itself.
 
 ### Completion and failures
 
 A named destination is replaced only after the transfer succeeds. The `-new`
 and `-existing` placement conditions apply as usual, before a named pipe is
-opened. S3 new-object writes also refuse replacement if an object appears
-during the upload.
+opened. S3 `-new` placements and `--if-exists=keep` also refuse replacement
+if an object appears during the upload.
 
 If the producer fails halfway through, syq can still successfully save the
 bytes it received: EOF does not tell it whether the producer succeeded.
@@ -269,11 +285,11 @@ unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput.
 
 <a id="selection-and-previews"></a>
 
-`--only-new` skips a destination that exists. Existing directories, S3 key
-prefixes, and dangling symlinks also count as existing for `--only-new`. Skips succeed without reading input or
+`--if-exists=keep` skips a destination that exists. Existing directories, S3 key
+prefixes, and dangling symlinks also count as existing for `--if-exists=keep`. Skips succeed without reading input or
 opening a named FIFO. A shell producer can therefore receive SIGPIPE; in Python, check the writer's
 `skipped` property before producing bytes. An output FD already exists, so
-`--only-new --as-fd N` always skips after validating the source.
+`--if-exists=keep --as-fd N` always skips after validating the source.
 
 Use `--dry-run` to check source and destination placement without reading input,
 opening a named pipe, or changing the destination. It cannot check a payload
@@ -290,7 +306,12 @@ worker count, and `--no-tcp` keeps data on SSH. S3 transfers one object using
 multipart controls; see [Descriptor copies](../object-storage.md#descriptor-copies).
 
 Restart recovery, named receiving destinations, detached execution,
-directory selection, and content comparison are unsupported.
+directory selection, and `--hash` are unsupported.
+`--if-exists=error-if-different` compares an existing named destination with the
+received stream before accepting it; a dry run cannot perform that comparison.
+Output descriptors are already opened by the caller and receive bytes directly;
+they do not apply the per-path existing-file policy (except `keep`, which always
+skips).
 
 ### Descriptor offsets and metadata
 
@@ -305,15 +326,15 @@ destination umask; existing files keep their permissions. S3 uploads store file
 attributes in object metadata.
 
 Output descriptors use the timestamps from normal writes, including when
-appending to an existing file. Add `--preserve=mtime` to copy the source
+appending to an existing file. Add `--copy-metadata=mtime` to copy the source
 modification time instead; this changes the whole destination file's timestamp
-even for a partial write. `--preserve=permissions,ownership` copies those
+even for a partial write. `--copy-metadata=permissions,ownership` copies those
 attributes without changing timestamps. S3 downloads interpret object metadata
 when attributes are requested; time preservation uses S3's modification time if
 no syq attributes are stored.
 
 Input pipes, sockets, and devices have no payload metadata, so they reject
-`--preserve`. Their new named destinations use `0666` limited by the umask
+`--copy-metadata`. Their new named destinations use `0666` limited by the umask
 and the time of the write; existing files keep their permissions.
 Output pipes likewise cannot preserve times, permissions, or ownership. Parent
 directories are created as needed. The source `--cwd` / `--root` options

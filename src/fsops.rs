@@ -889,6 +889,17 @@ impl FsOps {
                     })
             })
             .collect();
+        if request.if_exists == crate::cli::IfExists::Error
+            && destinations
+                .iter()
+                .zip(&permitted)
+                .any(|(entry, permitted)| *permitted && entry.is_some())
+        {
+            return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                anchor,
+                outcome: SmallCopyOutcome::UnsupportedTarget,
+            }));
+        }
         let ticket = self.descriptor_session.register(selection.directory)?;
         let directory = self.descriptor_session.acquire(&ticket)?;
         self.install_destination(directory, &request.request_prefix)?;
@@ -1014,6 +1025,20 @@ impl FsOps {
             }
         }
 
+        if request.if_exists == crate::cli::IfExists::ErrorIfDifferent
+            && destinations
+                .iter()
+                .zip(&unchanged)
+                .any(|(destination, same)| destination.is_some() && !same)
+        {
+            return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                anchor,
+                outcome: SmallCopyOutcome::StagingFailed(wire_error(&anyhow::anyhow!(
+                    "destination contents differ (--if-exists=error-if-different)"
+                ))),
+            }));
+        }
+
         // Stage everything before publishing any final files. A staging
         // failure keeps all sidecars for the fallback engine to resume.
         let mut staged = Vec::with_capacity(request.files.len());
@@ -1088,7 +1113,15 @@ impl FsOps {
                             &item.partial,
                             &item.target,
                             &item.file,
-                            TargetCondition::Any,
+                            if matches!(
+                                request.if_exists,
+                                crate::cli::IfExists::Error
+                                    | crate::cli::IfExists::ErrorIfDifferent
+                            ) {
+                                TargetCondition::Absent
+                            } else {
+                                TargetCondition::Any
+                            },
                         )
                         .err()
                         .map(|error| wire_error(&error)),
@@ -1096,7 +1129,7 @@ impl FsOps {
                     None => {
                         let stat = destination.expect("unchanged file has a destination");
                         let mut repair = if matched_content.is_some() {
-                            request.flags & flags::TIMES
+                            request.matching_flags & flags::TIMES
                         } else {
                             0
                         };

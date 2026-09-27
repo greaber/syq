@@ -30,7 +30,7 @@ def check():
         (destination / 'nested/keep').write_bytes(b'x')
         checks.run(['--from', remote, '--srcs-in', prefix, '--into', destination,
                     '--where', "src.path = 'nested/keep' and src.size > 1B",
-                    '--copy-if', 'not dst.exists or src.size > dst.size'])
+                    '--copy-if', 'not dst.exists or src.size > dst.size', '--if-exists=update'])
         assert (destination / 'nested/keep').read_bytes() == b'longer source'
         assert not (destination / 'nested/tiny').exists()
         copied = checks.PREFIX + '/copy'
@@ -64,6 +64,8 @@ def check():
         checks.request('PUT', prefix + '/nested/', b'')
         marker_copy = checks.PREFIX + '/markers'
         marker_predicate = "src.kind = 'dir' and src.name = 'nested' and src.path = 'nested'"
+        # --where excludes every leaf but still admits directory markers;
+        # --copy-if decides which markers to copy.
         checks.run(['--from', remote, '--srcs-in', prefix, '--to', remote, '--into', marker_copy,
                     '--where', 'false', '--copy-if', marker_predicate])
         assert set(checks.listing(marker_copy + '/')) == {marker_copy + '/nested/'}

@@ -65,6 +65,7 @@ struct Destination {
     mode: u32,
     source_meta: Option<crate::proto::Meta>,
     metadata: super::metadata::Policy,
+    existed: bool,
 }
 impl Drop for Destination {
     fn drop(&mut self) {
@@ -185,6 +186,7 @@ impl FileSession {
         metadata: super::metadata::Policy,
         source_meta: Option<crate::proto::Meta>,
     ) -> Result<Self> {
+        let existed = !matches!(&selected, PinnedPath::Missing(_));
         let new_mode =
             source_meta.as_ref().map_or(0o666, |m| m.mode & 0o777) & !crate::fsops::process_umask();
         let (file, destination) = if write {
@@ -258,6 +260,7 @@ impl FileSession {
                     },
                     source_meta,
                     metadata,
+                    existed,
                 }),
             )
         } else {
@@ -335,6 +338,9 @@ impl FileSession {
                         metadata: None,
                     });
                 }
+                if *write && exists && metadata.if_exists == Some(crate::cli::IfExists::Error) {
+                    bail!("destination already exists (--if-exists=error)");
+                }
                 let size = match &selected {
                     PinnedPath::Leaf(leaf) if leaf.metadata().is_file() => {
                         (!*write).then_some(leaf.metadata().len)
@@ -404,6 +410,35 @@ impl FileSession {
                     "stream completion length mismatch"
                 );
                 if let Some(destination) = &stream.destination {
+                    let protected = matches!(
+                        destination.metadata.if_exists,
+                        Some(crate::cli::IfExists::ErrorIfDifferent | crate::cli::IfExists::Error)
+                    );
+                    if protected && destination.existed {
+                        let existing = destination.root.open_regular_read(&destination.target)?;
+                        anyhow::ensure!(
+                            same_contents(&stream.file, &existing)?,
+                            "destination contents differ (--if-exists=error-if-different)"
+                        );
+                        if let Some(meta) = destination.source_meta.clone() {
+                            crate::fsops::set_meta_file(
+                                &existing,
+                                &meta,
+                                destination.metadata.preserve,
+                            )?;
+                        }
+                        if let Some(attributes) = destination.metadata.overrides {
+                            let mut meta = super::metadata::from_file(&existing.metadata()?);
+                            attributes.apply(&mut meta);
+                            crate::fsops::set_meta_file(
+                                &existing,
+                                &meta,
+                                attributes.apply_flags(),
+                            )?;
+                        }
+                        slot.take();
+                        return Ok(Response::Ok);
+                    }
                     if let Some(mut meta) = destination.source_meta.clone() {
                         meta.mode = destination.mode;
                         crate::fsops::set_meta_file(
@@ -428,11 +463,19 @@ impl FileSession {
                         crate::fsops::set_meta_file(&stream.file, &meta, attributes.apply_flags())?;
                     }
                     stream.file.sync_all()?;
-                    destination.root.rename_regular_if_same(
-                        &destination.temporary,
-                        &destination.target,
-                        (stream.original.dev(), stream.original.ino()),
-                    )?;
+                    if protected {
+                        destination.root.publish_new_regular(
+                            &destination.temporary,
+                            &destination.target,
+                            (stream.original.dev(), stream.original.ino()),
+                        )?;
+                    } else {
+                        destination.root.rename_regular_if_same(
+                            &destination.temporary,
+                            &destination.target,
+                            (stream.original.dev(), stream.original.ino()),
+                        )?;
+                    }
                 } else {
                     stream.unchanged()?;
                 }
@@ -449,6 +492,26 @@ impl FileSession {
         }
         result
     }
+}
+
+fn same_contents(left: &File, right: &File) -> Result<bool> {
+    let size = left.metadata()?.len();
+    if right.metadata()?.len() != size {
+        return Ok(false);
+    }
+    let mut left_bytes = vec![0u8; 64 * 1024];
+    let mut right_bytes = vec![0u8; 64 * 1024];
+    let mut offset = 0;
+    while offset < size {
+        let n = (size - offset).min(left_bytes.len() as u64) as usize;
+        left.read_exact_at(&mut left_bytes[..n], offset)?;
+        right.read_exact_at(&mut right_bytes[..n], offset)?;
+        if left_bytes[..n] != right_bytes[..n] {
+            return Ok(false);
+        }
+        offset += n as u64;
+    }
+    Ok(true)
 }
 
 /// Uses the ordinary range frames and direct payload encoding, confined to

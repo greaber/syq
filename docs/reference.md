@@ -4,8 +4,7 @@
 syq cp project --into backup
 ```
 
-This copies `project` to `backup/project`. Existing files are updated when
-needed; unrelated files stay.
+This copies `project` to `backup/project`. Existing files are updated when their contents differ. Unrelated files stay.
 
 <a id="more-options"></a>
 
@@ -144,13 +143,26 @@ when copying between filesystems with different naming rules.
 
 ## Choose which existing files to update
 
-By default, syq adds missing files and updates files that differ. Use
-`--only-new` to add missing entries and leave existing ones alone.
+By default, syq copies missing files and updates existing files whose contents
+differ. Existing directories remain containers. Choose another policy with `--if-exists`:
 
-```sh
-# Import new files without replacing existing files.
-syq cp --only-new --srcs-in incoming --into archive
-```
+| Value | Existing files |
+|---|---|
+| `error-if-different` | Accept matching contents; reject differences |
+| `error` | Reject every existing file, including identical files |
+| `keep` | Leave contents and metadata alone |
+| `update` (default) | Update differing contents and apply requested metadata |
+| `update-if-older` | Update only when the destination timestamp is strictly older; keep ties |
+
+Comparison is independent of this policy: matching size and modification time
+can establish equality; `--hash` requests content comparison. If
+`error-if-different` cannot establish equality from metadata, local/SSH copies and S3
+uploads/downloads compare contents before accepting an existing regular file.
+Bucket-to-bucket copies require matching object metadata or identifiers; see
+[S3 copies](object-storage.md#copies-between-s3-buckets). Explicit metadata requests apply after
+contents are accepted unchanged. A content conflict leaves that file's metadata
+alone too. `--as-new` and `--into-new` constrain the placement root; `--if-exists`
+applies to individual selected entries.
 
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 
@@ -238,13 +250,25 @@ Ignored paths are also protected from pruning.
 
 ## Resume an interrupted copy
 
-Rerun the same command. Syq skips completed files and can reuse matching parts
-of interrupted files. Partial-file resume is independent of
+Rerunning a copy can reuse completed files and matching parts of interrupted
+files. Placement conditions and `--if-exists` apply on every run. A `-new`
+placement or `--if-exists=error` can therefore prevent a retry once entries have
+been created. Partial-file resume is independent of
 [`block-reuse`](tuning.md#compare-block-reuse-with-full-replacement), which controls
 comparison against an existing final destination. Unless `--inplace` is selected,
 syq assembles each updated file beside the destination and replaces it when
-complete. With `--inplace`, interrupted bytes are in the final file itself;
-reusing them follows the block-reuse policy.
+complete. With `--inplace`, interrupted bytes are in the final file itself.
+With `--if-exists=error-if-different`, a retry rejects a differing final file:
+it cannot distinguish incomplete output from a pre-existing file that must remain
+untouched. Changing to `--if-exists=update` authorizes updates to all differing
+selected files; it does not preserve the original policy. Reusing matching parts
+follows the block-reuse policy.
+
+A copy may temporarily make a newly created directory writable while filling it.
+After interruption, syq cannot distinguish that directory from a pre-existing
+writable directory. A retry treats it as an existing container, so its permissions
+and modification time may differ from an uninterrupted copy. Explicit
+`--copy-metadata=permissions,mtime` makes those attributes match the source.
 
 Partial files may remain after a successful retry. To remove them:
 
@@ -294,16 +318,19 @@ interrupted copy can leave that write permission in place.
 See [Update policies](commands/cp.md#update-policies) before combining
 in-place writes with other copy policies.
 
-## Preserve metadata
+<a id="preserve-metadata"></a>
 
-Syq preserves modification times and copies symlinks as links, like rsync with
-`-t -l`. Use `--preserve=-mtime` to leave modification times as produced by
-writing. `--preserve=mtime` enables preservation again; `times` remains an alias
-for `mtime`. Repeated settings take effect in order, with the last one winning.
-Other preservation features are off unless requested and have no negative form.
-Disabling modification-time preservation can make later copies do more work
-because source and destination times no longer match. Explicit mapping
-`metadata.mtime` still sets the requested destination time.
+## Copy metadata
+
+Creating a named file or updating its contents sets its modification time to
+the source time. Accepting unchanged contents leaves destination metadata alone.
+Use `--copy-metadata=mtime` to make modification times match even on unchanged
+files. If identical files have different modification times, accepting them can
+require reading their full contents again on each run, including downloading an
+S3 object when no usable stored hash is available. Copying `mtime` lets later
+runs use the size/time comparison. Other metadata can be selected the same way, for example
+`--copy-metadata=permissions,ownership`. `times` remains an alias for `mtime`.
+Explicit mapping `metadata.mtime` also sets the requested destination time.
 
 Existing files keep their destination permissions. New files use the
 source read, write, and execute permissions, limited by the destination umask.
@@ -312,25 +339,25 @@ For example, a new script with mode `755` stays executable with umask `022`.
 To preserve source permissions and ownership as well:
 
 ```sh
-syq cp --preserve=permissions,ownership project --into backup
+syq cp --copy-metadata=permissions,ownership project --into backup
 ```
 
 | Syq option | Corresponding rsync option |
 |---|---|
-| `--preserve=permissions` | `-p` |
-| `--preserve=ownership` | `-o -g --numeric-ids` |
-| `--preserve=specials` | `-D` (devices and special files) |
-| `--preserve=hardlinks` | `-H` (regular files) |
-| `--preserve=acls` | `-A` (native ACLs; implies permissions) |
-| `--preserve=xattrs` | `-X` (extended attributes) |
-| `--preserve=atimes` | `-U` (access times) |
-| `--preserve=crtimes` | `-N` (birth times; macOS destination) |
+| `--copy-metadata=permissions` | `-p` |
+| `--copy-metadata=ownership` | `-o -g --numeric-ids` |
+| `--copy-metadata=specials` | `-D` (devices and special files) |
+| `--copy-metadata=hardlinks` | `-H` (regular files) |
+| `--copy-metadata=acls` | `-A` (native ACLs; implies permissions) |
+| `--copy-metadata=xattrs` | `-X` (extended attributes) |
+| `--copy-metadata=atimes` | `-U` (access times) |
+| `--copy-metadata=crtimes` | `-N` (birth times; macOS destination) |
 
 Setting ownership requires suitable destination permissions. See the
 [rsync option definitions](https://download.samba.org/pub/rsync/rsync.1#opt--perms)
 and [metadata details](commands/cp.md#metadata-details).
 
-With `--preserve=hardlinks`, selected names for the same source regular file
+With `--copy-metadata=hardlinks`, selected names for the same source regular file
 share one destination inode. This works for local and ordinary SSH copies,
 including updates, reruns, and `--inplace`. Only names eligible under the
 overwrite policy join the group; links outside the selected sources are not
@@ -355,7 +382,7 @@ or receiving destinations. `-a` retains its existing meaning; add `-H` explicitl
 Add ACLs and xattrs for filesystem archival copies on Linux or macOS:
 
 ```sh
-syq cp --preserve=permissions,ownership,specials,hardlinks,acls,xattrs --srcs-in source --into backup
+syq cp --copy-metadata=permissions,ownership,specials,hardlinks,acls,xattrs --srcs-in source --into backup
 # The rsync-compatible spelling:
 syq rsync -aHAX --numeric-ids source/ backup/
 ```
@@ -399,7 +426,7 @@ rejected. On macOS-to-macOS copies, names are preserved literally.
 | Symlink | Non-regular groups rejected | Not applicable | Attributes on the link itself, where supported |
 | FIFO, device, socket | Non-regular groups rejected | Access ACL, where supported | Selected namespaces, where supported |
 
-Copying special files also requires `--preserve=specials` or `-D` (included in
+Copying special files also requires `--copy-metadata=specials` or `-D` (included in
 `-a`), and creating devices requires suitable privileges. Filesystem restrictions
 on particular attribute namespaces still apply.
 
@@ -415,7 +442,7 @@ native copy defaults select ACLs, xattrs, hardlinks, or access times.
 These options do not preserve filesystem flags such as immutable or append-only,
 restore ctime or inode numbers, or create rsync `--fake-super` backup records.
 
-Use `--preserve=atimes` (rsync `-U`/`--atimes`) to restore access times captured
+Use `--copy-metadata=atimes` (rsync `-U`/`--atimes`) to restore access times captured
 before reading the source. It covers regular files, directories, links themselves,
 and copied special nodes on local and ordinary SSH filesystem copies. Linux
 requires kernel 5.8 or later; macOS support depends on the filesystem. Restoration
@@ -430,7 +457,7 @@ does not promise unchanged source access times, including directory scans and
 symlink reads. Destination access-time preservation remains independently selected
 and restoration errors make the copy unsuccessful.
 
-Use `--preserve=crtimes` (rsync `-N`/`--crtimes`) to preserve birth (creation)
+Use `--copy-metadata=crtimes` (rsync `-N`/`--crtimes`) to preserve birth (creation)
 times. The source filesystem must report birth times and the destination must
 be macOS with a filesystem that permits setting them. Linux destinations reject
 this option before copying. It supports the same named filesystem routes and

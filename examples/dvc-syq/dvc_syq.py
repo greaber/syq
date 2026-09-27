@@ -279,7 +279,7 @@ def download(
     source = {"from_": remote.endpoint} if remote.endpoint else {}
     if not remote.is_s3:
         source["cwd"] = remote.base
-    copy(client, label, entries, into=cache, only_new=True, dry_run=dry_run, **source, **remote.s3_options)
+    copy(client, label, entries, into=cache, if_exists="keep", dry_run=dry_run, **source, **remote.s3_options)
 
     if verify and not dry_run:
         dvc2_files = [obj for obj in objects if not obj.named_after_its_bytes]
@@ -307,11 +307,11 @@ def matches_dvc2_md5(path: Path, md5: str) -> bool:
 
 
 def upload(client: syq.Client, remote: Remote, cache: Path, label: str, objects: list[CacheObject], dry_run: bool) -> None:
-    """Cache to remote. `only_new` skips every object the remote already has."""
+    """Cache to remote. `if_exists="keep"` skips every object the remote already has."""
     entries = [MappingEntry(src=obj.path, dst=obj.path, kind="file") for obj in objects]
     destination = {"to": remote.endpoint} if remote.endpoint else {}
     copy(
-        client, label, entries, cwd=cache, into=remote.base or ".", only_new=True, dry_run=dry_run,
+        client, label, entries, cwd=cache, into=remote.base or ".", if_exists="keep", dry_run=dry_run,
         **destination, **remote.s3_options,
     )
 
@@ -346,7 +346,8 @@ def checkout(client: syq.Client, root: Path, cache: Path, outputs: list[Output],
     if force and not dry_run:
         for file in untracked:  # as `dvc pull --force` does, make tracked directories match exactly
             file.unlink()
-    copy(client, "checkout", entries, cwd=cache, into=root, dry_run=dry_run)
+    copy(client, "checkout", entries, cwd=cache, into=root, dry_run=dry_run,
+         if_exists="update" if force or dry_run else "error-if-different")
 
 
 # --- Commands ---------------------------------------------------------------

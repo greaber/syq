@@ -1095,6 +1095,8 @@ pub struct SmallCopyPayload {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallCopyRequest {
+    pub if_exists: crate::cli::IfExists,
+    pub matching_flags: u8,
     pub hash_policy: crate::hashing::HashPolicy,
     /// Update expression and coordinator's fixed invocation time.
     pub copy_if: Option<(String, i128)>,

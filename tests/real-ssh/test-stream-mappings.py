@@ -127,7 +127,7 @@ def main():
                 assert len(payloads) <= ready <= 2 * len(payloads), diagnostic
                 if name == 'tcp':
                     assert diagnostic.count(b'data connection via tcp ') == 2, diagnostic
-            run(directory, True, upload + ['--only-new'], payloads, skipped=True)
+            run(directory, True, upload + ['--if-exists=keep'], payloads, skipped=True)
             run(directory, True, upload, [b'partial'], abort=True)
             run(directory, False, download, payloads)
             print('PASS: shared stream mappings, skip, and failed publication over ' + name, flush=True)

@@ -116,9 +116,9 @@ class StreamTests(unittest.TestCase):
     def test_skip_is_known_before_producing_and_does_not_commit(self):
         target = self.root / "existing"
         target.write_bytes(b"old")
-        for option, destination in [("only_new", target), ("only_existing", self.root / "missing"),
-                                    ("only_new", self.root)]:
-            with self.client.open_writer(as_=destination, **{option: True}) as out:
+        for option, destination in [({"if_exists": "keep"}, target), ({"only_existing": True}, self.root / "missing"),
+                                    ({"if_exists": "keep"}, self.root)]:
+            with self.client.open_writer(as_=destination, **option) as out:
                 self.assertTrue(out.skipped)
                 self.assertFalse(out.writable())
                 with self.assertRaises(ValueError):
@@ -128,15 +128,15 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"old")
         self.assertFalse((self.root / "missing").exists())
         with self.assertWarnsRegex(FutureWarning, "only_existing.*unsupported"), \
-                self.client.open_writer(as_=target, only_existing=True) as out:
+                self.client.open_writer(as_=target, only_existing=True, if_exists="update") as out:
             self.assertFalse(out.skipped)
             out.write(b"new")
-        with self.client.open_writer(as_=self.root / "new", only_new=True) as out:
+        with self.client.open_writer(as_=self.root / "new", if_exists="keep") as out:
             self.assertFalse(out.skipped)
             out.write(b"created")
         self.assertEqual(target.read_bytes(), b"new")
         inherited = syq.Client(executable=SYQ, timeout=10,
-                               env={**self.env, "SYQ_CP_OPTIONS": "--only-new"})
+                               env={**self.env, "SYQ_CP_OPTIONS": "--if-exists=keep"})
         with inherited.open_writer(as_=target) as out:
             self.assertTrue(out.skipped)
         inherited = syq.Client(executable=SYQ, timeout=10,
@@ -147,7 +147,7 @@ class StreamTests(unittest.TestCase):
 
         async def asynchronous():
             client = syq.AsyncClient(executable=SYQ, env=self.env, timeout=10)
-            async with client.open_writer(as_=target, only_new=True) as out:
+            async with client.open_writer(as_=target, if_exists="keep") as out:
                 self.assertTrue(out.skipped)
             self.assertEqual(out.result.files_excluded, 1)
         asyncio.run(asynchronous())
@@ -229,7 +229,7 @@ class StreamTests(unittest.TestCase):
         with self.assertRaises(syq.SyqInvocationError):
             self.client.open_writer()
         with self.assertRaises(syq.SyqInvocationError):
-            self.client.open_writer(as_=target, as_new=target)
+            self.client.open_writer(if_exists="update", as_=target, as_new=target)
         with self.assertRaises(syq.SyqInvocationError):
             self.client.open_reader("object", cwd=base, root=base)
 
@@ -338,7 +338,7 @@ class StreamTests(unittest.TestCase):
                         target.write_bytes(b'old')
                         error = ValueError('producer failed')
                         try:
-                            with self.client.open_writer(as_=target, **options) as output:
+                            with self.client.open_writer(if_exists="update", as_=target, **options) as output:
                                 wrapper = (io.TextIOWrapper(output, encoding='utf-8') if text
                                            else io.BufferedWriter(output))
                                 with wrapper:
@@ -360,7 +360,7 @@ class StreamTests(unittest.TestCase):
         target = self.root / 'explicit'
         target.write_bytes(b'old')
         for commit in (False, True):
-            output = self.client.open_writer(as_=target)
+            output = self.client.open_writer(if_exists="update", as_=target)
             try:
                 with io.BufferedWriter(output) as buffered:
                     buffered.write(b'new')
@@ -510,7 +510,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
             async with client.open_reader("object", root=root) as input:
                 self.assertEqual(await input.read(), b"existing")
             with self.assertRaises(syq.SyqInvocationError):
-                async with client.open_writer(as_=target, as_new=target):
+                async with client.open_writer(if_exists="update", as_=target, as_new=target):
                     pass
             with self.assertRaises(syq.SyqProcessError):
                 async with client.open_reader("../outside", root=root) as input:
@@ -544,7 +544,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
             for fail in (False, True):
                 target.write_bytes(b'old')
                 try:
-                    async with client.open_writer(as_=target) as output:
+                    async with client.open_writer(if_exists="update", as_=target) as output:
                         await output.write(b'new')
                         await output.close()
                         self.assertEqual(target.read_bytes(), b'old')
@@ -554,7 +554,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(fail)
                 self.assertEqual(target.read_bytes(), b'old' if fail else b'new')
                 self.assertIsNotNone(output._stream._process.process.poll())
-            async with client.open_writer(as_=target) as output:
+            async with client.open_writer(if_exists="update", as_=target) as output:
                 await output.write(b'explicit')
                 await output.commit()
                 self.assertEqual(target.read_bytes(), b'explicit')

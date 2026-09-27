@@ -252,7 +252,7 @@ fn acl_mapping_mode_controls_mask_and_rerun_comparison() {
     let output = syq_cp_in(
         &t.path(""),
         &[
-            "--preserve=acls",
+            "--copy-metadata=acls",
             "--mapping",
             "-",
             "-C",
@@ -270,7 +270,7 @@ fn acl_mapping_mode_controls_mask_and_rerun_comparison() {
         &t.path(""),
         &[
             "--dry-run",
-            "--preserve=acls",
+            "--copy-metadata=acls",
             "--mapping",
             "-",
             "-C",
@@ -848,7 +848,7 @@ fn expressions_keep_unselected_container_attributes() {
         "src.kind = 'file'",
         "--copy-if",
         "src.kind != 'dir'",
-        "--preserve=permissions,xattrs",
+        "--copy-metadata=permissions,xattrs",
     ]);
     let mode = fs::metadata(t.path("dst/existing")).unwrap().mode() & 0o7777;
     fs::set_permissions(t.path("dst/existing"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -901,7 +901,7 @@ fn remote_pull_with_xattrs_tolerates_its_own_writes_to_the_destination_root() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--preserve=xattrs",
+            "--copy-metadata=xattrs",
             "--from",
             "host",
             "--srcs-in",

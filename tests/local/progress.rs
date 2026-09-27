@@ -579,6 +579,7 @@ fn small_push_mtime_precision_matches_stats_dry_run_and_hash() {
             command
                 .args([
                     "cp",
+                    "--if-exists=update",
                     "--syq-path",
                     env!("CARGO_BIN_EXE_syq"),
                     "--no-progress",

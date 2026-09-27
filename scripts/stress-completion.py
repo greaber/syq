@@ -94,7 +94,7 @@ def semantic_cases():
     yield [b'syq', b'receiver', b'enroll', b'--v'], [b'--via']
     yield [b'syq', b'help', b'receiver', b'e'], [b'enroll']
     yield [b'syq', b'completion', b'cache', b'f'], [b'forget']
-    yield [b'syq', b'cp', b'--preserve', b'permissions,ow'], [b'permissions,ownership']
+    yield [b'syq', b'cp', b'--copy-metadata', b'permissions,ow'], [b'permissions,ownership']
     yield [b'syq', b'rsync', b'--syq-ignore', b'--', b'--d'], [b'--delete', b'--delete-excluded', b'--dry-run']
     yield [b'syq', b'cp', b'alpha file', b'--into', b'base', b'--as'], []
     yield [b'syq', b'cp', b'--cwd', b'base', b'--root'], []

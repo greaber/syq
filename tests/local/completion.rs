@@ -245,13 +245,13 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
     }
     assert_completion_candidates(
         &t,
-        &["syq", "cp", "--preserve", "permissions,ow"],
+        &["syq", "cp", "--copy-metadata", "permissions,ow"],
         &["permissions,ownership"],
     );
     assert_completion_candidates(
         &t,
-        &["syq", "cp", "--preserve=permissions,ow"],
-        &["--preserve=permissions,ownership"],
+        &["syq", "cp", "--copy-metadata=permissions,ow"],
+        &["--copy-metadata=permissions,ownership"],
     );
     assert_completion_candidates(
         &t,
@@ -1748,6 +1748,7 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
             let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([
                     "cp",
+                    "--if-exists=update",
                     "--hash",
                     "--no-tcp",
                     "--resource-limits",
@@ -1778,6 +1779,7 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
             let second = Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([
                     "cp",
+                    "--if-exists=update",
                     "--hash",
                     "--no-tcp",
                     "--resource-limits",

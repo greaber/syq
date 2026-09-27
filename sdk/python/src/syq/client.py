@@ -595,13 +595,11 @@ def _s3_arguments(
             argv.append("--s3-header=" + _text_arg(header, label="s3_header"))
 
 
-def _warn_unsupported_copy_options(*, only_existing=False, skip_newer=False,
+def _warn_unsupported_copy_options(*, only_existing=False,
                                    integrity_checking=None) -> None:
     options = []
     if only_existing:
         options.append("only_existing")
-    if skip_newer:
-        options.append("skip_newer")
     if isinstance(integrity_checking, str) and any(
         pair.partition("=")[0] == "compare" for pair in integrity_checking.split(",")
     ):
@@ -638,9 +636,8 @@ def _copy_arguments(
     prune: bool,
     dry_run: bool,
     hash: bool,
-    only_new: bool,
+    if_exists: str | None,
     only_existing: bool,
-    skip_newer: bool,
     no_compress: bool,
     resource_limits: str | None,
     performance_tuning: str | None,
@@ -649,7 +646,7 @@ def _copy_arguments(
     receiver_receipt: str | None,
     ignore: IgnoreSelector | None,
     ignore_from: Selector | None,
-    preserve: str | Iterable[str] | None,
+    copy_metadata: str | Iterable[str] | None,
     open_noatime: bool,
     sparse: bool,
     inplace: bool,
@@ -730,21 +727,17 @@ def _copy_arguments(
     if hash:
         argv.append("--hash")
     _append_text(argv, "--integrity-checking", integrity_checking)
-    _warn_unsupported_copy_options(only_existing=only_existing, skip_newer=skip_newer,
+    _warn_unsupported_copy_options(only_existing=only_existing,
                                    integrity_checking=integrity_checking)
-    if only_new and (only_existing or skip_newer or inplace):
-        raise SyqInvocationError("only_new conflicts with only_existing, skip_newer, and inplace")
+    if if_exists is not None and if_exists not in {"error-if-different", "error", "keep", "update", "update-if-older"}:
+        raise SyqInvocationError("if_exists must be error-if-different, error, keep, update, or update-if-older")
     if only_existing and (into_new is not None or as_new is not None):
         raise SyqInvocationError("only_existing conflicts with into_new and as_new")
-    if skip_newer and inplace:
-        raise SyqInvocationError("skip_newer conflicts with inplace")
-    for enabled, option in (
-        (only_new, "--only-new"),
-        (only_existing, "--only-existing"),
-        (skip_newer, "--skip-newer"),
-    ):
-        if enabled:
-            argv.append(option)
+    if command == "cp":
+        if if_exists is not None:
+            argv.append(f"--if-exists={if_exists}")
+    if only_existing:
+        argv.append("--only-existing")
     if no_compress:
         argv.append("--no-compress")
     _append_text(argv, "--resource-limits", resource_limits)
@@ -776,14 +769,14 @@ def _copy_arguments(
                     "--ignore entries must be text or syq.IgnoreFrom"
                 )
     _append_paths(argv, "--ignore-from", ignore_from)
-    if preserve is not None:
-        attributes = (preserve,) if isinstance(preserve, str) else tuple(preserve)
+    if copy_metadata is not None:
+        attributes = (copy_metadata,) if isinstance(copy_metadata, str) else tuple(copy_metadata)
         for attribute in attributes:
-            if attribute not in {"mtime", "-mtime", "times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes", "crtimes"}:
+            if attribute not in {"mtime", "times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes", "crtimes"}:
                 raise SyqInvocationError(
-                    "--preserve must contain mtime, -mtime, times, permissions, ownership, specials, hardlinks, acls, xattrs, atimes, or crtimes"
+                    "--copy-metadata must contain mtime, times, permissions, ownership, specials, hardlinks, acls, xattrs, atimes, or crtimes"
                 )
-            _append_path_option(argv, "--preserve", attribute)
+            _append_path_option(argv, "--copy-metadata", attribute)
     if open_noatime:
         argv.append("--open-noatime")
     if sparse:
@@ -1056,7 +1049,7 @@ class Client:
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
-        only_new: bool = False,
+        if_exists: str | None = None,
         only_existing: bool = False,
         dry_run: bool = False,
         stats: bool = False,
@@ -1070,7 +1063,7 @@ class Client:
         from ._streams import _Process, arguments, StreamWriter
         argv = arguments(
             executable=self._executable_value(), writing=True, path=as_, endpoint=to,
-            options=dict(only_new=only_new, only_existing=only_existing, dry_run=dry_run, as_new=as_new, as_existing=as_existing,
+            options=dict(if_exists=if_exists, only_existing=only_existing, dry_run=dry_run, as_new=as_new, as_existing=as_existing,
                          rsh=rsh, syq_path=syq_path, pscope=pscope,
                          no_bootstrap=no_bootstrap, no_compress=no_compress,
                          no_tcp=no_tcp, tcp_plain=tcp_plain,
@@ -1112,7 +1105,7 @@ class Client:
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
-        only_new: bool = False,
+        if_exists: str | None = None,
         only_existing: bool = False,
         dry_run: bool = False,
         stats: bool = False,
@@ -1126,7 +1119,7 @@ class Client:
         from ._streams import _Process, arguments, StreamReader
         argv = arguments(
             executable=self._executable_value(), writing=False, path=src, endpoint=from_,
-            options=dict(only_new=only_new, only_existing=only_existing, dry_run=dry_run, cwd=cwd, root=root,
+            options=dict(if_exists=if_exists, only_existing=only_existing, dry_run=dry_run, cwd=cwd, root=root,
                          rsh=rsh, syq_path=syq_path, pscope=pscope,
                          no_bootstrap=no_bootstrap, no_compress=no_compress,
                          no_tcp=no_tcp, tcp_plain=tcp_plain,
@@ -1244,9 +1237,8 @@ class Client:
         dry_run: bool = False,
         hash: bool = False,
         integrity_checking: str | None = None,
-        only_new: bool = False,
+        if_exists: str | None = None,
         only_existing: bool = False,
-        skip_newer: bool = False,
         where: str | None = None,
         copy_if: str | None = None,
         no_compress: bool = False,
@@ -1272,7 +1264,7 @@ class Client:
         receiver_receipt: str | None = None,
         ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
-        preserve: str | Iterable[str] | None = None,
+        copy_metadata: str | Iterable[str] | None = None,
         open_noatime: bool = False,
         sparse: bool = False,
         inplace: bool = False,
@@ -1325,9 +1317,8 @@ class Client:
             dry_run=dry_run,
             hash=hash,
             integrity_checking=integrity_checking,
-            only_new=only_new,
+            if_exists=if_exists,
             only_existing=only_existing,
-            skip_newer=skip_newer,
             where=where,
             copy_if=copy_if,
             no_compress=no_compress,
@@ -1338,7 +1329,7 @@ class Client:
             receiver_receipt=receiver_receipt,
             ignore=ignore,
             ignore_from=ignore_from,
-            preserve=preserve,
+            copy_metadata=copy_metadata,
             open_noatime=open_noatime,
             sparse=sparse,
             inplace=inplace,
@@ -1551,9 +1542,8 @@ class Client:
             prune=False,
             dry_run=False,
             hash=False,
-            only_new=False,
+            if_exists=None,
             only_existing=False,
-            skip_newer=False,
             no_compress=False,
             resource_limits=None,
             performance_tuning=None,
@@ -1562,7 +1552,7 @@ class Client:
             receiver_receipt=None,
             ignore=None,
             ignore_from=None,
-            preserve=None,
+            copy_metadata=None,
             open_noatime=False,
             sparse=False,
             inplace=False,

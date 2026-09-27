@@ -29,7 +29,7 @@ fn native_hash_repairs_equal_metadata_content_mismatches() {
             write(&t.path(&format!("{destination}/extra")), b"remove");
         }
 
-        args.insert(1, "--hash");
+        args.extend(["--hash", "--if-exists=update"]);
         run_native_ok(&args);
         assert_eq!(read(&t.path(&format!("{destination}/file"))), expected);
         if prune {
@@ -125,6 +125,7 @@ fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
         write(&t.path("destination"), &previous);
         let output = native_syq(&[
             "cp",
+            "--if-exists=update",
             &t.s("src/source"),
             "--as",
             &t.s("destination"),
@@ -156,6 +157,7 @@ fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
     let copy = |results: &str| {
         let output = native_syq(&[
             "cp",
+            "--if-exists=update",
             "--mapping",
             &expected_mapping(
                 &t,
@@ -167,7 +169,7 @@ fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
             &t.s("src"),
             "--into",
             &t.s(""),
-            "--preserve=permissions",
+            "--copy-metadata=permissions",
             "--results",
             &t.s(results),
         ]);
@@ -193,6 +195,7 @@ fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
     set_mtime(&t.path("src/source"), 1_700_000_000);
     let output = native_syq(&[
         "cp",
+        "--if-exists=update",
         "--hash",
         "--mapping",
         &expected_mapping(
@@ -231,6 +234,7 @@ fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command.args([
             "cp",
+            "--if-exists=update",
             "--mapping",
             &expected_mapping(&t, "source", name, expected),
             "-C",
@@ -270,6 +274,7 @@ fn hash_policy_expected_mismatch_preserves_destination() {
         write(&t.path("destination"), b"previous contents");
         let output = native_syq(&[
             "cp",
+            "--if-exists=update",
             "--mapping",
             &expected_mapping(
                 &t,
@@ -367,6 +372,7 @@ fn hash_policy_xxh3_compares_repairs_and_previews() {
     // The default metadata comparison cannot detect this same-size, same-time edit.
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--src",
         &t.s("src/source"),
         "--as",
@@ -375,6 +381,7 @@ fn hash_policy_xxh3_compares_repairs_and_previews() {
     assert_eq!(read(&t.path("destination")), bad);
     run_native_ok(&[
         "cp",
+        "--if-exists=update",
         "--src",
         &t.s("src/source"),
         "--as",
@@ -387,6 +394,7 @@ fn hash_policy_xxh3_compares_repairs_and_previews() {
     let preview = |name: &str, changed: bool| {
         let output = native_syq(&[
             "cp",
+            "--if-exists=update",
             "--dry-run",
             "--src",
             &t.s("src/source"),
@@ -482,7 +490,7 @@ fn small_push_quick_check_uses_the_same_source_snapshot_as_the_engine() {
                 "cp",
                 "--syq-path",
                 env!("CARGO_BIN_EXE_syq"),
-                "--preserve=permissions",
+                "--copy-metadata=permissions",
                 "--no-progress",
             ])
             .arg(t.path("source"))
@@ -674,9 +682,10 @@ fn dry_run_hash_compares_contents_and_metadata_without_writing() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command.args([
             "cp",
+            "--if-exists=update",
             "--dry-run",
             "--hash",
-            "--preserve=permissions",
+            "--copy-metadata=permissions",
             "--ignore=ignored",
             "--performance-tuning=workers=2",
             "--rsh",
@@ -771,6 +780,7 @@ fn dry_run_hash_mapping_reports_source_names_and_timestamp_only_changes() {
         let destination = t.s("");
         let mut args = vec![
             "cp",
+            "--copy-metadata=mtime",
             "--dry-run",
             "--mapping",
             &mapping,
@@ -804,9 +814,12 @@ fn dry_run_hash_mapping_reports_source_names_and_timestamp_only_changes() {
         );
         assert_eq!(
             records.last().unwrap()["files_transferred"],
-            u64::from(!hash)
+            if hash { 0 } else { 1 }
         );
-        assert_eq!(records.last().unwrap()["files_unchanged"], u64::from(hash));
+        assert_eq!(
+            records.last().unwrap()["files_unchanged"],
+            if hash { 1 } else { 0 }
+        );
         assert_eq!(
             fs::metadata(t.path("output")).unwrap().mtime(),
             1_700_000_001

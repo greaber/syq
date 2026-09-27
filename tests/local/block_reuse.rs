@@ -192,6 +192,7 @@ fn off_preserves_expected_hash_failure_and_old_destination() {
     let wrong = format!("blake3:{}", "0".repeat(64));
     let output = native_syq(&[
         "cp",
+        "--if-exists=update",
         "--mapping",
         &hashing::expected_mapping(&t, "source", "destination", Some(&wrong)),
         "-C",
