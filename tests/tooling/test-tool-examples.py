@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Check that comparison coverage cannot silently become a capability claim."""
+from support import ROOT
+
 from html.parser import HTMLParser
 import json
 from pathlib import Path
@@ -27,7 +29,7 @@ class Examples(HTMLParser):
 class ComparisonCoverage(unittest.TestCase):
     def setUp(self):
         parser = Examples()
-        path = Path(__file__).resolve().parent.parent / "docs/assets/tool-examples.html"
+        path = ROOT / "docs/assets/tool-examples.html"
         parser.feed(path.read_text())
         self.groups = parser.groups
 

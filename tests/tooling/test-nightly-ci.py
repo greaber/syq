@@ -1,4 +1,6 @@
 """Check nightly selection without dispatching CI or requiring credentials."""
+from support import ROOT, SCRIPTS
+
 import contextlib
 import importlib.util
 import io
@@ -10,7 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location("nightly", Path(__file__).with_name("nightly-ci.py"))
+spec = importlib.util.spec_from_file_location("nightly", SCRIPTS / "nightly-ci.py")
 nightly = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nightly)
 
@@ -42,7 +44,7 @@ class NightlyTests(unittest.TestCase):
             self.invoke([{"head_sha": "missing"}], subprocess.CalledProcessError(128, "git"))
 
     def test_schedule_scope_runs_skips_and_propagates_api_failure(self):
-        root = Path(__file__).resolve().parent.parent
+        root = ROOT
         sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
         with tempfile.TemporaryDirectory() as tmp:
             event = Path(tmp) / "event.json"

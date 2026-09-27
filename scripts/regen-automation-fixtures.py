@@ -7,8 +7,14 @@ fields (run_id, started_at, syq_version, elapsed_ms, copying_elapsed_ms)
 get fixed values, and progress records are dropped with seq renumbered:
 whether a fast run emits its first sample before finishing is a race, and a
 stream with no progress records is itself a real possible stream.
+
+With --check, regenerate into a temporary directory and fail if the result
+differs from the committed fixtures, leaving them untouched. With --no-build,
+use the existing target/debug/syq instead of building it first, as CI does
+after building the test binaries.
 """
 import datetime
+import difflib
 import json
 import os
 from pathlib import Path
@@ -19,6 +25,7 @@ import tempfile
 
 REPOSITORY = Path(os.path.abspath(__file__)).parent.parent
 OUT = REPOSITORY / "tests/fixtures/automation"
+output_directory = OUT
 SYQ = REPOSITORY / "target/debug/syq"
 
 MAPPING_MANIFEST = "\n".join([
@@ -45,7 +52,7 @@ def normalize(raw, fixture):
             record["started_at"] = 1756800000
             record["syq_version"] = "0.0.0"
         output.append(json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n")
-    (OUT / fixture).write_text("".join(output), encoding="utf-8")
+    (output_directory / fixture).write_text("".join(output), encoding="utf-8")
 
 
 def syq(directory, *args, stdin="", check=True):
@@ -69,9 +76,37 @@ def touch_tree(root, stamp):
         os.utime(path, (seconds, seconds), follow_symlinks=False)
 
 
+def stale(regenerated):
+    """Print how the committed fixtures differ from REGENERATED; return whether they do."""
+    names = lambda directory: {name for name in os.listdir(directory) if not name.startswith(".")}
+    differs = False
+    for name in sorted(names(OUT) | names(regenerated)):
+        committed, fresh = ([] if not (directory / name).exists() else
+                            (directory / name).read_text(encoding="utf-8").splitlines(keepends=True)
+                            for directory in (OUT, regenerated))
+        if committed != fresh:
+            differs = True
+            sys.stdout.writelines(difflib.unified_diff(
+                committed, fresh, f"committed/{name}", f"regenerated/{name}"))
+    return differs
+
+
 def main():
-    subprocess.run(["cargo", "build", "--quiet", "--manifest-path", str(REPOSITORY / "Cargo.toml")],
-                   check=True)
+    global output_directory
+    arguments = sys.argv[1:]
+    if any(argument not in ("--check", "--no-build") for argument in arguments) or \
+            len(set(arguments)) != len(arguments):
+        sys.exit("usage: scripts/regen-automation-fixtures.py [--check] [--no-build]")
+    check = "--check" in arguments
+    if check:
+        checked = tempfile.TemporaryDirectory()
+        output_directory = Path(checked.name)
+    if "--no-build" in arguments:
+        if not SYQ.is_file():
+            sys.exit(f"--no-build: {SYQ} does not exist")
+    else:
+        subprocess.run(["cargo", "build", "--quiet", "--manifest-path", str(REPOSITORY / "Cargo.toml")],
+                       check=True)
     OUT.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as work:
         work = Path(work)
@@ -118,6 +153,10 @@ def main():
         write(directory / "dst/keep.txt", "k")
         write(directory / "dst/extra-1.txt", "x")
         write(directory / "dst/extra-2.txt", "x")
+        # Pin equal mtimes: whether keep.txt's two copies were written within the
+        # same timestamp is otherwise a race between unchanged and transferred.
+        touch_tree(directory / "src", "2024-07-01T12:00:00Z")
+        touch_tree(directory / "dst", "2024-07-01T12:00:00Z")
         syq(directory, "cp", "--performance-tuning", "workers=1", "--prune", "--max-delete", "1",
             "--srcs-in", "src", "--into", "dst", "--results", "raw.ndjson", "-q", check=False)
         normalize(directory / "raw.ndjson", "refused.ndjson")
@@ -174,6 +213,13 @@ def main():
             "victim", "--results", "raw.ndjson", "-q", check=False)
         normalize(directory / "raw.ndjson", "rm-failed.ndjson")
 
+    if check:
+        if stale(output_directory):
+            print("the committed automation fixtures are stale; "
+                  "run scripts/regen-automation-fixtures.py and review the change")
+            return 1
+        print("the committed automation fixtures match regenerated output")
+        return 0
     count = sum(1 for name in os.listdir(OUT) if not name.startswith("."))
     print(f"regenerated {count} fixtures in {OUT}")
     return 0

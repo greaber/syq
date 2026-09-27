@@ -4,6 +4,8 @@
 select-trusted-pr.jq runs in the prepare-python-sdk workflow, so its checks
 need jq.
 """
+from support import SCRIPTS
+
 import hashlib
 import json
 from pathlib import Path
@@ -14,7 +16,6 @@ import sys
 import tempfile
 import unittest
 
-SCRIPTS = Path(__file__).resolve().parent
 REPOSITORY = SCRIPTS.parent
 SDK = REPOSITORY / "sdk/python"
 MANIFEST = SDK / "src/syq/syq-release-manifest.json"

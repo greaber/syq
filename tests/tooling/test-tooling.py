@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the shared helpers in scripts/tooling.py."""
+import support  # Make production tooling importable.
+
 import os
 import signal
 import subprocess
@@ -9,7 +11,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tooling  # noqa: E402
 
 

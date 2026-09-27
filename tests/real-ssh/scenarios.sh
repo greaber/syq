@@ -458,9 +458,16 @@ test ! -e "$receive_root/cancelled-policy"
 printf 'case: native Linux notification actions control return copies\n'
 dbus-run-session -- python3 /usr/local/libexec/syq-test-receive-notifications.py
 
+printf 'case: return copies hand off between server PATH builds\n'
 python3 /usr/local/libexec/syq-test-return-handoff.py
+
+printf 'case: forward copies authorized through the return connection\n'
 python3 /usr/local/libexec/syq-test-forward-copy.py
+
+printf 'case: remote commands run through the return connection\n'
 python3 /usr/local/libexec/syq-test-return-exec.py
+
+printf 'case: storage authorization through the return connection\n'
 python3 /usr/local/libexec/syq-test-storage-authorization.py
 
 printf 'case: explicit automatic approval supports unattended copies\n'
@@ -1167,6 +1174,7 @@ syq cp --from source --srcs-in /tmp/syq-real-ssh/tuning-batches \
 assert_same_tree source /tmp/syq-real-ssh/tuning-batches \
     destination /tmp/syq-real-ssh/tuning-batches tuning-batches
 
+# Final checks after every selected case.
 if ssh source 'pgrep -x syq >/dev/null' || ssh destination 'pgrep -x syq >/dev/null'; then
     echo 'a remote syq process survived the attached test suite' >&2
     exit 1

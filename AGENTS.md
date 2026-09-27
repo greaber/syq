@@ -455,9 +455,9 @@ keywords, URLs, and signing domains, not just Rust types.
   or regenerating every fixture, does not demonstrate compatibility. Name the
   baseline and result in the PR description, including any authorized break.
 
-The public support baseline and duration are not yet decided. Surface that
-choice when it matters; do not add speculative compatibility implementations
-or promise indefinite support.
+Files shared between syq versions, because they hold information that should
+persist through updates, should stay readable by newer versions. Breaking
+that compatibility needs an explicit discussion with the user first.
 
 ## Release secrets
 
@@ -618,7 +618,8 @@ from the suite's scenarios, not from which files changed: copy planning,
 expression and selection semantics, directory creation, and restricted-receiver
 behavior reach both suites even when no SSH or S3 code changed. When a suite is
 relevant, run all of it at the final commit before handoff. Its cases interact,
-so hand-picked cases can miss regressions. Neither suite is part of
+so hand-picked cases can miss regressions. `scripts/test-real-ssh.py --case`
+runs selected cases while iterating. Neither suite is part of
 `cargo test` or post-merge CI; full nightly and manual `ci.yml` runs include
 both.
 
@@ -638,7 +639,6 @@ and reporting exactly what was and was not verified before review. Post-merge
 workflows select affected areas and do not run the local suites; nightly runs
 execute the complete suites, including both local suites, when test inputs
 have changed. Nightly should run every test in the repository. Leaving a test
-out of nightly needs the user's explicit agreement, recorded here with its
-reason. Full validation remains required before
-release. Pay particular attention to remote, TCP, platform-specific,
+out of nightly needs the user's explicit agreement. Full validation remains
+required before release. Pay particular attention to remote, TCP, platform-specific,
 and performance behavior when choosing local checks.

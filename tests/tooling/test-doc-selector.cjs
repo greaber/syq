@@ -4,7 +4,7 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
-const script = fs.readFileSync(path.join(__dirname, '../theme/version-selector.js'), 'utf8');
+const script = fs.readFileSync(path.join(__dirname, '../../theme/version-selector.js'), 'utf8');
 
 function browser() {
   const handlers = {};

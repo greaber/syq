@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Exercise release selection and generated navigation without network access."""
 
+from support import SCRIPTS
+
 import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
 from html.parser import HTMLParser
 
-spec = importlib.util.spec_from_file_location("doc_site", Path(__file__).with_name("build-doc-site.py"))
+spec = importlib.util.spec_from_file_location("doc_site", SCRIPTS / "build-doc-site.py")
 site = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(site)
 

@@ -4,6 +4,8 @@
 Exercises scripts/run-generated-sdk-post-merge-ci.py against a fake gh, and the
 ci.yml `sdks` aggregate job against every dependency result.
 """
+from support import SCRIPTS
+
 import os
 from pathlib import Path
 import re
@@ -11,7 +13,6 @@ import subprocess
 import tempfile
 import unittest
 
-SCRIPTS = Path(__file__).resolve().parent
 MERGE_SHA = "0123456789abcdef0123456789abcdef01234567"
 STALE_SHA = "a" * 40
 BRANCH = "automation/python-sdk-v0.1.9"

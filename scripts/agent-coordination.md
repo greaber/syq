@@ -248,7 +248,7 @@ before removing them with normal Git/tmux commands.
 ## Checks
 
 ```sh
-python3 scripts/test-agent-coordination.py
+python3 tests/tooling/test-agent-coordination.py
 ```
 
 Tests use disposable state and repositories, exercise concurrent claims and
