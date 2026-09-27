@@ -100,6 +100,7 @@ fn overflow_limits_and_zero_division() {
 fn partial_facts_keep_unread_metadata_distinct_from_null() {
     let listed = Facts::S3Listing {
         size: 12,
+        directory_marker: false,
         last_modified: Some((123, 0)),
     };
     for (expression, expected) in [
@@ -142,32 +143,32 @@ fn partial_facts_keep_unread_metadata_distinct_from_null() {
 }
 
 #[test]
-fn directory_selection_uses_the_same_predicate_as_files() {
+fn directory_selection_bypasses_where_but_not_copy_if() {
     let directory = File {
         exists: true,
         kind: Some(Kind::Dir),
         ..File::default()
     };
-    assert!(!Policy::compile(Some("src.kind = 'file'"), None)
-        .unwrap()
-        .selects(&directory, b"dir")
+    let policy = Policy::compile(Some("1 / 0 = 0"), Some("false")).unwrap();
+    assert!(policy.selects(&directory, b"dir").unwrap());
+    assert!(!policy
+        .permits(&directory, b"dir", &File::default(), b"dir")
         .unwrap());
-    assert!(Policy::compile(Some("1 / 0 = 0"), None)
-        .unwrap()
-        .selects(&directory, b"dir")
-        .is_err());
+    // A listed marker is a directory without reading its metadata, because
+    // syq rejects file or symlink metadata under marker-shaped keys. The
+    // failing expression shows --where is not evaluated for it.
     assert_eq!(
-        Policy::compile(Some("src.name = 'keep'"), None)
-            .unwrap()
+        policy
             .selects_known(
                 Facts::S3Listing {
                     size: 0,
+                    directory_marker: true,
                     last_modified: None
                 },
                 b"dir"
             )
             .unwrap(),
-        Some(false)
+        Some(true)
     );
 }
 
@@ -175,6 +176,7 @@ fn directory_selection_uses_the_same_predicate_as_files() {
 fn service_time_is_distinct_and_available_from_listing() {
     let facts = Facts::S3Listing {
         size: 4,
+        directory_marker: false,
         last_modified: Some((123, 123_456_789)),
     };
     let policy = Policy::compile(
