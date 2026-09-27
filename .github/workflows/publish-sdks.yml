@@ -1,15 +1,16 @@
-name: publish SDKs
+name: build and publish prepared Python SDK releases
 
 on:
-  # Manual runs build and test Python distributions without publishing.
+  # Manual runs test prepared release packages without publishing.
+  # For development, ci.yml tests Python and native code from the same commit.
   workflow_dispatch:
     inputs:
       candidate_commit:
-        description: Expected SDK merge commit for a preparation build
+        description: Expected prepared SDK commit with an updated native release pin (use ci.yml for development checks)
         type: string
         default: ''
       rebuild:
-        description: Rebuild Python distributions and compare complete output bytes
+        description: Rebuild prepared release packages and compare complete output bytes
         type: boolean
         default: false
   push:
