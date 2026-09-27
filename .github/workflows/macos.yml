@@ -291,7 +291,7 @@ jobs:
             tests/tooling/test-release-timings.py \
             tests/tooling/test-find-release-build.py \
             tests/tooling/test-installer.py \
-            tests/tooling/test-homebrew-formula.py
+            scripts/test-homebrew-formula.py
           do
             echo "=== $suite"
             if ! "$suite"; then

@@ -178,7 +178,7 @@ include Cargo package builds, so run the complete suite from a clean checkout.
 Add ordinary tooling tests to that directory; full nightly and manual CI discover
 them without a workflow change. Python tests can import `ROOT` and `SCRIPTS` from
 `support` to locate the checkout and import production tooling. Docker, Nix, and
-platform-specific suites retain their own setup and CI entry points. Benchmarks
+platform-specific suites such as Homebrew retain their own setup and CI entry points. Benchmarks
 and release operations live outside the discovered test directory.
 
 For docs, run `python3 scripts/check-doc-links.py` and build with the pinned mdBook.

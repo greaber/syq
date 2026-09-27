@@ -231,7 +231,7 @@ def classify(paths, preparation_only):
                      "tests/tooling/test-python-sdk-release-tools.py",
                      "scripts/verify-python-release-preparation.py"):
             path_tooling = python_sdk = True
-        elif matches(path, "scripts/generate-homebrew-formula.py", "tests/tooling/test-homebrew-formula.py",
+        elif matches(path, "scripts/generate-homebrew-formula.py", "scripts/test-homebrew-formula.py",
                      "scripts/generate-installer.py", "tests/tooling/test-installer.py"):
             path_tooling = True
         elif matches(path, "tests/real-ssh/*"):

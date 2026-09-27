@@ -2,8 +2,8 @@
 """Check that workflows and release instructions name scripts that exist.
 
 Scans .github/workflows/*.yml, .agents/skills/, RELEASING.md, and
-sdk/RELEASING.md for `scripts/...` and `tests/tooling/...` paths. Every referenced file must be
-tracked. A script run directly as a command in a workflow or a Markdown code
+sdk/RELEASING.md for `scripts/...` and `tests/tooling/...` paths. Every referenced
+file must be tracked. A script run directly as a command in a workflow or a Markdown code
 block, rather than through an interpreter such as `python3 scripts/x.py`, must
 also be committed as executable with a `#!` line. Release workflows run only
 at release time, so this catches a renamed or non-executable script before then.
