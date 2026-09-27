@@ -245,14 +245,14 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
         if CASE == 'existing-policy':
             for payload in (b'stored', DATA):
                 STATE.update(existing=payload, metadata={}, published=None)
-                success(run(put, input=payload, env=env))
+                success(run(put + ["--if-exists=error-if-different"], input=payload, env=env))
                 assert STATE['published'] is None
-                failure(run(put, input=b'x' * len(payload), env=env))
+                failure(run(put + ['--if-exists=error-if-different'], input=b'x' * len(payload), env=env))
                 assert STATE['published'] is None
                 before = STATE.get('reads', 0)
                 failure(run(put + ['--if-exists=error'], input=payload, env=env))
                 assert STATE.get('reads', 0) == before
-                success(run(put + ['--if-exists=update'], input=b'x' * len(payload), env=env))
+                success(run(put, input=b'x' * len(payload), env=env))
                 assert STATE['published'] == b'x' * len(payload)
             for payload in (b'stored', DATA):
                 STATE.update(existing=payload, metadata={
@@ -265,7 +265,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 source.write_bytes(payload)
                 os.utime(source, (20, 20))
                 with source.open('rb') as stream:
-                    success(run(put + ['--copy-metadata=mtime'], stdin=stream, env=env))
+                    success(run(put + ['--copy-metadata=mtime', '--if-exists=error-if-different'], stdin=stream, env=env))
                 assert STATE.get('metadata_changed')
                 assert STATE['published'] is None
             failure(run(base + ['--to', 's3://bucket', '--as-new', 'object'], input=b'stored', env=env))

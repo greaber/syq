@@ -109,14 +109,25 @@ fn file(path: &Path, bytes: &[u8], time: u64) {
 #[test]
 fn existing_uploads_obey_policy_and_update_only_requested_metadata() {
     for (contents, extra, succeeds, writes) in [
-        (b"stored".as_slice(), &[][..], true, false),
+        (
+            b"stored".as_slice(),
+            &["--if-exists=error-if-different"][..],
+            true,
+            false,
+        ),
         (
             b"stored".as_slice(),
             &["--if-exists=error"][..],
             false,
             false,
         ),
-        (b"change".as_slice(), &[][..], false, false),
+        (b"change".as_slice(), &[][..], true, true),
+        (
+            b"change".as_slice(),
+            &["--if-exists=error-if-different"][..],
+            false,
+            false,
+        ),
         (b"change".as_slice(), &["--if-exists=keep"][..], true, false),
         (
             b"change".as_slice(),
@@ -126,7 +137,7 @@ fn existing_uploads_obey_policy_and_update_only_requested_metadata() {
         ),
         (
             b"stored".as_slice(),
-            &["--copy-metadata=mtime"][..],
+            &["--copy-metadata=mtime", "--if-exists=error-if-different"][..],
             true,
             true,
         ),
@@ -155,6 +166,13 @@ fn existing_downloads_obey_policy_and_leave_unselected_metadata_alone() {
             &[][..],
             true,
             b"stored".as_slice(),
+            10,
+        ),
+        (
+            b"stored".as_slice(),
+            &["--if-exists=error-if-different"][..],
+            true,
+            b"stored".as_slice(),
             20,
         ),
         (
@@ -167,6 +185,13 @@ fn existing_downloads_obey_policy_and_leave_unselected_metadata_alone() {
         (
             b"change".as_slice(),
             &[][..],
+            true,
+            b"stored".as_slice(),
+            10,
+        ),
+        (
+            b"change".as_slice(),
+            &["--if-exists=error-if-different"][..],
             false,
             b"change".as_slice(),
             20,
@@ -187,7 +212,7 @@ fn existing_downloads_obey_policy_and_leave_unselected_metadata_alone() {
         ),
         (
             b"stored".as_slice(),
-            &["--copy-metadata=mtime"][..],
+            &["--copy-metadata=mtime", "--if-exists=error-if-different"][..],
             true,
             b"stored".as_slice(),
             10,
@@ -275,6 +300,7 @@ fn metadata_only_upload_to_foreign_object_keeps_unselected_defaults() {
             "--as",
             "object",
             "--copy-metadata=mtime",
+            "--if-exists=error-if-different",
         ],
     );
     assert!(output.status.success(), "{}", output_text(&output));

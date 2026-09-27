@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn default_errors_on_different_contents_without_changing_metadata() {
+fn error_if_different_leaves_contents_and_metadata_alone() {
     let t = Tmp::new();
     write(&t.path("src"), b"source");
     write(&t.path("dst"), b"target");
@@ -16,6 +16,7 @@ fn default_errors_on_different_contents_without_changing_metadata() {
             "--as",
             &t.s("dst"),
             "--copy-metadata=mtime,permissions",
+            "--if-exists=error-if-different",
             extra,
         ]);
         assert!(!output.status.success(), "{output:?}");
@@ -108,10 +109,22 @@ fn matching_symlink_is_accepted_and_different_target_is_rejected() {
     let t = Tmp::new();
     std::os::unix::fs::symlink("first", t.path("src")).unwrap();
     std::os::unix::fs::symlink("first", t.path("dst")).unwrap();
-    run_native_ok(&["cp", &t.s("src"), "--as", &t.s("dst")]);
+    run_native_ok(&[
+        "cp",
+        "--if-exists=error-if-different",
+        &t.s("src"),
+        "--as",
+        &t.s("dst"),
+    ]);
     fs::remove_file(t.path("src")).unwrap();
     std::os::unix::fs::symlink("second", t.path("src")).unwrap();
-    let output = native_syq(&["cp", &t.s("src"), "--as", &t.s("dst")]);
+    let output = native_syq(&[
+        "cp",
+        "--if-exists=error-if-different",
+        &t.s("src"),
+        "--as",
+        &t.s("dst"),
+    ]);
     assert!(!output.status.success());
     assert_eq!(fs::read_link(t.path("dst")).unwrap(), Path::new("first"));
 }
@@ -156,6 +169,7 @@ fn hardlink_followers_reject_different_contents_in_preview_and_copy() {
             &dst,
             "--hash",
             "--copy-metadata=hardlinks",
+            "--if-exists=error-if-different",
         ];
         if preview {
             args.push("--dry-run");
@@ -219,4 +233,46 @@ fn previous_partials_remain_reusable_without_an_option() {
     let data = fs::read_to_string(t.path("results.jsonl")).unwrap();
     let result: serde_json::Value = serde_json::from_str(data.lines().last().unwrap()).unwrap();
     assert_eq!(result["bytes_unchanged"], 3 << 20, "{result}");
+}
+
+#[test]
+fn default_updates_selected_files_and_prunes_independently() {
+    for extra in [
+        vec![],
+        vec!["--prune"],
+        vec!["--copy-if", "src.size > 0B"],
+        vec!["--inplace"],
+    ] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), b"replacement");
+        write(&t.path("dst/file"), b"old");
+        write(&t.path("dst/extra"), b"extra");
+        set_mtime(&t.path("src/file"), 123);
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let mut args = vec!["cp", "--srcs-in", &src, "--into", &dst];
+        args.extend_from_slice(&extra);
+        run_native_ok(&args);
+        assert_eq!(read(&t.path("dst/file")), b"replacement");
+        assert_eq!(fs::metadata(t.path("dst/file")).unwrap().mtime(), 123);
+        assert_eq!(t.path("dst/extra").exists(), !extra.contains(&"--prune"));
+    }
+}
+
+#[test]
+fn prune_does_not_require_permission_to_replace_source_matches() {
+    let t = Tmp::new();
+    write(&t.path("src/new"), b"new");
+    write(&t.path("dst/extra"), b"extra");
+    run_native_ok(&[
+        "cp",
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+        "--if-exists=error",
+        "--prune",
+    ]);
+    assert_eq!(read(&t.path("dst/new")), b"new");
+    assert!(!t.path("dst/extra").exists());
 }

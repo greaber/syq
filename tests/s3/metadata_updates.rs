@@ -154,6 +154,7 @@ fn metadata_only_bucket_copy_uses_destination_bytes_and_attributes() {
                 "--as",
                 "copied",
                 "--copy-metadata=permissions",
+                "--if-exists=error-if-different",
                 "--performance-tuning=s3-part-size=5G",
             ])
             .capture_output()

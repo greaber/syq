@@ -503,7 +503,7 @@ fn serve(
                 ),
                 "{path}"
             );
-            assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
+            assert_eq!(headers.get("if-none-match").map(String::as_str), None);
             assert_eq!(headers["x-amz-copy-source-if-match"], "\"source\"");
             if fault.ends_with("changed") {
                 reply(
@@ -778,7 +778,7 @@ fn serve(
             assert_eq!(headers.get("expires").map(String::as_str), Some("0"));
             reply(&mut socket, 200, &[], b"<InitiateMultipartUploadResult><UploadId>owned</UploadId></InitiateMultipartUploadResult>", false);
         } else if multipart && method == "POST" {
-            assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
+            assert_eq!(headers.get("if-none-match").map(String::as_str), None);
             let length: usize = headers["content-length"].parse().unwrap();
             let mut body = vec![0; length];
             socket.read_exact(&mut body).unwrap();
@@ -894,11 +894,10 @@ fn serve(
                     );
                 }
             } else {
-                if fault.starts_with("server-copy-compare-") {
-                    assert!(!headers.contains_key("if-none-match"));
-                } else {
-                    assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
-                }
+                assert_eq!(
+                    headers.get("if-none-match").map(String::as_str),
+                    (fault == "server-copy-only-new").then_some("*")
+                );
                 assert_eq!(headers["x-amz-website-redirect-location"], "/new-location");
                 assert!(
                     !matches!(

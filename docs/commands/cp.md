@@ -62,7 +62,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 | Argument / option | Meaning |
 |---|---|
-| `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Accept matching contents; report an error for different contents<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Update only when the destination is strictly older; keep ties<br><br>[default: error-if-different] |
+| `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Accept matching contents; report an error for different contents<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Update only when the destination is strictly older; keep ties<br><br>[default: update] |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
@@ -162,10 +162,10 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 ## Update policies
 
-The default `--if-exists=error-if-different` accepts matching contents and
-reports differing contents as an error. Use `error` to require every selected
-file to be absent, `keep` to leave existing files untouched, `update` to permit
-content updates, or `update-if-older` to update strictly older destinations.
+The default `--if-exists=update` updates existing files when their contents
+differ. Use `error-if-different` to accept matching contents and reject differences,
+`error` to require every selected file to be absent, `keep` to leave existing
+files untouched, or `update-if-older` to update strictly older destinations.
 Equal timestamps keep the destination. These choices do not change whether
 size/time or hashes are used for comparison. See
 [existing-file policies](../reference.md#choose-which-existing-files-to-update).
@@ -175,10 +175,10 @@ files inside it. `--if-exists=keep` can add children to an existing directory, b
 does not change that directory's permissions to make it writable.
 
 `--if-exists=keep` and `update-if-older` cannot combine with `--inplace`: an
-interrupted write could leave a file that a retry skips. The default policy
-rejects differing final contents, including incomplete output from an interrupted
-in-place copy. Changing to `--if-exists=update`
-authorizes updates to all differing selected files. Restricted receivers also
+interrupted write could leave a file that a retry skips. With
+`--if-exists=error-if-different`, a retry rejects differing final contents,
+including incomplete output from an interrupted in-place copy. The default
+`update` policy can repair that incomplete file. Restricted receivers also
 reject `--as-new --inplace`, because direct writes do not enforce that destination
 condition. S3 and named receiving destinations do not support `--inplace`; see
 [Copy limits](../persistence-reference.md#copy-limits).
@@ -204,8 +204,8 @@ deleted as extras.
 
 If the source has both `Report.txt` and `report.txt`, a case-insensitive
 destination cannot store both. Syq does not check for that before copying,
-and a later file can conflict with or, with `--if-exists=update`, replace the
-earlier one. The same problem applies to distinct
+and a later file can replace the earlier one or, with a protective existing-file
+policy, report a conflict. The same problem applies to distinct
 Unicode spellings that the destination treats as one name. Rename the source
 entries or use a destination that can distinguish them. Unsupported names
 are reported as copy errors.

@@ -427,7 +427,7 @@ class CopyPolicyCandidateTests(unittest.TestCase):
                     result = client.cp(srcs_in="src", into="dst", **options)
                     return asyncio.run(result) if asynchronous else result
 
-                different = copy(if_exists="update", dry_run=True, hash=True, on_event=events.append)
+                different = copy(dry_run=True, hash=True, on_event=events.append)
                 self.assertEqual(different.exit_code, 0)
                 self.assertEqual(different.files_transferred, 2)
                 self.assertEqual(different.bytes_transferred, 9)
@@ -441,7 +441,7 @@ class CopyPolicyCandidateTests(unittest.TestCase):
                 copy(only_existing=True, if_exists="update-if-older")
                 self.assertEqual((root / "dst/file").read_bytes(), b"target")
                 self.assertFalse((root / "dst/new").exists())
-                copy(only_existing=True, if_exists="update")
+                copy(only_existing=True)
                 self.assertEqual((root / "dst/file").read_bytes(), b"source")
                 self.assertFalse((root / "dst/new").exists())
                 matched = copy(dry_run=True, hash=True, ignore="new")

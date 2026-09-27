@@ -212,7 +212,7 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
                         'x-amz-meta-example': 'kept', 'content-type': 'text/plain'})
                     source_args = ['--src-fd', '0'] if descriptor else [metadata_source]
                     copy([*source_args, '--to', 's3://syq-storage-test', '--as', key,
-                          '--copy-metadata=mtime'], disconnect=False,
+                          '--copy-metadata=mtime', '--if-exists=error-if-different'], disconnect=False,
                          redirection=(' < '+metadata_source) if descriptor else '')
                     headers, body = checks.request('GET', key)
                     headers = {k.lower(): v for k, v in headers.items()}

@@ -88,7 +88,7 @@ In addition to the shared arguments above, it accepts:
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune`, `dry_run`, `hash` | Boolean: mirror, preview, or compare content |
 | `integrity_checking` | Comma-separated string, e.g. `"transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
-| `if_exists` | `"error-if-different"` (default), `"error"`, `"keep"`, `"update"`, or `"update-if-older"` |
+| `if_exists` | `"error-if-different"`, `"error"`, `"keep"`, `"update"` (default), or `"update-if-older"` |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
 | `copy_metadata` | Metadata string or iterable; applies even on unchanged files: `mtime`, `times` (alias for `mtime`), `permissions`, `ownership`, `specials`, `hardlinks`, `acls`, `xattrs`, `atimes`, `crtimes`; see [filesystem preservation](https://greaber.github.io/syq/reference.html#preserve-metadata) for platform and route support |

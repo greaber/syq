@@ -210,10 +210,10 @@ class StreamTests(unittest.TestCase):
                 with self.client.open_writer(as_new=target, **options, **to) as out:
                     out.write(b"replacement")
             self.assertEqual(target.read_bytes(), b"new")
-            with self.client.open_writer(if_exists="update", as_existing=target, **options, **to) as out:
+            with self.client.open_writer(as_existing=target, **options, **to) as out:
                 out.write(b"updated")
             with self.assertRaises(ValueError):
-                with self.client.open_writer(if_exists="update", as_existing=target, **options, **to) as out:
+                with self.client.open_writer(as_existing=target, **options, **to) as out:
                     out.write(b"aborted")
                     raise ValueError("producer failed")
             self.assertEqual(target.read_bytes(), b"updated")
@@ -505,7 +505,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(syq.SyqProcessError):
                 async with client.open_writer(as_new=target) as out:
                     await out.write(b"no")
-            async with client.open_writer(if_exists="update", as_existing=target) as out:
+            async with client.open_writer(as_existing=target) as out:
                 await out.write(b"existing")
             async with client.open_reader("object", root=root) as input:
                 self.assertEqual(await input.read(), b"existing")
