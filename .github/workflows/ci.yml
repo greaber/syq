@@ -550,7 +550,9 @@ jobs:
           python3 tests/object-storage/test-runner.py
           python3 tests/object-storage/test_benchmark.py
 
-  real-ssh:
+  # The lab image is built once and shared by the parallel real-SSH jobs.
+  # Only its dependency stage is cached; it changes with the lock file.
+  real-ssh-lab:
     needs: scope
     if: >-
       inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
@@ -558,7 +560,70 @@ jobs:
       needs.scope.outputs.native == 'true' &&
       needs.scope.outputs.full_suite == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore the lab's dependency build
+        id: dependencies
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/real-ssh-dependencies
+          key: real-ssh-dependencies-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/real-ssh/Dockerfile', 'Cargo.toml', 'Cargo.lock', 'build.rs') }}
+      - name: Build the lab image
+        env:
+          CACHE: ${{ runner.temp }}/real-ssh-dependencies
+          CACHED: ${{ steps.dependencies.outputs.cache-hit }}
+          IMAGE: ${{ runner.temp }}/real-ssh-lab.tar
+        run: |
+          docker buildx create --use --driver docker-container
+          if [ "$CACHED" != true ]; then
+            docker buildx build --progress plain --file tests/real-ssh/Dockerfile \
+              --target dependencies --cache-to "type=local,dest=$CACHE,mode=max" .
+          fi
+          docker buildx build --progress plain --file tests/real-ssh/Dockerfile \
+            --cache-from "type=local,src=$CACHE" --tag syq-real-ssh-lab \
+            --output "type=docker,dest=$IMAGE" .
+      - name: Save the lab's dependency build
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/real-ssh-dependencies
+          key: ${{ steps.dependencies.outputs.cache-primary-key }}
+      # The image layers are already compressed.
+      - name: Share the lab image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: real-ssh-lab
+          path: ${{ runner.temp }}/real-ssh-lab.tar
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  # The core suite also runs the storage checks.
+  real-ssh:
+    needs: [scope, real-ssh-lab]
+    if: >-
+      inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
+      needs.scope.result == 'success' &&
+      needs.scope.outputs.native == 'true' &&
+      needs.scope.outputs.full_suite == 'true'
+    name: real-ssh (${{ matrix.suite }}, ${{ matrix.profile }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: core
+            profile: default
+          - suite: core
+            profile: max-sessions-1
+          - suite: metadata
+            profile: default
+          - suite: benchmark
+            profile: default
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -572,27 +637,22 @@ jobs:
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
         run: scripts/setup.sh github python
-      # Later suites reuse the first build's Docker layers. Each suite runs even
-      # when an earlier one failed, and any failure fails the job.
-      - name: Test the core suite through real OpenSSH
-        run: scripts/test-real-ssh.py
-      - name: Test the core suite with one session per SSH connection
-        if: ${{ !cancelled() }}
-        run: scripts/test-real-ssh.py --profile max-sessions-1
-      - name: Test storage authorization through real OpenSSH
-        if: ${{ !cancelled() }}
-        run: scripts/test-real-ssh.py --suite storage
-      - name: Test metadata recovery through real OpenSSH
-        if: ${{ !cancelled() }}
-        run: scripts/test-real-ssh.py --suite metadata
-      - name: Test the interactive benchmark against a real remote
-        if: ${{ !cancelled() }}
-        run: scripts/test-real-ssh.py --suite benchmark
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: real-ssh-lab
+          path: ${{ runner.temp }}
+      - name: Load the lab image
+        run: docker load --input "$RUNNER_TEMP/real-ssh-lab.tar"
+      - name: Run the suite through real OpenSSH
+        env:
+          PROFILE: ${{ matrix.profile }}
+          SUITE: ${{ matrix.suite }}
+        run: scripts/test-real-ssh.py --image syq-real-ssh-lab --profile "$PROFILE" --suite "$SUITE"
       - name: Keep real-SSH diagnostics
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: real-ssh-diagnostics
+          name: real-ssh-diagnostics-${{ matrix.suite }}-${{ matrix.profile }}
           path: target/real-ssh.*/compose.log
           if-no-files-found: ignore
           retention-days: 14

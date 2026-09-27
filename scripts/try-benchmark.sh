@@ -553,6 +553,11 @@ main() {
         large_mib=1
         small_files=8
     fi
+    # The real-SSH lab shortens automatic sizing's copying target; it checks
+    # that sizing grows the dataset, not how long the chosen copy takes.
+    local sizing_target_ms=${SYQ_BENCHMARK_TEST_SIZING_MS:-5000}
+    [[ $sizing_target_ms =~ ^[1-9][0-9]*$ ]] ||
+        fail 'SYQ_BENCHMARK_TEST_SIZING_MS must be a positive whole number of milliseconds.'
     [[ $rounds =~ ^[1-9]$ ]] || fail 'Rounds must be between 1 and 9.'
     for tool in bash rsync openssl dd split cksum cmp awk mktemp mkdir rm cat ps sleep sed; do need "$tool"; done
     [[ $mode != local ]] || need cp
@@ -669,7 +674,8 @@ main() {
             capacity=$(space_capacity "$case_name")
             [[ $capacity -ge 1 ]] || fail 'Not enough scratch space for a test dataset.'
             [[ $amount -le $capacity ]] || amount=$capacity
-            printf '\nChoosing the %s workload size with syq (aiming for 5 seconds of copying)...\n' "$case_name"
+            printf '\nChoosing the %s workload size with syq (aiming for %s seconds of copying)...\n' "$case_name" \
+                "$(awk -v ms="$sizing_target_ms" 'BEGIN {printf "%g", ms / 1000}')"
         fi
         while :; do
             prepare_dataset "$case_name" "$amount"
@@ -688,9 +694,9 @@ main() {
             if [[ $mode == push ]]; then remote "rm -rf $(quote "$destination")"
             else rm -rf -- "$destination"; fi
             awk -v ms="$copying_ms" 'BEGIN {printf "Verified sizing copy; copying interval %.3f seconds.\n", ms / 1000}'
-            [[ $copying_ms -lt 5000 ]] || break
+            [[ $copying_ms -lt $sizing_target_ms ]] || break
             capacity=$(space_capacity "$case_name")
-            next=$(next_amount "$amount" "$copying_ms" "$capacity")
+            next=$(next_amount "$amount" "$copying_ms" "$capacity" "$sizing_target_ms")
             if [[ $next -le $amount ]]; then
                 printf 'WARNING: available scratch space limits test size. Short copies may mostly measure startup; interpret speeds cautiously.\n' >&2
                 break

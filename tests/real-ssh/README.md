@@ -24,9 +24,10 @@ Run the suite from any syq checkout:
 scripts/test-real-ssh.py
 ```
 
-Full nightly and manual `ci.yml` runs run the core suite in both SSH profiles
-and the storage, metadata, and benchmark suites below on GitHub's Linux runner.
-Pull requests and post-merge runs do not.
+Full nightly and manual `ci.yml` runs build the lab image once, then run the
+core suite in both SSH profiles and the metadata and benchmark suites below as
+parallel jobs on GitHub's Linux runners. The core suite includes the storage
+checks. Pull requests and post-merge runs do not run these suites.
 
 The suite also runs a pinned local S3 server fixture on the runner: PGSTY Silo,
 a maintained fork of the MinIO server. Storage checks approve

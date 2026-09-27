@@ -1,18 +1,25 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.94.1-bookworm AS builder
+FROM rust:1.94.1-bookworm AS dependencies
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
+# Compile the locked dependencies against a stub program. This layer changes
+# only with the manifest, lock file or build script, so CI can cache it.
+RUN mkdir src \
+    && printf 'fn main() {}\n' > src/main.rs \
+    && cargo build --locked --bin syq \
+    && rm -r src
+
+FROM dependencies AS builder
+
 COPY schemas ./schemas
 COPY src ./src
 # The second PATH fixture has a real distinct identity and return wire version.
 # It must hand off before making anything beyond a stable readiness probe.
-# Reused build caches can contain newer timestamps from another checkout.
-# Rebuild this package, including its identity build script; keep dependency artifacts.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo clean -p syq \
+# The stub build's artifacts can look newer than these sources. Rebuild this
+# package, including its identity build script; keep dependency artifacts.
+RUN cargo clean -p syq \
     && cargo build --locked --bin syq \
     && cp target/debug/syq /tmp/syq \
     && printf '%s\n' '{"git":{"sha1":"1234567890abcdef1234567890abcdef12345678"}}' > .cargo_vcs_info.json \
