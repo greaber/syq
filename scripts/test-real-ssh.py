@@ -3,11 +3,23 @@
 
 Usage: scripts/test-real-ssh.py [--profile max-sessions-1]
        [--suite core|benchmark|storage|metadata] [--image NAME]
+       [--case TEXT]... [--cases-from FILE]
+       [--skip-case TEXT]... [--skip-cases-from FILE]
+       scripts/test-real-ssh.py --list-cases
 
 --image uses an already loaded lab image built from this checkout instead of
 building one, and leaves it in place afterwards. CI builds the image once and
 runs the suites in parallel jobs.
+
+--case runs the core suite's shared setup and final checks with only the cases
+whose names contain TEXT (ignoring case); repeat it to add cases. --skip-case
+runs every selected case except those whose names contain TEXT. --cases-from
+and --skip-cases-from read one TEXT per line, ignoring blank lines and lines
+starting with #. Each TEXT must match at least one case. --list-cases prints
+the core suite's case names. Subsets are for iteration: cases share lab state,
+so run the whole suite when it is relevant to a change.
 """
+import re
 import os
 import secrets
 import shutil
@@ -18,11 +30,66 @@ import time
 from tooling import ForwardSignals
 
 USAGE = ("usage: scripts/test-real-ssh.py [--profile max-sessions-1] "
-         "[--suite core|benchmark|storage|metadata] [--image NAME]")
+         "[--suite core|benchmark|storage|metadata] [--image NAME] "
+         "[--case TEXT]... [--cases-from FILE] [--skip-case TEXT]... "
+         "[--skip-cases-from FILE] | --list-cases")
+SCENARIOS = "tests/real-ssh/scenarios.sh"
+CASE_HEADER = re.compile(r"^printf 'case: (.*)\\n'$")
+FINAL_CHECKS = "# Final checks after every selected case."
+# The entrypoint runs these checks as root before the scenarios.
+ROOT_SECURITY = "privileged copies keep root security checks"
 
 
 class Die(Exception):
     pass
+
+
+def scenario_parts(text):
+    """Split the core scenarios into setup, named cases and final checks."""
+    lines = text.splitlines(keepends=True)
+    setup, cases, final = [], [], None
+    for line in lines:
+        header = CASE_HEADER.match(line.rstrip("\n"))
+        if final is not None:
+            final.append(line)
+        elif line.rstrip("\n") == FINAL_CHECKS:
+            final = [line]
+        elif header:
+            cases.append((header.group(1), [line]))
+        elif cases:
+            cases[-1][1].append(line)
+        else:
+            setup.append(line)
+    if not cases or final is None:
+        raise Die(f"cannot find the cases and final checks in {SCENARIOS}")
+    return setup, cases, final
+
+
+def matching_cases(names, patterns):
+    matched = set()
+    for pattern in patterns:
+        matches = [name for name in names if pattern.casefold() in name.casefold()]
+        if not matches:
+            raise Die(f"no real-SSH case name contains: {pattern}")
+        matched.update(matches)
+    return matched
+
+
+def select_cases(names, includes, skips):
+    selected = matching_cases(names, includes) if includes else set(names)
+    selected -= matching_cases(names, skips)
+    if not selected:
+        raise Die("no real-SSH cases remain selected")
+    return selected
+
+
+def read_patterns(path):
+    try:
+        with open(path) as listed:
+            return [line.strip() for line in listed
+                    if line.strip() and not line.lstrip().startswith("#")]
+    except OSError as error:
+        raise Die(f"cannot read {path}: {error}")
 
 
 def main():
@@ -44,9 +111,14 @@ def lab():
     profile = "default"
     suite = "core"
     image = None
+    includes = []
+    skips = []
     arguments = sys.argv[1:]
+    if arguments == ["--list-cases"]:
+        return list_cases()
     while arguments:
-        if arguments[0] not in ("--profile", "--suite", "--image"):
+        if arguments[0] not in ("--profile", "--suite", "--image", "--case", "--cases-from",
+                                "--skip-case", "--skip-cases-from"):
             raise Die(USAGE)
         if len(arguments) < 2:
             raise Die(f"missing value for {arguments[0]}")
@@ -54,13 +126,24 @@ def lab():
             profile = arguments[1]
         elif arguments[0] == "--suite":
             suite = arguments[1]
-        else:
+        elif arguments[0] == "--image":
             image = arguments[1]
+        elif arguments[0] == "--case":
+            includes.append(arguments[1])
+        elif arguments[0] == "--cases-from":
+            includes += read_patterns(arguments[1])
+        elif arguments[0] == "--skip-case":
+            skips.append(arguments[1])
+        else:
+            skips += read_patterns(arguments[1])
         arguments = arguments[2:]
+    subset = bool(includes or skips)
     if suite not in ("core", "benchmark", "storage", "metadata"):
         raise Die(f"unknown real-SSH test suite: {suite}")
     if suite == "benchmark" and profile != "default":
         raise Die("the benchmark suite requires the default SSH profile")
+    if subset and suite != "core":
+        raise Die("case selection options select cases of the core suite")
     if image is not None and subprocess.run(
             ["docker", "image", "inspect", image], stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL).returncode:
@@ -81,6 +164,9 @@ def lab():
         compose_files += ["--file", f"{root}/tests/real-ssh/compose.max-sessions-1.yaml"]
     elif profile != "default":
         raise Die(f"unknown real-SSH test profile: {profile}")
+    if subset:
+        setup, cases, final = scenario_parts(open(f"{root}/{SCENARIOS}").read())
+        selected = select_cases([ROOT_SECURITY, *(name for name, _ in cases)], includes, skips)
     os.makedirs(f"{root}/target", exist_ok=True)
     # Docker Compose project names allow only lowercase letters, digits,
     # hyphens, and underscores; a hexadecimal token keeps the name valid.
@@ -92,6 +178,25 @@ def lab():
     os.environ["SYQ_REAL_SSH_STATE"] = state
     os.environ["SYQ_REAL_SSH_SUITE"] = suite
     compose = ["docker", "compose", "--project-name", project, *compose_files]
+    mount = []
+    if subset:
+        os.environ["SYQ_REAL_SSH_ROOT_SECURITY"] = "1" if ROOT_SECURITY in selected else "0"
+        script = f"{state}/scenarios.sh"
+        with open(script, "w") as filtered:
+            filtered.writelines(setup)
+            for name, lines in cases:
+                if name in selected:
+                    filtered.writelines(lines)
+            # The full suite ends with persistence off; a subset may skip
+            # the case that turns it off.
+            filtered.write("syq persist off >/dev/null\n")
+            filtered.writelines(final)
+        os.chmod(script, 0o755)
+        mount = ["--volume", f"{script}:/usr/local/libexec/syq-real-ssh-scenarios:ro"]
+        print(f"selected {len(selected)} real-SSH cases:")
+        for name in [ROOT_SECURITY, *(name for name, _ in cases)]:
+            if name in selected:
+                print(f"  {name}")
 
     children = ForwardSignals()
 
@@ -119,7 +224,7 @@ def lab():
             print(f"real-SSH lab image: {image}")
         execution_started = time.monotonic()
         run(*compose, "up", "--detach", "--wait", "--wait-timeout", "60", "source", "destination")
-        run(*compose, "run", "--rm", "--no-deps", "runner")
+        run(*compose, "run", "--rm", "--no-deps", *mount, "runner")
         passed = True
         print(f"real-SSH integration tests passed for syq {revision} (profile {profile}, suite "
               f"{suite}) in {time.monotonic() - execution_started:.0f}s excluding build")
@@ -127,6 +232,18 @@ def lab():
         children.shield()
         sys.stdout.flush()
         cleanup(compose, state, root, passed, remove_image=image is None)
+    return 0
+
+
+def list_cases():
+    toplevel = subprocess.run(["git", "rev-parse", "--show-toplevel"], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True)
+    if toplevel.returncode:
+        raise Die("run this from a syq checkout")
+    _, cases, _ = scenario_parts(open(f"{toplevel.stdout.rstrip()}/{SCENARIOS}").read())
+    print(ROOT_SECURITY)
+    for name, _ in cases:
+        print(name)
     return 0
 
 

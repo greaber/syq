@@ -38,7 +38,7 @@ endpoint() {
 }
 
 runner() {
-    if [ "${SYQ_REAL_SSH_SUITE:-core}" = core ]; then
+    if [ "${SYQ_REAL_SSH_SUITE:-core}" = core ] && [ "${SYQ_REAL_SSH_ROOT_SECURITY:-1}" = 1 ]; then
         python3 /usr/local/libexec/syq-test-root-security.py
     fi
     test -r /run/lab/id_ed25519
