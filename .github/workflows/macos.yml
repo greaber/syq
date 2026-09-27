@@ -240,8 +240,11 @@ jobs:
           do
             run_exact root "$local_tests" "$test"
           done
+      # Reuse the syq binary built for the integration tests. A plain `cargo
+      # build` resolves dependency features without dev-dependencies and
+      # would compile every dependency again.
       - name: Build the candidate syq executable
-        run: cargo build --locked --bin syq
+        run: cargo test --locked --all-targets --no-run
       - name: Use Homebrew OpenSSL for Ed25519 signing
         run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
       - name: Test and package Python SDK

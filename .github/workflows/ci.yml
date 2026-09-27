@@ -477,9 +477,7 @@ jobs:
     env:
       # This job checks compilation and updater behavior, not copy throughput.
       CARGO_PROFILE_DEV_OPT_LEVEL: "0"
-      CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_OPT_LEVEL: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -711,23 +709,28 @@ jobs:
           restore-keys: |
             cargo-ci-repository-checks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
             cargo-ci-repository-checks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      # One build serves the ignored tests, the fixture check and the
+      # compatibility check. A plain `cargo build` resolves dependency features
+      # without dev-dependencies, so it would compile every dependency again.
+      - name: Build test binaries and the candidate syq
+        id: build-tests
+        run: cargo test --locked --all-targets --no-run
       # The ignored Linux tests are timing and simulation reports.
       - name: Run ignored Linux tests
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.build-tests.outcome == 'success' }}
         run: cargo test --locked --all-targets -- --ignored
       - name: Check that automation fixtures match real output
-        if: ${{ !cancelled() }}
-        run: python3 scripts/regen-automation-fixtures.py --check
+        if: ${{ !cancelled() && steps.build-tests.outcome == 'success' }}
+        run: python3 scripts/regen-automation-fixtures.py --check --no-build
       - name: Check documentation links
         if: ${{ !cancelled() }}
         run: python3 scripts/check-doc-links.py
       - name: Check compatibility with released receivers and clients
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.build-tests.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cargo build --locked --bin syq
           candidate="$GITHUB_WORKSPACE/target/debug/syq"
           released="$RUNNER_TEMP/released"
           for version in 0.4.0 0.5.2 0.6.0; do
