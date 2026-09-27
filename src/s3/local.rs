@@ -106,11 +106,17 @@ impl Source {
             return Ok(Vec::new());
         }
         let path = RelativePath::new(&self.path)?;
-        if self.root.metadata(&path)? != self.meta {
+        let unchanged = || -> Result<bool> {
+            Ok(self
+                .root
+                .metadata(&path)?
+                .same_except_access_time(self.meta))
+        };
+        if !unchanged()? {
             bail!("symlink changed during S3 copy");
         }
         let target = self.root.read_link(&path)?;
-        if self.root.metadata(&path)? != self.meta {
+        if !unchanged()? {
             bail!("symlink changed during S3 copy");
         }
         Ok(target)
@@ -585,4 +591,42 @@ pub(super) fn apply_file_metadata(
                 0
             },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn symlink_source(meta_change: impl FnOnce(&mut RootMetadata)) -> Result<Vec<u8>> {
+        let dir = crate::test_support::tempdir().unwrap();
+        std::os::unix::fs::symlink("target", dir.path().join("link")).unwrap();
+        let root = Root::open(dir.path()).unwrap();
+        let mut meta = root.metadata(&RelativePath::new(b"link").unwrap()).unwrap();
+        meta_change(&mut meta);
+        Source {
+            root: Arc::new(root),
+            path: b"link".to_vec(),
+            meta,
+            key: "link".into(),
+            label: b"link".to_vec(),
+            mapped: false,
+            metadata: None,
+            expected_hash: None,
+            _pin: None,
+        }
+        .bytes()
+    }
+
+    #[test]
+    fn symlink_upload_tolerates_access_time_updates() {
+        // Filesystems such as ext4 and tmpfs update a new symlink's access
+        // time on its first readlink, so the scanned snapshot can differ only
+        // in atime from what the upload observes.
+        assert_eq!(
+            symlink_source(|meta| meta.atime.seconds -= 1).unwrap(),
+            b"target"
+        );
+        let error = symlink_source(|meta| meta.ctime -= 1).unwrap_err();
+        assert!(error.to_string().contains("symlink changed during S3 copy"));
+    }
 }
