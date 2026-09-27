@@ -33,6 +33,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install pinned tools without a cache
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
       - name: Require a verified annotated tag for this commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -61,6 +65,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Install pinned tools without a cache
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
       - id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
@@ -103,12 +111,10 @@ jobs:
         env:
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
         run: test "$GITHUB_SHA" = "$CANDIDATE_COMMIT"
-      - id: python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13.13"
-      - name: Install pinned Python tooling
-        run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
+      - name: Install pinned tools without a cache
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github uv python jq
       - name: Install checksum-pinned Nix
         run: scripts/install-nix-ci.sh
       - name: Verify the pinned native release
@@ -197,11 +203,14 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Check out the pinned tool setup
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12.14"
-      - name: Install pinned publishing tooling
-        run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
+          persist-credentials: false
+      - name: Install pinned tools without a cache
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github uv
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           github-token: ${{ github.token }}

@@ -43,8 +43,8 @@ scripts/test-real-ssh.py --suite metadata
 These checks inspect remote contents, modes, ownership, timestamps, ACLs,
 xattrs, and hardlink relationships directly after recovery.
 
-The host runner is a Python script. Run it with Python 3.12 or newer, such as
-the interpreter installed by `scripts/setup.sh`.
+The host runner is a Python script. Run it with the Python installed by
+`scripts/setup.sh`.
 
 Use the alternate destination sshd profile to exercise syq's fallback from a
 rejected multiplexed worker channel to independent SSH connections. The

@@ -402,6 +402,11 @@ extracts and compiles the crate once, using a separate reusable target directory
 It clears only syq's own build outputs before compiling: normalized archive
 mtimes cannot prove unchanged source or VCS identity across cached packages.
 
+Release and publishing jobs install the tools pinned in `scripts/setup.lock`
+afresh on every run instead of restoring them from a cache. `scripts/setup.sh`
+verifies a download's checksum but trusts a tool that is already installed, so
+a restored cache would bypass that check. The downloads are small.
+
 The checked-in classifier uses each push's exact diff. Documentation-only
 changes select no test jobs unless a document is consumed by a test or
 generator. Unknown paths fail safe by selecting every affected suite. Manual

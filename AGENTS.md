@@ -389,14 +389,17 @@ it is intentional" is not that decision.
   for a concrete scenario or consumer that needs them.
 - Write repository tooling (CI scope, release, status, and test scripts) in
   Python using only the standard library, run with the interpreter pinned by
-  `scripts/setup.sh`. Keep it compatible with Python 3.12, which the release
-  workflows still run from the runner image. Use portable shell only for code
-  that runs on users' machines or arbitrary hosts (the generated installer and
-  `scripts/try-benchmark.sh`), code that must run before pinned tools exist
-  (`scripts/setup.sh`), the real-SSH container scripts, and thin wrappers that
-  only run other commands, such as the release runners' Nix and build steps.
-  CI and release tooling is too complex to maintain well in Bash, so do not
-  spend effort on Bash 3.2 compatibility for development scripts.
+  `scripts/setup.sh`. CI and the release workflows use that interpreter too,
+  so the tooling needs no separate compatibility floor for older Python
+  releases. The exception is `tests/real-ssh/*.py`: those scripts run inside
+  the Debian test containers and must work with that image's `python3`. Use
+  portable shell only for code that runs on users' machines or arbitrary
+  hosts (the generated installer and `scripts/try-benchmark.sh`), code that
+  must run before pinned tools exist (`scripts/setup.sh`), the real-SSH
+  container scripts, and thin wrappers that only run other commands, such as
+  the release runners' Nix and build steps. CI and release tooling is too
+  complex to maintain well in Bash, so do not spend effort on Bash 3.2
+  compatibility for development scripts.
 - Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
   sync. A behavior change lands in `docs/reference.md` (or the topical
   document that owns it), not in a new README section.

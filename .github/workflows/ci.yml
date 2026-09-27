@@ -418,6 +418,26 @@ jobs:
             cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - if: needs.scope.outputs.linux_arm64 == 'true'
         run: cargo check --locked --all-targets
+      # Release jobs install these on this platform; verify the pinned ARM
+      # downloads without a cache so full and nightly runs catch a bad pin.
+      - name: Install and check every pinned tool
+        if: needs.scope.outputs.linux_arm64 == 'true'
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: |
+          set -euo pipefail
+          scripts/setup.sh install
+          eval "$(scripts/setup.sh env)"
+          awk '!/^#/ && NF && !seen[$1]++ { print $1, $2 }' scripts/setup.lock |
+            while read -r tool version; do
+              command=$tool
+              if [ "$tool" = python ]; then command=python3; fi
+              location=$(command -v "$command")
+              actual=$("$command" --version)
+              echo "$tool $version: $location: $actual"
+              case "$location" in "$SYQ_TOOLS_DIR"/*) ;; *) exit 1 ;; esac
+              case "$actual" in *"$version"*) ;; *) exit 1 ;; esac
+            done
 
   # An actual Intel runner catches host-architecture cfg and libc differences
   # before the release workflow builds its x86-64 artifact. Keep this on full
