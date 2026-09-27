@@ -862,3 +862,69 @@ fn expressions_keep_unselected_container_attributes() {
     assert_eq!(read(&t.path("dst/new/keep")), b"selected");
     assert_eq!(read(&t.path("dst/existing/keep")), b"selected");
 }
+
+#[test]
+fn remote_pull_with_xattrs_tolerates_its_own_writes_to_the_destination_root() {
+    // Copying starts while later batches are still planned, so this copy's
+    // workers add entries to the destination root between batches. Checking
+    // the root's identity must not read its xattrs, whose change guard would
+    // trip on those additions. tmpfs updates directory ctimes promptly enough
+    // to expose that race with a few thousand files; skip without it.
+    let shm = Path::new("/dev/shm");
+    let Ok(destination_parent) = tempfile::Builder::new()
+        .prefix("syq-root-identity-")
+        .tempdir_in(shm)
+    else {
+        return;
+    };
+    let probe = destination_parent.path().join("probe");
+    fs::write(&probe, b"").unwrap();
+    let name = CString::new("user.probe").unwrap();
+    let path = CString::new(probe.as_os_str().as_bytes()).unwrap();
+    if unsafe { libc::lsetxattr(path.as_ptr(), name.as_ptr(), b"x".as_ptr().cast(), 1, 0) } != 0 {
+        return;
+    }
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    t.expose_remote_syq();
+    fs::create_dir(t.path("remote-home")).unwrap();
+    let value = [0u8, 0xff].repeat(1536);
+    fs::create_dir(t.path("src")).unwrap();
+    for index in 0..5000 {
+        let file = t.path(&format!("src/{index}"));
+        write(&file, b"data");
+        set_attr(&file, "user.rich", &value);
+    }
+    let destination = destination_parent.path().join("copy");
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--preserve=xattrs",
+            "--from",
+            "host",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            destination.to_str().unwrap(),
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--no-bootstrap",
+            "--no-tcp",
+            "--no-progress",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    for index in [0, 2500, 4999] {
+        assert_eq!(
+            attr(&destination.join(index.to_string()), "user.rich").as_deref(),
+            Some(&value[..])
+        );
+    }
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 5000);
+}
