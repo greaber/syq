@@ -2,11 +2,6 @@ name: reproducible builds
 
 on:
   workflow_call:
-    inputs:
-      platform:
-        description: One release platform, or all
-        type: string
-        default: all
   workflow_dispatch:
     inputs:
       platform:

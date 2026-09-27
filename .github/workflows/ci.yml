@@ -684,9 +684,8 @@ jobs:
           python3 tests/receive-policy-compat.py \
             --old "$released/0.6.0/syq-linux-x86_64" --candidate "$candidate"
 
-  # The release recipe otherwise runs only during a release. One platform is
-  # enough to notice a broken recipe; releases still build every platform.
-  # This job also checks release dependency-cache invalidation.
+  # The release recipe otherwise runs only during a release. This builds
+  # every release platform and checks release dependency-cache invalidation.
   release-build:
     needs: scope
     if: >-
@@ -695,8 +694,6 @@ jobs:
       needs.scope.outputs.native == 'true' &&
       needs.scope.outputs.full_suite == 'true'
     uses: ./.github/workflows/reproducible-builds.yml
-    with:
-      platform: syq-linux-x86_64
 
   # A skipped certificate cannot certify successful selective stubs.
   release-certification:
