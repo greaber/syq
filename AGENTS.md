@@ -618,8 +618,9 @@ from the suite's scenarios, not from which files changed: copy planning,
 expression and selection semantics, directory creation, and restricted-receiver
 behavior reach both suites even when no SSH or S3 code changed. When a suite is
 relevant, run all of it at the final commit before handoff. Its cases interact,
-so hand-picked cases can miss regressions. Neither suite is part of `cargo test` or post-merge CI; full nightly
-and manual `ci.yml` runs include both.
+so hand-picked cases can miss regressions. Neither suite is part of
+`cargo test` or post-merge CI; full nightly and manual `ci.yml` runs include
+both.
 
 Small review fixes to diagnostics, documentation, or isolated validation checks
 can use focused tests when those tests adequately exercise the change. Batch
