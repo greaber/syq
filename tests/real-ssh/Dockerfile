@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.94.1-bookworm AS dependencies
+# Pinned by digest: a republished tag would stop matching CI's cached
+# dependency build without changing its cache key.
+FROM rust:1.94.1-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS dependencies
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./

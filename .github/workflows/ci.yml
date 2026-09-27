@@ -591,14 +591,15 @@ jobs:
         with:
           path: ${{ runner.temp }}/real-ssh-dependencies
           key: ${{ steps.dependencies.outputs.cache-primary-key }}
-      # The image layers are already compressed.
+      # The image layers are already compressed. Keep the image long enough
+      # to rerun a failed suite a few days later.
       - name: Share the lab image
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: real-ssh-lab
           path: ${{ runner.temp }}/real-ssh-lab.tar
           compression-level: 0
-          retention-days: 1
+          retention-days: 7
           if-no-files-found: error
 
   # The core suite also runs the storage checks.

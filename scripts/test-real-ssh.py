@@ -109,7 +109,7 @@ def lab():
         if subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"],
                           stdout=subprocess.PIPE, text=True, check=True).stdout.strip():
             revision += " (dirty)"
-        print(f"building real-SSH lab for syq {revision} (profile {profile}, suite {suite})")
+        print(f"real-SSH lab for syq {revision} (profile {profile}, suite {suite})")
         run(*compose, "config", "--quiet")
         if image is None:
             build_started = time.monotonic()
