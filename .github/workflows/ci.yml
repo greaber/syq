@@ -686,10 +686,11 @@ jobs:
 
   # The release recipe otherwise runs only during a release. This builds
   # every release platform and checks release dependency-cache invalidation.
+  # Scheduled runs only: a release starts its own builds beside a manual run.
   release-build:
     needs: scope
     if: >-
-      inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
+      github.event_name == 'schedule' &&
       needs.scope.result == 'success' &&
       needs.scope.outputs.native == 'true' &&
       needs.scope.outputs.full_suite == 'true'
