@@ -29,6 +29,10 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - name: Install pinned tools without a cache
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
       - name: Require curated release notes
         run: test -s ".github/release-notes/$GITHUB_REF_NAME.md"
       - name: Require the Python native API to be synchronized
@@ -59,6 +63,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Install pinned tools without a cache
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
       - id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
@@ -91,6 +99,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install pinned tools without a cache
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python jq
       - name: Download the validated source package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:

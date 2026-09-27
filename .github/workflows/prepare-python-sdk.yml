@@ -22,16 +22,16 @@ jobs:
       github.event.workflow_run.repository.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    env:
-      UV_PYTHON: "3.13.13"
     steps:
       - name: Check out current master
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
           fetch-depth: 0
-      - name: Install pinned Python tooling
-        run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
+      - name: Install pinned tools without a cache
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github uv python jq
       - name: Validate and download the immutable syq release manifest
         env:
           GH_TOKEN: ${{ github.token }}
