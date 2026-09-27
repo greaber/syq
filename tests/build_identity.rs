@@ -10,6 +10,14 @@ mod test_support;
 #[path = "../build.rs"]
 mod build_script;
 
+/// Keep the developer's and the system's Git configuration (for example
+/// commit signing or a reftable default) out of these repositories.
+fn isolated_git_config(command: &mut std::process::Command) -> &mut std::process::Command {
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+}
+
 #[test]
 fn emit_build_script() {
     if std::env::var_os("SYQ_BUILD_SCRIPT_TEST").is_some() {
@@ -30,7 +38,7 @@ fn packaged_provenance_and_helper_selection() {
     .unwrap();
     let run = |release: Option<&str>, official: bool| {
         let mut command = Command::new(std::env::current_exe().unwrap());
-        command
+        isolated_git_config(&mut command)
             .args(["--exact", "emit_build_script", "--nocapture"])
             .current_dir(&package)
             .env("SYQ_BUILD_SCRIPT_TEST", "1")
@@ -45,13 +53,13 @@ fn packaged_provenance_and_helper_selection() {
     };
     for enclosing_git in [false, true] {
         if enclosing_git {
-            assert!(Command::new("git")
+            assert!(isolated_git_config(&mut Command::new("git"))
                 .args(["init", "-q"])
                 .current_dir(root.path())
                 .status_guarded()
                 .unwrap()
                 .success());
-            assert!(Command::new("git")
+            assert!(isolated_git_config(&mut Command::new("git"))
                 .args([
                     "-c",
                     "user.name=SDK test",
@@ -104,7 +112,7 @@ fn watched_inputs_exist_outside_packages_and_nonce_builds() {
     fs::create_dir_all(package.join("src")).unwrap();
     fs::write(package.join("src/lib.rs"), "").unwrap();
     let run = || {
-        let output = Command::new(std::env::current_exe().unwrap())
+        let output = isolated_git_config(&mut Command::new(std::env::current_exe().unwrap()))
             .args(["--exact", "emit_build_script", "--nocapture"])
             .current_dir(&package)
             .env("SYQ_BUILD_SCRIPT_TEST", "1")
@@ -140,7 +148,7 @@ fn watched_inputs_exist_outside_packages_and_nonce_builds() {
     // In a checkout, every watched path exists, so an unchanged tree does
     // not rerun the script and recompile.
     let git = |args: &[&str]| {
-        assert!(Command::new("git")
+        assert!(isolated_git_config(&mut Command::new("git"))
             .args([
                 "-c",
                 "user.name=test",

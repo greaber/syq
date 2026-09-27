@@ -49,7 +49,6 @@ pub(crate) fn main() {
 
 fn register_inputs(packaged: bool) {
     // Cargo treats a watched path that does not exist as always changed.
-    let vcs_info_exists = fs::metadata(".cargo_vcs_info.json").is_ok();
     if packaged {
         // Track the extracted source, but never consult an enclosing checkout.
         println!("cargo::rerun-if-changed=.cargo_vcs_info.json");
@@ -67,7 +66,7 @@ fn register_inputs(packaged: bool) {
         println!("cargo::rerun-if-changed=.cargo_vcs_info.json");
         return;
     }
-    if vcs_info_exists {
+    if fs::metadata(".cargo_vcs_info.json").is_ok() {
         println!("cargo::rerun-if-changed=.cargo_vcs_info.json");
     }
     if let Ok(output) = Command::new("git")
@@ -96,10 +95,11 @@ fn register_inputs(packaged: bool) {
         println!("cargo::rerun-if-changed=src");
     }
     // HEAD and the index change on checkout and staging. A commit updates the
-    // branch's loose ref, or its reflog when the ref is packed.
+    // branch's loose ref, or its reflog when the ref is packed; repositories
+    // using the reftable format keep every ref in the reftable directory.
     let branch = git(&["symbolic-ref", "-q", "HEAD"]);
     let log = branch.as_ref().map(|name| format!("logs/{name}"));
-    for git_path in ["HEAD", "index", "packed-refs"]
+    for git_path in ["HEAD", "index", "packed-refs", "reftable"]
         .into_iter()
         .map(str::to_owned)
         .chain(branch)
