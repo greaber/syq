@@ -36,7 +36,7 @@ REAL_SSH = {
 # Suites that ci.yml's `suites` input can select, as the scope outputs each sets.
 SUITES = {
     "rust": {"native": True, "integration_targets": "all"},
-    "tooling": {"tooling": True, "tooling_checks": ALL_TOOLING},
+    "tooling": {"tooling": True, "tooling_checks": ALL_TOOLING, "all_tooling": True},
     "shellcheck": {"shellcheck": True},
     "mapping-docs": {"mapping_docs": True},
     "python-sdk": {"sdks": True, "python_sdk": True},
@@ -52,6 +52,8 @@ SUITES = {
 def run_everything():
     print("\n".join([
         "suite_selection=false",
+        "rust_suites=",
+        "all_tooling=true",
         "s3=true",
         "repository_checks=true",
         "macos_intel=true",
@@ -154,6 +156,7 @@ def select_suites(names):
     selection = {"native": False, "sdks": False, "python_sdk": False, "tooling": False,
                  "shellcheck": False, "mapping_docs": False, "linux_arm64": False,
                  "macos": False, "macos_intel": False, "s3": False, "repository_checks": False,
+                 "all_tooling": False,
                  "integration_targets": "", "tooling_checks": "", "real_ssh": []}
     for name in names:
         for key, value in SUITES[name].items():
@@ -168,6 +171,10 @@ def select_suites(names):
     real_ssh = [entry for entry in REAL_SSH.values() if entry in selected_real_ssh]
     for key, value in selection.items():
         print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
+    # The rust job runs different steps for these suites, so its name records
+    # which ones it ran; scripts/branch-status.py matches checks by job name.
+    print("rust_suites=" + " ".join(name for name in SUITES if name in names
+                                    and name in ("rust", "tooling", "shellcheck", "mapping-docs")))
     print(f"real_ssh_matrix={json.dumps(real_ssh)}")
     print("suite_selection=true\nconformance=false\nfull_suite=false")
     print('sdk_matrix=["python"]' if selection["python_sdk"] else 'sdk_matrix=["none"]')
@@ -219,8 +226,8 @@ def main():
         print(f"{key}={str(selection[key]).lower()}")
     print(f"integration_targets={selection['integration_targets']}")
     # Only full runs and selected suites run these.
-    print("suite_selection=false\ns3=false\nrepository_checks=false\nmacos_intel=false\n"
-          "real_ssh_matrix=[]")
+    print("suite_selection=false\nrust_suites=\nall_tooling=false\ns3=false\n"
+          "repository_checks=false\nmacos_intel=false\nreal_ssh_matrix=[]")
     print("CI scope: " + " ".join(f"{key}={str(selection[key]).lower()}" for key in keys),
           file=sys.stderr)
     print('sdk_matrix=["python"]' if selection["python_sdk"] else 'sdk_matrix=["none"]')

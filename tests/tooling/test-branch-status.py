@@ -18,17 +18,28 @@ case "$1:$2" in
     shift 2
     workflow=
     event=
+    branch=
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --workflow) workflow=$2; shift 2 ;;
         --event) event=$2; shift 2 ;;
+        --branch) branch=$2; shift 2 ;;
         *) shift ;;
       esac
     done
-    if [ -f "$SYQ_TEST_RUNS_DIR/$workflow.$event.json" ]; then
-      cat "$SYQ_TEST_RUNS_DIR/$workflow.$event.json"
-    else
+    # A branch-specific file stands in for runs that a query across every
+    # branch would not reach. Runs without headBranch are on master.
+    file="$SYQ_TEST_RUNS_DIR/$workflow.$event.json"
+    if [ -n "$branch" ] && [ -f "$SYQ_TEST_RUNS_DIR/$workflow.$event.branch-$branch.json" ]; then
+      file="$SYQ_TEST_RUNS_DIR/$workflow.$event.branch-$branch.json"
+    fi
+    if [ ! -f "$file" ]; then
       echo '[]'
+    elif [ -n "$branch" ]; then
+      python3 -c 'import json, sys; print(json.dumps([run for run in json.load(open(sys.argv[1]))
+        if run.get("headBranch", "master") == sys.argv[2]]))' "$file" "$branch"
+    else
+      cat "$file"
     fi
     ;;
   run:view)
@@ -85,6 +96,8 @@ class BranchStatusTests(unittest.TestCase):
         for workflow in ("ci.yml", "rsync-compat.yml", "macos.yml"):
             self.set_run(workflow, "completed", "success")
             self.set_run(workflow, "completed", "success", "schedule")
+        # The master runs above are not full-suite runs.
+        (self.runs / "jobs-1.json").write_text('{"jobs": []}')
         self.pr = {
             "number": 7, "url": "https://example.invalid/pull/7", "state": "OPEN",
             "isDraft": False, "baseRefName": "master", "headRefOid": self.head,
@@ -116,8 +129,10 @@ class BranchStatusTests(unittest.TestCase):
     def dispatch(self, workflow, run_id, created, jobs, branch="task", status="completed",
                  head=None):
         """Record a manually dispatched run and its jobs as {name: conclusion}."""
+        # As on GitHub, one cancelled job makes the whole run cancelled.
         conclusions = [conclusion for conclusion in jobs.values() if conclusion]
-        conclusion = ("" if status != "completed" else "failure" if "failure" in conclusions
+        conclusion = ("" if status != "completed" else "cancelled" if "cancelled" in conclusions
+                      else "failure" if set(conclusions) & {"failure", "timed_out"}
                       else "success")
         self.dispatched.setdefault(workflow, []).append({
             "databaseId": run_id, "headBranch": branch, "headSha": head or self.head,
@@ -131,10 +146,14 @@ class BranchStatusTests(unittest.TestCase):
             for name, conclusion in jobs.items()]}))
 
     def full_run(self, workflow, run_id, created, event="schedule", jobs=None):
-        """Record a successful run on master with the given (default certified) jobs."""
-        (self.runs / f"{workflow}..json").write_text(json.dumps([{
-            "databaseId": run_id, "event": event, "createdAt": created, "status": "completed",
-            "conclusion": "success"}]))
+        """Add a successful run on master with the given (default certified) jobs,
+        after the runs that the master status lines report."""
+        path = self.runs / f"{workflow}.{event}.json"
+        runs = json.loads(path.read_text()) if path.exists() else []
+        path.write_text(json.dumps(runs + [{
+            "databaseId": run_id, "headSha": self.master, "createdAt": created,
+            "status": "completed", "conclusion": "success",
+            "url": f"https://example.invalid/runs/{run_id}"}]))
         jobs = jobs or {"rust": "success", "release-certification": "success"}
         (self.runs / f"jobs-{run_id}.json").write_text(json.dumps({"jobs": [
             {"name": name, "conclusion": conclusion} for name, conclusion in jobs.items()]}))
@@ -340,6 +359,21 @@ class BranchStatusTests(unittest.TestCase):
         self.assertNotIn("failed   ci.yml", output)
         self.assertNotIn("WARNING", output)
 
+    def test_failure_in_a_cancelled_run_is_reported(self):
+        self.dispatch("ci.yml", 15, "2026-02-01T00:00:00Z",
+                      {"real-ssh (core, default)": "failure", "object-storage": "cancelled"})
+        report = json.loads(self.status("--json", expected=1))
+        self.assertEqual([entry["job"] for entry in report["dispatched"]["failed"]],
+                         ["real-ssh (core, default)"])
+
+    def test_this_branch_is_queried_beyond_the_shared_window(self):
+        # Runs on busy branches can push this branch's run out of the shared list.
+        self.dispatch("ci.yml", 16, "2026-02-01T00:00:00Z", {"s3": "failure"})
+        (self.runs / "ci.yml.workflow_dispatch.branch-task.json").write_text(
+            json.dumps(self.dispatched["ci.yml"]))
+        (self.runs / "ci.yml.workflow_dispatch.json").write_text("[]")
+        self.assertIn("  failed   ci.yml s3", self.status(expected=1))
+
     def test_checks_are_matched_by_workflow_and_job_name(self):
         self.dispatch("focused-check.yml", 21, "2026-02-01T00:00:00Z",
                       {"check (linux, namespace, script aaa)": "failure"})
@@ -383,9 +417,16 @@ class BranchStatusTests(unittest.TestCase):
         self.full_run("ci.yml", 93, "2026-02-03T00:00:00Z", event="workflow_dispatch")
         output = self.status()
         self.assertNotIn("Failures left by merged", output)
+        # Many later pushes do not hide the full run that cleared it.
+        (self.runs / "ci.yml.push.json").write_text(json.dumps([
+            {"headSha": self.master, "status": "completed", "conclusion": "success",
+             "url": "https://example.invalid/push", "createdAt": f"2026-02-04T00:{minute:02}:00Z",
+             "databaseId": 200 + minute} for minute in range(30)]))
+        self.status()
         # A cross-repository pull request's branch name says nothing about these runs.
         self.merged[0]["isCrossRepository"] = True
-        (self.runs / "ci.yml..json").unlink()
+        (self.runs / "ci.yml.workflow_dispatch.json").write_text(
+            json.dumps(self.dispatched["ci.yml"]))
         self.status()
 
     def test_merged_focused_failure_waits_for_both_native_suites(self):

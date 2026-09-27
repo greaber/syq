@@ -54,7 +54,8 @@ CLEARED_BY = {"ci.yml": ("ci.yml",), "macos.yml": ("macos.yml",),
               "rsync-compat.yml": ("rsync-compat.yml",),
               "focused-check.yml": ("ci.yml", "macos.yml")}
 FAILED = ("failure", "timed_out")
-# How far back to look: dispatched runs per workflow and merged pull requests.
+# How far back to look for merged branches: dispatched runs per workflow and
+# merged pull requests. The current branch's runs are queried separately.
 DISPATCHED_RUNS = 100
 MERGED_PULL_REQUESTS = 30
 
@@ -114,11 +115,12 @@ def run_state(workflow, run, kind, warn):
     return state
 
 
-def dispatched_runs(workflow):
-    """Recent manually dispatched runs of a branch workflow, on any branch."""
+def dispatched_runs(workflow, branch=None):
+    """Recent manually dispatched runs of a branch workflow, on one or any branch."""
     return [dict(run, workflow=workflow) for run in json_output(
         "gh", "run", "list", "--repo", REPOSITORY, "--workflow", workflow, "--event",
-        "workflow_dispatch", "--limit", str(DISPATCHED_RUNS), "--json",
+        "workflow_dispatch", *(["--branch", branch] if branch else []), "--limit",
+        str(DISPATCHED_RUNS), "--json",
         "databaseId,headBranch,headSha,createdAt,status,conclusion,url", status=2)]
 
 
@@ -150,11 +152,12 @@ def run_jobs(run):
 
 
 def undecided(runs):
-    """A branch's runs from the first failed or unfinished one on, oldest first;
-    only these can hold a failure that no later run passed."""
+    """A branch's runs from the first unsuccessful or unfinished one on, oldest
+    first; only these can hold a failure that no later run passed. GitHub marks
+    a run cancelled when any job was cancelled, even if another job failed."""
     runs = sorted(runs, key=lambda run: run.get("createdAt") or "")
     first = next((index for index, run in enumerate(runs) if run.get("status") != "completed"
-                  or run.get("conclusion") in FAILED), len(runs))
+                  or run.get("conclusion") != "success"), len(runs))
     return runs[first:]
 
 
@@ -181,12 +184,15 @@ def failed_checks(runs, jobs):
 
 
 def latest_full_run(workflow):
-    """When the latest successful full-suite run of a workflow on master started."""
-    runs = json_output("gh", "run", "list", "--repo", REPOSITORY, "--workflow", workflow,
-                       "--branch", "master", "--limit", "20", "--json",
-                       "databaseId,event,createdAt,status,conclusion", status=2)
+    """When the latest successful full-suite run of a workflow on master started.
+    Only nightly and manual runs can be full, so busy days of pushes don't
+    crowd them out."""
+    runs = [run for event in ("schedule", "workflow_dispatch") for run in json_output(
+        "gh", "run", "list", "--repo", REPOSITORY, "--workflow", workflow, "--branch", "master",
+        "--event", event, "--limit", "20", "--json", "databaseId,createdAt,status,conclusion",
+        status=2)]
     for run in sorted(runs, key=lambda run: run.get("createdAt") or "", reverse=True):
-        if run.get("event") in ("schedule", "workflow_dispatch") and run.get("conclusion") == "success":
+        if run.get("conclusion") == "success":
             passed = {job.get("name") for job in run_jobs(run) if job.get("conclusion") == "success"}
             if "release-certification" in passed and "nightly-unchanged" not in passed:
                 return run.get("createdAt") or ""
@@ -236,10 +242,15 @@ def report(json_report, check):
                 for workflow in WORKFLOWS for event in ("push", "schedule")]
     lookups += [lambda workflow=workflow: dispatched_runs(workflow)
                 for workflow in BRANCH_WORKFLOWS]
+    # The recent runs on every branch can crowd out this branch's older ones.
+    lookups += [lambda workflow=workflow: dispatched_runs(workflow, branch)
+                if branch != "HEAD" else [] for workflow in BRANCH_WORKFLOWS]
     results = in_parallel(lookups)
     pr, merged = results[:2]
     latest = iter(results[2:2 + 2 * len(WORKFLOWS)])
-    runs = [run for workflow_runs in results[2 + 2 * len(WORKFLOWS):] for run in workflow_runs]
+    runs = {run.get("databaseId"): run for workflow_runs in results[2 + 2 * len(WORKFLOWS):]
+            for run in workflow_runs}
+    runs = list(runs.values())
     master_runs = []
     for workflow in WORKFLOWS:
         push_run, nightly_run = next(latest), next(latest)

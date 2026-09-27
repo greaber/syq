@@ -56,6 +56,8 @@ jobs:
       full_suite: ${{ steps.changes.outputs.full_suite }}
       integration_targets: ${{ steps.changes.outputs.integration_targets }}
       suite_selection: ${{ steps.changes.outputs.suite_selection }}
+      rust_suites: ${{ steps.changes.outputs.rust_suites }}
+      all_tooling: ${{ steps.changes.outputs.all_tooling }}
       s3: ${{ steps.changes.outputs.s3 }}
       repository_checks: ${{ steps.changes.outputs.repository_checks }}
       macos_intel: ${{ steps.changes.outputs.macos_intel }}
@@ -84,6 +86,8 @@ jobs:
         run: scripts/ci-scope.py "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
   rust:
+    # Release checks require the name `rust`; selected suites never run on master.
+    name: ${{ needs.scope.outputs.suite_selection == 'true' && format('rust ({0})', needs.scope.outputs.rust_suites) || 'rust' }}
     # Cancel only matching automatic checks and later selections of the same
     # suite on the same branch; other manual runs keep a unique group.
     concurrency:
@@ -128,7 +132,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python${{ needs.scope.outputs.full_suite == 'true' && '-node' || '' }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python${{ needs.scope.outputs.all_tooling == 'true' && '-node' || '' }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         if: >-
           needs.scope.outputs.native == 'true' ||
@@ -139,7 +143,7 @@ jobs:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
         run: |
           scripts/setup.sh github shellcheck jq python
-          if [[ "${{ needs.scope.outputs.full_suite }}" == true ]]; then
+          if [[ "${{ needs.scope.outputs.all_tooling }}" == true ]]; then
             scripts/setup.sh github node
           fi
       - name: Show Linux trial hardware
@@ -230,26 +234,26 @@ jobs:
            needs.scope.outputs.full_suite != 'true')
         run: cargo test --locked --test local _md_
       - name: Test every repository tooling script
-        if: needs.scope.outputs.full_suite == 'true'
+        if: needs.scope.outputs.all_tooling == 'true'
         run: scripts/run-tooling-tests.py
       - name: Test Cargo package identity
         if: >-
-          needs.scope.outputs.full_suite != 'true' &&
+          needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' package ')
         run: tests/tooling/test-cargo-package.py
       - name: Test installer tooling
         if: >-
-          needs.scope.outputs.full_suite != 'true' &&
+          needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' installer ')
         run: tests/tooling/test-installer.py
       - name: Test interactive benchmark
         if: >-
-          needs.scope.outputs.full_suite != 'true' &&
+          needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' benchmark ')
         run: python3 tests/tooling/test-try-benchmark.py
       - name: Test release tooling
         if: >-
-          needs.scope.outputs.full_suite != 'true' &&
+          needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' release ')
         env:
           TOOLING_CHECKS: ${{ needs.scope.outputs.tooling_checks }}
@@ -261,7 +265,7 @@ jobs:
           fi
       - name: Test release orchestration
         if: >-
-          needs.scope.outputs.full_suite != 'true' &&
+          needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' orchestration ')
         run: |
           tests/tooling/test-release-orchestration.py
@@ -273,17 +277,17 @@ jobs:
           tests/tooling/test-find-release-build.py
       - name: Test focused check dispatch
         if: >-
-          needs.scope.outputs.full_suite != 'true' &&
+          needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' focused ')
         run: python3 tests/tooling/test-run-focused-check.py
       - name: Test branch status tooling
         if: >-
-          needs.scope.outputs.full_suite != 'true' &&
+          needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' branch ')
         run: tests/tooling/test-branch-status.py
       - name: Test the development setup
         if: >-
-          needs.scope.outputs.full_suite != 'true' &&
+          needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' setup ')
         run: tests/tooling/test-setup.sh
       - name: Validate workflow syntax and script references
