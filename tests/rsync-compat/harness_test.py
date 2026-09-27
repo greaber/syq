@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -61,6 +63,45 @@ def sample_report(tests: list[dict] | None = None) -> dict:
 
 
 class HarnessTests(unittest.TestCase):
+    def test_main_forwards_scratch_option_and_cleans_up_by_default(self) -> None:
+        test = rsync_compat.load_manifest()["tests"][0]
+        for preserve in (False, True):
+            with self.subTest(preserve=preserve), tempfile.TemporaryDirectory() as temporary:
+                cache = Path(temporary)
+                argv = [
+                    str(SCRIPT), "--cache-dir", str(cache),
+                    "--no-build-syq", "--syq-bin", sys.executable, "--require-tests",
+                ]
+                if preserve:
+                    argv.append("--preserve-scratch")
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(sys, "stdout", new_callable=io.StringIO),
+                    mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}),
+                    mock.patch.object(rsync_compat, "fetch_source", return_value=cache),
+                    mock.patch.object(rsync_compat, "validate_ledger"),
+                    mock.patch.object(rsync_compat, "prepare_suite", return_value=cache),
+                    mock.patch.object(rsync_compat, "running_as", return_value="non-root"),
+                    mock.patch.object(
+                        rsync_compat, "select_tests", return_value=([test], [], [])
+                    ),
+                    mock.patch.object(
+                        rsync_compat, "stream_command",
+                        return_value=(0, f"PASS    {test['name']}\n"),
+                    ) as runner,
+                ):
+                    self.assertEqual(rsync_compat.main(), 0)
+
+                runner.assert_called_once()
+                command = runner.call_args.args[0]
+                self.assertEqual("--preserve-scratch" in command, preserve)
+                self.assertNotIn("--copy-metadata-scratch", command)
+                scratch = Path(runner.call_args.kwargs["env"]["scratchbase"])
+                self.assertEqual(scratch.parent.exists(), preserve)
+                report = json.loads((cache / "reports" / "rsync.json").read_text())
+                self.assertTrue(report["harness_ok"])
+                self.assertEqual(report["tests"][0]["actual"], "pass")
+
     def test_scope_rejects_later_file_in_traditional_multi_file_patch(self) -> None:
         patch = b"""--- a/testsuite/README.md
 +++ b/testsuite/README.md
