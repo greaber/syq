@@ -91,6 +91,15 @@ pub(crate) struct RootMetadata {
 }
 
 impl RootMetadata {
+    /// Equal apart from access time, which merely reading the object can
+    /// update (for example a symlink's first readlink under relatime).
+    pub(crate) fn same_except_access_time(self, other: Self) -> bool {
+        Self {
+            atime: other.atime,
+            ..self
+        } == other
+    }
+
     pub(crate) fn is_dir(self) -> bool {
         self.mode & MODE_TYPE_MASK == MODE_DIRECTORY
     }
