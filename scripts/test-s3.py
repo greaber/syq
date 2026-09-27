@@ -17,11 +17,13 @@ import urllib.request
 from tooling import ForwardSignals
 
 ROOT = Path(os.path.abspath(__file__)).parent.parent
-IMAGE = ("quay.io/minio/minio@sha256:"
-         "14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e")
+# PGSTY Silo, a maintained community fork of the MinIO server, release
+# RELEASE.2026-09-03T13-18-01Z (multi-architecture index digest).
+IMAGE = ("docker.io/pgsty/silo@sha256:"
+         "b616a0cf8cb281e7e6bb3c9b1fb53875b4016a2878223925541c18f82d6c5ca3")
 
 
-def wait_for_minio(endpoint, children):
+def wait_for_server(endpoint, children):
     deadline = time.monotonic() + 60
     last = "not checked"
     while time.monotonic() < deadline:
@@ -32,10 +34,10 @@ def wait_for_minio(endpoint, children):
                 last = f"HTTP {response.status}"
         except OSError as error:
             last = str(error)
-        print(f"Waiting for MinIO: {last}", flush=True)
+        print(f"Waiting for the S3 server: {last}", flush=True)
         time.sleep(2)
         children.check()
-    raise SystemExit(f"MinIO readiness deadline exceeded; last state: {last}")
+    raise SystemExit(f"S3 server readiness deadline exceeded; last state: {last}")
 
 
 def create_bucket(binary):
@@ -77,9 +79,9 @@ def main():
         if status:
             return status
         os.environ["AWS_ENDPOINT_URL_S3"] = f"http://127.0.0.1:{port.strip()}"
-        wait_for_minio(os.environ["AWS_ENDPOINT_URL_S3"], children)
+        wait_for_server(os.environ["AWS_ENDPOINT_URL_S3"], children)
         create_bucket(binary)
-        # The fault server owns its endpoint and cache; overlap it with MinIO checks.
+        # The fault server owns its endpoint and cache; overlap it with the server checks.
         status, _ = children.run(sys.executable, "tests/object-storage/run.py", binary)
         return status
     finally:
