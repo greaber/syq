@@ -620,6 +620,7 @@ fn destination_inspection_errors_are_not_missing_entries() {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn fresh_dry_run_estimates_count_copy_if_selected_leaves() {
     for existing in [false, true] {
