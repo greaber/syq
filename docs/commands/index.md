@@ -38,7 +38,7 @@ syq --self-update
 
 | Argument / option | Meaning |
 |---|---|
-| `--use-version <VERSION>` | Run an exact official release, downloading it if needed (place before COMMAND) |
+| `--use-version <VERSION>` | Run an exact official release, downloading it if needed (must be the first argument) |
 | `--self-update` | Install the newest signed release (standalone installs); Homebrew: brew upgrade syq |
 
 **Help and version**

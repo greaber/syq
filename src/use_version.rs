@@ -8,7 +8,7 @@ use std::process::Command;
 
 pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
     let Some((version, consumed)) = selection(&argv).map_err(|error| {
-        clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+        clap::Error::raw(clap::error::ErrorKind::InvalidValue, format!("{error}\n"))
     })?
     else {
         return Ok(argv);

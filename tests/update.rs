@@ -742,6 +742,7 @@ fn use_version_rejects_misplaced_root_selection_before_early_exit() {
         let output = fixture.command_at_args(&fixture.installed, &args);
         assert_failure_contains(&output, "--use-version must be the first argument");
         assert_eq!(output.status.code(), Some(2));
+        assert!(output.stderr.ends_with(b"\n"), "{output:?}");
         assert!(output.stdout.is_empty());
     }
     assert!(!fixture.temp.path("cache").exists());
@@ -774,4 +775,16 @@ fn release_flag_without_a_key_still_cannot_register_for_self_update() {
         .installed
         .with_file_name(".syq-install.json")
         .exists());
+}
+
+#[test]
+fn use_version_invalid_selection_diagnostics_end_with_a_newline() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    for args in [vec!["--use-version=latest"], vec!["--use-version"]] {
+        let output = fixture.command_at_args(&fixture.installed, &args);
+        assert_failure_contains(&output, "requires an exact release version");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stderr.ends_with(b"\n"), "{output:?}");
+        assert!(output.stdout.is_empty());
+    }
 }
