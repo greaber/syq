@@ -24,10 +24,24 @@ Run the suite from any syq checkout:
 scripts/test-real-ssh.py
 ```
 
+To iterate on particular cases, list their names and select them by any part
+of the name. The run keeps the suite's shared setup and final checks:
+
+```sh
+scripts/test-real-ssh.py --list-cases
+scripts/test-real-ssh.py --case 'relaying between two SSH endpoints'
+```
+
+Many cases build on files, settings, or shell functions from earlier cases.
+If a selected case fails before its own checks, add the cases it builds on.
+A subset is for iteration: run the whole suite when it is relevant to a change.
+
 Full nightly and manual `ci.yml` runs build the lab image once, then run the
-core suite in both SSH profiles and the metadata and benchmark suites below as
-parallel jobs on GitHub's Linux runners. The core suite includes the storage
-checks. Pull requests and post-merge runs do not run these suites.
+core suite, the metadata and benchmark suites below, and the alternate SSH
+profile as parallel jobs on GitHub's Linux runners. The core suite includes the
+storage checks. The alternate profile runs the cases listed in
+`max-sessions-1.cases`: those that contact the destination, whose sshd the
+profile changes. Pull requests and post-merge runs do not run these suites.
 
 The suite also runs a pinned local S3 server fixture on the runner: PGSTY Silo,
 a maintained fork of the MinIO server. Storage checks approve

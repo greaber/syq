@@ -602,7 +602,8 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # The core suite also runs the storage checks.
+  # The core suite also runs the storage checks. The one-session profile runs
+  # only the cases that contact the destination, whose sshd it changes.
   real-ssh:
     needs: [scope, real-ssh-lab]
     if: >-
@@ -619,6 +620,7 @@ jobs:
             profile: default
           - suite: core
             profile: max-sessions-1
+            cases: tests/real-ssh/max-sessions-1.cases
           - suite: metadata
             profile: default
           - suite: benchmark
@@ -646,9 +648,12 @@ jobs:
         run: docker load --input "$RUNNER_TEMP/real-ssh-lab.tar"
       - name: Run the suite through real OpenSSH
         env:
+          CASES: ${{ matrix.cases }}
           PROFILE: ${{ matrix.profile }}
           SUITE: ${{ matrix.suite }}
-        run: scripts/test-real-ssh.py --image syq-real-ssh-lab --profile "$PROFILE" --suite "$SUITE"
+        run: >-
+          scripts/test-real-ssh.py --image syq-real-ssh-lab --profile "$PROFILE" --suite "$SUITE"
+          ${CASES:+--cases-from "$CASES"}
       - name: Keep real-SSH diagnostics
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
