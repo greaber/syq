@@ -959,9 +959,6 @@ fn run_remote(
     if let Some(policy) = args.if_exists {
         remote.push(format!("--if-exists={}", policy.as_str()));
     }
-    if args.resume {
-        remote.push("--resume".into());
-    }
     if args.existing {
         remote.push("--only-existing".into());
     }

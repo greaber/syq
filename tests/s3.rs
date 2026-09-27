@@ -2391,7 +2391,6 @@ fn s3_service_profile_endpoints_keep_recovery_separate() {
         .unwrap();
         let output = server
             .command(temp.path())
-            .arg("--resume")
             .env("AWS_CONFIG_FILE", &config)
             .args([
                 "--integrity-checking=transfer=blake3",
@@ -2430,7 +2429,6 @@ fn s3_unreadable_recovery_record_is_named_and_stale_temporaries_are_removed() {
         server.cp(
             temp.path(),
             &[
-                "--resume",
                 "--integrity-checking=transfer=blake3",
                 "--from",
                 "s3://bucket",

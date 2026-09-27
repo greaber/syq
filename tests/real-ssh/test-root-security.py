@@ -84,7 +84,7 @@ def main():
             partial.chmod(0o666)
             with partial.open("rb") as held:
                 old = os.fstat(held.fileno())
-                run(args + ([] if interface == "rsync" else ["--resume"]))
+                run(args)
                 published = destination.stat()
                 assert (published.st_dev, published.st_ino) != (old.st_dev, old.st_ino)
                 assert published.st_uid == (0 if interface == "native" else 1000)

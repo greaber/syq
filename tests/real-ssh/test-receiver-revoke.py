@@ -102,7 +102,7 @@ print(json.dumps([any(p.open('rb').read(4 << 20) == b'x' * (4 << 20) for p in ro
         for name in ("one", "two"):
             with tempfile.TemporaryDirectory(prefix="revoke-resume-results-") as temporary:
                 results = Path(temporary) / "results.ndjson"
-                run("syq", "cp", "--resume", "--from", "source", source, "--to", "destination",
+                run("syq", "cp", "--from", "source", source, "--to", "destination",
                     "--as", f"{root}/{name}", "--performance-tuning", "workers=2", "--no-progress", "--results", str(results), *transport)
                 terminal = [json.loads(line) for line in results.read_text().splitlines()][-1]
                 assert terminal["type"] == "result" and terminal["status"] == "success", terminal

@@ -70,10 +70,7 @@ impl Drop for ReadOnlyDirectory {
 }
 
 fn configure_cache(command: &mut Command, root: &Path, mode: &str) -> Option<ReadOnlyDirectory> {
-    command
-        .arg("--resume")
-        .env_remove("HOME")
-        .env_remove("XDG_CACHE_HOME");
+    command.env_remove("HOME").env_remove("XDG_CACHE_HOME");
     match mode {
         "read-only-home" => {
             let home = ReadOnlyDirectory::new(root.join("home"));
@@ -224,31 +221,4 @@ fn multipart_download_without_cache_publishes_or_cleans_up() {
             .to_string_lossy()
             .ends_with(".partial")));
     }
-}
-
-#[test]
-fn ordinary_multipart_upload_neither_reads_nor_prepares_recovery() {
-    let temp = test_support::tempdir().unwrap();
-    let server = Server::start("recovery-upload-ok");
-    std::fs::write(temp.path().join("source"), vec![b'x'; SIZE]).unwrap();
-    let cache = temp.path().join("cache");
-    std::fs::write(&cache, b"unusable cache").unwrap();
-    let output = server
-        .command(temp.path())
-        .env("XDG_CACHE_HOME", &cache)
-        .args([
-            "--s3-endpoint",
-            &server.address,
-            "source",
-            "--to",
-            "s3://bucket",
-            "--as",
-            "object",
-        ])
-        .capture_output()
-        .unwrap();
-    assert!(output.status.success(), "{}", output_text(&output));
-    assert!(!output_text(&output).contains("without saving recovery progress"));
-    assert_eq!(std::fs::read(cache).unwrap(), b"unusable cache");
-    assert!(server.gate.0.load(Ordering::Relaxed));
 }

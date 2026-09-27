@@ -189,7 +189,7 @@ syq cp --srcs-in source --into destination \
 Size/time quick checks still skip completed files. Explicit `--hash` (or rsync
 `--checksum`) still compares contents even when reuse is disabled; if copying
 is required, the final destination contributes no reusable blocks. Expected
-hashes, payload checks and publication-recovery checks stay in effect. Partial-file reuse requires `--resume` in native copies and remains enabled in `syq rsync`
+hashes, payload checks and publication-recovery checks stay in effect. Partial-file resume remains enabled
 in every mode: matching bytes from interrupted copies can still be reused,
 even with `off`. The setting controls reuse of the final destination, not partials.
 

@@ -450,7 +450,6 @@ pub struct FsOps {
     /// controller's decision to repair or accept that exact inode.
     held_basis: Option<HeldBasis>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
-    reuse_partials: bool,
     partial_directory_order: VecDeque<FileLocation>,
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
@@ -634,7 +633,6 @@ impl FsOps {
             fd_order: Vec::new(),
             held_basis: None,
             partial_candidates: HashMap::new(),
-            reuse_partials: true,
             partial_directory_order: VecDeque::new(),
             prepared_small_copy: None,
             operator_selection: None,
@@ -2028,7 +2026,7 @@ impl FsOps {
                     }
                 }
             }
-            Request::ConfigureHashing { .. }
+            Request::ConfigureHashing(_)
             | Request::Hello { .. }
             | Request::TcpListen { .. }
             | Request::ListDir { .. }

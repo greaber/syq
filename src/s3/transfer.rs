@@ -228,7 +228,7 @@ impl Engine {
         self.uploads.cancel();
         // Drain started requests, including synchronous file bodies, before exit.
         let _ = work.await;
-        bail!("S3 copy {interrupted}; rerun with --resume to continue")
+        bail!("S3 copy {interrupted}; rerun the command to continue")
     }
     fn check_cancelled(&self) -> Result<()> {
         anyhow::ensure!(!self.cancelled.load(Relaxed), "S3 copy cancelled");
@@ -526,14 +526,6 @@ impl Engine {
         }
         self.check_cancelled()
     }
-    fn recovery_state(&self, identity: &[u8]) -> Result<State> {
-        if self.args.resume {
-            State::open(identity)
-        } else {
-            Ok(State::without_cache())
-        }
-    }
-
     fn identity(&self, key: &str, extra: &str) -> Vec<u8> {
         let mut hash = blake3::Hasher::new();
         for header in &self.options.headers {
@@ -1152,7 +1144,7 @@ impl Engine {
                 uploaded,
             } = multipart.context("multipart preparation missing")?;
             let state = if recorded {
-                let state = self.recovery_state(&self.identity(&source.key, "upload"))?;
+                let state = State::open(&self.identity(&source.key, "upload"))?;
                 let saved: Option<UploadState> = state.load()?;
                 anyhow::ensure!(
                     saved
@@ -1346,14 +1338,6 @@ impl Engine {
             .bucket(&self.options.bucket)
             .key(key)
             .upload_id(upload_id)
-            .customize()
-            .config_override(
-                client::without_sdk_retries().timeout_config(
-                    aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-                        .operation_timeout(std::time::Duration::from_secs(15))
-                        .build(),
-                ),
-            )
             .send()
             .await
         {
@@ -1376,7 +1360,7 @@ impl Engine {
         metadata: &Metadata,
         algorithm: Algorithm,
     ) -> Result<PreparedMultipart> {
-        let state = self.recovery_state(&self.identity(&source.key, "upload"))?;
+        let state = State::open(&self.identity(&source.key, "upload"))?;
         let mut previous: Option<UploadState> = state.load()?;
         if let Some(old) = &previous {
             if old.schema != old.algorithm.schema() {
@@ -2320,7 +2304,7 @@ impl Engine {
             root.identity().ino,
             job.path
         );
-        let state = self.recovery_state(&self.identity(&object.key, &extra))?;
+        let state = State::open(&self.identity(&object.key, &extra))?;
         let mut saved: Option<DownloadState> = state.load()?;
         if let Some(old) = &saved {
             if old.schema != 1 && old.schema != 2 {
@@ -2412,15 +2396,13 @@ impl Engine {
                             length,
                             initial,
                             slot,
-                            state.can_checkpoint().then_some(range_algorithm),
+                            Some(range_algorithm),
                         )
                         .await?;
-                    if state.can_checkpoint() {
-                        output.finish().await?;
-                        let mut record = record.lock().await;
-                        record.parts.insert(index, hash);
-                        state.save(&*record)?;
-                    }
+                    output.finish().await?;
+                    let mut record = record.lock().await;
+                    record.parts.insert(index, hash);
+                    state.save(&*record)?;
                     Ok(())
                 }
             })

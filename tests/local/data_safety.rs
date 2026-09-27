@@ -477,7 +477,6 @@ fn resume_accepts_pre_path_hash_partial_filename() {
     fs::set_permissions(&partial, fs::Permissions::from_mode(0o600)).unwrap();
     run_native_ok(&[
         "cp",
-        "--resume",
         "--results",
         &t.s("results"),
         "--performance-tuning=copy-path=ranges",

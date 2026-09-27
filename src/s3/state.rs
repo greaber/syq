@@ -118,9 +118,6 @@ impl State {
         }
         Ok(())
     }
-    pub fn can_checkpoint(&self) -> bool {
-        self.writable.load(Relaxed)
-    }
     pub fn has_record(&self) -> bool {
         self.recorded.load(Relaxed)
     }
