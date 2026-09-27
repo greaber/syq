@@ -335,7 +335,9 @@ impl Planner<'_> {
         if !same {
             self.hardlink_failure(
                 follower,
-                "destination contents differ (--if-exists=error-if-different)".into(),
+                self.opts
+                    .file_difference_message(&display(&follower.rel))
+                    .into(),
             );
         }
         Ok(same)

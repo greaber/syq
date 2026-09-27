@@ -781,8 +781,8 @@ impl Worker {
             let diff = self.diff_final_and_hold(&job)?;
             anyhow::ensure!(
                 diff.ranges.is_empty() && diff.held_len == Some(size),
-                "destination contents differ: {} (--if-exists=error-if-different)",
-                job.rel
+                "{}",
+                self.opts.file_difference_message(&job.rel)
             );
             self.finish_matched_basis(idx, &job)?;
             job.done.store(size, Relaxed);
@@ -2076,8 +2076,8 @@ impl Worker {
         };
         anyhow::ensure!(
             matched || !self.opts.protects_existing_contents() || job.dst_entry.is_none(),
-            "destination contents differ: {} (--if-exists=error-if-different)",
-            job.rel
+            "{}",
+            self.opts.file_difference_message(&job.rel)
         );
         if self.opts.hardlinks && job.entry.nlink > 1 {
             self.opts.hardlink_completions.lock().unwrap().insert(

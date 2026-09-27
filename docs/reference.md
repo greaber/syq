@@ -261,8 +261,10 @@ restarts. Partial-file resume is independent of
 comparison against an existing final destination. Unless `--inplace` is selected,
 syq assembles each updated file beside the destination and replaces it when
 complete. With `--inplace`, interrupted bytes are in the final file itself.
-`--resume` cannot distinguish those bytes from a different pre-existing file;
-finishing that update requires `--if-exists=update`. Reusing matching parts
+With the default existing-file policy, `--resume` rejects a differing final file:
+it cannot distinguish incomplete output from a pre-existing file that must remain
+untouched. Changing to `--if-exists=update` authorizes updates to all differing
+selected files; it does not preserve the original policy. Reusing matching parts
 follows the block-reuse policy.
 
 A copy may temporarily make a newly created directory writable while filling it.

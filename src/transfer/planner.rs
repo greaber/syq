@@ -1834,7 +1834,14 @@ impl Planner<'_> {
                 .as_ref()
                 .is_some_and(|d| d.kind != Kind::File || d.size != e.size)
         {
-            self.existing_conflict(&dst_path, &dst_rel, "destination contents differ");
+            if dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File) {
+                self.report_existing_conflict(
+                    &dst_rel,
+                    &opts.file_difference_message(&display(&dst_path)),
+                );
+            } else {
+                self.existing_conflict(&dst_path, &dst_rel, "destination contents differ");
+            }
             return;
         }
         let same = dst_entry
@@ -3241,6 +3248,10 @@ impl Planner<'_> {
             display(path),
             self.opts.if_exists.unwrap().as_str()
         );
+        self.report_existing_conflict(rel, &message);
+    }
+
+    fn report_existing_conflict(&self, rel: &[u8], message: &str) {
         self.progress.error(&format!("syq: {message}"));
         if !self.opts.dry_run {
             self.emit_entry_failed(
@@ -3252,7 +3263,7 @@ impl Planner<'_> {
                 "no",
                 "conflict",
                 None,
-                &message,
+                message,
             );
         }
     }

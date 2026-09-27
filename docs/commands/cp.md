@@ -177,10 +177,11 @@ does not change that directory's permissions to make it writable.
 
 `--if-exists=keep` and `update-if-older` cannot combine with `--inplace`: an
 interrupted write could leave a file that a retry skips. With the default policy,
-a retry can instead reject that incomplete file as different; use
-`--if-exists=update` to finish it. Restricted receivers also reject `--as-new --inplace`,
-because direct writes do not enforce that destination condition. S3 and named
-receiving destinations do not support `--inplace`; see
+`--resume` rejects a differing final file because it cannot distinguish incomplete
+output from a protected pre-existing file. Changing to `--if-exists=update`
+authorizes updates to all differing selected files. Restricted receivers also
+reject `--as-new --inplace`, because direct writes do not enforce that destination
+condition. S3 and named receiving destinations do not support `--inplace`; see
 [Copy limits](../persistence-reference.md#copy-limits).
 
 These policies do not disable requested pruning. Descriptor-specific

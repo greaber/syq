@@ -218,6 +218,16 @@ impl Opts {
         )
     }
 
+    fn file_difference_message(&self, path: &str) -> String {
+        if self.resume && self.inplace {
+            format!(
+                "cannot resume {path} under the selected existing-file policy: syq cannot distinguish an incomplete in-place output from a pre-existing file that must remain untouched"
+            )
+        } else {
+            format!("destination contents differ: {path} (--if-exists=error-if-different)")
+        }
+    }
+
     fn inode_metadata_differs(&self, path: &[u8], source: &Entry, destination: &Entry) -> bool {
         source.inode_metadata.is_some()
             && self.metadata_for(path, source).inode_metadata != destination.inode_metadata
