@@ -68,54 +68,22 @@ Keep an administrative session open. See [OpenSSH's settings](https://man.openbs
 
 <a id="check-local-storage-placement"></a>
 
-## Check storage
+## Keep free space available
 
-Filesystem choice, mount settings, free space, and competing I/O can all affect
-copy speed. On Linux, inspect each path on the machine that owns it:
+Leave room for growth and allocation; the useful margin depends on your
+filesystem and workload. XFS's [reserved-block pool](https://man7.org/linux/man-pages/man2/ioctl_xfs_setresblks.2.html)
+can enforce headroom even for root writes. An enlarged reserve reduces usable
+space and must be reapplied after mounting; preserve the original emergency
+allowance when lowering it.
 
-```sh
-findmnt -T /srv/data -o TARGET,SOURCE,FSTYPE,OPTIONS
-```
+## Reduce allocation contention
 
-Compare settings with your actual workload on disposable data. For local
-copies and mounted NFS, see [local copies and NFS](speed.md#local-copies-and-nfs).
-
-### Keep free space available
-
-Free space gives the filesystem room for growth and more choices when placing
-data. Keeping 20% free is an example budget, not a universal performance
-threshold; the useful margin depends on the filesystem and workload.
-
-On XFS, the [reserved-block pool](https://man7.org/linux/man-pages/man8/xfs_io.8.html)
-can withhold headroom even from ordinary root writes, which fail with `ENOSPC`
-when unreserved space runs out. Enlarging this metadata emergency pool is an
-option to test. Reserve sizes use filesystem blocks, reduce the free space
-shown by `df`, and must be reapplied after mounting. Record the original reserve;
-lowering an expanded reserve can temporarily release capacity while preserving
-the original emergency allowance. See the [reserve interface](https://man7.org/linux/man-pages/man2/ioctl_xfs_setresblks.2.html).
-
-### Reduce allocation contention
-
-Concurrent writers can compete for filesystem allocation locks. If profiling
-shows contention there, filesystem layout may matter more than adding workers.
-
-On XFS, some systems default to four allocation groups, which can limit
-concurrent transfers on fast SSDs. Our tests found similar performance across
-a wide range of higher counts: 512 worked well, but was not uniquely good.
-More groups mean smaller groups and more metadata; tradeoffs depend on
-filesystem size and workload, especially when nearly full. There is no need
-to reformat a filesystem that already performs well.
-
-Inspect the current geometry, or preview a new filesystem with 512 groups:
-
-```sh
-xfs_info /srv/data
-sudo mkfs.xfs -N -d agcount=512 /dev/your-empty-device
-```
-
-`-N` previews without writing; removing it formats the device and can destroy
-data. See [XFS format options](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html)
-for group and journal size constraints.
+Concurrent writers can compete for filesystem allocation locks. On XFS,
+four-group defaults can limit concurrent SSD transfers. Check with `xfs_info`;
+when creating a filesystem, consider [more allocation groups](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html).
+512 is one example, not an optimum: a wide range of higher counts performed
+similarly in our tests. Tradeoffs depend on filesystem size and workload,
+especially when nearly full. Don't reformat a filesystem that performs well.
 
 ## Measure and track improvements
 
