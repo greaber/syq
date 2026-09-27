@@ -335,3 +335,16 @@ fn rsync_endpoint_suggestions_never_treat_a_native_port_as_a_path() {
         Some("alice@example:2222")
     );
 }
+
+#[test]
+fn version_prefix_keeps_command_completion_and_never_completes_a_download() {
+    for words in [
+        vec!["syq", "--use-version", "0.7.1", "cp", "--int"],
+        vec!["syq", "--use-version=0.7.1", "cp", "--int"],
+    ] {
+        let words = words.into_iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(values(candidates(words.len() - 1, &words).unwrap()).contains(&b"--into".to_vec()));
+    }
+    let words = ["syq", "--use-version", ""].map(OsString::from);
+    assert!(candidates(2, &words).unwrap().is_empty());
+}

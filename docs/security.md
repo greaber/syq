@@ -142,7 +142,8 @@ approved source scope. Upload approval is not a write-only grant.
 Official releases provide executables for each supported operating system and
 CPU architecture. They are published as GitHub release assets and served
 through `dl.syq.christmas`. An installed syq downloads them for explicit
-self-updates and, when needed, to install a matching helper on an SSH server.
+self-updates, explicit `--use-version` selections, and, when needed, to install
+a matching helper on an SSH server.
 Remote helpers use the same release as the client, even when the server needs
 a different platform's executable.
 
@@ -151,7 +152,8 @@ SHA-256 hash of each archive and executable. The installed client carries the
 release public key. It verifies the manifest's Ed25519 signature with that key,
 then checks downloaded files against the signed sizes and hashes before using
 them. The verification key comes from the installed executable, not from the
-server supplying the download.
+server supplying the download. Source builds also carry the official public
+key for explicit `--use-version` selections.
 
 This also applies when the SSH server downloads its own helper: your client
 verifies the manifest and checks the reported archive hash before authorizing

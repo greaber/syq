@@ -551,8 +551,23 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let index = index.saturating_sub(command_start);
     let words = &words[command_start..];
-    let current = &words[index];
     if index <= 1 {
+        return Ok(root_candidates(&words[index]));
+    }
+    // The global launcher prefix does not change the command's argument
+    // positions. Completion never downloads or starts the selected release.
+    let prefix = match words.get(1).map(Vec::as_slice) {
+        Some(b"--use-version") => 2,
+        Some(word) if word.starts_with(b"--use-version=") => 1,
+        _ => 0,
+    };
+    if index <= prefix {
+        return Ok(Vec::new());
+    }
+    let words = &words[prefix..];
+    let index = index - prefix;
+    let current = &words[index];
+    if index == 1 {
         return Ok(root_candidates(current));
     }
     let Some(command) = words.get(1).and_then(|word| std::str::from_utf8(word).ok()) else {
@@ -719,6 +734,7 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
         "--help-all",
         "--version",
         "--self-update",
+        "--use-version",
     ]
     .into_iter()
     .filter(|value| value.as_bytes().starts_with(current))
