@@ -14,34 +14,33 @@ of the pull request so it is reviewed as a decision rather than as routine
 editing. If a task seems to require breaking a principle, raise that before
 implementing it.
 
-## Copying and removing need write access only where they change files
+## Copying and removing write little outside the files they change
 
 Copying and removing files, whether through `syq cp`, `syq rsync`, or `syq rm`,
-need write access only where they change files: for a copy, the destination
-files and directories it creates, including their partial files; for a removal,
-the files it removes. They work with read-only source data and with an
-unwritable home directory or cache on every machine involved. Removal also works
-on a completely full filesystem, which is often why someone is removing files.
+write where they change files: for a copy, the destination files and
+directories it creates, including their partial files; for a removal, the files
+it removes. They work with read-only source data and with an unwritable home
+directory or cache on every machine involved. Removal also works on a
+completely full filesystem, which is often why someone is removing files.
 
-Syq may read and write other state, such as the tuning cache, resume and
-recovery records, and completion caches, to help performance, including for the
-current operation. That state is optional: when syq cannot read or write it,
-copying and removal still succeed.
+Beyond that, syq may need a few small files, such as local sockets, in the
+temporary directory: `TMPDIR` when it is set, otherwise `/tmp`. Syq keeps this
+to a minimum.
 
-Two exceptions are accepted. Installing a missing SSH helper needs somewhere
-writable on the server. The helper has to live somewhere, and syq cannot assume
-a writable temporary directory either. When the server's home is unwritable,
-install syq there separately and use `--syq-path` or `--no-bootstrap`.
+Syq may also read and write optional state, such as the tuning cache, resume
+and recovery records, and completion caches, to help performance. When syq
+cannot read or write it, copying and removal still succeed.
 
-Copies also need a writable temporary directory, `TMPDIR` or else `/tmp`, on
-each machine that reads or writes files. Syq keeps a private socket there so
-its processes can share the files and directories a copy has opened. This is
-tolerated for practical reasons rather than required: removing it would mean
-changing how those processes find each other, which was not worth the work
-while no one needed it (September 2026).
+Any other write requirement is discussed with the maintainer first and recorded
+here. The accepted one is installing a missing SSH helper, which needs a
+durable writable location on the server; the temporary directory is not a
+lasting place for it. When the server's home is unwritable, install syq there
+separately and use `--syq-path` or `--no-bootstrap`.
 
-Why: this state exists to make syq faster. It should never be the reason a
-copy or removal fails.
+Why: the temporary directory is the conventional place for a program's
+short-lived files, so a little space there is unsurprising. Caches and records
+exist to make syq faster and should never be the reason a copy or removal
+fails.
 
 ## Startup latency and throughput are core
 

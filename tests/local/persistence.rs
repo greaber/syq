@@ -137,6 +137,37 @@ fn unusable_persistence_setting_falls_back_to_a_per_run_connection() {
     assert!(!t.runtime().exists());
 }
 
+// An explicit scope is a command-line argument. A wrong or closed path is
+// reported instead of silently logging in again, which a script may not expect.
+#[test]
+fn unusable_explicit_scope_is_an_error() {
+    let t = Tmp::new();
+    fake_ssh_rejecting_multiplexed_workers(&t);
+    write(&t.path("src"), b"explicit scope");
+    let remote = format!("fake:{}", t.s("dst"));
+
+    let out = compat_command()
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-no-tcp", "-a", "--syq-pscope"])
+        .arg(t.path("not-a-scope"))
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("PATH", format!("{}:/usr/bin:/bin", t.s("bin")))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .run()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("open persistence directory"), "{stderr}");
+    assert!(!t.path("dst").exists());
+    assert!(!t.path("rsh.log").exists());
+}
+
 #[test]
 fn local_copy_does_not_read_the_global_persistence_configuration() {
     let t = Tmp::new();

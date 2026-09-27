@@ -69,21 +69,14 @@ fn unregister_signal_cleanup(path: &Path) {
     }
 }
 
-/// Create a private directory in `TMPDIR`, or in `/tmp` when `TMPDIR` names
-/// another location that cannot be used, such as a deleted job directory.
+/// Create an owner-only directory in the temporary directory.
 pub(crate) fn private_temp_dir(prefix: &str) -> io::Result<tempfile::TempDir> {
-    let mut builder = tempfile::Builder::new();
     // Request the mode at creation: tempfile otherwise uses 0777 minus the
     // umask, which can let group members replace entries.
-    builder
+    tempfile::Builder::new()
         .prefix(prefix)
-        .permissions(std::fs::Permissions::from_mode(0o700));
-    builder.tempdir().or_else(|error| {
-        if std::env::temp_dir() == Path::new("/tmp") {
-            return Err(error);
-        }
-        builder.tempdir_in("/tmp").map_err(|_| error)
-    })
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
 }
 
 pub(crate) struct PrivateBrokerConfig<'a> {

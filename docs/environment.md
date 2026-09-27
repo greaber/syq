@@ -51,10 +51,11 @@ Default locations include:
 | `~/.syq-destinations-v3/` | Registered receiving names on a server |
 | `~/.local/share/syq/restricted/` | Receiver enrollment state |
 
-Copies can proceed when optional caches cannot be written. Copies do need a
-writable temporary directory on each machine, `TMPDIR` or else `/tmp`, for
-private sockets. Persistent connections need a writable runtime directory; when
-syq cannot use it or the persistence setting, it warns and connects without
+Copies can proceed when optional caches cannot be written. They do need a
+little space for private sockets in the temporary directory on each machine:
+`TMPDIR` when it is set, otherwise `/tmp`. Persistent connections need a
+writable runtime directory. If `syq persist on` enabled persistence but syq
+cannot use its setting or runtime directory, a copy warns and connects without
 persistence. See [Enrollment](remote-reference.md#enrollment)
 for receiver state and [Names and profiles](persistence-reference.md#names-and-profiles)
 for backing up or replacing a receiving identity.
