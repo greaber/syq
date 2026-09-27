@@ -455,9 +455,9 @@ keywords, URLs, and signing domains, not just Rust types.
   or regenerating every fixture, does not demonstrate compatibility. Name the
   baseline and result in the PR description, including any authorized break.
 
-The public support baseline and duration are not yet decided. Surface that
-choice when it matters; do not add speculative compatibility implementations
-or promise indefinite support.
+Files shared between syq versions, because they hold information that should
+persist through updates, should stay readable by newer versions. Breaking
+that compatibility needs an explicit discussion with the user first.
 
 ## Release secrets
 
