@@ -145,7 +145,8 @@ SHA-256 hash of each archive and executable. The installed client carries the
 release public key. It verifies the manifest's Ed25519 signature with that key,
 then checks downloaded files against the signed sizes and hashes before using
 them. The verification key comes from the installed executable, not from the
-server supplying the download.
+server supplying the download. Source builds also carry the official public
+key for explicit `--use-version` selections.
 
 This also applies when the SSH server downloads its own helper: your client
 verifies the manifest and checks the reported archive hash before authorizing

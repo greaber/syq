@@ -324,7 +324,7 @@ pub(crate) fn root() -> Command {
         .arg(Arg::new("version").short('V').long("version").action(ArgAction::Version).help("Print version"))
         .version(env!("CARGO_PKG_VERSION"))
         .arg(Arg::new("use_version").long("use-version").value_name("VERSION")
-            .help("Run an exact official release, downloading it if needed (place before COMMAND)"))
+            .help("Run an exact official release, downloading it if needed (must be the first argument)"))
         .arg(Arg::new("self_update").long("self-update").action(ArgAction::SetTrue)
             .help("Install the newest signed release (standalone installs); Homebrew: brew upgrade syq"))
         .disable_help_subcommand(true)

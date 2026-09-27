@@ -728,3 +728,50 @@ fn use_version_rejects_a_signed_executable_with_wrong_identity() {
     let out = fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
     assert_failure_contains(&out, "unexpected build identity");
 }
+
+#[test]
+fn use_version_rejects_misplaced_root_selection_before_early_exit() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    for args in [
+        vec!["--version", "--use-version", "9.9.9"],
+        vec!["-V", "--use-version=9.9.9"],
+        vec!["--help", "--use-version=9.9.9"],
+        vec!["--build-identity", "--use-version=9.9.9"],
+        vec!["--self-update", "--use-version=9.9.9"],
+    ] {
+        let output = fixture.command_at_args(&fixture.installed, &args);
+        assert_failure_contains(&output, "--use-version must be the first argument");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    assert!(!fixture.temp.path("cache").exists());
+}
+
+#[test]
+fn use_version_failed_manifest_fetch_does_not_create_cache_directories() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    fs::remove_dir_all(fixture.temp.path("fixtures")).unwrap();
+    let output = fixture.command_at_args(&fixture.installed, &["--use-version=9.9.9"]);
+    assert_failure_contains(&output, "fetch official syq release 9.9.9");
+    assert!(!fixture.temp.path("cache").exists());
+}
+
+#[test]
+fn release_flag_without_a_key_still_cannot_register_for_self_update() {
+    if option_env!("SYQ_RELEASE_PUBLIC_KEY").is_some() {
+        return;
+    }
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let output = Command::new(&fixture.installed)
+        .arg("--register-standalone-install")
+        .env("SYQ_TEST_RELEASE_BUILD", "1")
+        .env_remove("SYQ_TEST_RELEASE_PUBLIC_KEY")
+        .env("XDG_CONFIG_HOME", &fixture.config)
+        .capture_output()
+        .unwrap();
+    assert_failure_contains(&output, "no official release verification key");
+    assert!(!fixture
+        .installed
+        .with_file_name(".syq-install.json")
+        .exists());
+}

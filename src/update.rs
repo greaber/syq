@@ -399,7 +399,9 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let tag = format!("v{version}");
     let directory = release_cache_directory(&tag, target)?;
     let manifest_path = directory.join(MANIFEST_NAME);
-    let key = embedded_public_key()?;
+    // Only explicit selection opts every build into the official trust anchor.
+    let key = embedded_public_key()
+        .unwrap_or_else(|_| Cow::Borrowed(include_str!("release-public-key.txt").trim()));
     let cached = match fs::read(&manifest_path) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -408,14 +410,14 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let bytes = match &cached {
         Some(bytes) => bytes.clone(),
         None => {
-            create_private_dir(&directory)?;
-            let temporary = TempFile::new(&directory, ".json")?;
+            let temporary = TempFile::new(&std::env::temp_dir(), ".json")?;
             fetch(
                 &format!("{}/{tag}/{MANIFEST_NAME}", release_downloads()),
                 &temporary,
                 FetchMode::Interactive,
                 MAX_MANIFEST_BYTES,
-            )?;
+            )
+            .map_err(|error| selection_download_error(version, error))?;
             fs::read(temporary.path())?
         }
     };
@@ -440,6 +442,38 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
         sync_parent(&directory)?;
     }
     Ok(executable)
+}
+
+fn selection_download_error(version: &Version, error: anyhow::Error) -> anyhow::Error {
+    if matches!(
+        error.downcast_ref::<ureq::Error>(),
+        Some(ureq::Error::StatusCode(404))
+    ) {
+        anyhow!("official syq release {version} is not available; check the version passed to --use-version")
+    } else {
+        error.context(format!("fetch official syq release {version}"))
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn missing_release_has_an_actionable_error_but_other_failures_keep_their_cause() {
+        let version = Version::new(9, 9, 9);
+        let missing = selection_download_error(
+            &version,
+            anyhow::Error::new(ureq::Error::StatusCode(404)).context("request URL"),
+        );
+        assert_eq!(missing.to_string(), "official syq release 9.9.9 is not available; check the version passed to --use-version");
+        let unavailable =
+            selection_download_error(&version, anyhow::Error::new(ureq::Error::StatusCode(503)));
+        assert!(matches!(
+            unavailable.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::StatusCode(503))
+        ));
+    }
 }
 
 fn current_version() -> Result<Version> {
@@ -472,14 +506,23 @@ fn embedded_public_key() -> Result<Cow<'static, str>> {
     if let Some(key) = std::env::var_os("SYQ_TEST_RELEASE_PUBLIC_KEY").filter(|v| !v.is_empty()) {
         return Ok(Cow::Owned(key.to_string_lossy().into_owned()));
     }
-    // Explicit release selection is also available from source builds. The
-    // checked-in public anchor is verified by release preflight; no private
-    // release credentials are needed to download an official executable.
-    Ok(Cow::Borrowed(
-        RELEASE_PUBLIC_KEY
-            .unwrap_or(include_str!("release-public-key.txt"))
-            .trim(),
-    ))
+    RELEASE_PUBLIC_KEY
+        .or_else(|| {
+            // Release preflight checks this public trust anchor against the
+            // repository variable used to build official releases.
+            // Source builds opting into official helpers need no private key.
+            (env!("SYQ_RELEASE_HELPERS") == "1" && !crate::identity::is_release_build()).then_some(
+                include_str!("release-public-key.txt")
+            )
+        })
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(Cow::Borrowed)
+        .ok_or_else(|| {
+            anyhow!(
+                "this syq build has no official release verification key; update it with its package manager"
+            )
+        })
 }
 
 fn verified_manifest(bytes: &[u8], public_key_b64: &str) -> Result<ReleaseManifest> {

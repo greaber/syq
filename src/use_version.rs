@@ -7,7 +7,10 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
-    let Some((version, consumed)) = selection(&argv)? else {
+    let Some((version, consumed)) = selection(&argv).map_err(|error| {
+        clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+    })?
+    else {
         return Ok(argv);
     };
     argv.drain(1..=consumed);
@@ -33,6 +36,17 @@ fn selection(argv: &[OsString]) -> Result<Option<(Version, usize)>> {
     } else if let Some(raw) = first.strip_prefix("--use-version=") {
         (raw, 1)
     } else {
+        // Clap's help/version actions can exit before reporting a later option.
+        // Check the root prefix here, without interpreting a subcommand's data.
+        for arg in argv.iter().skip(1) {
+            let Some(arg) = arg.to_str() else { break };
+            if arg == "--" || !arg.starts_with('-') {
+                break;
+            }
+            if arg == "--use-version" || arg.starts_with("--use-version=") {
+                bail!("--use-version must be the first argument after syq");
+            }
+        }
         return Ok(None);
     };
     let version = Version::parse(raw.strip_prefix('v').unwrap_or(raw))

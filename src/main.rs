@@ -154,6 +154,9 @@ fn main() {
     let argv = match use_version::enter(std::env::args_os().collect()) {
         Ok(argv) => argv,
         Err(error) => {
+            if let Some(error) = error.downcast_ref::<clap::Error>() {
+                error.exit();
+            }
             crate::output::diagnostic!("syq: {error:#}");
             std::process::exit(1);
         }

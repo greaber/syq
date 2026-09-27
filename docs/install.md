@@ -25,7 +25,8 @@ and choosing between your own executable and compatible official SSH helpers.
 
 ## Choose a version for a script
 
-Put `--use-version` before the command to run an exact official release:
+Put `--use-version VERSION` immediately after `syq`, before any other arguments,
+to run an exact official release:
 
 ```sh
 syq --use-version 0.7.1 cp photos --into backup
@@ -38,8 +39,8 @@ The first download needs network access and a writable cache; an unavailable
 release or unsupported platform is an error. `latest` and version ranges are
 not accepted.
 
-The syq you invoke must understand `--use-version`; the selected release does
-not need to. That release interprets the command and controls its remote helpers
+Official and source builds support this option. The syq you invoke must
+understand `--use-version`; the selected release does not need to. That release interprets the command and controls its remote helpers
 and shared state. Selecting an older release also selects its limitations and
 bugs; this option does not add newer behavior to it.
 
