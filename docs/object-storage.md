@@ -61,9 +61,10 @@ objects.
   when unavailable. Existing files with matching contents keep their time unless
   `--copy-metadata=mtime` requests a metadata update;
   `--copy-metadata=permissions,ownership` also restores permissions and ownership.
-  New or changed uploads and server-side copies retain source metadata. On
-  matching contents, only explicitly selected attributes are updated. Special
-  files are unsupported.
+  New or changed uploads store these source file attributes. For matching
+  contents, `--copy-metadata` selects which file attributes to reconcile. S3
+  metadata updates have the object-copy effects described below. Special files
+  are unsupported.
 - **Updates:** `--if-exists=keep`, `--into-new`, and `--as-new` protect individual
   objects against concurrent creation. Prefix checks are not transactional.
   `--inplace` and SSH/S3 combinations are unsupported.
@@ -79,9 +80,20 @@ objects.
 ## Copies between S3 buckets
 
 Bucket-to-bucket copies run within one service, using the same endpoint, region,
-and credentials. New or changed copies retain source metadata and tags. For
-unchanged contents, only `--copy-metadata` selections trigger metadata updates;
-changes to tags, encryption, or storage class alone do not trigger a copy.
+and credentials. New or changed copies retain source user metadata, content
+headers, and tags. For matching contents, `--copy-metadata` can reconcile stored
+modification time, permissions, and ownership. Changes to source Content-Type,
+other content headers, arbitrary user metadata, or tags are not copied in this
+case; there are no `--copy-metadata` settings for these S3-specific fields.
+
+Updating stored file attributes copies the destination object onto itself within
+S3, preserving its contents, content headers, tags, and unselected user metadata.
+It changes S3 Last-Modified and creates a new version when bucket versioning is
+enabled. Syq does not specify storage class or encryption settings on uploads or
+copies, including metadata updates. On AWS general-purpose buckets, the resulting
+object uses STANDARD storage and the destination bucket's default encryption
+settings, which can differ from the previous object's settings. Changes to source
+storage class or encryption alone do not trigger a copy.
 
 Syq uses stored size/time, whole-file hashes, provider checksums, or ETags to
 identify matching contents. Otherwise, the default policy replaces the destination.

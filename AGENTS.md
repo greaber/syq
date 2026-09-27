@@ -478,6 +478,14 @@ clients trust it. See RELEASING.md for the workflow's required inputs.
 
 ## Performance evidence
 
+Start with a cost model: identify the extra reads, bytes transferred, requests,
+and round trips, and which workloads incur them. Propose a benchmark when it
+can resolve a stated uncertainty or inform a decision; explain what its workload
+and environment represent. Do not require a one-off timing experiment merely to
+confirm an evident cost, or generalize its significance beyond the measured case.
+Measurements that verify an implementation's request or byte counts can still be
+useful even when the expected cost is clear.
+
 Choose benchmark duration to suit the behavior being measured; there is no
 fixed minimum. Short tests can measure startup or small operations, but do not
 infer sustained performance from subsecond runs unless there is evidence that
