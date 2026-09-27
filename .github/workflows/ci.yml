@@ -683,12 +683,18 @@ jobs:
             "$candidate" "$released/0.5.2/syq-linux-x86_64"
           python3 tests/receive-policy-compat.py \
             --old "$released/0.6.0/syq-linux-x86_64" --candidate "$candidate"
-      - name: Install checksum-pinned Nix
-        if: ${{ !cancelled() }}
-        run: scripts/install-nix-ci.sh
-      - name: Check release dependency cache invalidation
-        if: ${{ !cancelled() }}
-        run: python3 scripts/test-release-dependency-cache.py
+
+  # The release recipe otherwise runs only during a release. This builds
+  # every release platform and checks release dependency-cache invalidation.
+  # Scheduled runs only: a release starts its own builds beside a manual run.
+  release-build:
+    needs: scope
+    if: >-
+      github.event_name == 'schedule' &&
+      needs.scope.result == 'success' &&
+      needs.scope.outputs.native == 'true' &&
+      needs.scope.outputs.full_suite == 'true'
+    uses: ./.github/workflows/reproducible-builds.yml
 
   # A skipped certificate cannot certify successful selective stubs.
   release-certification:
