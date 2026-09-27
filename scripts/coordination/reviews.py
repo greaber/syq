@@ -102,7 +102,7 @@ def instruction(review):
         return common + ('Auto mode authorizes confirmed straightforward fixes within the task. '
                          'Validate, commit and push them, then use triage --action revise to launch '
                          'the next round and continue waiting. Before each handoff run '
-                         'scripts/branch-status.sh when present and report its output, including '
+                         'scripts/branch-status.py when present and report its output, including '
                          'unrelated red master checks. Record stable unresolved finding IDs; '
                          'repetition without progress requires discussion, not more changes.')
     return 'Automatic work stops here. Read the status, reason and disposition, and report to the user.'

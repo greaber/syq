@@ -66,13 +66,13 @@ jobs:
           set -euo pipefail
           python3 scripts/prepare-python-sdk-release.py \
             --manifest "$RELEASE_MANIFEST"
-          scripts/pin-python-native-source.sh
+          scripts/pin-python-native-source.py
           uv lock --project sdk/python
           if git diff --quiet; then
             echo 'changed=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          scripts/test-python-sdk-release-tools.sh
+          scripts/test-python-sdk-release-tools.py
           gh release download "$(jq -er .tag "$RELEASE_MANIFEST")" \
             --pattern syq-linux-x86_64 --dir "$RUNNER_TEMP/syq-release"
           uv sync --project sdk/python --frozen --no-install-project
@@ -143,7 +143,7 @@ jobs:
           echo "Merged $pr_url at $merge_sha; running post-merge Python SDK validation"
           gh workflow run publish-sdks.yml --repo "$GITHUB_REPOSITORY" \
             --ref "$branch" -f "candidate_commit=$merge_sha"
-          scripts/run-generated-sdk-post-merge-ci.sh \
+          scripts/run-generated-sdk-post-merge-ci.py \
             "$GITHUB_REPOSITORY" "$branch" "$merge_sha"
           # Keep the branch available until queued candidate checkouts finish.
           # A failed candidate stops here and preserves the branch for diagnosis.

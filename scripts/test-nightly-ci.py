@@ -58,12 +58,12 @@ class NightlyTests(unittest.TestCase):
                        SYQ_CI_DOCUMENTATION_ONLY="", FAIL_API="")
             for runs, full in [([], "true"), ([{"head_sha": sha}], "false")]:
                 env["RUNS"] = json.dumps({"workflow_runs": runs})
-                result = subprocess.run(["scripts/ci-scope.sh", str(event)], cwd=root, env=env,
+                result = subprocess.run(["scripts/ci-scope.py", str(event)], cwd=root, env=env,
                                         text=True, capture_output=True, check=True)
                 self.assertIn(f"full_suite={full}\n", result.stdout)
                 self.assertIn(f"linux_arm64={full}\n", result.stdout)
             env["FAIL_API"] = "1"
-            result = subprocess.run(["scripts/ci-scope.sh", str(event)], cwd=root, env=env,
+            result = subprocess.run(["scripts/ci-scope.py", str(event)], cwd=root, env=env,
                                     text=True, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("full_suite=false", result.stdout)

@@ -1,6 +1,7 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # CI-only setup: Nix's official installer embeds hashes of its platform archives.
-set -euo pipefail
+# POSIX sh: release runners on every platform run this without pinned tools.
+set -eu
 [ "${GITHUB_ACTIONS:-}" = true ] || {
   echo 'This installer is for disposable GitHub runners. Install Nix normally on your own machine.' >&2
   exit 1

@@ -133,7 +133,7 @@ review inboxes. It does not wake an agent that has stopped checking updates.
 
 ## Review and triage
 
-Run the project’s required validation and `scripts/branch-status.sh` before each
+Run the project’s required validation and `scripts/branch-status.py` before each
 review handoff and report its output, including unrelated red master checks.
 From a clean, pushed task branch with an open PR, provide a short task brief
 under `target/` or `current-plans/`. Include the user's actual requirements,

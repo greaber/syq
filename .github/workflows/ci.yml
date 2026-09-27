@@ -68,7 +68,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SYQ_CI_DOCUMENTATION_ONLY: ${{ inputs.documentation_only }}
           SYQ_CI_SCOPE_COMMIT: ${{ inputs.scope_commit }}
-        run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
+        run: scripts/ci-scope.py "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
   rust:
     # Cancel only matching automatic checks; manual runs keep a unique group.
@@ -207,11 +207,11 @@ jobs:
       - name: Test Cargo package identity
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' package ')
-        run: scripts/test-cargo-package.sh
+        run: scripts/test-cargo-package.py
       - name: Test installer tooling
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' installer ')
-        run: scripts/test-installer.sh
+        run: scripts/test-installer.py
       - name: Test interactive benchmark
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' benchmark ')
@@ -223,14 +223,16 @@ jobs:
           TOOLING_CHECKS: ${{ needs.scope.outputs.tooling_checks }}
         run: |
           if [[ " $TOOLING_CHECKS " == *" package "* ]]; then
-            scripts/test-release-tools.sh --syq "$GITHUB_WORKSPACE/target/package-identity/debug/syq"
+            scripts/test-release-tools.py --syq "$GITHUB_WORKSPACE/target/package-identity/debug/syq"
           else
-            scripts/test-release-tools.sh
+            scripts/test-release-tools.py
           fi
       - name: Test release orchestration
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' orchestration ')
-        run: scripts/test-release-orchestration.sh
+        run: |
+          scripts/test-release-orchestration.py
+          scripts/test-tooling.py
       - name: Test focused check dispatch
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' focused ')
@@ -238,15 +240,17 @@ jobs:
       - name: Test branch status tooling
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' branch ')
-        run: scripts/test-branch-status.sh
+        run: scripts/test-branch-status.py
       - name: Test the development setup
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' setup ')
         run: scripts/test-setup.sh
-      - name: Validate workflow syntax
+      - name: Validate workflow syntax and script references
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' workflows ')
-        run: scripts/check-workflows.sh
+        run: |
+          scripts/check-workflows.py
+          scripts/check-script-references.py
       - name: Lint tracked shell scripts
         if: >-
           needs.scope.outputs.tooling == 'true' ||
@@ -334,7 +338,7 @@ jobs:
         run: |
           SYQ_CANDIDATE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           export SYQ_CANDIDATE_VERSION
-          scripts/test-python-sdk-release-tools.sh
+          scripts/test-python-sdk-release-tools.py
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
           export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
           RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
@@ -457,7 +461,7 @@ jobs:
         run: cargo test --locked --test update
 
   # Preserve the `macos` check for Intel. Apple Silicon is certified once by
-  # the full macos.yml workflow, required separately by verify-release-ci.sh.
+  # the full macos.yml workflow, required separately by verify-release-ci.py.
   macos:
     needs: [scope, macos_intel]
     if: always() && needs.macos_intel.result != 'cancelled' && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace'

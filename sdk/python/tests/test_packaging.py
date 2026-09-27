@@ -6,6 +6,7 @@ import os
 import shutil
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import tarfile
 from types import SimpleNamespace
@@ -106,8 +107,8 @@ class PackagingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
-            script = root / "scripts/pin-python-native-source.sh"
-            shutil.copyfile(SCRIPT.with_name("pin-python-native-source.sh"), script)
+            script = root / "scripts/pin-python-native-source.py"
+            shutil.copyfile(SCRIPT.with_name("pin-python-native-source.py"), script)
             (root / "sdk/python/src/syq").mkdir(parents=True)
             manifest = root / "sdk/python/src/syq/syq-release-manifest.json"
             manifest.write_text(json.dumps({"tag": "v9.8.7"}))
@@ -132,20 +133,26 @@ class PackagingTests(unittest.TestCase):
             nix.write_text(
                 "#!/bin/sh\n"
                 + 'test "$6" = "github:greaber/syq/' + revision + '" || exit 1\n'
+                + 'test -z "${NO_HASH:-}" || { echo "{}"; exit 0; }\n'
                 + "echo '{\"hash\":\"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}'\n"
             )
             nix.chmod(0o755)
             env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"])
-            subprocess.run(["bash", str(script)], env=env, check=True)
+            subprocess.run([sys.executable, str(script)], env=env, check=True)
             pin = root / "sdk/python/native-source.json"
             self.assertEqual(json.loads(pin.read_text()), {
                 "tag": "v9.8.7", "rev": revision,
                 "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             })
             previous = pin.read_bytes()
-            subprocess.run(["bash", str(script)], env=env, check=True)
+            subprocess.run([sys.executable, str(script)], env=env, check=True)
+            self.assertEqual(previous, pin.read_bytes())
+            result = subprocess.run([sys.executable, str(script)], env={**env, "NO_HASH": "1"},
+                                    stderr=subprocess.PIPE, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("reported no source hash", result.stderr)
             self.assertEqual(previous, pin.read_bytes())
             manifest.write_text(json.dumps({"tag": "../invalid"}))
-            result = subprocess.run(["bash", str(script)], env=env)
+            result = subprocess.run([sys.executable, str(script)], env=env)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(previous, pin.read_bytes())

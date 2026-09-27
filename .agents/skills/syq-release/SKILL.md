@@ -45,7 +45,7 @@ not authorize changing its documentation tree.
 Honor a requested version. Otherwise inspect shipped changes and existing tags:
 reuse an appropriate already-prepared unpublished package version, or explain
 and prepare the next version. An existing requested tag calls for
-`scripts/release-status.sh v<version>` and verification/recovery, not a version
+`scripts/release-status.py v<version>` and verification/recovery, not a version
 bump or another preparation PR.
 
 Run `scripts/release-readiness.py v<version>` (or `--json`). It reports missing
@@ -82,7 +82,7 @@ CI workflow's state and next action. Perform only missing work:
 ## Publish and finish
 
 Follow the publication and recovery procedures in the checkout's `RELEASING.md`.
-Run `scripts/release-preflight.sh v<version>` from the clean candidate. It accepts
+Run `scripts/release-preflight.py v<version>` from the clean candidate. It accepts
 a clean task branch or detached checkout at the pinned candidate, which must
 remain an ancestor of remote master; an independent clone is unnecessary.
 Later master commits do not automatically replace the candidate. Assess them
@@ -93,7 +93,7 @@ release workflow waits for the candidate binaries and source crate.
 Restore tmux SSH-agent variables per `AGENTS.md` if
 signing is unavailable. Sign and push the matching annotated tag after preflight.
 
-Use `scripts/release-status.sh v<version>` to follow the exact release run,
+Use `scripts/release-status.py v<version>` to follow the exact release run,
 approve its eligible deployment, and verify every configured destination.
 After the immutable syq release triggers Python preparation, wait for its
 generated pull request, merge, and exact-commit post-merge checks. Repair a
