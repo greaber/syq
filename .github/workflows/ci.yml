@@ -477,9 +477,7 @@ jobs:
     env:
       # This job checks compilation and updater behavior, not copy throughput.
       CARGO_PROFILE_DEV_OPT_LEVEL: "0"
-      CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_OPT_LEVEL: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
