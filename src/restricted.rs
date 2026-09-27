@@ -112,6 +112,8 @@ struct RevokeRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct LocalEnrollment {
     version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build_identity: Option<String>,
     id: EnrollmentId,
     host: String,
     #[serde(default)]
@@ -127,6 +129,8 @@ struct LocalEnrollment {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingEnrollment {
     version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build_identity: Option<String>,
     id: EnrollmentId,
     host: String,
     #[serde(default)]

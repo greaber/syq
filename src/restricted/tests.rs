@@ -657,6 +657,7 @@ fn enrolled_destinations_accept_any_leaf_bytes() {
     use std::os::unix::ffi::OsStrExt as _;
     let metadata = LocalEnrollment {
         version: 1,
+        build_identity: Some(crate::identity::build().to_owned()),
         id: EnrollmentId::random(),
         host: "hostB".into(),
         port: None,
@@ -758,6 +759,7 @@ fn pending_enrollment_keeps_its_key_until_active_metadata_is_durable() {
     ensure_directory(&directory, 0o700).unwrap();
     let pending = PendingEnrollment {
         version: CONFIG_VERSION,
+        build_identity: Some(crate::identity::build().to_owned()),
         id,
         host: "host-b".into(),
         port: None,
@@ -785,6 +787,7 @@ fn pending_enrollment_keeps_its_key_until_active_metadata_is_durable() {
 
     let metadata = LocalEnrollment {
         version: CONFIG_VERSION,
+        build_identity: Some(crate::identity::build().to_owned()),
         id,
         host: pending.host,
         port: pending.port,
@@ -4677,4 +4680,19 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
         guard: None,
     };
     assert!(authority.authorize(&mut time_request, false).is_err());
+}
+
+#[test]
+fn receiver_executables_are_distinct_for_release_and_development_builds() {
+    let home = Path::new("/home/receiver");
+    let release = receiver_path_for_build(home, "v0.7.1");
+    let other = receiver_path_for_build(home, "v0.7.0");
+    let development = receiver_path_for_build(home, "v0.7.1+dev.abc");
+    assert_ne!(release, other);
+    assert_ne!(release, development);
+    assert_eq!(release, receiver_path_for_build(home, "v0.7.1"));
+    assert_eq!(
+        release.parent(),
+        Some(home.join(".local/libexec").as_path())
+    );
 }

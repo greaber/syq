@@ -179,7 +179,8 @@ The protection has several parts:
    SSH access to install a receiver and a dedicated public key. That key's
    `authorized_keys` entry permits only the receiver command, with SSH
    forwarding disabled. The private key stays on your laptop. Later copies
-   reuse this setup.
+   with the same build reuse this setup. Other builds have separate receivers
+   and keys; their grants and replay records belong to their own enrollments.
 2. **Authenticate hostA's connection without handing it the key.** A small
    signing service on your laptop answers hostA's SSH authentication requests.
    Before signing, it checks OpenSSH's cryptographic proof of which server

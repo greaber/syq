@@ -23,7 +23,7 @@ def remote(command):
 
 def enrollment(parent):
     records = [json.loads(path.read_bytes()) for path in
-               (Path.home() / ".local/state/syq/restricted").glob("*/metadata.json")]
+               (Path.home() / ".local/state/syq/restricted").rglob("metadata.json")]
     matches = [record for record in records if record["requested_parent"] == parent]
     assert len(matches) == 1, matches
     return matches[0]

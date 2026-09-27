@@ -893,6 +893,9 @@ python3 /usr/local/libexec/syq-test-restricted-mapping.py
 printf 'case: enrollment revocation stops active restricted receivers\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py
 
+printf 'case: independent receivers for different builds\n'
+python3 /usr/local/libexec/syq-test-receiver-builds.py
+
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
 syq cp --no-progress --performance-tuning workers=2 --preserve=permissions --tcp-congestion cubic \

@@ -18,7 +18,7 @@ def remote(code):
 
 def enrollments():
     state = Path.home()/'.local/state/syq/restricted'
-    return {bytes(json.loads(path.read_bytes())['id']).hex() for path in state.glob('*/metadata.json')}
+    return {bytes(json.loads(path.read_bytes())['id']).hex() for path in state.rglob('metadata.json')}
 
 
 root = '/tmp/syq-real-ssh/map-generation'

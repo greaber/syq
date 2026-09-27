@@ -41,7 +41,8 @@ Keep your laptop command running until the copy finishes.
 
 The first copy sets up a restricted receiver on hostB automatically. It adds
 a restricted key to `authorized_keys`; the private key stays on your machine.
-Later copies reuse this setup.
+Later copies with the same build reuse this setup; another build installs its
+own receiver and restricted key.
 
 To prepare `/archive` on hostB ahead of time, including before a dry run:
 

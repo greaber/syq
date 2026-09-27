@@ -137,20 +137,22 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             for (metadata, _) in active {
                 let target = endpoint(&metadata.target_login, &metadata.host, metadata.port)?;
                 println!(
-                    "{}\tactive\t{}\t{}",
+                    "{}\tactive\t{}\t{}\t{}",
                     metadata.id,
                     target.label(),
-                    metadata.canonical_root
+                    metadata.canonical_root,
+                    metadata.build_identity.as_deref().unwrap_or("legacy")
                 );
             }
             for (pending, _) in load_pending_enrollments()? {
                 if !active_ids.contains(&pending.id) {
                     let target = endpoint(&pending.target_login, &pending.host, pending.port)?;
                     println!(
-                        "{}\tpending\t{}\t{}",
+                        "{}\tpending\t{}\t{}\t{}",
                         pending.id,
                         target.label(),
-                        pending.requested_destination
+                        pending.requested_destination,
+                        pending.build_identity.as_deref().unwrap_or("legacy")
                     );
                 }
             }

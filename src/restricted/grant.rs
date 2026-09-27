@@ -320,7 +320,8 @@ pub(crate) fn prepare_transfer(
     let requested = destination.path.as_slice();
     let mut selected = None;
     for (metadata, directory) in load_local_enrollments()? {
-        if metadata.host == host
+        if metadata.build_identity.as_deref() == Some(crate::identity::build())
+            && metadata.host == host
             && metadata.port == destination.port
             && metadata.target_login == destination_login
         {
