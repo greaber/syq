@@ -875,6 +875,7 @@ fn remote_pull_with_xattrs_tolerates_its_own_writes_to_the_destination_root() {
         .prefix("syq-root-identity-")
         .tempdir_in(shm)
     else {
+        eprintln!("skipping: /dev/shm is not available for a tmpfs destination");
         return;
     };
     let probe = destination_parent.path().join("probe");
@@ -882,6 +883,7 @@ fn remote_pull_with_xattrs_tolerates_its_own_writes_to_the_destination_root() {
     let name = CString::new("user.probe").unwrap();
     let path = CString::new(probe.as_os_str().as_bytes()).unwrap();
     if unsafe { libc::lsetxattr(path.as_ptr(), name.as_ptr(), b"x".as_ptr().cast(), 1, 0) } != 0 {
+        eprintln!("skipping: /dev/shm does not support user extended attributes");
         return;
     }
     let t = Tmp::new();
