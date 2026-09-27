@@ -6,7 +6,7 @@ AWS_ENDPOINT_URL_S3 and SYQ_TEST_BUCKET. This does not create buckets or change
 their configuration; the pruning workloads require a bucket that has never
 enabled versioning. Requires /usr/bin/time on Linux and Python 3.11 or newer.
 Example, from the repository root:
-  python3 tests/object-storage/benchmark.py --syq target/release/syq \\
+  python3 scripts/benchmark-s3.py --syq target/release/syq \\
     --s5cmd /path/to/s5cmd --output target/s3-benchmark
 Omit --s5cmd to measure syq alone; use --baseline to include an older syq.
 The default transfer workloads (large, medium, small) report throughput. The
@@ -116,7 +116,7 @@ def main():
     # check.py only uses argv[1] to set its executable; its signed HTTP helpers
     # are independent of syq and own a fresh random prefix.
     sys.argv = [sys.argv[0], str(args.syq.resolve())]
-    spec = importlib.util.spec_from_file_location('checks', Path(__file__).with_name('check.py'))
+    spec = importlib.util.spec_from_file_location('checks', Path(__file__).resolve().parents[1] / 'tests/object-storage/check.py')
     c = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(c)
     if any(w in PRUNE for w in args.workloads):

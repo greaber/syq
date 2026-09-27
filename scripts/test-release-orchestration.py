@@ -123,7 +123,7 @@ class PathScopeTests(Scratch):
                      "scripts/stage-python-sdk.py", "scripts/prepare-python-sdk-release.py",
                      "scripts/run-generated-sdk-post-merge-ci.py", "scripts/select-trusted-pr.jq",
                      "scripts/test-python-sdk-release-tools.py",
-                     "scripts/test-python-release-preparation.py"]:
+                     "scripts/verify-python-release-preparation.py"]:
             with self.subTest(path=path):
                 self.assertScope(self.scope(path), tooling="true", sdks="true",
                                  python_sdk="true", native="false")
