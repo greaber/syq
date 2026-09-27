@@ -3,7 +3,7 @@
 # artifacts, without network access.
 set -eu
 
-script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/../../scripts" && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/syq-setup-test.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
 trap 'exit 1' HUP INT TERM

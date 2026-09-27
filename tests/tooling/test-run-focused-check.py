@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Check dispatch quoting, revision selection, and exact-run failure propagation."""
 
+from support import SCRIPTS
+
 import contextlib
 import importlib.util
 import io
@@ -12,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
-    "focused_check", Path(__file__).with_name("run-focused-check.py")
+    "focused_check", SCRIPTS / "run-focused-check.py"
 )
 focused = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(focused)

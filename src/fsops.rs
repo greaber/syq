@@ -2384,12 +2384,10 @@ impl FsOps {
                 {
                     Ok(None)
                 }
-                Err(error) => Err(error).with_context(|| {
-                    format!(
-                        "inspect destination for pruning: {}",
-                        resolve(path).display()
-                    )
-                }),
+                // Callers name the purpose (pruning, --copy-if, the root check).
+                Err(error) => {
+                    Err(error).with_context(|| format!("inspect {}", resolve(path).display()))
+                }
             }
         })
         .into_iter()

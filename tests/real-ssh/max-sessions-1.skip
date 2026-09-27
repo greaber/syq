@@ -1,0 +1,36 @@
+# Cases skipped with --profile max-sessions-1 in CI; every other case runs.
+# The profile changes only the destination's sshd and the runner's
+# strict-multiplexing SSH wrapper, which applies only to connections to
+# destination. A case that never contacts destination, directly, through a
+# script it runs, or through a coordinator on another host, behaves exactly
+# as in the default profile. List only such cases, and only when no case that
+# still runs needs their setup. New cases run in both profiles unless listed.
+privileged copies keep root security checks
+ephemeral connect only reuses forward SSH and leaves receiving off
+return copies await local approval and denial leaves no destination
+approval allows the pending 128-worker copy once
+disconnected requests cannot be approved later
+changing policy cancels a pending request
+native Linux notification actions control return copies
+return copies hand off between server PATH builds
+remote commands run through the return connection
+storage authorization through the return connection
+explicit automatic approval supports unattended copies
+named return rejects traversal and receiver symlink escape
+a copied receiver identity cannot displace a responsive laptop
+interrupted named copy fails, laptop reconnects, and retry resumes
+return heartbeat timeout reconnects without toggling persistence
+cwd permits destinations outside its starting directory
+persist receive off/on keeps ordinary persistence and restarts receiving
+persistence off stops background receiving
+offline names require the original receiver identity or explicit replacement
+shell completion adapters parse and keep descriptions separate
+remote filename completion reuses a persistent ordinary SSH login
+direct SSH helper sees the current SendEnv value
+restarting persistence adopts the new environment
+remote completion details use remote metadata without persistence
+small native push to an ordinary SSH destination takes one turn
+persistent debug output closes with the copying process
+existing small files skip TCP setup and SSH data sessions
+native remote removal follows parents but preserves final link identity
+native remote removal requires explicit tree selection

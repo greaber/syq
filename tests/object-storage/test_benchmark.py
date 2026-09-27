@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
-spec = importlib.util.spec_from_file_location('benchmark', Path(__file__).with_name('benchmark.py'))
+spec = importlib.util.spec_from_file_location('benchmark', Path(__file__).resolve().parents[2] / 'scripts/benchmark-s3.py')
 benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
 

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Unit checks for release timing selection and calculations."""
 
+from support import SCRIPTS
+
 import importlib.util
 from pathlib import Path
 import unittest
 
-SCRIPT = Path(__file__).resolve().with_name("release-timings.py")
+SCRIPT = SCRIPTS / "release-timings.py"
 SPEC = importlib.util.spec_from_file_location("release_timings", SCRIPT)
 assert SPEC and SPEC.loader
 release_timings = importlib.util.module_from_spec(SPEC)

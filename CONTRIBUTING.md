@@ -107,9 +107,13 @@ CARGO_PROFILE_RELEASE_STRIP=none cargo build --locked --release
 ```
 
 The same override works with `python -m pip install ./sdk/python`.
-`cargo build --locked` includes debug symbols, assertions, and overflow checks
-at optimization level 1. For easier stepping, set `CARGO_PROFILE_DEV_OPT_LEVEL=0`;
-BLAKE3 remains optimized at level 3.
+`cargo build --locked` includes assertions and overflow checks at optimization
+level 1, without debug information. Panic messages still name the file and
+line; backtraces show function names only. For file and line numbers in
+backtraces, set `CARGO_PROFILE_DEV_DEBUG=line-tables-only`; for debugger
+variable information, set `CARGO_PROFILE_DEV_DEBUG=full`, and for easier
+stepping also `CARGO_PROFILE_DEV_OPT_LEVEL=0`. BLAKE3 remains optimized at
+level 3.
 
 ## Reproduce a release binary
 
@@ -165,8 +169,21 @@ a maintained fork of the MinIO server). To test another provider, run
 `python3 tests/object-storage/check.py target/debug/syq` with
 `AWS_ENDPOINT_URL_S3`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 and `SYQ_TEST_BUCKET` set. It creates and removes a unique test prefix in the
-existing bucket. See `python3 tests/object-storage/benchmark.py --help` for
+existing bucket. See `python3 scripts/benchmark-s3.py --help` for
 benchmark options.
+
+Repository tooling tests run with `scripts/run-tooling-tests.py` after
+`scripts/setup.sh` and `eval "$(scripts/setup.sh env)"`. The runner executes every
+`test-*.py`, `test-*.sh`, and `test-*.cjs` file directly inside `tests/tooling/`,
+keeps each test's output visible, and reports all failures. Use `--list` to see
+what it will run, or run an individual file for a focused check. These tests
+include Cargo package builds, so run the complete suite from a clean checkout.
+
+Add ordinary tooling tests to that directory; full nightly and manual CI discover
+them without a workflow change. Python tests can import `ROOT` and `SCRIPTS` from
+`support` to locate the checkout and import production tooling. Docker, Nix, and
+platform-specific suites such as Homebrew retain their own setup and CI entry points. Benchmarks
+and release operations live outside the discovered test directory.
 
 For docs, run `python3 scripts/check-doc-links.py` and build with the pinned mdBook.
 The published site defaults to the latest stable release, with tagged versions
@@ -183,7 +200,7 @@ To build the complete site, fetch release tags and run
 It writes to a fresh `target/doc-site/` directory; use `--dest-dir` to choose
 another directory. The build reads published stable releases from GitHub and
 uses the current checkout for the `master` preview. Run
-`python3 scripts/test-doc-site.py` and `node --test scripts/test-doc-selector.cjs`
+`python3 tests/tooling/test-doc-site.py` and `node --test tests/tooling/test-doc-selector.cjs`
 to check version selection and navigation.
 The Pages workflow rebuilds on documentation changes and after release
 publication. A manual run on a task branch produces an artifact without

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Build the registry package outside the checkout and require Cargo's VCS
 metadata to produce a stable source identity."""
+from support import ROOT
+
 import json
 import os
 from pathlib import Path
@@ -11,7 +13,7 @@ import tempfile
 
 from tooling import cargo_version
 
-REPOSITORY = Path(os.path.abspath(__file__)).parent.parent
+REPOSITORY = ROOT
 
 
 def run(*args, **kwargs):

@@ -43,6 +43,8 @@ const REGISTRATION_VERSION: u16 = 3;
 const MAX_MESSAGE: usize = 256 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a registering server waits for the receiving laptop's handshake.
+const REGISTRATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PREFIX: &str = "named-v2:";
 const REQUEST_ROOT: &[u8] = b"/SYQ-RECEIVE";
 const RECONNECT_PENDING: i32 = 75;
@@ -1389,8 +1391,8 @@ impl Drop for RegistrationGuard {
         }
     }
 }
-fn register(name: &str, socket: &Path, secret: &str) -> Result<i32> {
-    match register_inner(name, socket, secret) {
+fn register(name: &str, socket: &Path, secret: &str, handshake_timeout: Duration) -> Result<i32> {
+    match register_inner(name, socket, secret, handshake_timeout) {
         Err(error)
             if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                 matches!(
@@ -1416,7 +1418,12 @@ fn register(name: &str, socket: &Path, secret: &str) -> Result<i32> {
     }
 }
 
-fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
+fn register_inner(
+    name: &str,
+    socket: &Path,
+    secret: &str,
+    handshake_timeout: Duration,
+) -> Result<i32> {
     validate_name(name)?;
     let metadata = fs::symlink_metadata(socket)?;
     if !metadata.file_type().is_socket()
@@ -1437,7 +1444,7 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
         socket: socket.into(),
         secret: secret.into(),
     };
-    let (_, reply) = exchange(&registration, Message::Ping, Duration::from_secs(10))?;
+    let (_, reply) = exchange(&registration, Message::Ping, handshake_timeout)?;
     if !matches!(reply, Reply::Ready) {
         bail!("receiving laptop handshake failed");
     }
@@ -1616,6 +1623,7 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
                 argv[2].to_str().context("invalid name")?,
                 Path::new(&argv[3]),
                 argv[4].to_str().context("invalid credential")?,
+                REGISTRATION_HANDSHAKE_TIMEOUT,
             )
         })()),
         _ => forward::dispatch(argv),
