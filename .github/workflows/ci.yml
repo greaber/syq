@@ -632,13 +632,10 @@ jobs:
             cargo-ci-repository-checks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Test agent coordination commands
         run: python3 scripts/test-agent-coordination.py
-      # The ignored Linux tests are timing and simulation reports. The v0.3.2
-      # replay check needs an agreed fix before it can run here.
+      # The ignored Linux tests are timing and simulation reports.
       - name: Run ignored Linux tests
         if: ${{ !cancelled() }}
-        run: >-
-          cargo test --locked --all-targets -- --ignored
-          --skip transfer::tests::existing_destination_setup_replays_on_v032_receiver
+        run: cargo test --locked --all-targets -- --ignored
       - name: Check tool comparison examples
         if: ${{ !cancelled() }}
         run: python3 scripts/test-tool-examples.py

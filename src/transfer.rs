@@ -22,8 +22,6 @@ use crate::sched::{FileJob, FileJobData, Item, RangeHandle, RangeWork, Sched, Wo
 use crate::tune::{self, Gate};
 use anyhow::{bail, ensure, Context, Result};
 use std::ffi::OsStr;
-#[cfg(test)]
-use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
