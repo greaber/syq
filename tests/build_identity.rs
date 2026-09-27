@@ -156,23 +156,33 @@ fn watched_inputs_exist_outside_packages_and_nonce_builds() {
     git(&["init", "-q"]);
     git(&["add", "."]);
     git(&["commit", "-qm", "checkout"]);
-    let text = run();
-    assert!(text.contains("SYQ_BUILD_IDENTITY=v0.6.0+dev."), "{text}");
-    assert!(!text.contains("+dev.source."), "{text}");
-    let paths = watched(&text);
-    assert!(paths.contains(&"src".to_owned()), "{text}");
-    assert!(paths.iter().any(|path| path.ends_with("HEAD")), "{text}");
-    for path in &paths {
-        let path = Path::new(path);
-        let path = if path.is_absolute() {
-            path.to_owned()
-        } else {
-            package.join(path)
-        };
+    // A packed branch ref has no loose file; its reflog still records commits.
+    for packed in [false, true] {
+        if packed {
+            git(&["pack-refs", "--all"]);
+        }
+        let text = run();
+        assert!(text.contains("SYQ_BUILD_IDENTITY=v0.6.0+dev."), "{text}");
+        assert!(!text.contains("+dev.source."), "{text}");
+        let paths = watched(&text);
+        assert!(paths.contains(&"src".to_owned()), "{text}");
+        assert!(paths.iter().any(|path| path.ends_with("HEAD")), "{text}");
         assert!(
-            path.exists(),
-            "watched path {} is missing:\n{text}",
-            path.display()
+            paths.iter().any(|path| path.contains("logs/refs/heads/")),
+            "{text}"
         );
+        for path in &paths {
+            let path = Path::new(path);
+            let path = if path.is_absolute() {
+                path.to_owned()
+            } else {
+                package.join(path)
+            };
+            assert!(
+                path.exists(),
+                "watched path {} is missing:\n{text}",
+                path.display()
+            );
+        }
     }
 }
