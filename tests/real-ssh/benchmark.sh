@@ -36,14 +36,23 @@ for benchmark_mode in push pull; do
         --mode "$benchmark_mode" --host destination --workload small --size quick \
         --tool syq --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's" \
         -- --no-tcp --resource-limits bandwidth=2M
-    python3 - "$benchmark_cache" "$benchmark_mode" <<'PY'
-import json, pathlib, sys
-cache = json.loads(pathlib.Path(sys.argv[1]).read_text())
-key = 'local>destination|ssh' if sys.argv[2] == 'push' else 'destination>local|ssh'
-assert cache['paths'][key] >= 1, cache
-print('Verified a learned starting count for', key)
-PY
-    rm -f "$benchmark_cache" "$benchmark_cache.lock"
+    # Tuning history lives beside the cache path; export is its supported reader.
+    SYQ_TUNING_CACHE="$benchmark_cache" syq tuning-cache export |
+        python3 -c '
+import json, sys
+runs, starts = {}, {}
+for line in sys.stdin:
+    record = json.loads(line)
+    if record["type"] == "transfer":
+        runs[record["run"]["id"]] = record["run"]
+    elif record["event"]["kind"] == "starting_count":
+        starts[record["run"]] = record["event"]["data"]
+scored = max(runs)
+start = starts.get(scored) or {}
+assert start.get("reason") == "history", [(run_id, starts.get(run_id)) for run_id in sorted(runs)]
+print("Verified the scored copy started from learned tuning history:", start["workers"], "workers")
+'
+    rm -f "$benchmark_cache" "$benchmark_cache.lock" "${benchmark_cache%.json}".history-v1.sqlite*
 done
 test -z "$(find "$benchmark_parent" -mindepth 1 -print)"
 ssh destination 'test -z "$(find "/tmp/benchmark scratch'"'"'s" -mindepth 1 -print)"'
