@@ -154,7 +154,9 @@ fn directory_selection_bypasses_where_but_not_copy_if() {
     assert!(!policy
         .permits(&directory, b"dir", &File::default(), b"dir")
         .unwrap());
-    // Listing shape alone does not override the kind in object metadata.
+    // A listed marker is a directory without reading its metadata, because
+    // syq rejects file or symlink metadata under marker-shaped keys. The
+    // failing expression shows --where is not evaluated for it.
     assert_eq!(
         policy
             .selects_known(
@@ -166,7 +168,7 @@ fn directory_selection_bypasses_where_but_not_copy_if() {
                 b"dir"
             )
             .unwrap(),
-        None
+        Some(true)
     );
 }
 

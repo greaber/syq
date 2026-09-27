@@ -630,9 +630,10 @@ impl Policy {
                 ..
             }
         ) {
-            // HEAD distinguishes a directory marker from a file/symlink object
-            // stored under a marker-shaped key. Directories bypass --where.
-            return Ok(None);
+            // syq rejects file or symlink metadata under a marker-shaped key
+            // when it reads the object, so the listing identifies a directory.
+            // Directories bypass --where.
+            return Ok(Some(true));
         }
         expression
             .evaluate_known(src, path, Facts::Unread, b"", self.now)
