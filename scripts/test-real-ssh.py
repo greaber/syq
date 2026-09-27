@@ -2,7 +2,11 @@
 """Local-only real OpenSSH integration tests in an isolated Docker Compose project.
 
 Usage: scripts/test-real-ssh.py [--profile max-sessions-1]
-       [--suite core|benchmark|storage|metadata]
+       [--suite core|benchmark|storage|metadata] [--image NAME]
+
+--image uses an already loaded lab image built from this checkout instead of
+building one, and leaves it in place afterwards. CI builds the image once and
+runs the suites in parallel jobs.
 """
 import os
 import secrets
@@ -14,7 +18,7 @@ import time
 from tooling import ForwardSignals
 
 USAGE = ("usage: scripts/test-real-ssh.py [--profile max-sessions-1] "
-         "[--suite core|benchmark|storage|metadata]")
+         "[--suite core|benchmark|storage|metadata] [--image NAME]")
 
 
 class Die(Exception):
@@ -39,21 +43,28 @@ def lab():
 
     profile = "default"
     suite = "core"
+    image = None
     arguments = sys.argv[1:]
     while arguments:
-        if arguments[0] not in ("--profile", "--suite"):
+        if arguments[0] not in ("--profile", "--suite", "--image"):
             raise Die(USAGE)
         if len(arguments) < 2:
             raise Die(f"missing value for {arguments[0]}")
         if arguments[0] == "--profile":
             profile = arguments[1]
-        else:
+        elif arguments[0] == "--suite":
             suite = arguments[1]
+        else:
+            image = arguments[1]
         arguments = arguments[2:]
     if suite not in ("core", "benchmark", "storage", "metadata"):
         raise Die(f"unknown real-SSH test suite: {suite}")
     if suite == "benchmark" and profile != "default":
         raise Die("the benchmark suite requires the default SSH profile")
+    if image is not None and subprocess.run(
+            ["docker", "image", "inspect", image], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL).returncode:
+        raise Die(f"no loaded Docker image named {image}")
 
     toplevel = subprocess.run(["git", "rev-parse", "--show-toplevel"], stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, text=True)
@@ -77,7 +88,7 @@ def lab():
     state = f"{root}/target/real-ssh.{token}"
     os.mkdir(state, 0o700)
     project = f"syq-real-ssh-{token}"
-    os.environ["SYQ_REAL_SSH_IMAGE"] = f"{project}-node"
+    os.environ["SYQ_REAL_SSH_IMAGE"] = image or f"{project}-node"
     os.environ["SYQ_REAL_SSH_STATE"] = state
     os.environ["SYQ_REAL_SSH_SUITE"] = suite
     compose = ["docker", "compose", "--project-name", project, *compose_files]
@@ -98,11 +109,14 @@ def lab():
         if subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"],
                           stdout=subprocess.PIPE, text=True, check=True).stdout.strip():
             revision += " (dirty)"
-        print(f"building real-SSH lab for syq {revision} (profile {profile}, suite {suite})")
+        print(f"real-SSH lab for syq {revision} (profile {profile}, suite {suite})")
         run(*compose, "config", "--quiet")
-        build_started = time.monotonic()
-        run(*compose, "build", "runner")
-        print(f"real-SSH build: {time.monotonic() - build_started:.0f}s")
+        if image is None:
+            build_started = time.monotonic()
+            run(*compose, "build", "runner")
+            print(f"real-SSH build: {time.monotonic() - build_started:.0f}s")
+        else:
+            print(f"real-SSH lab image: {image}")
         execution_started = time.monotonic()
         run(*compose, "up", "--detach", "--wait", "--wait-timeout", "60", "source", "destination")
         run(*compose, "run", "--rm", "--no-deps", "runner")
@@ -112,18 +126,19 @@ def lab():
     finally:
         children.shield()
         sys.stdout.flush()
-        cleanup(compose, state, root, passed)
+        cleanup(compose, state, root, passed, remove_image=image is None)
     return 0
 
 
-def cleanup(compose, state, root, passed):
+def cleanup(compose, state, root, passed, remove_image):
     if not passed:
         with open(f"{state}/compose.log", "w") as log:
             subprocess.run([*compose, "logs", "--no-color"], stdout=log, stderr=subprocess.STDOUT)
     subprocess.run([*compose, "down", "--volumes", "--remove-orphans"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["docker", "image", "rm", os.environ["SYQ_REAL_SSH_IMAGE"]],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if remove_image:
+        subprocess.run(["docker", "image", "rm", os.environ["SYQ_REAL_SSH_IMAGE"]],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         os.remove(f"{state}/id_ed25519")
     except FileNotFoundError:
