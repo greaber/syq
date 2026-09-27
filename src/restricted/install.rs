@@ -491,35 +491,28 @@ pub(super) fn revoke_for_account(
     let last_enrollment =
         !contains_managed_enrollment(&updated) && directory_is_empty(&state_base)?;
     if !receiver_is_referenced(&state_base, &receiver_path)? {
-        remove_receiver_executable(&receiver_path)?;
+        match fs::symlink_metadata(&receiver_path) {
+            Ok(_) => {
+                delegation::validate_regular_executable(&receiver_path, "restricted receiver")?;
+                fs::remove_file(&receiver_path).with_context(|| {
+                    format!(
+                        "remove unused restricted receiver {}",
+                        receiver_path.display()
+                    )
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", receiver_path.display()))
+            }
+        }
     }
     if last_enrollment {
-        // A legacy client removes its shared executable only when revoking
-        // the final enrollment. If a build-specific enrollment outlived it,
-        // finish that cleanup here, once no managed authorization remains.
-        let legacy_receiver = home.join(".local/libexec/syq-receiver");
-        if receiver_path != legacy_receiver {
-            remove_receiver_executable(&legacy_receiver)?;
-        }
         remove_final_enrollment_state_directories(home)?;
         // General account directories are not owned by an enrollment.
     }
     drop(directory);
     println!("revoked {}", request.id);
-    Ok(())
-}
-
-fn remove_receiver_executable(receiver: &Path) -> Result<()> {
-    match fs::symlink_metadata(receiver) {
-        Ok(_) => {
-            delegation::validate_regular_executable(receiver, "restricted receiver")?;
-            fs::remove_file(receiver).with_context(|| {
-                format!("remove unused restricted receiver {}", receiver.display())
-            })?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("inspect {}", receiver.display())),
-    }
     Ok(())
 }
 

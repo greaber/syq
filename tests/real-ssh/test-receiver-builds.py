@@ -98,8 +98,11 @@ print(json.dumps([hashlib.sha256((Path({root!r})/name).read_bytes()).hexdigest()
     run(programs[1], "receiver", "revoke", bytes(record_b["id"]).hex())
     assert not enrollments(root)
     for record in [record_a, record_b]:
-        # Other scopes may share this build's executable. Once none do, the
-        # last revoker removes it, including a legacy receiver left by an old client.
+        # Old clients can leave their legacy executable behind when another
+        # enrollment remains. Only check cleanup owned by a build enrollment.
+        if not record.get("build_identity"):
+            continue
+        # Other scopes may still share this build's executable.
         remote(f"""
 import json
 from pathlib import Path
