@@ -110,6 +110,8 @@ pub struct Args {
     #[arg(skip)]
     pub(crate) copy_mtime_metadata: bool,
     #[arg(skip)]
+    pub(crate) s3_metadata: crate::s3::metadata_fields::Selection,
+    #[arg(skip)]
     pub(crate) if_exists: Option<IfExists>,
     #[arg(skip)]
     pub(crate) results_override: Option<std::sync::Arc<crate::results::ResultsWriter>>,
@@ -1323,6 +1325,26 @@ enum NativeCopyMetadata {
     Atimes,
     /// Preserve birth times; requires a macOS destination
     Crtimes,
+    /// Match Content-Type on S3-to-S3 copies
+    ContentType,
+    /// Match Content-Encoding on S3-to-S3 copies
+    ContentEncoding,
+    /// Match Content-Language on S3-to-S3 copies
+    ContentLanguage,
+    /// Match Content-Disposition on S3-to-S3 copies
+    ContentDisposition,
+    /// Match Cache-Control on S3-to-S3 copies
+    CacheControl,
+    /// Match Expires on S3-to-S3 copies
+    Expires,
+    /// Match the website redirect on S3-to-S3 copies
+    WebsiteRedirect,
+    /// Match application user metadata on S3-to-S3 copies (excluding syq-* keys)
+    UserMetadata,
+    /// Match the complete tag set on S3-to-S3 copies
+    Tags,
+    /// Use the source storage class on S3-to-S3 copies
+    StorageClass,
 }
 
 #[derive(clap::Args, Debug)]
@@ -2856,7 +2878,24 @@ fn apply_native_copy_operational(
             NativeCopyMetadata::Xattrs => args.xattrs = true,
             NativeCopyMetadata::Atimes => args.atimes = 1,
             NativeCopyMetadata::Crtimes => args.crtimes = true,
+            NativeCopyMetadata::ContentType => args.s3_metadata.content_type = true,
+            NativeCopyMetadata::ContentEncoding => args.s3_metadata.content_encoding = true,
+            NativeCopyMetadata::ContentLanguage => args.s3_metadata.content_language = true,
+            NativeCopyMetadata::ContentDisposition => args.s3_metadata.content_disposition = true,
+            NativeCopyMetadata::CacheControl => args.s3_metadata.cache_control = true,
+            NativeCopyMetadata::Expires => args.s3_metadata.expires = true,
+            NativeCopyMetadata::WebsiteRedirect => args.s3_metadata.website_redirect = true,
+            NativeCopyMetadata::UserMetadata => args.s3_metadata.user_metadata = true,
+            NativeCopyMetadata::Tags => args.s3_metadata.tags = true,
+            NativeCopyMetadata::StorageClass => args.s3_metadata.storage_class = true,
         }
+    }
+    if args.s3_metadata.active()
+        && (!args.s3.as_ref().is_some_and(|s3| s3.route.is_server_copy())
+            || args.descriptor_copy.is_some()
+            || args.stream_mapping_fd.is_some())
+    {
+        bail!("S3 content headers, user-metadata, tags and storage-class selections require named S3-to-S3 copies");
     }
     if (args.hardlinks
         || args.acls

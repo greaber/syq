@@ -216,8 +216,11 @@ impl Request {
                         .any(|scope| prefix == &scope.key || scope.contains_prefix(prefix))
                 })
         } else if query.contains_key("tagging") {
-            (source || (destination && self.upload && !self.create_only))
-                && request.method == "GET"
+            ((request.method == "GET" && source)
+                || (destination
+                    && self.upload
+                    && !self.create_only
+                    && matches!(request.method.as_str(), "GET" | "PUT")))
                 && query
                     .keys()
                     .all(|k| matches!(k.as_str(), "tagging" | "versionId"))

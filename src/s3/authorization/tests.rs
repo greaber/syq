@@ -577,3 +577,37 @@ fn uploads_can_update_their_own_metadata_but_cannot_copy_other_destination_keys(
         .permits(&Unsigned::new("GET", "allowed/a").query("tagging", ""))
         .is_err());
 }
+
+#[test]
+fn tag_updates_require_overwritable_destination_scope() {
+    let mut permission = approval();
+    let write = Unsigned::new("PUT", "allowed/a")
+        .query("tagging", "")
+        .query("versionId", "known-version");
+    assert!(permission.permits(&write).is_err());
+    permission.create_only = false;
+    permission.permits(&write).unwrap();
+    assert!(permission
+        .permits(&Unsigned::new("PUT", "outside").query("tagging", ""))
+        .is_err());
+    assert!(permission
+        .permits(&write.clone().bucket("other", "fixture"))
+        .is_err());
+    assert!(permission.permits(&write.clone().query("acl", "")).is_err());
+    permission.source = Some(ReadAccess {
+        bucket: "source".into(),
+        scopes: vec![Scope {
+            key: "input".into(),
+            descendants: true,
+        }],
+    });
+    assert!(permission
+        .permits(
+            &Unsigned::new("PUT", "input/a")
+                .bucket("source", "fixture")
+                .query("tagging", "")
+        )
+        .is_err());
+    permission.upload = false;
+    assert!(permission.permits(&write).is_err());
+}

@@ -331,6 +331,8 @@ S3 object when no usable stored hash is available. Copying `mtime` lets later
 runs use the size/time comparison. Other metadata can be selected the same way, for example
 `--copy-metadata=permissions,ownership`. `times` remains an alias for `mtime`.
 Explicit mapping `metadata.mtime` also sets the requested destination time.
+S3-to-S3 copies also support [content headers, user metadata, tags, and storage
+class](object-storage.md#copies-between-s3-buckets).
 
 Existing files keep their destination permissions. New files use the
 source read, write, and execute permissions, limited by the destination umask.

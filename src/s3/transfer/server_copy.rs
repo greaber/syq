@@ -2,11 +2,11 @@
 use super::*;
 use aws_sdk_s3::{
     operation::head_object::HeadObjectOutput,
-    types::{ChecksumType, MetadataDirective, TaggingDirective},
+    types::{ChecksumType, MetadataDirective, StorageClass, Tag, Tagging, TaggingDirective},
 };
 
 // Compare only fields whose meaning survives a copy. LastModified, encryption,
-// storage class, version IDs and ETags are not user metadata.
+// version IDs and ETags are not user metadata.
 fn same_metadata(a: &HeadObjectOutput, b: &HeadObjectOutput) -> bool {
     a.metadata()
         .into_iter()
@@ -23,6 +23,8 @@ fn same_metadata(a: &HeadObjectOutput, b: &HeadObjectOutput) -> bool {
         && a.cache_control() == b.cache_control()
         && a.expires_string() == b.expires_string()
         && a.website_redirect_location() == b.website_redirect_location()
+        && super::super::metadata_fields::storage_class(a)
+            == super::super::metadata_fields::storage_class(b)
 }
 
 fn full_checksum_match(a: &HeadObjectOutput, b: &HeadObjectOutput) -> Option<bool> {
@@ -122,6 +124,12 @@ enum CopyPreparation {
     Preview(u64),
     Ready(Box<PreparedCopy>),
     Metadata(Box<super::super::metadata_copy::Prepared>),
+    Tags {
+        key: String,
+        version: Option<String>,
+        tags: Vec<Tag>,
+        size: u64,
+    },
 }
 struct PreparedCopy {
     source: Object,
@@ -131,6 +139,7 @@ struct PreparedCopy {
     copy_source: String,
     must_be_new: bool,
     explicit: bool,
+    tags: Option<Vec<Tag>>,
     multipart: Option<PreparedCopyMultipart>,
 }
 struct PreparedCopyMultipart {
@@ -369,6 +378,8 @@ impl Engine {
             .as_ref()
             .map_or((source.mtime, 0), |m| (m.mtime, m.nsec));
         let mut matching_contents = false;
+        let mut selected_tags = None;
+        let mut tags_differ = false;
         if let Some((old, old_head)) = &existing {
             let old_time = old
                 .metadata
@@ -441,7 +452,18 @@ impl Engine {
                         .get_or_insert_with(Default::default)
                         .extend(metadata.encode());
                 }
-                if same_metadata(&desired_head, old_head) {
+                self.args
+                    .s3_metadata
+                    .apply(&source_head, &mut desired_head)?;
+                if self.args.s3_metadata.tags {
+                    let (source_tags, destination_tags) = tokio::try_join!(
+                        self.selected_tags(source_bucket, &source.key, &source_head),
+                        self.selected_tags(&self.options.bucket, &key, old_head),
+                    )?;
+                    tags_differ = source_tags != destination_tags;
+                    selected_tags = Some(source_tags);
+                }
+                if same_metadata(&desired_head, old_head) && !tags_differ {
                     self.progress
                         .bytes_unchanged
                         .fetch_add(source.size, Relaxed);
@@ -456,13 +478,31 @@ impl Engine {
         self.check_cancelled()?;
         if matching_contents {
             let old_head = &existing.as_ref().unwrap().1;
+            if same_metadata(&desired_head, old_head) {
+                let version = old_head.version_id().map(str::to_owned);
+                let mut request =
+                    super::super::authorization::Unsigned::new("PUT", &key).query("tagging", "");
+                if let Some(version) = &version {
+                    request = request.query("versionId", version);
+                }
+                self.authorize_requests(vec![request]).await?;
+                return Ok(CopyPreparation::Tags {
+                    key,
+                    version,
+                    tags: selected_tags.unwrap(),
+                    size: source.size,
+                });
+            }
             let _slot = self.tuning.requests.acquire().await;
-            let update = super::super::metadata_copy::Prepared::prepare(
+            let update = super::super::metadata_copy::Prepared::prepare_selected(
                 &self.client,
                 &self.options,
                 &key,
                 old_head,
-                desired_head.metadata().cloned().unwrap_or_default(),
+                super::super::metadata_copy::Desired {
+                    head: desired_head,
+                    tags: selected_tags,
+                },
                 self.part_size(source.size),
                 self.copy_request_limit(source.size),
             )
@@ -474,14 +514,31 @@ impl Engine {
             }
             return Ok(CopyPreparation::Metadata(Box::new(update)));
         }
+        if self.args.s3_metadata.user_metadata {
+            anyhow::ensure!(source_head.missing_meta().unwrap_or(0) == 0,
+                "cannot copy user metadata: the service omitted source metadata (x-amz-missing-meta)");
+        }
+        let selected_tags = if self.args.s3_metadata.tags {
+            Some(
+                self.selected_tags(source_bucket, &source.key, &source_head)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let copy_source = encoded_source(source_bucket, &source);
         let must_be_new = self.args.ignore_existing
             || self.args.target_existence == Existence::New
             || (self.args.protects_existing_contents() && existing.is_none());
         let multipart = if source.size > self.copy_request_limit(source.size) {
             Some(
-                self.prepare_multipart_copy(&source, desired_head.clone(), &key)
-                    .await?,
+                self.prepare_multipart_copy(
+                    &source,
+                    desired_head.clone(),
+                    &key,
+                    selected_tags.as_deref(),
+                )
+                .await?,
             )
         } else {
             None
@@ -494,6 +551,7 @@ impl Engine {
             copy_source,
             must_be_new,
             explicit: explicit.flags() != 0 || matching_contents,
+            tags: selected_tags,
             multipart,
         };
         if let Err(error) = self.authorize_copy(&prepared).await {
@@ -512,6 +570,26 @@ impl Engine {
             CopyPreparation::Skipped => return Ok(None),
             CopyPreparation::Preview(size) => return Ok(Some(size)),
             CopyPreparation::Ready(work) => work,
+            CopyPreparation::Tags {
+                key,
+                version,
+                tags,
+                size,
+            } => {
+                let _slot = self.tuning.requests.acquire().await;
+                self.check_cancelled()?;
+                self.client
+                    .put_object_tagging()
+                    .bucket(&self.options.bucket)
+                    .key(&key)
+                    .set_version_id(version)
+                    .tagging(Tagging::builder().set_tag_set(Some(tags)).build()?)
+                    .send()
+                    .await
+                    .context("update destination tags")?;
+                self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+                return Ok(Some(0));
+            }
             CopyPreparation::Metadata(update) => {
                 update
                     .execute(
@@ -544,6 +622,7 @@ impl Engine {
             copy_source,
             must_be_new,
             explicit,
+            tags,
             multipart,
         } = *work;
         if let Some(multipart) = multipart {
@@ -562,7 +641,21 @@ impl Engine {
                     source_head.website_redirect_location().map(str::to_owned),
                 )
                 .metadata_directive(MetadataDirective::Copy)
-                .tagging_directive(TaggingDirective::Copy)
+                .tagging_directive(if tags.is_some() {
+                    TaggingDirective::Replace
+                } else {
+                    TaggingDirective::Copy
+                })
+                .set_tagging(
+                    tags.as_deref()
+                        .map(super::super::metadata_copy::encode_tags),
+                )
+                .set_storage_class(self.args.s3_metadata.storage_class.then(|| {
+                    desired_head
+                        .storage_class()
+                        .cloned()
+                        .unwrap_or(StorageClass::Standard)
+                }))
                 .set_if_none_match(must_be_new.then(|| "*".to_owned()));
             let request = if explicit {
                 request
@@ -656,7 +749,20 @@ impl Engine {
                     "x-amz-metadata-directive",
                     if work.explicit { "REPLACE" } else { "COPY" },
                 )
-                .header("x-amz-tagging-directive", "COPY");
+                .header(
+                    "x-amz-tagging-directive",
+                    if work.tags.is_some() {
+                        "REPLACE"
+                    } else {
+                        "COPY"
+                    },
+                );
+            if let Some(tags) = &work.tags {
+                request = request.header(
+                    "x-amz-tagging",
+                    &super::super::metadata_copy::encode_tags(tags),
+                );
+            }
             if let Some(redirect) = work.source_head.website_redirect_location() {
                 request = request.header("x-amz-website-redirect-location", redirect);
             }
@@ -667,6 +773,12 @@ impl Engine {
                     }
                 }
             }
+            if self.args.s3_metadata.storage_class {
+                request = request.header(
+                    "x-amz-storage-class",
+                    super::super::metadata_fields::storage_class(&work.desired_head),
+                );
+            }
             if work.must_be_new {
                 request = request.header("if-none-match", "*");
             }
@@ -675,11 +787,37 @@ impl Engine {
         self.authorize_requests(requests).await
     }
 
+    async fn selected_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        head: &HeadObjectOutput,
+    ) -> Result<Vec<Tag>> {
+        if head.tag_count() == Some(0) {
+            return Ok(Vec::new());
+        }
+        let _slot = self.tuning.requests.acquire().await;
+        self.check_cancelled()?;
+        let mut tags = self
+            .client
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .set_version_id(head.version_id().map(str::to_owned))
+            .send()
+            .await
+            .context("read explicitly selected S3 tags")?
+            .tag_set;
+        tags.sort_by(|a, b| a.key().cmp(b.key()).then_with(|| a.value().cmp(b.value())));
+        Ok(tags)
+    }
+
     async fn prepare_multipart_copy(
         &self,
         source: &Object,
         metadata: HeadObjectOutput,
         key: &str,
+        selected_tags: Option<&[Tag]>,
     ) -> Result<PreparedCopyMultipart> {
         let bucket = self.options.route.source_bucket().unwrap();
         let part_size = self.part_size(source.size);
@@ -689,7 +827,9 @@ impl Engine {
         );
         let setup_slot = self.tuning.requests.acquire().await;
         self.check_cancelled()?;
-        let tagging = if metadata.tag_count() == Some(0) {
+        let tagging = if let Some(tags) = selected_tags {
+            super::super::metadata_copy::encode_tags(tags)
+        } else if metadata.tag_count() == Some(0) {
             String::new()
         } else if self.copy_tagging_unsupported.load(Relaxed) {
             anyhow::ensure!(
@@ -748,6 +888,12 @@ impl Engine {
             .bucket(&self.options.bucket)
             .key(key)
             .set_metadata(metadata.metadata().cloned())
+            .set_storage_class(self.args.s3_metadata.storage_class.then(|| {
+                metadata
+                    .storage_class()
+                    .cloned()
+                    .unwrap_or(StorageClass::Standard)
+            }))
             .set_content_type(metadata.content_type().map(str::to_owned))
             .set_content_encoding(metadata.content_encoding().map(str::to_owned))
             .set_content_language(metadata.content_language().map(str::to_owned))

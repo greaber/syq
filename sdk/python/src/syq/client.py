@@ -781,9 +781,9 @@ def _copy_arguments(
     if copy_metadata is not None:
         attributes = (copy_metadata,) if isinstance(copy_metadata, str) else tuple(copy_metadata)
         for attribute in attributes:
-            if attribute not in {"mtime", "times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes", "crtimes"}:
+            if attribute not in {"mtime", "times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes", "crtimes", "content-type", "content-encoding", "content-language", "content-disposition", "cache-control", "expires", "website-redirect", "user-metadata", "tags", "storage-class"}:
                 raise SyqInvocationError(
-                    "--copy-metadata must contain mtime, times, permissions, ownership, specials, hardlinks, acls, xattrs, atimes, or crtimes"
+                    "--copy-metadata must contain mtime, times, permissions, ownership, specials, hardlinks, acls, xattrs, atimes, crtimes, content-type, content-encoding, content-language, content-disposition, cache-control, expires, website-redirect, user-metadata, tags, or storage-class"
                 )
             _append_path_option(argv, "--copy-metadata", attribute)
     if open_noatime:

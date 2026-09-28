@@ -1263,7 +1263,7 @@ pub(super) fn metadata_update_request(
     bucket: &str,
     key: &str,
     head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
-    metadata: HashMap<String, String>,
+    desired: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
     overrides: &[Header],
 ) -> Result<super::authorization::Unsigned> {
     anyhow::ensure!(
@@ -1284,19 +1284,19 @@ pub(super) fn metadata_update_request(
         )
         .header("x-amz-metadata-directive", "REPLACE")
         .header("x-amz-tagging-directive", "COPY");
-    for (name, value) in metadata {
-        request = request.header(&format!("x-amz-meta-{name}"), &value);
+    for (name, value) in desired.metadata().into_iter().flat_map(|m| m.iter()) {
+        request = request.header(&format!("x-amz-meta-{name}"), value);
     }
     for (name, value) in [
-        ("content-type", head.content_type()),
-        ("content-encoding", head.content_encoding()),
-        ("content-language", head.content_language()),
-        ("content-disposition", head.content_disposition()),
-        ("cache-control", head.cache_control()),
-        ("expires", head.expires_string()),
+        ("content-type", desired.content_type()),
+        ("content-encoding", desired.content_encoding()),
+        ("content-language", desired.content_language()),
+        ("content-disposition", desired.content_disposition()),
+        ("cache-control", desired.cache_control()),
+        ("expires", desired.expires_string()),
         (
             "x-amz-storage-class",
-            head.storage_class().map(|v| v.as_str()),
+            desired.storage_class().map(|v| v.as_str()),
         ),
         (
             "x-amz-server-side-encryption",
@@ -1313,7 +1313,7 @@ pub(super) fn metadata_update_request(
         ),
         (
             "x-amz-website-redirect-location",
-            head.website_redirect_location(),
+            desired.website_redirect_location(),
         ),
     ] {
         if let Some(value) = value {
@@ -1433,8 +1433,7 @@ mod tests {
                 .set_bucket_key_enabled(bucket_key)
                 .build();
             let request =
-                super::metadata_update_request("bucket", "key", &head, Default::default(), &[])
-                    .unwrap();
+                super::metadata_update_request("bucket", "key", &head, &head, &[]).unwrap();
             assert_eq!(
                 request.headers["x-amz-storage-class"],
                 "INTELLIGENT_TIERING"
@@ -1510,14 +1509,8 @@ mod tests {
             ),
         ] {
             let overrides: Vec<super::Header> = values.iter().map(|v| v.parse().unwrap()).collect();
-            let request = super::metadata_update_request(
-                "bucket",
-                "key",
-                &head,
-                Default::default(),
-                &overrides,
-            )
-            .unwrap();
+            let request =
+                super::metadata_update_request("bucket", "key", &head, &head, &overrides).unwrap();
             for (name, expected) in [
                 ("x-amz-server-side-encryption", mode),
                 ("x-amz-server-side-encryption-aws-kms-key-id", key),
@@ -1572,15 +1565,9 @@ mod tests {
             ],
         ] {
             let overrides: Vec<super::Header> = values.iter().map(|v| v.parse().unwrap()).collect();
-            let error = super::metadata_update_request(
-                "bucket",
-                "key",
-                &head,
-                Default::default(),
-                &overrides,
-            )
-            .unwrap_err()
-            .to_string();
+            let error = super::metadata_update_request("bucket", "key", &head, &head, &overrides)
+                .unwrap_err()
+                .to_string();
             assert!(
                 error.contains("conflicting S3 header encryption settings"),
                 "{error}"

@@ -90,6 +90,37 @@ def check():
         c.run(args)
         headers, _ = c.request('HEAD', name + '-copy')
         assert {k.lower(): v for k, v in headers.items()}['x-amz-meta-owner'] == 'before'
+        # Select S3 attributes on equal contents; tag-only changes do not copy bytes.
+        for size in [13, 6 * 1024 * 1024]:
+            selected = c.PREFIX + '/selected-metadata-' + str(size)
+            data = b'm' * size
+            c.request('PUT', selected, data, headers={
+                'Content-Type': 'application/source', 'x-amz-meta-app': 'source',
+                'x-amz-tagging': 'selected=source'})
+            c.request('PUT', selected + '-copy', data, headers={
+                'Content-Type': 'application/destination', 'Cache-Control': 'max-age=51',
+                'x-amz-meta-app': 'destination', 'x-amz-meta-destination-only': 'remove',
+                'x-amz-tagging': 'destination=remove'})
+            metadata_args = ['--from', remote, selected, '--to', remote, '--as', selected + '-copy']
+            old, _ = c.request('HEAD', selected + '-copy')
+            c.run(metadata_args + ['--copy-metadata=tags'])
+            new, _ = c.request('HEAD', selected + '-copy')
+            lower = lambda headers: {k.lower(): v for k, v in headers.items()}
+            assert lower(old)['etag'] == lower(new)['etag']
+            assert lower(old)['last-modified'] == lower(new)['last-modified']
+            _, tags = c.request('GET', selected + '-copy', query={'tagging': ''})
+            assert b'<Key>selected</Key>' in tags and b'destination' not in tags
+            c.run(metadata_args + ['--copy-metadata=content-type,user-metadata,tags'])
+            new, actual = c.request('GET', selected + '-copy')
+            new = lower(new)
+            assert actual == data
+            assert new['content-type'] == 'application/source'
+            assert new['cache-control'] == 'max-age=51'
+            assert new['x-amz-meta-app'] == 'source'
+            assert 'x-amz-meta-destination-only' not in new
+            _, tags = c.request('GET', selected + '-copy', query={'tagging': ''})
+            assert b'<Key>selected</Key>' in tags and b'destination' not in tags
+
         # An existing destination prefix does not prohibit its exact object key.
         target = c.PREFIX + '/coexisting'
         c.request('PUT', target + '/child', b'keep')

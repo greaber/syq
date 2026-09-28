@@ -17,6 +17,20 @@ use std::{
 
 pub(super) const SINGLE_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
 
+pub(super) struct Desired {
+    pub head: HeadObjectOutput,
+    /// None keeps destination tags; Some(empty) removes them all.
+    pub tags: Option<Vec<aws_sdk_s3::types::Tag>>,
+}
+
+pub(super) fn encode_tags(tags: &[aws_sdk_s3::types::Tag]) -> String {
+    let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+    for tag in tags {
+        encoded.append_pair(tag.key(), tag.value());
+    }
+    encoded.finish().replace('+', "%20")
+}
+
 #[derive(Clone)]
 pub(crate) struct Prepared {
     request: Unsigned,
@@ -35,11 +49,44 @@ impl Prepared {
         part_size: u64,
         single_limit: u64,
     ) -> Result<Self> {
+        let mut desired = head.clone();
+        desired.metadata = Some(metadata);
+        Self::prepare_selected(
+            client,
+            options,
+            key,
+            head,
+            Desired {
+                head: desired,
+                tags: None,
+            },
+            part_size,
+            single_limit,
+        )
+        .await
+    }
+
+    pub(super) async fn prepare_selected(
+        client: &Client,
+        options: &super::Options,
+        key: &str,
+        head: &HeadObjectOutput,
+        desired: Desired,
+        part_size: u64,
+        single_limit: u64,
+    ) -> Result<Self> {
         let size = u64::try_from(head.content_length().context("S3 omitted object size")?)?;
         let bucket = &options.bucket;
         // A metadata update is a self-copy, so it takes the object-writing headers.
         let overrides = options.headers_for("PUT", []).cloned().collect::<Vec<_>>();
-        let request = client::metadata_update_request(bucket, key, head, metadata, &overrides)?;
+        let mut request =
+            client::metadata_update_request(bucket, key, head, &desired.head, &overrides)?;
+        if let Some(tags) = &desired.tags {
+            request = request
+                .header("x-amz-tagging-directive", "REPLACE")
+                .header("x-amz-tagging", &encode_tags(tags));
+        }
+
         let mut prepared = Self {
             request,
             size,
@@ -54,7 +101,9 @@ impl Prepared {
             part_size <= SINGLE_LIMIT,
             "object exceeds the S3 multipart size limit"
         );
-        let tagging = if head.tag_count() == Some(0) {
+        let tagging = if let Some(tags) = &desired.tags {
+            encode_tags(tags)
+        } else if head.tag_count() == Some(0) {
             String::new()
         } else {
             let tags = client
