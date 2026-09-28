@@ -148,19 +148,19 @@ the conversation instead.
   synchronization, verify the resulting worktree, and drop it after the
   corresponding work is committed. Report any retained stash and why it is
   still needed in the handoff.
-- At review handoff, state the branch and exact short commit SHA, whether the
-  worktree is clean, and which checks passed, failed, or were not run. Treat
-  review-ready and merge-ready as separate states.
+- When reporting work, state the branch and exact short commit SHA, whether
+  the worktree is clean, which checks passed or failed, and which are still
+  running. Passing tests are not a precondition for reporting a change,
+  opening a pull request, or asking for review: report a known failure with
+  the work rather than holding the work back. Before merge, fix failures the
+  change causes, unless the user decides to merge anyway. A failure that
+  already happens on `master` does not block the work; name the `master` run
+  that shows it. See Verification for how much to run before replying.
 - List the checks in the pull request description as a table with one row per
   check: the exact command or test name, the short SHA it ran at, and its
-  result (passed, failed, running, or not run). Open the pull request once the
-  checks that show the change works have passed, without waiting for slower
-  ones. List those as running and update their rows when they finish. Every
-  check listed as running must pass before merge.
-- After pushing another commit, keep each row's SHA as the commit the check
-  actually ran at. Rerun a check when the new commit can change its result,
-  and update its row. For the checks not rerun, add a line under the table
-  naming the new commit and why it cannot affect them.
+  result (passed, failed, or running). Update rows when running checks finish.
+  The table records what ran where. A new commit does not by itself call for
+  rerunning checks; keep each row's SHA as the commit the check actually ran at.
 - Run `scripts/branch-status.py` from the task worktree before opening a pull
   request, before asking for review, and before merging, and include its output
   in the report. It fetches `origin/master` and prints the branch SHA,
@@ -168,16 +168,21 @@ the conversation instead.
   check results, and the latest post-merge and nightly `ci`, `rsync-compat`,
   and `macos` runs on `master`. Post-merge runs select checks by changed
   paths, so a green one does not show that an earlier failure was fixed; the
-  nightly run executes the full suite when test inputs changed. Pull requests
-  do not start automated test workflows and branch protection does not require
-  test status contexts. Any pull-request check results are informational. The
-  script lists a red post-merge or nightly `master` run, and failures left by
+  nightly run executes the full suite when test inputs changed. The script
+  lists a red post-merge or nightly `master` run, and failures left by
   recently merged branches, as notes without failing; report them to the user
   even when the current task did not cause them. A failed check in a run
   dispatched on this branch makes it exit 1 until a later run of that check
-  passes. `--check`
-  also runs the Rust baseline below, and `--json` prints the same facts for
-  scripting.
+  passes. `--check` also runs the Rust baseline below, and `--json` prints the
+  same facts for scripting.
+- Pull requests do not start automated test workflows. The same failed
+  dispatched checks fail the pull request's `dispatched-checks` status, which
+  branch protection requires, so GitHub refuses the merge until a later run of
+  each failed check passes. Checks still running do not block. The
+  `merge-despite-failures` label overrides the status. The gate cannot tell
+  who caused a failure, so it also blocks on failures that already happen on
+  `master`. Adding the label is the user's decision: when a requested merge is
+  blocked, report each failure, say whether `master` shows it too, and ask.
 - Before removing a worktree or branch, require a clean worktree, no retained
   task-related stash, and no commits that still need integration. An ancestry
   result such as `git branch --merged` says nothing about uncommitted files.
@@ -334,11 +339,11 @@ it is intentional" is not that decision.
 - Do not flag a missing `CHANGELOG.md` entry on an ordinary PR. The changelog
   is brought up to date during release preparation.
 - Do not repeat checks the pull request lists as passed or running; the
-  implementing agent owns those. For each row whose SHA is older than the
-  reviewed SHA, judge whether the later commits can change its result, and
-  ask for a rerun when they can. Name any check still running as required
-  before merge. If a check the pull request does not list matters for the
-  change, say which and why, and run it yourself when that is practical.
+  implementing agent owns those. Note rows whose SHA is older than the
+  reviewed SHA when later commits could change their result, and report failed
+  checks. Checks still running do not block merge. If a check the pull request
+  does not list matters for the change, say which and why; dispatch it in CI
+  when that is practical.
 
 ## PR review freshness
 
@@ -505,52 +510,70 @@ so macOS `/var` and other host symlinks do not become paths under test.
 Create intentional symlinks inside that root; do not canonicalize product
 arguments or add follow flags merely to make a fixture pass.
 
-Pre-merge validation should provide proportionate confidence in the change,
-not duplicate the post-merge suites or full release validation. Occasional
-temporary breakage on `master` is accepted so that narrow changes do not wait
-on broad checks and development keeps moving; `master` is not a published
-release. Nightly runs, which include both local suites below, catch much of
-what narrower pre-merge checks miss, usually within a day. Use that tradeoff
-when selecting checks, while giving
-potential data loss, authorization, and compatibility failures the targeted
-coverage their consequences warrant. Keep the release validation gates intact.
-When CI fails, first distinguish product defects from test, fixture, and runner
-problems; investigate the failure rather than reflexively expanding the suite.
+Testing happens in three places, each running more than the one before:
+before merge, after merge (post-merge CI, which selects checks by changed
+paths), and in nightly and release certification, which run everything. The
+goal before merge is to keep work moving. Before replying, opening a pull
+request, or merging, run only enough to be fairly confident the change works,
+usually a build and the tests that directly exercise it. Reviewers more often
+find the problems that are hard to fix; a test failure found later usually
+means a small follow-up pull request, and merging promptly can unblock other
+work. Occasional breakage on `master` is accepted; `master` is not a
+published release. Keep the release validation gates intact, and give
+potential data loss, authorization, and compatibility failures targeted tests
+before merge. When CI fails, first distinguish product defects from test,
+fixture, and runner problems; investigate the failure rather than reflexively
+expanding the suite.
 
-Validate the final changes, including conflict resolutions after branch
-synchronization. Use `--locked` for Cargo validation so a check cannot silently
-repair an uncommitted lockfile. For shell changes, run ShellCheck on the changed
-scripts; passing Rust checks does not cover shell lint. Inspect worktree changes
-after validation and commit intended generated changes before reporting the
-validated SHA.
+Weigh cost as well as relevance. For changes to code, tooling, tests, or
+executable documentation, run `scripts/run-tooling-tests.py --quick` once on
+the final relevant changes after loading the pinned setup environment. This
+inexpensive group catches accidental tooling breakage. Pure prose changes can
+use their focused documentation checks. Reuse a passing result when later
+edits cannot affect it; do not repeat it just because review starts or master
+advances. Prefer the local command over `ci.yml` with `suites=quick` when
+runner-specific evidence is unnecessary. The quick group does not cover every
+script or replace focused runtime tests; inspect all changed executable
+scripts for coverage, including incidental edits in a rename.
 
-Use test cost as well as relevance when choosing pre-merge checks. For changes
-to code, tooling, tests, or executable documentation, run
-`scripts/run-tooling-tests.py --quick` once on the final relevant changes after
-loading the pinned setup environment. This inexpensive group catches accidental
-tooling breakage. Pure prose changes can use their focused documentation checks.
-Reuse a passing result when later edits cannot affect it; do not repeat it just
-because review starts or master advances. Prefer the local command over
-`ci.yml` with `suites=quick` when runner-specific evidence is unnecessary.
+Keep moderate and expensive checks selective, accounting for compilation,
+setup, runner queues, and fixture costs as well as test execution. Run the
+ones worth running, such as the real-SSH and S3 suites, every Rust target, or
+another platform, in CI on the pushed branch, and do not wait for them before
+replying or merging:
 
-Keep moderate and expensive checks selective. Account for compilation, setup,
-runner queues, and fixture costs as well as test execution. Inspect all changed
-executable scripts for coverage, including incidental edits in a rename. The
-quick group does not cover every script or replace focused runtime tests. Run
-additional checks when their coverage justifies their cost; reserve broad suites
-for uncertainty that cheaper checks cannot resolve. Full tooling discovery and
-nightly/release validation continue to run the slower tests.
+```bash
+gh workflow run ci.yml --ref <task-branch> -f suites='real-ssh s3'
+```
 
-Choose additional checks from the behavior changed, not every workflow available.
-For a narrow change confined to one test or its private fixture, run formatting and
-that exact test on the affected platform. The full Rust baseline below is not
-required for that case. Broaden only when shared fixtures, runtime code, or a
-concrete unresolved risk makes other tests relevant. Do not dispatch a full
-workflow merely to reach one test, or wait for unrelated checks once the
-needed result is available. State the selected checks and why before running
-expensive validation.
+`suites` takes the names listed in `SUITES` in `scripts/ci-scope.py`,
+including `rust` (formatting, clippy, and every Rust target), `tooling`,
+`python-sdk`, `linux-arm64`, `macos-intel`, `s3`, `real-ssh`, and single
+real-SSH profiles. Report such checks as running and update the pull request
+when they finish. They keep running if the pull request merges. A later run
+with the same `suites` value on the branch cancels the earlier run of those
+jobs, so dispatch once the change has settled rather than after every commit.
+A check is a job name, and a combined selection names the `rust` job after
+all its parts, so to clear a failed check, dispatch the same `suites` value
+again or rerun the failed run. The same applies to what you ask of subagents:
+do not have a subagent run slow suites before it reports.
 
-For a substantial Rust runtime change, the normal pre-merge baseline is:
+After synchronizing a branch with `master`, build; when conflicts touched
+code, also run the focused tests for that code. Use `--locked` for Cargo
+validation so a check cannot silently repair an uncommitted lockfile. For
+shell changes, run ShellCheck on the changed scripts; passing Rust checks does
+not cover shell lint. Inspect worktree changes after validation and commit
+intended generated changes before reporting the SHA.
+
+Choose checks from the behavior changed, not every workflow available. For
+Rust changes, run `cargo fmt --all -- --check`, a build, and the unit or
+integration tests that exercise the change. Prefer exact or narrow filters in
+the `local` target (`tests/local.rs` holds the shared helpers and
+`tests/local/<topic>.rs` the tests, named `<topic>::<test>`); those tests
+invoke the built binary against temporary trees. For a substantial runtime
+change, dispatch `suites=rust` rather than running clippy and every target
+locally. `scripts/branch-status.py --check` runs this local baseline when you
+want it:
 
 ```bash
 cargo fmt --all -- --check
@@ -558,26 +581,14 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --bin syq
 ```
 
-For a small, well-understood runtime fix, formatting and focused tests may be
-sufficient; state what they cover and any concrete uncertainty left. Broaden
-when that uncertainty matters, not merely because runtime code changed.
-Select the integration tests that can plausibly exercise the changed behavior.
-Prefer exact or narrow filters in the `local` target (`tests/local.rs`
-holds the shared helpers and `tests/local/<topic>.rs` the tests, named
-`<topic>::<test>`); those tests invoke the built binary against temporary trees. Run `cargo test --locked --all-targets` before
-handoff when a change is broad, crosses subsystem boundaries, changes shared
-test infrastructure, or leaves meaningful uncertainty about the affected
-surface.
-
 For one exact Rust unit test, use
 `cargo test --locked --bin syq 'module::tests::name' -- --exact`; for an
 integration test, replace `--bin syq` with its target, such as `--test local`.
 Confirm the named test ran; a zero-test or ignored result is not validation.
 
-Choose the evidence needed before choosing a workflow. A workflow lacking a
-focused option is not a reason to run its full suite. For arbitrary checks on
-a Linux or macOS runner, use the manual focused runner from a clean, pushed
-task branch:
+A workflow lacking a focused option is not a reason to run its full suite.
+For arbitrary checks on a Linux or macOS runner, use the manual focused
+runner from a clean, pushed task branch:
 
 ```bash
 scripts/run-focused-check.py --runner macos --cargo-cache -- \
@@ -593,17 +604,15 @@ workflow setup regression, reproduce the relevant setup as well as the failing
 command. Inputs and logs are public: do not include secrets. Confirm exact Rust
 tests actually ran; Cargo accepts filters that match zero tests.
 
-The focused workflow must be merged to the default branch once before GitHub
-allows dispatching it. The helper selects the current remote branch, pins its
-checkout commit, prints
-the SHA and run URL, and watches that exact run through `gh run watch`.
-`--provider github` selects GitHub instead of Namespace; `--ref` explicitly tests
-another pushed branch or tag; `--timeout` changes the default 15-minute limit.
-Only enable `--cargo-cache` for checks needing Rust builds. No builds or test
-suites run implicitly, and these checks do not certify a full suite for release.
-Stop once the relevant evidence is available; expand validation only for a
-concrete remaining risk. Add reusable focused checks when repeated use justifies
-them rather than adding a permanent option for every repair.
+The helper selects the current remote branch, pins its checkout commit,
+prints the SHA and run URL, and watches that exact run through
+`gh run watch`; run it in the background when you do not need the result
+before replying. `--provider github` selects GitHub instead of Namespace; `--ref`
+explicitly tests another pushed branch or tag; `--timeout` changes the default
+15-minute limit. Only enable `--cargo-cache` for checks needing Rust builds.
+No builds or test suites run implicitly, and these checks do not certify a
+full suite for release. Add reusable focused checks when repeated use
+justifies them rather than adding a permanent option for every repair.
 
 For an exact macOS Rust test, the existing focused job also verifies that the
 named test exists and includes ignored tests:
@@ -615,11 +624,11 @@ gh workflow run macos.yml --ref <task-branch> \
 
 `test_target` also accepts the integration target names. This runs only the
 exact test, including it if marked ignored, and rejects a name absent on that
-platform. It does not produce full-suite release certification. Monitor the
-returned run with `gh run watch <run-id> --exit-status`. Leaving `test_name`
-empty selects the full workflow; use that only when broad validation is needed.
+platform. It does not produce full-suite release certification. Leaving
+`test_name` empty selects the full workflow.
 
-Two local suites cover behavior that the Rust targets cannot reach:
+Two suites cover behavior that the Rust targets cannot reach. Both run in
+Docker and can run locally:
 
 ```bash
 scripts/test-real-ssh.py
@@ -633,32 +642,20 @@ scripts/test-s3.py
   takes about a minute after the build. It covers S3 upload, download, and
   server copy, expressions, directory markers, pruning, streams, and listing.
 
-Run a local suite when its scenarios exercise the behavior you changed. Decide
-from the suite's scenarios, not from which files changed: copy planning,
-expression and selection semantics, directory creation, and restricted-receiver
-behavior reach both suites even when no SSH or S3 code changed. When a suite is
-relevant, run all of it at the final commit before handoff. Its cases interact,
-so hand-picked cases can miss regressions. `scripts/test-real-ssh.py --case`
-runs selected cases while iterating. Neither suite is part of
-`cargo test` or post-merge CI; full nightly and manual `ci.yml` runs include
-both.
+Dispatch them in CI (`suites=real-ssh`, `suites=s3`) when their scenarios
+exercise the behavior you changed. Decide from the suite's scenarios, not from
+which files changed: copy planning, expression and selection semantics,
+directory creation, and restricted-receiver behavior reach both suites even
+when no SSH or S3 code changed. Run them locally, or selected cases with
+`scripts/test-real-ssh.py --case`, while iterating on behavior they cover.
+Neither suite is part of `cargo test` or post-merge CI; nightly and full
+manual `ci.yml` runs include both.
 
-Small review fixes to diagnostics, documentation, or isolated validation checks
-can use focused tests when those tests adequately exercise the change. Batch
-related fixes before running the full suite. After a successful run, inspect
-the intervening changes before repeating it; rerun when they affect the suite's
-scenarios or leave meaningful uncertainty that focused tests cannot resolve.
-Report the SHA of the last successful full run, the checks on the current SHA,
-and why a repeat was unnecessary. Do not describe an earlier run as testing the
-current tree. Release validation follows the commit and release-preparation
-evidence rules under release tag lifecycle.
+Do not describe an earlier run as testing the current tree; the check table's
+SHAs say what ran where. Release validation follows the commit and
+release-preparation evidence rules under release tag lifecycle.
 
-Pull requests do not start automated test workflows. The agent remains
-responsible for selecting checks under the rules above, choosing integration tests,
-and reporting exactly what was and was not verified before review. Post-merge
-workflows select affected areas and do not run the local suites; nightly runs
-execute the complete suites, including both local suites, when test inputs
-have changed. Nightly should run every test in the repository. Leaving a test
-out of nightly needs the user's explicit agreement. Full validation remains
-required before release. Pay particular attention to remote, TCP, platform-specific,
-and performance behavior when choosing local checks.
+Nightly should run every test in the repository. Leaving a test out of
+nightly needs the user's explicit agreement. Full validation remains required
+before release. Pay particular attention to remote, TCP, platform-specific,
+and performance behavior when choosing checks.
