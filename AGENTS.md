@@ -152,8 +152,10 @@ the conversation instead.
   the worktree is clean, which checks passed or failed, and which are still
   running. Passing tests are not a precondition for reporting a change,
   opening a pull request, or asking for review: report a known failure with
-  the work rather than holding the work back. See Verification for how much to
-  run before replying.
+  the work rather than holding the work back. Before merge, fix failures the
+  change causes, unless the user decides to merge anyway. A failure that
+  already happens on `master` does not block the work; name the `master` run
+  that shows it. See Verification for how much to run before replying.
 - List the checks in the pull request description as a table with one row per
   check: the exact command or test name, the short SHA it ran at, and its
   result (passed, failed, or running). Update rows when running checks finish.
@@ -177,8 +179,10 @@ the conversation instead.
   dispatched checks fail the pull request's `dispatched-checks` status, which
   branch protection requires, so GitHub refuses the merge until a later run of
   each failed check passes. Checks still running do not block. The
-  `merge-despite-failures` label overrides the status; adding it is the user's
-  decision, so when a requested merge is blocked, report the failures and ask.
+  `merge-despite-failures` label overrides the status. The gate cannot tell
+  who caused a failure, so it also blocks on failures that already happen on
+  `master`. Adding the label is the user's decision: when a requested merge is
+  blocked, report each failure, say whether `master` shows it too, and ask.
 - Before removing a worktree or branch, require a clean worktree, no retained
   task-related stash, and no commits that still need integration. An ancestry
   result such as `git branch --merged` says nothing about uncommitted files.
