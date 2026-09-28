@@ -704,7 +704,7 @@ impl Engine {
         fields.extend(metadata.encode());
         let update = super::metadata_copy::Prepared::prepare(
             &self.client,
-            &self.options.bucket,
+            &self.options,
             &source.key,
             &head,
             fields,

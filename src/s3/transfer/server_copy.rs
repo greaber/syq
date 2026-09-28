@@ -459,7 +459,7 @@ impl Engine {
             let _slot = self.tuning.requests.acquire().await;
             let update = super::super::metadata_copy::Prepared::prepare(
                 &self.client,
-                &self.options.bucket,
+                &self.options,
                 &key,
                 old_head,
                 desired_head.metadata().cloned().unwrap_or_default(),

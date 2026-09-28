@@ -803,7 +803,7 @@ async fn accept_existing(
                 *metadata_update = Some(Box::new(
                     super::metadata_copy::Prepared::prepare(
                         client,
-                        &plan.options.bucket,
+                        &plan.options,
                         &plan.key,
                         &head,
                         fields,

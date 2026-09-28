@@ -28,7 +28,7 @@ impl Prepared {
     /// The caller holds its request permit during setup.
     pub(super) async fn prepare(
         client: &Client,
-        bucket: &str,
+        options: &super::Options,
         key: &str,
         head: &HeadObjectOutput,
         metadata: HashMap<String, String>,
@@ -36,7 +36,9 @@ impl Prepared {
         single_limit: u64,
     ) -> Result<Self> {
         let size = u64::try_from(head.content_length().context("S3 omitted object size")?)?;
-        let request = client::metadata_update_request(bucket, key, head, metadata)?;
+        let bucket = &options.bucket;
+        let request =
+            client::metadata_update_request(bucket, key, head, metadata, &options.headers)?;
         let mut prepared = Self {
             request,
             size,

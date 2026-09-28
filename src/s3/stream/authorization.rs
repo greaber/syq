@@ -152,7 +152,7 @@ impl Session {
                 let _request = self.requests.acquire().await?;
                 super::super::metadata_copy::Prepared::prepare(
                     &self.client,
-                    &self.options.bucket,
+                    &self.options,
                     &plan.key,
                     &head,
                     fields,

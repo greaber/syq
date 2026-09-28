@@ -93,10 +93,15 @@ case; there are no `--copy-metadata` settings for these S3-specific fields.
 Updating stored file attributes copies the destination object onto itself within
 S3, preserving its contents, content headers, tags, and unselected user metadata.
 It retains the destination storage class and the encryption method, KMS key,
-and S3 Bucket Key setting returned by the service. This applies to multipart
-metadata updates too. It changes S3 Last-Modified and creates a new version when
-bucket versioning is enabled. Object ACLs, Object Lock settings, and custom KMS
-encryption contexts are not preserved by this operation.
+and S3 Bucket Key setting returned by the service. Explicit `--s3-header`
+encryption settings override the selected fields: changing a KMS key retains the
+compatible encryption method, while switching away from KMS drops inherited KMS
+settings. Incompatible explicit encryption settings cause an error. Syq also
+refuses the update if the service reports that it omitted existing metadata from
+its response, because replacing that metadata could lose entries. These rules
+apply to multipart metadata updates too. The update changes S3 Last-Modified and
+creates a new version when bucket versioning is enabled. Object ACLs, Object Lock
+settings, and custom KMS encryption contexts are not preserved by this operation.
 
 New or changed uploads and bucket copies use the provider's storage and encryption
 defaults unless overridden with `--s3-header`. On AWS general-purpose buckets,
