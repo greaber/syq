@@ -407,6 +407,33 @@ fn default_download_reuses_stored_hash_without_changing_mtime() {
 }
 
 #[test]
+fn default_download_fetches_once_after_stored_hash_mismatch() {
+    for fault in [
+        "existing-policy-hash-blake3",
+        "existing-policy-hash-sha256",
+        "existing-policy-hash-md5",
+    ] {
+        let temp = test_support::tempdir().unwrap();
+        let server = Server::start(fault);
+        let local = temp.path().join("local");
+        file(&local, b"change", 20);
+        let output = server.cp(
+            temp.path(),
+            &["--from", "s3://bucket", "object", "--as", "local"],
+        );
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        // These fixtures reject a second object-body GET in serve().
+        assert!(
+            server.gate.0.load(Ordering::Relaxed),
+            "changed object body was not downloaded for {fault}"
+        );
+        assert!(!server.gate.1.load(Ordering::Relaxed), "object was changed");
+        assert_eq!(std::fs::read(&local).unwrap(), b"stored");
+        assert_eq!(std::fs::metadata(local).unwrap().mtime(), 10);
+    }
+}
+
+#[test]
 fn explicit_hash_uses_requested_algorithm_and_compares_only_once() {
     for fault in ["existing-policy-hash-sha256", "existing-policy-nohash-once"] {
         let temp = test_support::tempdir().unwrap();

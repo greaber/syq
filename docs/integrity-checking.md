@@ -27,13 +27,6 @@ do not use the filesystem rule above. Uploads need syq metadata on the existing
 object for this shortcut. Downloads use the stored source timestamp, or S3's
 modification time in whole seconds when syq metadata is absent.
 
-When an S3 download has matching size but a different timestamp, syq can compare
-the local file with a whole-file hash stored in the object's syq metadata. A
-matching hash avoids downloading the object and leaves the local timestamp alone.
-`error-if-different` uploads and downloads also reuse stored hashes when possible.
-Explicit `--hash` comparisons use BLAKE3; if the object has no stored BLAKE3 hash,
-syq reads its contents to compute one.
-
 A timestamp difference outside that precision triggers checking even when the
 source is older. Use `--hash` to check contents even when size and timestamp
 match:
@@ -44,6 +37,13 @@ syq cp --hash --srcs-in project --into backup
 
 `--hash` uses BLAKE3. In rsync syntax, use `-c` or `--checksum` for the same
 comparison.
+
+When an S3 download has matching size but a different timestamp, syq can compare
+the local file with a whole-file hash stored in the object's syq metadata. A
+matching hash avoids downloading the object and leaves the local timestamp alone.
+`error-if-different` uploads and downloads also reuse stored hashes when possible.
+Explicit `--hash` comparisons use BLAKE3; if the object has no stored BLAKE3 hash,
+syq reads its contents to compute one.
 
 ## Payload checks
 
