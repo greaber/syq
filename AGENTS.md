@@ -151,8 +151,9 @@ the conversation instead.
 - When reporting work, state the branch and exact short commit SHA, whether
   the worktree is clean, which checks passed or failed, and which are still
   running. Passing tests are not a precondition for reporting a change,
-  opening a pull request, or asking for review; see Verification for how much
-  to run before replying.
+  opening a pull request, or asking for review: report a known failure with
+  the work rather than holding the work back. See Verification for how much to
+  run before replying.
 - List the checks in the pull request description as a table with one row per
   check: the exact command or test name, the short SHA it ran at, and its
   result (passed, failed, or running). Update rows when running checks finish.
