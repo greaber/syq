@@ -56,7 +56,12 @@ jobs:
       full_suite: ${{ steps.changes.outputs.full_suite }}
       integration_targets: ${{ steps.changes.outputs.integration_targets }}
       suite_selection: ${{ steps.changes.outputs.suite_selection }}
-      rust_suites: ${{ steps.changes.outputs.rust_suites }}
+      rust_label: ${{ steps.changes.outputs.rust_label }}
+      # Manual runs on task branches skip unselected jobs instead of recording
+      # placeholder successes, which would hide earlier failures of the same job.
+      # Placeholders remain where release checks and the generated-SDK flow
+      # (scope_commit) expect the stable check names.
+      skip_unselected: ${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/master' && inputs.scope_commit == '' }}
       all_tooling: ${{ steps.changes.outputs.all_tooling }}
       s3: ${{ steps.changes.outputs.s3 }}
       repository_checks: ${{ steps.changes.outputs.repository_checks }}
@@ -86,8 +91,8 @@ jobs:
         run: scripts/ci-scope.py "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
   rust:
-    # Release checks require the name `rust`; selected suites never run on master.
-    name: ${{ needs.scope.outputs.suite_selection == 'true' && format('rust ({0})', needs.scope.outputs.rust_suites) || 'rust' }}
+    # Release checks require the name `rust`, which master runs keep.
+    name: ${{ needs.scope.outputs.skip_unselected == 'true' && format('rust ({0})', needs.scope.outputs.rust_label) || 'rust' }}
     # Cancel only matching automatic checks and later selections of the same
     # suite on the same branch; other manual runs keep a unique group.
     concurrency:
@@ -95,10 +100,9 @@ jobs:
       group: ${{ github.workflow }}-rust-${{ github.event_name == 'push' && github.ref || needs.scope.outputs.suite_selection == 'true' && format('{0}-selected', github.ref) || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.integration_targets }}-${{ needs.scope.outputs.tooling_checks }}-${{ needs.scope.outputs.native == 'true' && needs.scope.outputs.full_suite == 'true' && 'full' || format('{0}-{1}-{2}-{3}-{4}', needs.scope.outputs.native, needs.scope.outputs.tooling, needs.scope.outputs.shellcheck, needs.scope.outputs.mapping_docs, needs.scope.outputs.full_suite) }}
       cancel-in-progress: ${{ github.event_name == 'push' || needs.scope.outputs.suite_selection == 'true' }}
     needs: scope
-    # Selected suites skip unselected jobs instead of recording stub successes.
     if: >-
       always() &&
-      (needs.scope.outputs.suite_selection != 'true' ||
+      (needs.scope.outputs.skip_unselected != 'true' ||
        needs.scope.outputs.native == 'true' ||
        needs.scope.outputs.tooling == 'true' ||
        needs.scope.outputs.shellcheck == 'true' ||
@@ -317,7 +321,7 @@ jobs:
     needs: scope
     if: >-
       always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
-      (needs.scope.outputs.suite_selection != 'true' || needs.scope.outputs.python_sdk == 'true')
+      (needs.scope.outputs.skip_unselected != 'true' || needs.scope.outputs.python_sdk == 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Require successful path classification
@@ -421,7 +425,7 @@ jobs:
     needs: [scope, sdk-languages]
     if: >-
       always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
-      needs.scope.outputs.suite_selection != 'true'
+      (needs.scope.outputs.skip_unselected != 'true' || needs.scope.outputs.python_sdk == 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Require successful SDK validation
@@ -443,7 +447,7 @@ jobs:
     needs: scope
     if: >-
       always() && inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
-      (needs.scope.outputs.suite_selection != 'true' || needs.scope.outputs.linux_arm64 == 'true')
+      (needs.scope.outputs.skip_unselected != 'true' || needs.scope.outputs.linux_arm64 == 'true')
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Require successful path classification
@@ -538,7 +542,8 @@ jobs:
     if: >-
       always() && needs.macos_intel.result != 'cancelled' &&
       inputs.linux_trial != 'github' && inputs.linux_trial != 'namespace' &&
-      needs.scope.outputs.suite_selection != 'true'
+      (needs.scope.outputs.skip_unselected != 'true' ||
+       (needs.scope.outputs.macos_intel == 'true' && needs.scope.outputs.full_suite == 'true'))
     runs-on: ubuntu-latest
     steps:
       - name: Require successful path classification

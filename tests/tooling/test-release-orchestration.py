@@ -355,18 +355,21 @@ class EventScopeTests(Scratch):
         self.assertScope(scope, native="true", integration_targets="all", macos="true",
                          macos_intel="true", s3="false", tooling="false", full_suite="false")
         self.assertEqual(len(json.loads(scope["real_ssh_matrix"])), 4)
-        # The rust job's name records which of its suites ran, in a fixed order.
-        self.assertScope(scope, rust_suites="rust", all_tooling="false")
+        # On task branches the rust job's name records what it ran.
+        self.assertScope(scope, rust_label="native:all", all_tooling="false")
         scope = self.scope(event=dispatch, cwd=self.repo,
                            env=dict(branch, SYQ_CI_SUITES="shellcheck tooling"))
-        self.assertScope(scope, rust_suites="tooling shellcheck", all_tooling="true",
+        self.assertScope(scope, rust_label="tooling:all shellcheck", all_tooling="true",
                          native="false")
+        self.assertScope(self.scope(event=dispatch, cwd=self.repo,
+                                    env=dict(branch, SYQ_CI_DOCUMENTATION_ONLY="true")),
+                         rust_label="mapping-docs")
         # Path classification and full runs never select suites.
         self.assertScope(self.scope("src/main.rs"), suite_selection="false", s3="false",
-                         real_ssh_matrix="[]", rust_suites="", all_tooling="false")
+                         real_ssh_matrix="[]", rust_label="native:bin", all_tooling="false")
         self.assertScope(self.scope(event=dispatch, cwd=self.repo), suite_selection="false",
                          s3="true", repository_checks="true", macos_intel="true",
-                         all_tooling="true", rust_suites="")
+                         all_tooling="true", rust_label="full")
         for env, message in [
                 (dict(branch, SYQ_CI_SUITES="s3 bogus"), "unknown suite: bogus"),
                 ({"GITHUB_REF": "refs/heads/master", "SYQ_CI_SUITES": "s3"}, "not master"),
