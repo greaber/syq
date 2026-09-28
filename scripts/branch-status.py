@@ -14,17 +14,18 @@ and GitHub state. With --check it also runs the fixed Rust baseline (fmt,
 clippy, unit tests) in this worktree.
 
 A job that failed in a run dispatched on this branch stays a failure until a
-later dispatched run of the same job on the branch passes; merge past one only
-when the user explicitly says so. Runs still in progress at a merge keep
-running, so a failure left on a merged branch is reported until the next
-successful full-suite run of that workflow on master.
+later dispatched run of the same job on the branch passes. Runs still in
+progress at a merge keep running, so a failure left on a merged branch is
+reported until the next successful full-suite run of that workflow on master.
 
-Exit status: 0 when nothing needs attention; 1 when master's latest
-post-merge or nightly run failed, a dispatched check on this branch or a
-recently merged branch failed, the GitHub head is stale or unrelated, or a
---check step failed or changed worktree status; 2 on usage/tooling errors or
-HEAD moving during checks (stderr diagnostic, no report, even with --json).
-The pull request's check rollup is informational.
+Red master runs and failures left by merged branches are reported as notes:
+they are separate problems and do not make this branch's status fail.
+
+Exit status: 0 when nothing needs attention; 1 when a dispatched check on this
+branch failed, the GitHub head is stale or unrelated, or a --check step failed
+or changed worktree status; 2 on usage/tooling errors or HEAD moving during
+checks (stderr diagnostic, no report, even with --json). The pull request's
+check rollup is informational.
 """
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -99,8 +100,8 @@ def master_run(workflow, event):
     return runs[0] if runs else None
 
 
-def run_state(workflow, run, kind, warn):
-    """A master run's state, warning when it is missing or red."""
+def run_state(workflow, run, kind, note):
+    """A master run's state, noting when it is missing or red."""
     state = "missing"
     if run:
         if run.get("status") == "completed":
@@ -108,9 +109,9 @@ def run_state(workflow, run, kind, warn):
         else:
             state = run.get("status") or "unknown"
     if state == "missing":
-        warn(f"{workflow} has no {kind} run on master")
+        note(f"{workflow} has no {kind} run on master")
     elif state != "success" and state not in UNFINISHED:
-        warn(f"master is red: {workflow} {kind} {state} at {(run.get('headSha') or '')[:7]} "
+        note(f"master is red: {workflow} {kind} {state} at {(run.get('headSha') or '')[:7]} "
              f"{run.get('url')}")
     return state
 
@@ -212,6 +213,9 @@ def pull_request_checks(pr):
 def report(json_report, check):
     warnings = []
     warn = warnings.append
+    # Problems elsewhere in the repository, reported without failing this branch.
+    notes = []
+    note = notes.append
 
     toplevel = git("rev-parse", "--show-toplevel")
     head_sha, short_sha, status_lines, staged, unstaged, untracked = worktree_state()
@@ -255,9 +259,9 @@ def report(json_report, check):
     for workflow in WORKFLOWS:
         push_run, nightly_run = next(latest), next(latest)
         master_runs.append({
-            "workflow": workflow, "state": run_state(workflow, push_run, "post-merge", warn),
+            "workflow": workflow, "state": run_state(workflow, push_run, "post-merge", note),
             "run": push_run, "nightly": {
-                "state": run_state(workflow, nightly_run, "nightly", warn), "run": nightly_run}})
+                "state": run_state(workflow, nightly_run, "nightly", note), "run": nightly_run}})
 
     pr_head_relation = "none"
     if pr:
@@ -301,14 +305,13 @@ def report(json_report, check):
                             key=lambda run: run.get("createdAt") or "")
     for entry in branch_failed:
         warn(f"{entry['workflow']} {entry['job']} {entry['conclusion']} at {entry['head'][:7]} on "
-             f"this branch, and no later run passed it; merge only if the user says to "
-             f"{entry['url']}")
+             f"this branch, and no later run passed it {entry['url']}")
     merged_failed = []
     for merged_pr, pr_runs in merged_runs:
         for entry in failed_checks(pr_runs, jobs):
             merged_failed.append(dict(entry, number=merged_pr.get("number"),
                                       pull_request=merged_pr.get("url")))
-            warn(f"#{merged_pr.get('number')} merged with {entry['workflow']} {entry['job']} "
+            note(f"#{merged_pr.get('number')} merged with {entry['workflow']} {entry['job']} "
                  f"{entry['conclusion']} at {entry['head'][:7]}, and no full run of "
                  f"{' and '.join(CLEARED_BY[entry['workflow']])} on master has passed since "
                  f"{entry['url']}")
@@ -356,7 +359,8 @@ def report(json_report, check):
             },
             "master_ci": master_runs, "pull_request": pr, "pull_request_head": pr_head_relation,
             "dispatched": {"failed": branch_failed, "running": branch_running},
-            "merged_failures": merged_failed, "checks": checks, "warnings": warnings, "exit_status": exit_status,
+            "merged_failures": merged_failed, "checks": checks, "notes": notes,
+            "warnings": warnings, "exit_status": exit_status,
         }, indent=2, ensure_ascii=False))
         return exit_status
 
@@ -419,8 +423,9 @@ def report(json_report, check):
         lines += ["", f"Baseline checks (started at {initial_head_sha[:7]}; worktree state is "
                       "reported above):"]
         lines += [f"  {entry['name']}: {entry['result']}  ({entry['command']})" for entry in checks]
-    if warnings:
+    if notes or warnings:
         lines.append("")
+        lines += [f"NOTE: {entry}" for entry in notes]
         lines += [f"WARNING: {warning}" for warning in warnings]
     print("\n".join(lines))
     return exit_status

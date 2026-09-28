@@ -229,12 +229,13 @@ class BranchStatusTests(unittest.TestCase):
         self.assertIn("simulated GraphQL failure", output)
         self.assertNotIn("Pull request: none", output)
 
-    def test_red_post_merge_run_is_an_alert(self):
+    def test_red_post_merge_run_is_noted_without_failing_the_branch(self):
         self.set_run("macos.yml", "completed", "failure")
-        output = self.status(expected=1)
+        output = self.status()
         self.assertIn("macos.yml        failure", output)
-        self.assertIn(f"WARNING: master is red: macos.yml post-merge failure at {self.master[:7]} "
+        self.assertIn(f"NOTE: master is red: macos.yml post-merge failure at {self.master[:7]} "
                       "https://example.invalid/macos.yml/push", output)
+        self.assertNotIn("WARNING", output)
 
     def test_run_in_progress_is_not_an_alert(self):
         self.set_run("macos.yml", "in_progress", "")
@@ -245,16 +246,17 @@ class BranchStatusTests(unittest.TestCase):
     def test_red_nightly_behind_a_green_post_merge_run(self):
         # A green post-merge run can skip checks that the red nightly full suite ran.
         self.set_run("rsync-compat.yml", "completed", "failure", "schedule")
-        output = self.status(expected=1)
+        output = self.status()
         self.assertIn("rsync-compat.yml success", output)
         self.assertIn(f"  nightly        failure      {self.master[:7]}  "
                       "https://example.invalid/rsync-compat.yml/schedule", output)
-        self.assertIn(f"WARNING: master is red: rsync-compat.yml nightly failure at {self.master[:7]}",
+        self.assertIn(f"NOTE: master is red: rsync-compat.yml nightly failure at {self.master[:7]}",
                       output)
-        report = json.loads(self.status("--json", expected=1))
+        report = json.loads(self.status("--json"))
         self.assertEqual(report["master_ci"][1]["state"], "success")
         self.assertEqual(report["master_ci"][1]["nightly"]["state"], "failure")
-        self.assertEqual(report["exit_status"], 1)
+        self.assertEqual(len(report["notes"]), 1)
+        self.assertEqual(report["exit_status"], 0)
 
     def test_nightly_in_progress_is_not_an_alert(self):
         self.set_run("rsync-compat.yml", "in_progress", "", "schedule")
@@ -302,10 +304,14 @@ class BranchStatusTests(unittest.TestCase):
         self.assertEqual(report["warnings"], [])
         self.assertEqual(report["exit_status"], 0)
         self.set_run("ci.yml", "completed", "failure")
-        report = json.loads(self.status("--json", expected=1))
+        report = json.loads(self.status("--json"))
+        self.assertEqual(report["exit_status"], 0)
+        self.assertEqual(len(report["notes"]), 1)
+        self.assertEqual(report["master_ci"][0]["state"], "failure")
+        report = json.loads(self.status("--json", pr=self.with_pr(headRefOid=self.previous),
+                                        expected=1))
         self.assertEqual(report["exit_status"], 1)
         self.assertEqual(len(report["warnings"]), 1)
-        self.assertEqual(report["master_ci"][0]["state"], "failure")
 
     def test_json_check_stays_one_document(self):
         # --json --check stays one JSON document even when the checks write to stdout.
@@ -345,7 +351,7 @@ class BranchStatusTests(unittest.TestCase):
         self.assertIn(f"  failed   ci.yml s3 at {self.previous[:7]}  "
                       "https://example.invalid/runs/11/s3", output)
         self.assertIn(f"WARNING: ci.yml s3 failure at {self.previous[:7]} on this branch, and no "
-                      "later run passed it; merge only if the user says to", output)
+                      "later run passed it https://example.invalid/runs/11/s3", output)
         # A later run of other checks does not resolve it; a still-running one is listed.
         self.dispatch("ci.yml", 12, "2026-02-02T00:00:00Z", {"rust": "success"})
         self.dispatch("ci.yml", 13, "2026-02-03T00:00:00Z", {"s3": None}, status="in_progress")
@@ -403,17 +409,19 @@ class BranchStatusTests(unittest.TestCase):
         self.merged = [{"number": 6, "url": "https://example.invalid/pull/6",
                         "headRefName": "merged-task", "mergedAt": "2026-02-02T00:00:00Z",
                         "isCrossRepository": False}]
-        output = self.status(expected=1)
+        # A failure elsewhere is noted without failing this branch.
+        output = self.status()
         self.assertIn("Failures left by merged pull requests (until a full run on master passes):",
                       output)
         self.assertIn(f"  #6 ci.yml s3 at {self.head[:7]}", output)
-        self.assertIn("WARNING: #6 merged with ci.yml s3 failure", output)
+        self.assertIn("NOTE: #6 merged with ci.yml s3 failure", output)
+        self.assertNotIn("WARNING", output)
         # A nightly that skipped unchanged inputs, or one before the merge, does not clear it.
         self.full_run("ci.yml", 91, "2026-02-03T00:00:00Z",
                       jobs={"rust": "success", "nightly-unchanged": "success"})
-        self.status(expected=1)
+        self.assertIn("NOTE: #6", self.status())
         self.full_run("ci.yml", 92, "2026-02-01T12:00:00Z")
-        self.status(expected=1)
+        self.assertIn("NOTE: #6", self.status())
         self.full_run("ci.yml", 93, "2026-02-03T00:00:00Z", event="workflow_dispatch")
         output = self.status()
         self.assertNotIn("Failures left by merged", output)
@@ -422,12 +430,12 @@ class BranchStatusTests(unittest.TestCase):
             {"headSha": self.master, "status": "completed", "conclusion": "success",
              "url": "https://example.invalid/push", "createdAt": f"2026-02-04T00:{minute:02}:00Z",
              "databaseId": 200 + minute} for minute in range(30)]))
-        self.status()
+        self.assertNotIn("NOTE: #6", self.status())
         # A cross-repository pull request's branch name says nothing about these runs.
         self.merged[0]["isCrossRepository"] = True
         (self.runs / "ci.yml.workflow_dispatch.json").write_text(
             json.dumps(self.dispatched["ci.yml"]))
-        self.status()
+        self.assertNotIn("NOTE: #6", self.status())
 
     def test_merged_focused_failure_waits_for_both_native_suites(self):
         self.dispatch("focused-check.yml", 51, "2026-02-01T00:00:00Z",
@@ -436,9 +444,9 @@ class BranchStatusTests(unittest.TestCase):
                         "headRefName": "merged-task", "mergedAt": "2026-02-02T00:00:00Z",
                         "isCrossRepository": False}]
         self.full_run("ci.yml", 94, "2026-02-03T00:00:00Z")
-        self.status(expected=1)
+        self.assertIn("NOTE: #8", self.status())
         self.full_run("macos.yml", 95, "2026-02-03T00:00:00Z")
-        self.status()
+        self.assertNotIn("NOTE: #8", self.status())
 
     def test_usage_errors(self):
         self.assertIn("usage:", self.status("--bogus", expected=2))

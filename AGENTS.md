@@ -170,9 +170,12 @@ the conversation instead.
   paths, so a green one does not show that an earlier failure was fixed; the
   nightly run executes the full suite when test inputs changed. Pull requests
   do not start automated test workflows and branch protection does not require
-  test status contexts. Any pull-request check results are informational. A
-  red post-merge or nightly `master` run makes the script exit 1; report it to
-  the user even when the current task did not cause it. `--check`
+  test status contexts. Any pull-request check results are informational. The
+  script lists a red post-merge or nightly `master` run, and failures left by
+  recently merged branches, as notes without failing; report them to the user
+  even when the current task did not cause them. A failed check in a run
+  dispatched on this branch makes it exit 1 until a later run of that check
+  passes. `--check`
   also runs the Rust baseline below, and `--json` prints the same facts for
   scripting.
 - Before removing a worktree or branch, require a clean worktree, no retained
