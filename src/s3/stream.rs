@@ -465,7 +465,7 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
         } else {
             exact_head
         };
-        // Match pathname S3 copies, keeping the destination on timestamp ties.
+        // Match pathname S3 copies: only a strictly newer destination is protected.
         if let Some(head) = head {
             let stored = client::Metadata::decode(head.metadata())?;
             let mtime = stored.map_or_else(
@@ -476,7 +476,7 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
                 .source_meta
                 .as_ref()
                 .context("missing source timestamp")?;
-            if mtime >= (source.mtime, source.mtime_nsec) {
+            if mtime > (source.mtime, source.mtime_nsec) {
                 report.skip();
             }
         }
@@ -803,7 +803,7 @@ async fn accept_existing(
                 *metadata_update = Some(Box::new(
                     super::metadata_copy::Prepared::prepare(
                         client,
-                        &plan.options.bucket,
+                        &plan.options,
                         &plan.key,
                         &head,
                         fields,

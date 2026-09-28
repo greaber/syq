@@ -62,7 +62,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 | Argument / option | Meaning |
 |---|---|
-| `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Accept matching contents; report an error for different contents<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Update only when the destination is strictly older; keep ties<br><br>[default: update] |
+| `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Reject detected content differences; trusts matching size and mtime unless --hash is set<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Keep newer destinations; otherwise update differing contents<br><br>[default: update] |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
@@ -165,9 +165,9 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 The default `--if-exists=update` updates existing files when their contents
 differ. Use `error-if-different` to accept matching contents and reject differences,
 `error` to require every selected file to be absent, `keep` to leave existing
-files untouched, or `update-if-older` to update strictly older destinations.
-Equal timestamps keep the destination. These choices do not change whether
-size/time or hashes are used for comparison. See
+files untouched, or `update-if-older` to keep newer destinations and otherwise
+update differing contents. Timestamp ties use the normal comparison. These choices
+do not change whether size/time or hashes are used for comparison. See
 [existing-file policies](../reference.md#choose-which-existing-files-to-update).
 
 `--into-existing` requires the destination directory to exist but allows new

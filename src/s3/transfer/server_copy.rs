@@ -374,7 +374,7 @@ impl Engine {
                 .metadata
                 .as_ref()
                 .map_or((old.mtime, 0), |m| (m.mtime, m.nsec));
-            if self.args.update && source.kind() != ObjectKind::Dir && old_time >= source_time {
+            if self.args.update && source.kind() != ObjectKind::Dir && old_time > source_time {
                 return Ok(CopyPreparation::Skipped);
             }
             matching_contents = source.kind() == old.kind()
@@ -459,7 +459,7 @@ impl Engine {
             let _slot = self.tuning.requests.acquire().await;
             let update = super::super::metadata_copy::Prepared::prepare(
                 &self.client,
-                &self.options.bucket,
+                &self.options,
                 &key,
                 old_head,
                 desired_head.metadata().cloned().unwrap_or_default(),

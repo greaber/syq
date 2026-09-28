@@ -606,6 +606,51 @@ fn unsupported_rsync_flags_explain_themselves() {
 }
 
 #[test]
+fn unsupported_copy_options_suggest_relevant_controls() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"data");
+    for (options, control) in [
+        (&["--only-new"][..], "--if-exists=keep"),
+        (&["--skip-newer"][..], "--if-exists=update-if-older"),
+        (&["--preserve=mtime"][..], "--copy-metadata"),
+        (
+            &["--preserve=-mtime"][..],
+            "sets the source timestamp and cannot be disabled",
+        ),
+        (
+            &["--preserve", "-mtime"][..],
+            "sets the source timestamp and cannot be disabled",
+        ),
+    ] {
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let mut args = vec!["cp", &src, "--as", &dst];
+        args.extend_from_slice(options);
+        let output = native_syq(&args);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("is not a syq cp option"), "{stderr}");
+        assert!(stderr.contains(control), "{stderr}");
+        if options.iter().any(|arg| arg.contains("-mtime")) {
+            assert!(!stderr.contains("--copy-metadata"), "{stderr}");
+        }
+        for history in ["removed", "former", "replacement", "migrat"] {
+            assert!(!stderr.contains(history), "{stderr}");
+        }
+        assert!(!stderr.contains("--resume"), "{stderr}");
+        assert!(!t.path("dst").exists());
+    }
+    // Option-like spellings remain usable as path values.
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .current_dir(&t.0)
+        .args(["cp", "--src=src", "--as=--preserve"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(read(&t.path("--preserve")), b"data");
+}
+
+#[test]
 fn removed_fsync_option_is_rejected() {
     let t = Tmp::new();
     write(&t.path("src"), b"data");
@@ -1364,6 +1409,18 @@ fn stream_file_metadata_and_newer_selection() {
             assert_eq!(input.try_clone().unwrap().stream_position().unwrap(), 0);
             assert_eq!(read(&t.path(target)), b"payload");
         }
+        write(&t.path(target), b"short");
+        File::open(t.path(target))
+            .unwrap()
+            .set_modified(source_time)
+            .unwrap();
+        input.try_clone().unwrap().rewind().unwrap();
+        let mut args = vec!["--src-fd", "0"];
+        args.extend(&endpoint);
+        args.extend(["--as", target, "--if-exists=update-if-older"]);
+        let result = cp(&args, None);
+        assert!(result.status.success(), "{}", stderr_of(&result));
+        assert_eq!(read(&t.path(target)), b"xpayload");
     }
     // Output descriptors keep surrounding bytes and only acquire requested
     // metadata. Permissions/ownership alone must not change the write timestamp.

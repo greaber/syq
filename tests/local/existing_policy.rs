@@ -49,12 +49,12 @@ fn error_keep_and_update_are_distinct_policies() {
 }
 
 #[test]
-fn update_if_older_keeps_ties_and_newer_destinations() {
+fn update_if_older_keeps_newer_destinations_and_compares_ties() {
     let t = Tmp::new();
     write(&t.path("src"), b"new bytes");
     write(&t.path("dst"), b"old bytes");
     set_mtime(&t.path("src"), 123);
-    for time in [123, 124] {
+    for time in [124, 125] {
         set_mtime(&t.path("dst"), time);
         run_native_ok(&[
             "cp",
@@ -66,7 +66,19 @@ fn update_if_older_keeps_ties_and_newer_destinations() {
         ]);
         assert_eq!(read(&t.path("dst")), b"old bytes");
     }
-    set_mtime(&t.path("dst"), 122);
+    set_mtime(&t.path("dst"), 123);
+    run_native_ok(&[
+        "cp",
+        &t.s("src"),
+        "--as",
+        &t.s("dst"),
+        "--if-exists=update-if-older",
+        "--hash",
+    ]);
+    assert_eq!(read(&t.path("dst")), b"new bytes");
+    // Different sizes do not need hashing to establish a difference on a tie.
+    write(&t.path("dst"), b"short");
+    set_mtime(&t.path("dst"), 123);
     run_native_ok(&[
         "cp",
         &t.s("src"),
@@ -146,7 +158,7 @@ fn update_if_older_applies_to_symlink_targets() {
         ]);
         assert_eq!(
             fs::read_link(t.path("dst")).unwrap(),
-            Path::new(if time < 123 { "source" } else { "destination" })
+            Path::new(if time <= 123 { "source" } else { "destination" })
         );
     }
 }

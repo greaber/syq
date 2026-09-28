@@ -67,6 +67,10 @@ objects.
   are unsupported.
 - **Updates:** `--if-exists=keep`, `--into-new`, and `--as-new` protect individual
   objects against concurrent creation. Prefix checks are not transactional.
+  `--if-exists=update-if-older` compares stored file timestamps, falling back
+  to S3 Last-Modified when an object has no stored timestamp. S3 Last-Modified
+  reflects uploads and metadata rewrites, rather than the original file's age.
+  Equal timestamps use the normal content comparison.
   `--inplace` and SSH/S3 combinations are unsupported.
 - **Recovery:** Retrying a copy can reuse multipart work. Recovery records are
   stored in the local user cache and removed on success. If that cache cannot be used, for example
@@ -88,12 +92,21 @@ case; there are no `--copy-metadata` settings for these S3-specific fields.
 
 Updating stored file attributes copies the destination object onto itself within
 S3, preserving its contents, content headers, tags, and unselected user metadata.
-It changes S3 Last-Modified and creates a new version when bucket versioning is
-enabled. Syq does not specify storage class or encryption settings on uploads or
-copies, including metadata updates. On AWS general-purpose buckets, the resulting
-object uses STANDARD storage and the destination bucket's default encryption
-settings, which can differ from the previous object's settings. Changes to source
-storage class or encryption alone do not trigger a copy.
+It retains the destination storage class and the encryption method, KMS key,
+and S3 Bucket Key setting returned by the service. Explicit `--s3-header`
+encryption settings override the selected fields: changing a KMS key retains the
+compatible encryption method, while switching away from KMS drops inherited KMS
+settings. Incompatible explicit encryption settings cause an error. Syq also
+refuses the update if the service reports that it omitted existing metadata from
+its response, because replacing that metadata could lose entries. These rules
+apply to multipart metadata updates too. The update changes S3 Last-Modified and
+creates a new version when bucket versioning is enabled. Object ACLs, Object Lock
+settings, and custom KMS encryption contexts are not preserved by this operation.
+
+New or changed uploads and bucket copies use the provider's storage and encryption
+defaults unless overridden with `--s3-header`. On AWS general-purpose buckets,
+these are STANDARD storage and the destination bucket's default encryption.
+Changes to source storage class or encryption alone do not trigger a copy.
 
 Syq uses stored size/time, whole-file hashes, provider checksums, or ETags to
 identify matching contents. Otherwise, the default policy replaces the destination.

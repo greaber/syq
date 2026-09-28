@@ -152,7 +152,7 @@ differ. Existing directories remain containers. Choose another policy with `--if
 | `error` | Reject every existing file, including identical files |
 | `keep` | Leave contents and metadata alone |
 | `update` (default) | Update differing contents and apply requested metadata |
-| `update-if-older` | Update only when the destination timestamp is strictly older; keep ties |
+| `update-if-older` | Keep newer destinations; otherwise update differing contents |
 
 Comparison is independent of this policy: matching size and modification time
 can establish equality; `--hash` requests content comparison. If

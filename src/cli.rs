@@ -49,7 +49,7 @@ pub enum SourceSelection {
     Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize,
 )]
 pub enum IfExists {
-    /// Accept matching contents; report an error for different contents.
+    /// Reject detected content differences; trusts matching size and mtime unless --hash is set.
     ErrorIfDifferent,
     /// Report an error for every existing destination leaf.
     Error,
@@ -58,7 +58,7 @@ pub enum IfExists {
     /// Update contents when they differ and apply requested metadata.
     #[default]
     Update,
-    /// Update only when the destination is strictly older; keep ties.
+    /// Keep newer destinations; otherwise update differing contents.
     UpdateIfOlder,
 }
 
@@ -2108,9 +2108,30 @@ fn parse_descriptor_copy(
 fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
-    let matches = crate::help::filesystem(NativeCopyCommand::command())
-        .try_get_matches_from(full_argv)
-        .unwrap_or_else(|error| error.exit());
+    let mut command = crate::help::filesystem(NativeCopyCommand::command());
+    let matches = command.try_get_matches_from_mut(full_argv).unwrap_or_else(|error| {
+        // Use the parser's classification, so a filename or an option value
+        // that happens to spell an unsupported flag remains an ordinary operand.
+        if error.kind() == clap::error::ErrorKind::UnknownArgument {
+            if let Some(clap::error::ContextValue::String(argument)) =
+                error.get(clap::error::ContextKind::InvalidArg)
+            {
+                let message = match argument.as_str() {
+                    "--only-new" => Some("--only-new is not a syq cp option; use --if-exists=keep to leave existing files unchanged"),
+                    "--skip-newer" => Some("--skip-newer is not a syq cp option; use --if-exists=update-if-older to keep newer destination files"),
+                    "--preserve" if argv.iter().any(|arg| arg == "--preserve=-mtime")
+                        || argv.windows(2).any(|args| args[0] == "--preserve" && args[1] == "-mtime") =>
+                        Some("--preserve=-mtime is not a syq cp option; creating or updating file contents sets the source timestamp and cannot be disabled"),
+                    "--preserve" => Some("--preserve is not a syq cp option; use --copy-metadata to select source metadata to apply, including on unchanged files"),
+                    _ => None,
+                };
+                if let Some(message) = message {
+                    command.error(error.kind(), message).exit();
+                }
+            }
+        }
+        error.exit()
+    });
     validate_native_copy_argument_order(&matches)?;
     let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
     let stream = selected_stream_source(&parsed.copy)?;

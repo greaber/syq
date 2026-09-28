@@ -1252,7 +1252,12 @@ pub(super) fn metadata_update_request(
     key: &str,
     head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
     metadata: HashMap<String, String>,
+    overrides: &[Header],
 ) -> Result<super::authorization::Unsigned> {
+    anyhow::ensure!(
+        head.missing_meta().unwrap_or(0) == 0,
+        "cannot update S3 metadata: the service omitted existing metadata (x-amz-missing-meta); replacing it would lose those entries"
+    );
     let encode = |text: &str| {
         percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC).to_string()
     };
@@ -1278,6 +1283,23 @@ pub(super) fn metadata_update_request(
         ("cache-control", head.cache_control()),
         ("expires", head.expires_string()),
         (
+            "x-amz-storage-class",
+            head.storage_class().map(|v| v.as_str()),
+        ),
+        (
+            "x-amz-server-side-encryption",
+            head.server_side_encryption().map(|v| v.as_str()),
+        ),
+        (
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            head.ssekms_key_id(),
+        ),
+        (
+            "x-amz-server-side-encryption-bucket-key-enabled",
+            head.bucket_key_enabled()
+                .map(|v| if v { "true" } else { "false" }),
+        ),
+        (
             "x-amz-website-redirect-location",
             head.website_redirect_location(),
         ),
@@ -1286,7 +1308,68 @@ pub(super) fn metadata_update_request(
             request = request.header(name, value);
         }
     }
+    merge_metadata_encryption(&mut request, overrides)?;
     Ok(request)
+}
+
+/// Keep compatible destination settings, but do not attach inherited KMS fields
+/// to a newly selected encryption method. Resolve this before both authorization
+/// and execution; the client interceptor adds the same explicit headers later.
+fn merge_metadata_encryption(
+    request: &mut super::authorization::Unsigned,
+    overrides: &[Header],
+) -> Result<()> {
+    const MODE: &str = "x-amz-server-side-encryption";
+    const KEY: &str = "x-amz-server-side-encryption-aws-kms-key-id";
+    const CONTEXT: &str = "x-amz-server-side-encryption-context";
+    const BUCKET_KEY: &str = "x-amz-server-side-encryption-bucket-key-enabled";
+    let explicit = |name: &str| {
+        overrides
+            .iter()
+            .rev()
+            .find(|Header(key, _)| key == name)
+            .map(|Header(_, value)| value.as_str())
+    };
+    let customer_key = overrides
+        .iter()
+        .any(|Header(name, _)| name.starts_with("x-amz-server-side-encryption-customer-"));
+    if customer_key {
+        anyhow::ensure!(
+            [MODE, KEY, CONTEXT, BUCKET_KEY]
+                .iter()
+                .all(|name| explicit(name).is_none()),
+            "conflicting --s3-header encryption settings: customer-key encryption cannot be combined with a server-managed encryption method or KMS settings"
+        );
+        for name in [MODE, KEY, CONTEXT, BUCKET_KEY] {
+            request.headers.remove(name);
+        }
+    } else {
+        let mode = explicit(MODE).or_else(|| request.headers.get(MODE).map(String::as_str));
+        let kms = matches!(mode, Some("aws:kms" | "aws:kms:dsse"));
+        let bucket_key = mode == Some("aws:kms");
+        for name in [KEY, CONTEXT, BUCKET_KEY] {
+            if !kms || (name == BUCKET_KEY && !bucket_key) {
+                anyhow::ensure!(
+                    explicit(name).is_none(),
+                    "conflicting --s3-header encryption settings: {name} requires {}",
+                    if name == BUCKET_KEY {
+                        "aws:kms encryption"
+                    } else {
+                        "aws:kms or aws:kms:dsse encryption"
+                    }
+                );
+                if explicit(MODE).is_some() {
+                    request.headers.remove(name);
+                }
+            }
+        }
+    }
+    for Header(name, value) in overrides {
+        if name.starts_with("x-amz-server-side-encryption") {
+            request.headers.insert(name.clone(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn copy_metadata(
@@ -1315,6 +1398,188 @@ pub(super) async fn copy_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn metadata_update_keeps_reported_storage_and_encryption_settings() {
+        use aws_sdk_s3::{
+            operation::head_object::HeadObjectOutput,
+            types::{ServerSideEncryption, StorageClass},
+        };
+        for (encryption, bucket_key) in [
+            (None, None),
+            (Some(ServerSideEncryption::Aes256), None),
+            (Some(ServerSideEncryption::AwsKms), Some(false)),
+            (Some(ServerSideEncryption::AwsKms), Some(true)),
+            (
+                Some(ServerSideEncryption::from("provider-specific")),
+                Some(false),
+            ),
+        ] {
+            let head = HeadObjectOutput::builder()
+                .e_tag("destination")
+                .storage_class(StorageClass::IntelligentTiering)
+                .set_server_side_encryption(encryption.clone())
+                .set_bucket_key_enabled(bucket_key)
+                .build();
+            let request =
+                super::metadata_update_request("bucket", "key", &head, Default::default(), &[])
+                    .unwrap();
+            assert_eq!(
+                request.headers["x-amz-storage-class"],
+                "INTELLIGENT_TIERING"
+            );
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-amz-server-side-encryption")
+                    .map(String::as_str),
+                encryption.as_ref().map(|v| v.as_str())
+            );
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-amz-server-side-encryption-bucket-key-enabled")
+                    .map(String::as_str),
+                bucket_key.map(|v| if v { "true" } else { "false" })
+            );
+            assert!(!request
+                .headers
+                .contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
+        }
+    }
+
+    #[test]
+    fn metadata_encryption_overrides_keep_only_compatible_settings() {
+        use aws_sdk_s3::{operation::head_object::HeadObjectOutput, types::ServerSideEncryption};
+        let head = HeadObjectOutput::builder()
+            .e_tag("destination")
+            .server_side_encryption(ServerSideEncryption::AwsKms)
+            .ssekms_key_id("destination-key")
+            .bucket_key_enabled(false)
+            .build();
+        for (values, mode, key, bucket_key) in [
+            (
+                vec!["x-amz-server-side-encryption: AES256"],
+                Some("AES256"),
+                None,
+                None,
+            ),
+            (
+                vec!["x-amz-server-side-encryption-aws-kms-key-id: selected-key"],
+                Some("aws:kms"),
+                Some("selected-key"),
+                Some("false"),
+            ),
+            (
+                vec!["x-amz-server-side-encryption-bucket-key-enabled: true"],
+                Some("aws:kms"),
+                Some("destination-key"),
+                Some("true"),
+            ),
+            (
+                vec!["x-amz-server-side-encryption: aws:kms:dsse"],
+                Some("aws:kms:dsse"),
+                Some("destination-key"),
+                None,
+            ),
+            (
+                vec!["x-amz-server-side-encryption-customer-algorithm: AES256"],
+                None,
+                None,
+                None,
+            ),
+            (
+                vec![
+                    "x-amz-server-side-encryption: AES256",
+                    "x-amz-server-side-encryption: aws:kms",
+                ],
+                Some("aws:kms"),
+                Some("destination-key"),
+                Some("false"),
+            ),
+        ] {
+            let overrides: Vec<super::Header> = values.iter().map(|v| v.parse().unwrap()).collect();
+            let request = super::metadata_update_request(
+                "bucket",
+                "key",
+                &head,
+                Default::default(),
+                &overrides,
+            )
+            .unwrap();
+            for (name, expected) in [
+                ("x-amz-server-side-encryption", mode),
+                ("x-amz-server-side-encryption-aws-kms-key-id", key),
+                (
+                    "x-amz-server-side-encryption-bucket-key-enabled",
+                    bucket_key,
+                ),
+            ] {
+                assert_eq!(
+                    request.headers.get(name).map(String::as_str),
+                    expected,
+                    "{values:?}: {name}"
+                );
+            }
+            for super::Header(name, value) in &overrides {
+                if overrides.iter().rev().find(|h| h.0 == *name).unwrap().1 == *value {
+                    assert_eq!(request.headers.get(name), Some(value));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_encryption_rejects_conflicting_overrides() {
+        use aws_sdk_s3::{operation::head_object::HeadObjectOutput, types::ServerSideEncryption};
+        let head = HeadObjectOutput::builder()
+            .e_tag("destination")
+            .server_side_encryption(ServerSideEncryption::AwsKms)
+            .ssekms_key_id("destination-key")
+            .bucket_key_enabled(false)
+            .build();
+        for values in [
+            vec![
+                "x-amz-server-side-encryption: AES256",
+                "x-amz-server-side-encryption-aws-kms-key-id: secret-key",
+            ],
+            vec![
+                "x-amz-server-side-encryption: AES256",
+                "x-amz-server-side-encryption-context: secret-context",
+            ],
+            vec![
+                "x-amz-server-side-encryption: AES256",
+                "x-amz-server-side-encryption-bucket-key-enabled: false",
+            ],
+            vec![
+                "x-amz-server-side-encryption: aws:kms:dsse",
+                "x-amz-server-side-encryption-bucket-key-enabled: true",
+            ],
+            vec![
+                "x-amz-server-side-encryption: AES256",
+                "x-amz-server-side-encryption-customer-key: secret-key",
+            ],
+        ] {
+            let overrides: Vec<super::Header> = values.iter().map(|v| v.parse().unwrap()).collect();
+            let error = super::metadata_update_request(
+                "bucket",
+                "key",
+                &head,
+                Default::default(),
+                &overrides,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("conflicting --s3-header encryption settings"),
+                "{error}"
+            );
+            assert!(
+                !error.contains("secret-"),
+                "header values must not appear in errors"
+            );
+        }
+    }
+
     #[test]
     fn exclusion_identifies_first_pruned_ancestor_and_preserves_negations() {
         use super::{exclusion, Exclusion};

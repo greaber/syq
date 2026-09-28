@@ -704,7 +704,7 @@ impl Engine {
         fields.extend(metadata.encode());
         let update = super::metadata_copy::Prepared::prepare(
             &self.client,
-            &self.options.bucket,
+            &self.options,
             &source.key,
             &head,
             fields,
@@ -776,7 +776,7 @@ impl Engine {
                     .metadata
                     .as_ref()
                     .map_or((o.mtime, 0), |m| (m.mtime, m.nsec));
-                time >= (source.meta.mtime, source.meta.mtime_nsec)
+                time > (source.meta.mtime, source.meta.mtime_nsec)
             })
         {
             return Ok(UploadPreparation::Skipped);
@@ -824,8 +824,12 @@ impl Engine {
                 .prepare_accepted_upload(source, existing.as_ref().unwrap())
                 .await;
         }
+        let comparison_algorithm = existing
+            .as_ref()
+            .and_then(|object| self.stored_comparison_hash(object))
+            .map_or(self.args.hash_algorithm, |(algorithm, _)| algorithm);
         let whole_algorithm =
-            whole_algorithm.or_else(|| protected_existing.then_some(self.args.hash_algorithm));
+            whole_algorithm.or_else(|| protected_existing.then_some(comparison_algorithm));
         let part_size = self.part_size(size);
         if part_size > 5 * 1024 * 1024 * 1024 {
             bail!("file exceeds the S3 multipart size limit");
@@ -996,7 +1000,7 @@ impl Engine {
             && (self.args.checksum || (protected_existing && !same_contents))
         {
             if let Some(object) = &existing {
-                let algorithm = self.args.hash_algorithm;
+                let algorithm = comparison_algorithm;
                 let source_hash = if whole_algorithm == Some(algorithm) {
                     whole_digest.clone().unwrap()
                 } else {
@@ -1021,7 +1025,7 @@ impl Engine {
                 };
                 same_contents = object.kind() == source.kind()
                     && object.size == size
-                    && source_hash == destination_hash;
+                    && source_hash.eq_ignore_ascii_case(&destination_hash);
             }
         }
         if same_contents && expected_hash.is_some() {
@@ -2157,7 +2161,7 @@ impl Engine {
         );
         if self.args.update
             && object.kind() != ObjectKind::Dir
-            && existing.is_some_and(|m| !m.is_dir() && (m.mtime, m.mtime_nsec) >= source_time)
+            && existing.is_some_and(|m| !m.is_dir() && (m.mtime, m.mtime_nsec) > source_time)
         {
             return Ok(None);
         }
@@ -2233,37 +2237,22 @@ impl Engine {
         }
         let mut unchanged = false;
         if let Some(m) = existing.filter(|m| m.is_file() && m.len == object.size) {
-            if self.args.checksum {
-                if metadata.hash.is_none() || metadata.hash_algorithm != self.args.hash_algorithm {
-                    unchanged = self.verify_download(root, &path, &object).await?;
-                } else {
-                    let file = root.open_regular_read(&path)?;
-                    let algorithm = metadata.hash_algorithm;
-                    let hash =
-                        tokio::task::spawn_blocking(move || local::hash_file_as(file, algorithm))
-                            .await??;
-                    unchanged = metadata.hash.as_ref() == Some(&hash);
-                }
-            } else {
-                unchanged = explicit.mtime.is_none() && (m.mtime, m.mtime_nsec) == source_time;
-            }
-        }
-
-        if !unchanged && self.args.protects_existing_contents() {
-            if let Some(current) = existing {
-                anyhow::ensure!(
-                    current.is_file() && current.len == object.size,
-                    "destination contents differ: {} (--if-exists=error-if-different)",
-                    job.path
-                );
+            unchanged = !self.args.checksum
+                && explicit.mtime.is_none()
+                && (m.mtime, m.mtime_nsec) == source_time;
+            if !unchanged
+                && (self.args.checksum
+                    || self.args.protects_existing_contents()
+                    || self.stored_comparison_hash(&object).is_some())
+            {
                 unchanged = self.verify_download(root, &path, &object).await?;
-                anyhow::ensure!(
-                    unchanged,
-                    "destination contents differ: {} (--if-exists=error-if-different)",
-                    job.path
-                );
             }
         }
+        anyhow::ensure!(
+            unchanged || existing.is_none() || !self.args.protects_existing_contents(),
+            "destination contents differ: {} (--if-exists=error-if-different)",
+            job.path
+        );
         if unchanged && expected_hash.is_some() {
             unchanged = self
                 .verify_expected_local(root, &path, expected_hash)
@@ -2684,13 +2673,25 @@ impl Engine {
         object: &Object,
     ) -> Result<bool> {
         let file = root.open_regular_read(path)?;
-        let algorithm = self.args.hash_algorithm;
+        let stored = self.stored_comparison_hash(object);
+        let algorithm = stored.map_or(self.args.hash_algorithm, |(algorithm, _)| algorithm);
         let expected =
             tokio::task::spawn_blocking(move || local::hash_file_as(file, algorithm)).await??;
-        Ok(self.remote_hash(object).await? == expected)
+        let actual = match stored {
+            Some((_, hash)) => hash.to_owned(),
+            None => self.remote_hash_as(object, algorithm).await?,
+        };
+        Ok(actual.eq_ignore_ascii_case(&expected))
     }
-    async fn remote_hash(&self, object: &Object) -> Result<String> {
-        self.remote_hash_as(object, self.args.hash_algorithm).await
+
+    fn stored_comparison_hash<'a>(&self, object: &'a Object) -> Option<(HashAlgorithm, &'a str)> {
+        let metadata = object.metadata.as_ref()?;
+        // Explicit --hash selects the comparison algorithm. Automatic comparisons
+        // can reuse any supported stored whole-file hash.
+        if self.args.checksum && metadata.hash_algorithm != self.args.hash_algorithm {
+            return None;
+        }
+        Some((metadata.hash_algorithm, metadata.hash.as_deref()?))
     }
     async fn remote_hash_as(&self, object: &Object, algorithm: HashAlgorithm) -> Result<String> {
         let _slot = self.tuning.requests.acquire().await;

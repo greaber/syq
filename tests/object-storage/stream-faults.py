@@ -400,6 +400,15 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                     response = run(put + ['--if-exists=update-if-older', *preview], stdin=stream, env=env)
                     success(response)
                     assert b'Skipped' in response.stderr and stream.tell() == 0
+            # An equal timestamp permits the ordinary copy, even if lengths differ.
+            STATE['metadata']['x-amz-meta-syq-mtime'] = str(stamp // 1_000_000_000)
+            STATE['metadata']['x-amz-meta-syq-mtime-nsec'] = str(stamp % 1_000_000_000)
+            source.write_bytes(b'changed on a timestamp tie')
+            os.utime(source, ns=(stamp, stamp))
+            with source.open('rb') as stream:
+                response = run(put + ['--if-exists=update-if-older'], stdin=stream, env=env)
+            success(response)
+            assert STATE['published'] == b'changed on a timestamp tie'
             # Timestamp selection concerns the exact object. A sibling prefix
             # must neither add a LIST nor prevent creation of that object.
             source.write_bytes(b'prefix can coexist')
