@@ -9,6 +9,7 @@ from pathlib import Path
 import signal
 import tempfile
 import unittest
+from unittest import mock
 
 from tooling import ToolError
 
@@ -37,6 +38,39 @@ class DiscoveryTests(unittest.TestCase):
             finally:
                 for sig, handler in handlers.items():
                     signal.signal(sig, handler)
+
+    def test_quick_selection_runs_harness_and_leaves_new_tests_in_full_suite(self):
+        with tempfile.TemporaryDirectory(prefix="syq-quick-tests-") as temporary:
+            root = Path(temporary)
+            tooling = root / "tests/tooling"
+            tooling.mkdir(parents=True)
+            quick = tooling / "test-quick.py"
+            quick.write_text("from pathlib import Path; Path('quick-ran').touch()\n")
+            extra = tooling / "test-new.py"
+            extra.write_text("raise AssertionError('expensive test ran')\n")
+            harness = root / runner.HARNESS
+            harness.parent.mkdir(parents=True)
+            harness.write_text("from pathlib import Path; Path('harness-ran').touch()\n")
+            with mock.patch.object(runner, "QUICK_TESTS", (
+                    "tests/tooling/test-quick.py", str(runner.HARNESS))):
+                selected = runner.select_tests(root, quick=True)
+                self.assertEqual(selected, [quick, harness])
+                self.assertEqual(set(runner.select_tests(root)), {quick, extra, harness})
+                handlers = {sig: signal.getsignal(sig) for sig in runner.ForwardSignals.SIGNALS}
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(runner.run_tests(selected, root), 0)
+                    self.assertTrue((root / "quick-ran").is_file())
+                    self.assertTrue((root / "harness-ran").is_file())
+                finally:
+                    for sig, handler in handlers.items():
+                        signal.signal(sig, handler)
+                quick.unlink()
+                with self.assertRaisesRegex(ToolError, "not in the full suite"):
+                    runner.select_tests(root, quick=True)
+            harness.unlink()
+            with self.assertRaisesRegex(ToolError, "test not found"):
+                runner.select_tests(root)
 
     def test_empty_directory_and_unknown_test_type_are_errors(self):
         with tempfile.TemporaryDirectory(prefix="syq-tooling-discovery-") as temporary:
