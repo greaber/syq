@@ -462,7 +462,9 @@ fn run_metadata_update(
     );
     assert_eq!(
         server.probes.load(Ordering::Relaxed),
-        usize::from(update && !rejected),
+        // Missing metadata and conflicting headers fail before a write. A lock
+        // permission failure comes from the service after receiving the write.
+        usize::from(update && (!rejected || fault.ends_with("lock-denied"))),
         "{fault} upload={upload} update={update} {flag}"
     );
 }
