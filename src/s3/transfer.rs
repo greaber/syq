@@ -534,6 +534,19 @@ impl Engine {
             hash.update(header.1.as_bytes());
             hash.update(&[0]);
         }
+        // Object-writing headers change the uploaded object's settings. Without
+        // them, keep earlier identities so existing recovery records still match.
+        // Header names and values cannot contain a newline, so the marker cannot
+        // be confused with an every-request header.
+        if !self.options.write_headers.is_empty() {
+            hash.update(b"\nwrite\n");
+            for header in &self.options.write_headers {
+                hash.update(header.0.as_bytes());
+                hash.update(&[0]);
+                hash.update(header.1.as_bytes());
+                hash.update(&[0]);
+            }
+        }
         format!(
             "syq.s3.v1\n{}\n{}\n{}\n{}\n{}\n{extra}",
             self.options.endpoint.as_deref().unwrap_or("AWS"),

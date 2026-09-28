@@ -41,12 +41,18 @@ use std::{
     time::Duration,
 };
 
+/// Tests pass this with `--s3-write-header`; the server rejects it on any
+/// request other than PutObject, CopyObject, or CreateMultipartUpload.
+const WRITE_PROBE: &str = "x-syq-write-probe";
+
 struct Server {
     address: String,
     stop: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<()>>,
     gate: Arc<(AtomicBool, AtomicBool)>,
+    /// Requests carrying the write-only probe header; `serve` checks each one.
+    probes: Arc<AtomicUsize>,
 }
 impl Server {
     fn start(fault: &'static str) -> Self {
@@ -56,6 +62,8 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new((AtomicBool::new(false), AtomicBool::new(false)));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let worker_probes = probes.clone();
         let worker_gate = gate.clone();
         let stopping = stop.clone();
         let count = requests.clone();
@@ -66,7 +74,10 @@ impl Server {
                     Ok((socket, _)) => {
                         let count = count.clone();
                         let gate = worker_gate.clone();
-                        workers.push(thread::spawn(move || serve(socket, fault, count, gate)));
+                        let probes = worker_probes.clone();
+                        workers.push(thread::spawn(move || {
+                            serve(socket, fault, count, gate, probes)
+                        }));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2))
@@ -84,6 +95,7 @@ impl Server {
             requests,
             thread: Some(handle),
             gate,
+            probes,
         }
     }
     fn command(&self, temp: &Path) -> Command {
@@ -166,11 +178,30 @@ impl Drop for Server {
 }
 
 const SIZE: usize = 6 * 1024 * 1024 + 7;
+/// PutObject, CopyObject, or CreateMultipartUpload, judged independently of
+/// syq's own classification.
+fn writes_object(method: &str, target: &str) -> bool {
+    let query = target
+        .split_once('?')
+        .map_or(vec![], |(_, query)| query.split('&').collect());
+    let keys = query
+        .iter()
+        .map(|pair| pair.split('=').next().unwrap())
+        .filter(|key| *key != "x-id")
+        .collect::<Vec<_>>();
+    match method {
+        "PUT" => keys.is_empty(),
+        "POST" => keys == ["uploads"],
+        _ => false,
+    }
+}
+
 fn serve(
     mut socket: TcpStream,
     fault: &str,
     requests: Arc<AtomicUsize>,
     gate: Arc<(AtomicBool, AtomicBool)>,
+    probes: Arc<AtomicUsize>,
 ) {
     // BSD can inherit the listener's nonblocking mode; this handler uses
     // blocking I/O with timeouts on every platform.
@@ -211,6 +242,14 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if headers.contains_key(WRITE_PROBE) {
+        let target = first.split_whitespace().nth(1).unwrap();
+        assert!(
+            writes_object(method, target),
+            "object-writing header on {first}"
+        );
+        probes.fetch_add(1, Ordering::Relaxed);
+    }
     if fault.starts_with("existing-policy") {
         existing_policy::serve(
             &mut socket,
@@ -594,8 +633,13 @@ fn serve(
             }
         }
 
-        if fault.contains("storage-class") {
-            assert_eq!(headers["x-amz-storage-class"], "INTELLIGENT_TIERING");
+        if fault.contains("override-storage-class") && !writes_object(method, path) {
+            assert_eq!(headers["x-amz-storage-class"], "STANDARD", "{first}");
+        } else if fault.contains("storage-class") {
+            assert_eq!(
+                headers["x-amz-storage-class"], "INTELLIGENT_TIERING",
+                "{first}"
+            );
         } else {
             assert!(
                 !headers.contains_key("x-amz-storage-class"),
@@ -1854,6 +1898,7 @@ fn s3_fixture_completes_response_on_inherited_nonblocking_socket() {
             "ok",
             Arc::new(AtomicUsize::new(0)),
             Arc::new((AtomicBool::new(false), AtomicBool::new(false))),
+            Arc::new(AtomicUsize::new(0)),
         )
     });
     let mut response = Vec::new();
@@ -2293,6 +2338,15 @@ fn s3_usage_errors_do_not_contact_storage() {
         ],
         vec!["--from", "s3://bucket/path", "data", "--as", "out"],
         vec!["data", "--into", "out"],
+        vec![
+            "--from",
+            "s3://bucket",
+            "data",
+            "--as",
+            "out",
+            "--s3-write-header",
+            "x-amz-storage-class: STANDARD_IA",
+        ],
     ] {
         let output = server.cp(temp.path(), &args);
         assert_eq!(output.status.code(), Some(2), "{}", output_text(&output));
@@ -2585,6 +2639,30 @@ fn s3_transfer_integrity_is_opt_in_but_framing_stays_mandatory() {
             output_text(&output)
         );
     }
+}
+
+#[test]
+fn s3_write_headers_reach_only_object_writes() {
+    let server = Server::start("upload-default");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::write(temp.path().join("source"), b"payload").unwrap();
+    let probe = format!("{WRITE_PROBE}: yes");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "source",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "object",
+            "--s3-write-header",
+            &probe,
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.0.load(Ordering::Acquire));
+    assert_eq!(server.probes.load(Ordering::Relaxed), 1, "one PutObject");
+    assert!(server.requests.load(Ordering::Relaxed) > 1);
 }
 
 #[test]
@@ -4292,6 +4370,8 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
         "server-copy-heads-overlap",
         "server-copy-storage-class",
         "server-copy-multipart-storage-class",
+        "server-copy-override-storage-class",
+        "server-copy-multipart-override-storage-class",
     ] {
         let server = Server::start(fault);
         let temp = crate::test_support::tempdir().unwrap();
@@ -4320,11 +4400,26 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
                 "--if-exists=keep",
             ];
         }
-        if fault.contains("storage-class") {
+        if fault.contains("override-storage-class") {
+            // On object writes, the write header replaces the every-request value.
+            args.extend(["--s3-header", "x-amz-storage-class: STANDARD"]);
+            args.extend([
+                "--s3-write-header",
+                "x-amz-storage-class: INTELLIGENT_TIERING",
+            ]);
+        } else if fault.contains("storage-class") {
             args.extend(["--s3-header", "x-amz-storage-class: INTELLIGENT_TIERING"]);
         }
+        let probe = format!("{WRITE_PROBE}: yes");
+        args.extend(["--s3-write-header", &probe]);
         let output = server.cp(temp.path(), &args);
         assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        // One CopyObject or CreateMultipartUpload; the dry run writes nothing.
+        assert_eq!(
+            server.probes.load(Ordering::Relaxed),
+            usize::from(fault != "server-copy-heads-overlap"),
+            "{fault}"
+        );
     }
 }
 

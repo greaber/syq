@@ -1403,6 +1403,8 @@ struct NativeCopyCommand {
     #[command(flatten)]
     s3: crate::s3::Flags,
     #[command(flatten)]
+    s3_write: crate::s3::WriteFlags,
+    #[command(flatten)]
     copy: NativeCopyFields,
     #[command(flatten)]
     remote: NativeRemoteArgs,
@@ -1856,6 +1858,7 @@ fn parse_descriptor_copy(
                 | "s3_region"
                 | "s3_profile"
                 | "s3_header"
+                | "s3_write_header"
                 | "auth_from"
                 | "performance_tuning"
                 | "rsh"
@@ -2140,6 +2143,8 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     }
     let NativeCopyCommand {
         s3,
+        // Options::parse reads the object-writing headers from the matches.
+        s3_write: _,
         mut copy,
         remote,
         pscope,

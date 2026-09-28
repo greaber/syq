@@ -131,9 +131,12 @@ fn multipart_upload_accepts_read_only_source_and_unavailable_cache() {
             .arg("--srcs-in")
             .arg(&_source.0)
             .args(["--to", "s3://bucket", "--into", "prefix"])
+            .args(["--s3-write-header", &format!("{WRITE_PROBE}: yes")])
             .capture_output()
             .unwrap();
         assert!(output.status.success(), "{mode}: {}", output_text(&output));
+        // Only each object's CreateMultipartUpload, not its parts or completion.
+        assert_eq!(server.probes.load(Ordering::Relaxed), 2, "{mode}");
         // Each multipart object opens its own record, but one warning suffices.
         assert_eq!(
             output_text(&output)

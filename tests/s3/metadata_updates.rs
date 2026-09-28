@@ -299,7 +299,9 @@ fn metadata_encryption_overrides_work_for_single_and_multipart_copies() {
         ),
     ] {
         for upload in [false, true] {
-            run_metadata_update(fault, upload, &headers, true);
+            for flag in ["--s3-header", "--s3-write-header"] {
+                run_metadata_update(fault, upload, flag, &headers, true);
+            }
         }
     }
 }
@@ -312,13 +314,19 @@ fn incomplete_metadata_blocks_only_requested_metadata_updates() {
     ] {
         for upload in [false, true] {
             for update in [false, true] {
-                run_metadata_update(fault, upload, &[], update);
+                run_metadata_update(fault, upload, "--s3-header", &[], update);
             }
         }
     }
 }
 
-fn run_metadata_update(fault: &'static str, upload: bool, headers: &[&str], update: bool) {
+fn run_metadata_update(
+    fault: &'static str,
+    upload: bool,
+    flag: &str,
+    headers: &[&str],
+    update: bool,
+) {
     let temp = test_support::tempdir().unwrap();
     let path = temp.path().join("source");
     if upload {
@@ -349,8 +357,10 @@ fn run_metadata_update(fault: &'static str, upload: bool, headers: &[&str], upda
         command.arg("--copy-metadata=permissions");
     }
     for header in headers {
-        command.args(["--s3-header", header]);
+        command.args([flag, header]);
     }
+    // Metadata updates are self-copies: CopyObject or CreateMultipartUpload.
+    command.args(["--s3-write-header", &format!("{}: yes", super::WRITE_PROBE)]);
     let output = command.capture_output().unwrap();
     let text = output_text(&output);
     let rejected = update && (fault.ends_with("missing") || fault.ends_with("conflict"));
@@ -363,7 +373,7 @@ fn run_metadata_update(fault: &'static str, upload: bool, headers: &[&str], upda
         let expected = if fault.ends_with("missing") {
             "x-amz-missing-meta"
         } else {
-            "conflicting --s3-header encryption settings"
+            "conflicting S3 header encryption settings"
         };
         assert!(text.contains(expected), "{fault}: {text}");
     }
@@ -371,5 +381,10 @@ fn run_metadata_update(fault: &'static str, upload: bool, headers: &[&str], upda
         server.gate.1.load(Ordering::Relaxed),
         update && !rejected,
         "{fault}"
+    );
+    assert_eq!(
+        server.probes.load(Ordering::Relaxed),
+        usize::from(update && !rejected),
+        "{fault} upload={upload} update={update} {flag}"
     );
 }

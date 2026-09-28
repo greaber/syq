@@ -29,7 +29,10 @@ impl Session {
                 .retain(|name, _| crate::s3::authorization::signed_header(name, &request.method));
             request.bucket =
                 (self.options.bucket != authorization.bucket).then(|| self.options.bucket.clone());
-            for super::super::Header(name, value) in &self.options.headers {
+            let headers = self
+                .options
+                .headers_for(&request.method, request.query.keys().map(String::as_str));
+            for super::super::Header(name, value) in headers {
                 if crate::s3::authorization::signed_header(name, &request.method) {
                     request.headers.insert(name.clone(), value.clone());
                 }
