@@ -606,23 +606,27 @@ fn unsupported_rsync_flags_explain_themselves() {
 }
 
 #[test]
-fn removed_copy_options_explain_their_replacements() {
+fn unsupported_copy_options_suggest_relevant_controls() {
     let t = Tmp::new();
     write(&t.path("src"), b"data");
-    for (option, replacement) in [
+    for (option, control) in [
         ("--only-new", "--if-exists=keep"),
         ("--skip-newer", "--if-exists=update-if-older"),
         ("--preserve=mtime", "--copy-metadata"),
-        ("--preserve=-mtime", "has no replacement"),
+        ("--preserve=-mtime", "--copy-metadata"),
     ] {
         let output = native_syq(&["cp", &t.s("src"), "--as", &t.s("dst"), option]);
         assert_eq!(output.status.code(), Some(2), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains(replacement), "{stderr}");
+        assert!(stderr.contains("is not a syq cp option"), "{stderr}");
+        assert!(stderr.contains(control), "{stderr}");
+        for history in ["removed", "former", "replacement", "migrat"] {
+            assert!(!stderr.contains(history), "{stderr}");
+        }
         assert!(!stderr.contains("--resume"), "{stderr}");
         assert!(!t.path("dst").exists());
     }
-    // Old option spellings remain usable as path values.
+    // Option-like spellings remain usable as path values.
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .current_dir(&t.0)
         .args(["cp", "--src=src", "--as=--preserve"])

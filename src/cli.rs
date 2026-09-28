@@ -2111,15 +2111,15 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let mut command = crate::help::filesystem(NativeCopyCommand::command());
     let matches = command.try_get_matches_from_mut(full_argv).unwrap_or_else(|error| {
         // Use the parser's classification, so a filename or an option value
-        // that happens to spell an old flag remains an ordinary operand.
+        // that happens to spell an unsupported flag remains an ordinary operand.
         if error.kind() == clap::error::ErrorKind::UnknownArgument {
             if let Some(clap::error::ContextValue::String(argument)) =
                 error.get(clap::error::ContextKind::InvalidArg)
             {
                 let message = match argument.as_str() {
-                    "--only-new" => Some("--only-new was removed; use --if-exists=keep"),
-                    "--skip-newer" => Some("--skip-newer was removed; use --if-exists=update-if-older"),
-                    "--preserve" => Some("--preserve was removed; use --copy-metadata to select metadata. The former --preserve=-mtime has no replacement: creating or updating file contents sets the source mtime"),
+                    "--only-new" => Some("--only-new is not a syq cp option; use --if-exists=keep to leave existing files unchanged"),
+                    "--skip-newer" => Some("--skip-newer is not a syq cp option; use --if-exists=update-if-older to keep newer destination files"),
+                    "--preserve" => Some("--preserve is not a syq cp option; use --copy-metadata to select source metadata to apply, including on unchanged files"),
                     _ => None,
                 };
                 if let Some(message) = message {
