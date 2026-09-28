@@ -203,7 +203,11 @@ def check():
         # The independent reader sees ordinary object bytes and metadata.
         hdr, body = request('GET', placement + '/source/script')
         assert body == (src / 'script').read_bytes()
-        assert {k.lower(): v for k, v in hdr.items()}['x-amz-meta-syq-format'] == '1'
+        fields = {k.lower(): v for k, v in hdr.items()}
+        assert fields['x-amz-meta-syq-format'] == '2'
+        algorithm = fields['x-amz-meta-syq-hash-algorithm']
+        assert algorithm in {'sha256', 'md5'}, algorithm
+        assert fields['x-amz-meta-syq-hash'] == hashlib.new(algorithm, body).hexdigest()
         # Existing outputs remain intact on a dry run and no recovery data is created.
         (restored / 'script').write_bytes(b'local edits')
         run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--if-exists=update', '--dry-run'])
