@@ -546,9 +546,12 @@ including `rust` (formatting, clippy, and every Rust target), `tooling`,
 `python-sdk`, `linux-arm64`, `macos-intel`, `s3`, `real-ssh`, and single
 real-SSH profiles. Report such checks as running and update the pull request
 when they finish. They keep running if the pull request merges. A later run
-of the same suite on the branch cancels the earlier one, so dispatch once the
-change has settled rather than after every commit. The same applies to what
-you ask of subagents: do not have a subagent run slow suites before it reports.
+with the same `suites` value on the branch cancels the earlier run of those
+jobs, so dispatch once the change has settled rather than after every commit.
+A check is a job name, and a combined selection names the `rust` job after
+all its parts, so to clear a failed check, dispatch the same `suites` value
+again or rerun the failed run. The same applies to what you ask of subagents:
+do not have a subagent run slow suites before it reports.
 
 After synchronizing a branch with `master`, build; when conflicts touched
 code, also run the focused tests for that code. Use `--locked` for Cargo
@@ -597,9 +600,9 @@ command. Inputs and logs are public: do not include secrets. Confirm exact Rust
 tests actually ran; Cargo accepts filters that match zero tests.
 
 The helper selects the current remote branch, pins its checkout commit,
-prints the SHA and run URL, and watches that exact run through `gh run
-watch`; run it in the background when you do not need the result before
-replying. `--provider github` selects GitHub instead of Namespace; `--ref`
+prints the SHA and run URL, and watches that exact run through
+`gh run watch`; run it in the background when you do not need the result
+before replying. `--provider github` selects GitHub instead of Namespace; `--ref`
 explicitly tests another pushed branch or tag; `--timeout` changes the default
 15-minute limit. Only enable `--cargo-cache` for checks needing Rust builds.
 No builds or test suites run implicitly, and these checks do not certify a
