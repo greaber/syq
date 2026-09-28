@@ -8,6 +8,11 @@ pub(super) struct Hashes {
     pub checksums: Vec<String>,
 }
 
+struct PartHashes {
+    native: Vec<[u8; 32]>,
+    blake3: Option<[u8; 32]>,
+}
+
 pub(super) fn native_algorithm(algorithm: Algorithm) -> HashAlgorithm {
     match algorithm {
         Algorithm::Sha256 => HashAlgorithm::Sha256,
@@ -76,7 +81,10 @@ pub(super) fn ranges(
             }
             hashes
         });
-    let (parts, blake3) = if parallel {
+    let PartHashes {
+        native: parts,
+        blake3,
+    } = if parallel {
         let (whole_result, parts) = rayon::join(
             || -> Result<()> {
                 if !whole_hashes.is_empty() {
@@ -115,7 +123,10 @@ pub(super) fn ranges(
             }
             parts.push(hash.finalize());
         }
-        (parts, None)
+        PartHashes {
+            native: parts,
+            blake3: None,
+        }
     };
     let digests: Vec<_> = whole_hashes
         .into_iter()
@@ -150,7 +161,7 @@ fn parallel_parts(
     native: HashAlgorithm,
     tree: bool,
     read: impl Fn(&mut [u8], u64) -> Result<()> + Sync,
-) -> Result<(Vec<[u8; 32]>, Option<[u8; 32]>)> {
+) -> Result<PartHashes> {
     use blake3::hazmat::{merge_subtrees_non_root, merge_subtrees_root, HasherExt, Mode};
     anyhow::ensure!(
         !tree || (size > part_size && part_size.is_power_of_two() && part_size >= 1024)
@@ -196,7 +207,10 @@ fn parallel_parts(
         }
     }
     let whole = tree.then(|| merge(&parts, true));
-    Ok((parts.into_iter().map(|part| part.0).collect(), whole))
+    Ok(PartHashes {
+        native: parts.into_iter().map(|part| part.0).collect(),
+        blake3: whole,
+    })
 }
 
 #[cfg(test)]
@@ -219,7 +233,10 @@ mod tests {
             for size in sizes {
                 for native in [Algorithm::Sha256, Algorithm::Md5] {
                     let read_bytes = AtomicUsize::new(0);
-                    let (parts, whole) = parallel_parts(
+                    let PartHashes {
+                        native: parts,
+                        blake3: whole,
+                    } = parallel_parts(
                         size as u64,
                         part_size as u64,
                         native_algorithm(native),
