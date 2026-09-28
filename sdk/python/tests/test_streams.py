@@ -466,6 +466,20 @@ class StreamTests(unittest.TestCase):
             finally:
                 stream.abort()
 
+    def test_writer_forwards_object_writing_headers(self):
+        fake = self.root / 'stream-syq'
+        fake.write_text(ready_stub())
+        fake.chmod(0o700)
+        client = syq.Client(executable=fake, timeout=5)
+        stream = client.open_writer(to='s3://bucket', as_='key',
+                                    s3_write_header=['x-amz-storage-class: STANDARD_IA'])
+        try:
+            argv = stream._process.process.args
+            self.assertEqual(argv[argv.index('--s3-write-header') + 1],
+                             'x-amz-storage-class: STANDARD_IA')
+        finally:
+            stream.abort()
+
     def test_timeout_interrupts_blocking_write_and_reaps_child(self):
         fake = self.root / 'slow-syq'
         fake.write_text(ready_stub())

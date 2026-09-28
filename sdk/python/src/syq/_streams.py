@@ -55,7 +55,7 @@ def arguments(*, executable: str, writing: bool, path: PathArgument | None,
                 raise SyqInvocationError("verbose must be an integer from 0 to 255")
             argv += ["-v"] * value
             continue
-        if name == "s3_header":
+        if name in {"s3_header", "s3_write_header"}:
             for header in ([value] if isinstance(value, str) else value):
                 _append_path_option(argv, option, _text_arg(header, label=name))
             continue

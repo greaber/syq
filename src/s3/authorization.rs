@@ -387,6 +387,7 @@ impl Signer {
             region: request.region.clone(),
             profile: request.profile.clone(),
             headers: vec![],
+            write_headers: vec![],
             concurrency: 1,
             part_size: 8 << 20,
             retries: 1,
@@ -733,6 +734,7 @@ pub(super) fn acl_headers(options: &super::Options) -> BTreeMap<String, String> 
     options
         .headers
         .iter()
+        .chain(&options.write_headers)
         .filter(|super::Header(name, _)| name == "x-amz-acl" || name.starts_with("x-amz-grant-"))
         .map(|super::Header(name, value)| (name.clone(), value.clone()))
         .collect()

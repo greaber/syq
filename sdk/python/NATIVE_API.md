@@ -100,6 +100,7 @@ In addition to the shared arguments above, it accepts:
 | `performance_tuning` | Comma-separated overrides, e.g. `"workers=4"` or `"s3-objects=4,s3-parts-per-object=8,s3-requests=16"`; omitted means automatic |
 | `s3_endpoint`, `s3_region`, `s3_profile` | Endpoint URL, signing region, and AWS profile strings |
 | `s3_header` | Iterable of `"NAME: VALUE"` strings; applied before signing every request |
+| `s3_write_header` | Iterable of `"NAME: VALUE"` strings; applied only to requests that create or replace objects |
 | `auth_from` | Credential source string |
 | `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
 | `pscope` | Existing ephemeral scope path for forward SSH connection reuse |
@@ -153,7 +154,8 @@ endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
 `tcp_ports`, `tcp_congestion`, `auth_from` (S3), `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
 `performance_tuning`, `resource_limits`, `integrity_checking`, `if_exists`,
 `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
-and `timeout` with the same meanings as `cp`.
+and `timeout` with the same meanings as `cp`. `open_writer` also accepts
+`s3_write_header`.
 See the CLI stream reference for the applicable tuning and integrity controls.
 The client supplies the executable, process working directory, environment,
 and default timeout. Stream calls always check transfer failures.

@@ -110,7 +110,10 @@ impl Intercept for ControlLatency {
 }
 
 #[derive(Debug)]
-struct Headers(Vec<Header>);
+struct Headers {
+    every: Vec<Header>,
+    write: Vec<Header>,
+}
 impl Intercept for Headers {
     fn name(&self) -> &'static str {
         "SyqS3Headers"
@@ -143,18 +146,24 @@ impl Intercept for Headers {
         _: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> std::result::Result<(), BoxError> {
-        for Header(name, value) in &self.0 {
-            context
-                .request_mut()
+        let request = context.request_mut();
+        let url = url::Url::parse(request.uri())?;
+        let query = url.query_pairs().map(|(key, _)| key).collect::<Vec<_>>();
+        let method = request.method().to_owned();
+        for Header(name, value) in super::applicable_headers(
+            &self.every,
+            &self.write,
+            &method,
+            query.iter().map(|key| key.as_ref()),
+        ) {
+            request
                 .headers_mut()
                 .try_insert(name.clone(), value.clone())?;
         }
         let request = context.request();
         if request.method() == "PUT" {
             if let Some(checksum) = request.headers().get("x-amz-checksum-sha256") {
-                let multipart = url::Url::parse(request.uri())?
-                    .query_pairs()
-                    .any(|(key, _)| key == "uploadId");
+                let multipart = query.iter().any(|key| key == "uploadId");
                 if let Some(hash) =
                     super::checksum::single_put_payload("PUT", multipart, Some(checksum))?
                 {
@@ -320,7 +329,10 @@ pub(super) async fn connect_authorized(
         // Explicit payload checksums avoid aws-chunked trailers, which several
         // S3-compatible services do not implement. Downloads retain SDK checks.
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .interceptor(Headers(options.headers.clone()))
+        .interceptor(Headers {
+            every: options.headers.clone(),
+            write: options.write_headers.clone(),
+        })
         .interceptor(ControlLatency(control));
 
     let endpoint = options
@@ -1338,7 +1350,7 @@ fn merge_metadata_encryption(
             [MODE, KEY, CONTEXT, BUCKET_KEY]
                 .iter()
                 .all(|name| explicit(name).is_none()),
-            "conflicting --s3-header encryption settings: customer-key encryption cannot be combined with a server-managed encryption method or KMS settings"
+            "conflicting S3 header encryption settings: customer-key encryption cannot be combined with a server-managed encryption method or KMS settings"
         );
         for name in [MODE, KEY, CONTEXT, BUCKET_KEY] {
             request.headers.remove(name);
@@ -1351,7 +1363,7 @@ fn merge_metadata_encryption(
             if !kms || (name == BUCKET_KEY && !bucket_key) {
                 anyhow::ensure!(
                     explicit(name).is_none(),
-                    "conflicting --s3-header encryption settings: {name} requires {}",
+                    "conflicting S3 header encryption settings: {name} requires {}",
                     if name == BUCKET_KEY {
                         "aws:kms encryption"
                     } else {
@@ -1570,7 +1582,7 @@ mod tests {
             .unwrap_err()
             .to_string();
             assert!(
-                error.contains("conflicting --s3-header encryption settings"),
+                error.contains("conflicting S3 header encryption settings"),
                 "{error}"
             );
             assert!(

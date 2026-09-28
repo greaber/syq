@@ -559,18 +559,22 @@ class NativeClientTests(unittest.TestCase):
         self.client.cp("source", to="s3://bucket", into="prefix",
                        s3_endpoint="https://storage.example", s3_region="auto",
                        s3_profile="archive", auth_from="@laptop", s3_header=["X-Policy: a:b", "X-Other: yes"],
+                       s3_write_header=["x-amz-storage-class: STANDARD_IA"],
                        performance_tuning="s3-parts-per-object=7,s3-part-size=64M,s3-retries=2",
                        resource_limits="s3-requests=16,s3-objects=4")
         argv = self.argv()
         self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
         for expected in ["--s3-endpoint=https://storage.example", "--s3-region=auto",
                          "--s3-profile=archive", "--s3-header=X-Policy: a:b",
-                         "--s3-header=X-Other: yes", "--resource-limits",
+                         "--s3-header=X-Other: yes",
+                         "--s3-write-header=x-amz-storage-class: STANDARD_IA", "--resource-limits",
                          "s3-requests=16,s3-objects=4", "--performance-tuning",
                          "s3-parts-per-object=7,s3-part-size=64M,s3-retries=2"]:
             self.assertIn(expected, argv)
         with self.assertRaises(syq.SyqInvocationError):
             self.client.cp("source", to="s3://bucket", into="prefix", s3_header="X: value")
+        with self.assertRaises(syq.SyqInvocationError):
+            self.client.cp("source", to="s3://bucket", into="prefix", s3_write_header="X: value")
         with self.assertRaises(syq.SyqInvocationError):
             self.client.cp("source", to="s3://bucket", into="prefix", performance_tuning=True)
 

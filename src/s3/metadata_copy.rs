@@ -37,8 +37,9 @@ impl Prepared {
     ) -> Result<Self> {
         let size = u64::try_from(head.content_length().context("S3 omitted object size")?)?;
         let bucket = &options.bucket;
-        let request =
-            client::metadata_update_request(bucket, key, head, metadata, &options.headers)?;
+        // A metadata update is a self-copy, so it takes the object-writing headers.
+        let overrides = options.headers_for("PUT", []).cloned().collect::<Vec<_>>();
+        let request = client::metadata_update_request(bucket, key, head, metadata, &overrides)?;
         let mut prepared = Self {
             request,
             size,

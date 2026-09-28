@@ -22,6 +22,7 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-endpoint URL` | Use an S3-compatible service; also accepts `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` |
 | `--s3-region REGION` | Set the signing region explicitly |
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
+| `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects: uploads, multipart starts, and copies; repeatable. Use it for settings such as storage class or encryption that the service rejects or ignores on other requests. It takes precedence over an `--s3-header` of the same name |
 
 See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 
@@ -66,7 +67,9 @@ objects.
   metadata updates have the object-copy effects described below. Special files
   are unsupported.
 - **Updates:** `--if-exists=keep`, `--into-new`, and `--as-new` protect individual
-  objects against concurrent creation. Prefix checks are not transactional.
+  objects against concurrent creation. How reliably this works depends on the
+  consistency guarantees of your storage service. Prefix checks are not
+  transactional.
   `--if-exists=update-if-older` compares stored file timestamps, falling back
   to S3 Last-Modified when an object has no stored timestamp. S3 Last-Modified
   reflects uploads and metadata rewrites, rather than the original file's age.
@@ -93,10 +96,10 @@ case; there are no `--copy-metadata` settings for these S3-specific fields.
 Updating stored file attributes copies the destination object onto itself within
 S3, preserving its contents, content headers, tags, and unselected user metadata.
 It retains the destination storage class and the encryption method, KMS key,
-and S3 Bucket Key setting returned by the service. Explicit `--s3-header`
-encryption settings override the selected fields: changing a KMS key retains the
-compatible encryption method, while switching away from KMS drops inherited KMS
-settings. Incompatible explicit encryption settings cause an error. Syq also
+and S3 Bucket Key setting returned by the service. Encryption settings given
+with `--s3-header` or `--s3-write-header` override the selected fields:
+changing a KMS key retains the compatible encryption method, while switching
+away from KMS drops inherited KMS settings. Incompatible explicit encryption settings cause an error. Syq also
 refuses the update if the service reports that it omitted existing metadata from
 its response, because replacing that metadata could lose entries. These rules
 apply to multipart metadata updates too. The update changes S3 Last-Modified and
@@ -104,7 +107,7 @@ creates a new version when bucket versioning is enabled. Object ACLs, Object Loc
 settings, and custom KMS encryption contexts are not preserved by this operation.
 
 New or changed uploads and bucket copies use the provider's storage and encryption
-defaults unless overridden with `--s3-header`. On AWS general-purpose buckets,
+defaults unless overridden with `--s3-write-header`. On AWS general-purpose buckets,
 these are STANDARD storage and the destination bucket's default encryption.
 Changes to source storage class or encryption alone do not trigger a copy.
 

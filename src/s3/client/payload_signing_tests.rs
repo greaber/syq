@@ -67,7 +67,10 @@ async fn precomputed_payload_detects_corruption_in_buffered_and_streamed_puts() 
                 "test", "test", None, None, "fixture",
             ))
             .retry_config(RetryConfig::disabled())
-            .interceptor(Headers(vec![]))
+            .interceptor(Headers {
+                every: vec![],
+                write: vec![],
+            })
             .http_client(http_client_fn(|_, _| {
                 SharedHttpConnector::new(ValidatePayload)
             }))
