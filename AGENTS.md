@@ -529,8 +529,10 @@ to code, tooling, tests, or executable documentation, run
 `scripts/run-tooling-tests.py --quick` once on the final relevant changes after
 loading the pinned setup environment. This broad, build-free group includes the
 rsync harness and aims to finish within 30 seconds with tools already installed.
-It prints each test's duration; the budget guides which tests belong in the
-group, rather than stopping or skipping tests mid-run. Pure prose changes can
+It enables Python bytecode caching under ignored `target/python-cache/` for
+tests and their subprocesses, overriding shell bytecode-cache settings. It prints
+each test's duration; the budget guides which tests belong in the group, rather
+than stopping or skipping tests mid-run. Pure prose changes can
 use their focused documentation checks. Reuse a passing result when later edits
 cannot affect it; do not repeat it just because review starts or master advances.
 The same group is available through `ci.yml` with `suites=quick`; prefer the

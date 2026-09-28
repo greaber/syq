@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run tooling tests and the rsync harness; --quick selects the cheap default checks."""
 import argparse
+import os
 from pathlib import Path
 import sys
 import time
@@ -60,6 +61,10 @@ def select_tests(root, quick=False):
 
 
 def run_tests(tests, root):
+    # Tests launch many short-lived Python processes. Keep their import cache
+    # enabled and inside ignored target/, independent of the caller's shell.
+    env = dict(os.environ, PYTHONPYCACHEPREFIX=str((root / "target/python-cache").resolve()))
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
     children = ForwardSignals()
     failures = []
     started = time.monotonic()
@@ -67,7 +72,7 @@ def run_tests(tests, root):
         print(f"Running {test.name}", flush=True)
         test_started = time.monotonic()
         try:
-            status, _ = children.run(*INTERPRETERS[test.suffix], str(test), cwd=root)
+            status, _ = children.run(*INTERPRETERS[test.suffix], str(test), cwd=root, env=env)
         except OSError as error:
             print(f"{test.name}: {error}", file=sys.stderr, flush=True)
             status = 1
