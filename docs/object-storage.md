@@ -22,7 +22,7 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-endpoint URL` | Use an S3-compatible service; also accepts `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` |
 | `--s3-region REGION` | Set the signing region explicitly |
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
-| `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects: uploads, multipart starts, and copies; repeatable. Use it for settings such as storage class or encryption that the service rejects or ignores on other requests. It takes precedence over an `--s3-header` of the same name |
+| `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects: uploads, multipart starts, and copies; repeatable. Use it for settings such as storage class, or a server-side encryption method or KMS key, that the service rejects or ignores on other requests. Customer-provided encryption key headers (`x-amz-server-side-encryption-customer-*`) are also required on part uploads and reads, so they cannot be write-only. A write header takes precedence over an `--s3-header` of the same name |
 
 See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 

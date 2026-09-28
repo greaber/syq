@@ -178,6 +178,24 @@ impl Drop for Server {
 }
 
 const SIZE: usize = 6 * 1024 * 1024 + 7;
+/// PutObject, CopyObject, or CreateMultipartUpload, judged independently of
+/// syq's own classification.
+fn writes_object(method: &str, target: &str) -> bool {
+    let query = target
+        .split_once('?')
+        .map_or(vec![], |(_, query)| query.split('&').collect());
+    let keys = query
+        .iter()
+        .map(|pair| pair.split('=').next().unwrap())
+        .filter(|key| *key != "x-id")
+        .collect::<Vec<_>>();
+    match method {
+        "PUT" => keys.is_empty(),
+        "POST" => keys == ["uploads"],
+        _ => false,
+    }
+}
+
 fn serve(
     mut socket: TcpStream,
     fault: &str,
@@ -226,20 +244,8 @@ fn serve(
     );
     if headers.contains_key(WRITE_PROBE) {
         let target = first.split_whitespace().nth(1).unwrap();
-        let query = target
-            .split_once('?')
-            .map_or(vec![], |(_, query)| query.split('&').collect());
-        let keys = query
-            .iter()
-            .map(|pair| pair.split('=').next().unwrap())
-            .filter(|key| *key != "x-id")
-            .collect::<Vec<_>>();
         assert!(
-            match method {
-                "PUT" => keys.is_empty(),
-                "POST" => keys == ["uploads"],
-                _ => false,
-            },
+            writes_object(method, target),
             "object-writing header on {first}"
         );
         probes.fetch_add(1, Ordering::Relaxed);
@@ -627,8 +633,13 @@ fn serve(
             }
         }
 
-        if fault.contains("storage-class") {
-            assert_eq!(headers["x-amz-storage-class"], "INTELLIGENT_TIERING");
+        if fault.contains("override-storage-class") && !writes_object(method, path) {
+            assert_eq!(headers["x-amz-storage-class"], "STANDARD", "{first}");
+        } else if fault.contains("storage-class") {
+            assert_eq!(
+                headers["x-amz-storage-class"], "INTELLIGENT_TIERING",
+                "{first}"
+            );
         } else {
             assert!(
                 !headers.contains_key("x-amz-storage-class"),
@@ -4359,6 +4370,8 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
         "server-copy-heads-overlap",
         "server-copy-storage-class",
         "server-copy-multipart-storage-class",
+        "server-copy-override-storage-class",
+        "server-copy-multipart-override-storage-class",
     ] {
         let server = Server::start(fault);
         let temp = crate::test_support::tempdir().unwrap();
@@ -4387,7 +4400,14 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
                 "--if-exists=keep",
             ];
         }
-        if fault.contains("storage-class") {
+        if fault.contains("override-storage-class") {
+            // On object writes, the write header replaces the every-request value.
+            args.extend(["--s3-header", "x-amz-storage-class: STANDARD"]);
+            args.extend([
+                "--s3-write-header",
+                "x-amz-storage-class: INTELLIGENT_TIERING",
+            ]);
+        } else if fault.contains("storage-class") {
             args.extend(["--s3-header", "x-amz-storage-class: INTELLIGENT_TIERING"]);
         }
         let probe = format!("{WRITE_PROBE}: yes");
