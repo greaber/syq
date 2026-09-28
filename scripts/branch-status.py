@@ -25,7 +25,8 @@ Exit status: 0 when nothing needs attention; 1 when a dispatched check on this
 branch failed, the GitHub head is stale or unrelated, or a --check step failed
 or changed worktree status; 2 on usage/tooling errors or HEAD moving during
 checks (stderr diagnostic, no report, even with --json). The pull request's
-check rollup is informational.
+check rollup is reported as is; its required `dispatched-checks` status
+reflects the same dispatched failures this script reports.
 """
 import json
 import shutil

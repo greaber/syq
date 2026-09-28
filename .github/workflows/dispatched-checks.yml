@@ -8,8 +8,8 @@ name: Dispatched checks
 # ref) and never checks out or runs pull-request code.
 on:
   pull_request_target:
-    # `edited` includes a changed base, such as a stacked pull request
-    # retargeted to master after its base merged.
+    # `edited` covers a changed base, such as a stacked pull request retargeted
+    # to master after its base merged; the job skips other edits.
     types: [opened, reopened, synchronize, edited, labeled, unlabeled]
   workflow_run:
     workflows: [ci, macOS suite, rsync compatibility, Focused check]
@@ -29,10 +29,14 @@ permissions:
 
 jobs:
   status:
-    # Only manually dispatched runs on task branches affect the status.
+    # Only manually dispatched runs on task branches affect the status, and
+    # among edits only a changed base does; title and body edits are frequent.
     if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.event == 'workflow_dispatch' &&
+      (github.event_name == 'pull_request_target' &&
+       (github.event.action != 'edited' || github.event.changes.base != null)) ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.event == 'workflow_dispatch' &&
        github.event.workflow_run.head_branch != 'master')
     # Evaluate one branch at a time so an older event-driven evaluation cannot
     # overwrite a newer one. A newer pending evaluation reads the current state
