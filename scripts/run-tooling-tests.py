@@ -15,6 +15,7 @@ INTERPRETERS = {".py": [sys.executable], ".sh": ["sh"], ".cjs": ["node", "--test
 # Aim for 30 seconds total with pinned tools already installed. Re-measure before
 # adding tests; the budget guides selection, never skips tests during a run.
 QUICK_TESTS = (
+    "tests/tooling/test-branch-status.py",
     "tests/tooling/test-doc-selector.cjs",
     "tests/tooling/test-doc-site.py",
     "tests/tooling/test-find-release-build.py",

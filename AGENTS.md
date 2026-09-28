@@ -527,16 +527,11 @@ validated SHA.
 Use test cost as well as relevance when choosing pre-merge checks. For changes
 to code, tooling, tests, or executable documentation, run
 `scripts/run-tooling-tests.py --quick` once on the final relevant changes after
-loading the pinned setup environment. This broad, build-free group includes the
-rsync harness and aims to finish within 30 seconds with tools already installed.
-It enables Python bytecode caching under ignored `target/python-cache/` for
-tests and their subprocesses, overriding shell bytecode-cache settings. It prints
-each test's duration; the budget guides which tests belong in the group, rather
-than stopping or skipping tests mid-run. Pure prose changes can
-use their focused documentation checks. Reuse a passing result when later edits
-cannot affect it; do not repeat it just because review starts or master advances.
-The same group is available through `ci.yml` with `suites=quick`; prefer the
-local command when no runner-specific evidence is needed.
+loading the pinned setup environment. This inexpensive group catches accidental
+tooling breakage. Pure prose changes can use their focused documentation checks.
+Reuse a passing result when later edits cannot affect it; do not repeat it just
+because review starts or master advances. Prefer the local command when
+runner-specific evidence is unnecessary.
 
 Keep moderate and expensive checks selective. Account for compilation, setup,
 runner queues, and fixture costs as well as test execution. Inspect all changed

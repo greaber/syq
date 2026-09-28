@@ -173,11 +173,13 @@ existing bucket. See `python3 scripts/benchmark-s3.py --help` for
 benchmark options.
 
 Repository tooling tests run with `scripts/run-tooling-tests.py` after
-`scripts/setup.sh` and `eval "$(scripts/setup.sh env)"`. The runner executes every
-`test-*.py`, `test-*.sh`, and `test-*.cjs` file directly inside `tests/tooling/`,
-keeps each test's output visible, and reports all failures. Use `--list` to see
-what it will run, or run an individual file for a focused check. These tests
-include Cargo package builds, so run the complete suite from a clean checkout.
+`scripts/setup.sh` and `eval "$(scripts/setup.sh env)"`. The full runner executes
+every `test-*.py`, `test-*.sh`, and `test-*.cjs` file directly inside `tests/tooling/`,
+plus `tests/rsync-compat/harness_test.py`. Use `--quick` for the inexpensive group
+that needs no builds or external services. The runner keeps each test's output
+visible and reports all failures. Use `--list` (optionally with `--quick`) to see
+what it will run, or run an individual file for a focused check. The full suite
+includes Cargo package builds, so run it from a clean checkout.
 
 Add ordinary tooling tests to that directory; full nightly and manual CI discover
 them without a workflow change. Python tests can import `ROOT` and `SCRIPTS` from
