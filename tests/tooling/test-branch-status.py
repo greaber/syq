@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise scripts/branch-status.py against a scratch repository and a fake gh
-that serves controlled run and pull-request JSON."""
+that serves controlled run, job, and pull-request JSON."""
 from support import SCRIPTS
 
 import json
@@ -18,16 +18,37 @@ case "$1:$2" in
     shift 2
     workflow=
     event=
+    branch=
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --workflow) workflow=$2; shift 2 ;;
         --event) event=$2; shift 2 ;;
+        --branch) branch=$2; shift 2 ;;
         *) shift ;;
       esac
     done
-    cat "$SYQ_TEST_RUNS_DIR/$workflow.$event.json"
+    # A branch-specific file stands in for runs that a query across every
+    # branch would not reach. Runs without headBranch are on master.
+    file="$SYQ_TEST_RUNS_DIR/$workflow.$event.json"
+    if [ -n "$branch" ] && [ -f "$SYQ_TEST_RUNS_DIR/$workflow.$event.branch-$branch.json" ]; then
+      file="$SYQ_TEST_RUNS_DIR/$workflow.$event.branch-$branch.json"
+    fi
+    if [ ! -f "$file" ]; then
+      echo '[]'
+    elif [ -n "$branch" ]; then
+      python3 -c 'import json, sys; print(json.dumps([run for run in json.load(open(sys.argv[1]))
+        if run.get("headBranch", "master") == sys.argv[2]]))' "$file" "$branch"
+    else
+      cat "$file"
+    fi
+    ;;
+  run:view)
+    cat "$SYQ_TEST_RUNS_DIR/jobs-$3.json"
     ;;
   pr:list)
+    case " $* " in
+      *" merged "*) printf '%s\n' "${SYQ_TEST_MERGED_JSON:-[]}"; exit 0 ;;
+    esac
     if [ "${SYQ_TEST_PR_JSON:-}" = FAIL ]; then
       echo 'GraphQL: simulated GraphQL failure' >&2
       exit 1
@@ -75,12 +96,16 @@ class BranchStatusTests(unittest.TestCase):
         for workflow in ("ci.yml", "rsync-compat.yml", "macos.yml"):
             self.set_run(workflow, "completed", "success")
             self.set_run(workflow, "completed", "success", "schedule")
+        # The master runs above are not full-suite runs.
+        (self.runs / "jobs-1.json").write_text('{"jobs": []}')
         self.pr = {
             "number": 7, "url": "https://example.invalid/pull/7", "state": "OPEN",
             "isDraft": False, "baseRefName": "master", "headRefOid": self.head,
             "reviewDecision": "", "mergeStateStatus": "CLEAN",
             "statusCheckRollup": [{"name": "rust", "status": "COMPLETED", "conclusion": "SUCCESS"},
                                   {"name": "macos", "status": "COMPLETED", "conclusion": "SKIPPED"}]}
+        self.merged = []
+        self.dispatched = {}
 
     def tearDown(self):
         self.temp.cleanup()
@@ -101,11 +126,44 @@ class BranchStatusTests(unittest.TestCase):
             "url": f"https://example.invalid/{workflow}/{event}",
             "createdAt": "2026-01-01T00:00:00Z", "databaseId": 1}]))
 
+    def dispatch(self, workflow, run_id, created, jobs, branch="task", status="completed",
+                 head=None):
+        """Record a manually dispatched run and its jobs as {name: conclusion}."""
+        # As on GitHub, one cancelled job makes the whole run cancelled.
+        conclusions = [conclusion for conclusion in jobs.values() if conclusion]
+        conclusion = ("" if status != "completed" else "cancelled" if "cancelled" in conclusions
+                      else "failure" if set(conclusions) & {"failure", "timed_out"}
+                      else "success")
+        self.dispatched.setdefault(workflow, []).append({
+            "databaseId": run_id, "headBranch": branch, "headSha": head or self.head,
+            "createdAt": created, "status": status, "conclusion": conclusion,
+            "url": f"https://example.invalid/runs/{run_id}"})
+        (self.runs / f"{workflow}.workflow_dispatch.json").write_text(
+            json.dumps(self.dispatched[workflow]))
+        (self.runs / f"jobs-{run_id}.json").write_text(json.dumps({"jobs": [
+            {"name": name, "conclusion": conclusion,
+             "url": f"https://example.invalid/runs/{run_id}/{name}"}
+            for name, conclusion in jobs.items()]}))
+
+    def full_run(self, workflow, run_id, created, event="schedule", jobs=None):
+        """Add a successful run on master with the given (default certified) jobs,
+        after the runs that the master status lines report."""
+        path = self.runs / f"{workflow}.{event}.json"
+        runs = json.loads(path.read_text()) if path.exists() else []
+        path.write_text(json.dumps(runs + [{
+            "databaseId": run_id, "headSha": self.master, "createdAt": created,
+            "status": "completed", "conclusion": "success",
+            "url": f"https://example.invalid/runs/{run_id}"}]))
+        jobs = jobs or {"rust": "success", "release-certification": "success"}
+        (self.runs / f"jobs-{run_id}.json").write_text(json.dumps({"jobs": [
+            {"name": name, "conclusion": conclusion} for name, conclusion in jobs.items()]}))
+
     def status(self, *args, pr=None, expected=0, split=False):
         result = subprocess.run(
             [str(STATUS), *args], cwd=self.repo, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if split else subprocess.STDOUT,
             env={**os.environ, "SYQ_TEST_RUNS_DIR": str(self.runs),
+                 "SYQ_TEST_MERGED_JSON": json.dumps(self.merged),
                  "SYQ_TEST_PR_JSON": "" if pr is None else pr if isinstance(pr, str) else json.dumps(pr),
                  "PATH": f"{self.fakebin}{os.pathsep}{os.environ['PATH']}"})
         self.assertEqual(result.returncode, expected, result.stdout + (result.stderr or ""))
@@ -171,12 +229,13 @@ class BranchStatusTests(unittest.TestCase):
         self.assertIn("simulated GraphQL failure", output)
         self.assertNotIn("Pull request: none", output)
 
-    def test_red_post_merge_run_is_an_alert(self):
+    def test_red_post_merge_run_is_noted_without_failing_the_branch(self):
         self.set_run("macos.yml", "completed", "failure")
-        output = self.status(expected=1)
+        output = self.status()
         self.assertIn("macos.yml        failure", output)
-        self.assertIn(f"WARNING: master is red: macos.yml post-merge failure at {self.master[:7]} "
+        self.assertIn(f"NOTE: master is red: macos.yml post-merge failure at {self.master[:7]} "
                       "https://example.invalid/macos.yml/push", output)
+        self.assertNotIn("WARNING", output)
 
     def test_run_in_progress_is_not_an_alert(self):
         self.set_run("macos.yml", "in_progress", "")
@@ -187,16 +246,17 @@ class BranchStatusTests(unittest.TestCase):
     def test_red_nightly_behind_a_green_post_merge_run(self):
         # A green post-merge run can skip checks that the red nightly full suite ran.
         self.set_run("rsync-compat.yml", "completed", "failure", "schedule")
-        output = self.status(expected=1)
+        output = self.status()
         self.assertIn("rsync-compat.yml success", output)
         self.assertIn(f"  nightly        failure      {self.master[:7]}  "
                       "https://example.invalid/rsync-compat.yml/schedule", output)
-        self.assertIn(f"WARNING: master is red: rsync-compat.yml nightly failure at {self.master[:7]}",
+        self.assertIn(f"NOTE: master is red: rsync-compat.yml nightly failure at {self.master[:7]}",
                       output)
-        report = json.loads(self.status("--json", expected=1))
+        report = json.loads(self.status("--json"))
         self.assertEqual(report["master_ci"][1]["state"], "success")
         self.assertEqual(report["master_ci"][1]["nightly"]["state"], "failure")
-        self.assertEqual(report["exit_status"], 1)
+        self.assertEqual(len(report["notes"]), 1)
+        self.assertEqual(report["exit_status"], 0)
 
     def test_nightly_in_progress_is_not_an_alert(self):
         self.set_run("rsync-compat.yml", "in_progress", "", "schedule")
@@ -244,10 +304,14 @@ class BranchStatusTests(unittest.TestCase):
         self.assertEqual(report["warnings"], [])
         self.assertEqual(report["exit_status"], 0)
         self.set_run("ci.yml", "completed", "failure")
-        report = json.loads(self.status("--json", expected=1))
+        report = json.loads(self.status("--json"))
+        self.assertEqual(report["exit_status"], 0)
+        self.assertEqual(len(report["notes"]), 1)
+        self.assertEqual(report["master_ci"][0]["state"], "failure")
+        report = json.loads(self.status("--json", pr=self.with_pr(headRefOid=self.previous),
+                                        expected=1))
         self.assertEqual(report["exit_status"], 1)
         self.assertEqual(len(report["warnings"]), 1)
-        self.assertEqual(report["master_ci"][0]["state"], "failure")
 
     def test_json_check_stays_one_document(self):
         # --json --check stays one JSON document even when the checks write to stdout.
@@ -279,6 +343,110 @@ class BranchStatusTests(unittest.TestCase):
         output = self.status("--check", expected=2)
         self.assertIn("HEAD changed during baseline checks", output)
         self.assertNotIn("Baseline checks (", output)
+
+    def test_failed_dispatched_check_blocks_until_a_later_run_passes(self):
+        self.dispatch("ci.yml", 11, "2026-02-01T00:00:00Z",
+                      {"s3": "failure", "real-ssh (core, default)": "success"}, head=self.previous)
+        output = self.status(expected=1)
+        self.assertIn(f"  failed   ci.yml s3 at {self.previous[:7]}  "
+                      "https://example.invalid/runs/11/s3", output)
+        self.assertIn(f"WARNING: ci.yml s3 failure at {self.previous[:7]} on this branch, and no "
+                      "later run passed it https://example.invalid/runs/11/s3", output)
+        # A later run of other checks does not resolve it; a still-running one is listed.
+        self.dispatch("ci.yml", 12, "2026-02-02T00:00:00Z", {"rust": "success"})
+        self.dispatch("ci.yml", 13, "2026-02-03T00:00:00Z", {"s3": None}, status="in_progress")
+        report = json.loads(self.status("--json", expected=1))
+        self.assertEqual([entry["job"] for entry in report["dispatched"]["failed"]], ["s3"])
+        self.assertEqual([run["databaseId"] for run in report["dispatched"]["running"]], [13])
+        # A later pass of the same job resolves it.
+        self.dispatch("ci.yml", 14, "2026-02-04T00:00:00Z", {"s3": "success"})
+        output = self.status()
+        self.assertIn("  running  ci.yml at", output)
+        self.assertNotIn("failed   ci.yml", output)
+        self.assertNotIn("WARNING", output)
+
+    def test_failure_in_a_cancelled_run_is_reported(self):
+        self.dispatch("ci.yml", 15, "2026-02-01T00:00:00Z",
+                      {"real-ssh (core, default)": "failure", "object-storage": "cancelled"})
+        report = json.loads(self.status("--json", expected=1))
+        self.assertEqual([entry["job"] for entry in report["dispatched"]["failed"]],
+                         ["real-ssh (core, default)"])
+
+    def test_this_branch_is_queried_beyond_the_shared_window(self):
+        # Runs on busy branches can push this branch's run out of the shared list.
+        self.dispatch("ci.yml", 16, "2026-02-01T00:00:00Z", {"s3": "failure"})
+        (self.runs / "ci.yml.workflow_dispatch.branch-task.json").write_text(
+            json.dumps(self.dispatched["ci.yml"]))
+        (self.runs / "ci.yml.workflow_dispatch.json").write_text("[]")
+        self.assertIn("  failed   ci.yml s3", self.status(expected=1))
+
+    def test_checks_are_matched_by_workflow_and_job_name(self):
+        self.dispatch("focused-check.yml", 21, "2026-02-01T00:00:00Z",
+                      {"check (linux, namespace, script aaa)": "failure"})
+        self.dispatch("focused-check.yml", 22, "2026-02-02T00:00:00Z",
+                      {"check (linux, namespace, script bbb)": "success"})
+        self.dispatch("macos.yml", 23, "2026-02-03T00:00:00Z",
+                      {"check (linux, namespace, script aaa)": "success"})
+        report = json.loads(self.status("--json", expected=1))
+        self.assertEqual([(entry["workflow"], entry["job"]) for entry in report["dispatched"]["failed"]],
+                         [("focused-check.yml", "check (linux, namespace, script aaa)")])
+
+    def test_other_branches_and_an_earlier_pull_request_are_ignored(self):
+        self.dispatch("ci.yml", 31, "2026-02-01T00:00:00Z", {"s3": "failure"}, branch="other")
+        # An earlier pull request from the same branch name merged after this failure.
+        self.dispatch("ci.yml", 32, "2026-02-01T00:00:00Z", {"rust": "failure"})
+        self.merged = [{"number": 5, "url": "https://example.invalid/pull/5", "headRefName": "task",
+                        "mergedAt": "2026-02-02T00:00:00Z", "isCrossRepository": False}]
+        self.full_run("ci.yml", 90, "2026-02-03T00:00:00Z")
+        output = self.status()
+        self.assertIn("  no failed or running checks", output)
+        self.assertNotIn("WARNING", output)
+
+    def test_failure_left_by_a_merge_is_reported_until_a_full_run_on_master(self):
+        self.dispatch("ci.yml", 41, "2026-02-01T00:00:00Z", {"s3": "failure"}, branch="merged-task")
+        # Runs after the merge belong to later work that reuses the branch name.
+        self.dispatch("ci.yml", 42, "2026-02-05T00:00:00Z", {"s3": "success"}, branch="merged-task")
+        self.merged = [{"number": 6, "url": "https://example.invalid/pull/6",
+                        "headRefName": "merged-task", "mergedAt": "2026-02-02T00:00:00Z",
+                        "isCrossRepository": False}]
+        # A failure elsewhere is noted without failing this branch.
+        output = self.status()
+        self.assertIn("Failures left by merged pull requests (until a full run on master passes):",
+                      output)
+        self.assertIn(f"  #6 ci.yml s3 at {self.head[:7]}", output)
+        self.assertIn("NOTE: #6 merged with ci.yml s3 failure", output)
+        self.assertNotIn("WARNING", output)
+        # A nightly that skipped unchanged inputs, or one before the merge, does not clear it.
+        self.full_run("ci.yml", 91, "2026-02-03T00:00:00Z",
+                      jobs={"rust": "success", "nightly-unchanged": "success"})
+        self.assertIn("NOTE: #6", self.status())
+        self.full_run("ci.yml", 92, "2026-02-01T12:00:00Z")
+        self.assertIn("NOTE: #6", self.status())
+        self.full_run("ci.yml", 93, "2026-02-03T00:00:00Z", event="workflow_dispatch")
+        output = self.status()
+        self.assertNotIn("Failures left by merged", output)
+        # Many later pushes do not hide the full run that cleared it.
+        (self.runs / "ci.yml.push.json").write_text(json.dumps([
+            {"headSha": self.master, "status": "completed", "conclusion": "success",
+             "url": "https://example.invalid/push", "createdAt": f"2026-02-04T00:{minute:02}:00Z",
+             "databaseId": 200 + minute} for minute in range(30)]))
+        self.assertNotIn("NOTE: #6", self.status())
+        # A cross-repository pull request's branch name says nothing about these runs.
+        self.merged[0]["isCrossRepository"] = True
+        (self.runs / "ci.yml.workflow_dispatch.json").write_text(
+            json.dumps(self.dispatched["ci.yml"]))
+        self.assertNotIn("NOTE: #6", self.status())
+
+    def test_merged_focused_failure_waits_for_both_native_suites(self):
+        self.dispatch("focused-check.yml", 51, "2026-02-01T00:00:00Z",
+                      {"check (macos, namespace, script ccc)": "failure"}, branch="merged-task")
+        self.merged = [{"number": 8, "url": "https://example.invalid/pull/8",
+                        "headRefName": "merged-task", "mergedAt": "2026-02-02T00:00:00Z",
+                        "isCrossRepository": False}]
+        self.full_run("ci.yml", 94, "2026-02-03T00:00:00Z")
+        self.assertIn("NOTE: #8", self.status())
+        self.full_run("macos.yml", 95, "2026-02-03T00:00:00Z")
+        self.assertNotIn("NOTE: #8", self.status())
 
     def test_usage_errors(self):
         self.assertIn("usage:", self.status("--bogus", expected=2))

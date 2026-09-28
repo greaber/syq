@@ -2,6 +2,8 @@
 """Run a command or local Bash script on a CI runner and watch that exact run."""
 
 import argparse
+import base64
+import hashlib
 import json
 from pathlib import Path
 import shlex
@@ -56,6 +58,14 @@ def main():
             "timeout": str(args.timeout),
         },
     }
+    # Reruns of the same script share a job name, which is how
+    # scripts/branch-status.py tells whether a later run passed. GitHub rejects
+    # inputs the ref's workflow does not declare, so older branches get no label.
+    workflow = base64.b64decode(output(
+        "gh", "api", f"repos/{repo}/contents/.github/workflows/focused-check.yml?ref={revision}",
+        "--jq", ".content")).decode()
+    if "\n      label:\n" in workflow:
+        payload["inputs"]["label"] = "script " + hashlib.sha256(script.encode()).hexdigest()[:12]
     print(f"Checking {repo}@{revision} on {args.provider}/{args.runner}", flush=True)
     response = json.loads(output(
         "gh", "api", f"repos/{repo}/actions/workflows/focused-check.yml/dispatches",

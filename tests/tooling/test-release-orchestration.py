@@ -20,7 +20,8 @@ SCOPE_KEYS = ["native", "sdks", "python_sdk", "tooling", "shellcheck", "mapping_
               "conformance", "macos", "linux_arm64", "full_suite"]
 ALL_TOOLING = "benchmark branch focused installer orchestration package release setup workflows"
 # Scope fixtures below supply their own events and overrides.
-INHERITED = ("SYQ_TEST_CHANGED_PATHS_FILE", "SYQ_CI_SCOPE_COMMIT", "SYQ_CI_DOCUMENTATION_ONLY")
+INHERITED = ("SYQ_TEST_CHANGED_PATHS_FILE", "SYQ_CI_SCOPE_COMMIT", "SYQ_CI_DOCUMENTATION_ONLY",
+             "SYQ_CI_SUITES", "GITHUB_REF")
 BASE_ENV = {key: value for key, value in os.environ.items() if key not in INHERITED}
 DISPATCH_EVENT = {}
 
@@ -337,6 +338,50 @@ class EventScopeTests(Scratch):
                                 SYQ_CI_SCOPE_COMMIT="0123456789abcdef0123456789abcdef01234567"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("is not checked out", result.stdout + result.stderr)
+
+    def test_selected_suites(self):
+        dispatch = self.event("workflow-dispatch-event.json", DISPATCH_EVENT)
+        branch = {"GITHUB_REF": "refs/heads/task"}
+        scope = self.scope(event=dispatch, cwd=self.repo,
+                           env=dict(branch, SYQ_CI_SUITES="real-ssh-metadata, s3 real-ssh-core"))
+        self.assertScope(scope, suite_selection="true", s3="true", native="false",
+                         repository_checks="false", full_suite="false")
+        # Matrix order is fixed so equal selections share cancellation groups.
+        self.assertEqual(json.loads(scope["real_ssh_matrix"]),
+                         [{"suite": "core", "profile": "default"},
+                          {"suite": "metadata", "profile": "default"}])
+        scope = self.scope(event=dispatch, cwd=self.repo,
+                           env=dict(branch, SYQ_CI_SUITES="rust real-ssh macos-intel"))
+        self.assertScope(scope, native="true", integration_targets="all", macos="true",
+                         macos_intel="true", s3="false", tooling="false", full_suite="false")
+        self.assertEqual(len(json.loads(scope["real_ssh_matrix"])), 4)
+        # On task branches the rust job's name records what it ran.
+        self.assertScope(scope, rust_label="native:all", all_tooling="false")
+        scope = self.scope(event=dispatch, cwd=self.repo,
+                           env=dict(branch, SYQ_CI_SUITES="shellcheck tooling"))
+        self.assertScope(scope, rust_label="tooling:all shellcheck", all_tooling="true",
+                         native="false")
+        self.assertScope(self.scope(event=dispatch, cwd=self.repo,
+                                    env=dict(branch, SYQ_CI_DOCUMENTATION_ONLY="true")),
+                         rust_label="mapping-docs")
+        # Path classification and full runs never select suites.
+        self.assertScope(self.scope("src/main.rs"), suite_selection="false", s3="false",
+                         real_ssh_matrix="[]", rust_label="native:bin", all_tooling="false")
+        self.assertScope(self.scope(event=dispatch, cwd=self.repo), suite_selection="false",
+                         s3="true", repository_checks="true", macos_intel="true",
+                         all_tooling="true", rust_label="full")
+        for env, message in [
+                (dict(branch, SYQ_CI_SUITES="s3 bogus"), "unknown suite: bogus"),
+                ({"GITHUB_REF": "refs/heads/master", "SYQ_CI_SUITES": "s3"}, "not master"),
+                (dict(branch, SYQ_CI_SUITES="s3", SYQ_CI_DOCUMENTATION_ONLY="true"),
+                 "cannot be combined")]:
+            with self.subTest(env=env):
+                result = subprocess.run([str(SCRIPTS / "ci-scope.py"), str(dispatch)],
+                                        cwd=self.repo, capture_output=True, text=True,
+                                        env=dict(BASE_ENV, **env))
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def macos_step(self):
         """The real macOS classification step, rather than a copy of its logic.
