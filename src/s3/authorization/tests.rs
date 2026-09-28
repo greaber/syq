@@ -156,7 +156,7 @@ fn released_upload_authorization_cannot_sign_object_lock_or_retention_bypass() {
     signer
         .sign(&upload.header("x-amz-meta-object-lock-note", "ordinary user metadata"))
         .unwrap();
-    // Bucket-wide path approval must not permit enabling bucket Object Lock.
+    // Bucket-wide path approval must not turn object access into bucket control.
     signer.request.scopes[0].key.clear();
     for header in [
         "x-amz-bucket-object-lock-enabled",
@@ -165,6 +165,36 @@ fn released_upload_authorization_cannot_sign_object_lock_or_retention_bypass() {
         let bucket_lock = Unsigned::new("PUT", "").header(header, "true");
         assert!(signer.request.permits(&bucket_lock).is_err());
         assert!(signer.sign(&bucket_lock).is_err());
+    }
+    for request in [
+        Unsigned::new("HEAD", ""),
+        Unsigned::new("GET", ""),
+        Unsigned::new("GET", "")
+            .query("list-type", "2")
+            .query("prefix", "allowed/"),
+        Unsigned::new("PUT", "allowed/file"),
+    ] {
+        signer.sign(&request).unwrap();
+    }
+    for upload_allowed in [true, false] {
+        signer.request.upload = upload_allowed;
+        signer.request.removal = Some(Removal::Current);
+        signer.request.validate().unwrap();
+        // Object removal remains authorized, including for removal-only approval.
+        signer
+            .sign(&Unsigned::new("DELETE", "allowed/file"))
+            .unwrap();
+        for request in [
+            Unsigned::new("PUT", ""),
+            Unsigned::new("POST", ""),
+            Unsigned::new("POST", "").query("uploads", ""),
+            Unsigned::new("POST", "").query("uploadId", "id"),
+            Unsigned::new("DELETE", ""),
+        ] {
+            assert!(signer.request.permits(&request).is_err());
+            let error = signer.sign(&request).unwrap_err().to_string();
+            assert!(error.contains("bucket mutations"), "{request:?}: {error}");
+        }
     }
 }
 

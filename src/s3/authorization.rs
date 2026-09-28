@@ -142,6 +142,12 @@ impl Request {
                 || request.query.contains_key("versions"),
             "storage request is outside the approved paths"
         );
+        // The empty key addresses the bucket itself, not an object. Bucket-wide
+        // object scopes still must not authorize creating or deleting buckets.
+        anyhow::ensure!(
+            !request.key.is_empty() || reading,
+            "storage authorization does not permit bucket mutations"
+        );
         for (name, value) in &request.headers {
             // SigV4 takes an explicit Host header in preference to the URL's
             // authority. Only the approved endpoint may supply that authority.
