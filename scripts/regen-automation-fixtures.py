@@ -132,18 +132,19 @@ def main():
         normalize(directory / "raw.ndjson", "partial.ndjson")
 
         # dry-run: the success scenario against a stale destination, emitting
-        # traces (destination_missing, content_differs) instead of results. Exit 0.
+        # traces (destination_missing, content_differs, metadata_differs). Exit 0.
         directory = work / "dry-run"
         write(directory / "src/Berlin/IMG.JPG", "img")
         write(directory / "src/Notes.TXT", "hello")
         write(directory / "dst/berlin/2024/07/img.jpg", "stale")
         # Pin mtimes on both sides: whether the pre-created destination directory
         # matches the source's timestamp is otherwise a sub-second race, and the
-        # guaranteed mismatch keeps a metadata_differs trace in the fixture.
+        # explicit mtime request and mismatch keep a metadata_differs trace in the fixture.
         touch_tree(directory / "src", "2024-07-01T12:00:00Z")
         touch_tree(directory / "dst", "2024-01-01T00:00:00Z")
         syq(directory, "cp", "--performance-tuning", "workers=1", "-C", "src", "--mapping", "-",
-            "--into", "dst", "-n", "--results", "raw.ndjson", "-q", stdin=MAPPING_MANIFEST)
+            "--into", "dst", "--copy-metadata=mtime", "-n", "--results", "raw.ndjson", "-q",
+            stdin=MAPPING_MANIFEST)
         normalize(directory / "raw.ndjson", "dry-run.ndjson")
 
         # refused: --prune finds more destination-only entries than --max-delete
