@@ -155,6 +155,12 @@ impl Request {
                     && http::HeaderValue::from_str(value).is_ok(),
                 "invalid storage signing header"
             );
+            anyhow::ensure!(
+                !name.starts_with("x-amz-object-lock-")
+                    && !name.starts_with("x-amz-bucket-object-lock-")
+                    && name != "x-amz-bypass-governance-retention",
+                "storage authorization does not permit Object Lock or retention bypass headers"
+            );
         }
         let query = &request.query;
         let allowed = if query.get("list-type").is_some_and(|v| v == "2") {
