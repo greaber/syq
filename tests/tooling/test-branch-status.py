@@ -47,6 +47,7 @@ case "$1:$2" in
     ;;
   pr:list)
     case " $* " in
+      *" merged "*"--head "*) printf '%s\n' "${SYQ_TEST_BRANCH_MERGED_JSON:-${SYQ_TEST_MERGED_JSON:-[]}}"; exit 0 ;;
       *" merged "*) printf '%s\n' "${SYQ_TEST_MERGED_JSON:-[]}"; exit 0 ;;
     esac
     if [ "${SYQ_TEST_PR_JSON:-}" = FAIL ]; then
@@ -105,6 +106,7 @@ class BranchStatusTests(unittest.TestCase):
             "statusCheckRollup": [{"name": "rust", "status": "COMPLETED", "conclusion": "SUCCESS"},
                                   {"name": "macos", "status": "COMPLETED", "conclusion": "SKIPPED"}]}
         self.merged = []
+        self.branch_merged = None
         self.dispatched = {}
 
     def tearDown(self):
@@ -164,6 +166,8 @@ class BranchStatusTests(unittest.TestCase):
             stderr=subprocess.PIPE if split else subprocess.STDOUT,
             env={**os.environ, "SYQ_TEST_RUNS_DIR": str(self.runs),
                  "SYQ_TEST_MERGED_JSON": json.dumps(self.merged),
+                 "SYQ_TEST_BRANCH_MERGED_JSON": "" if self.branch_merged is None
+                 else json.dumps(self.branch_merged),
                  "SYQ_TEST_PR_JSON": "" if pr is None else pr if isinstance(pr, str) else json.dumps(pr),
                  "PATH": f"{self.fakebin}{os.pathsep}{os.environ['PATH']}"})
         self.assertEqual(result.returncode, expected, result.stdout + (result.stderr or ""))
@@ -401,6 +405,15 @@ class BranchStatusTests(unittest.TestCase):
         output = self.status()
         self.assertIn("  no failed or running checks", output)
         self.assertNotIn("WARNING", output)
+
+    def test_an_old_merge_of_this_branch_name_is_found_directly(self):
+        # The earlier pull request from this branch name is older than the recent
+        # merges shared with other branches, so it is looked up by name.
+        self.dispatch("ci.yml", 33, "2026-01-01T00:00:00Z", {"s3": "failure"})
+        self.branch_merged = [{"number": 2, "url": "https://example.invalid/pull/2",
+                               "headRefName": "task", "mergedAt": "2026-01-02T00:00:00Z",
+                               "isCrossRepository": False}]
+        self.assertIn("  no failed or running checks", self.status())
 
     def test_failure_left_by_a_merge_is_reported_until_a_full_run_on_master(self):
         self.dispatch("ci.yml", 41, "2026-02-01T00:00:00Z", {"s3": "failure"}, branch="merged-task")

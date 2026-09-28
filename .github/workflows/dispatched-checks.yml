@@ -8,7 +8,9 @@ name: Dispatched checks
 # ref) and never checks out or runs pull-request code.
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, labeled, unlabeled]
+    # `edited` includes a changed base, such as a stacked pull request
+    # retargeted to master after its base merged.
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled]
   workflow_run:
     workflows: [ci, macOS suite, rsync compatibility, Focused check]
     types: [completed]
@@ -32,8 +34,9 @@ jobs:
       github.event_name != 'workflow_run' ||
       (github.event.workflow_run.event == 'workflow_dispatch' &&
        github.event.workflow_run.head_branch != 'master')
-    # Evaluate one branch at a time so an older evaluation cannot overwrite a
-    # newer one. A newer pending evaluation reads the current state anyway.
+    # Evaluate one branch at a time so an older event-driven evaluation cannot
+    # overwrite a newer one. A newer pending evaluation reads the current state
+    # anyway. Manual runs have their own group; the next event corrects them.
     concurrency:
       group: dispatched-checks-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch || github.run_id }}
       cancel-in-progress: false

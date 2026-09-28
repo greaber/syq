@@ -23,7 +23,7 @@ import os
 import sys
 
 from dispatched_checks import (BRANCH_WORKFLOWS, branch_runs, dispatched_runs, failed_checks,
-                               fetch_jobs, in_parallel, merged_pull_requests, running)
+                               fetch_jobs, in_parallel, merged_from_branch, running)
 from tooling import ToolError, json_output, output, report_errors
 
 CONTEXT = "dispatched-checks"
@@ -72,31 +72,43 @@ def status(pr, failed, active):
     return "success", description, ""
 
 
+def post(repository, pr):
+    failed, active = [], []
+    if not pr.get("isCrossRepository"):
+        branch = pr.get("headRefName")
+        # Branch names get reused; only runs since this name's latest merge count.
+        runs = in_parallel([lambda: merged_from_branch(repository, branch)] + [
+            lambda workflow=workflow: dispatched_runs(repository, workflow, branch)
+            for workflow in BRANCH_WORKFLOWS])
+        runs = branch_runs([run for workflow_runs in runs[1:] for run in workflow_runs],
+                           branch, runs[0])
+        failed = failed_checks(runs, fetch_jobs(repository, [runs]))
+        active = running(runs)
+    state, description, url = status(pr, failed, active)
+    # GitHub limits a status description to 140 characters.
+    if len(description) > 140:
+        description = description[:139] + "…"
+    output("gh", "api", "--method", "POST",
+           f"repos/{repository}/statuses/{pr.get('headRefOid')}", "-f", f"state={state}",
+           "-f", f"context={CONTEXT}", "-f", f"description={description}",
+           *(["-f", f"target_url={url}"] if url else []), status=2)
+    print(f"#{pr.get('number')} {pr.get('headRefOid', '')[:7]}: {state}: {description}")
+
+
 def main():
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     if not repository:
         raise ToolError("GITHUB_REPOSITORY must name the repository", 2)
-    prs = selected_pull_requests(repository, sys.argv[1:])
-    merged = merged_pull_requests(repository) if prs else []
-    for pr in prs:
-        failed, active = [], []
-        if not pr.get("isCrossRepository"):
-            branch = pr.get("headRefName")
-            runs = [run for runs in in_parallel(
-                [lambda workflow=workflow: dispatched_runs(repository, workflow, branch)
-                 for workflow in BRANCH_WORKFLOWS]) for run in runs]
-            runs = branch_runs(runs, branch, merged)
-            failed = failed_checks(runs, fetch_jobs(repository, [runs]))
-            active = running(runs)
-        state, description, url = status(pr, failed, active)
-        # GitHub limits a status description to 140 characters.
-        if len(description) > 140:
-            description = description[:139] + "…"
-        output("gh", "api", "--method", "POST",
-               f"repos/{repository}/statuses/{pr.get('headRefOid')}", "-f", f"state={state}",
-               "-f", f"context={CONTEXT}", "-f", f"description={description}",
-               *(["-f", f"target_url={url}"] if url else []), status=2)
-        print(f"#{pr.get('number')} {pr.get('headRefOid', '')[:7]}: {state}: {description}")
+    # One pull request's failure must not leave the others without a status.
+    failures = []
+    for pr in selected_pull_requests(repository, sys.argv[1:]):
+        try:
+            post(repository, pr)
+        except ToolError as error:
+            print(f"error: #{pr.get('number')}: {error}", file=sys.stderr)
+            failures.append(pr.get("number"))
+    if failures:
+        raise ToolError(f"no status set for {', '.join(f'#{number}' for number in failures)}")
     return 0
 
 

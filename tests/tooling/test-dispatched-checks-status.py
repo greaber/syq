@@ -22,7 +22,8 @@ def option(name):
     return args[args.index(name) + 1] if name in args else None
 if args[:2] == ["pr", "list"]:
     if option("--state") == "merged":
-        print((data / "merged.json").read_text())
+        merged = json.loads((data / "merged.json").read_text())
+        print(json.dumps([pr for pr in merged if pr["headRefName"] == option("--head")]))
     else:
         prs = json.loads((data / "prs.json").read_text())
         head = option("--head")
@@ -34,7 +35,10 @@ elif args[:2] == ["run", "list"]:
     runs = json.loads((data / "runs.json").read_text()).get(option("--workflow"), [])
     print(json.dumps([run for run in runs if run["headBranch"] == option("--branch")]))
 elif args[:2] == ["run", "view"]:
-    print((data / f"jobs-{args[2]}.json").read_text())
+    path = data / f"jobs-{args[2]}.json"
+    if not path.exists():
+        sys.exit(f"simulated failure reading run {args[2]}")
+    print(path.read_text())
 elif args[:3] == ["api", "--method", "POST"]:
     fields = dict(value.split("=", 1) for value in args[5::2])
     with open(data / "posted.jsonl", "a") as posted:
@@ -146,6 +150,14 @@ class DispatchedChecksStatusTests(unittest.TestCase):
             run, head_repository={"full_name": "someone/fork"})}), [])
         # Without an event or numbers, every open pull request is evaluated.
         self.assertEqual(len(self.post()), 2)
+
+    def test_one_pull_request_error_does_not_stop_the_others(self):
+        self.prs.insert(0, {"number": 6, "headRefName": "broken", "headRefOid": "d" * 40,
+                            "isCrossRepository": False, "labels": [], "state": "OPEN"})
+        self.dispatch(61, "2026-02-01T00:00:00Z", {"s3": "failure"}, branch="broken")
+        (self.data / "jobs-61.json").unlink()
+        posted = self.post(expected=1)
+        self.assertEqual([entry["endpoint"][-40:] for entry in posted], ["a" * 40])
 
     def test_long_descriptions_fit_github(self):
         self.dispatch(51, "2026-02-01T00:00:00Z", {f"check {index}": "failure"

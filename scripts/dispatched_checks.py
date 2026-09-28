@@ -45,6 +45,14 @@ def merged_pull_requests(repository):
         raise ToolError("could not list merged pull requests", 2) from None
 
 
+def merged_from_branch(repository, branch):
+    """Merged pull requests from one branch name, however long ago."""
+    return [pr for pr in json_output(
+        "gh", "pr", "list", "--repo", repository, "--state", "merged", "--head", branch,
+        "--limit", "100", "--json", "number,url,headRefName,mergedAt,isCrossRepository",
+        status=2) if not pr.get("isCrossRepository")]
+
+
 def run_jobs(repository, run):
     return json_output("gh", "run", "view", str(run.get("databaseId")), "--repo", repository,
                        "--json", "jobs", status=2).get("jobs") or []

@@ -33,7 +33,8 @@ import subprocess
 import sys
 
 from dispatched_checks import (BRANCH_WORKFLOWS, branch_runs, dispatched_runs, failed_checks,
-                                fetch_jobs, in_parallel, merged_pull_requests, run_jobs,
+                                fetch_jobs, in_parallel, merged_from_branch,
+                                merged_pull_requests, run_jobs,
                                 running, undecided)
 from tooling import ToolError, json_output, output, report_errors
 
@@ -173,8 +174,11 @@ def report(json_report, check):
     # Post-merge runs select checks from the changed paths, so a later success
     # need not rerun an earlier failure. The nightly run covers the full suite
     # whenever test inputs changed since its last success.
+    # Branch names get reused, so this branch's own earlier merges are looked up
+    # directly rather than from the recent merges shared with other branches.
     lookups = [lambda: open_pull_request(branch) if branch != "HEAD" else None,
-               lambda: merged_pull_requests(REPOSITORY)]
+               lambda: merged_pull_requests(REPOSITORY),
+               lambda: merged_from_branch(REPOSITORY, branch) if branch != "HEAD" else []]
     lookups += [lambda workflow=workflow, event=event: master_run(workflow, event)
                 for workflow in WORKFLOWS for event in ("push", "schedule")]
     lookups += [lambda workflow=workflow: dispatched_runs(REPOSITORY, workflow)
@@ -183,9 +187,9 @@ def report(json_report, check):
     lookups += [lambda workflow=workflow: dispatched_runs(REPOSITORY, workflow, branch)
                 if branch != "HEAD" else [] for workflow in BRANCH_WORKFLOWS]
     results = in_parallel(lookups)
-    pr, merged = results[:2]
-    latest = iter(results[2:2 + 2 * len(WORKFLOWS)])
-    runs = {run.get("databaseId"): run for workflow_runs in results[2 + 2 * len(WORKFLOWS):]
+    pr, merged, own_merged = results[:3]
+    latest = iter(results[3:3 + 2 * len(WORKFLOWS)])
+    runs = {run.get("databaseId"): run for workflow_runs in results[3 + 2 * len(WORKFLOWS):]
             for run in workflow_runs}
     runs = list(runs.values())
     master_runs = []
@@ -214,7 +218,7 @@ def report(json_report, check):
     # Failed dispatched checks on this branch, and those merged branches left behind.
     # A merged branch needs its jobs read only while its failing workflows have
     # had no full run on master since the merge.
-    own_runs = branch_runs(runs, branch, merged) if branch != "HEAD" else []
+    own_runs = branch_runs(runs, branch, own_merged) if branch != "HEAD" else []
     merged_runs = [(merged_pr, branch_runs(runs, merged_pr.get("headRefName"), merged,
                                            merged_pr.get("mergedAt") or ""))
                    for merged_pr in merged]
