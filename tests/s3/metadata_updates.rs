@@ -374,7 +374,7 @@ fn metadata_updates_keep_reported_lock_settings_and_do_not_drop_rejected_protect
         "metadata-update-large-lock-denied",
     ] {
         for upload in [false, true] {
-            run_metadata_update(fault, upload, &[], true);
+            run_metadata_update(fault, upload, "--s3-write-header", &[], true);
         }
     }
 }
