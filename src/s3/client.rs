@@ -1287,6 +1287,18 @@ pub(super) fn metadata_update_request(
     for (name, value) in metadata {
         request = request.header(&format!("x-amz-meta-{name}"), &value);
     }
+    // A metadata-only copy creates a new version. Repeat any lock settings
+    // the service disclosed so that the new version keeps that protection.
+    // Services reject dates in the past; expired retention no longer protects
+    // this version. Legal hold is independent and still needs to be repeated.
+    let expired_retention = head.object_lock_retain_until_date().is_some_and(|until| {
+        *until <= aws_smithy_types::DateTime::from(std::time::SystemTime::now())
+    });
+    let retain_until = head
+        .object_lock_retain_until_date()
+        .filter(|_| !expired_retention)
+        .map(|time| time.fmt(aws_smithy_types::date_time::Format::DateTime))
+        .transpose()?;
     for (name, value) in [
         ("content-type", head.content_type()),
         ("content-encoding", head.content_encoding()),
@@ -1314,6 +1326,21 @@ pub(super) fn metadata_update_request(
         (
             "x-amz-website-redirect-location",
             head.website_redirect_location(),
+        ),
+        (
+            "x-amz-object-lock-mode",
+            head.object_lock_mode()
+                .filter(|_| !expired_retention)
+                .map(|mode| mode.as_str()),
+        ),
+        (
+            "x-amz-object-lock-retain-until-date",
+            retain_until.as_deref(),
+        ),
+        (
+            "x-amz-object-lock-legal-hold",
+            head.object_lock_legal_hold_status()
+                .map(|hold| hold.as_str()),
         ),
     ] {
         if let Some(value) = value {
@@ -1410,6 +1437,70 @@ pub(super) async fn copy_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn metadata_update_keeps_reported_object_lock_settings() {
+        use aws_sdk_s3::{
+            operation::head_object::HeadObjectOutput,
+            types::{ObjectLockLegalHoldStatus, ObjectLockMode},
+        };
+        use aws_smithy_types::{date_time::Format, DateTime};
+
+        for (mode, until) in [
+            (None, None),
+            (
+                Some(ObjectLockMode::Governance),
+                Some("2099-02-03T04:05:06.123Z"),
+            ),
+            (
+                Some(ObjectLockMode::Compliance),
+                Some("2099-02-03T04:05:06.123Z"),
+            ),
+            (
+                Some(ObjectLockMode::Compliance),
+                Some("2000-01-01T00:00:00Z"),
+            ),
+        ] {
+            for hold in [
+                None,
+                Some(ObjectLockLegalHoldStatus::On),
+                Some(ObjectLockLegalHoldStatus::Off),
+            ] {
+                let head = HeadObjectOutput::builder()
+                    .e_tag("destination")
+                    .set_object_lock_mode(mode.clone())
+                    .set_object_lock_retain_until_date(
+                        until.map(|time| DateTime::from_str(time, Format::DateTime).unwrap()),
+                    )
+                    .set_object_lock_legal_hold_status(hold.clone())
+                    .build();
+                let request =
+                    super::metadata_update_request("bucket", "key", &head, Default::default(), &[])
+                        .unwrap();
+                let expired = until == Some("2000-01-01T00:00:00Z");
+                for (name, expected) in [
+                    (
+                        "x-amz-object-lock-mode",
+                        mode.as_ref().filter(|_| !expired).map(|mode| mode.as_str()),
+                    ),
+                    (
+                        "x-amz-object-lock-retain-until-date",
+                        until.filter(|_| !expired),
+                    ),
+                    (
+                        "x-amz-object-lock-legal-hold",
+                        hold.as_ref().map(|hold| hold.as_str()),
+                    ),
+                ] {
+                    assert_eq!(
+                        request.headers.get(name).map(String::as_str),
+                        expected,
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn metadata_update_keeps_reported_storage_and_encryption_settings() {
         use aws_sdk_s3::{

@@ -79,6 +79,31 @@ pub(super) fn serve(
                 ("x-amz-meta-syq-mtime".into(), "10".into()),
                 ("x-amz-meta-syq-mtime-nsec".into(), "0".into()),
             ];
+            if fault.contains("lock") {
+                if !fault.contains("hold-only") {
+                    fields.push((
+                        "x-amz-object-lock-mode".into(),
+                        if source { "GOVERNANCE" } else { "COMPLIANCE" }.into(),
+                    ));
+                    fields.push((
+                        "x-amz-object-lock-retain-until-date".into(),
+                        if source {
+                            "2099-01-01T00:00:00Z"
+                        } else if fault.contains("expired") {
+                            "2000-01-01T00:00:00Z"
+                        } else {
+                            "2099-02-03T04:05:06.123Z"
+                        }
+                        .into(),
+                    ));
+                }
+                if !fault.contains("retention-only") {
+                    fields.push((
+                        "x-amz-object-lock-legal-hold".into(),
+                        if source { "OFF" } else { "ON" }.into(),
+                    ));
+                }
+            }
             for (name, id) in [
                 ("uid", unsafe { libc::geteuid() }),
                 ("gid", unsafe { libc::getegid() }),
@@ -97,6 +122,10 @@ pub(super) fn serve(
         }
         "POST" if target.contains("uploads") => {
             check_metadata(headers, fault);
+            if fault.ends_with("lock-denied") {
+                reply(socket, 403, &[], b"<Error><Code>AccessDenied</Code><Message>lock permission required</Message></Error>", false);
+                return;
+            }
             assert_eq!(headers["x-amz-tagging"], "keep=destination%20tag");
             reply(socket, 200, &[], b"<InitiateMultipartUploadResult><UploadId>metadata-update</UploadId></InitiateMultipartUploadResult>", false);
         }
@@ -123,6 +152,10 @@ pub(super) fn serve(
                 );
             } else {
                 check_metadata(headers, fault);
+                if fault.ends_with("lock-denied") {
+                    reply(socket, 403, &[], b"<Error><Code>AccessDenied</Code><Message>lock permission required</Message></Error>", false);
+                    return;
+                }
                 assert_eq!(headers["x-amz-tagging-directive"], "COPY");
                 gate.1.store(true, Ordering::Relaxed);
                 reply(
@@ -152,6 +185,26 @@ pub(super) fn serve(
 }
 
 fn check_metadata(headers: &std::collections::HashMap<String, String>, fault: &str) {
+    for (name, expected) in [
+        ("x-amz-object-lock-mode", "COMPLIANCE"),
+        (
+            "x-amz-object-lock-retain-until-date",
+            "2099-02-03T04:05:06.123Z",
+        ),
+        ("x-amz-object-lock-legal-hold", "ON"),
+    ] {
+        let present = fault.contains("lock")
+            && if name.ends_with("legal-hold") {
+                !fault.contains("retention-only")
+            } else {
+                !fault.contains("hold-only") && !fault.contains("expired")
+            };
+        assert_eq!(
+            headers.get(name).map(String::as_str),
+            present.then_some(expected),
+            "{name}"
+        );
+    }
     let aes = fault.ends_with("aes");
     assert_eq!(
         headers["x-amz-server-side-encryption"],
@@ -307,6 +360,26 @@ fn metadata_encryption_overrides_work_for_single_and_multipart_copies() {
 }
 
 #[test]
+fn metadata_updates_keep_reported_lock_settings_and_do_not_drop_rejected_protection() {
+    for fault in [
+        "metadata-update-small-lock",
+        "metadata-update-large-lock",
+        "metadata-update-small-lock-hold-only",
+        "metadata-update-large-lock-hold-only",
+        "metadata-update-small-lock-retention-only",
+        "metadata-update-large-lock-retention-only",
+        "metadata-update-small-lock-expired",
+        "metadata-update-large-lock-expired",
+        "metadata-update-small-lock-denied",
+        "metadata-update-large-lock-denied",
+    ] {
+        for upload in [false, true] {
+            run_metadata_update(fault, upload, &[], true);
+        }
+    }
+}
+
+#[test]
 fn incomplete_metadata_blocks_only_requested_metadata_updates() {
     for fault in [
         "metadata-update-small-missing",
@@ -363,7 +436,10 @@ fn run_metadata_update(
     command.args(["--s3-write-header", &format!("{}: yes", super::WRITE_PROBE)]);
     let output = command.capture_output().unwrap();
     let text = output_text(&output);
-    let rejected = update && (fault.ends_with("missing") || fault.ends_with("conflict"));
+    let rejected = update
+        && (fault.ends_with("missing")
+            || fault.ends_with("conflict")
+            || fault.ends_with("lock-denied"));
     assert_eq!(
         output.status.success(),
         !rejected,
@@ -372,6 +448,8 @@ fn run_metadata_update(
     if rejected {
         let expected = if fault.ends_with("missing") {
             "x-amz-missing-meta"
+        } else if fault.ends_with("lock-denied") {
+            "lock permission required"
         } else {
             "conflicting S3 header encryption settings"
         };

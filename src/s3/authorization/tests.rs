@@ -442,3 +442,23 @@ fn uploads_can_update_their_own_metadata_but_cannot_copy_other_destination_keys(
         .permits(&Unsigned::new("GET", "allowed/a").query("tagging", ""))
         .is_err());
 }
+
+#[test]
+fn metadata_self_copy_with_object_lock_stays_within_upload_authority() {
+    let mut permission = approval();
+    permission.create_only = false;
+    let request = Unsigned::new("PUT", "allowed/file")
+        .header("x-amz-copy-source", "fixture/allowed/file")
+        .header("x-amz-object-lock-mode", "COMPLIANCE")
+        .header(
+            "x-amz-object-lock-retain-until-date",
+            "2099-02-03T04:05:06Z",
+        )
+        .header("x-amz-object-lock-legal-hold", "ON");
+    permission.permits(&request).unwrap();
+    permission.create_only = true;
+    assert!(permission.permits(&request).is_err());
+    permission.create_only = false;
+    permission.upload = false;
+    assert!(permission.permits(&request).is_err());
+}

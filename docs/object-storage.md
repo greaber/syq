@@ -103,8 +103,14 @@ away from KMS drops inherited KMS settings. Incompatible explicit encryption set
 refuses the update if the service reports that it omitted existing metadata from
 its response, because replacing that metadata could lose entries. These rules
 apply to multipart metadata updates too. The update changes S3 Last-Modified and
-creates a new version when bucket versioning is enabled. Object ACLs, Object Lock
-settings, and custom KMS encryption contexts are not preserved by this operation.
+creates a new version when bucket versioning is enabled. Syq repeats any Object
+Lock retention mode, expiry, and legal-hold status returned by the service.
+Expired retention is omitted; bucket defaults can apply to the new version.
+Legal hold is kept independently of retention expiry. If setting those
+protections requires permissions you lack, the update fails; syq
+does not retry without them. Services can omit these fields when you lack
+permission to read them, so unreported settings cannot be preserved. Object ACLs
+and custom KMS encryption contexts are not preserved by this operation.
 
 New or changed uploads and bucket copies use the provider's storage and encryption
 defaults unless overridden with `--s3-write-header`. On AWS general-purpose buckets,
