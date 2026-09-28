@@ -25,14 +25,18 @@ Exit status: 0 when nothing needs attention; 1 when a dispatched check on this
 branch failed, the GitHub head is stale or unrelated, or a --check step failed
 or changed worktree status; 2 on usage/tooling errors or HEAD moving during
 checks (stderr diagnostic, no report, even with --json). The pull request's
-check rollup is informational.
+check rollup is reported as is; its required `dispatched-checks` status
+reflects the same dispatched failures this script reports.
 """
-from concurrent.futures import ThreadPoolExecutor
 import json
 import shutil
 import subprocess
 import sys
 
+from dispatched_checks import (BRANCH_WORKFLOWS, branch_runs, dispatched_runs, failed_checks,
+                                fetch_jobs, in_parallel, merged_from_branch,
+                                merged_pull_requests, run_jobs,
+                                running, undecided)
 from tooling import ToolError, json_output, output, report_errors
 
 REPOSITORY = "greaber/syq"
@@ -46,19 +50,11 @@ BASELINE = [
 ]
 CHANGE_CODES = {"M", "A", "D", "R", "C", "T"}
 UNFINISHED = ("queued", "in_progress", "pending", "waiting", "requested")
-# Workflows whose manually dispatched runs test task branches. A check is one job
-# name in one workflow; focused jobs carry their test or script in the name.
-BRANCH_WORKFLOWS = ("ci.yml", "macos.yml", "rsync-compat.yml", "focused-check.yml")
 # The full-suite master workflows whose next success covers a merged failure.
 # Focused scripts can run anything, so they wait for both native suites.
 CLEARED_BY = {"ci.yml": ("ci.yml",), "macos.yml": ("macos.yml",),
               "rsync-compat.yml": ("rsync-compat.yml",),
               "focused-check.yml": ("ci.yml", "macos.yml")}
-FAILED = ("failure", "timed_out")
-# How far back to look for merged branches: dispatched runs per workflow and
-# merged pull requests. The current branch's runs are queried separately.
-DISPATCHED_RUNS = 100
-MERGED_PULL_REQUESTS = 30
 
 
 def git(*args):
@@ -86,12 +82,6 @@ def ahead_behind(range_):
     return int(ahead), int(behind)
 
 
-def in_parallel(calls):
-    """The results of independent GitHub lookups, in order."""
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        return [future.result() for future in [pool.submit(call) for call in calls]]
-
-
 def master_run(workflow, event):
     """The latest run of a workflow on master for one trigger."""
     runs = json_output("gh", "run", "list", "--repo", REPOSITORY, "--workflow", workflow,
@@ -116,25 +106,6 @@ def run_state(workflow, run, kind, note):
     return state
 
 
-def dispatched_runs(workflow, branch=None):
-    """Recent manually dispatched runs of a branch workflow, on one or any branch."""
-    return [dict(run, workflow=workflow) for run in json_output(
-        "gh", "run", "list", "--repo", REPOSITORY, "--workflow", workflow, "--event",
-        "workflow_dispatch", *(["--branch", branch] if branch else []), "--limit",
-        str(DISPATCHED_RUNS), "--json",
-        "databaseId,headBranch,headSha,createdAt,status,conclusion,url", status=2)]
-
-
-def merged_pull_requests():
-    try:
-        return [pr for pr in json_output(
-            "gh", "pr", "list", "--repo", REPOSITORY, "--state", "merged", "--limit",
-            str(MERGED_PULL_REQUESTS), "--json", "number,url,headRefName,mergedAt,isCrossRepository",
-            status=2) if not pr.get("isCrossRepository")]
-    except ToolError:
-        raise ToolError("could not list merged pull requests", 2) from None
-
-
 def open_pull_request(branch):
     """The branch's open pull request; an empty list means none, a failure is an error."""
     try:
@@ -147,43 +118,6 @@ def open_pull_request(branch):
     return prs[0] if prs else None
 
 
-def run_jobs(run):
-    return json_output("gh", "run", "view", str(run.get("databaseId")), "--repo", REPOSITORY,
-                       "--json", "jobs", status=2).get("jobs") or []
-
-
-def undecided(runs):
-    """A branch's runs from the first unsuccessful or unfinished one on, oldest
-    first; only these can hold a failure that no later run passed. GitHub marks
-    a run cancelled when any job was cancelled, even if another job failed."""
-    runs = sorted(runs, key=lambda run: run.get("createdAt") or "")
-    first = next((index for index, run in enumerate(runs) if run.get("status") != "completed"
-                  or run.get("conclusion") != "success"), len(runs))
-    return runs[first:]
-
-
-def branch_runs(runs, branch, merged, until=None):
-    """A branch's runs since an earlier pull request from the same branch name
-    merged, and up to `until` (a merge time) when given."""
-    since = max((pr.get("mergedAt") or "" for pr in merged if pr.get("headRefName") == branch
-                 and (until is None or (pr.get("mergedAt") or "") < until)), default="")
-    return [run for run in runs if run.get("headBranch") == branch
-            and since < (run.get("createdAt") or "") and (until is None or run["createdAt"] <= until)]
-
-
-def failed_checks(runs, jobs):
-    """Failed checks that no later run passed, given each undecided run's jobs."""
-    latest = {}
-    for run in undecided(runs):
-        for job in jobs[run.get("databaseId")]:
-            if job.get("conclusion") in FAILED + ("success",):
-                latest[run["workflow"], job.get("name")] = job, run
-    return [{"workflow": workflow, "job": name, "conclusion": job.get("conclusion"),
-             "head": run.get("headSha") or "", "url": job.get("url") or run.get("url")}
-            for (workflow, name), (job, run) in latest.items()
-            if job.get("conclusion") in FAILED]
-
-
 def latest_full_run(workflow):
     """When the latest successful full-suite run of a workflow on master started.
     Only nightly and manual runs can be full, so busy days of pushes don't
@@ -194,7 +128,8 @@ def latest_full_run(workflow):
         status=2)]
     for run in sorted(runs, key=lambda run: run.get("createdAt") or "", reverse=True):
         if run.get("conclusion") == "success":
-            passed = {job.get("name") for job in run_jobs(run) if job.get("conclusion") == "success"}
+            passed = {job.get("name") for job in run_jobs(REPOSITORY, run)
+                      if job.get("conclusion") == "success"}
             if "release-certification" in passed and "nightly-unchanged" not in passed:
                 return run.get("createdAt") or ""
     return ""
@@ -240,19 +175,22 @@ def report(json_report, check):
     # Post-merge runs select checks from the changed paths, so a later success
     # need not rerun an earlier failure. The nightly run covers the full suite
     # whenever test inputs changed since its last success.
+    # Branch names get reused, so this branch's own earlier merges are looked up
+    # directly rather than from the recent merges shared with other branches.
     lookups = [lambda: open_pull_request(branch) if branch != "HEAD" else None,
-               merged_pull_requests]
+               lambda: merged_pull_requests(REPOSITORY),
+               lambda: merged_from_branch(REPOSITORY, branch) if branch != "HEAD" else []]
     lookups += [lambda workflow=workflow, event=event: master_run(workflow, event)
                 for workflow in WORKFLOWS for event in ("push", "schedule")]
-    lookups += [lambda workflow=workflow: dispatched_runs(workflow)
+    lookups += [lambda workflow=workflow: dispatched_runs(REPOSITORY, workflow)
                 for workflow in BRANCH_WORKFLOWS]
     # The recent runs on every branch can crowd out this branch's older ones.
-    lookups += [lambda workflow=workflow: dispatched_runs(workflow, branch)
+    lookups += [lambda workflow=workflow: dispatched_runs(REPOSITORY, workflow, branch)
                 if branch != "HEAD" else [] for workflow in BRANCH_WORKFLOWS]
     results = in_parallel(lookups)
-    pr, merged = results[:2]
-    latest = iter(results[2:2 + 2 * len(WORKFLOWS)])
-    runs = {run.get("databaseId"): run for workflow_runs in results[2 + 2 * len(WORKFLOWS):]
+    pr, merged, own_merged = results[:3]
+    latest = iter(results[3:3 + 2 * len(WORKFLOWS)])
+    runs = {run.get("databaseId"): run for workflow_runs in results[3 + 2 * len(WORKFLOWS):]
             for run in workflow_runs}
     runs = list(runs.values())
     master_runs = []
@@ -281,7 +219,7 @@ def report(json_report, check):
     # Failed dispatched checks on this branch, and those merged branches left behind.
     # A merged branch needs its jobs read only while its failing workflows have
     # had no full run on master since the merge.
-    own_runs = branch_runs(runs, branch, merged) if branch != "HEAD" else []
+    own_runs = branch_runs(runs, branch, own_merged) if branch != "HEAD" else []
     merged_runs = [(merged_pr, branch_runs(runs, merged_pr.get("headRefName"), merged,
                                            merged_pr.get("mergedAt") or ""))
                    for merged_pr in merged]
@@ -295,14 +233,9 @@ def report(json_report, check):
 
     merged_runs = [(merged_pr, [run for run in pr_runs if not cleared(
         run["workflow"], merged_pr.get("mergedAt") or "")]) for merged_pr, pr_runs in merged_runs]
-    undecided_runs = {run.get("databaseId"): run
-                      for pr_runs in [own_runs] + [pr_runs for _, pr_runs in merged_runs]
-                      for run in undecided(pr_runs)}
-    jobs = dict(zip(undecided_runs, in_parallel(
-        [lambda run=run: run_jobs(run) for run in undecided_runs.values()])))
+    jobs = fetch_jobs(REPOSITORY, [own_runs] + [pr_runs for _, pr_runs in merged_runs])
     branch_failed = failed_checks(own_runs, jobs)
-    branch_running = sorted((run for run in own_runs if run.get("status") != "completed"),
-                            key=lambda run: run.get("createdAt") or "")
+    branch_running = running(own_runs)
     for entry in branch_failed:
         warn(f"{entry['workflow']} {entry['job']} {entry['conclusion']} at {entry['head'][:7]} on "
              f"this branch, and no later run passed it {entry['url']}")

@@ -9,6 +9,7 @@ permissions:
   actions: write
   contents: write
   pull-requests: write
+  statuses: write
 
 concurrency:
   group: prepare-python-sdk-release
@@ -131,6 +132,10 @@ jobs:
             --title "Prepare Python SDK $PYTHON_VERSION" \
             --body "$body")
           echo "Created $pr_url"
+          # Pull requests opened with this token start no workflows, so post the
+          # status that branch protection requires. A new automation branch has
+          # no dispatched checks, so it succeeds.
+          scripts/dispatched-checks-status.py "${pr_url##*/}"
           head_sha=$(git rev-parse HEAD)
           gh pr merge "$pr_url" --merge --match-head-commit "$head_sha"
           merge_sha=$(gh pr view "$pr_url" --json mergeCommit,state --jq \
