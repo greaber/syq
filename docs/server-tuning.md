@@ -78,12 +78,10 @@ allowance when lowering it.
 
 ## Reduce allocation contention
 
-Concurrent writers can compete for filesystem allocation locks. On XFS,
-four-group defaults can limit concurrent SSD transfers. Check with `xfs_info`;
-when creating a filesystem, consider [more allocation groups](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html).
-512 is one example, not an optimum: a wide range of higher counts performed
-similarly in our tests. Tradeoffs depend on filesystem size and workload,
-especially when nearly full. Don't reformat a filesystem that performs well.
+XFS filesystems with only four allocation groups can bottleneck concurrent SSD
+transfers. [More allocation groups](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html)
+can reduce contention. 512 is one example; our tests found similar performance
+across a wide range of higher counts.
 
 ## Measure and track improvements
 
