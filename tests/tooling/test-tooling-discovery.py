@@ -5,10 +5,12 @@ from support import SCRIPTS
 import contextlib
 import importlib.util
 import io
+import os
 from pathlib import Path
 import signal
 import tempfile
 import unittest
+from unittest import mock
 
 from tooling import ToolError
 
@@ -34,6 +36,75 @@ class DiscoveryTests(unittest.TestCase):
                 (root / "test-a.py").write_text("pass\n")
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(runner.run_tests(runner.discover(root), root), 0)
+            finally:
+                for sig, handler in handlers.items():
+                    signal.signal(sig, handler)
+
+    def test_quick_selection_runs_harness_and_leaves_new_tests_in_full_suite(self):
+        with tempfile.TemporaryDirectory(prefix="syq-quick-tests-") as temporary:
+            root = Path(temporary)
+            tooling = root / "tests/tooling"
+            tooling.mkdir(parents=True)
+            quick = tooling / "test-quick.py"
+            quick.write_text("from pathlib import Path; Path('quick-ran').touch()\n")
+            extra = tooling / "test-new.py"
+            extra.write_text("raise AssertionError('expensive test ran')\n")
+            harness = root / runner.HARNESS
+            harness.parent.mkdir(parents=True)
+            harness.write_text("from pathlib import Path; Path('harness-ran').touch()\n")
+            with mock.patch.object(runner, "QUICK_TESTS", (
+                    "tests/tooling/test-quick.py", str(runner.HARNESS))):
+                selected = runner.select_tests(root, quick=True)
+                self.assertEqual(selected, [quick, harness])
+                self.assertEqual(set(runner.select_tests(root)), {quick, extra, harness})
+                handlers = {sig: signal.getsignal(sig) for sig in runner.ForwardSignals.SIGNALS}
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(runner.run_tests(selected, root), 0)
+                    self.assertTrue((root / "quick-ran").is_file())
+                    self.assertTrue((root / "harness-ran").is_file())
+                finally:
+                    for sig, handler in handlers.items():
+                        signal.signal(sig, handler)
+                quick.unlink()
+                with self.assertRaisesRegex(ToolError, "not in the full suite"):
+                    runner.select_tests(root, quick=True)
+            harness.unlink()
+            with self.assertRaisesRegex(ToolError, "test not found"):
+                runner.select_tests(root)
+
+    def test_python_children_cache_imports_despite_the_callers_environment(self):
+        with tempfile.TemporaryDirectory(prefix="syq-bytecode-test-") as temporary:
+            root = Path(temporary)
+            (root / "probe.py").write_text("VALUE = 42\n")
+            (root / "nested.py").write_text("VALUE = 43\n")
+            test = root / "test-cache.py"
+            test.write_text(
+                "import probe, subprocess, sys\n"
+                "assert not sys.dont_write_bytecode\n"
+                "assert probe.VALUE == 42\n"
+                "subprocess.run([sys.executable, '-c', 'import nested; assert nested.VALUE == 43'], "
+                "check=True)\n"
+            )
+            ambient = {"PYTHONDONTWRITEBYTECODE": "1",
+                       "PYTHONPYCACHEPREFIX": str(root / "shell-cache")}
+            handlers = {sig: signal.getsignal(sig) for sig in runner.ForwardSignals.SIGNALS}
+            try:
+                with mock.patch.dict(os.environ, ambient), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(runner.run_tests([test], root), 0)
+                    cache = root / "target/python-cache"
+                    compiled = [path for name in ("probe", "nested")
+                                for path in cache.rglob(f"{name}.*.pyc")]
+                    self.assertEqual(len(compiled), 2)
+                    for path in compiled:
+                        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+                    self.assertEqual(runner.run_tests([test], root), 0)
+                    self.assertTrue(all(path.stat().st_mtime_ns == 1_000_000_000
+                                        for path in compiled), "cached imports were rewritten")
+                    self.assertFalse((root / "shell-cache").exists())
+                    self.assertFalse((root / "__pycache__").exists())
+                    self.assertEqual(os.environ["PYTHONDONTWRITEBYTECODE"], "1")
+                    self.assertEqual(os.environ["PYTHONPYCACHEPREFIX"], ambient["PYTHONPYCACHEPREFIX"])
             finally:
                 for sig, handler in handlers.items():
                     signal.signal(sig, handler)

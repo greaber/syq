@@ -63,6 +63,7 @@ jobs:
       # (scope_commit) expect the stable check names.
       skip_unselected: ${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/master' && inputs.scope_commit == '' }}
       all_tooling: ${{ steps.changes.outputs.all_tooling }}
+      quick_tooling: ${{ steps.changes.outputs.quick_tooling }}
       s3: ${{ steps.changes.outputs.s3 }}
       repository_checks: ${{ steps.changes.outputs.repository_checks }}
       macos_intel: ${{ steps.changes.outputs.macos_intel }}
@@ -136,7 +137,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python${{ needs.scope.outputs.all_tooling == 'true' && '-node' || '' }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python${{ (needs.scope.outputs.all_tooling == 'true' || needs.scope.outputs.quick_tooling == 'true') && '-node' || '' }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         if: >-
           needs.scope.outputs.native == 'true' ||
@@ -147,7 +148,7 @@ jobs:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
         run: |
           scripts/setup.sh github shellcheck jq python
-          if [[ "${{ needs.scope.outputs.all_tooling }}" == true ]]; then
+          if [[ "${{ needs.scope.outputs.all_tooling }}" == true || "${{ needs.scope.outputs.quick_tooling }}" == true ]]; then
             scripts/setup.sh github node
           fi
       - name: Show Linux trial hardware
@@ -237,6 +238,11 @@ jobs:
           (needs.scope.outputs.native != 'true' ||
            needs.scope.outputs.full_suite != 'true')
         run: cargo test --locked --test local _md_
+      - name: Run cheap tooling checks
+        if: >-
+          needs.scope.outputs.quick_tooling == 'true' &&
+          needs.scope.outputs.all_tooling != 'true'
+        run: scripts/run-tooling-tests.py --quick
       - name: Test every repository tooling script
         if: needs.scope.outputs.all_tooling == 'true'
         run: scripts/run-tooling-tests.py
@@ -302,7 +308,8 @@ jobs:
           scripts/check-script-references.py
       - name: Lint tracked shell scripts
         if: >-
-          needs.scope.outputs.tooling == 'true' ||
+          (needs.scope.outputs.tooling == 'true' &&
+           (needs.scope.outputs.quick_tooling != 'true' || needs.scope.outputs.all_tooling == 'true')) ||
           needs.scope.outputs.shellcheck == 'true' ||
           (needs.scope.outputs.native == 'true' &&
            needs.scope.outputs.full_suite == 'true')

@@ -524,8 +524,25 @@ scripts; passing Rust checks does not cover shell lint. Inspect worktree changes
 after validation and commit intended generated changes before reporting the
 validated SHA.
 
-Choose checks from the behavior changed, not every workflow available. For a
-narrow change confined to one test or its private fixture, run formatting and
+Use test cost as well as relevance when choosing pre-merge checks. For changes
+to code, tooling, tests, or executable documentation, run
+`scripts/run-tooling-tests.py --quick` once on the final relevant changes after
+loading the pinned setup environment. This inexpensive group catches accidental
+tooling breakage. Pure prose changes can use their focused documentation checks.
+Reuse a passing result when later edits cannot affect it; do not repeat it just
+because review starts or master advances. Prefer the local command over
+`ci.yml` with `suites=quick` when runner-specific evidence is unnecessary.
+
+Keep moderate and expensive checks selective. Account for compilation, setup,
+runner queues, and fixture costs as well as test execution. Inspect all changed
+executable scripts for coverage, including incidental edits in a rename. The
+quick group does not cover every script or replace focused runtime tests. Run
+additional checks when their coverage justifies their cost; reserve broad suites
+for uncertainty that cheaper checks cannot resolve. Full tooling discovery and
+nightly/release validation continue to run the slower tests.
+
+Choose additional checks from the behavior changed, not every workflow available.
+For a narrow change confined to one test or its private fixture, run formatting and
 that exact test on the affected platform. The full Rust baseline below is not
 required for that case. Broaden only when shared fixtures, runtime code, or a
 concrete unresolved risk makes other tests relevant. Do not dispatch a full

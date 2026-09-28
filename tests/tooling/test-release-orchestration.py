@@ -364,6 +364,19 @@ class EventScopeTests(Scratch):
         self.assertScope(self.scope(event=dispatch, cwd=self.repo,
                                     env=dict(branch, SYQ_CI_DOCUMENTATION_ONLY="true")),
                          rust_label="mapping-docs")
+        scope = self.scope(event=dispatch, cwd=self.repo,
+                           env=dict(branch, SYQ_CI_SUITES="quick"))
+        self.assertScope(scope, rust_label="tooling:quick", quick_tooling="true", tooling="true",
+                         tooling_checks="", all_tooling="false", native="false",
+                         shellcheck="false", conformance="false", full_suite="false",
+                         s3="false", python_sdk="false", mapping_docs="false")
+        for names in ("quick tooling", "tooling quick"):
+            scope = self.scope(event=dispatch, cwd=self.repo,
+                               env=dict(branch, SYQ_CI_SUITES=names))
+            self.assertScope(scope, rust_label="tooling:all", quick_tooling="true",
+                             all_tooling="true",
+                             native="false", full_suite="false")
+            self.assertEqual(set(scope["tooling_checks"].split()), set(ALL_TOOLING.split()))
         # Path classification and full runs never select suites.
         self.assertScope(self.scope("src/main.rs"), suite_selection="false", s3="false",
                          real_ssh_matrix="[]", rust_label="native:bin", all_tooling="false")

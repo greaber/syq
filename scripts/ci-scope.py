@@ -36,6 +36,7 @@ REAL_SSH = {
 # Suites that ci.yml's `suites` input can select, as the scope outputs each sets.
 SUITES = {
     "rust": {"native": True, "integration_targets": "all"},
+    "quick": {"tooling": True, "quick_tooling": True},
     "tooling": {"tooling": True, "tooling_checks": ALL_TOOLING, "all_tooling": True},
     "shellcheck": {"shellcheck": True},
     "mapping-docs": {"mapping_docs": True},
@@ -54,6 +55,7 @@ def run_everything():
         "suite_selection=false",
         "rust_label=full",
         "all_tooling=true",
+        "quick_tooling=false",
         "s3=true",
         "repository_checks=true",
         "macos_intel=true",
@@ -150,6 +152,7 @@ def rust_label(selection):
         parts.append("native:" + ",".join(selection["integration_targets"].split() or ["bin"]))
     if selection["tooling"]:
         parts.append("tooling:" + ("all" if selection.get("all_tooling") else
+                                   "quick" if selection.get("quick_tooling") else
                                    ",".join(selection["tooling_checks"].split())))
     parts += [name for name, key in (("shellcheck", "shellcheck"), ("mapping-docs", "mapping_docs"))
               if selection[key]]
@@ -170,7 +173,7 @@ def select_suites(names):
     selection = {"native": False, "sdks": False, "python_sdk": False, "tooling": False,
                  "shellcheck": False, "mapping_docs": False, "linux_arm64": False,
                  "macos": False, "macos_intel": False, "s3": False, "repository_checks": False,
-                 "all_tooling": False,
+                 "all_tooling": False, "quick_tooling": False,
                  "integration_targets": "", "tooling_checks": "", "real_ssh": []}
     for name in names:
         for key, value in SUITES[name].items():
@@ -238,7 +241,7 @@ def main():
     print(f"integration_targets={selection['integration_targets']}")
     # Only full runs and selected suites run these.
     print(f"rust_label={rust_label(selection)}")
-    print("suite_selection=false\nall_tooling=false\ns3=false\n"
+    print("suite_selection=false\nall_tooling=false\nquick_tooling=false\ns3=false\n"
           "repository_checks=false\nmacos_intel=false\nreal_ssh_matrix=[]")
     print("CI scope: " + " ".join(f"{key}={str(selection[key]).lower()}" for key in keys),
           file=sys.stderr)
