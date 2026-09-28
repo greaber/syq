@@ -2119,6 +2119,9 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
                 let message = match argument.as_str() {
                     "--only-new" => Some("--only-new is not a syq cp option; use --if-exists=keep to leave existing files unchanged"),
                     "--skip-newer" => Some("--skip-newer is not a syq cp option; use --if-exists=update-if-older to keep newer destination files"),
+                    "--preserve" if argv.iter().any(|arg| arg == "--preserve=-mtime")
+                        || argv.windows(2).any(|args| args[0] == "--preserve" && args[1] == "-mtime") =>
+                        Some("--preserve=-mtime is not a syq cp option; creating or updating file contents sets the source timestamp and cannot be disabled"),
                     "--preserve" => Some("--preserve is not a syq cp option; use --copy-metadata to select source metadata to apply, including on unchanged files"),
                     _ => None,
                 };

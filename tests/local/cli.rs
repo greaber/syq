@@ -609,17 +609,31 @@ fn unsupported_rsync_flags_explain_themselves() {
 fn unsupported_copy_options_suggest_relevant_controls() {
     let t = Tmp::new();
     write(&t.path("src"), b"data");
-    for (option, control) in [
-        ("--only-new", "--if-exists=keep"),
-        ("--skip-newer", "--if-exists=update-if-older"),
-        ("--preserve=mtime", "--copy-metadata"),
-        ("--preserve=-mtime", "--copy-metadata"),
+    for (options, control) in [
+        (&["--only-new"][..], "--if-exists=keep"),
+        (&["--skip-newer"][..], "--if-exists=update-if-older"),
+        (&["--preserve=mtime"][..], "--copy-metadata"),
+        (
+            &["--preserve=-mtime"][..],
+            "sets the source timestamp and cannot be disabled",
+        ),
+        (
+            &["--preserve", "-mtime"][..],
+            "sets the source timestamp and cannot be disabled",
+        ),
     ] {
-        let output = native_syq(&["cp", &t.s("src"), "--as", &t.s("dst"), option]);
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let mut args = vec!["cp", &src, "--as", &dst];
+        args.extend_from_slice(options);
+        let output = native_syq(&args);
         assert_eq!(output.status.code(), Some(2), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("is not a syq cp option"), "{stderr}");
         assert!(stderr.contains(control), "{stderr}");
+        if options.iter().any(|arg| arg.contains("-mtime")) {
+            assert!(!stderr.contains("--copy-metadata"), "{stderr}");
+        }
         for history in ["removed", "former", "replacement", "migrat"] {
             assert!(!stderr.contains(history), "{stderr}");
         }
