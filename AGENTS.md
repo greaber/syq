@@ -530,8 +530,8 @@ to code, tooling, tests, or executable documentation, run
 loading the pinned setup environment. This inexpensive group catches accidental
 tooling breakage. Pure prose changes can use their focused documentation checks.
 Reuse a passing result when later edits cannot affect it; do not repeat it just
-because review starts or master advances. Prefer the local command when
-runner-specific evidence is unnecessary.
+because review starts or master advances. Prefer the local command over
+`ci.yml` with `suites=quick` when runner-specific evidence is unnecessary.
 
 Keep moderate and expensive checks selective. Account for compilation, setup,
 runner queues, and fixture costs as well as test execution. Inspect all changed
