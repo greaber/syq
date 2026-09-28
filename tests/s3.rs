@@ -1587,32 +1587,27 @@ fn serve(
             assert_eq!(headers["x-amz-meta-syq-mtime-nsec"], "456");
         }
 
-        if matches!(fault, "upload-default" | "upload-metadata") {
-            assert_eq!(headers["x-amz-meta-syq-format"], "1");
-            assert!(!headers.contains_key("x-amz-meta-syq-hash"));
+        let digest = if fault == "upload-md5" {
+            md5::Md5::digest(&body)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         } else {
-            let digest = if fault == "upload-md5" {
-                md5::Md5::digest(&body)
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
+            sha2::Sha256::digest(&body)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(headers["x-amz-meta-syq-format"], "2");
+        assert_eq!(headers["x-amz-meta-syq-hash"], digest);
+        assert_eq!(
+            headers["x-amz-meta-syq-hash-algorithm"],
+            if fault == "upload-md5" {
+                "md5"
             } else {
-                sha2::Sha256::digest(&body)
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            };
-            assert_eq!(headers["x-amz-meta-syq-format"], "2");
-            assert_eq!(headers["x-amz-meta-syq-hash"], digest);
-            assert_eq!(
-                headers["x-amz-meta-syq-hash-algorithm"],
-                if fault == "upload-md5" {
-                    "md5"
-                } else {
-                    "sha256"
-                }
-            );
-        }
+                "sha256"
+            }
+        );
         gate.0.store(true, Ordering::Release);
         reply(
             &mut socket,

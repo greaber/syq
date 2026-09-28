@@ -3,6 +3,7 @@ mod authorization;
 mod fast;
 mod pruning;
 mod server_copy;
+mod upload_hashes;
 
 use super::{
     admission::parallel,
@@ -26,7 +27,6 @@ use aws_sdk_s3::{
 };
 use aws_smithy_types::byte_stream::Length;
 use futures_util::{stream, StreamExt};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::{
@@ -810,7 +810,7 @@ impl Engine {
             "destination contents differ: {} (--if-exists=error-if-different)",
             source.key
         );
-        let whole_algorithm = expected_hash.map(|d| d.algorithm).or_else(|| {
+        let requested_algorithm = expected_hash.map(|d| d.algorithm).or_else(|| {
             if self.args.transfer_integrity {
                 Some(self.args.transfer_hash_type.unwrap_or_default())
             } else if self.args.checksum {
@@ -820,7 +820,7 @@ impl Engine {
             }
         });
         let can_compare_time = source.metadata.is_none_or(|m| m.mtime.is_none());
-        if whole_algorithm.is_none()
+        if requested_algorithm.is_none()
             && can_compare_time
             && existing
                 .as_ref()
@@ -837,16 +837,26 @@ impl Engine {
                 .prepare_accepted_upload(source, existing.as_ref().unwrap())
                 .await;
         }
-        let comparison_algorithm = existing
+        let comparable = existing
             .as_ref()
-            .and_then(|object| self.stored_comparison_hash(object))
-            .map_or(self.args.hash_algorithm, |(algorithm, _)| algorithm);
-        let whole_algorithm =
-            whole_algorithm.or_else(|| protected_existing.then_some(comparison_algorithm));
+            .filter(|o| o.kind() == source.kind() && o.size == size);
+        let stored_hash = comparable.and_then(|o| self.stored_comparison_hash(o));
+        let comparison_algorithm = (source.kind() != ObjectKind::Dir
+            && comparable.is_some()
+            && (self.args.checksum || protected_existing || stored_hash.is_some()))
+        .then(|| stored_hash.map_or(self.args.hash_algorithm, |(algorithm, _)| algorithm));
         let part_size = self.part_size(size);
         if part_size > 5 * 1024 * 1024 * 1024 {
             bail!("file exceeds the S3 multipart size limit");
         }
+        let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
+        let whole_algorithm = requested_algorithm.unwrap_or_else(|| {
+            if size <= part_size {
+                upload_hashes::native_algorithm(algorithm)
+            } else {
+                HashAlgorithm::Blake3
+            }
+        });
         let buffer_limit = if self.tuning.tigris() {
             8 << 20
         } else {
@@ -869,13 +879,11 @@ impl Engine {
         };
         self.check_cancelled()?;
         let source_clone = source.clone();
-        let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
-        let (whole_digest, checksums, small) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (hashes, small) = tokio::task::spawn_blocking(move || -> Result<_> {
             if source_clone.kind() != ObjectKind::File {
                 let bytes = source_clone.bytes()?;
                 return Ok((
-                    whole_algorithm.map(|a| Digest::hash_bytes(a, &bytes).value),
-                    vec![algorithm.digest(&bytes)],
+                    upload_hashes::bytes(&bytes, algorithm, whole_algorithm, comparison_algorithm),
                     Some(bytes::Bytes::from(bytes)),
                 ));
             }
@@ -885,23 +893,8 @@ impl Engine {
                 let mut bytes = vec![0; size as usize];
                 file.read_exact(&mut bytes)?;
                 source_clone.check(&file)?;
-                let native_algorithm = if algorithm.is_sha256() {
-                    HashAlgorithm::Sha256
-                } else {
-                    HashAlgorithm::Md5
-                };
-                let hash = native_algorithm.hash(&bytes);
-                let checksum = encode_native_parts(native_algorithm, &[hash]).remove(0);
-                let whole = whole_algorithm.map(|a| {
-                    if a == native_algorithm {
-                        Digest::from_hash(a, &hash).value
-                    } else {
-                        Digest::hash_bytes(a, &bytes).value
-                    }
-                });
                 return Ok((
-                    whole,
-                    vec![checksum],
+                    upload_hashes::bytes(&bytes, algorithm, whole_algorithm, comparison_algorithm),
                     Some(bytes::Bytes::from_owner(fast::UploadBuffer {
                         bytes,
                         _reservation: reservation,
@@ -909,96 +902,34 @@ impl Engine {
                     })),
                 ));
             }
-            // Independent native part checksums provide both upload validation
-            // and resume identity. A whole-file hash is optional unless requested.
-            let native_algorithm = match algorithm {
-                Algorithm::Sha256 => HashAlgorithm::Sha256,
-                Algorithm::Md5 => HashAlgorithm::Md5,
-            };
-            let reuse_native = size <= part_size && whole_algorithm == Some(native_algorithm);
-            if size <= part_size || size < 32 * 1024 * 1024 {
-                // For small files, feed every required digest from one read.
-                // Large multipart files retain independent parallel hash work.
-                let mut file = source_clone.open()?;
-                let mut whole = whole_algorithm
-                    .filter(|_| !reuse_native)
-                    .map(HashAlgorithm::hasher);
-                let mut buffer = vec![0; 1024 * 1024];
-                let mut parts = Vec::new();
-                let mut remaining = size;
-                for _ in 0..size.div_ceil(part_size).max(1) {
-                    let mut part = native_algorithm.hasher();
-                    let mut left = remaining.min(part_size);
-                    while left > 0 {
-                        let n = buffer.len().min(left as usize);
-                        file.read_exact(&mut buffer[..n])?;
-                        part.update(&buffer[..n]);
-                        if let Some(whole) = &mut whole {
-                            whole.update(&buffer[..n]);
-                        }
-                        left -= n as u64;
-                    }
-                    parts.push(part.finalize());
-                    remaining = remaining.saturating_sub(part_size);
-                }
-                source_clone.check(&file)?;
-                let whole = if reuse_native {
-                    Some(Digest::from_hash(native_algorithm, &parts[0]).value)
-                } else {
-                    whole.map(|h| Digest::from_hash(whole_algorithm.unwrap(), &h.finalize()).value)
-                };
-                return Ok((whole, encode_native_parts(native_algorithm, &parts), None));
-            }
-            let (whole, parts) = rayon::join(
-                || -> Result<Option<String>> {
-                    whole_algorithm
-                        .filter(|_| !reuse_native)
-                        .map(|a| local::hash_file_as(source_clone.open()?, a))
-                        .transpose()
-                },
-                || {
-                    (0..size.div_ceil(part_size).max(1))
-                        .into_par_iter()
-                        .map(|index| {
-                            let file = source_clone.open()?;
-                            let offset = index * part_size;
-                            let length = part_size.min(size.saturating_sub(offset));
-                            let mut buffer = vec![0; 1024 * 1024];
-                            let mut hash = native_algorithm.hasher();
-                            let mut done = 0;
-                            while done < length {
-                                let n = buffer.len().min((length - done) as usize);
-                                file.read_exact_at(&mut buffer[..n], offset + done)?;
-                                hash.update(&buffer[..n]);
-                                done += n as u64;
-                            }
-                            source_clone.check(&file)?;
-                            Ok(hash.finalize())
-                        })
-                        .collect::<Result<Vec<_>>>()
-                },
-            );
-            let parts = parts?;
-            let whole = if reuse_native {
-                Some(Digest::from_hash(native_algorithm, &parts[0]).value)
-            } else {
-                whole?
-            };
-            let checksums = encode_native_parts(native_algorithm, &parts);
-            source_clone.check(&source_clone.open()?)?;
-            Ok((whole, checksums, None))
+            let file = source_clone.open()?;
+            let hashes = upload_hashes::ranges(
+                size,
+                part_size,
+                algorithm,
+                whole_algorithm,
+                comparison_algorithm,
+                |buffer, offset| Ok(file.read_exact_at(buffer, offset)?),
+            )?;
+            source_clone.check(&file)?;
+            Ok((hashes, None))
         })
         .await??;
+        let upload_hashes::Hashes {
+            whole: whole_digest,
+            comparison: comparison_digest,
+            checksums,
+        } = hashes;
         if let Some(expected) = expected_hash {
-            if !whole_digest
-                .as_ref()
-                .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected.value))
-            {
+            if !whole_digest.eq_ignore_ascii_case(&expected.value) {
                 bail!("source does not match expected hash");
             }
         }
-        let mut metadata = source.metadata(whole_digest.clone());
-        metadata.hash_algorithm = whole_algorithm.unwrap_or(HashAlgorithm::Blake3);
+        let store_hash = source.kind() != ObjectKind::Dir || requested_algorithm.is_some();
+        let mut metadata = source.metadata(store_hash.then_some(whole_digest));
+        if store_hash {
+            metadata.hash_algorithm = whole_algorithm;
+        }
         let digest = upload_identity(algorithm, size, part_size, &checksums);
         let mut same_contents = existing.as_ref().is_some_and(|o| {
             o.kind() == source.kind()
@@ -1009,36 +940,15 @@ impl Engine {
                             (m.mtime, m.nsec) == (source.meta.mtime, source.meta.mtime_nsec)
                         })))
         });
-        if source.kind() != ObjectKind::Dir
-            && (self.args.checksum || (protected_existing && !same_contents))
-        {
-            if let Some(object) = &existing {
-                let algorithm = comparison_algorithm;
-                let source_hash = if whole_algorithm == Some(algorithm) {
-                    whole_digest.clone().unwrap()
-                } else {
-                    let source = source.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if source.kind() == ObjectKind::File {
-                            local::hash_file_as(source.open()?, algorithm)
-                        } else {
-                            Ok(Digest::hash_bytes(algorithm, &source.bytes()?).value)
-                        }
-                    })
-                    .await??
-                };
-                let destination_hash = match object
-                    .metadata
-                    .as_ref()
-                    .filter(|m| m.hash_algorithm == algorithm)
-                    .and_then(|m| m.hash.clone())
-                {
-                    Some(hash) => hash,
+        if self.args.checksum || !same_contents {
+            if let (Some(object), Some(algorithm), Some(source_hash)) =
+                (comparable, comparison_algorithm, comparison_digest)
+            {
+                let destination_hash = match stored_hash {
+                    Some((_, hash)) => hash.to_owned(),
                     None => self.remote_hash_as(object, algorithm).await?,
                 };
-                same_contents = object.kind() == source.kind()
-                    && object.size == size
-                    && source_hash.eq_ignore_ascii_case(&destination_hash);
+                same_contents = source_hash.eq_ignore_ascii_case(&destination_hash);
             }
         }
         if same_contents && expected_hash.is_some() {

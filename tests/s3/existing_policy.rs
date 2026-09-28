@@ -383,6 +383,55 @@ fn stored_hashes_avoid_comparison_downloads() {
 }
 
 #[test]
+fn default_upload_reuses_stored_hash_and_uploads_only_on_mismatch() {
+    for fault in [
+        "existing-policy-hash-blake3",
+        "existing-policy-hash-sha256",
+        "existing-policy-hash-md5",
+    ] {
+        for different in [false, true] {
+            let temp = test_support::tempdir().unwrap();
+            let server = Server::start(fault);
+            let local = temp.path().join("local");
+            file(&local, if different { b"change" } else { b"stored" }, 20);
+            let output = server.cp(
+                temp.path(),
+                &["local", "--to", "s3://bucket", "--as", "object"],
+            );
+            assert!(output.status.success(), "{fault}: {}", output_text(&output));
+            assert!(
+                !server.gate.0.load(Ordering::Relaxed),
+                "comparison downloaded {fault}"
+            );
+            assert_eq!(server.gate.1.load(Ordering::Relaxed), different);
+            assert_eq!(
+                server.requests.load(Ordering::Relaxed),
+                if different { 2 } else { 1 }
+            );
+            assert_eq!(std::fs::metadata(local).unwrap().mtime(), 20);
+        }
+    }
+}
+
+#[test]
+fn explicit_upload_hash_keeps_its_algorithm_when_stored_hash_differs() {
+    let temp = test_support::tempdir().unwrap();
+    let server = Server::start("existing-policy-hash-sha256");
+    file(&temp.path().join("local"), b"stored", 20);
+    let output = server.cp(
+        temp.path(),
+        &["local", "--to", "s3://bucket", "--as", "object", "--hash"],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        server.gate.0.load(Ordering::Relaxed),
+        "explicit BLAKE3 must read the object without a BLAKE3 hash"
+    );
+    assert!(!server.gate.1.load(Ordering::Relaxed));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn default_download_reuses_stored_hash_without_changing_mtime() {
     for fault in [
         "existing-policy-hash-blake3",
