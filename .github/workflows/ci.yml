@@ -294,7 +294,9 @@ jobs:
         if: >-
           needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' branch ')
-        run: tests/tooling/test-branch-status.py
+        run: |
+          tests/tooling/test-branch-status.py
+          tests/tooling/test-dispatched-checks-status.py
       - name: Test the development setup
         if: >-
           needs.scope.outputs.all_tooling != 'true' &&

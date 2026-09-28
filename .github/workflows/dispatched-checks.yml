@@ -1,0 +1,63 @@
+name: Dispatched checks
+
+# Sets the `dispatched-checks` status that branch protection requires on pull
+# requests: it fails while a check dispatched on the branch has failed and no
+# later run of it passed. The `merge-despite-failures` label overrides it.
+# This workflow only reads GitHub state and writes commit statuses. It checks
+# out the default branch's tooling (or, when dispatched manually, the selected
+# ref) and never checks out or runs pull-request code.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+  workflow_run:
+    workflows: [ci, macOS suite, rsync compatibility, Focused check]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pull_requests:
+        description: Pull request numbers to evaluate (space-separated; empty evaluates every open one)
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  status:
+    # Only manually dispatched runs on task branches affect the status.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.event == 'workflow_dispatch' &&
+       github.event.workflow_run.head_branch != 'master')
+    # Evaluate one branch at a time so an older evaluation cannot overwrite a
+    # newer one. A newer pending evaluation reads the current state anyway.
+    concurrency:
+      group: dispatched-checks-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch || github.run_id }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
+      - name: Set the status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUESTS: ${{ inputs.pull_requests }}
+        # Numbers stay data: word splitting of digits cannot run anything.
+        run: |
+          [[ "$PULL_REQUESTS" =~ ^[0-9\ ]*$ ]] || { echo 'Pull request numbers only.' >&2; exit 2; }
+          # shellcheck disable=SC2086
+          scripts/dispatched-checks-status.py $PULL_REQUESTS

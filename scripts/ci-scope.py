@@ -359,7 +359,9 @@ def classify(paths, preparation_only):
             path_tooling_checks.append("benchmark")
         elif matches(path, "scripts/run-focused-check.py", "tests/tooling/test-run-focused-check.py"):
             path_tooling_checks.append("focused")
-        elif matches(path, "scripts/branch-status.py", "tests/tooling/test-branch-status.py"):
+        elif matches(path, "scripts/branch-status.py", "tests/tooling/test-branch-status.py",
+                     "scripts/dispatched_checks.py", "scripts/dispatched-checks-status.py",
+                     "tests/tooling/test-dispatched-checks-status.py"):
             path_tooling_checks.append("branch")
         elif matches(path, "scripts/setup.sh", "tests/tooling/test-setup.sh"):
             path_tooling_checks.append("setup")
