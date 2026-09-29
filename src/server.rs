@@ -1168,15 +1168,17 @@ fn accept_data_connections(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 // Wake as soon as a peer connects; a sleep here delayed every
                 // data connection. The timeout keeps the closure checks above.
-                let mut ready = libc::pollfd {
-                    fd: std::os::fd::AsRawFd::as_raw_fd(&listener),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                unsafe { libc::poll(&mut ready, 1, 25) };
+                crate::sys::wait_readable(
+                    std::os::fd::AsRawFd::as_raw_fd(&listener),
+                    Duration::from_millis(25),
+                );
                 continue;
             }
-            Err(_) => continue,
+            // Back off rather than spin on persistent errors such as EMFILE.
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
         };
         let handshake_deadline = std::time::Instant::now() + Duration::from_secs(10);
         let id = next_id.fetch_add(1, Relaxed);
