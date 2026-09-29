@@ -822,8 +822,12 @@ fn attempt_small_copy(
         .map(|actor| actor.span(crate::transfer_observations::Stage::Work));
     let copying = progress.copying_interval();
     let mut source_reader = None;
+    // Preparation selects the destination directory on the receiver. After
+    // that, a rejected copy leaves the session changed, so it cannot decline.
+    let mut prepared = false;
     let response = match dst_ctl.call(Request::PrepareSmallFiles(request))? {
         Response::SmallFilesPrepared(needed) => {
+            prepared = true;
             if needed.len() != entries.len() {
                 bail!("small copy returned a mismatched selection count");
             }
@@ -948,6 +952,22 @@ fn attempt_small_copy(
             return Ok(SmallCopy::Reconnect);
         }
         Response::SmallFilesCopied(_) => bail!("small copy returned a mismatched result count"),
+        // The receiver rejected the payloads, for example after a payload
+        // check failed. Nothing was written, but the directory stays selected;
+        // the ordinary engine copies these files again on a new session.
+        Response::Err(_) | Response::EndpointError(_) if prepared => {
+            if debug() {
+                let message = match &response {
+                    Response::Err(error) => error.clone(),
+                    Response::EndpointError(error) => error.message.clone(),
+                    _ => unreachable!(),
+                };
+                crate::output::diagnostic!(
+                    "syq: small copy failed ({message}); using the ordinary engine on a new control connection"
+                );
+            }
+            return Ok(SmallCopy::Reconnect);
+        }
         // The receiver could not select the directory; the engine's own
         // preflight reproduces and reports that condition.
         Response::Err(error) => {
