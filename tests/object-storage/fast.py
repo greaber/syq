@@ -29,7 +29,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"hello")
                 self.wfile.flush()
                 download_started.set()
-                assert self.rfile.read(1) == b""
+                # The cancelled client closes its socket: an orderly EOF, or a
+                # reset when unread response bytes were still queued.
+                try:
+                    assert self.rfile.read(1) == b""
+                except ConnectionResetError:
+                    pass
                 download_finished.set()
                 return
             self.wfile.write(b"bad" if scenario=="download-truncated" else b"hello world")
