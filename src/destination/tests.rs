@@ -844,7 +844,24 @@ fn named_tcp_workers_obey_limits_and_revocation() {
             assert!(Instant::now() < deadline, "copy did not revoke its workers");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(worker.call(Request::TransportStats).is_err());
+        // Revocation closes admission before the watcher shuts down TCP. A
+        // request racing that watcher can receive a refusal before EOF.
+        let (closed, observed) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            if let Ok(response) = worker.call(Request::TransportStats) {
+                assert!(
+                    matches!(response, Response::Err(ref error)
+                        if error.contains("transfer control is closed or expired")),
+                    "revoked worker accepted a request: {response:?}"
+                );
+                assert!(worker.recv().is_err(), "revoked TCP worker did not close");
+            }
+            closed.send(()).unwrap();
+        });
+        observed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("revoked TCP worker did not close");
+        reader.join().unwrap();
         assert!(tcp::open(spec.restricted_grant.as_deref().unwrap(), vec![7; 32]).is_err());
         assert!(connect(spec.restricted_grant.as_deref().unwrap(), false).is_err());
     }
