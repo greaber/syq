@@ -104,20 +104,44 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
         reader.read_msg::<Response>().unwrap(),
         Response::HelloOk { .. }
     ));
+    let target = root.path().join("target");
+    let copy_id = CopyId::default();
+    writer
+        .write_msg(&Request::Prepare {
+            path: target.as_os_str().as_bytes().to_vec(),
+            size: 4,
+            inplace: false,
+            copy_id,
+            mode: 0o600,
+            attempt: 0,
+            create_if_missing: true,
+            guard: None,
+        })
+        .unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::Prepared(_)
+    ));
+    let write = |data: &[u8]| Request::WriteRange {
+        path: target.as_os_str().as_bytes().to_vec(),
+        inplace: false,
+        copy_id,
+        attempt: 0,
+        off: 0,
+        hash: fsops::content_digest(data),
+        data: data.to_vec().into(),
+        guard: None,
+    };
+    writer.write_msg(&write(b"keep")).unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::Ok
+    ));
+    let partial = fsops::partial_path(&target, &copy_id).unwrap();
+    assert_eq!(std::fs::read(&partial).unwrap(), b"keep");
     authority.close_control();
     for _ in 0..2 {
-        writer
-            .write_msg(&Request::WriteRange {
-                path: b"file".to_vec(),
-                inplace: false,
-                copy_id: CopyId::default(),
-                attempt: 0,
-                off: 0,
-                hash: fsops::content_digest(b"data"),
-                data: b"data".to_vec().into(),
-                guard: None,
-            })
-            .unwrap();
+        writer.write_msg(&write(b"lost")).unwrap();
         assert!(
             matches!(reader.read_msg::<Response>().unwrap(), Response::Err(error) if error.contains("closed"))
         );
@@ -129,7 +153,8 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
     }
     socket.shutdown(std::net::Shutdown::Both).unwrap();
     server.join().unwrap();
-    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read(&partial).unwrap(), b"keep");
+    assert!(!target.exists(), "revoked writes must not publish the file");
 }
 
 #[test]

@@ -286,9 +286,9 @@ mod tests {
             guard: None,
         };
         first_writer.write_msg(&prepare("target/a", 1024)).unwrap();
-        assert!(!matches!(
+        assert!(matches!(
             first_reader.read_msg::<Response>().unwrap(),
-            Response::Err(_)
+            Response::Prepared(_)
         ));
         second_writer.write_msg(&prepare("target/b", 1)).unwrap();
         assert!(
@@ -315,12 +315,24 @@ mod tests {
             second_reader.read_msg::<Response>().unwrap(),
             Response::Err(_)
         ));
+        // Leave a worker slot free so the connection limit cannot mask a
+        // missing revocation check on admission.
+        drop(second_reader);
+        drop(second_writer);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while authority.state.lock().unwrap().live_connections != 1 {
+            assert!(Instant::now() < deadline, "worker permit was not released");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         authority.close_control();
         assert!(worker(&ticket, role()).is_err());
-        first_writer.write_msg(&prepare("target/c", 1)).unwrap();
+        // Repeat the preparation that succeeded before revocation. A new
+        // file would also exceed the exhausted byte budget and could mask a
+        // missing closed-control check.
+        first_writer.write_msg(&prepare("target/a", 1024)).unwrap();
         assert!(matches!(
             first_reader.read_msg::<Response>().unwrap(),
-            Response::Err(_)
+            Response::Err(message) if message.contains("control is closed or expired")
         ));
         let socket_path = broker.socket_path().to_path_buf();
         drop(broker);
