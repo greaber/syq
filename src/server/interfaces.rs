@@ -1,6 +1,4 @@
 //! Platform enumeration feeding shared data-address selection.
-#[cfg(target_os = "linux")]
-use crate::process::CommandExt as _;
 use std::net::IpAddr;
 
 fn is_virtual_iface(name: &str) -> bool {
@@ -75,14 +73,10 @@ pub(super) fn local_addrs(families: BoundFamilies) -> Vec<(String, u32)> {
 }
 
 #[cfg(target_os = "linux")]
-fn interface_addresses() -> Vec<InterfaceAddress> {
-    let text = std::process::Command::new("ip")
-        .args(["-o", "addr", "show"])
-        .capture_output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    parse_ip_addrs(&text, iface_speed)
-}
+#[path = "interfaces/linux.rs"]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux::interface_addresses;
 
 #[cfg(target_os = "macos")]
 #[path = "interfaces/macos.rs"]
@@ -160,67 +154,30 @@ fn usable_ip(ip: IpAddr) -> bool {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn parse_ip_addrs(text: &str, iface_speed: impl Fn(&str) -> u32) -> Vec<InterfaceAddress> {
-    let mut addrs = Vec::new();
-    for line in text.lines() {
-        // "3: bond0    inet 10.2.201.45/24 brd ... scope global bond0\ ..."
-        // "3: bond0    inet6 fdaa:0:1::2/112 scope global \ ..."
-        let f: Vec<&str> = line.split_whitespace().collect();
-        let Some(iface) = f.get(1) else {
-            continue;
-        };
-        let Some(family_at) = f.iter().position(|w| *w == "inet" || *w == "inet6") else {
-            continue;
-        };
-        let Some(ipcidr) = f.get(family_at + 1) else {
-            continue;
-        };
-        let scope = f
-            .iter()
-            .position(|w| *w == "scope")
-            .and_then(|at| f.get(at + 1))
-            .copied();
-        if scope != Some("global") {
-            continue;
-        }
-        // An address the kernel is still checking, or is retiring, is not a
-        // reliable route to advertise.
-        if f.iter().any(|w| *w == "tentative" || *w == "deprecated") {
-            continue;
-        }
-        let Some(ip) = ipcidr
-            .split('/')
-            .next()
-            .and_then(|ip| ip.parse::<IpAddr>().ok())
-        else {
-            continue;
-        };
-        addrs.push(InterfaceAddress {
-            name: (*iface).to_owned(),
-            ip,
-            speed_mbps: iface_speed(iface),
-        });
-    }
-    addrs
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    const IP_ADDR_SHOW: &str = "\
-1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
-1: lo    inet6 ::1/128 scope host noprefixroute \\       valid_lft forever preferred_lft forever
-2: eth0    inet 172.19.3.10/29 brd 172.19.3.15 scope global eth0\\       valid_lft forever preferred_lft forever
-2: eth0    inet6 fdaa:0:1:a7b::2/112 scope global \\       valid_lft forever preferred_lft forever
-2: eth0    inet6 2001:db8::2/64 scope global \\       valid_lft forever preferred_lft forever
-2: eth0    inet6 2001:db8::3/64 scope global tentative \\       valid_lft forever preferred_lft forever
-2: eth0    inet6 fe80::9e6b:ff:fe4e:89ad/64 scope link \\       valid_lft forever preferred_lft forever
-3: bond0    inet 10.2.201.45/24 brd 10.2.201.255 scope global bond0\\       valid_lft forever preferred_lft forever
-4: tailscale0    inet 100.101.102.103/32 scope global tailscale0\\       valid_lft forever preferred_lft forever
-4: tailscale0    inet6 fd7a:115c:a1e0::1234/128 scope global \\       valid_lft forever preferred_lft forever
-5: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever preferred_lft forever
-";
+    /// Usable and unusable addresses of the kinds interface listings return.
+    fn listing() -> Vec<InterfaceAddress> {
+        [
+            ("lo", "127.0.0.1"),
+            ("lo", "::1"),
+            ("eth0", "172.19.3.10"),
+            ("eth0", "fdaa:0:1:a7b::2"),
+            ("eth0", "2001:db8::2"),
+            ("eth0", "fe80::9e6b:ff:fe4e:89ad"),
+            ("bond0", "10.2.201.45"),
+            ("tailscale0", "100.101.102.103"),
+            ("tailscale0", "fd7a:115c:a1e0::1234"),
+            ("docker0", "172.17.0.1"),
+        ]
+        .map(|(name, ip)| InterfaceAddress {
+            name: name.into(),
+            ip: ip.parse().unwrap(),
+            speed_mbps: speeds(name),
+        })
+        .into()
+    }
 
     fn speeds(name: &str) -> u32 {
         match name {
@@ -234,7 +191,7 @@ mod tests {
     fn advertised_addrs_lists_both_families_with_ssh_arrival_first() {
         let ssh = "fdaa:0:1:a7b::2".parse().ok();
         let both = BoundFamilies { v4: true, v6: true };
-        let got = advertised_addrs(parse_ip_addrs(IP_ADDR_SHOW, speeds), ssh, both);
+        let got = advertised_addrs(listing(), ssh, both);
         assert_eq!(
             got,
             vec![
@@ -254,7 +211,7 @@ mod tests {
             v4: true,
             v6: false,
         };
-        let got = advertised_addrs(parse_ip_addrs(IP_ADDR_SHOW, speeds), None, v4);
+        let got = advertised_addrs(listing(), None, v4);
         assert!(got
             .iter()
             .all(|(ip, _)| ip.parse::<IpAddr>().unwrap().is_ipv4()));
@@ -262,25 +219,25 @@ mod tests {
         // The ssh arrival address is still advertised first, but only when a
         // listener of its family exists.
         let ssh = "fdaa:0:1:a7b::2".parse().ok();
-        let got = advertised_addrs(parse_ip_addrs(IP_ADDR_SHOW, speeds), ssh, v4);
+        let got = advertised_addrs(listing(), ssh, v4);
         assert!(!got.iter().any(|(ip, _)| ip.starts_with("fdaa")));
     }
 
     #[test]
     fn advertised_addrs_includes_ipoib_addresses_with_known_or_unknown_speed() {
-        let listing = "\
-    2: eth0    inet 192.0.2.2/24 scope global eth0
-    3: ib0    inet 192.0.2.3/24 scope global ib0
-    4: ib0.8001    inet6 2001:db8::4/64 scope global
-    4: ib0.8001    inet6 fe80::4/64 scope link
-    5: docker0    inet 172.17.0.1/16 scope global docker0
-    ";
         let both = BoundFamilies { v4: true, v6: true };
         let got = advertised_addrs(
-            parse_ip_addrs(listing, |name| match name {
-                "ib0" => 100_000,
-                "eth0" => 10_000,
-                _ => 0,
+            [
+                ("eth0", "192.0.2.2", 10_000),
+                ("ib0", "192.0.2.3", 100_000),
+                ("ib0.8001", "2001:db8::4", 0),
+                ("ib0.8001", "fe80::4", 0),
+                ("docker0", "172.17.0.1", 0),
+            ]
+            .map(|(name, ip, speed_mbps)| InterfaceAddress {
+                name: name.into(),
+                ip: ip.parse().unwrap(),
+                speed_mbps,
             }),
             None,
             both,

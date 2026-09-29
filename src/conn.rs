@@ -1596,7 +1596,9 @@ impl RemoteSpec {
         }
         let mut cmd = if self.local_process {
             let mut command = Command::new(std::env::current_exe()?);
-            command.args(&server_args);
+            // The same executable receives, so this internal flag is always
+            // understood; it keeps the data listener on loopback.
+            command.args(&server_args).arg("--local-receiver");
             command
         } else {
             if self
