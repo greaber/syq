@@ -1398,9 +1398,10 @@ impl FsOps {
                 bail!("guarded small-file updates require atomic publication");
             }
             let file = match condition {
+                // The whole file is written here and never read back.
                 TargetCondition::Absent => rooted
                     .root
-                    .create_file(&rooted.relative, meta.mode)
+                    .create_write_only_file(&rooted.relative, meta.mode)
                     .with_context(|| format!("create {}", rooted.label.display()))?,
                 TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
                     let file = rooted.root.open_regular_write(&rooted.relative, false)?;
@@ -1424,7 +1425,10 @@ impl FsOps {
                                 bail!("destination {} is a directory", rooted.label.display())
                             }
                             Some(_) => rooted.root.unlink(&rooted.relative)?,
-                            None => match rooted.root.create_file(&rooted.relative, meta.mode) {
+                            None => match rooted
+                                .root
+                                .create_write_only_file(&rooted.relative, meta.mode)
+                            {
                                 Ok(file) => {
                                     opened = Some(file);
                                     break;
