@@ -330,7 +330,9 @@ fn presigns_bind_the_payload_marker_and_write_condition() {
             .header("if-none-match", "*")
             .header(
                 "x-amz-checksum-sha256",
-                &crate::s3::checksum::Algorithm::Sha256.digest(b"abc"),
+                &crate::s3::checksum::Algorithm::Sha256
+                    .digest(b"abc")
+                    .unwrap(),
             ),
     ] {
         let url = url::Url::parse(&signer.sign(&request).unwrap()).unwrap();

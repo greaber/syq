@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Local fault-injection checks for automatic S3 transfers. No cloud credentials."""
-import base64, hashlib, shutil, http.server, json, os, pathlib, signal, subprocess, sys, tempfile, threading, time, urllib.parse
+import shutil, http.server, json, os, pathlib, signal, subprocess, sys, tempfile, threading, time, urllib.parse
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 events = []
 scenario = "upload"
@@ -41,7 +41,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             events.append(("create",time.monotonic())); self.respond(200,b"<InitiateMultipartUploadResult><UploadId>fixture</UploadId></InitiateMultipartUploadResult>")
     def do_PUT(self):
-        assert self.headers.get("x-amz-checksum-sha256")
+        # Ordinary uploads rely on HTTPS: no request checksum and no payload hash.
+        # The injected InvalidRequest failures are retried once with Content-MD5.
+        assert not any(k.lower().startswith("x-amz-checksum") for k in self.headers), self.headers
+        if self.headers.get("content-md5"):
+            assert scenario in ("upload-failure", "upload-single-failure"), (scenario, self.headers)
         part=int(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("partNumber",[0])[0])
         if part:
             assert not self.headers.get("x-amz-meta-syq-blake3")
@@ -49,18 +53,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             assert self.headers.get("x-amz-meta-syq-format")=="1"
             whole=self.headers["x-amz-meta-syq-blake3"]
             assert len(whole)==64 and int(whole,16)>=0, whole
-        # Single PUTs sign the precomputed SHA-256 digest; multipart parts use
-        # UNSIGNED-PAYLOAD and their separate checksum header.
-        expected_payload = "UNSIGNED-PAYLOAD" if part else base64.b64decode(self.headers["x-amz-checksum-sha256"]).hex()
-        assert self.headers.get("x-amz-content-sha256") == expected_payload
+        assert self.headers.get("x-amz-content-sha256") == "UNSIGNED-PAYLOAD"
         events.append(("put-start",time.monotonic(),part))
         upload_started.set()
         left=int(self.headers["Content-Length"])
-        digest=hashlib.sha256()
         while left:
             block=self.rfile.read(min(left,1024*1024))
             if not block: break
-            digest.update(block)
             left-=len(block)
         if scenario == "upload-interrupted":
             # Never acknowledge the request. The client must close its socket
@@ -70,7 +69,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 events.append(("put-end",time.monotonic(),part))
                 uploads_finished.notify_all()
             return
-        assert base64.b64encode(digest.digest()).decode()==self.headers["x-amz-checksum-sha256"]
+        assert not left, "short upload body"
         if part==2: time.sleep(.4)
         if scenario in ("upload-delayed", "upload-single-delayed"): time.sleep(7)
         events.append(("put-end",time.monotonic(),part))
