@@ -5545,9 +5545,12 @@ fn equality_windows_keep_the_same_destination_inode() {
         }
         other => panic!("unexpected responses {other:?}"),
     }
-    assert!(matches!(ops.handle(&request(1)), Response::Err(_)));
-    assert!(matches!(
-        ops.handle(&request(u64::MAX - block + 1)),
-        Response::Err(_)
-    ));
+    for off in [1, u64::MAX - block + 1] {
+        let response = ops.handle(&request(off));
+        assert!(
+            matches!(response, Response::Err(_) | Response::EndpointError(_)),
+            "{response:?}"
+        );
+        assert!(format!("{response:?}").contains("invalid hash interval"));
+    }
 }
