@@ -1631,6 +1631,26 @@ fn serve(
             reply(&mut socket, status, &[], b"", false);
             return;
         }
+        if fault == "upload-corrupt-once" && !gate.0.swap(true, Ordering::SeqCst) {
+            reply(
+                &mut socket,
+                400,
+                &[],
+                b"<Error><Code>BadDigest</Code><Message>The Content-MD5 you specified did not match what we received.</Message></Error>",
+                false,
+            );
+            return;
+        }
+        if fault == "upload-corrupt-once" {
+            reply(
+                &mut socket,
+                200,
+                &[("ETag".into(), "\"stored\"".into())],
+                b"",
+                false,
+            );
+            return;
+        }
         if fault == "upload-timeout-code-once" {
             if !gate.0.swap(true, Ordering::SeqCst) {
                 // S3 reports a slow request body as RequestTimeout with HTTP 400.
@@ -3520,6 +3540,36 @@ fn s3_upload_retries_request_timeout_error_codes_within_the_budget() {
             server.requests.load(Ordering::Relaxed),
             requests,
             "retries {retries}"
+        );
+    }
+}
+
+#[test]
+fn s3_upload_retries_corrupted_data_with_a_warning_within_the_budget() {
+    for (retries, expected_exit, requests) in [(1, 0, 3), (0, 23, 2)] {
+        let temp = crate::test_support::tempdir().unwrap();
+        std::fs::write(temp.path().join("source"), b"small body").unwrap();
+        let server = Server::start("upload-corrupt-once");
+        let output = server
+            .command_with_retries(temp.path(), retries)
+            .args(["--s3-endpoint", &server.address])
+            .args(["source", "--to", "s3://bucket", "--as", "object"])
+            .capture_output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "retries {retries}: {}",
+            output_text(&output)
+        );
+        // One HEAD, the PUT answered with BadDigest, and at most one resend.
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("syq: warning: object: the destination received corrupted data (BadDigest); retrying"),
+            retries > 0,
+            "{}",
+            output_text(&output)
         );
     }
 }

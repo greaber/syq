@@ -597,6 +597,7 @@ async fn upload(
         let comparison = comparison_digest(plan, &first.bytes);
         let _request = plan.session.requests.acquire().await?;
         let mut retry_with_md5 = false;
+        let mut corrupt_attempts = 0;
         let published = loop {
             let fallback = (algorithm == Algorithm::None
                 && (retry_with_md5 || plan.session.content_md5.load(Relaxed)))
@@ -630,6 +631,18 @@ async fn upload(
                         && super::checksum::requires_checksum(&e) =>
                 {
                     retry_with_md5 = true;
+                }
+                Err(e)
+                    if corrupt_attempts < options.retries
+                        && super::checksum::corrupted(&e).is_some() =>
+                {
+                    crate::output::diagnostic!(
+                        "syq: warning: {}: the destination received corrupted data ({}); retrying",
+                        plan.key,
+                        super::checksum::corrupted(&e).unwrap_or_default()
+                    );
+                    super::backoff(corrupt_attempts).await;
+                    corrupt_attempts += 1;
                 }
                 result => {
                     // Content-MD5 fixed the rejection, so send it from now on.
@@ -958,6 +971,7 @@ async fn upload_part(
     let comparison = comparison_digest(plan, &data.bytes);
     let _request = plan.session.requests.acquire().await?;
     let mut retry_with_md5 = false;
+    let mut corrupt_attempts = 0;
     let output = loop {
         let fallback = (algorithm == Algorithm::None
             && (retry_with_md5 || plan.session.content_md5.load(Relaxed)))
@@ -986,6 +1000,18 @@ async fn upload_part(
                     && super::checksum::requires_checksum(&e) =>
             {
                 retry_with_md5 = true;
+            }
+            Err(e)
+                if corrupt_attempts < plan.options.retries
+                    && super::checksum::corrupted(&e).is_some() =>
+            {
+                crate::output::diagnostic!(
+                    "syq: warning: {}: the destination received corrupted data in part {number} ({}); retrying",
+                    plan.key,
+                    super::checksum::corrupted(&e).unwrap_or_default()
+                );
+                super::backoff(corrupt_attempts).await;
+                corrupt_attempts += 1;
             }
             result => {
                 if result.is_ok() && fallback.is_some() {

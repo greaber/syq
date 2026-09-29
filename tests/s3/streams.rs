@@ -44,6 +44,10 @@ fn plain_http_stream_uploads_send_content_md5() {
     scenario("plain-http");
 }
 #[test]
+fn stream_uploads_resend_corrupted_data_with_a_warning() {
+    scenario("corrupt-once");
+}
+#[test]
 fn failed_parts_abort_multipart_upload() {
     scenario("upload-error");
 }
