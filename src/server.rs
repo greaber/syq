@@ -1166,7 +1166,14 @@ fn accept_data_connections(
             Ok((stream, _)) if stream.set_nonblocking(false).is_ok() => stream,
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(25));
+                // Wake as soon as a peer connects; a sleep here delayed every
+                // data connection. The timeout keeps the closure checks above.
+                let mut ready = libc::pollfd {
+                    fd: std::os::fd::AsRawFd::as_raw_fd(&listener),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe { libc::poll(&mut ready, 1, 25) };
                 continue;
             }
             Err(_) => continue,

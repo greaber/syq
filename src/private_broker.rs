@@ -274,7 +274,14 @@ fn accept_connections<F>(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(5));
+                // Wake as soon as a client or the shutdown connection arrives;
+                // a sleep here delayed every descriptor claim and every close.
+                let mut ready = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe { libc::poll(&mut ready, 1, 5) };
             }
             Err(_) => break,
         }
