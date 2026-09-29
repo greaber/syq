@@ -851,6 +851,7 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
 
     let mut stat = Request::StatMany {
         paths: vec![target.clone()],
+        identity_only: false,
         sources: None,
         follow: false,
         guard: Some(ContainerGuard {
@@ -887,6 +888,7 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
 
     let mut outside_stat = Request::StatMany {
         paths: vec![outside.clone()],
+        identity_only: false,
         sources: None,
         follow: false,
         guard: None,
@@ -962,6 +964,7 @@ fn exact_destination_observation_scope_excludes_its_parent() {
 
     let mut exact = Request::StatMany {
         paths: vec![destination],
+        identity_only: false,
         sources: None,
         follow: false,
         guard: None,
@@ -2496,6 +2499,7 @@ fn receipt_attests_confirmed_outcomes_and_closes_the_grant() {
     assert!(authority.issue_receipt().is_err());
     let mut observe = Request::StatMany {
         paths: vec![path_bytes(&kept)],
+        identity_only: false,
         sources: None,
         follow: false,
         guard: None,
@@ -3826,7 +3830,7 @@ fn authority_binds_one_encrypted_listener_and_known_metadata_flags() {
                 mtime: 0,
                 mtime_nsec: 0,
             },
-            flags: 0x80,
+            flags: proto::flags::REQUIRE_OWNER,
             condition: proto::TargetCondition::Any,
         }],
         guard: None,
@@ -3950,6 +3954,7 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
 
     let mut observation = Request::StatMany {
         paths: vec![target],
+        identity_only: false,
         sources: None,
         follow: false,
         guard: None,
@@ -3991,6 +3996,7 @@ fn directory_as_child_scope_does_not_authorize_unrelated_siblings() {
 
     let mut observe_container = Request::StatMany {
         paths: vec![target],
+        identity_only: false,
         sources: None,
         follow: false,
         guard: None,
@@ -4012,6 +4018,7 @@ fn entry_ceiling_survives_resubmission_of_a_rejected_path() {
             .as_os_str()
             .as_bytes()
             .to_vec()],
+        identity_only: false,
         sources: None,
         follow: false,
         guard: None,

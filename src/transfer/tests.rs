@@ -1932,6 +1932,7 @@ fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
     // both spellings exceeds the metadata frame boundary.
     let oversized = Request::StatMany {
         paths: jobs.iter().map(|job| job.src.clone()).collect(),
+        identity_only: false,
         sources: Some(jobs.iter().map(|job| job.source.clone()).collect()),
         follow: false,
         guard: None,

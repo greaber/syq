@@ -279,6 +279,7 @@ fn tcp_server_joins_request_reader_on_shutdown() {
     writer
         .write_msg(&Request::StatMany {
             paths: vec![selected.path().as_os_str().as_bytes().to_vec()],
+            identity_only: false,
             sources: None,
             follow: false,
             guard: Some(guard),

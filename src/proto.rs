@@ -729,6 +729,8 @@ pub enum WireRequest<Data> {
         /// used only outside a source session or by `--insecure-links`.
         sources: Option<Vec<RegisteredPath>>,
         follow: bool,
+        /// Return lstat identity without reading link targets or inode metadata.
+        identity_only: bool,
         guard: Option<ContainerGuard>,
     },
     /// Resolve an operator-supplied directory component by component. A

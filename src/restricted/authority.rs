@@ -1437,7 +1437,8 @@ impl RestrictedAuthority {
             | proto::flags::GROUP
             | proto::flags::TIMES
             | proto::flags::REQUIRE_OWNER
-            | proto::flags::REQUIRE_GROUP;
+            | proto::flags::REQUIRE_GROUP
+            | proto::flags::REPORT_IDENTITY;
         if flags & !known != 0 {
             bail!("request contains unknown metadata flags");
         }

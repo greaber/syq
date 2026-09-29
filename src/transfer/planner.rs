@@ -3858,7 +3858,19 @@ impl Planner<'_> {
                     .map(|(_, path)| path)
                     .collect();
                 if !paths.is_empty() {
-                    let observed = self.stat_many(paths.clone())?;
+                    let observed = match ok(
+                        self.dst.call(Request::StatMany {
+                            paths: paths.clone(),
+                            sources: None,
+                            follow: false,
+                            identity_only: true,
+                            guard: self.container_guard.clone(),
+                        })?,
+                        "record published identities",
+                    )? {
+                        Response::Stats(entries) if entries.len() == paths.len() => entries,
+                        other => bail!("unexpected publication identity response {other:?}"),
+                    };
                     if let Some(job) = &self.opts.resume_job {
                         job.published(paths.into_iter().zip(observed).filter_map(
                             |(path, entry)| entry.map(|entry| (path, (entry.dev, entry.ino))),

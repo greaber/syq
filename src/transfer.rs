@@ -3932,6 +3932,7 @@ fn stat_many_registered(
             paths,
             sources,
             follow,
+            identity_only: false,
             guard: None,
         })?,
         "stat",
@@ -4346,6 +4347,7 @@ fn stat_and_canonicalize(
 ) -> Result<(Option<Entry>, std::path::PathBuf)> {
     conn.send(Request::StatMany {
         paths: vec![path.to_vec()],
+        identity_only: false,
         sources: None,
         follow: false,
         guard: None,

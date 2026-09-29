@@ -318,6 +318,7 @@ fn remote_vector_replies_must_match_request_counts() {
             (
                 Request::StatMany {
                     paths: vec![b"file".to_vec()],
+                    identity_only: false,
                     sources: None,
                     follow: false,
                     guard: None,
@@ -2033,6 +2034,7 @@ fn connection_replaying(responses: &[Response]) -> RemoteConn {
 fn fragmented_metadata_replies_preserve_counts_and_errors() {
     let request = || Request::StatMany {
         paths: vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()],
+        identity_only: false,
         sources: None,
         follow: false,
         guard: None,

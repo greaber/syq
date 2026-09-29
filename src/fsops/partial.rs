@@ -1986,8 +1986,15 @@ impl FsOps {
                 sources,
                 follow,
                 guard,
+                identity_only,
             } => self
-                .stat_many_request(paths, sources.as_deref(), *follow, guard.as_ref())
+                .stat_many_request(
+                    paths,
+                    sources.as_deref(),
+                    *follow,
+                    guard.as_ref(),
+                    *identity_only,
+                )
                 .map(Response::Stats),
             Request::CheckOperatorDirectory {
                 path,

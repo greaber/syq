@@ -3279,6 +3279,7 @@ fn source_workers_adopt_registered_descriptor_after_path_replacement() {
         let original = roots[0].selection.join(b"original").unwrap();
         let response = worker.handle(&Request::StatMany {
             paths: vec![selected.join("original").as_os_str().as_bytes().to_vec()],
+            identity_only: false,
             sources: Some(vec![original]),
             follow: false,
             guard: None,
@@ -3287,6 +3288,7 @@ fn source_workers_adopt_registered_descriptor_after_path_replacement() {
         let replacement = roots[0].selection.join(b"replacement").unwrap();
         let response = worker.handle(&Request::StatMany {
             paths: vec![selected.join("replacement").as_os_str().as_bytes().to_vec()],
+            identity_only: false,
             sources: Some(vec![replacement]),
             follow: false,
             guard: None,
@@ -3489,6 +3491,7 @@ fn independent_source_worker_keeps_exact_object_after_control_and_broker_close()
 
     let response = worker.handle(&Request::StatMany {
         paths: vec![selected.as_os_str().as_bytes().to_vec()],
+        identity_only: false,
         sources: Some(vec![roots[0].selection.clone()]),
         follow: false,
         guard: None,
@@ -3535,6 +3538,7 @@ fn repeated_source_registration_keeps_the_original_root_and_leaf_pin() {
 
     let response = control.handle(&Request::StatMany {
         paths: vec![first.as_os_str().as_bytes().to_vec()],
+        identity_only: false,
         sources: Some(vec![roots[0].selection.clone()]),
         follow: false,
         guard: None,
@@ -3571,6 +3575,7 @@ fn source_stat_enforces_exact_leaf_authority_and_ignores_parallel_path() {
             .as_os_str()
             .as_bytes()
             .to_vec()],
+        identity_only: false,
         sources: Some(vec![roots[0].selection.clone()]),
         follow: false,
         guard: None,
@@ -3585,6 +3590,7 @@ fn source_stat_enforces_exact_leaf_authority_and_ignores_parallel_path() {
             .as_os_str()
             .as_bytes()
             .to_vec()],
+        identity_only: false,
         sources: Some(vec![sibling]),
         follow: false,
         guard: None,
@@ -3595,6 +3601,7 @@ fn source_stat_enforces_exact_leaf_authority_and_ignores_parallel_path() {
 
     let response = worker.handle(&Request::StatMany {
         paths: vec![selected.as_os_str().as_bytes().to_vec()],
+        identity_only: false,
         sources: None,
         follow: false,
         guard: None,
@@ -3607,6 +3614,7 @@ fn source_stat_enforces_exact_leaf_authority_and_ignores_parallel_path() {
     fs::write(&selected, b"replacement").unwrap();
     let response = worker.handle(&Request::StatMany {
         paths: vec![selected.as_os_str().as_bytes().to_vec()],
+        identity_only: false,
         sources: Some(vec![roots[0].selection.clone()]),
         follow: false,
         guard: None,
@@ -4081,6 +4089,7 @@ fn source_stat_batches_preserve_order_across_sizes() {
             .collect();
         let response = worker.handle(&Request::StatMany {
             paths: vec![b"/display/path/is/not/authority".to_vec(); count],
+            identity_only: false,
             sources: Some(sources),
             follow: true,
             guard: None,
@@ -4150,7 +4159,7 @@ fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
             })
             .collect();
         let actual = worker
-            .stat_many_request(&paths, Some(&sources), true, None)
+            .stat_many_request(&paths, Some(&sources), true, None, false)
             .unwrap();
         assert_eq!(actual.len(), expected.len());
         for (index, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
@@ -4167,7 +4176,7 @@ fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
     fs::create_dir(roots[0].join("parent")).unwrap();
     fs::write(roots[0].join("parent/file"), b"replacement").unwrap();
     let actual = worker
-        .stat_many_request(&paths, Some(&sources), false, None)
+        .stat_many_request(&paths, Some(&sources), false, None, false)
         .unwrap();
     assert!(actual
         .iter()
@@ -4175,7 +4184,7 @@ fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
     fs::remove_dir_all(roots[0].join("parent")).unwrap();
     symlink("moved", roots[0].join("parent")).unwrap();
     let actual = worker
-        .stat_many_request(&paths, Some(&sources), true, None)
+        .stat_many_request(&paths, Some(&sources), true, None, false)
         .unwrap();
     assert!(actual.iter().all(Option::is_none));
 }
@@ -4195,7 +4204,13 @@ fn source_stat_grouping_reports_the_first_error_in_request_order() {
     // failure must not mask the missing-file error requested first.
     let sources = vec![selections[1].clone(), selections[0].clone()];
     let error = worker
-        .stat_many_request(&vec![b"ignored".to_vec(); 2], Some(&sources), false, None)
+        .stat_many_request(
+            &vec![b"ignored".to_vec(); 2],
+            Some(&sources),
+            false,
+            None,
+            false,
+        )
         .unwrap_err();
     assert_eq!(error.to_string(), "inspect registered source leaf");
     assert_eq!(
@@ -4212,6 +4227,7 @@ fn source_stat_batches_report_missing_sources_and_accept_restored_files() {
     let (mut worker, selections, _control) = registered_source_worker(&[&path], false);
     let request = Request::StatMany {
         paths: vec![b"ignored".to_vec(); 64],
+        identity_only: false,
         sources: Some(vec![selections[0].clone(); 64]),
         follow: false,
         guard: None,
@@ -4267,6 +4283,7 @@ fn source_stat_does_not_follow_intermediate_symlinks() {
     worker.initialize_sources(&roots).unwrap();
     let response = worker.handle(&Request::StatMany {
         paths: vec![selected.join("link/secret").as_os_str().as_bytes().to_vec()],
+        identity_only: false,
         sources: Some(vec![secret]),
         follow: true,
         guard: None,
@@ -4661,6 +4678,7 @@ fn source_legacy_stat_requires_explicit_unconfined_registration() {
     worker.initialize_sources(&roots).unwrap();
     let response = worker.handle(&Request::StatMany {
         paths: vec![sibling.as_os_str().as_bytes().to_vec()],
+        identity_only: false,
         sources: None,
         follow: false,
         guard: None,
@@ -4881,6 +4899,7 @@ fn registered_fifo_keeps_identity_checks_without_connecting_a_writer() {
     );
     let response = worker.handle(&Request::StatMany {
         paths: vec![b"ignored".to_vec()],
+        identity_only: false,
         sources: Some(vec![roots[0].selection.clone()]),
         follow: false,
         guard: None,

@@ -286,7 +286,33 @@ impl FsOps {
         sources: Option<&[RegisteredPath]>,
         follow: bool,
         guard: Option<&ContainerGuard>,
+        identity_only: bool,
     ) -> Result<Vec<Option<Entry>>> {
+        if identity_only {
+            anyhow::ensure!(
+                sources.is_none() && !follow,
+                "identity lookup requires destination paths without following symlinks"
+            );
+            return paths
+                .iter()
+                .map(|path| {
+                    let metadata =
+                        if let Some(target) = self.rooted_destination_target(path, guard)? {
+                            target.root.metadata_optional(&target.relative)?
+                        } else {
+                            match fs::symlink_metadata(resolve(path)) {
+                                Ok(m) => Some(crate::rooted::root_metadata_from_std(&m)?),
+                                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                                Err(e) => return Err(e.into()),
+                            }
+                        };
+                    Ok(
+                        metadata
+                            .map(|m| entry_from_root_metadata(Vec::new(), m, Kind::Other, None)),
+                    )
+                })
+                .collect();
+        }
         let mut entries = self.stat_many_unadorned_request(paths, sources, follow, guard)?;
         if self.inode_preservation.any() {
             anyhow::ensure!(
