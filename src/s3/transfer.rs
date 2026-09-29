@@ -914,7 +914,11 @@ impl Engine {
                     })
                 },
             )?;
-            source_clone.check(&source_clone.open()?)?;
+            if size >= 32 * 1024 * 1024 && size > part_size {
+                // Parallel readers can finish at different times. Recheck the
+                // selected pathname after all parts complete, as before.
+                source_clone.check(&source_clone.open()?)?;
+            }
             Ok((hashes, None))
         })
         .await??;
