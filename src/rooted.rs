@@ -195,6 +195,13 @@ pub(crate) struct MutationTurn {
     _turn: directory_gate::Turn,
 }
 
+/// Scheduling only, like a turn: admission to replacing files on the root's
+/// filesystem.
+pub(crate) struct ReplacementTurn {
+    #[cfg(any(target_os = "linux", test))]
+    _permit: directory_gate::Permit,
+}
+
 /// An existing directory opened once as the authority boundary.
 pub(crate) struct Root {
     directory: File,
@@ -265,6 +272,15 @@ impl Root {
     fn mutation_permit(&self, path: &RelativePath) -> Result<directory_gate::Permit> {
         let (parents, _) = path.leaf()?;
         Ok(directory_gate::acquire(self.identity, parents))
+    }
+
+    /// Wait to replace files beneath this root. Take it before a directory
+    /// turn, and only around publication.
+    pub(crate) fn replacement_turn(&self) -> ReplacementTurn {
+        ReplacementTurn {
+            #[cfg(any(target_os = "linux", test))]
+            _permit: directory_gate::replacement(self.identity.dev),
+        }
     }
 
     /// Take a turn changing the directory that holds `path`, for a caller

@@ -22,6 +22,12 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 // capacity.
 const MUTATORS: usize = 2;
 
+// Replacing a file frees its inode. ext4 without an orphan file does that
+// under one lock for the whole filesystem, and its throughput falls once more
+// than about eight threads replace files at once, whichever directories they
+// work in. Filesystems that scale further lose little to the same bound.
+const REPLACERS: usize = 8;
+
 thread_local! {
     // Turns this thread holds. Its operations inside a turn already own the
     // directory's capacity and must not wait for it again.
@@ -40,16 +46,24 @@ struct State {
     waiting: usize,
 }
 
-#[derive(Default)]
 struct Gate {
     state: Mutex<State>,
     available: Condvar,
+    limit: usize,
 }
 
 impl Gate {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::default(),
+            available: Condvar::new(),
+            limit,
+        }
+    }
+
     fn acquire(self: &Arc<Self>) -> Permit {
         let mut state = self.state.lock().unwrap();
-        while state.active == MUTATORS {
+        while state.active == self.limit {
             state.waiting += 1;
             state = self.available.wait(state).unwrap();
             state.waiting -= 1;
@@ -114,11 +128,26 @@ impl Registry {
             .get(&key)
             .and_then(Weak::upgrade)
             .unwrap_or_else(|| {
-                let gate = Arc::new(Gate::default());
+                let gate = Arc::new(Gate::new(MUTATORS));
                 self.gates.insert(key, Arc::downgrade(&gate));
                 gate
             })
     }
+}
+
+/// Admit one more thread to replacing files on this filesystem. Callers take
+/// it before any directory turn, so that a thread waiting here keeps no
+/// directory from its other contender.
+pub(super) fn replacement(device: u64) -> Permit {
+    static FILESYSTEMS: OnceLock<Mutex<HashMap<u64, Arc<Gate>>>> = OnceLock::new();
+    let gate = FILESYSTEMS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(device)
+        .or_insert_with(|| Arc::new(Gate::new(REPLACERS)))
+        .clone();
+    gate.acquire()
 }
 
 pub(super) fn turn(root: RootIdentity, parents: &[Vec<u8>]) -> Turn {
@@ -167,7 +196,7 @@ mod tests {
 
     #[test]
     fn all_permits_are_usable_and_concurrent_mutations_stay_bounded() {
-        let gate = Arc::new(Gate::default());
+        let gate = Arc::new(Gate::new(MUTATORS));
         let entered = Barrier::new(MUTATORS);
         std::thread::scope(|scope| {
             for _ in 0..MUTATORS {
@@ -244,8 +273,26 @@ mod tests {
     }
 
     #[test]
+    fn replacements_are_bounded_for_each_filesystem_separately() {
+        let held: Vec<_> = (0..REPLACERS).map(|_| replacement(u64::MAX)).collect();
+        // Another filesystem has its own capacity while this one is full.
+        drop(replacement(u64::MAX - 1));
+        let (entered, waited) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _permit = replacement(u64::MAX);
+                entered.send(()).unwrap();
+            });
+            let pause = std::time::Duration::from_millis(50);
+            assert!(waited.recv_timeout(pause).is_err());
+            drop(held);
+            waited.recv().unwrap();
+        });
+    }
+
+    #[test]
     fn errors_and_panics_release_permits() {
-        let gate = Arc::new(Gate::default());
+        let gate = Arc::new(Gate::new(MUTATORS));
         let fail = || -> Result<(), ()> {
             let _permit = gate.acquire();
             Err(())

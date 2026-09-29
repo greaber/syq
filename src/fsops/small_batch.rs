@@ -162,6 +162,13 @@ impl FsOps {
             },
         );
         let mut published = Vec::with_capacity(stages.len());
+        // Replacing files contends across the whole filesystem on some
+        // filesystems, so a burst that replaces any waits for admission there
+        // first. New names need none.
+        let replacement = stages
+            .iter()
+            .any(|(index, _)| puts[*index].replaces)
+            .then(|| root.replacement_turn());
         let turn = root.mutation_turn(&directory).ok();
         for (index, stage) in stages {
             match self.publish_small_stage(&puts[index], &stage) {
@@ -170,6 +177,7 @@ impl FsOps {
             }
         }
         drop(turn);
+        drop(replacement);
         for (index, stage) in published {
             results[index] = self
                 .finish_small_stage(&puts[index], stage)
@@ -275,6 +283,7 @@ mod tests {
             inplace: false,
             condition: TargetCondition::Any,
             guard: None,
+            replaces: false,
         }
     }
 

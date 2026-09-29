@@ -457,6 +457,7 @@ impl Worker {
                         inplace: self.opts.inplace,
                         condition: job.target_condition,
                         guard: job.container_guard.clone(),
+                        replaces: job.dst_entry.is_some(),
                     });
                     sent.push(idx);
                 }
