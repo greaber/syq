@@ -53,14 +53,19 @@ pub(super) fn bytes(
 // Keep the small-file path to one read for every algorithm. Large files retain
 // independent parallel native part hashing. BLAKE3 can reuse that read when each
 // part is a power-of-two subtree; other whole hashes share one additional read.
-pub(super) fn ranges(
+// The factory gives each parallel part and whole-file pass its own reader. Its
+// end offset lets the caller check source identity after the final read.
+pub(super) fn ranges<R>(
     size: u64,
     part_size: u64,
     native: Algorithm,
     whole: HashAlgorithm,
     comparison: Option<HashAlgorithm>,
-    read: impl Fn(&mut [u8], u64) -> Result<()> + Sync,
-) -> Result<Hashes> {
+    open: impl Fn(u64) -> Result<R> + Sync,
+) -> Result<Hashes>
+where
+    R: FnMut(&mut [u8], u64) -> Result<()>,
+{
     let native = native_algorithm(native);
     let tree = size > part_size
         && part_size.is_power_of_two()
@@ -88,6 +93,7 @@ pub(super) fn ranges(
         let (whole_result, parts) = rayon::join(
             || -> Result<()> {
                 if !whole_hashes.is_empty() {
+                    let mut read = open(size)?;
                     let mut buffer = vec![0; 1024 * 1024];
                     let mut offset = 0;
                     while offset < size {
@@ -101,11 +107,12 @@ pub(super) fn ranges(
                 }
                 Ok(())
             },
-            || parallel_parts(size, part_size, native, tree, &read),
+            || parallel_parts(size, part_size, native, tree, &open),
         );
         whole_result?;
         parts?
     } else {
+        let mut read = open(size)?;
         let mut parts = Vec::new();
         let mut buffer = vec![0; 1024 * 1024];
         for index in 0..size.div_ceil(part_size).max(1) {
@@ -155,13 +162,16 @@ pub(super) fn ranges(
 
 // In tree mode each part is a complete, equally sized BLAKE3 subtree except the
 // final rightmost part. These are exactly the tree shapes supported here.
-fn parallel_parts(
+fn parallel_parts<R>(
     size: u64,
     part_size: u64,
     native: HashAlgorithm,
     tree: bool,
-    read: impl Fn(&mut [u8], u64) -> Result<()> + Sync,
-) -> Result<PartHashes> {
+    open: impl Fn(u64) -> Result<R> + Sync,
+) -> Result<PartHashes>
+where
+    R: FnMut(&mut [u8], u64) -> Result<()>,
+{
     use blake3::hazmat::{merge_subtrees_non_root, merge_subtrees_root, HasherExt, Mode};
     anyhow::ensure!(
         !tree || (size > part_size && part_size.is_power_of_two() && part_size >= 1024)
@@ -171,6 +181,7 @@ fn parallel_parts(
         .map(|index| -> Result<_> {
             let start = index * part_size;
             let end = (start + part_size).min(size);
+            let mut read = open(end)?;
             let mut native = native.hasher();
             let mut subtree = tree.then(|| {
                 let mut hash = blake3::Hasher::new();
@@ -241,12 +252,14 @@ mod tests {
                         part_size as u64,
                         native_algorithm(native),
                         true,
-                        |buffer, offset| {
-                            buffer.copy_from_slice(
-                                &bytes[offset as usize..offset as usize + buffer.len()],
-                            );
-                            read_bytes.fetch_add(buffer.len(), Ordering::Relaxed);
-                            Ok(())
+                        |_| {
+                            Ok(|buffer: &mut [u8], offset| {
+                                buffer.copy_from_slice(
+                                    &bytes[offset as usize..offset as usize + buffer.len()],
+                                );
+                                read_bytes.fetch_add(buffer.len(), Ordering::Relaxed);
+                                Ok(())
+                            })
                         },
                     )
                     .unwrap();
@@ -266,7 +279,12 @@ mod tests {
                 }
             }
         }
-        assert!(parallel_parts(4096, 3072, HashAlgorithm::Sha256, true, |_, _| Ok(())).is_err());
+        assert!(
+            parallel_parts(4096, 3072, HashAlgorithm::Sha256, true, |_| Ok(
+                |_: &mut [u8], _| Ok(())
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -284,22 +302,27 @@ mod tests {
                         HashAlgorithm::Xxh3,
                     ] {
                         let read_bytes = AtomicUsize::new(0);
+                        let opens = AtomicUsize::new(0);
                         let result = ranges(
                             size as u64,
                             part_size,
                             native,
                             whole,
                             Some(HashAlgorithm::Sha256),
-                            |buffer, offset| {
-                                buffer.copy_from_slice(
-                                    &bytes[offset as usize..offset as usize + buffer.len()],
-                                );
-                                read_bytes.fetch_add(buffer.len(), Ordering::Relaxed);
-                                Ok(())
+                            |_| {
+                                opens.fetch_add(1, Ordering::Relaxed);
+                                Ok(|buffer: &mut [u8], offset| {
+                                    buffer.copy_from_slice(
+                                        &bytes[offset as usize..offset as usize + buffer.len()],
+                                    );
+                                    read_bytes.fetch_add(buffer.len(), Ordering::Relaxed);
+                                    Ok(())
+                                })
                             },
                         )
                         .unwrap();
                         assert_eq!(read_bytes.load(Ordering::Relaxed), size);
+                        assert_eq!(opens.load(Ordering::Relaxed), 1);
                         assert_eq!(
                             result.whole,
                             Digest::hash_bytes(whole, &bytes[..size]).value
@@ -345,20 +368,36 @@ mod tests {
             ),
         ] {
             let read_bytes = AtomicUsize::new(0);
+            let opens = AtomicUsize::new(0);
             let result = ranges(
                 bytes.len() as u64,
                 part_size,
                 Algorithm::Sha256,
                 whole,
                 comparison,
-                |buffer, offset| {
-                    buffer.copy_from_slice(&bytes[offset as usize..offset as usize + buffer.len()]);
-                    read_bytes.fetch_add(buffer.len(), Ordering::Relaxed);
-                    Ok(())
+                |end| {
+                    opens.fetch_add(1, Ordering::Relaxed);
+                    let bytes = &bytes;
+                    let read_bytes = &read_bytes;
+                    let mut next = None;
+                    Ok(move |buffer: &mut [u8], offset| {
+                        assert!(next.is_none_or(|next| next == offset));
+                        next = Some(offset + buffer.len() as u64);
+                        assert!(next.unwrap() <= end);
+                        buffer.copy_from_slice(
+                            &bytes[offset as usize..offset as usize + buffer.len()],
+                        );
+                        read_bytes.fetch_add(buffer.len(), Ordering::Relaxed);
+                        Ok(())
+                    })
                 },
             )
             .unwrap();
             assert_eq!(read_bytes.load(Ordering::Relaxed), reads * bytes.len());
+            assert_eq!(
+                opens.load(Ordering::Relaxed),
+                bytes.len().div_ceil(part_size as usize) + reads - 1
+            );
             assert_eq!(result.whole, Digest::hash_bytes(whole, &bytes).value);
             assert_eq!(
                 result.comparison,
@@ -382,7 +421,11 @@ mod tests {
             Algorithm::Sha256,
             HashAlgorithm::Blake3,
             None,
-            |_, _| Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
+            |_| {
+                Ok(|_: &mut [u8], _| {
+                    Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
+                })
+            },
         );
         assert!(result.is_err());
     }

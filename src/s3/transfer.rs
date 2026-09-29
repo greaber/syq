@@ -902,16 +902,25 @@ impl Engine {
                     })),
                 ));
             }
-            let file = source_clone.open()?;
             let hashes = upload_hashes::ranges(
                 size,
                 part_size,
                 algorithm,
                 whole_algorithm,
                 comparison_algorithm,
-                |buffer, offset| Ok(file.read_exact_at(buffer, offset)?),
+                |end| {
+                    let file = source_clone.open()?;
+                    let source = &source_clone;
+                    Ok(move |buffer: &mut [u8], offset| {
+                        file.read_exact_at(buffer, offset)?;
+                        if offset + buffer.len() as u64 == end {
+                            source.check(&file)?;
+                        }
+                        Ok(())
+                    })
+                },
             )?;
-            source_clone.check(&file)?;
+            source_clone.check(&source_clone.open()?)?;
             Ok((hashes, None))
         })
         .await??;
