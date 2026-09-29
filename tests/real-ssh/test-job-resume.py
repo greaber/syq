@@ -49,7 +49,7 @@ assert not (p / 'stale').exists()
         # on the invoking host while both endpoints use ordinary SSH helpers.
         relay_source = destination + '-source'
         relay_destination = destination + '/relay'
-        remote(f"from pathlib import Path; p=Path({relay_source!r}); p.mkdir(); (p/'file').write_bytes(b'relayed')", 'source')
+        remote(f"from pathlib import Path; p=Path({relay_source!r}); p.mkdir(parents=True); (p/'file').write_bytes(b'relayed')", 'source')
         remote(f"from pathlib import Path; p=Path({relay_destination!r}); p.mkdir(); (p/'stale').write_bytes(b'stale')")
         first = run(['syq', 'cp', '--from', 'source', '--srcs-in', relay_source,
                      '--to', 'destination', '--into', relay_destination,
