@@ -141,6 +141,10 @@ pub(crate) fn record_command_line(argv: &[OsString]) {
         .expect("command line recorded once");
 }
 
+pub(crate) fn command_line() -> Result<&'static [OsString]> {
+    Ok(COMMAND_LINE.get().context("command line not recorded")?)
+}
+
 pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
     check_selection(selection)?;
     if selection.registration.identity == crate::identity::build() {
@@ -148,7 +152,7 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
     }
     let program = std::ffi::OsStr::from_bytes(&selection.registration.program);
     let guard = serde_json::to_string(&selection.guard()?)?;
-    let argv = COMMAND_LINE.get().context("command line not recorded")?;
+    let argv = command_line()?;
     let error = Command::new(program)
         .arg(HANDOFF)
         .arg(guard)

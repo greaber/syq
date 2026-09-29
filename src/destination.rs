@@ -138,10 +138,19 @@ enum Message {
         challenge: String,
     },
     Exec(exec::ExecRequest),
-    Storage(crate::s3::authorization::Request),
-    Request(Box<CopyRequest>),
+    // Copy and storage requests carry the command that produced them. The
+    // receiving machine derives the request from it and shows it for approval.
+    Storage {
+        command: Vec<Vec<u8>>,
+        request: crate::s3::authorization::Request,
+    },
+    Request {
+        command: Vec<Vec<u8>>,
+        request: Box<CopyRequest>,
+    },
     Forward {
         target: String,
+        command: Vec<Vec<u8>>,
         request: Box<CopyRequest>,
     },
     Open {
@@ -681,6 +690,11 @@ fn constrain(
     Ok(request)
 }
 
+/// The SSH destination a copy through the receiving machine's access would use.
+pub(crate) fn forward_target(args: &crate::cli::Args) -> Result<String> {
+    forward::eligible_target(args)
+}
+
 pub(crate) fn is_named(grant: &Option<String>) -> bool {
     grant.as_deref().is_some_and(|s| s.starts_with(PREFIX))
 }
@@ -786,7 +800,10 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     crate::output::diagnostic!("syq: requesting permission from @{name} (up to 300 seconds; approve on the receiving machine with its desktop prompt or syq persist receive pending)");
     let (_, reply) = exchange(
         &registration,
-        Message::Request(Box::new(request)),
+        Message::Request {
+            command: crate::approval_command::current()?,
+            request: Box::new(request),
+        },
         REQUEST_TIMEOUT + Duration::from_secs(10),
     )?;
     let Reply::Approved(approved) = reply else {
@@ -928,6 +945,7 @@ impl Receiver {
     /// Decide locally after scope validation and before issuing a usable token.
     fn authorize_request(
         &self,
+        command: &[Vec<u8>],
         request: &CopyRequest,
         socket: &UnixStream,
         generation: u64,
@@ -953,8 +971,13 @@ impl Receiver {
             bail!("receiving stopped or request disconnected");
         }
         if !automatic {
-            self.approvals
-                .request(&self.requester, request, self.notifications, cancelled)?;
+            self.approvals.request(
+                &self.requester,
+                command,
+                request,
+                self.notifications,
+                cancelled,
+            )?;
         }
         Ok(())
     }
@@ -989,7 +1012,7 @@ impl Receiver {
             Message::TcpProbe(request) => self.probe_tcp(request, stream),
             Message::TcpOpen(request) => self.open_tcp(request, stream),
             Message::Exec(request) => self.execute(request, stream),
-            Message::Storage(request) => self.storage(request, stream),
+            Message::Storage { command, request } => self.storage(command, request, stream),
             Message::Ping => write_message(&mut stream, &Reply::Ready),
             Message::Identify { name, challenge } => {
                 if name != self.name {
@@ -998,13 +1021,18 @@ impl Receiver {
                 let proof = identity::prove(&self.identity_key, &name, &challenge, &self.secret)?;
                 write_message(&mut stream, &Reply::Identity(proof))
             }
-            Message::Forward { target, request } => self.forward(target, *request, stream),
-            Message::Request(request) => {
+            Message::Forward {
+                target,
+                command,
+                request,
+            } => self.forward(target, command, *request, stream),
+            Message::Request { command, request } => {
                 let _request = self.request_lock.try_lock().map_err(|_| {
                     anyhow::anyhow!(
                         "another transfer is awaiting approval; retry after it is decided"
                     )
                 })?;
+                crate::approval_command::check_copy(&command, &request, Some(&self.name), None)?;
                 let (destination, mut container) =
                     resolve_destination(&self.cwd, self.root.as_deref(), &request.destination)?;
                 if self.root.as_ref() == Some(&destination)
@@ -1047,7 +1075,13 @@ impl Receiver {
                 // Validate the complete operation before the local policy decision.
                 let (authority, approved) =
                     crate::restricted::named_authority(&container, request.clone())?;
-                self.authorize_request(&request, &stream.try_clone()?, generation, automatic)?;
+                self.authorize_request(
+                    &command,
+                    &request,
+                    &stream.try_clone()?,
+                    generation,
+                    automatic,
+                )?;
                 // Start the grant clock at approval, including after a long prompt.
                 let (authority, mut approved) = if !automatic {
                     crate::restricted::named_authority(&container, request)?

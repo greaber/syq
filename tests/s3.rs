@@ -199,6 +199,36 @@ fn writes_object(method: &str, target: &str) -> bool {
     }
 }
 
+/// Content-MD5 as S3 request headers encode it.
+fn content_md5(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    use md5::Digest as _;
+    base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(bytes))
+}
+
+/// No request checksum and an unsigned payload: HTTPS protects the transfer.
+fn assert_unchecked_upload(headers: &std::collections::HashMap<String, String>) {
+    assert!(
+        !headers
+            .keys()
+            .any(|name| name.starts_with("x-amz-checksum") || name == "content-md5"),
+        "{headers:?}"
+    );
+    assert_eq!(headers["x-amz-content-sha256"], "UNSIGNED-PAYLOAD");
+}
+
+/// An AWS bucket with an Object Lock default retention period rejects
+/// uploads without Content-MD5 or a checksum.
+fn reply_checksum_required(socket: &mut TcpStream) {
+    reply(
+        socket,
+        400,
+        &[],
+        b"<Error><Code>InvalidRequest</Code><Message>Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object requests with Object Lock parameters</Message></Error>",
+        false,
+    );
+}
+
 fn serve(
     mut socket: TcpStream,
     fault: &str,
@@ -1543,6 +1573,43 @@ fn serve(
             return;
         }
     }
+    if fault == "object-lock-upload" {
+        match method {
+            "HEAD" => reply(&mut socket, 404, &[], b"", true),
+            "GET" => reply(
+                &mut socket,
+                200,
+                &[],
+                b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+                false,
+            ),
+            "PUT" => {
+                let length: usize = headers["content-length"].parse().unwrap();
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).unwrap();
+                assert_eq!(headers["x-amz-content-sha256"], "UNSIGNED-PAYLOAD");
+                if let Some(checksum) = headers.get("content-md5") {
+                    assert_eq!(*checksum, content_md5(&body));
+                    gate.0.store(true, Ordering::Release);
+                    reply(
+                        &mut socket,
+                        200,
+                        &[("ETag".into(), "\"put\"".into())],
+                        b"",
+                        false,
+                    );
+                } else {
+                    assert!(!headers
+                        .keys()
+                        .any(|name| name.starts_with("x-amz-checksum")));
+                    probes.fetch_add(1, Ordering::Relaxed);
+                    reply_checksum_required(&mut socket);
+                }
+            }
+            _ => panic!("unexpected {first}"),
+        }
+        return;
+    }
     if fault.starts_with("upload-") {
         if method == "HEAD" {
             reply(&mut socket, 404, &[], b"", true);
@@ -1581,19 +1648,8 @@ fn serve(
             }
             return;
         }
-        use base64::Engine as _;
         use sha2::Digest as _;
-        assert_eq!(
-            headers["x-amz-checksum-sha256"],
-            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&body))
-        );
-        assert_eq!(
-            headers["x-amz-content-sha256"],
-            sha2::Sha256::digest(&body)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        );
+        assert_unchecked_upload(&headers);
         if fault == "upload-metadata" {
             assert_eq!(headers["x-amz-meta-syq-mode"], "416");
             assert_eq!(headers["x-amz-meta-syq-mtime"], "123");
@@ -1678,7 +1734,11 @@ fn serve(
         reply(&mut socket, 404, &[], b"", false);
         return;
     }
-    let size = if fault.starts_with("single") || fault.starts_with("prefix-") {
+    let size = if fault.starts_with("single")
+        || (fault.starts_with("prefix-")
+            && fault != "prefix-multipart"
+            && !fault.starts_with("prefix-recovery"))
+    {
         65536
     } else {
         SIZE
@@ -1741,6 +1801,10 @@ fn serve(
                 }
             }
             assert!(gate.1.load(Ordering::Acquire), "LIST did not overlap HEAD");
+            if fault == "prefix-multipart" {
+                // Reuse the gate for range overlap only after discovery finishes.
+                gate.1.store(false, Ordering::Release);
+            }
             if fault != "prefix-collision" {
                 reply(&mut socket, 404, &[], b"", false);
                 return;
@@ -1763,8 +1827,20 @@ fn serve(
             return;
         } else {
             assert_eq!(path, "/bucket/data/file");
-            assert_eq!(fault, "prefix-ok", "copied before validating discovery");
+            assert!(
+                matches!(fault, "prefix-ok" | "prefix-multipart")
+                    || fault.starts_with("prefix-recovery"),
+                "copied before validating discovery"
+            );
         }
+    }
+    if fault.starts_with("prefix-recovery")
+        && method == "HEAD"
+        && !gate.0.swap(true, Ordering::AcqRel)
+    {
+        // Leave every downloaded range checkpointed, but fail before publication.
+        reply(&mut socket, 403, &[], b"", true);
+        return;
     }
     if method == "HEAD" {
         fields.push(("Content-Length".into(), size.to_string()));
@@ -1815,6 +1891,13 @@ fn serve(
         .unwrap();
     let start: usize = start.parse().unwrap();
     let end: usize = end.parse().unwrap();
+    if gate.0.load(Ordering::Acquire)
+        && (fault == "prefix-recovery-all" || (fault == "prefix-recovery-first" && start == 0))
+    {
+        // Retrying must not request a range already recorded and present locally.
+        reply(&mut socket, 403, &[], b"", false);
+        return;
+    }
     if fault == "ignore-range" {
         reply(&mut socket, 200, &fields, &data, false);
         return;
@@ -1827,7 +1910,7 @@ fn serve(
         fields[0].1 = "\"different\"".into();
     }
     let mut body = data[start..=end].to_vec();
-    if fault == "initial-range-overlap" {
+    if matches!(fault, "initial-range-overlap" | "prefix-multipart") {
         if start == 0 {
             let mut head = format!(
                 "HTTP/1.1 206 Fixture\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -2144,6 +2227,97 @@ fn s3_first_range_supplies_metadata_without_serializing_the_remaining_ranges() {
     );
     // One selector HEAD, two range GETs, and the final identity HEAD.
     assert_eq!(server.requests.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn s3_prefix_multipart_download_starts_ranges_without_an_object_head() {
+    for existing in [false, true] {
+        let server = Server::start("prefix-multipart");
+        let temp = crate::test_support::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("download")).unwrap();
+        if existing {
+            std::fs::write(temp.path().join("download/file"), b"original").unwrap();
+        }
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "data",
+                "--into",
+                "download",
+            ],
+        );
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert_eq!(
+            std::fs::read(temp.path().join("download/file")).unwrap(),
+            vec![b'x'; SIZE]
+        );
+        // Prefix validation HEAD + LIST, two concurrent range GETs, final identity HEAD.
+        assert_eq!(server.requests.load(Ordering::Relaxed), 5);
+    }
+}
+
+#[test]
+fn s3_multipart_download_reuses_completed_ranges_before_getting_more() {
+    for existing in [false, true] {
+        for fault in ["prefix-recovery-all", "prefix-recovery-first"] {
+            let server = Server::start(fault);
+            let temp = crate::test_support::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("download")).unwrap();
+            let destination = temp.path().join("download/file");
+            if existing {
+                std::fs::write(&destination, b"original").unwrap();
+            }
+            let args = [
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "data",
+                "--into",
+                "download",
+            ];
+            let first = server.cp(temp.path(), &args);
+            assert!(!first.status.success(), "{}", output_text(&first));
+            if existing {
+                assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+            } else {
+                assert!(
+                    !destination.exists(),
+                    "failed download must not publish a file"
+                );
+            }
+            let record = std::fs::read_dir(temp.path().join("cache/syq/s3"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .expect("failed publication keeps its completed ranges");
+            let mut saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+            assert_eq!(saved["parts"].as_object().unwrap().len(), 2);
+            if fault == "prefix-recovery-first" {
+                saved["parts"].as_object_mut().unwrap().remove("1").unwrap();
+                std::fs::write(&record, serde_json::to_vec(&saved).unwrap()).unwrap();
+            }
+            server.requests.store(0, Ordering::Relaxed);
+            let retry = server.cp(temp.path(), &args);
+            assert!(retry.status.success(), "{fault}: {}", output_text(&retry));
+            assert_eq!(std::fs::read(&destination).unwrap(), vec![b'x'; SIZE]);
+            // Discovery HEAD + LIST, identity HEAD, final HEAD, and only unsaved GETs.
+            assert_eq!(
+                server.requests.load(Ordering::Relaxed),
+                if fault == "prefix-recovery-all" { 4 } else { 5 }
+            );
+            assert!(
+                !record.exists(),
+                "successful publication removes the checkpoint"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2732,6 +2906,33 @@ fn s3_upload_native_checksum_and_whole_file_hash() {
         !server.gate.0.load(Ordering::Acquire),
         "mismatching source was uploaded"
     );
+}
+
+#[test]
+fn uploads_add_content_md5_when_the_destination_requires_a_checksum() {
+    let server = Server::start("object-lock-upload");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("source")).unwrap();
+    for name in ["first", "second", "third"] {
+        std::fs::write(temp.path().join("source").join(name), name.repeat(1000)).unwrap();
+    }
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--performance-tuning",
+            "s3-objects=1",
+            "--srcs-in",
+            "source",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "prefix",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.0.load(Ordering::Acquire));
+    // Only the first upload is rejected; later uploads send Content-MD5 at once.
+    assert_eq!(server.probes.load(Ordering::Relaxed), 1);
 }
 
 #[test]

@@ -333,7 +333,7 @@ impl Options {
     }
 }
 
-fn validate_endpoint(endpoint: &str) -> Result<()> {
+pub(crate) fn validate_endpoint(endpoint: &str) -> Result<()> {
     let url = url::Url::parse(endpoint).context("invalid S3 endpoint URL")?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()

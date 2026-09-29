@@ -294,6 +294,7 @@ pub(super) fn planning_engine(extra: &[&str]) -> Engine {
         upload_keys: OnceLock::new(),
         authorization: None,
         copy_checksum_unsupported: Default::default(),
+        content_md5: Default::default(),
         copy_tagging_unsupported: Default::default(),
         cancelled: Default::default(),
         cancel_wake: Default::default(),

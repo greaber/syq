@@ -55,6 +55,8 @@ pub(super) struct Engine {
     cancel_wake: tokio::sync::Notify,
     uploads: Arc<super::upload_http::Cancellation>,
     authorization: Option<Arc<super::authorization::Authorization>>,
+    /// The destination rejected an upload without a checksum; send Content-MD5.
+    content_md5: std::sync::atomic::AtomicBool,
 }
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -111,8 +113,15 @@ struct UploadState {
 #[derive(Clone, Serialize, Deserialize)]
 struct UploadedPart {
     etag: String,
+    // Uploads without request checksums identify parts by ETag alone.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     checksum: String,
     length: u64,
+}
+struct Acknowledged {
+    parts: BTreeMap<i32, UploadedPart>,
+    saved: tokio::time::Instant,
+    dirty: bool,
 }
 impl UploadState {
     fn acknowledged_part(&self, number: i32, etag: &str, checksum: &str, length: u64) -> bool {
@@ -210,6 +219,7 @@ impl Engine {
             pace: Mutex::new(tokio::time::Instant::now()),
             upload_keys: OnceLock::new(),
             copy_checksum_unsupported: Default::default(),
+            content_md5: Default::default(),
             copy_tagging_unsupported: Default::default(),
         }))
     }
@@ -734,7 +744,10 @@ impl Engine {
             source,
             size,
             part_size: self.part_size(size),
-            algorithm: Algorithm::for_endpoint(self.options.endpoint.as_deref()),
+            algorithm: Algorithm::for_upload(
+                self.options.endpoint.as_deref(),
+                self.authorization.is_some(),
+            ),
             checksums: Vec::new(),
             small: None,
             metadata,
@@ -849,7 +862,17 @@ impl Engine {
         if part_size > 5 * 1024 * 1024 * 1024 {
             bail!("file exceeds the S3 multipart size limit");
         }
-        let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
+        let algorithm = Algorithm::for_upload(
+            self.options.endpoint.as_deref(),
+            self.authorization.is_some(),
+        );
+        // Once the destination has required Content-MD5, compute it in the
+        // hashing read rather than reading each file again to send it.
+        let part_checksums = if algorithm == Algorithm::None && self.content_md5.load(Relaxed) {
+            Algorithm::Md5
+        } else {
+            algorithm
+        };
         let whole_algorithm = requested_algorithm.unwrap_or(HashAlgorithm::Blake3);
         let buffer_limit = if self.tuning.tigris() {
             8 << 20
@@ -877,7 +900,12 @@ impl Engine {
             if source_clone.kind() != ObjectKind::File {
                 let bytes = source_clone.bytes()?;
                 return Ok((
-                    upload_hashes::bytes(&bytes, algorithm, whole_algorithm, comparison_algorithm),
+                    upload_hashes::bytes(
+                        &bytes,
+                        part_checksums,
+                        whole_algorithm,
+                        comparison_algorithm,
+                    ),
                     Some(bytes::Bytes::from(bytes)),
                 ));
             }
@@ -888,7 +916,12 @@ impl Engine {
                 file.read_exact(&mut bytes)?;
                 source_clone.check(&file)?;
                 return Ok((
-                    upload_hashes::bytes(&bytes, algorithm, whole_algorithm, comparison_algorithm),
+                    upload_hashes::bytes(
+                        &bytes,
+                        part_checksums,
+                        whole_algorithm,
+                        comparison_algorithm,
+                    ),
                     Some(bytes::Bytes::from_owner(fast::UploadBuffer {
                         bytes,
                         _reservation: reservation,
@@ -899,7 +932,7 @@ impl Engine {
             let hashes = upload_hashes::ranges(
                 size,
                 part_size,
-                algorithm,
+                part_checksums,
                 whole_algorithm,
                 comparison_algorithm,
                 |end| {
@@ -914,7 +947,7 @@ impl Engine {
                     })
                 },
             )?;
-            if upload_hashes::uses_parallel_readers(size, part_size) {
+            if hashes.concurrent {
                 // Parallel readers can finish at different times. Recheck the
                 // selected pathname after all parts complete, as before.
                 source_clone.check(&source_clone.open()?)?;
@@ -926,6 +959,7 @@ impl Engine {
             whole: whole_digest,
             comparison: comparison_digest,
             checksums,
+            concurrent: _,
         } = hashes;
         if let Some(expected) = expected_hash {
             if !whole_digest.eq_ignore_ascii_case(&expected.value) {
@@ -937,7 +971,7 @@ impl Engine {
         if store_hash {
             metadata.hash_algorithm = whole_algorithm;
         }
-        let digest = upload_identity(algorithm, size, part_size, &checksums);
+        let digest = upload_identity(algorithm, size, part_size, &checksums, &metadata);
         let mut same_contents = existing.as_ref().is_some_and(|o| {
             o.kind() == source.kind()
                 && o.size == size
@@ -1051,14 +1085,26 @@ impl Engine {
         } = prepared;
         let _interval = self.progress.copying_interval();
         if size <= part_size || small.is_some() {
+            let checksum = checksums.first().map(String::as_str);
             let _slot = self.tuning.requests.acquire().await;
             let synchronous =
                 source.kind() == ObjectKind::File && small.is_none() && self.tuning.local_latency();
             let sync_file =
                 synchronous.then(|| crate::s3::upload_http::FileBody::new(source.clone(), 0, size));
+            let mut fallback = None;
+            let mut retry_with_md5 = false;
             let mut attempt = 0;
             loop {
                 self.check_cancelled()?;
+                if algorithm == Algorithm::None
+                    && fallback.is_none()
+                    && (retry_with_md5 || self.content_md5.load(Relaxed))
+                {
+                    fallback = Some(match checksum {
+                        Some(md5) => md5.to_owned(),
+                        None => content_md5(&source, small.as_ref(), 0, size).await?,
+                    });
+                }
                 let body = if let Some(bytes) = &small {
                     ByteStream::from(bytes.clone())
                 } else if synchronous {
@@ -1074,8 +1120,12 @@ impl Engine {
                     .key(&source.key)
                     .body(body)
                     .content_length(size as i64)
-                    .set_checksum_sha256(algorithm.is_sha256().then(|| checksums[0].clone()))
-                    .set_content_md5((algorithm == Algorithm::Md5).then(|| checksums[0].clone()))
+                    .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum))
+                    .set_content_md5(
+                        algorithm
+                            .header(Algorithm::Md5, checksum)
+                            .or_else(|| fallback.clone()),
+                    )
                     .set_metadata(Some(metadata.encode()))
                     .set_if_none_match(must_be_new.then(|| "*".into()))
                     .customize()
@@ -1091,7 +1141,20 @@ impl Engine {
                     file.drain().await;
                 }
                 match result {
-                    Ok(_) => break,
+                    Ok(_) => {
+                        // Content-MD5 fixed the rejection, so send it from now on.
+                        if fallback.is_some() {
+                            self.content_md5.store(true, Relaxed);
+                        }
+                        break;
+                    }
+                    Err(e)
+                        if algorithm == Algorithm::None
+                            && fallback.is_none()
+                            && super::checksum::requires_checksum(&e) =>
+                    {
+                        retry_with_md5 = true;
+                    }
                     Err(e) if retryable(&e) && attempt < self.options.retries => {
                         super::backoff(attempt).await;
                         attempt += 1;
@@ -1124,28 +1187,46 @@ impl Engine {
                 State::without_cache()
             };
             let result: Result<()> = async {
-                let saved_parts = Mutex::new(upload.completed.clone());
+                let acknowledged = Mutex::new(Acknowledged {
+                    parts: upload.completed.clone(),
+                    saved: tokio::time::Instant::now(),
+                    dirty: false,
+                });
+                let save = |parts: &BTreeMap<i32, UploadedPart>| {
+                    let mut record = upload.clone();
+                    record.completed = parts.clone();
+                    state.save(&record)
+                };
                 // Stop admitting parts on failure, but drain requests already in flight.
                 let failed = std::sync::atomic::AtomicBool::new(false);
-                let completed = stream::iter(checksums.into_iter().enumerate())
+                let results = stream::iter(0..size.div_ceil(part_size))
                     .take_while(|_| std::future::ready(!failed.load(Relaxed)))
-                    .map(|(index, checksum)| {
+                    .map(|index| {
                         let source = &source;
                         let upload = &upload;
                         let uploaded = &uploaded;
-                        let saved_parts = &saved_parts;
-                        let state = &state;
+                        let acknowledged = &acknowledged;
+                        let save = &save;
+                        // Without request checksums any precomputed value is a
+                        // Content-MD5 fallback, not part of the recovery identity.
+                        let checksum = checksums.get(index as usize).map(String::as_str);
+                        let recorded = match algorithm {
+                            Algorithm::None => "",
+                            _ => checksum.unwrap_or_default(),
+                        };
                         async move {
                             let number = index as i32 + 1;
-                            let offset = index as u64 * part_size;
+                            let offset = index * part_size;
                             let length = part_size.min(size - offset);
                             if let Some((etag, old_checksum, old_length)) = uploaded.get(&number) {
                                 let matches = match algorithm {
-                                    Algorithm::Sha256 => old_checksum.as_ref() == Some(&checksum),
+                                    Algorithm::Sha256 => {
+                                        checksum.is_some() && old_checksum.as_deref() == checksum
+                                    }
                                     // An ETag is opaque. Reuse only an acknowledged
                                     // part from this exact source/recovery record.
-                                    Algorithm::Md5 => {
-                                        upload.acknowledged_part(number, etag, &checksum, length)
+                                    Algorithm::Md5 | Algorithm::None => {
+                                        upload.acknowledged_part(number, etag, recorded, length)
                                     }
                                 };
                                 if matches && *old_length == Some(length) {
@@ -1154,7 +1235,7 @@ impl Engine {
                                         .part_number(number)
                                         .e_tag(etag)
                                         .set_checksum_sha256(
-                                            algorithm.is_sha256().then(|| checksum.clone()),
+                                            algorithm.header(Algorithm::Sha256, checksum),
                                         )
                                         .build());
                                 }
@@ -1167,9 +1248,20 @@ impl Engine {
                                     length,
                                 )
                             });
+                            let mut fallback = None;
+                            let mut retry_with_md5 = false;
                             let mut attempt = 0;
                             loop {
                                 self.check_cancelled()?;
+                                if algorithm == Algorithm::None
+                                    && fallback.is_none()
+                                    && (retry_with_md5 || self.content_md5.load(Relaxed))
+                                {
+                                    fallback = Some(match checksum {
+                                        Some(md5) => md5.to_owned(),
+                                        None => content_md5(source, None, offset, length).await?,
+                                    });
+                                }
                                 let body = if sync_file.is_some() {
                                     crate::s3::upload_http::body(length)
                                 } else {
@@ -1186,10 +1278,12 @@ impl Engine {
                                     .body(body)
                                     .content_length(length as i64)
                                     .set_checksum_sha256(
-                                        algorithm.is_sha256().then(|| checksum.clone()),
+                                        algorithm.header(Algorithm::Sha256, checksum),
                                     )
                                     .set_content_md5(
-                                        (algorithm == Algorithm::Md5).then(|| checksum.clone()),
+                                        algorithm
+                                            .header(Algorithm::Md5, checksum)
+                                            .or_else(|| fallback.clone()),
                                     )
                                     .customize()
                                     .config_override(super::client::without_sdk_retries())
@@ -1207,19 +1301,30 @@ impl Engine {
                                     Ok(output) => {
                                         let etag =
                                             output.e_tag().context("S3 part omitted ETag")?;
-                                        if algorithm == Algorithm::Md5 {
-                                            let mut parts = saved_parts.lock().await;
-                                            parts.insert(
+                                        if fallback.is_some() {
+                                            self.content_md5.store(true, Relaxed);
+                                        }
+                                        if !algorithm.is_sha256() {
+                                            let mut acknowledged = acknowledged.lock().await;
+                                            acknowledged.parts.insert(
                                                 number,
                                                 UploadedPart {
                                                     etag: etag.into(),
-                                                    checksum: checksum.clone(),
+                                                    checksum: recorded.to_owned(),
                                                     length,
                                                 },
                                             );
-                                            let mut record = upload.clone();
-                                            record.completed = parts.clone();
-                                            state.save(&record)?;
+                                            acknowledged.dirty = true;
+                                            // The record grows with each part. Saving at most
+                                            // once a second bounds its rewrites; an unsaved
+                                            // acknowledgment only uploads that part again.
+                                            if acknowledged.saved.elapsed()
+                                                >= Duration::from_secs(1)
+                                            {
+                                                save(&acknowledged.parts)?;
+                                                acknowledged.saved = tokio::time::Instant::now();
+                                                acknowledged.dirty = false;
+                                            }
                                         }
                                         self.tuning.requests.completed(length);
                                         self.progress.add_bytes(length);
@@ -1227,9 +1332,16 @@ impl Engine {
                                             .part_number(number)
                                             .e_tag(etag)
                                             .set_checksum_sha256(
-                                                algorithm.is_sha256().then(|| checksum.clone()),
+                                                algorithm.header(Algorithm::Sha256, checksum),
                                             )
                                             .build());
+                                    }
+                                    Err(e)
+                                        if algorithm == Algorithm::None
+                                            && fallback.is_none()
+                                            && super::checksum::requires_checksum(&e) =>
+                                    {
+                                        retry_with_md5 = true;
                                     }
                                     Err(e) if retryable(&e) && attempt < self.options.retries => {
                                         super::backoff(attempt).await;
@@ -1250,9 +1362,15 @@ impl Engine {
                         }
                     })
                     .collect::<Vec<Result<_>>>()
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>>>()?;
+                    .await;
+                if results.iter().any(Result::is_err) {
+                    let acknowledged = acknowledged.lock().await;
+                    if acknowledged.dirty {
+                        // Keep the part failure as the reported error.
+                        let _ = save(&acknowledged.parts);
+                    }
+                }
+                let completed = results.into_iter().collect::<Result<Vec<_>>>()?;
                 self.check_cancelled()?;
                 source.check(&source.open()?)?;
                 let mut completed = completed;
@@ -1994,17 +2112,33 @@ impl Engine {
         if permitted == Some(false) {
             return Ok(None);
         }
-        // A fresh file obtains metadata with its first data request. For a
-        // multipart download, receiving these headers is enough to start the
-        // other ranges; the first body is consumed alongside them.
-        // Existing files still use HEAD so an unchanged object is not fetched.
-        let mut initial_slot = None;
-        let initial = if existing.is_none()
+        // A fresh file, or an ordinary update with a different listed size,
+        // needs the body anyway. Obtain metadata with its first data request.
+        // Keep HEAD when metadata could still reject the copy or prove equality.
+        // For multipart downloads these headers let the other ranges start
+        // while the first body is consumed alongside them.
+        let needs_body = existing.is_none()
+            || (job.source_object.is_none()
+                && existing.is_some_and(|m| m.is_file() && m.len != job.size)
+                && !self.args.update
+                && !self.args.protects_existing_contents());
+        let mut get_first = needs_body
             && !self.args.dry_run
             && !job.key.ends_with('/')
             && selected == Some(true)
-            && permitted == Some(true)
-        {
+            && permitted == Some(true);
+        // A saved first range can exist before the destination is published.
+        // Check recovery before fetching it, and keep this state for the normal
+        // identity and range checks below so the record is opened only once.
+        let recovery = if get_first && job.size > part_size {
+            let recovery = self.open_download_state(root, &job.key, &job.path)?;
+            get_first = recovery.1.is_none();
+            Some(recovery)
+        } else {
+            None
+        };
+        let mut initial_slot = None;
+        let initial = if get_first {
             initial_slot = Some(self.tuning.requests.acquire().await);
             Some(
                 self.client
@@ -2250,14 +2384,10 @@ impl Engine {
                 )
                 .await;
         }
-        let extra = format!(
-            "download:{}:{}:{}",
-            root.identity().dev,
-            root.identity().ino,
-            job.path
-        );
-        let state = State::open(&self.identity(&object.key, &extra))?;
-        let mut saved: Option<DownloadState> = state.load()?;
+        let (state, mut saved) = match recovery {
+            Some(recovery) => recovery,
+            None => self.open_download_state(root, &object.key, &job.path)?,
+        };
         if let Some(old) = &saved {
             if old.schema != 1 && old.schema != 2 {
                 bail!("unsupported S3 download recovery schema");
@@ -2532,6 +2662,21 @@ impl Engine {
         .await;
         result
     }
+    fn open_download_state(
+        &self,
+        root: &Root,
+        key: &str,
+        path: &str,
+    ) -> Result<(State, Option<DownloadState>)> {
+        let extra = format!(
+            "download:{}:{}:{path}",
+            root.identity().dev,
+            root.identity().ino,
+        );
+        let state = State::open(&self.identity(key, &extra))?;
+        let saved = state.load()?;
+        Ok((state, saved))
+    }
     fn new_download_state(
         &self,
         root: &Root,
@@ -2694,25 +2839,31 @@ async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStre
         .build()
         .await?)
 }
-fn encode_native_parts(algorithm: HashAlgorithm, parts: &[[u8; 32]]) -> Vec<String> {
-    use base64::Engine as _;
-    parts
-        .iter()
-        .map(|p| base64::engine::general_purpose::STANDARD.encode(&p[..algorithm.output_len()]))
-        .collect()
-}
-
 fn upload_identity(
     algorithm: Algorithm,
     size: u64,
     part_size: u64,
     checksums: &[String],
+    metadata: &Metadata,
 ) -> String {
     let mut hash = blake3::Hasher::new();
+    if algorithm == Algorithm::None {
+        // Parts carry no request checksums; the stored whole-file hash
+        // identifies the contents that the recorded parts were cut from.
+        hash.update(b"syq-s3-whole-v1\0");
+        hash.update(metadata.hash_algorithm.as_str().as_bytes());
+        hash.update(&[0]);
+        hash.update(metadata.hash.as_deref().unwrap_or_default().as_bytes());
+        hash.update(&[0]);
+        hash.update(&size.to_le_bytes());
+        hash.update(&part_size.to_le_bytes());
+        return format!("whole:{}", hash.finalize().to_hex());
+    }
     hash.update(b"syq-s3-native-parts-v1\0");
     hash.update(&[match algorithm {
         Algorithm::Sha256 => 1,
         Algorithm::Md5 => 2,
+        Algorithm::None => unreachable!(),
     }]);
     hash.update(&size.to_le_bytes());
     hash.update(&part_size.to_le_bytes());
@@ -2721,6 +2872,36 @@ fn upload_identity(
         hash.update(&[0]);
     }
     format!("parts:{}", hash.finalize().to_hex())
+}
+
+/// Content-MD5 for a destination that requires upload checksums. Only such
+/// destinations pay for this separate read.
+async fn content_md5(
+    source: &Source,
+    small: Option<&bytes::Bytes>,
+    offset: u64,
+    length: u64,
+) -> Result<String> {
+    if let Some(bytes) = small {
+        let range = &bytes[offset as usize..(offset + length) as usize];
+        return Ok(Algorithm::Md5.digest(range).unwrap());
+    }
+    let source = source.clone();
+    tokio::task::spawn_blocking(move || {
+        let file = source.open()?;
+        let mut hash = Algorithm::Md5.hasher().unwrap();
+        let mut buffer = vec![0; length.clamp(1, 1024 * 1024) as usize];
+        let mut done = 0;
+        while done < length {
+            let n = buffer.len().min((length - done) as usize);
+            file.read_exact_at(&mut buffer[..n], offset + done)?;
+            hash.update(&buffer[..n]);
+            done += n as u64;
+        }
+        source.check(&file)?;
+        Ok(hash.finish())
+    })
+    .await?
 }
 
 fn hash_range(file: &File, offset: u64, length: u64, algorithm: HashAlgorithm) -> Result<String> {
@@ -2773,20 +2954,33 @@ mod tests {
 
     #[test]
     fn native_upload_identity_binds_parts_algorithm_and_boundaries() {
+        let metadata: UploadState =
+            serde_json::from_str(include_str!("../../tests/fixtures/s3-upload-v1.json")).unwrap();
+        let metadata = metadata.metadata;
         let checksums = vec!["first".to_string(), "second".to_string()];
-        let identity = upload_identity(Algorithm::Sha256, 10, 5, &checksums);
-        assert_ne!(identity, upload_identity(Algorithm::Md5, 10, 5, &checksums));
+        let identity = |algorithm, size, part_size, checksums: &[String]| {
+            upload_identity(algorithm, size, part_size, checksums, &metadata)
+        };
+        let native = identity(Algorithm::Sha256, 10, 5, &checksums);
+        assert_ne!(native, identity(Algorithm::Md5, 10, 5, &checksums));
+        assert_ne!(native, identity(Algorithm::Sha256, 11, 5, &checksums));
+        assert_ne!(native, identity(Algorithm::Sha256, 10, 6, &checksums));
         assert_ne!(
-            identity,
-            upload_identity(Algorithm::Sha256, 11, 5, &checksums)
+            native,
+            identity(Algorithm::Sha256, 10, 5, &["second".into(), "first".into()])
         );
+        // Without request checksums the stored whole-file hash identifies the
+        // contents, together with the part boundaries.
+        let whole = identity(Algorithm::None, 10, 5, &[]);
+        assert!(whole.starts_with("whole:"), "{whole}");
+        assert_eq!(whole, identity(Algorithm::None, 10, 5, &checksums));
+        assert_ne!(whole, identity(Algorithm::None, 11, 5, &[]));
+        assert_ne!(whole, identity(Algorithm::None, 10, 6, &[]));
+        let mut changed = metadata.clone();
+        changed.hash = Some("0".repeat(64));
         assert_ne!(
-            identity,
-            upload_identity(Algorithm::Sha256, 10, 6, &checksums)
-        );
-        assert_ne!(
-            identity,
-            upload_identity(Algorithm::Sha256, 10, 5, &["second".into(), "first".into()])
+            whole,
+            upload_identity(Algorithm::None, 10, 5, &[], &changed)
         );
     }
 
@@ -2804,26 +2998,40 @@ mod tests {
     }
 
     #[test]
-    fn md5_recovery_requires_acknowledged_opaque_etag_checksum_and_length() {
-        let mut record: UploadState =
-            serde_json::from_str(include_str!("../../tests/fixtures/s3-upload-v1.json")).unwrap();
-        record.algorithm = Algorithm::Md5;
-        record.schema = record.algorithm.schema();
-        record.completed.insert(
-            1,
-            UploadedPart {
-                etag: "opaque-etag".into(),
-                checksum: "checksum".into(),
-                length: 42,
-            },
-        );
-        let record: UploadState =
-            serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
-        assert_eq!(record.schema, 2); // The earlier binary rejects this schema.
-        assert!(record.acknowledged_part(1, "opaque-etag", "checksum", 42));
-        assert!(!record.acknowledged_part(2, "opaque-etag", "checksum", 42));
-        assert!(!record.acknowledged_part(1, "replaced-etag", "checksum", 42));
-        assert!(!record.acknowledged_part(1, "opaque-etag", "changed", 42));
-        assert!(!record.acknowledged_part(1, "opaque-etag", "checksum", 41));
+    fn unlisted_checksum_recovery_requires_acknowledged_etag_checksum_and_length() {
+        // ETags are opaque. Uploads whose part checksums are not listed (R2's
+        // MD5, or none at all) reuse only parts recorded by this source's upload.
+        for (algorithm, schema, name, checksum) in [
+            (Algorithm::Md5, 2, "md5", "checksum"),
+            (Algorithm::None, 3, "none", ""),
+        ] {
+            let mut record: UploadState =
+                serde_json::from_str(include_str!("../../tests/fixtures/s3-upload-v1.json"))
+                    .unwrap();
+            record.algorithm = algorithm;
+            record.schema = record.algorithm.schema();
+            record.completed.insert(
+                1,
+                UploadedPart {
+                    etag: "opaque-etag".into(),
+                    checksum: checksum.into(),
+                    length: 42,
+                },
+            );
+            let value = serde_json::to_value(record).unwrap();
+            // Earlier binaries reject this schema or algorithm name.
+            assert_eq!(value["schema"], schema);
+            assert_eq!(value["algorithm"], name);
+            assert_eq!(
+                value["completed"]["1"].get("checksum").is_some(),
+                !checksum.is_empty()
+            );
+            let record: UploadState = serde_json::from_value(value).unwrap();
+            assert!(record.acknowledged_part(1, "opaque-etag", checksum, 42));
+            assert!(!record.acknowledged_part(2, "opaque-etag", checksum, 42));
+            assert!(!record.acknowledged_part(1, "replaced-etag", checksum, 42));
+            assert!(!record.acknowledged_part(1, "opaque-etag", "changed", 42));
+            assert!(!record.acknowledged_part(1, "opaque-etag", checksum, 41));
+        }
     }
 }

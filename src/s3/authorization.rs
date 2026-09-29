@@ -63,6 +63,10 @@ pub(crate) struct Request {
     pub delete: bool,
     pub create_only: bool,
     pub lifetime: u64,
+    /// Headers the command adds with --s3-header or --s3-write-header. Other
+    /// signed headers must be ones syq sends itself.
+    #[serde(default)]
+    pub headers: std::collections::BTreeSet<(String, String)>,
 }
 impl Request {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -108,6 +112,18 @@ impl Request {
         }
         if let Some(Removal::Version(version)) = &self.removal {
             anyhow::ensure!(!version.is_empty(), "storage version ID cannot be empty");
+        }
+        anyhow::ensure!(
+            self.headers.len() <= 64,
+            "too many approved storage headers"
+        );
+        for (name, value) in &self.headers {
+            anyhow::ensure!(
+                name == &name.to_ascii_lowercase()
+                    && http::HeaderName::from_bytes(name.as_bytes()).is_ok()
+                    && http::HeaderValue::from_str(value).is_ok(),
+                "invalid approved storage header"
+            );
         }
         for (name, value) in &self.acl {
             anyhow::ensure!(
@@ -161,11 +177,12 @@ impl Request {
                     && http::HeaderValue::from_str(value).is_ok(),
                 "invalid storage signing header"
             );
+            // Some services apply headers a signature does not cover, so this
+            // limits only what signing adds: syq's own headers and those the
+            // approved command shows.
             anyhow::ensure!(
-                !name.starts_with("x-amz-object-lock-")
-                    && !name.starts_with("x-amz-bucket-object-lock-")
-                    && name != "x-amz-bypass-governance-retention",
-                "storage authorization does not permit Object Lock or retention bypass headers"
+                sent_by_syq(name) || self.headers.contains(&(name.clone(), value.clone())),
+                "storage authorization does not permit the {name} header; the command must add it with --s3-header or --s3-write-header"
             );
         }
         let query = &request.query;
@@ -315,6 +332,51 @@ impl Request {
         }
         Ok(())
     }
+}
+
+/// Headers syq's own storage requests sign: payload and condition checks,
+/// server-side copies, and object settings copied from an existing object.
+fn sent_by_syq(name: &str) -> bool {
+    name.starts_with("x-amz-checksum-")
+        || name.starts_with("x-amz-meta-")
+        || name.starts_with("x-amz-grant-")
+        || matches!(
+            name,
+            "content-md5"
+                | "content-length"
+                | "content-type"
+                | "content-encoding"
+                | "content-language"
+                | "content-disposition"
+                | "cache-control"
+                | "expires"
+                | "if-match"
+                | "if-none-match"
+                | "x-amz-acl"
+                | "x-amz-copy-source"
+                | "x-amz-copy-source-if-match"
+                | "x-amz-copy-source-range"
+                | "x-amz-metadata-directive"
+                | "x-amz-tagging-directive"
+                | "x-amz-tagging"
+                | "x-amz-website-redirect-location"
+                | "x-amz-storage-class"
+                | "x-amz-server-side-encryption"
+                | "x-amz-server-side-encryption-aws-kms-key-id"
+                | "x-amz-server-side-encryption-bucket-key-enabled"
+        )
+}
+
+/// The headers a command adds to storage requests.
+pub(crate) fn command_headers(
+    options: &super::Options,
+) -> std::collections::BTreeSet<(String, String)> {
+    options
+        .headers
+        .iter()
+        .chain(&options.write_headers)
+        .map(|super::Header(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 /// A canonical request description contains no credentials or request body.
@@ -647,6 +709,13 @@ pub(crate) async fn connect(
         args.descriptor_copy.is_none(),
         "storage authorization currently requires a file or tree upload/download"
     );
+    let request = request_for(args, options)?;
+    connect_request(name, request).await.map(Some)
+}
+
+/// The authorization a command requests. The authorizing machine derives the
+/// same request from the command it shows for approval.
+pub(crate) fn request_for(args: &crate::cli::Args, options: &super::Options) -> Result<Request> {
     let upload = options.route == super::Route::Upload || options.route.is_server_copy();
     let scopes = if args.rm {
         let base = super::local::key_path(
@@ -742,8 +811,9 @@ pub(crate) async fn connect(
         delete: (args.rm || (upload && args.delete)) && !args.dry_run,
         create_only: args.ignore_existing || args.target_existence == crate::cli::Existence::New,
         lifetime: DEFAULT_LIFETIME,
+        headers: command_headers(options),
     };
-    connect_request(name, request).await.map(Some)
+    Ok(request)
 }
 
 pub(super) fn acl_headers(options: &super::Options) -> BTreeMap<String, String> {

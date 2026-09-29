@@ -94,7 +94,9 @@ impl Session {
         }
         let mut requests = vec![put];
         let mut metadata_update = None;
-        if protects_existing(plan) && plan.placement.existence != crate::cli::Existence::New {
+        if plan.controls.metadata.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)
+            && plan.placement.existence != crate::cli::Existence::New
+        {
             requests.push(Unsigned::new("GET", &plan.key));
             if metadata_update_flags(plan) != 0 {
                 requests.push(Unsigned::new("HEAD", &plan.key));
@@ -258,12 +260,23 @@ pub(super) async fn connect(
     target: &str,
     existence: crate::cli::Existence,
 ) -> Result<Option<Arc<Authorization>>> {
-    use crate::s3::authorization::{Request, Scope, DEFAULT_LIFETIME};
     let crate::cli::AuthFrom::Return(name) = &args.auth_from else {
         return Ok(None);
     };
+    crate::s3::authorization::connect_request(name, request(args, options, target, existence))
+        .await
+        .map(Some)
+}
+
+pub(crate) fn request(
+    args: &crate::cli::Args,
+    options: &Options,
+    target: &str,
+    existence: crate::cli::Existence,
+) -> crate::s3::authorization::Request {
+    use crate::s3::authorization::{Request, Scope, DEFAULT_LIFETIME};
     let upload = options.route == crate::s3::Route::Upload;
-    let request = Request {
+    Request {
         bucket: options.bucket.clone(),
         endpoint: options.endpoint.clone(),
         region: options.region.clone(),
@@ -279,8 +292,6 @@ pub(super) async fn connect(
         delete: false,
         create_only: args.ignore_existing || existence == crate::cli::Existence::New,
         lifetime: DEFAULT_LIFETIME,
-    };
-    crate::s3::authorization::connect_request(name, request)
-        .await
-        .map(Some)
+        headers: crate::s3::authorization::command_headers(options),
+    }
 }

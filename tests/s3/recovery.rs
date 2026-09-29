@@ -2,6 +2,8 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
+static REJECTED_PARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(super) fn serve_upload(
     socket: &mut TcpStream,
     fault: &str,
@@ -28,6 +30,9 @@ pub(super) fn serve_upload(
             );
         }
         "POST" if target.contains("uploads") => {
+            assert!(!headers
+                .keys()
+                .any(|name| name.starts_with("x-amz-checksum")));
             if fault == "recovery-upload-default-hash" {
                 assert_eq!(headers["x-amz-meta-syq-format"], "1");
                 assert_eq!(
@@ -39,20 +44,19 @@ pub(super) fn serve_upload(
                 b"<InitiateMultipartUploadResult><UploadId>new-upload</UploadId></InitiateMultipartUploadResult>", false);
         }
         "PUT" => {
-            use base64::Engine as _;
-            use sha2::Digest as _;
             assert!(target.contains("uploadId=new-upload"));
             assert!(body.iter().all(|b| *b == b'x'));
-            if let Some(checksum) = headers.get("content-md5") {
-                assert_eq!(
-                    *checksum,
-                    base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&body))
-                );
+            if fault == "recovery-upload-object-lock" {
+                match headers.get("content-md5") {
+                    Some(checksum) => assert_eq!(*checksum, content_md5(&body)),
+                    None => {
+                        REJECTED_PARTS.fetch_add(1, Ordering::Relaxed);
+                        reply_checksum_required(socket);
+                        return;
+                    }
+                }
             } else {
-                assert_eq!(
-                    headers["x-amz-checksum-sha256"],
-                    base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&body))
-                );
+                assert_unchecked_upload(headers);
             }
             if fault == "recovery-upload-fail" {
                 reply(
@@ -77,6 +81,7 @@ pub(super) fn serve_upload(
             let body = String::from_utf8(body).unwrap();
             assert!(body.contains("<PartNumber>1</PartNumber>"), "{body}");
             assert!(body.contains("<PartNumber>2</PartNumber>"), "{body}");
+            assert!(!body.contains("<Checksum"), "{body}");
             gate.0.store(true, Ordering::Relaxed);
             reply(
                 socket,
@@ -276,4 +281,20 @@ fn ordinary_multipart_upload_stores_whole_file_hash() {
     );
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(server.gate.0.load(Ordering::Relaxed));
+}
+
+#[test]
+fn multipart_parts_add_content_md5_when_the_destination_requires_a_checksum() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let server = Server::start("recovery-upload-object-lock");
+    std::fs::write(temp.path().join("source"), vec![b'x'; SIZE]).unwrap();
+    let output = server.cp(
+        temp.path(),
+        &["source", "--to", "s3://bucket", "--as", "object"],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.0.load(Ordering::Relaxed));
+    // Parts already in flight may each be rejected once before the switch.
+    let rejected = REJECTED_PARTS.load(Ordering::Relaxed);
+    assert!((1..=2).contains(&rejected), "{rejected}");
 }

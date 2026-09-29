@@ -36,7 +36,9 @@ impl HttpConnector for ValidatePayload {
                     bytes.extend_from_slice(&data);
                 }
             }
-            let actual = super::super::checksum::Algorithm::Sha256.digest(&bytes);
+            let actual = super::super::checksum::Algorithm::Sha256
+                .digest(&bytes)
+                .unwrap();
             // Model a provider that only validates the signed payload digest.
             let valid = super::super::checksum::single_put_payload("PUT", false, Some(&actual))
                 .unwrap()
@@ -86,11 +88,9 @@ async fn precomputed_payload_detects_corruption_in_buffered_and_streamed_puts() 
             } else {
                 ByteStream::from_static(b"original")
             };
-            let checksum = super::super::checksum::Algorithm::Sha256.digest(if corrupt {
-                b"different"
-            } else {
-                b"original"
-            });
+            let checksum = super::super::checksum::Algorithm::Sha256
+                .digest(if corrupt { b"different" } else { b"original" })
+                .unwrap();
             let result = client
                 .put_object()
                 .bucket("bucket")

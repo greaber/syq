@@ -3,7 +3,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
 fn file_upload_accepts_precomputed_digest_but_rejects_placeholder_hash() {
-    let checksum = crate::s3::checksum::Algorithm::Sha256.digest(b"abc");
+    let checksum = crate::s3::checksum::Algorithm::Sha256
+        .digest(b"abc")
+        .unwrap();
     let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
     let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     for (query, native, signed, valid) in [

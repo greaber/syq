@@ -4,6 +4,7 @@ mod authorization;
 use super::{checksum::Algorithm, client, Options};
 use crate::descriptor_copy::fd::{Descriptor, Source};
 use anyhow::{bail, Context, Result};
+pub(crate) use authorization::request as authorization_request;
 pub(crate) use authorization::Prepared;
 use aws_sdk_s3::{
     primitives::ByteStream,
@@ -31,6 +32,8 @@ pub(crate) struct Session {
     requests: Arc<tokio::sync::Semaphore>,
     objects: Arc<tokio::sync::Semaphore>,
     bandwidth: Option<Arc<crate::bwlimit::BandwidthLimit>>,
+    /// The destination rejected an upload without a checksum; send Content-MD5.
+    content_md5: std::sync::atomic::AtomicBool,
 }
 impl Session {
     pub(crate) async fn connect(
@@ -59,6 +62,7 @@ impl Session {
             options,
             cancellation,
             bandwidth: controls.bandwidth(),
+            content_md5: Default::default(),
         })
     }
     pub(crate) fn share_admission(&mut self, other: &Self) {
@@ -403,7 +407,8 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
     let report = &plan.controls.report;
     let policy = report.only_new || report.only_existing;
     let inspect_placement = existence != Existence::Any || policy;
-    if !inspect_placement && !plan.controls.metadata.skip_newer {
+    let reject_existing = plan.controls.metadata.if_exists == Some(crate::cli::IfExists::Error);
+    if !inspect_placement && !plan.controls.metadata.skip_newer && !reject_existing {
         return Ok(());
     }
     // Match ordinary S3 cp: a new target must have neither an exact object
@@ -420,10 +425,20 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
     let exact_head = if target.is_empty() {
         None
     } else {
-        client::head_output(client, &plan.options.bucket, target, None).await?
+        let head = client::head_output(client, &plan.options.bucket, target, None).await;
+        if inspect_placement || plan.controls.metadata.skip_newer {
+            head?
+        } else {
+            // This optional preflight avoids reading and uploading a rejected
+            // stream. Write-only credentials can still use conditional writes:
+            // a failed HEAD is not proof of absence, and publication below
+            // always retains If-None-Match for this policy.
+            head.unwrap_or(None)
+        }
     };
+    let exact = exact_head.is_some();
+    let mut final_head = if container { None } else { exact_head };
     if inspect_placement {
-        let exact = exact_head.is_some();
         let prefix = if target.is_empty() {
             String::new()
         } else {
@@ -438,9 +453,9 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
         }
         if policy {
             let final_present = if container {
-                super::client::head_output(client, &plan.options.bucket, &plan.key, None)
-                    .await?
-                    .is_some()
+                final_head =
+                    client::head_output(client, &plan.options.bucket, &plan.key, None).await?;
+                final_head.is_some()
                     || super::client::prefix_exists(
                         client,
                         &plan.options.bucket,
@@ -459,14 +474,27 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
             bail!("S3 destination is a prefix, not an object");
         }
     }
-    if plan.controls.metadata.skip_newer {
-        let head = if container {
-            client::head_output(client, &plan.options.bucket, &plan.key, None).await?
+    // A successfully checked new container has no children. Conditional
+    // publication protects against a child appearing after that inspection.
+    if container
+        && !policy
+        && (plan.controls.metadata.skip_newer || (reject_existing && existence != Existence::New))
+    {
+        let head = client::head_output(client, &plan.options.bucket, &plan.key, None).await;
+        final_head = if plan.controls.metadata.skip_newer {
+            head?
         } else {
-            exact_head
+            head.unwrap_or(None)
         };
+    }
+    anyhow::ensure!(
+        !reject_existing || final_head.is_none(),
+        "destination already exists: {} (--if-exists=error)",
+        plan.key
+    );
+    if plan.controls.metadata.skip_newer {
         // Match pathname S3 copies: only a strictly newer destination is protected.
-        if let Some(head) = head {
+        if let Some(head) = final_head {
             let stored = client::Metadata::decode(head.metadata())?;
             let mtime = stored.map_or_else(
                 || (head.last_modified().map_or(0, |t| t.secs()), 0),
@@ -484,10 +512,12 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
     Ok(())
 }
 
-fn digest(algorithm: Algorithm, data: &[u8]) -> String {
-    let mut hash = algorithm.hasher();
-    hash.update(data);
-    hash.finish()
+/// `--if-exists=error-if-different` compares an existing object with the
+/// uploaded parts after the stream's bytes are gone, so keep a digest of each.
+fn comparison_digest(plan: &Plan<'_>, data: &[u8]) -> Option<String> {
+    (plan.controls.metadata.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)).then(|| {
+        crate::hashing::Digest::hash_bytes(crate::hashing::HashAlgorithm::Blake3, data).value
+    })
 }
 
 fn upload_metadata(plan: &Plan<'_>) -> Option<std::collections::HashMap<String, String>> {
@@ -549,7 +579,7 @@ async fn upload(
     let algorithm = if plan.session.authorization.is_some() {
         Algorithm::Md5
     } else {
-        Algorithm::for_endpoint(options.endpoint.as_deref())
+        Algorithm::None
     };
     let mut check = controls.expected.start();
     let (mut input, first) = plan.session.read(input).await?;
@@ -562,24 +592,53 @@ async fn upload(
         }
         plan.session.pace(length).await;
         crate::descriptor_copy::fd::await_commit(commit).await?;
-        let hash = digest(algorithm, &first.bytes);
+        let checksum = algorithm.digest(&first.bytes);
+        let comparison = comparison_digest(plan, &first.bytes);
         let _request = plan.session.requests.acquire().await?;
-        let published = client
-            .put_object()
-            .set_metadata(metadata.clone())
-            .bucket(&options.bucket)
-            .key(&plan.key)
-            .set_checksum_sha256(algorithm.is_sha256().then_some(hash.clone()))
-            .set_content_md5((algorithm == Algorithm::Md5).then_some(hash.clone()))
-            .set_if_none_match(
-                (plan.placement.existence == crate::cli::Existence::New
-                    || plan.controls.report.only_new
-                    || protects_existing(plan))
-                .then(|| "*".into()),
-            )
-            .body(ByteStream::from(first.bytes))
-            .send()
-            .await;
+        let mut retry_with_md5 = false;
+        let published = loop {
+            let fallback = (algorithm == Algorithm::None
+                && (retry_with_md5 || plan.session.content_md5.load(Relaxed)))
+            .then(|| Algorithm::Md5.digest(&first.bytes).unwrap());
+            let result = client
+                .put_object()
+                .set_metadata(metadata.clone())
+                .bucket(&options.bucket)
+                .key(&plan.key)
+                .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum.as_deref()))
+                .set_content_md5(
+                    algorithm
+                        .header(Algorithm::Md5, checksum.as_deref())
+                        .or_else(|| fallback.clone()),
+                )
+                .set_if_none_match(
+                    (plan.placement.existence == crate::cli::Existence::New
+                        || plan.controls.report.only_new
+                        || protects_existing(plan))
+                    .then(|| "*".into()),
+                )
+                .body(ByteStream::from(first.bytes.clone()))
+                .customize()
+                .disable_payload_signing()
+                .send()
+                .await;
+            match result {
+                Err(e)
+                    if algorithm == Algorithm::None
+                        && fallback.is_none()
+                        && super::checksum::requires_checksum(&e) =>
+                {
+                    retry_with_md5 = true;
+                }
+                result => {
+                    // Content-MD5 fixed the rejection, so send it from now on.
+                    if result.is_ok() && fallback.is_some() {
+                        plan.session.content_md5.store(true, Relaxed);
+                    }
+                    break result;
+                }
+            }
+        };
         drop(_request);
         if let Err(error) = published {
             if protects_existing(plan)
@@ -591,8 +650,7 @@ async fn upload(
                 accept_existing(
                     client,
                     plan,
-                    algorithm,
-                    &[(hash, length)],
+                    &[(comparison, length)],
                     metadata.as_ref(),
                     metadata_update,
                 )
@@ -701,15 +759,7 @@ async fn upload(
                 .iter()
                 .map(|(_, hash, length)| (hash.clone(), *length))
                 .collect::<Vec<_>>();
-            accept_existing(
-                client,
-                plan,
-                algorithm,
-                &hashes,
-                metadata.as_ref(),
-                metadata_update,
-            )
-            .await?;
+            accept_existing(client, plan, &hashes, metadata.as_ref(), metadata_update).await?;
             plan.session.abort(&plan.key, &id).await?;
         } else {
             return Err(error.into_service_error()).context("complete multipart upload (destination may have completed if the response was lost)");
@@ -729,8 +779,7 @@ fn protects_existing(plan: &Plan<'_>) -> bool {
 async fn accept_existing(
     client: &Client,
     plan: &Plan<'_>,
-    algorithm: Algorithm,
-    parts: &[(String, u64)],
+    parts: &[(Option<String>, u64)],
     desired: Option<&std::collections::HashMap<String, String>>,
     metadata_update: &mut Option<Box<super::metadata_copy::Prepared>>,
 ) -> Result<()> {
@@ -764,16 +813,18 @@ async fn accept_existing(
     let mut input = object.body.into_async_read();
     let mut buffer = vec![0u8; 64 * 1024];
     for (expected, length) in parts {
+        use crate::hashing::{Digest, HashAlgorithm};
         let mut remaining = *length;
-        let mut hash = algorithm.hasher();
+        let mut hash = HashAlgorithm::Blake3.hasher();
         while remaining > 0 {
             let n = remaining.min(buffer.len() as u64) as usize;
             input.read_exact(&mut buffer[..n]).await?;
             hash.update(&buffer[..n]);
             remaining -= n as u64;
         }
+        let actual = Digest::from_hash(HashAlgorithm::Blake3, &hash.finalize()).value;
         anyhow::ensure!(
-            &hash.finish() == expected,
+            expected.as_deref() == Some(actual.as_str()),
             "destination contents differ: {} (--if-exists=error-if-different)",
             plan.key
         );
@@ -898,33 +949,61 @@ async fn upload_part(
     number: i32,
     data: Part,
     algorithm: Algorithm,
-) -> Result<(CompletedPart, String, u64)> {
+) -> Result<(CompletedPart, Option<String>, u64)> {
     let controls = plan.controls;
     let length = data.bytes.len() as u64;
     plan.session.pace(length).await;
-    let hash = digest(algorithm, &data.bytes);
+    let checksum = algorithm.digest(&data.bytes);
+    let comparison = comparison_digest(plan, &data.bytes);
     let _request = plan.session.requests.acquire().await?;
-    let output = client
-        .upload_part()
-        .bucket(&plan.options.bucket)
-        .key(&plan.key)
-        .upload_id(id)
-        .part_number(number)
-        .set_checksum_sha256(algorithm.is_sha256().then_some(hash.clone()))
-        .set_content_md5((algorithm == Algorithm::Md5).then_some(hash.clone()))
-        .body(ByteStream::from(data.bytes))
-        .send()
-        .await
-        .map_err(|e| e.into_service_error())
-        .context("upload stream part")?;
+    let mut retry_with_md5 = false;
+    let output = loop {
+        let fallback = (algorithm == Algorithm::None
+            && (retry_with_md5 || plan.session.content_md5.load(Relaxed)))
+        .then(|| Algorithm::Md5.digest(&data.bytes).unwrap());
+        let result = client
+            .upload_part()
+            .bucket(&plan.options.bucket)
+            .key(&plan.key)
+            .upload_id(id)
+            .part_number(number)
+            .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum.as_deref()))
+            .set_content_md5(
+                algorithm
+                    .header(Algorithm::Md5, checksum.as_deref())
+                    .or_else(|| fallback.clone()),
+            )
+            .body(ByteStream::from(data.bytes.clone()))
+            .customize()
+            .disable_payload_signing()
+            .send()
+            .await;
+        match result {
+            Err(e)
+                if algorithm == Algorithm::None
+                    && fallback.is_none()
+                    && super::checksum::requires_checksum(&e) =>
+            {
+                retry_with_md5 = true;
+            }
+            result => {
+                if result.is_ok() && fallback.is_some() {
+                    plan.session.content_md5.store(true, Relaxed);
+                }
+                break result
+                    .map_err(|e| e.into_service_error())
+                    .context("upload stream part")?;
+            }
+        }
+    };
     controls.add_bytes(length);
     Ok((
         CompletedPart::builder()
             .part_number(number)
             .e_tag(output.e_tag().context("S3 part omitted ETag")?)
-            .set_checksum_sha256(algorithm.is_sha256().then_some(hash.clone()))
+            .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum.as_deref()))
             .build(),
-        hash,
+        comparison,
         length,
     ))
 }

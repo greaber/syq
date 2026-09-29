@@ -327,9 +327,11 @@ connections. A null automatic approval root means every download asks.
 Connection entries list only profiles allowed on that endpoint.
 
 Command approvals in `syq persist receive pending --json` use `kind: "command"`
-and include `argv`, `cwd`, and `permission`. Argument and directory strings in
-this summary are escaped for display. Use an up-to-date syq binary to inspect
-and approve commands; clients that only support copy requests omit them.
+and include `argv`, `cwd`, and `permission`. Copy and storage approvals include
+`command`, the syq command the server ran, one argument per element. Argument
+and directory strings in this summary are escaped for display. Use an
+up-to-date syq binary to inspect and approve commands; clients that only
+support copy requests omit them.
 
 ## Retry failed mapping entries
 

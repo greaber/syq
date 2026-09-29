@@ -36,6 +36,10 @@ fn stream_uploads_publish_only_complete_input() {
     scenario("upload");
 }
 #[test]
+fn stream_uploads_add_content_md5_when_the_destination_requires_a_checksum() {
+    scenario("object-lock");
+}
+#[test]
 fn failed_parts_abort_multipart_upload() {
     scenario("upload-error");
 }

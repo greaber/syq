@@ -278,8 +278,11 @@ Requests from a server are subject to local approval:
 | Run a command on your machine | Always required |
 | Use your storage credentials for a transfer | Always required |
 
-The prompt identifies the server account and requested operation. It cannot
-prove who typed the command there. Approving a copy does not approve a later
+The prompt shows the server account and the requested command. For copies and
+authorizations, that is the syq command the server ran, including options from
+its environment variables; your laptop derives what it enforces from that
+command and rejects a request that does not match. It cannot prove who typed
+the command. Approving a copy does not approve a later
 command. By default, every connected server can use every enabled profile.
 A profile's optional `--server` list limits which locally selected SSH
 connections may use it. Within each allowed server account, all processes
@@ -289,8 +292,10 @@ share this authority; choosing a different profile name does not isolate them.
 
 ### Receiving files on your laptop
 
-Copy approval permits the shown destination, overwrite policy, and limits;
-syq enforces them on every filesystem operation. The server can supply false
+Copy approval permits the destination, overwrite policy, and limits of the
+shown command; syq enforces them on every filesystem operation. The server
+supplies the command's ignore rules and mapping file contents, which your
+laptop does not check; they can only narrow the copy. The server can supply false
 contents, inspect destination entries during planning, and use disk space
 within those limits. The default starting directory is your home, without
 containment; `syq persist receive on --root DIRECTORY` confines copies to that
@@ -324,13 +329,10 @@ it is not sandboxed or confined to a copy destination directory.
 
 [Storage authorization](object-storage.md#authorize-from-your-laptop) gives the
 server signed URLs for approved paths and operations. The secret access key
-stays on your laptop. Approval trusts the server to choose uploaded contents.
-Storage authorization rejects Object Lock headers, including retention periods
-and legal holds, and headers that bypass governance retention. Upload or removal
-approval does not grant control over those protections. Bucket-wide path scopes
-permit operations on the bucket's objects, not creating or deleting the bucket.
-Bucket-configured retention defaults still apply. These restrictions concern delegated signing;
-commands using your own storage credentials remain subject to provider permissions.
+stays on your laptop. Approval trusts the server to choose uploaded contents
+and object settings, such as tags or Object Lock retention, within the
+authorizing credentials' permissions: some services accept request headers that
+a signature does not cover.
 Anyone with the URLs can reuse them until expiry; stopping receiving does not
 revoke them. Filesystem receiver roots, aggregate limits, one-use grants, and
 signed receipts do not apply.

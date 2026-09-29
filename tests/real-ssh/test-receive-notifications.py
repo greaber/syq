@@ -115,7 +115,9 @@ def tests():
                 assert "&lt;b&gt;&amp;" in body and "<b>" not in body, body
                 assert "\\nFrom: fake" in body and "\nFrom: fake" not in body, body
                 assert "source" in body and "overwritten" not in body and "May create" not in body, body
-                assert body.startswith("To: "), body
+                # The server's command comes first, then where it writes.
+                assert body.startswith("syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as "), body
+                assert "\nWrites to: " in body, body
                 assert "Details: syq persist receive pending" in body, body
                 assert "Limits:" not in body and "not been inspected" not in body, body
                 assert actions == ["allow", "Allow once", "deny", "Deny"], actions

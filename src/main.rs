@@ -3,6 +3,7 @@
 
 mod advanced;
 mod agent_broker;
+mod approval_command;
 mod bwlimit;
 mod cli;
 mod completion;
@@ -351,6 +352,9 @@ fn main() {
     let mut args = match cli::Args::parse_args(&argv[1..]) {
         Ok(a) => a,
         Err(e) => {
+            if let Some(error) = e.downcast_ref::<clap::Error>() {
+                error.exit();
+            }
             crate::output::diagnostic!("syq: {e:#}");
             std::process::exit(2);
         }
