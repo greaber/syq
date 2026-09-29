@@ -206,6 +206,7 @@ impl Engine {
             progress.println(&note);
         }
         super::diagnostics::elapsed(setup, "client_setup", 0);
+        let content_md5 = super::checksum::plain_http(options.endpoint.as_deref());
         Ok(Arc::new(Self {
             tuning: super::tuning::Tuning::new(&options, &args, control),
             cancelled: std::sync::atomic::AtomicBool::new(false),
@@ -219,7 +220,7 @@ impl Engine {
             pace: Mutex::new(tokio::time::Instant::now()),
             upload_keys: OnceLock::new(),
             copy_checksum_unsupported: Default::default(),
-            content_md5: Default::default(),
+            content_md5: content_md5.into(),
             copy_tagging_unsupported: Default::default(),
         }))
     }

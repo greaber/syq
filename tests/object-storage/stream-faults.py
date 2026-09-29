@@ -134,8 +134,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         assert not any(k.lower().startswith('x-amz-checksum') for k in self.headers), self.headers
         assert self.headers['x-amz-content-sha256'] == 'UNSIGNED-PAYLOAD'
         if 'Content-MD5' in self.headers:
-            assert CASE == 'object-lock'
+            assert CASE in ('object-lock', 'plain-http')
             assert self.headers['Content-MD5'] == base64.b64encode(hashlib.md5(data).digest()).decode()
+        elif CASE == 'plain-http':
+            raise AssertionError('plain HTTP upload without Content-MD5')
         elif CASE == 'object-lock':
             with LOCK: STATE['rejected'] = STATE.get('rejected', 0) + 1
             self.reply(400, b'<Error><Code>InvalidRequest</Code><Message>Content-MD5 OR x-amz-checksum- '
@@ -255,7 +257,10 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
     env = {k: v for k, v in os.environ.items() if not k.startswith(('AWS_', 'SYQ_'))}
     env.update(AWS_ACCESS_KEY_ID='test-access', AWS_SECRET_ACCESS_KEY='test-secret',
                AWS_EC2_METADATA_DISABLED='true', AWS_CONFIG_FILE=os.devnull,
-               AWS_SHARED_CREDENTIALS_FILE=os.devnull, HOME=temp)
+               AWS_SHARED_CREDENTIALS_FILE=os.devnull, HOME=temp,
+               # This server speaks plain HTTP; test the HTTPS upload behavior
+               # except in the plain-http case.
+               SYQ_TEST_S3_TREAT_HTTP_AS_HTTPS='1')
     base = [SYQ, 'cp', '--s3-endpoint', f'http://127.0.0.1:{server.server_port}',
             '--s3-region', 'us-east-1', '--performance-tuning',
             's3-part-size=5M,s3-parts-per-object=2,s3-retries=1']
@@ -601,6 +606,12 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 # One rejection switches the copy to Content-MD5; parts already
                 # in flight may each be rejected once.
                 assert 1 <= STATE['rejected'] <= 2, STATE['rejected']
+        elif CASE == 'plain-http':
+            plain = {k: v for k, v in env.items() if k != 'SYQ_TEST_S3_TREAT_HTTP_AS_HTTPS'}
+            for data in (b'binary\x00\xff', DATA):
+                STATE.update(parts={}, completed=False)
+                success(run(put, input=data, env=plain))
+                assert STATE['published'] == data
         elif CASE == 'upload-error':
             result = run(put, input=DATA, env=env)
             failure(result)

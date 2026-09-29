@@ -40,6 +40,10 @@ fn stream_uploads_add_content_md5_when_the_destination_requires_a_checksum() {
     scenario("object-lock");
 }
 #[test]
+fn plain_http_stream_uploads_send_content_md5() {
+    scenario("plain-http");
+}
+#[test]
 fn failed_parts_abort_multipart_upload() {
     scenario("upload-error");
 }

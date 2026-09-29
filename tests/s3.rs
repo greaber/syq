@@ -47,6 +47,7 @@ use std::{
 /// Tests pass this with `--s3-write-header`; the server rejects it on any
 /// request other than PutObject, CopyObject, or CreateMultipartUpload.
 const WRITE_PROBE: &str = "x-syq-write-probe";
+const TREAT_HTTP_AS_HTTPS: &str = "SYQ_TEST_S3_TREAT_HTTP_AS_HTTPS";
 
 struct Server {
     address: String,
@@ -159,6 +160,9 @@ impl Server {
             .env("AWS_CONFIG_FILE", temp.join("no-config"))
             .env("AWS_SHARED_CREDENTIALS_FILE", temp.join("no-credentials"))
             .env("XDG_CACHE_HOME", temp.join("cache"))
+            // These servers speak plain HTTP; test the HTTPS upload behavior.
+            // Tests of plain-HTTP uploads remove this.
+            .env(TREAT_HTTP_AS_HTTPS, "1")
             .current_dir(temp);
         if mode == "cp" && explicit {
             command.args(["--performance-tuning", "s3-part-size=5M"]);
@@ -2933,6 +2937,35 @@ fn uploads_add_content_md5_when_the_destination_requires_a_checksum() {
     assert!(server.gate.0.load(Ordering::Acquire));
     // Only the first upload is rejected; later uploads send Content-MD5 at once.
     assert_eq!(server.probes.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn plain_http_uploads_send_content_md5_from_the_start() {
+    let server = Server::start("object-lock-upload");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("source")).unwrap();
+    for name in ["first", "second", "third"] {
+        std::fs::write(temp.path().join("source").join(name), name.repeat(1000)).unwrap();
+    }
+    let output = server
+        .command(temp.path())
+        .env_remove(TREAT_HTTP_AS_HTTPS)
+        .args(["--s3-endpoint", &server.address])
+        .args([
+            "--srcs-in",
+            "source",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "prefix",
+        ])
+        .capture_output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.0.load(Ordering::Acquire));
+    // The server accepted only uploads with a correct Content-MD5 and never
+    // had to reject one first.
+    assert_eq!(server.probes.load(Ordering::Relaxed), 0);
 }
 
 #[test]

@@ -58,12 +58,12 @@ its checksum.
 
 For a complete check of a local copy, use an [expected hash](#expected-hashes).
 
-For local/S3 copies, uploads rely on HTTPS to protect the transfer and send no
-request checksum. Over a plain `http://` endpoint, only TCP's checksum protects
-uploaded bytes. When a destination rejects an upload without a checksum, as AWS
-does for buckets with an Object Lock default retention period, syq retries with
-Content-MD5 and sends it for the rest of the copy, reading files again to compute
-it. With
+For local/S3 copies, uploads over HTTPS rely on it to protect the transfer and
+send no request checksum. Uploads to a plain `http://` endpoint send Content-MD5,
+which the destination checks and the request signature covers, so bytes changed
+in transit are rejected. When a destination rejects an upload without a
+checksum, as AWS does for buckets with an Object Lock default retention period,
+syq retries with Content-MD5 and sends it for the rest of the copy. With
 [storage authorization](object-storage.md#authorize-from-your-laptop), uploads
 send SHA-256 request checksums instead (Content-MD5 on R2 and for streams).
 Pathname uploads store a whole-file BLAKE3 hash by default, so later `--hash`
