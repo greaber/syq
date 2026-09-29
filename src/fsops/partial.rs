@@ -441,7 +441,10 @@ impl FsOps {
                 )
             })?;
         let Some((file, basis_size)) = opened else {
-            return Ok(Preparation::default());
+            return Ok(Preparation {
+                partial_size: None,
+                has_candidates: !self.candidate_partials(&target).is_empty(),
+            });
         };
         if let Some(old_size) = basis_size {
             if old_size > size {
@@ -546,11 +549,13 @@ impl FsOps {
             file,
         });
         #[cfg(debug_assertions)]
-        test_race_barrier(
-            "SYQ_TEST_BASIS_READY_FILE",
-            "SYQ_TEST_BASIS_CONTINUE_FILE",
-            "basis-ready",
-        )?;
+        if off == 0 {
+            test_race_barrier(
+                "SYQ_TEST_BASIS_READY_FILE",
+                "SYQ_TEST_BASIS_CONTINUE_FILE",
+                "basis-ready",
+            )?;
+        }
         // Hashing is intentionally limited to the source length. Report the
         // retained inode's length afterward so a file that grew since the
         // planner's stat cannot be mistaken for an exact content match.
@@ -663,11 +668,6 @@ impl FsOps {
                 previous_end = end;
             }
         }
-        #[cfg(debug_assertions)]
-        if stage_only && std::env::var_os("SYQ_TEST_FAIL_STAGE_BASIS").is_some() {
-            return Err(io::Error::from_raw_os_error(libc::ENOSPC))
-                .context("seed comparison basis");
-        }
         let target = self.destination_mutation_target(path, guard)?;
         let expected = target.location();
         // A previous failed job may have left a hold on this connection. It is
@@ -769,7 +769,15 @@ impl FsOps {
                         self.preallocate_new_partial(&output, len)?;
                     }
                 } else {
-                    super::basis_copy::seed(input, &output, len)?;
+                    let donor = input.metadata()?;
+                    super::basis_copy::seed(input, &output, len, || {
+                        // Preserve sparse extents and successful clones. Dense
+                        // donors still reserve capacity before copying begins.
+                        if donor.blocks().saturating_mul(512) >= donor.len() {
+                            self.preallocate_new_partial(&output, len)?;
+                        }
+                        Ok(())
+                    })?;
                 }
             }
             #[cfg(debug_assertions)]
@@ -1621,19 +1629,14 @@ impl FsOps {
         }
         if final_basis {
             let location = target.location();
-            let file = if let Some(file) = self.cached_clone(location.clone(), attempt, false)? {
-                file
-            } else {
-                let Ok(file) = target.root.open_regular_read(&target.relative) else {
-                    // The old destination is only an optional basis. If it
-                    // disappears, force every block in this window from source.
-                    return Ok(vec![
-                        self.hash_policy.algorithm.hash(&[]);
-                        u64::from(len).div_ceil(block) as usize
-                    ]);
-                };
-                self.cache_file(location.clone(), attempt, false, file.try_clone()?);
-                file
+            // Only the bytes need to survive this request. Keeping a donor
+            // descriptor in the window would pin replaced files after an error
+            // or cancellation, while the connection continues serving other work.
+            let Ok(file) = target.root.open_regular_read(&target.relative) else {
+                return Ok(vec![
+                    self.hash_policy.algorithm.hash(&[]);
+                    u64::from(len).div_ceil(block) as usize
+                ]);
             };
             let metadata = file.metadata()?;
             let mut window = self
@@ -1701,7 +1704,7 @@ impl FsOps {
                 }
                 pos += n as u64;
             }
-            self.comparison_window = Some(window);
+            self.comparison_window = (!window.blocks.is_empty()).then_some(window);
             return Ok(hashes);
         }
 
@@ -1908,6 +1911,13 @@ impl FsOps {
                 && window.attempt == attempt
         }) {
             window.blocks.retain(|(pos, _)| *pos != off);
+        }
+        if self
+            .comparison_window
+            .as_ref()
+            .is_some_and(|window| window.blocks.is_empty())
+        {
+            self.comparison_window = None;
         }
         let mut write = |relative: &RelativePath, label: &Path| {
             let file = self.cached_rooted(label, &rooted.root, relative, attempt, !inplace)?;

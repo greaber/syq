@@ -927,20 +927,6 @@ impl Worker {
                 None
             };
 
-            // Probe equality without creating a sidecar. A difference restarts
-            // the staged pipeline; equal prefixes need not survive that restart.
-            // Explicit checksums and protected/in-place checks stay separate.
-            if !inplace && reuse_blocks && final_is_file && !self.opts.checksum && size > 0 {
-                if final_entry.is_some_and(|entry| entry.size == size)
-                    && self.matches_final_windows(&job)?
-                {
-                    self.finish_matched_basis(idx, &job)?;
-                    return Ok((vec![], false));
-                }
-                self.stage_comparison(idx, &job, true)?;
-                return Ok((full(), true));
-            }
-
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
             // absent until the content comparison shows a difference.
@@ -962,13 +948,41 @@ impl Worker {
             }
             // Resume an owned output or a previous invocation's partial,
             // independently of the policy for reusing the final destination.
-            if prepared.partial_size.is_some() || (!reuse_blocks && prepared.has_candidates) {
+            if prepared.partial_size.is_some()
+                || (prepared.has_candidates
+                    && !reuse_blocks
+                    && (!self.opts.checksum || !final_is_file))
+            {
                 if size == 0 {
+                    // Discovery can report a donor without creating our output.
+                    // Even an empty replacement needs its own file to publish.
+                    if prepared.partial_size.is_none() {
+                        self.prepare_file(&job, true)?;
+                    }
                     return Ok((vec![], true));
                 }
-                self.stage_comparison(idx, &job, false)?;
+                return Ok((self.resume_ranges(idx, &job)?, true));
+            }
+            // Probe equality without creating a sidecar. A difference restarts
+            // the staged pipeline; equal prefixes need not survive that restart.
+            // Explicit checksums and protected/in-place checks stay separate.
+            if !inplace
+                && reuse_blocks
+                && final_is_file
+                && !self.opts.checksum
+                && !self.bandwidth_limited_remote_source()
+                && size > 0
+            {
+                if final_entry.is_some_and(|entry| entry.size == size)
+                    && self.matches_final_windows(&job)?
+                {
+                    self.finish_matched_basis(idx, &job)?;
+                    return Ok((vec![], false));
+                }
+                self.stage_comparison(idx, &job, true)?;
                 return Ok((full(), true));
             }
+
             if !reuse_blocks {
                 // An explicit checksum may still establish a complete match.
                 // A differing final file contributes no blocks to the output.
@@ -980,8 +994,7 @@ impl Worker {
                     }
                     let prepared = self.prepare_file(&job, true)?;
                     if prepared.partial_size.is_some() || prepared.has_candidates {
-                        self.stage_comparison(idx, &job, false)?;
-                        return Ok((full(), true));
+                        return Ok((self.resume_ranges(idx, &job)?, true));
                     }
                 }
                 return Ok((full(), true));
@@ -998,8 +1011,7 @@ impl Worker {
                 ));
             }
             if prepared.has_candidates {
-                self.stage_comparison(idx, &job, false)?;
-                return Ok((full(), true));
+                return Ok((self.resume_ranges(idx, &job)?, true));
             }
             Ok((full(), true))
         })();
@@ -1108,6 +1120,33 @@ impl Worker {
             off += len;
         }
         Ok(true)
+    }
+
+    fn bandwidth_limited_remote_source(&self) -> bool {
+        self.bwlimit.is_some() && self.opts.src_remote
+    }
+
+    fn resume_ranges(&mut self, idx: usize, job: &WorkerJob) -> Result<Vec<(u64, u64)>> {
+        if self.bandwidth_limited_remote_source() {
+            // Conditional source reads may return data immediately. Compare
+            // first so only differing bytes consume bandwidth, and the normal
+            // range/stream path pays their budget before requesting them.
+            // Empty final ranges prohibit using the final file if the partial
+            // disappears before seeding.
+            return self
+                .diff_with(
+                    job,
+                    self.seed_request(job, Some(Vec::new())),
+                    "seed partial",
+                )
+                .map(|diff| diff.ranges);
+        }
+        self.stage_comparison(idx, job, false)?;
+        Ok(if job.entry.size == 0 {
+            vec![]
+        } else {
+            vec![(0, job.entry.size)]
+        })
     }
 
     fn stage_comparison(&mut self, idx: usize, job: &WorkerJob, allow_final: bool) -> Result<()> {
@@ -1519,7 +1558,7 @@ impl Worker {
         };
         // Two windows may retain destination bytes. Bound their combined size.
         let window = block
-            .saturating_mul(hash_depth as u64)
+            .saturating_mul(read_depth.max(hash_depth) as u64)
             .min(crate::proto::MAX_READ_BYTES / 2)
             .max(block);
         let prefetch =

@@ -5603,3 +5603,169 @@ fn directory_changes_share_each_directory_between_two_threads() {
         assert!((1..=2).contains(&directory.load(Ordering::SeqCst)));
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn comparison_workers_release_donor_descriptors_before_publication() {
+    use std::os::unix::fs::MetadataExt;
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("file");
+    fs::write(&path, b"abcdefgh").unwrap();
+    let old = fs::metadata(&path).unwrap();
+    let id = [103; 16];
+    let mut creator = destination_ops(tree.path());
+    assert!(matches!(
+        creator.handle(&Request::StageBasis {
+            path: path_bytes(&path),
+            copy_id: id,
+            len: 8,
+            block: MIN_HASH_BLOCK_BYTES,
+            allow_final: false,
+            attempt: 0,
+            guard: None,
+        }),
+        Response::BasisStaged { .. }
+    ));
+    let mut workers = [destination_ops(tree.path()), destination_ops(tree.path())];
+    for (index, ops) in workers.iter_mut().enumerate() {
+        let off = index as u64 * 4;
+        assert!(matches!(
+            ops.handle(&Request::HashWindow {
+                final_basis: true,
+                path: path_bytes(&path),
+                copy_id: id,
+                off,
+                len: 4,
+                block: 4,
+                attempt: 0,
+                guard: None,
+            }),
+            Response::Hashes(_)
+        ));
+        let request = if index == 0 {
+            Request::ReuseComparedRange {
+                path: path_bytes(&path),
+                copy_id: id,
+                attempt: 0,
+                off,
+                len: 4,
+                guard: None,
+            }
+        } else {
+            Request::WriteRange {
+                path: path_bytes(&path),
+                inplace: false,
+                copy_id: id,
+                attempt: 0,
+                off,
+                hash: ops.hash_policy.payload_algorithm().hash(b"WXYZ"),
+                data: b"WXYZ".to_vec().into(),
+                guard: None,
+            }
+        };
+        assert!(matches!(ops.handle(&request), Response::Ok));
+        assert!(ops.comparison_window.is_none());
+    }
+    let partial = creator.partial_path(Path::new("file"), &id).unwrap();
+    fs::rename(tree.path().join(partial), &path).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"abcdWXYZ");
+    // Keep all sessions alive while checking every descriptor, including those
+    // owned by workers which never execute Finalize.
+    for entry in fs::read_dir("/proc/self/fd").unwrap().flatten() {
+        if let Ok(meta) = fs::metadata(entry.path()) {
+            assert_ne!(
+                (meta.dev(), meta.ino()),
+                (old.dev(), old.ino()),
+                "donor still open: {:?}",
+                entry.path()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unconsumed_comparison_windows_do_not_pin_deleted_donors_after_failure() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("file");
+    fs::write(&path, b"abcdefgh").unwrap();
+    let old = fs::metadata(&path).unwrap();
+    let mut ops = destination_ops(tree.path());
+    let id = [104; 16];
+    for off in [0, 4] {
+        assert!(matches!(
+            ops.handle(&Request::HashWindow {
+                path: path_bytes(&path),
+                copy_id: id,
+                off,
+                len: 4,
+                block: 4,
+                attempt: 0,
+                final_basis: true,
+                guard: None,
+            }),
+            Response::Hashes(_)
+        ));
+    }
+    // A failed request leaves both the active and prefetched bytes unconsumed.
+    assert!(!matches!(
+        ops.handle(&Request::ReuseComparedRange {
+            path: path_bytes(&path),
+            copy_id: id,
+            attempt: 0,
+            off: 999,
+            len: 4,
+            guard: None,
+        }),
+        Response::Ok
+    ));
+    fs::remove_file(&path).unwrap();
+    assert_eq!(ops.comparison_window.as_ref().unwrap().blocks.len(), 2);
+    for entry in fs::read_dir("/proc/self/fd").unwrap().flatten() {
+        if let Ok(meta) = fs::metadata(entry.path()) {
+            assert_ne!(
+                (meta.dev(), meta.ino()),
+                (old.dev(), old.ino()),
+                "unconsumed comparison pinned deleted donor: {:?}",
+                entry.path()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn staged_basis_uses_apfs_clone_and_keeps_an_independent_snapshot() {
+    for len in [4097, 8192, 16384] {
+        let tree = crate::test_support::tempdir().unwrap();
+        let path = tree.path().join("file");
+        fs::write(&path, vec![7; 8192]).unwrap();
+        let id = [105; 16];
+        let mut ops = destination_ops(tree.path());
+        let response = ops.handle(&Request::StageBasis {
+            path: path_bytes(&path),
+            copy_id: id,
+            len,
+            block: MIN_HASH_BLOCK_BYTES,
+            allow_final: true,
+            attempt: 0,
+            guard: None,
+        });
+        // With a final donor, false proves that cloning created the sidecar;
+        // falling back to buffered comparison returns compare_final=true.
+        assert!(
+            matches!(
+                response,
+                Response::BasisStaged {
+                    compare_final: false
+                }
+            ),
+            "APFS clone was not used: {response:?}"
+        );
+        let partial = ops.partial_path(Path::new("file"), &id).unwrap();
+        fs::write(&path, vec![9; 8192]).unwrap();
+        let mut expected = vec![7; 8192];
+        expected.resize(len as usize, 0);
+        assert_eq!(fs::read(tree.path().join(partial)).unwrap(), expected);
+    }
+}
