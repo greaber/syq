@@ -47,9 +47,10 @@ BLAKE3 hash; without one, syq reads the object's contents to compute it.
 ## Payload checks
 
 SSH and encrypted TCP retain their transport authentication independently.
-`--tcp-plain` does not enable payload checks automatically, and checksums do
-not authenticate plaintext traffic: an attacker can replace both the data and
-its checksum.
+`--no-tcp-encryption` turns on `transfer=xxh3-128` unless `--integrity-checking`
+sets `transfer`, including `transfer=off`. That check catches data corrupted in
+transit, but no checksum authenticates unencrypted traffic: an attacker can
+replace both the data and its checksum.
 
 For a complete check of a local copy, use an [expected hash](#expected-hashes).
 

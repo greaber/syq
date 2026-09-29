@@ -1056,7 +1056,7 @@ pub struct RemoteDiagnostics {
 pub enum DataTransport {
     Ssh,
     EncryptedTcp,
-    PlaintextTcp,
+    UnencryptedTcp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1164,7 +1164,7 @@ impl RemoteSpec {
             Some(info) if !info.failed && (info.key.is_some() || info.reverse.is_some()) => {
                 DataTransport::EncryptedTcp
             }
-            Some(info) if !info.failed => DataTransport::PlaintextTcp,
+            Some(info) if !info.failed => DataTransport::UnencryptedTcp,
             _ => DataTransport::Ssh,
         }
     }

@@ -55,7 +55,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     if let Some(input) = &args.mapping_contents {
         input.validate_restricted_bounds()?;
     }
-    if args.tcp_plain {
+    if args.no_tcp_encryption {
         bail!("command-restricted transfers require encrypted data connections");
     }
     if args.inplace

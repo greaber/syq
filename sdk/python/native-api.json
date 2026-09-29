@@ -32,7 +32,7 @@
         "pscope",
         "syq-path",
         "no-bootstrap",
-        "tcp-plain",
+        "no-tcp-encryption",
         "no-tcp",
         "tcp-ports",
         "tcp-congestion",

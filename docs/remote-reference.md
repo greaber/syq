@@ -60,7 +60,7 @@ their original limits.
 |---|---|
 | `--no-tcp` | Use SSH workers directly from source to destination |
 | `--tcp-congestion` | The receiver enforces the algorithm authorized for TCP |
-| `--tcp-plain` | Unsupported; data connections must be encrypted |
+| `--no-tcp-encryption` | Unsupported; data connections must be encrypted |
 | `--mapping` | Listed destinations and necessary parent creation are authorized |
 | Fixed `workers` above 128 | Unsupported |
 | `--inplace` with `--as-new` | Unsupported |
@@ -140,7 +140,7 @@ SSH destination, while `--to @NAME` sends files to a receiving machine.
 
 SSH authorization through a receiving machine does not support `--detach`, custom
 `--rsh` or `--syq-path`, `--no-bootstrap`, `--pscope`, alternative `--peer-auth`
-or `--coordinate-at`, `--no-tcp`, or `--tcp-plain`. It requires direct encrypted
+or `--coordinate-at`, `--no-tcp`, or `--no-tcp-encryption`. It requires direct encrypted
 TCP from source to destination. Destination completion does not request
 permission through a receiving machine; use `--auth-from ssh` for completion
 through the source's own SSH access.

@@ -105,7 +105,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--rsh <COMMAND>` | Remote shell command (default: ssh); the command owns SSH and agent policy when set |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
-| `--tcp-plain` | Use TCP data connections without encryption (trusted networks only) |
+| `--no-tcp-encryption` | Send TCP data without encryption or authentication (trusted networks only); checks payloads with xxh3-128 unless --integrity-checking sets transfer |
 | `--no-tcp` | Send file data through SSH rather than separate TCP data connections |
 | `--tcp-ports <LO-HI>` | Port range remote listeners use for TCP data connections<br><br>[default: 47600-47699] |
 | `--tcp-congestion <ALGO>` | Use this congestion-control algorithm for TCP data sockets (Linux only) |

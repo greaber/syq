@@ -59,7 +59,7 @@ def arguments(*, executable: str, writing: bool, path: PathArgument | None,
             for header in ([value] if isinstance(value, str) else value):
                 _append_path_option(argv, option, _text_arg(header, label=name))
             continue
-        if name in {"no_bootstrap", "no_compress", "no_tcp", "tcp_plain", "follow_src", "follow_dst",
+        if name in {"no_bootstrap", "no_compress", "no_tcp", "no_tcp_encryption", "follow_src", "follow_dst",
                     "stats", "quiet", "progress", "no_progress", "dry_run", "only_existing"}:
             if not isinstance(value, bool):
                 raise SyqInvocationError(f"{name} must be a boolean")

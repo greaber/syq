@@ -384,9 +384,9 @@ pub struct Args {
     /// Syq extension: require syq on the remote PATH instead of installing a versioned helper
     #[arg(long = "syq-no-bootstrap")]
     pub no_bootstrap: bool,
-    /// Syq extension: use TCP data connections without encryption (trusted networks only)
-    #[arg(long = "syq-tcp-plain")]
-    pub tcp_plain: bool,
+    /// Syq extension: send TCP data without encryption or authentication (trusted networks only); checks payloads with xxh3-128 unless --integrity-checking sets transfer
+    #[arg(long = "syq-no-tcp-encryption")]
+    pub no_tcp_encryption: bool,
     /// Syq extension: send all data over ssh instead of separate TCP data connections
     #[arg(long = "syq-no-tcp")]
     pub no_tcp: bool,
@@ -787,9 +787,24 @@ impl Args {
                 self.transfer_hash_type = transfer;
             }
         }
+        self.check_unencrypted_tcp();
         self.connections_default = self.connections_opt.is_none();
         self.connections = self.connections_opt.unwrap_or(8);
         Ok(())
+    }
+
+    /// Without encryption, TCP data has only TCP's 16-bit checksum. A fast
+    /// payload check catches corruption unless `transfer` was chosen, including
+    /// `transfer=off`; it cannot stop tampering on an untrusted network.
+    fn check_unencrypted_tcp(&mut self) {
+        if self.no_tcp_encryption
+            && self
+                .integrity_checking
+                .is_none_or(|checks| checks.transfer.is_none())
+        {
+            self.transfer_integrity = true;
+            self.transfer_hash_type = Some(crate::hashing::HashAlgorithm::Xxh3);
+        }
     }
 
     pub(crate) fn warn_unsupported_options(&self) {
@@ -1290,9 +1305,9 @@ struct NativeRemoteArgs {
     rsh: Option<String>,
     #[command(flatten)]
     helper: NativeRemoteHelperArgs,
-    /// Use TCP data connections without encryption (trusted networks only)
+    /// Send TCP data without encryption or authentication (trusted networks only); checks payloads with xxh3-128 unless --integrity-checking sets transfer
     #[arg(long)]
-    tcp_plain: bool,
+    no_tcp_encryption: bool,
     /// Send file data through SSH rather than separate TCP data connections
     #[arg(long)]
     no_tcp: bool,
@@ -1918,7 +1933,7 @@ fn parse_descriptor_copy(
                 | "syq_path"
                 | "no_bootstrap"
                 | "no_tcp"
-                | "tcp_plain"
+                | "no_tcp_encryption"
                 | "tcp_ports"
                 | "tcp_congestion"
                 | "pscope"
@@ -2964,7 +2979,8 @@ fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> 
     args.rsh = remote.rsh;
     args.syq_path = remote.helper.syq_path;
     args.no_bootstrap = remote.helper.no_bootstrap;
-    args.tcp_plain = remote.tcp_plain;
+    args.no_tcp_encryption = remote.no_tcp_encryption;
+    args.check_unencrypted_tcp();
     args.no_tcp = remote.no_tcp;
     crate::conn::parse_ports(&remote.tcp_ports)?;
     args.tcp_ports = remote.tcp_ports;

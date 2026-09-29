@@ -229,7 +229,7 @@ impl Options {
             "rsh",
             "syq_path",
             "no_bootstrap",
-            "tcp_plain",
+            "no_tcp_encryption",
             "no_tcp",
             "tcp_ports",
             "tcp_congestion",

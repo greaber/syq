@@ -126,8 +126,8 @@ cannot modify.
 Remote copies encrypt and authenticate file data, whether it travels through
 SSH or syq's direct TCP connections.
 
-`--tcp-plain` disables this protection for TCP: someone on the network can
-read or alter the traffic, including its authentication token. Use it only
+`--no-tcp-encryption` disables this protection for TCP: someone on the network
+can read or alter the traffic, including its authentication token. Use it only
 on a network you trust.
 
 Storage upload approvals include reading object contents and metadata within

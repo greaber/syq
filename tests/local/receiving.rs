@@ -1046,7 +1046,7 @@ fn return_via_rejects_unsupported_routes_and_never_falls_back_to_ssh() {
         for extra in [
             vec![],
             vec!["--no-tcp"],
-            vec!["--tcp-plain"],
+            vec!["--no-tcp-encryption"],
             vec!["--detach"],
             vec!["--rsh", "ssh"],
             vec!["--syq-path", "/opt/syq"],

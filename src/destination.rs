@@ -749,10 +749,10 @@ fn select_copy(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
         || args.pscope_explicit
         || args.detach
         || args.restricted_grant.is_some()
-        || args.tcp_plain
+        || args.no_tcp_encryption
         || args.peer_auth != crate::cli::PeerAuth::Restricted
     {
-        bail!("named destinations own their connection; --syq-path, --rsh, --pscope, --detach, --peer-auth, and --tcp-plain cannot be combined with them");
+        bail!("named destinations own their connection; --syq-path, --rsh, --pscope, --detach, --peer-auth, and --no-tcp-encryption cannot be combined with them");
     }
     if args.connections_opt.is_some()
         && args.connections > usize::from(crate::delegation::MAX_CONNECTIONS)
