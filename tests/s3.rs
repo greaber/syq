@@ -2174,78 +2174,93 @@ fn s3_first_range_supplies_metadata_without_serializing_the_remaining_ranges() {
 }
 
 #[test]
-fn s3_changed_size_prefix_download_starts_ranges_without_an_object_head() {
-    let server = Server::start("prefix-multipart");
-    let temp = crate::test_support::tempdir().unwrap();
-    std::fs::create_dir(temp.path().join("download")).unwrap();
-    std::fs::write(temp.path().join("download/file"), b"original").unwrap();
-    let output = server.cp(
-        temp.path(),
-        &[
-            "--from",
-            "s3://bucket",
-            "--srcs-in",
-            "data",
-            "--into",
-            "download",
-        ],
-    );
-    assert!(output.status.success(), "{}", output_text(&output));
-    assert_eq!(
-        std::fs::read(temp.path().join("download/file")).unwrap(),
-        vec![b'x'; SIZE]
-    );
-    // Prefix validation HEAD + LIST, two concurrent range GETs, final identity HEAD.
-    assert_eq!(server.requests.load(Ordering::Relaxed), 5);
+fn s3_prefix_multipart_download_starts_ranges_without_an_object_head() {
+    for existing in [false, true] {
+        let server = Server::start("prefix-multipart");
+        let temp = crate::test_support::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("download")).unwrap();
+        if existing {
+            std::fs::write(temp.path().join("download/file"), b"original").unwrap();
+        }
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "data",
+                "--into",
+                "download",
+            ],
+        );
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert_eq!(
+            std::fs::read(temp.path().join("download/file")).unwrap(),
+            vec![b'x'; SIZE]
+        );
+        // Prefix validation HEAD + LIST, two concurrent range GETs, final identity HEAD.
+        assert_eq!(server.requests.load(Ordering::Relaxed), 5);
+    }
 }
 
 #[test]
-fn s3_changed_size_download_reuses_completed_ranges_before_getting_more() {
-    for fault in ["prefix-recovery-all", "prefix-recovery-first"] {
-        let server = Server::start(fault);
-        let temp = crate::test_support::tempdir().unwrap();
-        std::fs::create_dir(temp.path().join("download")).unwrap();
-        let destination = temp.path().join("download/file");
-        std::fs::write(&destination, b"original").unwrap();
-        let args = [
-            "--from",
-            "s3://bucket",
-            "--srcs-in",
-            "data",
-            "--into",
-            "download",
-        ];
-        let first = server.cp(temp.path(), &args);
-        assert!(!first.status.success(), "{}", output_text(&first));
-        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
-        let record = std::fs::read_dir(temp.path().join("cache/syq/s3"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "json")
-            })
-            .expect("failed publication keeps its completed ranges");
-        let mut saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
-        assert_eq!(saved["parts"].as_object().unwrap().len(), 2);
-        if fault == "prefix-recovery-first" {
-            saved["parts"].as_object_mut().unwrap().remove("1").unwrap();
-            std::fs::write(&record, serde_json::to_vec(&saved).unwrap()).unwrap();
+fn s3_multipart_download_reuses_completed_ranges_before_getting_more() {
+    for existing in [false, true] {
+        for fault in ["prefix-recovery-all", "prefix-recovery-first"] {
+            let server = Server::start(fault);
+            let temp = crate::test_support::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("download")).unwrap();
+            let destination = temp.path().join("download/file");
+            if existing {
+                std::fs::write(&destination, b"original").unwrap();
+            }
+            let args = [
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "data",
+                "--into",
+                "download",
+            ];
+            let first = server.cp(temp.path(), &args);
+            assert!(!first.status.success(), "{}", output_text(&first));
+            if existing {
+                assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+            } else {
+                assert!(
+                    !destination.exists(),
+                    "failed download must not publish a file"
+                );
+            }
+            let record = std::fs::read_dir(temp.path().join("cache/syq/s3"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .expect("failed publication keeps its completed ranges");
+            let mut saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+            assert_eq!(saved["parts"].as_object().unwrap().len(), 2);
+            if fault == "prefix-recovery-first" {
+                saved["parts"].as_object_mut().unwrap().remove("1").unwrap();
+                std::fs::write(&record, serde_json::to_vec(&saved).unwrap()).unwrap();
+            }
+            server.requests.store(0, Ordering::Relaxed);
+            let retry = server.cp(temp.path(), &args);
+            assert!(retry.status.success(), "{fault}: {}", output_text(&retry));
+            assert_eq!(std::fs::read(&destination).unwrap(), vec![b'x'; SIZE]);
+            // Discovery HEAD + LIST, identity HEAD, final HEAD, and only unsaved GETs.
+            assert_eq!(
+                server.requests.load(Ordering::Relaxed),
+                if fault == "prefix-recovery-all" { 4 } else { 5 }
+            );
+            assert!(
+                !record.exists(),
+                "successful publication removes the checkpoint"
+            );
         }
-        server.requests.store(0, Ordering::Relaxed);
-        let retry = server.cp(temp.path(), &args);
-        assert!(retry.status.success(), "{fault}: {}", output_text(&retry));
-        assert_eq!(std::fs::read(&destination).unwrap(), vec![b'x'; SIZE]);
-        // Discovery HEAD + LIST, identity HEAD, final HEAD, and only unsaved GETs.
-        assert_eq!(
-            server.requests.load(Ordering::Relaxed),
-            if fault == "prefix-recovery-all" { 4 } else { 5 }
-        );
-        assert!(
-            !record.exists(),
-            "successful publication removes the checkpoint"
-        );
     }
 }
 

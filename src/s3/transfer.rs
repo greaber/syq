@@ -2009,10 +2009,10 @@ impl Engine {
             && !job.key.ends_with('/')
             && selected == Some(true)
             && permitted == Some(true);
-        // The changed-size fast path must not fetch a saved first range again.
-        // Keep this state open for the normal identity and range checks below;
-        // an ordinary fresh transfer still opens and reads its record only once.
-        let recovery = if get_first && existing.is_some() && job.size > part_size {
+        // A saved first range can exist before the destination is published.
+        // Check recovery before fetching it, and keep this state for the normal
+        // identity and range checks below so the record is opened only once.
+        let recovery = if get_first && job.size > part_size {
             let recovery = self.open_download_state(root, &job.key, &job.path)?;
             get_first = recovery.1.is_none();
             Some(recovery)
