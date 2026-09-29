@@ -208,8 +208,10 @@ pub(crate) fn render(
             words.push(plain("… (full command in Details)"));
             break;
         }
+        // A quoted argument keeps its ASCII option name after the opening quote.
+        let bare = word.strip_prefix('"').unwrap_or(word);
         let inline = OPTIONS.iter().any(|option| {
-            word.strip_prefix(option)
+            bare.strip_prefix(option)
                 .is_some_and(|v| v.starts_with('='))
         });
         words.push(if value || inline {

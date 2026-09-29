@@ -336,6 +336,8 @@ fn displayed_commands_escape_unusual_text_and_mark_server_files() {
         b"--ignore-from=rules".to_vec(),
         b"--ignore".to_vec(),
         b"*.tmp".to_vec(),
+        b"--ignore=*.log".to_vec(),
+        b"--mapping=my files.ndjson".to_vec(),
         b"--to".to_vec(),
         b"@laptop".to_vec(),
     ]);
@@ -346,12 +348,20 @@ fn displayed_commands_escape_unusual_text_and_mark_server_files() {
             "{word}"
         );
     }
+    let styled = std::cell::RefCell::new(Vec::new());
+    render(&shown, None, str::to_owned, |word| {
+        styled.borrow_mut().push(word.to_owned());
+        word.to_owned()
+    });
     assert_eq!(
-        render(&shown, None, str::to_owned, |word| format!("[{word}]"))
-            .split(' ')
-            .filter(|word| word.starts_with('['))
-            .collect::<Vec<_>>(),
-        ["[map.json]", "[--ignore-from=rules]", "[\"*.tmp\"]"]
+        styled.into_inner(),
+        [
+            "map.json",
+            "--ignore-from=rules",
+            "\"*.tmp\"",
+            "\"--ignore=*.log\"",
+            "\"--mapping=my files.ndjson\"",
+        ]
     );
     assert!(display(&[]).is_empty());
 }
