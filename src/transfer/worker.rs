@@ -232,7 +232,7 @@ impl Worker {
         }
     }
 
-    /// Small new files are sent without a per-file protocol round trip. The
+    /// Small files are sent without a per-file protocol round trip. The
     /// default publishes sidecars atomically; explicit --inplace batches write
     /// final names directly when no placement guard requires staging.
     pub(super) fn fast_eligible(&self, idx: usize) -> bool {
@@ -242,8 +242,28 @@ impl Worker {
             && !self.opts.has_expected_for(j)
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
-            && jobs.destination(idx).is_none()
+            && jobs
+                .destination(idx)
+                .is_none_or(|existing| self.replaces_without_comparison(j, existing))
             && (!self.opts.inplace || j.inplace)
+    }
+
+    /// An existing file whose contents this copy would replace without
+    /// reading them can take the same batch as a new file. Comparison, block
+    /// reuse, protected contents, conditional placement and hardlink
+    /// representatives keep the per-file path, which inspects the destination
+    /// before deciding what to write.
+    fn replaces_without_comparison(&self, job: &FileJobData, existing: &Entry) -> bool {
+        existing.kind == Kind::File
+            && job.target_condition == TargetCondition::Any
+            && !self.opts.protects_existing_contents()
+            && !self.opts.checksum
+            && !self.opts.restricted_receiver
+            && !(self.opts.hardlinks && job.entry.nlink > 1)
+            && !self
+                .opts
+                .tuning
+                .reuse_destination_blocks(self.opts.same_host)
     }
 
     pub(super) fn fail_small_batch(

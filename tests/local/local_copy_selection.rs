@@ -52,6 +52,37 @@ fn local_batch_boundary_and_scheduler_agree() {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
+fn small_existing_files_are_replaced_in_batches() {
+    let t = Tmp::new();
+    for i in 0..8 {
+        write(&t.path(&format!("src/file{i}")), &prng(1000, i));
+        // The same length with other contents and an older time: only
+        // reading the destination could tell, and a same-host copy does not.
+        write(&t.path(&format!("dst/file{i}")), &prng(1000, 50 + i));
+        set_mtime(&t.path(&format!("dst/file{i}")), 1_000_000_000);
+    }
+    let out = compat_command()
+        .args([
+            "-a",
+            "--syq-no-tcp",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    assert!(partial_files(&t.0).is_empty());
+    let observed = tuning_observed(&out);
+    assert!(observed["small_batches"].as_u64().unwrap() > 0, "{out:?}");
+    assert_eq!(observed["local_whole_files"], 0);
+    assert_eq!(observed["range_requests"], 0);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
 fn unsupported_offload_is_attempted_once_not_for_every_file() {
     let t = Tmp::new();
     for i in 0..6 {
