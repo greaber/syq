@@ -155,7 +155,8 @@ impl RelativePath {
         Ok(Self { components })
     }
 
-    fn leaf(&self) -> Result<(&[Vec<u8>], &[u8])> {
+    /// The components of the holding directory, and the entry's own name.
+    pub(crate) fn leaf(&self) -> Result<(&[Vec<u8>], &[u8])> {
         let (leaf, parents) = self
             .components
             .split_last()
@@ -185,6 +186,13 @@ impl RelativePath {
             .collect::<Vec<_>>()
             .join("/")
     }
+}
+
+/// Scheduling only: a turn grants no authority over the directory, and every
+/// change made during it still resolves and checks its path through `Root`.
+pub(crate) struct MutationTurn {
+    #[cfg(any(target_os = "linux", test))]
+    _turn: directory_gate::Turn,
 }
 
 /// An existing directory opened once as the authority boundary.
@@ -257,6 +265,17 @@ impl Root {
     fn mutation_permit(&self, path: &RelativePath) -> Result<directory_gate::Permit> {
         let (parents, _) = path.leaf()?;
         Ok(directory_gate::acquire(self.identity, parents))
+    }
+
+    /// Take a turn changing the directory that holds `path`, for a caller
+    /// about to create or publish several of its entries. Release it before
+    /// writing file data: other contenders for the directory wait meanwhile.
+    pub(crate) fn mutation_turn(&self, path: &RelativePath) -> Result<MutationTurn> {
+        let (_parents, _) = path.leaf()?;
+        Ok(MutationTurn {
+            #[cfg(any(target_os = "linux", test))]
+            _turn: directory_gate::turn(self.identity, _parents),
+        })
     }
 
     pub(crate) fn identity(&self) -> RootIdentity {

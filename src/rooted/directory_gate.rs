@@ -5,16 +5,28 @@
 //! for the same inode share admission, but different descendant aliases may
 //! miss that optimization. Path resolution and publication checks remain with
 //! the caller, and a permit must not span data writes or metadata inspection.
+//!
+//! A single operation takes a permit for its one syscall. A batch takes a
+//! turn instead and changes many entries before the next contender wakes, so
+//! the directory is handed over once per burst rather than once per file.
 use super::RootIdentity;
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
-// Full serialization delayed local copies. A few contenders preserve the
-// create/rename pipeline without letting every transfer worker spin in the
-// kernel on one directory. Eight retains the CPU saving while avoiding the
-// short-copy latency cost measured with four. Independent directories have
-// independent capacity.
-const MUTATORS: usize = 8;
+// The kernel changes a directory's entries under one lock, so only one
+// mutation proceeds at a time however many threads ask. A second contender
+// keeps that lock busy while the first does the unlocked part of its call;
+// any further one only spins. Independent directories have independent
+// capacity.
+const MUTATORS: usize = 2;
+
+thread_local! {
+    // Turns this thread holds. Its operations inside a turn already own the
+    // directory's capacity and must not wait for it again.
+    static TURNS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Eq, Hash, PartialEq)]
 struct Directory {
@@ -44,23 +56,39 @@ impl Gate {
         }
         state.active += 1;
         drop(state);
-        Permit(self.clone())
+        Permit(Some(self.clone()))
     }
 }
 
-pub(super) struct Permit(Arc<Gate>);
+pub(super) struct Permit(Option<Arc<Gate>>);
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
+        let Some(gate) = &self.0 else {
+            return;
+        };
+        let mut state = gate.state.lock().unwrap();
         state.active -= 1;
         let waiting = state.waiting != 0;
         drop(state);
         // Condvar notification can enter the kernel even without a waiter.
         // Uncontended directories need only the userspace mutex fast path.
         if waiting {
-            self.0.available.notify_one();
+            gate.available.notify_one();
         }
+    }
+}
+
+/// A permit held across several changes by the thread that took it. The
+/// turn stays on that thread: its scope is what exempts nested operations.
+pub(super) struct Turn {
+    _permit: Permit,
+    _thread: PhantomData<*const ()>,
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        TURNS.with(|turns| turns.set(turns.get() - 1));
     }
 }
 
@@ -93,7 +121,21 @@ impl Registry {
     }
 }
 
+pub(super) fn turn(root: RootIdentity, parents: &[Vec<u8>]) -> Turn {
+    // A nested turn waits for nothing either: waiting for a second directory
+    // while holding the first could deadlock two batches.
+    let permit = acquire(root, parents);
+    TURNS.with(|turns| turns.set(turns.get() + 1));
+    Turn {
+        _permit: permit,
+        _thread: PhantomData,
+    }
+}
+
 pub(super) fn acquire(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
+    if TURNS.with(Cell::get) != 0 {
+        return Permit(None);
+    }
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
     let key = Directory {
         root,
@@ -170,6 +212,35 @@ mod tests {
         let _parent_permit = other_parent.acquire();
         let _root_permit = other_root.acquire();
         drop(busy);
+    }
+
+    #[test]
+    fn a_turn_covers_its_own_threads_operations_until_it_ends() {
+        let root = RootIdentity { dev: 7, ino: 7 };
+        let parent = vec![b"burst".to_vec()];
+        let other = vec![b"elsewhere".to_vec()];
+        let held = turn(root, &parent);
+        // Operations inside the turn, a nested turn, and a panic that unwinds
+        // through a nested turn all leave the outer turn in place.
+        assert!(acquire(root, &parent).0.is_none());
+        assert!(acquire(root, &other).0.is_none());
+        assert!(std::panic::catch_unwind(|| {
+            let _nested = turn(root, &other);
+            assert!(acquire(root, &other).0.is_none());
+            panic!("mutation failed");
+        })
+        .is_err());
+        assert!(acquire(root, &parent).0.is_none());
+        // Another thread competes for the capacity the turn occupies.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let permits: Vec<_> = (1..MUTATORS).map(|_| acquire(root, &parent)).collect();
+                assert!(permits.iter().all(|permit| permit.0.is_some()));
+            });
+        });
+        drop(held);
+        let all: Vec<_> = (0..MUTATORS).map(|_| acquire(root, &parent)).collect();
+        assert!(all.iter().all(|permit| permit.0.is_some()));
     }
 
     #[test]

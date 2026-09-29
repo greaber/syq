@@ -1378,7 +1378,6 @@ impl FsOps {
         if self.hash_policy.transfer_integrity && self.observed_payload_hash(data) != hash {
             bail!("block hash mismatch on receive");
         }
-        let staged_mode = staged_file_mode(meta, flags);
         let rooted = self.destination_mutation_target(target.path, target.guard)?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
         if inplace {
@@ -1479,36 +1478,10 @@ impl FsOps {
         // New/replace small files, and the existing guarded-receiver
         // policy, stage through the same private rooted sidecar as ranged
         // writes do.
-        let (relative, label, opened) =
-            with_rooted_partial(&rooted, target.id, |relative, label| {
-                self.open_private_partial_rooted(&rooted.root, relative, label, true, staged_mode)
-            })?;
-        let (file, basis_size) = opened.context("sidecar creation was requested")?;
-        #[cfg(debug_assertions)]
-        test_race_barrier(
-            "SYQ_TEST_SMALL_STAGE_READY_FILE",
-            "SYQ_TEST_SMALL_STAGE_CONTINUE_FILE",
-            "small-file stage before data",
-        )?;
-        if basis_size.is_some() {
-            file.set_len(0)?;
-        }
-        observed_write(&self.operation, &file, data, 0, self.sparse)
-            .with_context(|| format!("write {}", label.display()))?;
-        set_meta_file_for_publication(&file, meta, flags)
-            .with_context(|| format!("set metadata {}", label.display()))?;
-        // `publish_partial_rooted` re-checks the staged name against the
-        // open descriptor immediately before the rename, so no separate
-        // check is needed here.
-        #[cfg(debug_assertions)]
-        fail_put_small_before_rename_for_test(&rooted.label)?;
-        publish_partial_rooted(&rooted.root, &relative, &rooted.relative, &file, condition)?;
-        crate::inode_metadata::finish_publication(
-            &file,
-            meta.inode_metadata.as_deref(),
-            meta.mode,
-        )?;
-        published_identity(&file, flags)
+        let stage = self.create_small_stage(put, rooted)?;
+        self.write_small_stage(put, &stage)?;
+        self.publish_small_stage(put, &stage)?;
+        self.finish_small_stage(put, stage)
     }
 
     pub(super) fn hash_blocks(
@@ -2692,17 +2665,12 @@ impl FsOps {
                     CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
                 }),
             Request::PutSmallBatch(puts) => {
+                let results = self.put_small_batch(puts);
                 if puts.iter().any(|p| p.flags & flags::REPORT_IDENTITY != 0) {
-                    Ok(Response::PublishedBatch(
-                        puts.iter()
-                            .map(|put| self.put_small(put).map_err(|e| wire_error(&e)))
-                            .collect(),
-                    ))
+                    Ok(Response::PublishedBatch(results))
                 } else {
                     Ok(Response::Applied(
-                        puts.iter()
-                            .map(|put| self.put_small(put).err().as_ref().map(wire_error))
-                            .collect(),
+                        results.into_iter().map(Result::err).collect(),
                     ))
                 }
             }
@@ -3114,7 +3082,7 @@ pub(super) fn set_meta_file_known(
     set_meta_file_inner(f, meta, flags, current, false)
 }
 
-fn set_meta_file_for_publication(f: &File, meta: &Meta, flags: u8) -> Result<()> {
+pub(super) fn set_meta_file_for_publication(f: &File, meta: &Meta, flags: u8) -> Result<()> {
     set_meta_file_inner(f, meta, flags, &f.metadata()?, true)
 }
 
@@ -3228,7 +3196,7 @@ pub(super) fn apply_owner_if_changed(
 }
 
 // Read from the completed descriptor, never from its mutable published name.
-fn published_identity(file: &File, flags: u8) -> Result<Option<(u64, u64)>> {
+pub(super) fn published_identity(file: &File, flags: u8) -> Result<Option<(u64, u64)>> {
     if flags & flags::REPORT_IDENTITY == 0 {
         return Ok(None);
     }

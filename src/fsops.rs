@@ -38,6 +38,7 @@ mod limits;
 mod operator;
 mod partial;
 mod paths;
+mod small_batch;
 
 pub(crate) use apply::*;
 pub(crate) use entry::*;
