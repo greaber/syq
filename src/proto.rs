@@ -656,6 +656,8 @@ pub enum ConnectionRole {
 /// An existing private output and an optional donor are separate states.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Preparation {
+    /// Identity of a newly created in-place output, before payload writes.
+    pub created_identity: Option<(u64, u64)>,
     pub partial_size: Option<u64>,
     pub has_candidates: bool,
 }
@@ -1144,6 +1146,7 @@ pub enum SmallCopyDisposition {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SmallCopyFileResult {
+    pub identity: Option<(u64, u64)>,
     pub disposition: SmallCopyDisposition,
     pub error: Option<WireError>,
 }
@@ -1211,7 +1214,6 @@ pub enum Response {
     /// An empty batch is an attached native-rm liveness frame.
     NativeRemoveBatch(Vec<NativeRemoveOutcome>),
     NativeRemoveDone,
-    NativeRemoveJobAvailable(bool),
     Stats(Vec<Option<Entry>>),
     /// Absolute operator spelling plus device/inode of the securely opened
     /// directory, or None when an allowed missing suffix was reached.
@@ -1298,7 +1300,11 @@ pub enum Response {
     NativeMapData(Vec<u8>),
     NativeMapDone,
     /// One bit per offered file; true requests its payload (including empty files).
-    SmallFilesPrepared(Vec<bool>),
+    SmallFilesPrepared {
+        needed: Vec<bool>,
+        absent: Vec<bool>,
+    },
+    NativeRemoveJobAvailable(bool),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

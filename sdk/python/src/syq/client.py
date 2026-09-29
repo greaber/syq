@@ -664,8 +664,10 @@ def _copy_arguments(
     allow_missing_placement: bool = False,
     where: str | None = None,
     copy_if: str | None = None,
+    resume: str | None = None,
 ) -> tuple[list[Argument], int, int]:
     argv: list[Argument] = [command]
+    _append_text(argv, "--resume", resume)
     _append_text(argv, "--where", where)
     _append_text(argv, "--copy-if", copy_if)
     source_count = 0
@@ -712,7 +714,7 @@ def _copy_arguments(
     selected_placements = [
         (name, value) for name, value in placements if value is not None
     ]
-    if command != "map" and len(selected_placements) != 1 and not (allow_missing_placement and not selected_placements):
+    if command != "map" and len(selected_placements) != 1 and not ((allow_missing_placement or resume is not None) and not selected_placements):
         raise SyqInvocationError(
             "exactly one of --into, --into-new, --into-existing, --as, "
             "--as-new, or --as-existing is required"
@@ -794,7 +796,7 @@ def _copy_arguments(
         argv.append("--inplace")
     max_delete = _nonnegative_integer(max_delete, option="--max-delete")
     if max_delete is not None:
-        if not prune:
+        if not prune and resume is None:
             raise SyqInvocationError("--max-delete requires --prune")
         argv.extend(("--max-delete", str(max_delete)))
     return argv, source_count, source_end
@@ -824,8 +826,10 @@ def _rm_arguments(
     syq_path: str | os.PathLike[str] | None,
     no_bootstrap: bool,
     pscope: PathArgument | None,
+    resume: str | None = None,
 ) -> tuple[list[Argument], int]:
     argv: list[Argument] = ["rm"]
+    _append_text(argv, "--resume", resume)
     source_count = 0
     for index, source in enumerate(sources):
         value = _argument(source, label=f"sources[{index}]")
@@ -838,7 +842,7 @@ def _rm_arguments(
         ("--src-dir", src_dir),
     ):
         source_count += _append_paths(argv, option, value)
-    if source_count == 0:
+    if source_count == 0 and resume is None:
         raise SyqInvocationError("syq rm needs at least one source selector")
     if on is not None:
         argv.extend(("--on", _text_arg(on, label="on")))
@@ -855,7 +859,7 @@ def _rm_arguments(
     if dry_run:
         argv.append("--dry-run")
     _append_text(argv, "--performance-tuning", performance_tuning)
-    if on is None and (syq_path is not None or no_bootstrap):
+    if resume is None and on is None and (syq_path is not None or no_bootstrap):
         raise SyqInvocationError(
             "syq_path and no_bootstrap apply only to a remote removal endpoint"
         )
@@ -1156,8 +1160,8 @@ class Client:
         argv: list[Argument],
         *,
         mode: str,
-        prune: bool,
-        mapping: bool,
+        prune: bool | None,
+        mapping: bool | None,
         dry_run: bool,
         selectors_total: int | None,
         on_event: Callable[[AutomationEvent], object] | None,
@@ -1224,6 +1228,7 @@ class Client:
     def cp(
         self,
         *sources: PathArgument,
+        resume: str | None = None,
         src: Selector | None = None,
         srcs_in: Selector | None = None,
         src_non_dir: Selector | None = None,
@@ -1285,6 +1290,8 @@ class Client:
         timeout: Timeout = CLIENT_DEFAULT,
         check: bool = True,
     ) -> CpResult:
+        if resume is not None and mapping is not None:
+            raise SyqInvocationError("resume does not accept a new mapping")
         connection = _connection_options(mapping, _Connection(
             rsh, syq_path, no_bootstrap, s3_endpoint, s3_region, s3_profile, s3_header,
         ))
@@ -1308,6 +1315,7 @@ class Client:
         argv, source_count, source_end = _copy_arguments(
             "cp",
             sources,
+            resume=resume,
             src=src,
             srcs_in=srcs_in,
             src_non_dir=src_non_dir,
@@ -1369,13 +1377,13 @@ class Client:
         if mapping is not None and prune:
             raise SyqInvocationError("--mapping conflicts with --prune")
         if mapping is None:
-            if source_count == 0:
+            if source_count == 0 and resume is None:
                 raise SyqInvocationError("syq cp needs a source selector or mapping")
             return self._typed(
                 argv,
                 mode="cp",
-                prune=prune,
-                mapping=False,
+                prune=prune if resume is None else None,
+                mapping=False if resume is None else None,
                 dry_run=dry_run,
                 selectors_total=None,
                 on_event=on_event,
@@ -1436,6 +1444,7 @@ class Client:
     def rm(
         self,
         *sources: PathArgument,
+        resume: str | None = None,
         src: Selector | None = None,
         srcs_in: Selector | None = None,
         src_non_dir: Selector | None = None,
@@ -1465,6 +1474,7 @@ class Client:
         results = _prepare_results_file(results)
         argv, selectors_total = _rm_arguments(
             sources,
+            resume=resume,
             src=src,
             srcs_in=srcs_in,
             src_non_dir=src_non_dir,
@@ -1493,7 +1503,7 @@ class Client:
             prune=False,
             mapping=False,
             dry_run=dry_run,
-            selectors_total=selectors_total,
+            selectors_total=selectors_total if resume is None else None,
             on_event=on_event,
             results=results,
             timeout=timeout,

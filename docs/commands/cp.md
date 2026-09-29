@@ -151,6 +151,12 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--no-progress` | Never show the human progress display |
 | `--stats` | Print transfer statistics, worker waits, endpoint operations and CPU at the end |
 
+## Other options
+
+| Argument / option | Meaning |
+|---|---|
+| `--resume <JOB>` | Resume a previous named job; sources and destinations come from its saved command |
+
 ## Help and version
 
 | Argument / option | Meaning |

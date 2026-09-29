@@ -263,12 +263,20 @@ fn main() {
         }
         return;
     }
-    // Internal entry points above never see environment options. Insert them
-    // here, before `exec` and the copy commands, and record the result for
-    // the return-helper handoff, which both of those may perform.
-    if let Err(error) = environment_options.insert(&mut argv) {
-        crate::output::diagnostic!("syq: {error:#}");
-        std::process::exit(2);
+    // A saved command already includes its original environment options.
+    // New ambient defaults must not change that job's scope on a retry.
+    let resumed_job = match resume::restore(&mut argv) {
+        Ok(job) => job,
+        Err(error) => {
+            crate::output::diagnostic!("syq: {error:#}");
+            std::process::exit(2);
+        }
+    };
+    if resumed_job.is_none() {
+        if let Err(error) = environment_options.insert(&mut argv) {
+            crate::output::diagnostic!("syq: {error:#}");
+            std::process::exit(2);
+        }
     }
     destination::handoff::record_command_line(&argv);
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("exec") {
@@ -348,13 +356,6 @@ fn main() {
             }
         }
     }
-    let resumed_job = match resume::restore(&mut argv) {
-        Ok(job) => job,
-        Err(error) => {
-            crate::output::diagnostic!("syq: {error:#}");
-            std::process::exit(2);
-        }
-    };
     let mut args = match cli::Args::parse_args(&argv[1..]) {
         Ok(a) => a,
         Err(e) => {

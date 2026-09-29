@@ -3338,6 +3338,7 @@ impl Planner<'_> {
                 self.opts.ignore.clone()
             };
             let mut found = Deletes::default();
+            let mut removal_observations = Vec::new();
             // Destination directories that hold an ignored path, so must stay.
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
@@ -3405,6 +3406,17 @@ impl Planner<'_> {
                     }
                     None => {}
                 }
+                if let Some(job) = &self.opts.resume_job {
+                    let ctime =
+                        (entry_kind != Kind::Dir).then_some((entry.ctime, entry.ctime_nsec));
+                    if !job.before_remove(&full, entry.dev, entry.ino, entry_kind, ctime, true)? {
+                        protected.extend(ancestor_prefixes(&full).map(<[u8]>::to_vec));
+                        if entry_kind == Kind::Dir {
+                            shielded.insert(full);
+                        }
+                        continue;
+                    }
+                }
                 let dst_rel = join(&sub, entry_path);
                 let rel = display(&dst_rel);
                 let name = entry_path
@@ -3423,6 +3435,13 @@ impl Planner<'_> {
                             .or_insert_with(|| rel.clone());
                     }
                 } else {
+                    removal_observations.push((
+                        full.clone(),
+                        entry.dev,
+                        entry.ino,
+                        entry_kind,
+                        (entry_kind != Kind::Dir).then_some((entry.ctime, entry.ctime_nsec)),
+                    ));
                     if entry_kind == Kind::Dir {
                         let depth = full.iter().filter(|&&c| c == b'/').count();
                         found
@@ -3441,6 +3460,11 @@ impl Planner<'_> {
                 }
             }
 
+            if !self.opts.dry_run {
+                if let Some(job) = &self.opts.resume_job {
+                    job.observe_removals(removal_observations);
+                }
+            }
             self.deletes.leaves.append(&mut found.leaves);
             for (d, v) in found.dirs {
                 for (path, rel, kind) in v {
@@ -3588,6 +3612,9 @@ impl Planner<'_> {
                         None => {
                             n += 1;
                             me.progress.deletions_completed.fetch_add(1, Relaxed);
+                            if let Some(job) = &opts.resume_job {
+                                job.removed(p);
+                            }
                             if opts.verbose > 0 {
                                 me.progress.println(&format!("deleting {rel}"));
                             }
@@ -3623,6 +3650,9 @@ impl Planner<'_> {
         run(self, &leaves, false)?;
         for (_, items) in dirs.iter().rev() {
             run(self, items, true)?;
+        }
+        if let Some(job) = &opts.resume_job {
+            job.flush();
         }
         Ok(n)
     }

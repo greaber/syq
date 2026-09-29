@@ -562,6 +562,7 @@ fn emit_attached(
     Ok(())
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn remove(
     cwd: Option<&[u8]>,

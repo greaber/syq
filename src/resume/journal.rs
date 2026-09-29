@@ -16,6 +16,7 @@ pub(super) struct Journal {
     file: File,
     end: u64,
     failed: bool,
+    compressor: zstd::bulk::Compressor<'static>,
 }
 
 impl Journal {
@@ -85,6 +86,7 @@ impl Journal {
             file,
             end,
             failed: false,
+            compressor: zstd::bulk::Compressor::new(3)?,
         })
     }
 
@@ -99,7 +101,7 @@ impl Journal {
         if decoded.len() > MAX_BATCH {
             bail!("job journal batch exceeds 16 MiB");
         }
-        let compressed = zstd::bulk::compress(&decoded, 3)?;
+        let compressed = self.compressor.compress(&decoded)?;
         if compressed.len() > MAX_BATCH {
             bail!("compressed job journal batch exceeds 16 MiB");
         }
@@ -114,6 +116,16 @@ impl Journal {
         }
         self.end += frame.len() as u64;
         Ok(())
+    }
+}
+
+impl Drop for Journal {
+    fn drop(&mut self) {
+        // A concurrent fork may briefly inherit this open file description.
+        // Release our lock explicitly instead of waiting for its exec/exit.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 }
 

@@ -164,6 +164,11 @@
         "type": {
           "const": "run"
         },
+        "job_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "description": "Optional resumption job shared by attempts; removed on successful completion."
+        },
         "run_id": {
           "type": "string"
         },
@@ -243,6 +248,11 @@
         "seq": true,
         "type": {
           "const": "run"
+        },
+        "job_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "description": "Optional resumption job shared by attempts; removed on successful completion."
         },
         "run_id": {
           "type": "string"

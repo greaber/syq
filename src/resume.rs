@@ -154,12 +154,14 @@ pub(crate) fn start(
                 job.save_inputs(args)?;
             }
             if job.available() {
-                crate::output::diagnostic!(
-                    "syq: job {}; resume with syq {} --resume {}",
-                    job.id,
-                    if args.rm { "rm" } else { "cp" },
-                    job.id
-                );
+                if !args.quiet {
+                    crate::output::diagnostic!(
+                        "syq: job {}; resume with syq {} --resume {}",
+                        job.id,
+                        if args.rm { "rm" } else { "cp" },
+                        job.id
+                    );
+                }
                 args.resume_job = Some(job);
             }
         }

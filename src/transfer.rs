@@ -631,6 +631,7 @@ fn small_copy_eligible(
         return false;
     }
     args.interface == Interface::NativeCp
+        && !args.resume_job.as_ref().is_some_and(|job| job.resumed)
         && !args.tuning_options.unwrap_or_default().force_ranges()
         && !args.tuning_options.unwrap_or_default().batch_override()
         && matches!(args.placement, Placement::Into | Placement::As)
@@ -782,7 +783,12 @@ fn attempt_small_copy(
         targets.push((dst_path, rel_bytes, rel));
     }
 
-    let flags = publication_metadata_flags(opts.flags);
+    let flags = publication_metadata_flags(opts.flags)
+        | if opts.resume_job.is_some() {
+            flags::REPORT_IDENTITY
+        } else {
+            0
+        };
     let files = entries
         .iter()
         .zip(srcs)
@@ -840,9 +846,18 @@ fn attempt_small_copy(
     let copying = progress.copying_interval();
     let mut source_reader = None;
     let response = match dst_ctl.call(Request::PrepareSmallFiles(request))? {
-        Response::SmallFilesPrepared(needed) => {
-            if needed.len() != entries.len() {
+        Response::SmallFilesPrepared { needed, absent } => {
+            if needed.len() != entries.len() || absent.len() != entries.len() {
                 bail!("small copy returned a mismatched selection count");
+            }
+            if let Some(job) = &opts.resume_job {
+                job.observe(
+                    targets
+                        .iter()
+                        .zip(&absent)
+                        .filter(|(_, absent)| **absent)
+                        .map(|((path, ..), _)| (path.clone(), None)),
+                );
             }
             // Read through the engine's source-worker path.
             let Ok(mut reader) = src_ep.connect_with_sources(args.compress, roots.to_vec(), true)
@@ -981,6 +996,19 @@ fn attempt_small_copy(
         }
         other => bail!("unexpected response {other:?}"),
     };
+    if let Some(job) = &opts.resume_job {
+        job.published(
+            targets
+                .iter()
+                .zip(&results)
+                .filter_map(|((path, ..), result)| {
+                    result
+                        .identity
+                        .filter(|_| result.error.is_none())
+                        .map(|identity| (path.clone(), identity))
+                }),
+        );
+    }
     if debug() {
         crate::output::diagnostic!(
             "syq: small copy: published at {:.2}s",

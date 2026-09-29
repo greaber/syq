@@ -358,6 +358,7 @@ class RunEvent:
     mapping: bool | None
     dry_run: bool
     endpoints: tuple[Endpoint, ...]
+    job_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -2653,6 +2653,7 @@ fn observation_only_prepare_releases_absent_reservation_and_skips_lifecycle() {
     authority.settle(
         settlement,
         &proto::Response::Prepared(proto::Preparation {
+            created_identity: None,
             partial_size: Some(0),
             has_candidates: false,
         }),

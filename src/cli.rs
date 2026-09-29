@@ -1429,6 +1429,10 @@ struct NativeCopyFields {
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]\n       syq cp [OPTIONS] --src-fd FD --as PATH\n       syq cp [OPTIONS] SOURCE --as-fd FD"
 )]
 struct NativeCopyCommand {
+    /// Resume a previous named job; sources and destinations come from its saved command
+    #[arg(long, value_name = "JOB")]
+    resume: Option<String>,
+
     #[command(flatten)]
     s3: crate::s3::Flags,
     #[command(flatten)]
@@ -1545,6 +1549,10 @@ struct NativeMapCommand {
     override_usage = "syq rm [OPTIONS] PATH...\n       syq rm [OPTIONS] --srcs-in DIR"
 )]
 struct NativeRmCommand {
+    /// Resume a previous named job; sources and destinations come from its saved command
+    #[arg(long, value_name = "JOB")]
+    resume: Option<String>,
+
     /// Request storage authorization from a connected receiving machine
     #[arg(long, value_name = "@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
@@ -2166,11 +2174,16 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     });
     validate_native_copy_argument_order(&matches)?;
     let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
+    anyhow::ensure!(
+        parsed.resume.is_none(),
+        "job resumption must be restored before argument parsing"
+    );
     let stream = selected_stream_source(&parsed.copy)?;
     if parsed.copy.src_fd.is_some() || parsed.copy.as_fd.is_some() || stream.is_some() {
         return parse_descriptor_copy(parsed, &matches, stream);
     }
     let NativeCopyCommand {
+        resume: _,
         s3,
         // Options::parse reads the object-writing headers from the matches.
         s3_write: _,
@@ -2515,6 +2528,10 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         .try_get_matches_from(full_argv)
         .unwrap_or_else(|error| error.exit());
     let parsed = NativeRmCommand::from_arg_matches(&matches)?;
+    anyhow::ensure!(
+        parsed.resume.is_none(),
+        "job resumption must be restored before argument parsing"
+    );
     validate_native_results_fd(parsed.results_output.results_fd)?;
     let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
     for (id, selection, paths) in [

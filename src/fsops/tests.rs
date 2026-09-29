@@ -1333,7 +1333,7 @@ fn complete_small_copy(
     (offer, contents): (SmallCopyRequest, Vec<Vec<u8>>),
 ) -> Response {
     match operations.handle(&Request::PrepareSmallFiles(offer)) {
-        Response::SmallFilesPrepared(needed) => {
+        Response::SmallFilesPrepared { needed, .. } => {
             let payloads = contents
                 .into_iter()
                 .enumerate()
@@ -1452,6 +1452,7 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
             results,
             vec![
                 SmallCopyFileResult {
+                    identity: None,
                     disposition: SmallCopyDisposition::Copied,
                     error: None
                 };
@@ -1535,6 +1536,7 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
                 results,
                 vec![
                     SmallCopyFileResult {
+                        identity: None,
                         disposition: SmallCopyDisposition::Copied,
                         error: None
                     };
@@ -1676,7 +1678,7 @@ fn small_copy_rejects_invalid_payloads_before_writing_and_consumes_the_offer() {
         let mut operations = FsOps::new();
         assert!(
             matches!(operations.handle(&Request::PrepareSmallFiles(offer.clone())),
-            Response::SmallFilesPrepared(needed) if needed == [true, true])
+            Response::SmallFilesPrepared { needed, .. } if needed == [true, true])
         );
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 0);
         let response = operations.handle(&Request::CopySmallFiles(invalid));
@@ -1707,7 +1709,7 @@ fn small_copy_keeps_the_prepared_directory_when_its_name_is_replaced() {
     let offer = offered_small_copy(selected.as_os_str().as_bytes(), &[b"one"]);
     assert!(matches!(
         operations.handle(&Request::PrepareSmallFiles(offer)),
-        Response::SmallFilesPrepared(_)
+        Response::SmallFilesPrepared { .. }
     ));
     fs::rename(&selected, &moved).unwrap();
     fs::create_dir(&selected).unwrap();

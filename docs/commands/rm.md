@@ -17,6 +17,18 @@ syq rm [OPTIONS] PATH...
 syq rm [OPTIONS] --srcs-in DIR
 ```
 
+## Copy policy and filtering
+
+| Argument / option | Meaning |
+|---|---|
+| `--resume <JOB>` | Resume a previous named job; sources and destinations come from its saved command |
+| `--s3-endpoint <URL>` | S3 API endpoint URL (also AWS_ENDPOINT_URL_S3 or AWS_ENDPOINT_URL) |
+| `--s3-region <REGION>` | S3 signing region, used as given (otherwise syq asks AWS where the bucket is) |
+| `--s3-profile <NAME>` | AWS shared configuration/credentials profile |
+| `--s3-header <NAME: VALUE>` | Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused) |
+| `--s3-all-versions` | Permanently remove all selected S3 object versions and delete markers |
+| `--s3-version-id <ID>` | Permanently remove one version or delete marker of one exact S3 key |
+
 ## SSH and transport
 
 | Argument / option | Meaning |
@@ -25,17 +37,6 @@ syq rm [OPTIONS] --srcs-in DIR
 | `--syq-path <PATH>` | Use this exact syq executable on the remote removal endpoint |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
 | `--pscope <PATH>` | Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral` |
-
-## Copy policy and filtering
-
-| Argument / option | Meaning |
-|---|---|
-| `--s3-endpoint <URL>` | S3 API endpoint URL (also AWS_ENDPOINT_URL_S3 or AWS_ENDPOINT_URL) |
-| `--s3-region <REGION>` | S3 signing region, used as given (otherwise syq asks AWS where the bucket is) |
-| `--s3-profile <NAME>` | AWS shared configuration/credentials profile |
-| `--s3-header <NAME: VALUE>` | Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused) |
-| `--s3-all-versions` | Permanently remove all selected S3 object versions and delete markers |
-| `--s3-version-id <ID>` | Permanently remove one version or delete marker of one exact S3 key |
 
 ## Sources and selection
 

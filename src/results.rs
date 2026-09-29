@@ -75,6 +75,7 @@ pub struct OperationRecord<'a> {
 }
 
 pub struct RunRecord<'a> {
+    pub job_id: Option<&'a str>,
     pub run_id: &'a str,
     pub started_at: i64,
     pub mode: &'static str,
@@ -258,6 +259,11 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
         RunMode::Rm => ("rm", None, None),
     };
     writer.emit_run(&RunRecord {
+        job_id: args
+            .resume_job
+            .as_ref()
+            .filter(|job| job.available())
+            .map(|job| job.id.as_str()),
         run_id: &run_id,
         started_at,
         mode: name,
@@ -385,6 +391,9 @@ impl ResultsWriter {
         });
         let object = record.as_object_mut().expect("record is an object");
 
+        if let Some(job_id) = run.job_id {
+            object.insert("job_id".into(), job_id.into());
+        }
         if let Some(prune) = run.prune {
             object.insert("prune".into(), prune.into());
         }

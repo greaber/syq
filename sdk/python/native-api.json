@@ -59,7 +59,8 @@
         "resource-limits",
         "integrity-checking",
         "where",
-        "copy-if"
+        "copy-if",
+        "resume"
       ],
       "internal": [
         "delegated-operands-b64",
@@ -110,7 +111,8 @@
         "s3-profile",
         "s3-header",
         "s3-all-versions",
-        "s3-version-id"
+        "s3-version-id",
+        "resume"
       ],
       "internal": [
         "results-fd"

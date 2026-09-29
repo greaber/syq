@@ -67,8 +67,13 @@ impl Command {
         let changed = parse_overrides(overrides)?;
         let mut result = vec![command.clone()];
         let mut index = 1;
+        let mut operands = Vec::new();
         while index < original.len() {
             let value = &original[index];
+            if value == "--" {
+                operands.extend_from_slice(&original[index..]);
+                break;
+            }
             let key = option_key(value);
             // Each attempt gets its own results stream; never reopen the file
             // or descriptor from an earlier process.
@@ -89,6 +94,7 @@ impl Command {
         for (_, words) in changed {
             result.extend(words);
         }
+        result.extend(operands);
         Ok((result, PathBuf::from(self.cwd.os()?)))
     }
 }

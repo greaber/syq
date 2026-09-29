@@ -1247,7 +1247,14 @@ impl Worker {
             })?,
             "prepare",
         )? {
-            Response::Prepared(prepared) => Ok(prepared),
+            Response::Prepared(prepared) => {
+                if let (Some(record), Some(identity)) =
+                    (&self.opts.resume_job, prepared.created_identity)
+                {
+                    record.published([(job.dst.clone(), identity)]);
+                }
+                Ok(prepared)
+            }
             other => bail!("unexpected response {other:?}"),
         }
     }

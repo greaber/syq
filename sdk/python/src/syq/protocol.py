@@ -244,8 +244,8 @@ class AutomationDecoder:
         *,
         dry_run: bool,
         mode: str = "cp",
-        prune: bool = False,
-        mapping: bool = False,
+        prune: bool | None = False,
+        mapping: bool | None = False,
         selectors_total: int | None = None,
         stream_entries: set[int] | None = None,
     ) -> None:
@@ -333,7 +333,7 @@ class AutomationDecoder:
                     (dry_run, self.expected_dry_run, "dry_run"),
                 )
             for actual, expected, label in expected_values:
-                if actual != expected:
+                if expected is not None and actual != expected:
                     raise SyqProtocolError(
                         f"automation run {label} disagrees with the invocation"
                     )
@@ -342,6 +342,7 @@ class AutomationDecoder:
             event = RunEvent(
                 **common,
                 run_id=run_id,
+                job_id=_optional_string(record, "job_id"),
                 started_at=_integer(record, "started_at"),
                 syq_version=_string(record, "syq_version"),
                 mode=mode,

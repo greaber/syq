@@ -346,6 +346,7 @@ impl FsOps {
             return Ok(Preparation {
                 partial_size: None,
                 has_candidates: true,
+                created_identity: None,
             });
         }
         if inplace {
@@ -398,8 +399,13 @@ impl FsOps {
                             self.set_copy_length(&file, size).with_context(|| {
                                 format!("resize confined file {}", target.label.display())
                             })?;
+                            let metadata = file.metadata()?;
+                            let created_identity = Some((metadata.dev(), metadata.ino()));
                             self.cache_file(target.location(), attempt, false, file);
-                            return Ok(Preparation::default());
+                            return Ok(Preparation {
+                                created_identity,
+                                ..Preparation::default()
+                            });
                         }
                         Err(error)
                             if error.downcast_ref::<io::Error>().is_some_and(|error| {
@@ -455,6 +461,7 @@ impl FsOps {
         Ok(Preparation {
             partial_size: basis_size,
             has_candidates: false,
+            created_identity: None,
         })
     }
 

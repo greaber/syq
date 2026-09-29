@@ -908,6 +908,7 @@ impl FsOps {
             .iter()
             .map(|unchanged| !unchanged)
             .collect::<Vec<_>>();
+        let absent = destinations.iter().map(Option::is_none).collect();
         self.prepared_small_copy = Some(PreparedSmallCopy {
             request: request.clone(),
             anchor,
@@ -917,7 +918,7 @@ impl FsOps {
             unchanged,
         });
         if needed.iter().any(|needed| *needed) {
-            Ok(Response::SmallFilesPrepared(needed))
+            Ok(Response::SmallFilesPrepared { needed, absent })
         } else {
             // An all-rejected/quick-checked batch completes in this first turn.
             self.copy_small_files(&[])
@@ -1095,6 +1096,7 @@ impl FsOps {
             .map(|(i, (((file, destination), item), matched_content))| {
                 if !permitted[i] {
                     return SmallCopyFileResult {
+                        identity: None,
                         disposition: SmallCopyDisposition::Excluded,
                         error: None,
                     };
@@ -1106,26 +1108,37 @@ impl FsOps {
                         ino: stat.st_ino as u64,
                     });
                 match item {
-                    Some(item) => SmallCopyFileResult {
-                        disposition: SmallCopyDisposition::Copied,
-                        error: publish_partial_rooted(
-                            &item.root,
-                            &item.partial,
-                            &item.target,
-                            &item.file,
-                            if matches!(
-                                request.if_exists,
-                                crate::cli::IfExists::Error
-                                    | crate::cli::IfExists::ErrorIfDifferent
-                            ) {
-                                TargetCondition::Absent
-                            } else {
-                                TargetCondition::Any
-                            },
-                        )
-                        .err()
-                        .map(|error| wire_error(&error)),
-                    },
+                    Some(item) => {
+                        let identity = if request.flags & flags::REPORT_IDENTITY != 0 {
+                            item.file
+                                .metadata()
+                                .ok()
+                                .map(|meta| (meta.dev(), meta.ino()))
+                        } else {
+                            None
+                        };
+                        SmallCopyFileResult {
+                            identity,
+                            disposition: SmallCopyDisposition::Copied,
+                            error: publish_partial_rooted(
+                                &item.root,
+                                &item.partial,
+                                &item.target,
+                                &item.file,
+                                if matches!(
+                                    request.if_exists,
+                                    crate::cli::IfExists::Error
+                                        | crate::cli::IfExists::ErrorIfDifferent
+                                ) {
+                                    TargetCondition::Absent
+                                } else {
+                                    TargetCondition::Any
+                                },
+                            )
+                            .err()
+                            .map(|error| wire_error(&error)),
+                        }
+                    }
                     None => {
                         let stat = destination.expect("unchanged file has a destination");
                         let mut repair = if matched_content.is_some() {
@@ -1191,7 +1204,11 @@ impl FsOps {
                                 Err(error) => Some(wire_error(&error)),
                             }
                         };
-                        SmallCopyFileResult { disposition, error }
+                        SmallCopyFileResult {
+                            identity: None,
+                            disposition,
+                            error,
+                        }
                     }
                 }
             })

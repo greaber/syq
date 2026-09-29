@@ -28,6 +28,37 @@ def resolved_temporary_directory() -> tempfile.TemporaryDirectory[str]:
     "candidate compatibility requires SYQ_CANDIDATE_EXECUTABLE and version",
 )
 class CandidateCompatibilityTests(unittest.TestCase):
+    def test_named_job_resume_preserves_saved_pruning_for_both_clients(self) -> None:
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous), resolved_temporary_directory() as temporary:
+                root = Path(temporary)
+                (root / "source").mkdir()
+                (root / "source/file").write_bytes(b"copied")
+                (root / "destination").mkdir()
+                (root / "destination/stale").write_bytes(b"stale")
+                client = (syq.AsyncClient if asynchronous else syq.Client)(
+                    executable=EXECUTABLE, process_cwd=root,
+                    env={**os.environ, "XDG_CACHE_HOME": str(root / "cache")},
+                )
+                events = []
+                first = client.cp(srcs_in="source", into="destination", prune=True,
+                                  max_delete=0, if_exists="error", on_event=events.append, check=False)
+                if asynchronous:
+                    first = asyncio.run(first)
+                self.assertEqual(first.exit_code, 25)
+                self.assertIsInstance(events[0], syq.RunEvent)
+                job = events[0].job_id
+                self.assertIsNotNone(job)
+                resumed_events = []
+                second = client.cp(resume=job, max_delete=1, on_event=resumed_events.append)
+                if asynchronous:
+                    second = asyncio.run(second)
+                self.assertEqual(second.exit_code, 0)
+                self.assertTrue(resumed_events[0].prune)
+                self.assertEqual(resumed_events[0].job_id, job)
+                self.assertFalse((root / "destination/stale").exists())
+                self.assertEqual((root / "destination/file").read_bytes(), b"copied")
+
     def test_expression_selection_and_update(self) -> None:
         for asynchronous in (False, True):
             with self.subTest(asynchronous=asynchronous), resolved_temporary_directory() as temporary:

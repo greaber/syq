@@ -704,8 +704,8 @@ class AsyncClient:
         argv: list[Argument],
         *,
         mode: str,
-        prune: bool,
-        mapping: bool,
+        prune: bool | None,
+        mapping: bool | None,
         dry_run: bool,
         selectors_total: int | None,
         on_event: AsyncEventCallback | None,
@@ -791,6 +791,7 @@ class AsyncClient:
     async def cp(
         self,
         *sources: PathArgument,
+        resume: str | None = None,
         src: Selector | None = None,
         srcs_in: Selector | None = None,
         src_non_dir: Selector | None = None,
@@ -857,6 +858,8 @@ class AsyncClient:
         timeout: Timeout = CLIENT_DEFAULT,
         check: bool = True,
     ) -> CpResult:
+        if resume is not None and mapping is not None:
+            raise SyqInvocationError("resume does not accept a new mapping")
         connection = _connection_options(mapping, _Connection(
             rsh, syq_path, no_bootstrap, s3_endpoint, s3_region, s3_profile, s3_header,
         ))
@@ -882,6 +885,7 @@ class AsyncClient:
         argv, source_count, source_end = _copy_arguments(
             "cp",
             sources,
+            resume=resume,
             src=src,
             srcs_in=srcs_in,
             src_non_dir=src_non_dir,
@@ -943,13 +947,13 @@ class AsyncClient:
         if mapping is not None and prune:
             raise SyqInvocationError("--mapping conflicts with --prune")
         if mapping is None:
-            if source_count == 0:
+            if source_count == 0 and resume is None:
                 raise SyqInvocationError("syq cp needs a source selector or mapping")
             result = await self._typed(
                 argv,
                 mode="cp",
-                prune=prune,
-                mapping=False,
+                prune=prune if resume is None else None,
+                mapping=False if resume is None else None,
                 dry_run=dry_run,
                 selectors_total=None,
                 on_event=on_event,
@@ -1024,6 +1028,7 @@ class AsyncClient:
     async def rm(
         self,
         *sources: PathArgument,
+        resume: str | None = None,
         src: Selector | None = None,
         srcs_in: Selector | None = None,
         src_non_dir: Selector | None = None,
@@ -1055,6 +1060,7 @@ class AsyncClient:
         )
         argv, selectors_total = _rm_arguments(
             sources,
+            resume=resume,
             src=src,
             srcs_in=srcs_in,
             src_non_dir=src_non_dir,
@@ -1083,7 +1089,7 @@ class AsyncClient:
             prune=False,
             mapping=False,
             dry_run=dry_run,
-            selectors_total=selectors_total,
+            selectors_total=selectors_total if resume is None else None,
             on_event=on_event,
             results=results,
             timeout=timeout,
