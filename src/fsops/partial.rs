@@ -881,12 +881,16 @@ impl FsOps {
         Ok(())
     }
 
+    /// `inspect_parent` sees the directory that will hold the copy, so a
+    /// caller can learn about the destination filesystem before it creates
+    /// anything there.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(super) fn prepare_local_copy(
+    pub(super) fn prepare_local_copy<T>(
         &self,
         source: &RegisteredPath,
         dst: &[u8],
-    ) -> Result<(File, fs::Metadata, RootedTarget)> {
+        inspect_parent: impl FnOnce(&File) -> T,
+    ) -> Result<(File, fs::Metadata, RootedTarget, T)> {
         let source_target = self
             .registered_source_target(source)
             .context("resolve registered local-copy source")?;
@@ -907,19 +911,26 @@ impl FsOps {
         // command that names the same file is still a self-copy and should not
         // silently replace its own selected source. The in-place open repeats
         // this check against the exact descriptor before truncation.
-        if destination_root
-            .metadata_optional(&destination_relative)?
-            .is_some_and(|metadata| {
-                metadata.is_file()
-                    && metadata.dev == source_metadata.dev()
-                    && metadata.ino == source_metadata.ino()
-            })
-        {
+        let parent = destination_root.resolve_parent(&destination_relative)?;
+        let existing = match parent.metadata() {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat {}", destination_label.display()));
+            }
+        };
+        if existing.is_some_and(|metadata| {
+            metadata.is_file()
+                && metadata.dev == source_metadata.dev()
+                && metadata.ino == source_metadata.ino()
+        }) {
             bail!(
                 "source and destination are the same file: {}",
                 destination_label.display()
             );
         }
+        let inspected = inspect_parent(parent.directory());
+        drop(parent);
         Ok((
             s,
             source_metadata,
@@ -930,6 +941,7 @@ impl FsOps {
                 create_missing_parents: false,
                 query_partial_name_limit: false,
             },
+            inspected,
         ))
     }
 
@@ -958,14 +970,83 @@ impl FsOps {
             progress,
         } = policy;
         let mut progress = CopyProgress::new(progress, size);
-        let (s, source_metadata, target) = self.prepare_local_copy(source, dst)?;
+        // A new entry lives on its directory's filesystem, so the directory
+        // answers every filesystem question before a sidecar exists.
+        let (s, source_metadata, target, destination) =
+            self.prepare_local_copy(source, dst, directory_file_system)?;
+        let (destination_key, destination_fs) =
+            destination.context("inspect the destination filesystem")?;
         let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
+        let destination_root = target.root.clone();
+        let source_key = file_system_key(&s, source_metadata.dev());
+        let source_fs = file_system_traits(&s, source_key);
+        // Exercise fallback policy independently of the filesystem hosting the
+        // integration tests. Apply before the NFS/synchronous overrides so those
+        // exclusions can still be tested with otherwise eligible local traits.
+        #[cfg(debug_assertions)]
+        let (source_fs, destination_fs) = match std::env::var("SYQ_TEST_COPY_LOCAL_FS").as_deref() {
+            Ok("local") => {
+                let local = FileSystemTraits {
+                    measured_local_source: true,
+                    local_userspace_copy: true,
+                    ..FileSystemTraits::default()
+                };
+                (local, local)
+            }
+            Ok("unsupported") => (FileSystemTraits::default(), FileSystemTraits::default()),
+            Ok(value) => panic!("unknown SYQ_TEST_COPY_LOCAL_FS value: {value}"),
+            Err(_) => (source_fs, destination_fs),
+        };
+        #[cfg(debug_assertions)]
+        let source_fs = FileSystemTraits {
+            is_nfs: source_fs.is_nfs
+                || std::env::var_os("SYQ_TEST_COPY_LOCAL_SOURCE_NFS").is_some(),
+            measured_local_source: source_fs.measured_local_source
+                || std::env::var_os("SYQ_TEST_COPY_LOCAL_SOURCE_DISK").is_some(),
+            ..source_fs
+        };
+        #[cfg(debug_assertions)]
+        let destination_fs = FileSystemTraits {
+            is_nfs: destination_fs.is_nfs || std::env::var_os("SYQ_TEST_COPY_LOCAL_NFS").is_some(),
+            synchronous: destination_fs.synchronous
+                || std::env::var_os("SYQ_TEST_COPY_LOCAL_NFS_SYNC").is_some(),
+            ..destination_fs
+        };
+        // The measured fast path is a local filesystem feeding an ordinary
+        // asynchronous NFS mount. NFS reads can benefit from parallelism, and
+        // a synchronous destination makes every write syscall wait for the
+        // server, so let the normal adaptive range path handle either case.
+        let use_sequential_nfs_fallback = allow_sequential_nfs_fallback
+            && !source_fs.is_nfs
+            && source_fs.measured_local_source
+            && destination_fs.is_nfs
+            && !destination_fs.synchronous;
+        // Local files keep parallelism across files without paying transport
+        // and per-range hashing costs. Explicit sparse mode also needs a buffered
+        // writer when cloning cannot preserve its allocation.
+        let use_userspace_fallback = self.sparse
+            || use_sequential_nfs_fallback
+            || (allow_sequential_local_fallback
+                && source_fs.local_userspace_copy
+                && destination_fs.local_userspace_copy
+                && !source_fs.is_nfs
+                && !destination_fs.is_nfs
+                && !destination_fs.synchronous);
+        let copy_pair = (source_key, destination_key);
+        let copy_pair_unsupported = unsupported_copy_pairs()
+            .lock()
+            .unwrap()
+            .contains(&copy_pair);
+        if copy_pair_unsupported && !use_userspace_fallback && !inplace {
+            // An earlier file already showed that this pair cannot offload.
+            // Leave the directory alone: a sidecar created only to be removed
+            // costs two directory changes for every file.
+            return Ok(CopyLocalOutcome::Unsupported);
+        }
         // Advisory sequential readahead for the kernel copy on Linux.
         unsafe {
             libc::posix_fadvise(s.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         }
-        let destination_root = target.root.clone();
-        let source_key = file_system_key(&s, source_metadata.dev());
         self.uncache_rooted(&destination_root, &target.relative);
         let (mut target_relative, mut target_label) =
             (target.relative.clone(), target.label.clone());
@@ -1037,81 +1118,9 @@ impl FsOps {
             }
             d
         };
-        let destination_metadata = d.metadata()?;
-        let destination_dev = destination_metadata.dev();
-        let destination_key = file_system_key(&d, destination_dev);
-        let source_fs = file_system_traits(&s, source_key);
-        let destination_fs = file_system_traits(&d, destination_key);
-        // Exercise fallback policy independently of the filesystem hosting the
-        // integration tests. Apply before the NFS/synchronous overrides so those
-        // exclusions can still be tested with otherwise eligible local traits.
-        #[cfg(debug_assertions)]
-        let (source_fs, destination_fs) = match std::env::var("SYQ_TEST_COPY_LOCAL_FS").as_deref() {
-            Ok("local") => {
-                let local = FileSystemTraits {
-                    measured_local_source: true,
-                    local_userspace_copy: true,
-                    ..FileSystemTraits::default()
-                };
-                (local, local)
-            }
-            Ok("unsupported") => (FileSystemTraits::default(), FileSystemTraits::default()),
-            Ok(value) => panic!("unknown SYQ_TEST_COPY_LOCAL_FS value: {value}"),
-            Err(_) => (source_fs, destination_fs),
-        };
-        #[cfg(debug_assertions)]
-        let source_fs = FileSystemTraits {
-            is_nfs: source_fs.is_nfs
-                || std::env::var_os("SYQ_TEST_COPY_LOCAL_SOURCE_NFS").is_some(),
-            measured_local_source: source_fs.measured_local_source
-                || std::env::var_os("SYQ_TEST_COPY_LOCAL_SOURCE_DISK").is_some(),
-            ..source_fs
-        };
-        #[cfg(debug_assertions)]
-        let destination_fs = FileSystemTraits {
-            is_nfs: destination_fs.is_nfs || std::env::var_os("SYQ_TEST_COPY_LOCAL_NFS").is_some(),
-            synchronous: destination_fs.synchronous
-                || std::env::var_os("SYQ_TEST_COPY_LOCAL_NFS_SYNC").is_some(),
-            ..destination_fs
-        };
-        // The measured fast path is a local filesystem feeding an ordinary
-        // asynchronous NFS mount. NFS reads can benefit from parallelism, and
-        // a synchronous destination makes every write syscall wait for the
-        // server, so let the normal adaptive range path handle either case.
-        let use_sequential_nfs_fallback = allow_sequential_nfs_fallback
-            && !source_fs.is_nfs
-            && source_fs.measured_local_source
-            && destination_fs.is_nfs
-            && !destination_fs.synchronous;
-        // Local files keep parallelism across files without paying transport
-        // and per-range hashing costs. Explicit sparse mode also needs a buffered
-        // writer when cloning cannot preserve its allocation.
-        let use_userspace_fallback = self.sparse
-            || use_sequential_nfs_fallback
-            || (allow_sequential_local_fallback
-                && source_fs.local_userspace_copy
-                && destination_fs.local_userspace_copy
-                && !source_fs.is_nfs
-                && !destination_fs.is_nfs
-                && !destination_fs.synchronous);
-        let copy_pair = (source_key, destination_key);
-        let copy_pair_unsupported = unsupported_copy_pairs()
-            .lock()
-            .unwrap()
-            .contains(&copy_pair);
         let mut userspace_fallback = copy_pair_unsupported && use_userspace_fallback;
         if copy_pair_unsupported && !use_userspace_fallback {
-            let partial_metadata = d.metadata()?;
-            drop(d);
-            if !inplace {
-                discard_rooted_copy_partial(
-                    &destination_root,
-                    &target_relative,
-                    &target_label,
-                    partial_metadata.dev(),
-                    partial_metadata.ino(),
-                )?;
-            }
+            // Only an in-place copy reaches this point; it has no sidecar.
             return Ok(CopyLocalOutcome::Unsupported);
         }
         #[cfg(debug_assertions)]
@@ -1324,7 +1333,7 @@ impl FsOps {
         if policy.inplace {
             return Ok(CopyLocalOutcome::Unsupported);
         }
-        let (source, source_metadata, target) = self.prepare_local_copy(source, dst)?;
+        let (source, source_metadata, target, ()) = self.prepare_local_copy(source, dst, |_| ())?;
         let root = target.root.clone();
         let (partial, _) = rooted_partial_target(&target, copy_id)?;
         self.uncache_rooted(&root, &target.relative);

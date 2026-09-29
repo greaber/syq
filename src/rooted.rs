@@ -1621,6 +1621,12 @@ impl ResolvedParent<'_> {
         metadata_at(self.directory.as_raw_fd(), &self.leaf)
     }
 
+    /// The directory that holds the leaf, for inspecting where a new entry
+    /// would live. Mutations still go through `Root`.
+    pub(crate) fn directory(&self) -> &File {
+        &self.directory
+    }
+
     pub(crate) fn open_metadata(&self) -> io::Result<File> {
         #[cfg(target_os = "linux")]
         let flags =

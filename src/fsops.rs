@@ -191,6 +191,8 @@ fn discard_rooted_copy_partial(
     expected_dev: u64,
     expected_ino: u64,
 ) -> Result<()> {
+    #[cfg(debug_assertions)]
+    record_test_event("SYQ_TEST_COPY_LOCAL_DISCARDS", format_args!("discard"))?;
     match root.metadata_optional(relative)? {
         Some(current)
             if is_safe_rooted_partial(current)
@@ -328,6 +330,28 @@ fn file_system_key(file: &File, dev: u64) -> FileSystemKey {
         }
     }
     FileSystemKey::Device(dev)
+}
+
+/// The filesystem a new entry of `directory` would live on, with its traits.
+#[cfg(target_os = "linux")]
+fn directory_file_system(directory: &File) -> io::Result<(FileSystemKey, FileSystemTraits)> {
+    let mut stat = std::mem::MaybeUninit::<libc::statx>::uninit();
+    let named_mount = unsafe {
+        libc::statx(
+            directory.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_MNT_ID,
+            stat.as_mut_ptr(),
+        ) == 0
+            && stat.assume_init().stx_mask & libc::STATX_MNT_ID != 0
+    };
+    let key = if named_mount {
+        FileSystemKey::Mount(unsafe { stat.assume_init() }.stx_mnt_id)
+    } else {
+        FileSystemKey::Device(directory.metadata()?.dev())
+    };
+    Ok((key, file_system_traits(directory, key)))
 }
 
 #[cfg(target_os = "linux")]
