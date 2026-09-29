@@ -308,8 +308,11 @@ multipart controls; see [Descriptor copies](../object-storage.md#descriptor-copi
 
 Restart recovery, named receiving destinations, detached execution,
 directory selection, and `--hash` are unsupported.
-`--if-exists=error-if-different` compares an existing named destination with the
-received stream before accepting it; a dry run cannot perform that comparison.
+`--if-exists=error` rejects an existing named destination before reading input
+when syq can inspect it. If an object-storage provider denies or fails that
+inspection, syq sends the stream using conditional creation, which still refuses
+replacement. `--if-exists=error-if-different` compares an existing named destination
+with the received stream before accepting it; a dry run cannot perform that comparison.
 Output descriptors are already opened by the caller and receive bytes directly;
 they do not apply the per-path existing-file policy (except `keep`, which always
 skips).
