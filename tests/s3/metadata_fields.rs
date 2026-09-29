@@ -157,7 +157,8 @@ pub(super) fn serve(
         }
         "PUT" => {
             assert!(!source);
-            assert!(!fault.contains("same-tags") && !fault.contains("missing"));
+            assert!(!fault.contains("same-tags"));
+            assert!(!fault.contains("missing") || (fresh && !large));
             let copy = percent_encoding::percent_decode_str(&headers["x-amz-copy-source"])
                 .decode_utf8()
                 .unwrap();
@@ -188,6 +189,9 @@ pub(super) fn serve(
                 );
             } else {
                 check_fields(headers, all, empty, fresh);
+                if fresh {
+                    assert_eq!(headers["x-amz-metadata-directive"], "COPY");
+                }
                 if tags && fresh {
                     assert_eq!(headers["x-amz-tagging-directive"], "REPLACE");
                     assert_eq!(headers["x-amz-tagging"], "source=a%20b");
@@ -294,6 +298,8 @@ fn selected_s3_metadata_keeps_destination_contents_and_unselected_attributes() {
         ("metadata-fields-same-tags", "tags"),
         ("metadata-fields-all-missing", "user-metadata"),
         ("metadata-fields-fresh", "storage-class"),
+        ("metadata-fields-fresh-missing", "storage-class,user-metadata"),
+        ("metadata-fields-fresh-large-missing", "storage-class,user-metadata"),
         ("metadata-fields-fresh-tags", "storage-class,tags"),
         ("metadata-fields-fresh-tags-unsupported", "storage-class,tags"),
         ("metadata-fields-fresh-large", "storage-class,tags"),
@@ -303,16 +309,18 @@ fn selected_s3_metadata_keeps_destination_contents_and_unselected_attributes() {
         let out = server.command_with_part_size(temp.path(), 0, false)
             .args(["--s3-endpoint", &server.address, "--from", "s3://source", "original", "--to", "s3://destination", "--as", "copied", "--copy-metadata", selected, "--performance-tuning=s3-part-size=5G"])
             .capture_output().unwrap();
+        let incomplete_copy = fault.contains("missing")
+            && (!fault.contains("fresh") || fault.contains("large"));
         if fault.contains("unsupported") {
             assert!(!out.status.success(), "{fault}");
             assert!(output_text(&out).contains("read explicitly selected S3 tags"), "{}", output_text(&out));
-        } else if fault.contains("missing") {
+        } else if incomplete_copy {
             assert!(!out.status.success(), "{fault}");
             assert!(output_text(&out).contains("omitted source metadata"), "{}", output_text(&out));
         } else {
             assert!(out.status.success(), "{fault}: {}", output_text(&out));
         }
-        assert_eq!(server.gate.1.load(Ordering::Relaxed), !fault.contains("same-tags") && !fault.contains("missing") && !fault.contains("unsupported"), "{fault}");
+        assert_eq!(server.gate.1.load(Ordering::Relaxed), !fault.contains("same-tags") && !incomplete_copy && !fault.contains("unsupported"), "{fault}");
     }
 }
 

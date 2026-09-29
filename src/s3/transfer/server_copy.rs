@@ -514,7 +514,11 @@ impl Engine {
             }
             return Ok(CopyPreparation::Metadata(Box::new(update)));
         }
-        if self.args.s3_metadata.user_metadata {
+        // Native COPY preserves even metadata omitted from HEAD. Only reject
+        // an incomplete set when this request must reconstruct that metadata.
+        if self.args.s3_metadata.user_metadata
+            && (explicit.flags() != 0 || source.size > self.copy_request_limit(source.size))
+        {
             anyhow::ensure!(source_head.missing_meta().unwrap_or(0) == 0,
                 "cannot copy user metadata: the service omitted source metadata (x-amz-missing-meta)");
         }
