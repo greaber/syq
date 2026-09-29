@@ -607,3 +607,48 @@ fn resumable_candidates_skip_the_final_equality_probe() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), source);
 }
+
+#[test]
+fn bandwidth_limited_pulls_transfer_only_differing_blocks() {
+    for pacing in ["average", "125ms"] {
+        for changed in [0, 1 << 19, 1 << 20] {
+            let t = Tmp::new();
+            let rsh = fake_rsh(&t);
+            let source = prng(1 << 20, 863);
+            let mut old = source.clone();
+            old[..changed].fill(0);
+            write(&t.path("src"), &source);
+            write(&t.path("dst"), &old);
+            set_mtime(&t.path("dst"), 1);
+            let src = format!("fake:{}", t.s("src"));
+            let tuning = format!(
+                "copy-path=ranges,request-size=128K,comparison-block-size=256K,bw-pacing={pacing}"
+            );
+            let out = remote_syq_command(
+                &t,
+                &rsh,
+                &[
+                    "-a",
+                    "--rsync-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--syq-no-bootstrap",
+                    "--bwlimit=1M",
+                    "--performance-tuning",
+                    &tuning,
+                    &src,
+                    &t.s("dst"),
+                ],
+            )
+            .env("SYQ_DEBUG", "1")
+            .run()
+            .unwrap();
+            assert_output_ok(&out);
+            assert_eq!(read(&t.path("dst")), source);
+            assert_eq!(
+                tuning_observed(&out)["range_requests"],
+                changed / (128 << 10)
+            );
+            assert!(partial_files(&t.0).is_empty());
+        }
+    }
+}

@@ -196,7 +196,8 @@ even with `off`. The setting controls reuse of the final destination, not partia
 With block reuse enabled, files with identical contents can finish without
 rewriting data even when their metadata differs. A difference near the end can
 add almost a full extra read of both files before copying. Resumable partials
-take precedence over comparing the completed destination.
+take precedence over the preliminary equality probe; explicit whole-file
+checksum comparisons still apply.
 
 Changed files still use atomic replacement unless `--inplace` is selected.
 Reflinks can reduce replacement writes on supporting filesystems; otherwise the
@@ -224,11 +225,12 @@ syq cp --srcs-in source --to host --into destination \
 ```
 
 Set `request-size` too: it otherwise follows the comparison block size.
-Both endpoints still read the full file to compare it. Staged updates and
+Both endpoints still read the full file to compare it. Most staged updates and
 partial resume compare bounded windows; their hash memory does not grow with
-file size. Explicit whole-file comparisons (`--hash`, protected-existing-file
-policies, and in-place reuse) still have a hash-response limit: at 64 KiB,
-files must be smaller than 130 GiB. Increasing `comparison-block-size`
+file size. Bandwidth-limited pulls compare before downloading, so matching blocks
+do not consume the bandwidth budget. These pulls and explicit whole-file
+comparisons (`--hash`, protected-existing-file policies, and in-place reuse)
+have a hash-response limit: at 64 KiB, files must be smaller than 130 GiB. Increasing `comparison-block-size`
 increases that limit proportionally. A smaller effective request size, including
 bandwidth pacing, also reduces staged comparison granularity.
 
