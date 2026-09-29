@@ -22,6 +22,9 @@ mod expressions;
 #[path = "s3/metadata_updates.rs"]
 mod metadata_updates;
 
+#[path = "s3/metadata_fields.rs"]
+mod metadata_fields;
+
 #[path = "s3/existing_policy.rs"]
 mod existing_policy;
 
@@ -340,6 +343,17 @@ fn serve(
             ],
             data,
             method == "HEAD",
+        );
+        return;
+    }
+    if fault.starts_with("metadata-fields-") {
+        metadata_fields::serve(
+            &mut socket,
+            fault,
+            method,
+            first.split_whitespace().nth(1).unwrap(),
+            &headers,
+            &gate,
         );
         return;
     }

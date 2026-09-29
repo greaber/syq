@@ -11,6 +11,7 @@ pub(crate) mod listing;
 mod local;
 pub(crate) mod map;
 mod metadata_copy;
+pub(crate) mod metadata_fields;
 mod remove;
 pub(crate) use remove::RemoveFlags;
 mod prune;

@@ -89,12 +89,42 @@ objects.
 Bucket-to-bucket copies run within one service, using the same endpoint, region,
 and credentials. New or changed copies retain source user metadata, content
 headers, and tags. For matching contents, `--copy-metadata` can reconcile stored
-modification time, permissions, and ownership. Changes to source Content-Type,
-other content headers, arbitrary user metadata, or tags are not copied in this
-case; there are no `--copy-metadata` settings for these S3-specific fields.
+modification time, permissions, ownership, and these S3 attributes:
 
-Updating stored file attributes copies the destination object onto itself within
-S3, preserving its contents, content headers, tags, and unselected user metadata.
+| Selection | Source attribute to match |
+|---|---|
+| `content-type`, `content-encoding`, `content-language`, `content-disposition` | The corresponding content header |
+| `cache-control`, `expires` | Cache response headers |
+| `website-redirect` | Website redirect location |
+| `user-metadata` | All application user metadata, excluding reserved `syq-*` keys |
+| `tags` | The complete tag set |
+| `storage-class` | Storage class, including for new or changed copies |
+
+For example, `--copy-metadata=content-type,tags` updates those attributes even
+when the contents match. A selected attribute absent on the source is cleared
+at the destination, subject to service defaults. Selecting `user-metadata` or
+`tags` also removes destination-only keys in that set. Unselected destination
+attributes remain unchanged when contents match. These S3 selections require
+named S3 sources and destinations; uploads from files, downloads, and streams
+do not have corresponding source or destination attributes.
+
+Tag-only changes use the tagging API without rewriting the object or creating a
+new object version. Comparing tags requires permission to read source and
+destination tags; updating them requires permission to write destination tags.
+Reading tags uses a known object version when available. Tag updates using
+your own credentials also use the known destination version. Your provider may
+require separate permissions for reading and writing versioned tags. With
+`--auth-from`, updates always target the current destination object; upload
+approval does not allow changing historical versions.
+
+New or changed copies that fit in one server-side copy request use the provider's
+native tag-copy operation, without a separate tag read or support check. Providers
+without tag support may accept that copy without tags. With `tags` explicitly
+selected, multipart copies and tag comparisons read tags separately; if a
+required tagging operation is unsupported, the copy fails.
+
+Updating other metadata copies the destination object onto itself within
+S3, preserving its contents and unselected content headers, tags, and user metadata.
 It retains the destination storage class and the encryption method, KMS key,
 and S3 Bucket Key setting returned by the service. Encryption settings given
 with `--s3-header` or `--s3-write-header` override the selected fields:
@@ -107,9 +137,12 @@ creates a new version when bucket versioning is enabled. Object ACLs, Object Loc
 settings, and custom KMS encryption contexts are not preserved by this operation.
 
 New or changed uploads and bucket copies use the provider's storage and encryption
-defaults unless overridden with `--s3-write-header`. On AWS general-purpose buckets,
+defaults unless overridden with `--s3-write-header` or, for bucket copies, selecting
+`--copy-metadata=storage-class`. On AWS general-purpose buckets,
 these are STANDARD storage and the destination bucket's default encryption.
-Changes to source storage class or encryption alone do not trigger a copy.
+Changes to source encryption alone do not trigger a copy. Source storage class
+changes apply only when explicitly selected; copying a storage class can affect
+storage costs and require restoring an archived object first.
 
 Syq uses stored size/time, whole-file hashes, provider checksums, or ETags to
 identify matching contents. Otherwise, the default policy replaces the destination.

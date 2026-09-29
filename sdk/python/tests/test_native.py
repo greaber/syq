@@ -784,6 +784,13 @@ class NativeClientTests(unittest.TestCase):
         with self.assertRaises(syq.SyqInvocationError):
             self.client.cp(src="source", into="target", copy_metadata="-mtime")
 
+    def test_s3_metadata_selections(self) -> None:
+        attributes = ["content-type", "content-encoding", "content-language", "content-disposition",
+                      "cache-control", "expires", "website-redirect", "user-metadata", "tags", "storage-class"]
+        self.client.cp("source", from_="s3://source", to="s3://destination", as_="target", copy_metadata=attributes)
+        argv = self.argv()
+        self.assertEqual([argv[i + 1] for i, value in enumerate(argv) if value == "--copy-metadata"], attributes)
+
     def test_map_is_streaming_typed_and_context_managed(self) -> None:
         with self.client.map(
             srcs_in="source", root="source-root", follow_src=True, where="src.kind = 'file'"

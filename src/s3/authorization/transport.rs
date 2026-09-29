@@ -23,6 +23,25 @@ impl HttpConnector for Connector {
             let mut request = request
                 .try_into_http1x()
                 .map_err(|e| ConnectorError::other(e.into(), None))?;
+            // The SDK serializes tag XML and adds CRC32 only during send.
+            // Use the existing late Content-MD5 capability, so prepared tag
+            // writes can still run after the authorizer disconnects. Unlike an
+            // x-amz-* checksum, this header need not enter the signed header set.
+            if request.method() == "PUT"
+                && request.uri().query().is_some_and(|query| {
+                    url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name == "tagging")
+                })
+            {
+                let body = request
+                    .body()
+                    .bytes()
+                    .ok_or_else(|| failure("tag request body is not buffered"))?;
+                let md5 = crate::s3::checksum::Algorithm::Md5.digest(body);
+                request.headers_mut().remove("x-amz-checksum-crc32");
+                request
+                    .headers_mut()
+                    .insert("content-md5", http::HeaderValue::from_str(&md5).unwrap());
+            }
             let unsigned = describe(&mut request, &authorization)
                 .map_err(|e| ConnectorError::other(e.into(), None))?;
             let payload = unsigned
@@ -156,6 +175,17 @@ mod tests {
                 Some(self.expected.as_str())
             );
             assert!(request.headers().get("authorization").is_none());
+            if request.uri().contains("?tagging") {
+                assert!(request.headers().get("x-amz-checksum-crc32").is_none());
+                assert_eq!(
+                    request.headers().get("content-md5"),
+                    Some(
+                        crate::s3::checksum::Algorithm::Md5
+                            .digest(request.body().bytes().unwrap())
+                            .as_str()
+                    )
+                );
+            }
             HttpConnectorFuture::ready(Ok(
                 aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
                     200.try_into().unwrap(),
@@ -234,6 +264,64 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn delegated_tag_update_reuses_prepared_request_after_disconnect() {
+        use aws_sdk_s3::{
+            config::{Builder, Credentials, Region, RequestChecksumCalculation},
+            types::{Tag, Tagging},
+        };
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let authorization = Arc::new(Authorization::new(
+            "fixture".into(),
+            Configuration {
+                endpoint: "https://storage.example".into(),
+                region: "auto".into(),
+                expires_at: now().unwrap() + 60,
+                requested_lifetime: 60,
+            },
+            socket,
+        ));
+        let signed = "https://storage.example/fixture/key?tagging&X-Amz-Signature=fixture";
+        {
+            let mut state = authorization.state.lock().unwrap();
+            state.connection = None;
+            state.requests.insert(
+                Unsigned::new("PUT", "key").query("tagging", ""),
+                signed.into(),
+            );
+        }
+        let inner = http_client_fn(move |_, _| {
+            SharedHttpConnector::new(CheckPayload {
+                expected: "UNSIGNED-PAYLOAD".into(),
+                signed: signed.into(),
+            })
+        });
+        let client = aws_sdk_s3::Client::from_conf(
+            Builder::new()
+                .behavior_version_latest()
+                .region(Region::new("auto"))
+                .endpoint_url("https://storage.example")
+                .force_path_style(true)
+                .credentials_provider(Credentials::new("fixture", "fixture", None, None, "test"))
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                .http_client(http_client(inner, authorization))
+                .build(),
+        );
+        client
+            .put_object_tagging()
+            .bucket("fixture")
+            .key("key")
+            .tagging(
+                Tagging::builder()
+                    .tag_set(Tag::builder().key("tag").value("value").build().unwrap())
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
     }
 
     #[derive(Debug, Clone)]
