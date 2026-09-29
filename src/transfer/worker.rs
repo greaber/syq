@@ -928,7 +928,7 @@ impl Worker {
             // independently of the policy for reusing the final destination.
             if prepared.partial_size.is_some()
                 || (prepared.has_candidates
-                    && (!reuse_blocks || self.bandwidth_limited_pull())
+                    && !reuse_blocks
                     && (!self.opts.checksum || !final_is_file))
             {
                 if size == 0 {
@@ -951,8 +951,7 @@ impl Worker {
                 && !self.bandwidth_limited_pull()
                 && size > 0
             {
-                if !prepared.has_candidates
-                    && final_entry.is_some_and(|entry| entry.size == size)
+                if final_entry.is_some_and(|entry| entry.size == size)
                     && self.matches_final_windows(&job)?
                 {
                     self.finish_matched_basis(idx, &job)?;

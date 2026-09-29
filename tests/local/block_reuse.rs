@@ -582,30 +582,57 @@ fn pipeline_equality_probe_spans_windows_and_handles_late_difference() {
     }
 }
 
-#[cfg(debug_assertions)]
 #[test]
-fn resumable_candidates_skip_the_final_equality_probe() {
-    let t = Tmp::new();
-    let source = vec![b'a'; 8 << 20];
-    write(&t.path("src"), &source);
-    let mut final_contents = source.clone();
-    final_contents[7 << 20..].fill(b'z');
-    write(&t.path("dst"), &final_contents);
-    write(&t.path(".dst.syq-tmp.abcdefghijklmnop"), &source[..4 << 20]);
-    set_mtime(&t.path("dst"), 1);
-    let out = compat_command()
-        .args([
-            "-a",
-            "--no-progress",
-            "--performance-tuning=block-reuse=on,workers=1",
-            &t.s("src"),
-            &t.s("dst"),
-        ])
-        .env("SYQ_TEST_FAIL_HASH_BASIS", "1")
-        .run()
-        .unwrap();
-    assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst")), source);
+fn stale_partial_does_not_replace_an_identical_final_with_different_metadata() {
+    for capped_pull in [false, true] {
+        for donor_len in [5, 8 << 20] {
+            let t = Tmp::new();
+            let source = prng(8 << 20, 864);
+            write(&t.path("src"), &source);
+            write(&t.path("dst"), &source);
+            let donor = t.path(".dst.syq-tmp.abcdefghijklmnop");
+            write(&donor, &vec![b'z'; donor_len]);
+            let inode = fs::metadata(t.path("dst")).unwrap().ino();
+            let rsh = fake_rsh(&t);
+            // Leftover donors persist. Neither this run nor a subsequent
+            // metadata repair should rewrite an already matching final file.
+            for _ in 0..2 {
+                set_mtime(&t.path("dst"), 1);
+                let mut command = if capped_pull {
+                    remote_syq_command(
+                        &t,
+                        &rsh,
+                        &[
+                            "-a",
+                            "--rsync-path",
+                            env!("CARGO_BIN_EXE_syq"),
+                            "--syq-no-bootstrap",
+                            "--bwlimit=64M",
+                            "--performance-tuning=block-reuse=on",
+                            &format!("fake:{}", t.s("src")),
+                            &t.s("dst"),
+                        ],
+                    )
+                } else {
+                    let mut command = compat_command();
+                    command.args([
+                        "-a",
+                        "--no-progress",
+                        "--performance-tuning=block-reuse=on,workers=1",
+                        &t.s("src"),
+                        &t.s("dst"),
+                    ]);
+                    command
+                };
+                let out = command.env("SYQ_DEBUG", "1").run().unwrap();
+                assert_output_ok(&out);
+                assert_eq!(read(&t.path("dst")), source);
+                assert_eq!(fs::metadata(t.path("dst")).unwrap().ino(), inode);
+                assert_eq!(tuning_observed(&out)["range_requests"], 0);
+                assert_eq!(read(&donor), vec![b'z'; donor_len]);
+            }
+        }
+    }
 }
 
 #[test]

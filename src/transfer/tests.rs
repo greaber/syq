@@ -2190,7 +2190,7 @@ fn bandwidth_limited_pull_compares_before_pacing_only_differing_reads() {
                 partial_size: (basis == "owned-partial").then_some(1536),
                 has_candidates: basis.starts_with("candidate"),
             }));
-        if basis == "final" {
+        if matches!(basis, "final" | "candidate-with-final") {
             dst.lock().unwrap().replies.push_back(Response::HeldHashes {
                 hashes: vec![[1; 32], [2; 32], [9; 32]],
                 len: 1536,
@@ -2258,7 +2258,7 @@ fn bandwidth_limited_pull_compares_before_pacing_only_differing_reads() {
             .requests
             .iter()
             .any(|r| matches!(r, Request::StageBasis { .. } | Request::HashWindow { .. })));
-        if basis != "final" {
+        if !matches!(basis, "final" | "candidate-with-final") {
             assert!(destination.requests.iter().any(|r| matches!(r,
                 Request::SeedBasis { final_ranges: Some(ranges), .. } if ranges.is_empty()
             )));

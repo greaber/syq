@@ -655,11 +655,6 @@ impl FsOps {
                 previous_end = end;
             }
         }
-        #[cfg(debug_assertions)]
-        if stage_only && std::env::var_os("SYQ_TEST_FAIL_STAGE_BASIS").is_some() {
-            return Err(io::Error::from_raw_os_error(libc::ENOSPC))
-                .context("seed comparison basis");
-        }
         let target = self.destination_mutation_target(path, guard)?;
         let expected = target.location();
         // A previous failed job may have left a hold on this connection. It is
@@ -1635,33 +1630,31 @@ impl FsOps {
         }
         if final_basis {
             let location = target.location();
-            // Keep the donor only while this connection has unconsumed
-            // comparison bytes. A shared cache would pin replaced files even
-            // after another worker publishes their replacements.
-            let mut window = match self.comparison_window.take().filter(|window| {
-                window.location == location
-                    && window.copy_id == *partial.id
-                    && window.attempt == attempt
-            }) {
-                Some(window) => window,
-                None => {
-                    let Ok(file) = target.root.open_regular_read(&target.relative) else {
-                        return Ok(vec![
-                            self.hash_policy.algorithm.hash(&[]);
-                            u64::from(len).div_ceil(block) as usize
-                        ]);
-                    };
-                    let metadata = file.metadata()?;
-                    ComparisonWindow {
-                        file,
-                        location,
-                        copy_id: *partial.id,
-                        attempt,
-                        blocks: Vec::new(),
-                        sparse: metadata.blocks().saturating_mul(512) < metadata.len(),
-                    }
-                }
+            // Only the bytes need to survive this request. Keeping a donor
+            // descriptor in the window would pin replaced files after an error
+            // or cancellation, while the connection continues serving other work.
+            let Ok(file) = target.root.open_regular_read(&target.relative) else {
+                return Ok(vec![
+                    self.hash_policy.algorithm.hash(&[]);
+                    u64::from(len).div_ceil(block) as usize
+                ]);
             };
+            let metadata = file.metadata()?;
+            let mut window = self
+                .comparison_window
+                .take()
+                .filter(|window| {
+                    window.location == location
+                        && window.copy_id == *partial.id
+                        && window.attempt == attempt
+                })
+                .unwrap_or_else(|| ComparisonWindow {
+                    location,
+                    copy_id: *partial.id,
+                    attempt,
+                    blocks: Vec::new(),
+                    sparse: metadata.blocks().saturating_mul(512) < metadata.len(),
+                });
             let retained: u64 = window
                 .blocks
                 .iter()
@@ -1691,7 +1684,7 @@ impl FsOps {
                         .operation
                         .span(crate::transfer_observations::Stage::SourceRead);
                     while got < n {
-                        match window.file.read_at(&mut bytes[got..], pos + got as u64) {
+                        match file.read_at(&mut bytes[got..], pos + got as u64) {
                             Ok(0) => break,
                             Ok(n) => got += n,
                             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
