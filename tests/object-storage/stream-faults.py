@@ -22,7 +22,7 @@ SYQ = sys.argv[1]
 CASE = sys.argv[2]
 PART = 5 * 1024 * 1024
 DATA = bytes(range(256)) * (PART // 256) + b'last part\x00\xff'
-STATE = {'requests': 0, 'gets': {}, 'parts': {}, 'aborts': 0, 'completed': False}
+STATE = {'requests': 0, 'heads': 0, 'writes': 0, 'gets': {}, 'parts': {}, 'aborts': 0, 'completed': False}
 LOCK = threading.Lock()
 LATER = threading.Event()
 PART_UPLOADED = threading.Event()
@@ -51,7 +51,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         STATE['requests'] += 1
-        STATE['heads'] = STATE.get('heads', 0) + 1
+        STATE['heads'] += 1
         if CASE == 'existing-policy':
             status = STATE.get('head_status', 200 if STATE['existing'] is not None else 404)
             if status != 200:
@@ -106,7 +106,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.rfile.read(int(self.headers.get('Content-Length', '0')))
 
     def do_PUT(self):
-        STATE['writes'] = STATE.get('writes', 0) + 1
+        STATE['writes'] += 1
         data = self.body()
         if CASE == 'existing-policy' and self.headers.get('x-amz-copy-source'):
             assert self.headers['x-amz-copy-source-if-match'] == '"original"'
@@ -152,7 +152,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply(200, headers={'ETag': '"part"', 'x-amz-checksum-sha256': self.headers['x-amz-checksum-sha256']})
 
     def do_POST(self):
-        STATE['writes'] = STATE.get('writes', 0) + 1
+        STATE['writes'] += 1
         body = self.body()
         if CASE == 'existing-policy' and 'uploadId=metadata' in self.path:
             assert self.headers['If-Match'] == '"original"'
