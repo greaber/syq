@@ -49,6 +49,7 @@ impl Session {
             authorization.clone(),
         )
         .await?;
+        let content_md5 = super::checksum::plain_http(options.endpoint.as_deref());
         Ok(Self {
             client,
             authorization,
@@ -62,7 +63,7 @@ impl Session {
             options,
             cancellation,
             bandwidth: controls.bandwidth(),
-            content_md5: Default::default(),
+            content_md5: content_md5.into(),
         })
     }
     pub(crate) fn share_admission(&mut self, other: &Self) {

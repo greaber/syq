@@ -55,6 +55,8 @@ pub(super) fn serve_upload(
                         return;
                     }
                 }
+            } else if fault == "recovery-upload-plain-http" {
+                assert_eq!(headers["content-md5"], content_md5(&body));
             } else {
                 assert_unchecked_upload(headers);
             }
@@ -279,6 +281,22 @@ fn ordinary_multipart_upload_stores_whole_file_hash() {
         temp.path(),
         &["source", "--to", "s3://bucket", "--as", "object"],
     );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.0.load(Ordering::Relaxed));
+}
+
+#[test]
+fn plain_http_multipart_parts_send_content_md5() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let server = Server::start("recovery-upload-plain-http");
+    std::fs::write(temp.path().join("source"), vec![b'x'; SIZE]).unwrap();
+    let output = server
+        .command(temp.path())
+        .env_remove(TREAT_HTTP_AS_HTTPS)
+        .args(["--s3-endpoint", &server.address])
+        .args(["source", "--to", "s3://bucket", "--as", "object"])
+        .capture_output()
+        .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(server.gate.0.load(Ordering::Relaxed));
 }
