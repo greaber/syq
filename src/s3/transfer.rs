@@ -611,13 +611,12 @@ impl Engine {
             return Ok(());
         }
         let target = local::key_path(&self.args.locations.last().unwrap().path)?;
-        let exact = if target.is_empty() {
-            false
+        let exact_object = if target.is_empty() {
+            None
         } else {
-            client::head(&self.client, &self.options.bucket, &target)
-                .await?
-                .is_some()
+            client::head(&self.client, &self.options.bucket, &target).await?
         };
+        let exact = exact_object.is_some();
         let prefix = if target.is_empty() {
             String::new()
         } else {
@@ -629,10 +628,20 @@ impl Engine {
             || client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
         let scope = format!("s3-placement:{}", target);
         let owned = self.args.resume_job.as_ref().is_some_and(|job| {
-            job.object_original(scope.as_bytes()) == Some(None)
-                && job.has_created_objects_beneath(
-                    format!("s3\0{}\0", self.options.bucket).as_bytes(),
+            if self.args.placement == Placement::As && single_object == Some(true) {
+                let identity = exact_object
+                    .as_ref()
+                    .map(|object| super::jobs::identity(&object.etag, object.version.as_deref()));
+                job.owns_object(
+                    &super::jobs::key(&self.options.bucket, &target, None),
+                    identity.as_deref(),
                 )
+            } else {
+                job.object_original(scope.as_bytes()) == Some(None)
+                    && job.has_created_objects_beneath(
+                        format!("s3\0{}\0{}", self.options.bucket, prefix).as_bytes(),
+                    )
+            }
         });
         if (self.args.target_existence == Existence::New && present && !owned)
             || (self.args.target_existence == Existence::Existing && !present)
