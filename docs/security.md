@@ -324,6 +324,12 @@ it is not sandboxed or confined to a copy destination directory.
 [Storage authorization](object-storage.md#authorize-from-your-laptop) gives the
 server signed URLs for approved paths and operations. The secret access key
 stays on your laptop. Approval trusts the server to choose uploaded contents.
+Storage authorization rejects Object Lock headers, including retention periods
+and legal holds, and headers that bypass governance retention. Upload or removal
+approval does not grant control over those protections. Bucket-wide path scopes
+permit operations on the bucket's objects, not creating or deleting the bucket.
+Bucket-configured retention defaults still apply. These restrictions concern delegated signing;
+commands using your own storage credentials remain subject to provider permissions.
 Anyone with the URLs can reuse them until expiry; stopping receiving does not
 revoke them. Filesystem receiver roots, aggregate limits, one-use grants, and
 signed receipts do not apply.

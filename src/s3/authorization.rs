@@ -142,6 +142,12 @@ impl Request {
                 || request.query.contains_key("versions"),
             "storage request is outside the approved paths"
         );
+        // The empty key addresses the bucket itself, not an object. Bucket-wide
+        // object scopes still must not authorize creating or deleting buckets.
+        anyhow::ensure!(
+            !request.key.is_empty() || reading,
+            "storage authorization does not permit bucket mutations"
+        );
         for (name, value) in &request.headers {
             // SigV4 takes an explicit Host header in preference to the URL's
             // authority. Only the approved endpoint may supply that authority.
@@ -154,6 +160,12 @@ impl Request {
                     && http::HeaderName::from_bytes(name.as_bytes()).is_ok()
                     && http::HeaderValue::from_str(value).is_ok(),
                 "invalid storage signing header"
+            );
+            anyhow::ensure!(
+                !name.starts_with("x-amz-object-lock-")
+                    && !name.starts_with("x-amz-bucket-object-lock-")
+                    && name != "x-amz-bypass-governance-retention",
+                "storage authorization does not permit Object Lock or retention bypass headers"
             );
         }
         let query = &request.query;

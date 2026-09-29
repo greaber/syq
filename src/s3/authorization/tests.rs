@@ -64,6 +64,141 @@ fn old_request_shapes_do_not_acquire_storage_authority() {
     assert!(serde_json::from_value::<Request>(value).is_err());
 }
 #[test]
+fn released_upload_authorization_cannot_sign_object_lock_or_retention_bypass() {
+    // Keep the v0.7.1 JSON shapes literal: tightening signing policy must not
+    // change how existing approval/request fields are read.
+    let approval: Request = serde_json::from_str(
+        r#"{
+        "bucket":"fixture","endpoint":null,"region":null,"profile":null,
+        "scopes":[{"key":"allowed","descendants":true}],
+        "source":null,"removal":null,"acl":{},"upload":true,"delete":true,
+        "create_only":false,"lifetime":60
+    }"#,
+    )
+    .unwrap();
+    approval.validate().unwrap();
+    let upload: Unsigned = serde_json::from_str(
+        r#"{
+        "bucket":null,"method":"PUT","key":"allowed/file","query":{},"headers":{}
+    }"#,
+    )
+    .unwrap();
+    let mut signer = Signer {
+        request: approval,
+        configuration: Configuration {
+            endpoint: "https://storage.example".into(),
+            region: "auto".into(),
+            expires_at: now().unwrap() + 60,
+            requested_lifetime: 60,
+        },
+        credentials: aws_sdk_s3::config::Credentials::new(
+            "fixture-key",
+            "fixture-secret",
+            None,
+            None,
+            "test",
+        ),
+    };
+    for request in [
+        upload.clone(),
+        upload
+            .clone()
+            .header("x-amz-copy-source", "fixture/allowed/file"),
+        Unsigned::new("POST", "allowed/file").query("uploads", ""),
+        upload
+            .clone()
+            .query("uploadId", "id")
+            .query("partNumber", "1"),
+        Unsigned::new("POST", "allowed/file").query("uploadId", "id"),
+        Unsigned::new("DELETE", "allowed/file"),
+    ] {
+        signer.request.permits(&request).unwrap();
+        signer.sign(&request).unwrap();
+        for (name, value) in [
+            ("x-amz-object-lock-mode", "COMPLIANCE"),
+            (
+                "x-amz-object-lock-retain-until-date",
+                "2099-01-01T00:00:00Z",
+            ),
+            ("x-amz-object-lock-legal-hold", "ON"),
+            ("x-amz-object-lock-event-hold", "ON"),
+            ("x-amz-object-lock-event-hold-duration-days", "10"),
+            ("x-amz-object-lock-future-setting", "yes"),
+            ("x-amz-bypass-governance-retention", "true"),
+            ("x-amz-bucket-object-lock-enabled", "true"),
+            ("x-amz-bucket-object-lock-token", "1"),
+        ] {
+            let forbidden = request.clone().header(name, value);
+            assert!(signer.request.permits(&forbidden).is_err(), "{name}");
+            let error = signer.sign(&forbidden).unwrap_err().to_string();
+            assert!(
+                error.contains("Object Lock or retention bypass"),
+                "{name}: {error}"
+            );
+            // Forged wire requests cannot evade the lowercase-header check.
+            assert!(signer
+                .sign(&request.clone().header(&name.to_ascii_uppercase(), value))
+                .is_err());
+        }
+    }
+    // The subresource/query routes cannot be used instead of denied headers.
+    for query in [
+        "retention",
+        "legal-hold",
+        "object-lock",
+        "x-amz-object-lock-mode",
+    ] {
+        assert!(
+            signer.sign(&upload.clone().query(query, "")).is_err(),
+            "{query}"
+        );
+    }
+    signer
+        .sign(&upload.header("x-amz-meta-object-lock-note", "ordinary user metadata"))
+        .unwrap();
+    // Bucket-wide path approval must not turn object access into bucket control.
+    signer.request.scopes[0].key.clear();
+    for header in [
+        "x-amz-bucket-object-lock-enabled",
+        "x-amz-bucket-object-lock-token",
+    ] {
+        let bucket_lock = Unsigned::new("PUT", "").header(header, "true");
+        assert!(signer.request.permits(&bucket_lock).is_err());
+        assert!(signer.sign(&bucket_lock).is_err());
+    }
+    for request in [
+        Unsigned::new("HEAD", ""),
+        Unsigned::new("GET", ""),
+        Unsigned::new("GET", "")
+            .query("list-type", "2")
+            .query("prefix", "allowed/"),
+        Unsigned::new("PUT", "allowed/file"),
+    ] {
+        signer.sign(&request).unwrap();
+    }
+    for upload_allowed in [true, false] {
+        signer.request.upload = upload_allowed;
+        signer.request.removal = Some(Removal::Current);
+        signer.request.validate().unwrap();
+        // Object removal remains authorized, including for removal-only approval.
+        signer
+            .sign(&Unsigned::new("DELETE", "allowed/file"))
+            .unwrap();
+        for request in [
+            Unsigned::new("PUT", ""),
+            Unsigned::new("POST", ""),
+            Unsigned::new("POST", "").query("uploads", ""),
+            Unsigned::new("POST", "").query("uploadId", "id"),
+            Unsigned::new("DELETE", ""),
+        ] {
+            assert!(signer.request.permits(&request).is_err());
+            let error = signer.sign(&request).unwrap_err().to_string();
+            assert!(error.contains("bucket mutations"), "{request:?}: {error}");
+        }
+    }
+}
+
+#[test]
 fn paths_and_query_are_encoded_without_changing_key_scope() {
     let request = Unsigned::new("PUT", "allowed/a +?#雪")
         .query("uploadId", "a+/=")
