@@ -2004,13 +2004,23 @@ impl Engine {
                 && existing.is_some_and(|m| m.is_file() && m.len != job.size)
                 && !self.args.update
                 && !self.args.protects_existing_contents());
-        let mut initial_slot = None;
-        let initial = if needs_body
+        let mut get_first = needs_body
             && !self.args.dry_run
             && !job.key.ends_with('/')
             && selected == Some(true)
-            && permitted == Some(true)
-        {
+            && permitted == Some(true);
+        // The changed-size fast path must not fetch a saved first range again.
+        // Keep this state open for the normal identity and range checks below;
+        // an ordinary fresh transfer still opens and reads its record only once.
+        let recovery = if get_first && existing.is_some() && job.size > part_size {
+            let recovery = self.open_download_state(root, &job.key, &job.path)?;
+            get_first = recovery.1.is_none();
+            Some(recovery)
+        } else {
+            None
+        };
+        let mut initial_slot = None;
+        let initial = if get_first {
             initial_slot = Some(self.tuning.requests.acquire().await);
             Some(
                 self.client
@@ -2256,14 +2266,10 @@ impl Engine {
                 )
                 .await;
         }
-        let extra = format!(
-            "download:{}:{}:{}",
-            root.identity().dev,
-            root.identity().ino,
-            job.path
-        );
-        let state = State::open(&self.identity(&object.key, &extra))?;
-        let mut saved: Option<DownloadState> = state.load()?;
+        let (state, mut saved) = match recovery {
+            Some(recovery) => recovery,
+            None => self.open_download_state(root, &object.key, &job.path)?,
+        };
         if let Some(old) = &saved {
             if old.schema != 1 && old.schema != 2 {
                 bail!("unsupported S3 download recovery schema");
@@ -2537,6 +2543,21 @@ impl Engine {
         }
         .await;
         result
+    }
+    fn open_download_state(
+        &self,
+        root: &Root,
+        key: &str,
+        path: &str,
+    ) -> Result<(State, Option<DownloadState>)> {
+        let extra = format!(
+            "download:{}:{}:{path}",
+            root.identity().dev,
+            root.identity().ino,
+        );
+        let state = State::open(&self.identity(key, &extra))?;
+        let saved = state.load()?;
+        Ok((state, saved))
     }
     fn new_download_state(
         &self,
