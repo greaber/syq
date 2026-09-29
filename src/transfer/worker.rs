@@ -905,20 +905,6 @@ impl Worker {
                 None
             };
 
-            // Probe equality without creating a sidecar. A difference restarts
-            // the staged pipeline; equal prefixes need not survive that restart.
-            // Explicit checksums and protected/in-place checks stay separate.
-            if !inplace && reuse_blocks && final_is_file && !self.opts.checksum && size > 0 {
-                if final_entry.is_some_and(|entry| entry.size == size)
-                    && self.matches_final_windows(&job)?
-                {
-                    self.finish_matched_basis(idx, &job)?;
-                    return Ok((vec![], false));
-                }
-                self.stage_comparison(idx, &job, true)?;
-                return Ok((full(), true));
-            }
-
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
             // absent until the content comparison shows a difference.
@@ -947,6 +933,21 @@ impl Worker {
                 self.stage_comparison(idx, &job, false)?;
                 return Ok((full(), true));
             }
+            // Probe equality without creating a sidecar. A difference restarts
+            // the staged pipeline; equal prefixes need not survive that restart.
+            // Explicit checksums and protected/in-place checks stay separate.
+            if !inplace && reuse_blocks && final_is_file && !self.opts.checksum && size > 0 {
+                if !prepared.has_candidates
+                    && final_entry.is_some_and(|entry| entry.size == size)
+                    && self.matches_final_windows(&job)?
+                {
+                    self.finish_matched_basis(idx, &job)?;
+                    return Ok((vec![], false));
+                }
+                self.stage_comparison(idx, &job, true)?;
+                return Ok((full(), true));
+            }
+
             if !reuse_blocks {
                 // An explicit checksum may still establish a complete match.
                 // A differing final file contributes no blocks to the output.
@@ -1497,7 +1498,7 @@ impl Worker {
         };
         // Two windows may retain destination bytes. Bound their combined size.
         let window = block
-            .saturating_mul(hash_depth as u64)
+            .saturating_mul(read_depth.max(hash_depth) as u64)
             .min(crate::proto::MAX_READ_BYTES / 2)
             .max(block);
         let prefetch =

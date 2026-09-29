@@ -428,7 +428,10 @@ impl FsOps {
                 )
             })?;
         let Some((file, basis_size)) = opened else {
-            return Ok(Preparation::default());
+            return Ok(Preparation {
+                partial_size: None,
+                has_candidates: !self.candidate_partials(&target).is_empty(),
+            });
         };
         if let Some(old_size) = basis_size {
             if old_size > size {
@@ -533,11 +536,13 @@ impl FsOps {
             file,
         });
         #[cfg(debug_assertions)]
-        test_race_barrier(
-            "SYQ_TEST_BASIS_READY_FILE",
-            "SYQ_TEST_BASIS_CONTINUE_FILE",
-            "basis-ready",
-        )?;
+        if off == 0 {
+            test_race_barrier(
+                "SYQ_TEST_BASIS_READY_FILE",
+                "SYQ_TEST_BASIS_CONTINUE_FILE",
+                "basis-ready",
+            )?;
+        }
         // Hashing is intentionally limited to the source length. Report the
         // retained inode's length afterward so a file that grew since the
         // planner's stat cannot be mistaken for an exact content match.
@@ -756,7 +761,15 @@ impl FsOps {
                         self.preallocate_new_partial(&output, len)?;
                     }
                 } else {
-                    super::basis_copy::seed(input, &output, len)?;
+                    let donor = input.metadata()?;
+                    super::basis_copy::seed(input, &output, len, || {
+                        // Preserve sparse extents and successful clones. Dense
+                        // donors still reserve capacity before copying begins.
+                        if donor.blocks().saturating_mul(512) >= donor.len() {
+                            self.preallocate_new_partial(&output, len)?;
+                        }
+                        Ok(())
+                    })?;
                 }
             }
             #[cfg(debug_assertions)]
@@ -1622,36 +1635,33 @@ impl FsOps {
         }
         if final_basis {
             let location = target.location();
-            let file = if let Some(file) = self.cached_clone(location.clone(), attempt, false)? {
-                file
-            } else {
-                let Ok(file) = target.root.open_regular_read(&target.relative) else {
-                    // The old destination is only an optional basis. If it
-                    // disappears, force every block in this window from source.
-                    return Ok(vec![
-                        self.hash_policy.algorithm.hash(&[]);
-                        u64::from(len).div_ceil(block) as usize
-                    ]);
-                };
-                self.cache_file(location.clone(), attempt, false, file.try_clone()?);
-                file
+            // Keep the donor only while this connection has unconsumed
+            // comparison bytes. A shared cache would pin replaced files even
+            // after another worker publishes their replacements.
+            let mut window = match self.comparison_window.take().filter(|window| {
+                window.location == location
+                    && window.copy_id == *partial.id
+                    && window.attempt == attempt
+            }) {
+                Some(window) => window,
+                None => {
+                    let Ok(file) = target.root.open_regular_read(&target.relative) else {
+                        return Ok(vec![
+                            self.hash_policy.algorithm.hash(&[]);
+                            u64::from(len).div_ceil(block) as usize
+                        ]);
+                    };
+                    let metadata = file.metadata()?;
+                    ComparisonWindow {
+                        file,
+                        location,
+                        copy_id: *partial.id,
+                        attempt,
+                        blocks: Vec::new(),
+                        sparse: metadata.blocks().saturating_mul(512) < metadata.len(),
+                    }
+                }
             };
-            let metadata = file.metadata()?;
-            let mut window = self
-                .comparison_window
-                .take()
-                .filter(|window| {
-                    window.location == location
-                        && window.copy_id == *partial.id
-                        && window.attempt == attempt
-                })
-                .unwrap_or_else(|| ComparisonWindow {
-                    location,
-                    copy_id: *partial.id,
-                    attempt,
-                    blocks: Vec::new(),
-                    sparse: metadata.blocks().saturating_mul(512) < metadata.len(),
-                });
             let retained: u64 = window
                 .blocks
                 .iter()
@@ -1681,7 +1691,7 @@ impl FsOps {
                         .operation
                         .span(crate::transfer_observations::Stage::SourceRead);
                     while got < n {
-                        match file.read_at(&mut bytes[got..], pos + got as u64) {
+                        match window.file.read_at(&mut bytes[got..], pos + got as u64) {
                             Ok(0) => break,
                             Ok(n) => got += n,
                             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1702,7 +1712,7 @@ impl FsOps {
                 }
                 pos += n as u64;
             }
-            self.comparison_window = Some(window);
+            self.comparison_window = (!window.blocks.is_empty()).then_some(window);
             return Ok(hashes);
         }
 
@@ -1909,6 +1919,13 @@ impl FsOps {
                 && window.attempt == attempt
         }) {
             window.blocks.retain(|(pos, _)| *pos != off);
+        }
+        if self
+            .comparison_window
+            .as_ref()
+            .is_some_and(|window| window.blocks.is_empty())
+        {
+            self.comparison_window = None;
         }
         let mut write = |relative: &RelativePath, label: &Path| {
             let file = self.cached_rooted(label, &rooted.root, relative, attempt, !inplace)?;

@@ -581,3 +581,29 @@ fn pipeline_equality_probe_spans_windows_and_handles_late_difference() {
         assert!(partial_files(&t.0).is_empty());
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn resumable_candidates_skip_the_final_equality_probe() {
+    let t = Tmp::new();
+    let source = vec![b'a'; 8 << 20];
+    write(&t.path("src"), &source);
+    let mut final_contents = source.clone();
+    final_contents[7 << 20..].fill(b'z');
+    write(&t.path("dst"), &final_contents);
+    write(&t.path(".dst.syq-tmp.abcdefghijklmnop"), &source[..4 << 20]);
+    set_mtime(&t.path("dst"), 1);
+    let out = compat_command()
+        .args([
+            "-a",
+            "--no-progress",
+            "--performance-tuning=block-reuse=on,workers=1",
+            &t.s("src"),
+            &t.s("dst"),
+        ])
+        .env("SYQ_TEST_FAIL_HASH_BASIS", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), source);
+}

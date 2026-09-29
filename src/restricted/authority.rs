@@ -2478,10 +2478,13 @@ impl RestrictedAuthority {
                     self.copy.policy.publication == PublicationPolicy::AtomicStaged,
                     "in-place signed receiver forbids staged block reuse"
                 );
+                self.check_mutation_path(path, false)?;
                 let declared = self.declared_size(path, *copy_id)?;
                 anyhow::ensure!(
-                    off.checked_add(u64::from(*len))
-                        .is_some_and(|end| end <= declared),
+                    *len > 0
+                        && off
+                            .checked_add(u64::from(*len))
+                            .is_some_and(|end| end <= declared),
                     "reused block extends past declared file size"
                 );
                 outcomes.push(PendingOutcome::FileStage {

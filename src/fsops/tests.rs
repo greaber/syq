@@ -5554,3 +5554,82 @@ fn equality_windows_keep_the_same_destination_inode() {
         assert!(format!("{response:?}").contains("invalid hash interval"));
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn comparison_workers_release_donor_descriptors_before_publication() {
+    use std::os::unix::fs::MetadataExt;
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("file");
+    fs::write(&path, b"abcdefgh").unwrap();
+    let old = fs::metadata(&path).unwrap();
+    let id = [103; 16];
+    let mut creator = destination_ops(tree.path());
+    assert!(matches!(
+        creator.handle(&Request::StageBasis {
+            path: path_bytes(&path),
+            copy_id: id,
+            len: 8,
+            block: MIN_HASH_BLOCK_BYTES,
+            allow_final: false,
+            attempt: 0,
+            guard: None,
+        }),
+        Response::BasisStaged { .. }
+    ));
+    let mut workers = [destination_ops(tree.path()), destination_ops(tree.path())];
+    for (index, ops) in workers.iter_mut().enumerate() {
+        let off = index as u64 * 4;
+        assert!(matches!(
+            ops.handle(&Request::HashWindow {
+                final_basis: true,
+                path: path_bytes(&path),
+                copy_id: id,
+                off,
+                len: 4,
+                block: 4,
+                attempt: 0,
+                guard: None,
+            }),
+            Response::Hashes(_)
+        ));
+        let request = if index == 0 {
+            Request::ReuseComparedRange {
+                path: path_bytes(&path),
+                copy_id: id,
+                attempt: 0,
+                off,
+                len: 4,
+                guard: None,
+            }
+        } else {
+            Request::WriteRange {
+                path: path_bytes(&path),
+                inplace: false,
+                copy_id: id,
+                attempt: 0,
+                off,
+                hash: ops.hash_policy.payload_algorithm().hash(b"WXYZ"),
+                data: b"WXYZ".to_vec().into(),
+                guard: None,
+            }
+        };
+        assert!(matches!(ops.handle(&request), Response::Ok));
+        assert!(ops.comparison_window.is_none());
+    }
+    let partial = creator.partial_path(Path::new("file"), &id).unwrap();
+    fs::rename(tree.path().join(partial), &path).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"abcdWXYZ");
+    // Keep all sessions alive while checking every descriptor, including those
+    // owned by workers which never execute Finalize.
+    for entry in fs::read_dir("/proc/self/fd").unwrap().flatten() {
+        if let Ok(meta) = fs::metadata(entry.path()) {
+            assert_ne!(
+                (meta.dev(), meta.ino()),
+                (old.dev(), old.ino()),
+                "donor still open: {:?}",
+                entry.path()
+            );
+        }
+    }
+}

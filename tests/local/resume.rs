@@ -898,7 +898,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
 
     let mut first = compat_command()
         .args([
-            "-ac",
+            "-a",
             "--performance-tuning",
             "workers=1,block-reuse=on",
             "--resource-limits",
@@ -918,7 +918,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     );
 
     let second = syq(&[
-        "-ac",
+        "-a",
         "--performance-tuning",
         "workers=1,block-reuse=on",
         "--resource-limits",
@@ -950,7 +950,7 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
 
     let mut child = compat_command()
         .args([
-            "-ac",
+            "-a",
             "--performance-tuning",
             "workers=1,block-reuse=on",
             "--resource-limits",
@@ -997,7 +997,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
 
     let mut first = compat_command()
         .args([
-            "-ac",
+            "-a",
             "--performance-tuning",
             "workers=1,block-reuse=on",
             "--resource-limits",
@@ -1017,7 +1017,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     );
 
     let second = syq(&[
-        "-ac",
+        "-a",
         "--performance-tuning",
         "workers=1,block-reuse=on",
         "--resource-limits",
@@ -2005,7 +2005,7 @@ fn partial_candidates_do_not_disable_local_whole_file_copies() {
 
 #[cfg(all(target_os = "linux", debug_assertions))]
 #[test]
-fn staging_failure_preserves_final_and_donor() {
+fn seeding_preallocates_before_copying_donor_bytes() {
     for existing in [false, true] {
         let t = Tmp::new();
         write(&t.path("src"), &vec![b'a'; 5 << 20]);
@@ -2015,19 +2015,20 @@ fn staging_failure_preserves_final_and_donor() {
         write(&t.path(".out.syq-tmp.abcdefghijklmnop"), b"donor");
         let out = compat_command()
             .args([
-                "-ac",
+                "-a",
                 "--resource-limits",
                 "bandwidth=1G",
                 "--no-progress",
                 &t.s("src"),
                 &t.s("out"),
             ])
-            .env("SYQ_TEST_FAIL_STAGE_BASIS", "1")
+            .env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1")
+            .env("SYQ_TEST_FALLOCATE_ERRNO", "no_space")
             .run()
             .unwrap();
         assert!(!out.status.success());
         assert!(
-            stderr_of(&out).contains("seed comparison basis"),
+            stderr_of(&out).contains("preallocate destination file"),
             "{}",
             stderr_of(&out)
         );

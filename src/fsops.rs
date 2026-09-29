@@ -462,6 +462,7 @@ pub struct FsOps {
 }
 
 struct ComparisonWindow {
+    file: File,
     location: FileLocation,
     copy_id: CopyId,
     attempt: u32,

@@ -2094,3 +2094,56 @@ fn local_copy_progress_is_live_but_failure_retracts_completion_credit() {
         );
     }
 }
+
+#[test]
+fn comparing_pull_pipelines_remote_reads_with_a_synchronous_destination() {
+    for final_basis in [false, true] {
+        for depth in [1, 4] {
+            let (sched, handle, job) = pipeline_ranges(&[(0, 8192)]);
+            {
+                let mut jobs = sched.jobs.lock().unwrap();
+                jobs[0].compare_ranges = true;
+                jobs[0].compare_final = final_basis;
+            }
+            let src = Arc::new(Mutex::new(PipelineState {
+                latency: Some(std::time::Duration::from_millis(20)),
+                ..Default::default()
+            }));
+            let dst = Arc::new(Mutex::new(PipelineState {
+                synchronous: true,
+                ..Default::default()
+            }));
+            for window in (0..16).step_by(depth) {
+                dst.lock()
+                    .unwrap()
+                    .replies
+                    .push_back(Response::Hashes(vec![[0; 32]; depth]));
+                for index in window..window + depth {
+                    let off = index as u64 * 512;
+                    let data = vec![1; 512];
+                    src.lock().unwrap().replies.push_back(Response::Block {
+                        off,
+                        hash: content_digest(&data),
+                        data,
+                    });
+                    dst.lock().unwrap().replies.push_back(Response::Ok);
+                }
+            }
+            let mut worker = pipeline_worker(&sched, &src, &dst, false);
+            let opts = Arc::get_mut(&mut worker.opts).unwrap();
+            opts.dst_remote = false;
+            opts.tuning.pipeline_depth = Some(depth);
+            let start = std::time::Instant::now();
+            let mut credited = 0;
+            worker.transfer_range(&handle, &mut credited).unwrap();
+            eprintln!(
+                "compare pull: final={final_basis} depth={depth} RTT=20ms elapsed={:?}",
+                start.elapsed()
+            );
+            assert_eq!(src.lock().unwrap().max_pending, depth);
+            assert_eq!(credited, 8192);
+            assert_eq!(job.done.load(Relaxed), 8192);
+            assert_eq!(src.lock().unwrap().received, 16);
+        }
+    }
+}

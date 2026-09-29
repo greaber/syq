@@ -193,18 +193,17 @@ hashes, payload checks and publication-recovery checks stay in effect. Partial-f
 in every mode: matching bytes from interrupted copies can still be reused,
 even with `off`. The setting controls reuse of the final destination, not partials.
 
-For staged updates with block reuse enabled, syq first compares equal-length
-files in bounded windows. If all bytes match, it applies metadata without
-replacing the file. On the first difference, it restarts comparison and copying
-through a private output; the already compared prefix is read again. Files with
-different lengths skip this preliminary comparison.
+With block reuse enabled, files with identical contents can finish without
+rewriting data even when their metadata differs. A difference near the end can
+add almost a full extra read of both files before copying. Resumable partials
+take precedence over comparing the completed destination.
 
-For that private output, syq prefers a reflink of the old destination. When
-cloning is unavailable, it retains a bounded window of destination bytes while
-comparing them, then writes matching retained bytes or different source bytes.
-This copying pass reads each source block once; retained destination bytes are
-never reread after comparison. Without cloning, it needs buffers for both sides
-of the current window. Explicit whole-file checks can require additional reads.
+Changed files still use atomic replacement unless `--inplace` is selected.
+Reflinks can reduce replacement writes on supporting filesystems; otherwise the
+replacement must include every byte, including matching blocks. Comparison can
+use up to 64 MiB of destination buffers per worker (up to 32 MiB at default
+request settings), in addition to source payload buffers. Increasing the worker
+count increases this memory cost.
 
 This setting does not select a sequential writer. To isolate comparison and
 reuse costs while keeping range transfers, compare
