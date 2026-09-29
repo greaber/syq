@@ -50,6 +50,10 @@ pub(super) fn bytes(
     }
 }
 
+pub(super) fn uses_parallel_readers(size: u64, part_size: u64) -> bool {
+    size >= 32 * 1024 * 1024 && size > part_size
+}
+
 // Keep the small-file path to one read for every algorithm. Large files retain
 // independent parallel native part hashing. BLAKE3 can reuse that read when each
 // part starts at a BLAKE3 chunk boundary; other whole hashes share one additional read.
@@ -70,7 +74,7 @@ where
     let tree = size > part_size
         && part_size.is_multiple_of(blake3::CHUNK_LEN as u64)
         && (whole == HashAlgorithm::Blake3 || comparison == Some(HashAlgorithm::Blake3));
-    let parallel = size >= 32 * 1024 * 1024 && size > part_size;
+    let parallel = uses_parallel_readers(size, part_size);
     let reusable = |algorithm| {
         (size <= part_size && algorithm == native)
             || (parallel && tree && algorithm == HashAlgorithm::Blake3)
