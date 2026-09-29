@@ -470,7 +470,12 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
             bail!("S3 destination is a prefix, not an object");
         }
     }
-    if container && !policy && (reject_existing || plan.controls.metadata.skip_newer) {
+    // A successfully checked new container has no children. Conditional
+    // publication protects against a child appearing after that inspection.
+    if container
+        && !policy
+        && (plan.controls.metadata.skip_newer || (reject_existing && existence != Existence::New))
+    {
         let head = client::head_output(client, &plan.options.bucket, &plan.key, None).await;
         final_head = if plan.controls.metadata.skip_newer {
             head?
@@ -501,12 +506,6 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn digest(algorithm: Algorithm, data: &[u8]) -> String {
-    let mut hash = algorithm.hasher();
-    hash.update(data);
-    hash.finish()
 }
 
 fn upload_metadata(plan: &Plan<'_>) -> Option<std::collections::HashMap<String, String>> {
@@ -581,7 +580,7 @@ async fn upload(
         }
         plan.session.pace(length).await;
         crate::descriptor_copy::fd::await_commit(commit).await?;
-        let hash = digest(algorithm, &first.bytes);
+        let hash = algorithm.digest(&first.bytes);
         let _request = plan.session.requests.acquire().await?;
         let published = client
             .put_object()
@@ -921,7 +920,7 @@ async fn upload_part(
     let controls = plan.controls;
     let length = data.bytes.len() as u64;
     plan.session.pace(length).await;
-    let hash = digest(algorithm, &data.bytes);
+    let hash = algorithm.digest(&data.bytes);
     let _request = plan.session.requests.acquire().await?;
     let output = client
         .upload_part()

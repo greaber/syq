@@ -52,6 +52,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         STATE['requests'] += 1
         STATE['heads'] += 1
+        STATE.setdefault('head_paths', []).append(self.path)
         if CASE == 'existing-policy':
             status = STATE.get('head_status', 200 if STATE['existing'] is not None else 404)
             if status != 200:
@@ -73,6 +74,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         STATE['requests'] += 1
         if CASE == 'existing-policy':
             if 'list-type=2' in self.path:
+                STATE['lists'] = STATE.get('lists', 0) + 1
                 self.reply(200, b'<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>')
             else:
                 STATE['reads'] = STATE.get('reads', 0) + 1
@@ -260,10 +262,13 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 # and performs neither data requests nor multipart preparation.
                 source = Path(temp) / 'unread-source'
                 source.write_bytes(payload)
-                for placement in ([], ['--only-existing'], ['--copy-metadata=mtime']):
+                cases = [(put, flags) for flags in ([], ['--only-existing'], ['--copy-metadata=mtime'], ['--dry-run'])]
+                placed = base + ['--to', 's3://bucket', '--as-existing', 'object']
+                cases.extend((placed, flags) for flags in ([], ['--dry-run']))
+                for command, flags in cases:
                     before = (STATE.get('reads', 0), STATE.get('writes', 0), STATE['heads'])
                     with source.open('rb') as stream:
-                        response = run(put + ['--if-exists=error', *placement], stdin=stream, env=env)
+                        response = run(command + ['--if-exists=error', *flags], stdin=stream, env=env)
                         failure(response)
                         assert stream.tell() == 0, 'rejected stream input was consumed'
                     assert b'--if-exists=error' in response.stderr, response.stderr
@@ -289,6 +294,34 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                     failure(response)
                     assert b'destination already exists' in response.stderr
                     assert STATE['published'] is None, 'conditional publication lost race protection'
+            # New-container inspection already establishes child absence.
+            # Do not HEAD that child again, but retain conditional publication
+            # if an object appears after the empty-prefix observation.
+            into_new = base + ['--src', str(fifo), '--to', 's3://bucket', '--into-new', 'new-container', '--if-exists=error']
+            STATE.update(existing=None, head_status=404, head_paths=[], lists=0)
+            before = STATE['writes']
+            success(run(into_new + ['--dry-run'], env=env))
+            assert STATE['head_paths'] == ['/bucket/new-container']
+            assert STATE['lists'] == 1 and STATE['writes'] == before
+            for payload in (b'new object', DATA):
+                source = Path(temp) / 'container-source'
+                source.write_bytes(payload)
+                for existing in (None, b'late object'):
+                    STATE.update(existing=existing, head_status=404, head_paths=[], lists=0, parts={}, published=None)
+                    writer = subprocess.Popen([sys.executable, '-c',
+                        'import sys; open(sys.argv[1], "wb").write(open(sys.argv[2], "rb").read())',
+                        str(fifo), str(source)], start_new_session=True)
+                    CHILDREN.append(writer)
+                    response = run(into_new, env=env)
+                    assert writer.wait(timeout=5) == 0
+                    assert STATE['head_paths'] == ['/bucket/new-container']
+                    assert STATE['lists'] == 1
+                    if existing is None:
+                        success(response)
+                        assert STATE['published'] == payload
+                    else:
+                        failure(response)
+                        assert STATE['published'] is None, 'new container lost conditional race protection'
             del STATE['head_status']
             for payload in (b'stored', DATA):
                 STATE.update(existing=payload, metadata={
