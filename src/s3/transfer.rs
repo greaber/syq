@@ -1994,12 +1994,18 @@ impl Engine {
         if permitted == Some(false) {
             return Ok(None);
         }
-        // A fresh file obtains metadata with its first data request. For a
-        // multipart download, receiving these headers is enough to start the
-        // other ranges; the first body is consumed alongside them.
-        // Existing files still use HEAD so an unchanged object is not fetched.
+        // A fresh file, or an ordinary update with a different listed size,
+        // needs the body anyway. Obtain metadata with its first data request.
+        // Keep HEAD when metadata could still reject the copy or prove equality.
+        // For multipart downloads these headers let the other ranges start
+        // while the first body is consumed alongside them.
+        let needs_body = existing.is_none()
+            || (job.source_object.is_none()
+                && existing.is_some_and(|m| m.is_file() && m.len != job.size)
+                && !self.args.update
+                && !self.args.protects_existing_contents());
         let mut initial_slot = None;
-        let initial = if existing.is_none()
+        let initial = if needs_body
             && !self.args.dry_run
             && !job.key.ends_with('/')
             && selected == Some(true)

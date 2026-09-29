@@ -1678,7 +1678,9 @@ fn serve(
         reply(&mut socket, 404, &[], b"", false);
         return;
     }
-    let size = if fault.starts_with("single") || fault.starts_with("prefix-") {
+    let size = if fault.starts_with("single")
+        || (fault.starts_with("prefix-") && fault != "prefix-multipart")
+    {
         65536
     } else {
         SIZE
@@ -1741,6 +1743,10 @@ fn serve(
                 }
             }
             assert!(gate.1.load(Ordering::Acquire), "LIST did not overlap HEAD");
+            if fault == "prefix-multipart" {
+                // Reuse the gate for range overlap only after discovery finishes.
+                gate.1.store(false, Ordering::Release);
+            }
             if fault != "prefix-collision" {
                 reply(&mut socket, 404, &[], b"", false);
                 return;
@@ -1763,7 +1769,10 @@ fn serve(
             return;
         } else {
             assert_eq!(path, "/bucket/data/file");
-            assert_eq!(fault, "prefix-ok", "copied before validating discovery");
+            assert!(
+                matches!(fault, "prefix-ok" | "prefix-multipart"),
+                "copied before validating discovery"
+            );
         }
     }
     if method == "HEAD" {
@@ -1827,7 +1836,7 @@ fn serve(
         fields[0].1 = "\"different\"".into();
     }
     let mut body = data[start..=end].to_vec();
-    if fault == "initial-range-overlap" {
+    if matches!(fault, "initial-range-overlap" | "prefix-multipart") {
         if start == 0 {
             let mut head = format!(
                 "HTTP/1.1 206 Fixture\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -2144,6 +2153,32 @@ fn s3_first_range_supplies_metadata_without_serializing_the_remaining_ranges() {
     );
     // One selector HEAD, two range GETs, and the final identity HEAD.
     assert_eq!(server.requests.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn s3_changed_size_prefix_download_starts_ranges_without_an_object_head() {
+    let server = Server::start("prefix-multipart");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    std::fs::write(temp.path().join("download/file"), b"original").unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://bucket",
+            "--srcs-in",
+            "data",
+            "--into",
+            "download",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    // Prefix validation HEAD + LIST, two concurrent range GETs, final identity HEAD.
+    assert_eq!(server.requests.load(Ordering::Relaxed), 5);
 }
 
 #[test]
