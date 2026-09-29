@@ -798,6 +798,86 @@ fn initial_envelope_deadline_is_not_extended_by_partial_bytes() {
 }
 
 #[test]
+fn named_workers_refuse_mutations_before_transport_shutdown() {
+    for tcp in [false, true] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+        let mut args = args(Path::new("source"), ".");
+        args.compress = false;
+        let (request, _) = request(&args);
+        let approved = approve(&registration, request);
+        let authority = receiver.sessions.lock().unwrap()[&approved.token]
+            .authority
+            .clone();
+        let mut spec = crate::conn::RemoteSpec::local_receiver(true);
+        spec.restricted_grant = Some(route(registration, approved.token));
+        let mut control = spec.connect_with(false, false).unwrap();
+        if tcp {
+            let pending = spec
+                .begin_tcp_setup(&mut control, false, (47600, 47699), None)
+                .unwrap();
+            spec.finish_tcp_setup(pending).unwrap();
+        }
+        let mut worker = crate::conn::Endpoint::Remote(spec.clone())
+            .connect_with_copy_capabilities(false, None, Vec::new(), false)
+            .unwrap();
+        assert_eq!(worker.transport_stats().is_some(), tcp);
+        let (finished, observed) = mpsc::channel();
+        let task = std::thread::spawn(move || {
+            let mkdir = |name: &str| Request::Apply {
+                ops: vec![crate::proto::Op::Mkdir {
+                    path: root.join(name).as_os_str().as_bytes().to_vec(),
+                    mode: 0o700,
+                    condition: crate::proto::TargetCondition::Absent,
+                }],
+                guard: None,
+            };
+            assert!(matches!(
+                worker.call(mkdir("source")).unwrap(),
+                Response::Applied(results) if results.len() == 1 && results[0].is_none()
+            ));
+            assert!(root.join("source").is_dir());
+
+            // Hold both transports open while closing only admission. This
+            // forces the interval before the TCP watcher can deliver EOF,
+            // without a scheduling delay or a hook in production code.
+            authority.close_control();
+            for (connection, name) in [
+                (&mut *worker as &mut dyn Conn, "source/worker-blocked"),
+                (&mut control as &mut dyn Conn, "source/control-blocked"),
+            ] {
+                let response = connection.call(mkdir(name)).unwrap();
+                assert!(
+                    matches!(response, Response::Err(ref error)
+                        if error.contains("transfer control is closed or expired")),
+                    "revoked mutation was not refused: {response:?}"
+                );
+                assert!(!root.join(name).exists());
+            }
+            // The token and session still exist and the allowance has room:
+            // closed authority itself must refuse new workers on both routes.
+            let grant = spec.restricted_grant.as_deref().unwrap();
+            let error = connect(grant, false).unwrap_err();
+            assert!(format!("{error:#}").contains("control is closed or expired"));
+            if tcp {
+                let error = tcp::open(grant, vec![7; 32]).unwrap_err();
+                assert!(format!("{error:#}").contains("control is closed or expired"));
+            }
+            assert_eq!(fs::read_dir(root.join("source")).unwrap().count(), 0);
+            drop(control);
+            assert!(worker.recv().is_err(), "revoked worker did not close");
+            finished.send(()).unwrap();
+        });
+        let result = observed.recv_timeout(Duration::from_secs(3));
+        // Release the sockets even when an assertion fails or a reply stalls.
+        receiver.revoke_all();
+        task.join().unwrap();
+        result.expect("revocation checks did not finish");
+    }
+}
+
+#[test]
 fn named_tcp_workers_obey_limits_and_revocation() {
     for stop_profile in [false, true] {
         let temp = crate::test_support::tempdir().unwrap();
