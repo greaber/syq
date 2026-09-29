@@ -41,33 +41,6 @@ fn parse_with(command: &[Vec<u8>], sources: crate::cli::SourceProbe) -> Result<c
     Ok(args)
 }
 
-/// Whether `lines` consists of the command's inline ignore patterns in order,
-/// with any lines at the places where it reads ignore files.
-fn follows_ignore_template(template: &[Option<&str>], lines: &[String]) -> bool {
-    // reachable[j]: the template items so far can end just before line j.
-    let mut reachable = vec![false; lines.len() + 1];
-    reachable[0] = true;
-    for item in template {
-        let mut next = vec![false; lines.len() + 1];
-        match item {
-            Some(pattern) => {
-                for (j, line) in lines.iter().enumerate() {
-                    next[j + 1] = reachable[j] && line == pattern;
-                }
-            }
-            None => {
-                let mut earlier = false;
-                for j in 0..=lines.len() {
-                    earlier |= reachable[j];
-                    next[j] = earlier;
-                }
-            }
-        }
-        reachable = next;
-    }
-    reachable[lines.len()]
-}
-
 fn ensure_same<T: serde::Serialize>(requested: &T, derived: &T) -> Result<()> {
     anyhow::ensure!(
         serde_json::to_value(requested)? == serde_json::to_value(derived)?,
@@ -103,16 +76,12 @@ pub(crate) fn check_copy(
     }
     let mut derived =
         crate::restricted::named_request(&args, request.constraints.receipt_policy.clone())?;
-    // The server reads these files; this machine cannot. A mapping only limits
-    // the destination paths. Ignore file lines take their places among the
-    // command's own patterns, which must all be present in order.
+    // The server supplies ignore rules and mapping file contents; this machine
+    // does not check them. The receiver uses them only to refuse operations
+    // within the checked scopes, policy, and limits, so they only narrow a copy.
     if args.native_mapping.is_some() {
         derived.constraints.mapping = request.constraints.mapping.clone();
     }
-    anyhow::ensure!(
-        follows_ignore_template(&args.ignore_template(), &request.constraints.filters.ignore),
-        "the request's ignore rules do not match the command that produced it"
-    );
     derived.constraints.filters.ignore = request.constraints.filters.ignore.clone();
     ensure_same(request, &derived)
 }
@@ -219,8 +188,8 @@ fn secret_header(header: &[u8]) -> bool {
     name.ends_with(b"server-side-encryption-customer-key")
 }
 
-/// Join displayed arguments, styling the values of options whose files are read
-/// on the server: this machine cannot see or check their contents. With a
+/// Join displayed arguments, styling the values of options this machine does not
+/// check: ignore rules and mapping files, which only narrow a copy. With a
 /// `limit`, keep about that many characters, so a long command cannot push the
 /// rest of a prompt out of view.
 pub(crate) fn render(
@@ -229,7 +198,7 @@ pub(crate) fn render(
     plain: impl Fn(&str) -> String,
     server_input: impl Fn(&str) -> String,
 ) -> String {
-    const OPTIONS: [&str; 2] = ["--mapping", "--ignore-from"];
+    const OPTIONS: [&str; 3] = ["--mapping", "--ignore", "--ignore-from"];
     let mut words = Vec::with_capacity(display.len());
     let mut value = false;
     let mut length = 0;

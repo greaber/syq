@@ -613,18 +613,6 @@ impl Args {
         }
     }
 
-    /// Ignore inputs in command order: inline patterns, and `None` for each
-    /// file whose lines are read in its place.
-    pub(crate) fn ignore_template(&self) -> Vec<Option<&str>> {
-        self.pending_ignore_inputs
-            .iter()
-            .map(|input| match input {
-                IgnoreInput::Pattern(pattern) => Some(pattern.as_str()),
-                IgnoreInput::File(_) => None,
-            })
-            .collect()
-    }
-
     /// Parse the command line. Native copy defers reading ignore sources until
     /// after return handoff, retaining their order among inline patterns.
     pub fn parse_args(argv: &[OsString]) -> Result<Args> {

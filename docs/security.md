@@ -294,8 +294,8 @@ share this authority; choosing a different profile name does not isolate them.
 
 Copy approval permits the destination, overwrite policy, and limits of the
 shown command; syq enforces them on every filesystem operation. The server
-supplies the contents of files the command names, such as a mapping or ignore
-file; your laptop cannot check them. The server can supply false
+supplies the command's ignore rules and mapping file contents, which your
+laptop does not check; they can only narrow the copy. The server can supply false
 contents, inspect destination entries during planning, and use disk space
 within those limits. The default starting directory is your home, without
 containment; `syq persist receive on --root DIRECTORY` confines copies to that

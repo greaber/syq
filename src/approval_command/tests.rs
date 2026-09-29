@@ -107,21 +107,13 @@ fn server_files_supply_only_their_own_contents() {
 }
 
 #[test]
-fn inline_ignore_rules_are_enforced_in_command_order() {
-    let temp = crate::test_support::tempdir().unwrap();
-    let file = temp.path().join("rules");
-    std::fs::write(&file, "*.tmp\ncache/\n").unwrap();
-    let file = file.to_str().unwrap();
-    let with_file = command(&[
+fn ignore_rules_come_from_the_server_and_only_narrow() {
+    let command = command(&[
         "cp",
         "--src",
         "tree",
         "--ignore",
         "a",
-        "--ignore-from",
-        file,
-        "--ignore",
-        "b",
         "--to",
         "@laptop",
         "--into",
@@ -130,44 +122,20 @@ fn inline_ignore_rules_are_enforced_in_command_order() {
         "--max-delete",
         "5",
     ]);
-    let request = copy_request(&with_file);
-    assert_eq!(
-        request.constraints.filters.ignore,
-        ["a", "*.tmp", "cache/", "b"]
-    );
-    check_copy(&with_file, &request, Some("laptop"), None).unwrap();
-    for (lines, accepted) in [
-        (&["a", "b"][..], true),
-        (&["a", "anything", "b"], true),
-        (&["a", "*.tmp"], false),
-        (&["*.tmp", "b"], false),
-        (&["b", "a"], false),
-        (&["a", "b", "extra"], false),
-        (&["extra", "a", "b"], false),
-        (&[], false),
-    ] {
+    let request = copy_request(&command);
+    assert_eq!(request.constraints.filters.ignore, ["a"]);
+    for lines in [&[][..], &["b"], &["!a", "a"]] {
         let mut changed = request.clone();
         changed.constraints.filters.ignore = lines.iter().map(|line| line.to_string()).collect();
-        assert_eq!(
-            check_copy(&with_file, &changed, Some("laptop"), None).is_ok(),
-            accepted,
-            "{lines:?}"
-        );
+        check_copy(&command, &changed, Some("laptop"), None).unwrap();
     }
-
-    let inline = command(&[
-        "cp", "--src", "tree", "--ignore", "a", "--ignore", "b", "--to", "@laptop",
-    ]);
-    let request = copy_request(&inline);
-    check_copy(&inline, &request, Some("laptop"), None).unwrap();
-    for lines in [&["a"][..], &["b", "a"], &["a", "b", "c"], &[]] {
-        let mut changed = request.clone();
-        changed.constraints.filters.ignore = lines.iter().map(|line| line.to_string()).collect();
-        assert!(
-            check_copy(&inline, &changed, Some("laptop"), None).is_err(),
-            "{lines:?}"
-        );
-    }
+    // What the ignore rules restrict is still checked.
+    let mut changed = request.clone();
+    changed.copy.limits.max_deletions += 1;
+    assert!(check_copy(&command, &changed, Some("laptop"), None).is_err());
+    let mut changed = request;
+    changed.constraints.filters.delete_excluded = true;
+    assert!(check_copy(&command, &changed, Some("laptop"), None).is_err());
 }
 
 #[test]
@@ -366,6 +334,8 @@ fn displayed_commands_escape_unusual_text_and_mark_server_files() {
         b"--mapping".to_vec(),
         b"map.json".to_vec(),
         b"--ignore-from=rules".to_vec(),
+        b"--ignore".to_vec(),
+        b"*.tmp".to_vec(),
         b"--to".to_vec(),
         b"@laptop".to_vec(),
     ]);
@@ -381,7 +351,7 @@ fn displayed_commands_escape_unusual_text_and_mark_server_files() {
             .split(' ')
             .filter(|word| word.starts_with('['))
             .collect::<Vec<_>>(),
-        ["[map.json]", "[--ignore-from=rules]"]
+        ["[map.json]", "[--ignore-from=rules]", "[\"*.tmp\"]"]
     );
     assert!(display(&[]).is_empty());
 }
