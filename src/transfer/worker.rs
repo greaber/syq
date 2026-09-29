@@ -563,6 +563,18 @@ impl Worker {
             .zip(owned)
             .filter_map(|(result, own)| own.then_some(result))
             .collect();
+        // Keep every acknowledged publication, even if another request or
+        // the following source recheck fails. The destination has changed.
+        if let Some(record) = &self.opts.resume_job {
+            record.published(
+                jobs.iter()
+                    .zip(&results)
+                    .filter_map(|(job, result)| match result {
+                        Some(Ok(Some(identity))) => Some((job.dst.clone(), *identity)),
+                        _ => None,
+                    }),
+            );
+        }
         let (credited, credited_files) = jobs
             .iter()
             .zip(&results)
@@ -599,7 +611,6 @@ impl Worker {
             }
         };
         let mut now = now.into_iter();
-        let mut publications = Vec::new();
         for ((idx, j), res) in batch.iter().zip(jobs.iter()).zip(results) {
             let Some(res) = res else {
                 self.sched.requeue(*idx);
@@ -679,9 +690,6 @@ impl Worker {
                 self.file_error(*idx, error)?;
                 continue;
             }
-            if let Some(identity) = published {
-                publications.push((j.dst.clone(), identity));
-            }
             j.done.store(j.entry.size, Relaxed);
             // Already counted for tuning when the destination acknowledged it.
             self.progress.files_done.fetch_add(1, Relaxed);
@@ -703,9 +711,6 @@ impl Worker {
             if self.opts.verbose > 0 {
                 self.progress.println(&j.rel);
             }
-        }
-        if let Some(job) = &self.opts.resume_job {
-            job.published(publications);
         }
         Ok(())
     }

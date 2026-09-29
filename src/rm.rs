@@ -74,6 +74,12 @@ pub fn run(mut args: Args) -> Result<i32> {
             );
             if !args.quiet {
                 print_summary(&args, &progress, &summary);
+            } else if exit_code != 0 && !args.dry_run {
+                crate::output::diagnostic!(
+                    "syq: {} removals confirmed in this attempt; {} entries failed",
+                    summary.entries_removed,
+                    summary.entries_failed
+                );
             }
             Ok(exit_code)
         }
