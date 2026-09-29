@@ -94,7 +94,9 @@ impl Session {
         }
         let mut requests = vec![put];
         let mut metadata_update = None;
-        if protects_existing(plan) && plan.placement.existence != crate::cli::Existence::New {
+        if plan.controls.metadata.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)
+            && plan.placement.existence != crate::cli::Existence::New
+        {
             requests.push(Unsigned::new("GET", &plan.key));
             if metadata_update_flags(plan) != 0 {
                 requests.push(Unsigned::new("HEAD", &plan.key));

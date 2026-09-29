@@ -403,7 +403,8 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
     let report = &plan.controls.report;
     let policy = report.only_new || report.only_existing;
     let inspect_placement = existence != Existence::Any || policy;
-    if !inspect_placement && !plan.controls.metadata.skip_newer {
+    let reject_existing = plan.controls.metadata.if_exists == Some(crate::cli::IfExists::Error);
+    if !inspect_placement && !plan.controls.metadata.skip_newer && !reject_existing {
         return Ok(());
     }
     // Match ordinary S3 cp: a new target must have neither an exact object
@@ -420,10 +421,20 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
     let exact_head = if target.is_empty() {
         None
     } else {
-        client::head_output(client, &plan.options.bucket, target, None).await?
+        let head = client::head_output(client, &plan.options.bucket, target, None).await;
+        if inspect_placement || plan.controls.metadata.skip_newer {
+            head?
+        } else {
+            // This optional preflight avoids reading and uploading a rejected
+            // stream. Write-only credentials can still use conditional writes:
+            // a failed HEAD is not proof of absence, and publication below
+            // always retains If-None-Match for this policy.
+            head.unwrap_or(None)
+        }
     };
+    let exact = exact_head.is_some();
+    let mut final_head = if container { None } else { exact_head };
     if inspect_placement {
-        let exact = exact_head.is_some();
         let prefix = if target.is_empty() {
             String::new()
         } else {
@@ -438,9 +449,9 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
         }
         if policy {
             let final_present = if container {
-                super::client::head_output(client, &plan.options.bucket, &plan.key, None)
-                    .await?
-                    .is_some()
+                final_head =
+                    client::head_output(client, &plan.options.bucket, &plan.key, None).await?;
+                final_head.is_some()
                     || super::client::prefix_exists(
                         client,
                         &plan.options.bucket,
@@ -459,14 +470,22 @@ async fn check_placement(client: &Client, plan: &Plan<'_>) -> Result<()> {
             bail!("S3 destination is a prefix, not an object");
         }
     }
-    if plan.controls.metadata.skip_newer {
-        let head = if container {
-            client::head_output(client, &plan.options.bucket, &plan.key, None).await?
+    if container && !policy && (reject_existing || plan.controls.metadata.skip_newer) {
+        let head = client::head_output(client, &plan.options.bucket, &plan.key, None).await;
+        final_head = if plan.controls.metadata.skip_newer {
+            head?
         } else {
-            exact_head
+            head.unwrap_or(None)
         };
+    }
+    anyhow::ensure!(
+        !reject_existing || final_head.is_none(),
+        "destination already exists: {} (--if-exists=error)",
+        plan.key
+    );
+    if plan.controls.metadata.skip_newer {
         // Match pathname S3 copies: only a strictly newer destination is protected.
-        if let Some(head) = head {
+        if let Some(head) = final_head {
             let stored = client::Metadata::decode(head.metadata())?;
             let mtime = stored.map_or_else(
                 || (head.last_modified().map_or(0, |t| t.secs()), 0),

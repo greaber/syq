@@ -190,6 +190,13 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             copy([prefix+'/descriptor', '--from', 's3://syq-storage-test', '--as-fd', '1'],
                  redirection=' > /tmp/syq-storage-authorization/descriptor-download')
             assert run('ssh', 'source', 'sha256sum /tmp/syq-storage-authorization/descriptor-download').split()[0] == expected
+            print('case: protected descriptor rejects before opening a producer FIFO', flush=True)
+            fifo = remote_root+'/unopened-fifo'
+            run('ssh', 'source', shlex.join(['mkfifo', fifo]))
+            copy(['--src', fifo, '--to', 's3://syq-storage-test', '--as', prefix+'/descriptor',
+                  '--if-exists=error'], disconnect=False, ok=False)
+            assert hashlib.sha256(checks.request('GET', prefix+'/descriptor')[1]).hexdigest() == expected
+            assert not checks.listing(uploads=True), 'rejected stream prepared multipart upload'
             print('case: unknown-length input signs parts before reading the pipe', flush=True)
             copy(['--src-fd', '0', '--to', 's3://syq-storage-test', '--as', prefix+'/pipe'],
                  pipe_input=True)
