@@ -196,6 +196,7 @@ pub trait Conn: Send {
         follow_symlinks: bool,
         dry_run: bool,
         workers: usize,
+        job: Option<&std::sync::Arc<crate::resume::Job>>,
         trace: &mut dyn FnMut(Vec<String>) -> Result<()>,
         sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
     ) -> Result<()>;
@@ -867,6 +868,7 @@ impl Conn for RemoteConn {
         follow_symlinks: bool,
         dry_run: bool,
         workers: usize,
+        job: Option<&std::sync::Arc<crate::resume::Job>>,
         trace: &mut dyn FnMut(Vec<String>) -> Result<()>,
         sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
     ) -> Result<()> {
@@ -874,6 +876,10 @@ impl Conn for RemoteConn {
             cwd: cwd.map(<[u8]>::to_vec),
             root: root.map(<[u8]>::to_vec),
             selections: selections.to_vec(),
+            job: job.map(|job| crate::resume::JobSpec {
+                id: job.id.clone(),
+                resumed: job.resumed,
+            }),
             follow_symlinks,
             dry_run,
             workers,
@@ -883,6 +889,13 @@ impl Conn for RemoteConn {
                 Response::NativeRemoveTrace(messages) => trace(messages)?,
                 Response::NativeRemoveBatch(outcomes) => sink(outcomes)?,
                 Response::NativeRemoveDone => return Ok(()),
+                Response::NativeRemoveJobAvailable(available) => {
+                    if !available {
+                        if let Some(job) = job {
+                            job.disable("endpoint journal is unavailable");
+                        }
+                    }
+                }
                 Response::EndpointError(error) => {
                     return Err(endpoint_error(error)).context(format!("{}: remove", self.label));
                 }

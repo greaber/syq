@@ -599,6 +599,7 @@ impl Worker {
             }
         };
         let mut now = now.into_iter();
+        let mut publications = Vec::new();
         for ((idx, j), res) in batch.iter().zip(jobs.iter()).zip(results) {
             let Some(res) = res else {
                 self.sched.requeue(*idx);
@@ -678,6 +679,9 @@ impl Worker {
                 self.file_error(*idx, error)?;
                 continue;
             }
+            if let Some(identity) = published {
+                publications.push((j.dst.clone(), identity));
+            }
             j.done.store(j.entry.size, Relaxed);
             // Already counted for tuning when the destination acknowledged it.
             self.progress.files_done.fetch_add(1, Relaxed);
@@ -699,6 +703,9 @@ impl Worker {
             if self.opts.verbose > 0 {
                 self.progress.println(&j.rel);
             }
+        }
+        if let Some(job) = &self.opts.resume_job {
+            job.published(publications);
         }
         Ok(())
     }
@@ -771,10 +778,15 @@ impl Worker {
         let opts = self.opts.clone();
         let _ = &opts;
 
-        if self.opts.protects_existing_contents() && job.dst_entry.is_some() {
+        let policy = self.opts.policy_for(&job.dst, job.dst_entry.as_deref());
+        if matches!(
+            policy,
+            Some(crate::cli::IfExists::Error | crate::cli::IfExists::ErrorIfDifferent)
+        ) && job.dst_entry.is_some()
+        {
             self.sched.ranges_ready(idx, vec![]);
             anyhow::ensure!(
-                self.opts.if_exists != Some(crate::cli::IfExists::Error),
+                policy != Some(crate::cli::IfExists::Error),
                 "destination already exists: {} (--if-exists=error)",
                 job.rel
             );
@@ -2075,7 +2087,12 @@ impl Worker {
             }
         };
         anyhow::ensure!(
-            matched || !self.opts.protects_existing_contents() || job.dst_entry.is_none(),
+            matched
+                || !matches!(
+                    self.opts.policy_for(&job.dst, job.dst_entry.as_deref()),
+                    Some(crate::cli::IfExists::Error | crate::cli::IfExists::ErrorIfDifferent)
+                )
+                || job.dst_entry.is_none(),
             "{}",
             self.opts.file_difference_message(&job.rel)
         );

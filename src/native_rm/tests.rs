@@ -219,6 +219,8 @@ fn failed_attached_emit_cancels_pending_mutation() {
         pending: Mutex::new(0),
         events: event_tx,
         dry_run: false,
+        job: None,
+        failed: AtomicBool::new(false),
         cancelled: AtomicBool::new(false),
     });
 
@@ -480,6 +482,8 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
             pending: Mutex::new(2),
             events: event_tx,
             dry_run: false,
+            job: None,
+            failed: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
         };
         pool.task_done();
@@ -505,4 +509,56 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
         assert!(pool.is_done());
         assert!(matches!(event_rx.try_recv(), Ok(None)));
     }
+}
+
+#[test]
+fn resumed_removal_keeps_replacements_of_completed_entries() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let base = temp.path().join("jobs");
+    let selected = temp.path().join("selected");
+    std::fs::create_dir(&selected).unwrap();
+    let path = selected.join("replaced");
+    std::fs::write(&path, b"original").unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let job = crate::resume::Job::endpoint_at(&base, id, "remove", false).unwrap();
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    let bytes = path.as_os_str().as_bytes();
+    job.before_remove(
+        bytes,
+        metadata.dev(),
+        metadata.ino(),
+        Kind::File,
+        Some((metadata.ctime(), metadata.ctime_nsec() as u32)),
+        false,
+    )
+    .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    job.removed(bytes);
+    drop(job);
+    std::fs::write(&path, b"replacement").unwrap();
+    std::fs::write(selected.join("unfinished"), b"remove this").unwrap();
+    let job = Arc::new(crate::resume::Job::endpoint_at(&base, id, "remove", true).unwrap());
+    let mut outcomes = Vec::new();
+    remove_with_job(
+        None,
+        None,
+        &[NativeRemoveSelection {
+            path: selected.as_os_str().as_bytes().to_vec(),
+            kind: NativeRemoveKind::Contents,
+        }],
+        false,
+        false,
+        2,
+        Some(job),
+        &mut |_| Ok(()),
+        &mut |batch| {
+            outcomes.extend(batch);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    assert!(!selected.join("unfinished").exists());
+    assert!(outcomes.iter().any(|outcome| outcome.path == bytes
+        && outcome.disposition == NativeRemoveDisposition::AlreadyAbsent));
 }

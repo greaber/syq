@@ -399,6 +399,7 @@ mod tests {
             _: bool,
             _: bool,
             _: usize,
+            _job: Option<&std::sync::Arc<crate::resume::Job>>,
             _: &mut dyn FnMut(Vec<String>) -> Result<()>,
             _: &mut dyn FnMut(Vec<crate::proto::NativeRemoveOutcome>) -> Result<()>,
         ) -> Result<()> {

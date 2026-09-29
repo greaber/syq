@@ -99,6 +99,8 @@ pub enum CoordinateAt {
 )]
 pub struct Args {
     #[arg(skip)]
+    pub(crate) resume_job: Option<std::sync::Arc<crate::resume::Job>>,
+    #[arg(skip)]
     pub(crate) descriptor_copy: Option<crate::descriptor_copy::Plan>,
     #[arg(skip)]
     pub(crate) stream_mapping_fd: Option<i32>,
@@ -584,6 +586,11 @@ impl EnvironmentOptions {
 }
 
 impl Args {
+    pub(crate) fn restore_resume_ignore(&mut self, lines: Vec<String>) {
+        self.pending_ignore_inputs.clear();
+        self.ignore_lines = lines;
+    }
+
     pub(crate) fn only_new_native_entries(&self) -> bool {
         self.interface == Interface::NativeCp && self.ignore_existing
     }

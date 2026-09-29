@@ -504,7 +504,7 @@ fn same_source(current: Option<&Entry>, expected: &Entry) -> bool {
 impl Worker {
     pub(super) fn publication_flags(&self, job: &WorkerJob) -> u8 {
         publication_metadata_flags(self.opts.flags_for(&job.rel_bytes))
-            | if self.opts.hardlinks && job.entry.nlink > 1 {
+            | if (self.opts.hardlinks && job.entry.nlink > 1) || self.opts.resume_job.is_some() {
                 flags::REPORT_IDENTITY
             } else {
                 0

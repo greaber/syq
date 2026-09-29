@@ -348,6 +348,13 @@ fn main() {
             }
         }
     }
+    let resumed_job = match resume::restore(&mut argv) {
+        Ok(job) => job,
+        Err(error) => {
+            crate::output::diagnostic!("syq: {error:#}");
+            std::process::exit(2);
+        }
+    };
     let mut args = match cli::Args::parse_args(&argv[1..]) {
         Ok(a) => a,
         Err(e) => {
@@ -355,6 +362,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    args.resume_job = resumed_job;
     fsops::reserve_startup_descriptors();
     args.warn_unsupported_options();
     args.normalize();
@@ -379,6 +387,12 @@ fn main() {
             std::process::exit(2);
         }
     }
+    if let Err(error) = resume::start(&argv[1..], &mut args) {
+        crate::output::diagnostic!("syq: {error:#}");
+        std::process::exit(2);
+    }
+    let resume_job = args.resume_job.clone();
+    let resume_dry_run = args.dry_run;
     let quiet = args.quiet;
     let result = if args.stream_mapping_fd.is_some() {
         stream_mapping::run(args)
@@ -393,6 +407,21 @@ fn main() {
     } else {
         transfer::run(args)
     };
+    if let Some(job) = resume_job.filter(|_| !resume_dry_run) {
+        if matches!(&result, Ok(0)) {
+            job.complete();
+        } else if job.available() {
+            crate::output::diagnostic!(
+                "syq: resume this job with syq {} --resume {}",
+                if argv.get(1).is_some_and(|command| command == "rm") {
+                    "rm"
+                } else {
+                    "cp"
+                },
+                job.id
+            );
+        }
+    }
     match result {
         Ok(code) => {
             if code == 0 {

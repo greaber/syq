@@ -751,6 +751,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 }
             }
             Request::NativeRemove {
+                job,
                 cwd,
                 root,
                 selections,
@@ -759,13 +760,27 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 workers,
             } => {
                 let wref = std::cell::RefCell::new(&mut w);
-                let result = crate::native_rm::remove(
+                let endpoint_job = match crate::resume::open_removal_job(job.as_ref()) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        wref.borrow_mut().write_msg(&Response::EndpointError(
+                            crate::fsops::wire_error(&error),
+                        ))?;
+                        continue;
+                    }
+                };
+                if job.is_some() {
+                    wref.borrow_mut()
+                        .write_msg(&Response::NativeRemoveJobAvailable(endpoint_job.is_some()))?;
+                }
+                let result = crate::native_rm::remove_with_job(
                     cwd.as_deref(),
                     root.as_deref(),
                     &selections,
                     follow_symlinks,
                     dry_run,
                     workers,
+                    endpoint_job.clone(),
                     &mut |messages| {
                         Ok(wref
                             .borrow_mut()
@@ -777,8 +792,16 @@ fn serve<R: Read + Send + 'static, W: Write>(
                             .write_msg(&Response::NativeRemoveBatch(outcomes))?)
                     },
                 );
+                if job.is_some() {
+                    wref.borrow_mut()
+                        .write_msg(&Response::NativeRemoveJobAvailable(
+                            endpoint_job.as_ref().is_some_and(|job| job.available()),
+                        ))?;
+                }
                 match result {
-                    Ok(()) => wref.borrow_mut().write_msg(&Response::NativeRemoveDone)?,
+                    Ok(()) => {
+                        wref.borrow_mut().write_msg(&Response::NativeRemoveDone)?;
+                    }
                     Err(error) => wref
                         .borrow_mut()
                         .write_msg(&Response::EndpointError(crate::fsops::wire_error(&error)))?,

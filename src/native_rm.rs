@@ -38,13 +38,20 @@ const EVENT_FLUSH: Duration = Duration::from_millis(100);
 const ATTACHED_HEARTBEAT: Duration = Duration::from_secs(1);
 const RMDIR_RETRIES: usize = 3;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 struct Identity {
     dev: u64,
     ino: u64,
     file_type: u32,
+    ctime: (i64, u32),
 }
 
+impl PartialEq for Identity {
+    fn eq(&self, other: &Self) -> bool {
+        (self.dev, self.ino, self.file_type) == (other.dev, other.ino, other.file_type)
+    }
+}
+impl Eq for Identity {}
 impl Identity {
     fn is_dir(self) -> bool {
         self.file_type == MODE_DIRECTORY
@@ -257,6 +264,7 @@ fn identity_from_root(metadata: RootMetadata) -> Identity {
         dev: metadata.dev,
         ino: metadata.ino,
         file_type: metadata.file_type(),
+        ctime: (metadata.ctime, metadata.ctime_nsec),
     }
 }
 
@@ -427,6 +435,8 @@ struct Pool {
     pending: Mutex<usize>,
     events: mpsc::Sender<Option<NativeRemoveOutcome>>,
     dry_run: bool,
+    job: Option<Arc<crate::resume::Job>>,
+    failed: AtomicBool,
     cancelled: AtomicBool,
 }
 
@@ -480,6 +490,9 @@ impl Pool {
     }
 
     fn outcome(&self, outcome: NativeRemoveOutcome) {
+        if outcome.disposition == NativeRemoveDisposition::Failed {
+            self.failed.store(true, Ordering::SeqCst);
+        }
         if !self.is_cancelled() {
             let _ = self.events.send(Some(outcome));
         }
@@ -560,6 +573,31 @@ pub(crate) fn remove(
     trace: &mut dyn FnMut(Vec<String>) -> Result<()>,
     sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
 ) -> Result<()> {
+    remove_with_job(
+        cwd,
+        root,
+        selections,
+        follow_symlinks,
+        dry_run,
+        workers,
+        None,
+        trace,
+        sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remove_with_job(
+    cwd: Option<&[u8]>,
+    root: Option<&[u8]>,
+    selections: &[NativeRemoveSelection],
+    follow_symlinks: bool,
+    dry_run: bool,
+    workers: usize,
+    job: Option<Arc<crate::resume::Job>>,
+    trace: &mut dyn FnMut(Vec<String>) -> Result<()>,
+    sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+) -> Result<()> {
     let mut traces = Vec::new();
     let (base, confined) =
         open_base(cwd, root, selections, follow_symlinks, &mut traces).map_err(endpoint_failure)?;
@@ -627,6 +665,8 @@ pub(crate) fn remove(
         pending: Mutex::new(0),
         events: event_tx,
         dry_run,
+        job,
+        failed: AtomicBool::new(false),
         cancelled: AtomicBool::new(false),
     });
     for selected in resolved {
@@ -715,8 +755,16 @@ pub(crate) fn remove(
             )));
         }
     }
+    if let Some(job) = &pool.job {
+        job.flush();
+    }
     if let Some(error) = sink_error {
         return Err(error);
+    }
+    if !dry_run && !pool.failed.load(Ordering::SeqCst) {
+        if let Some(job) = &pool.job {
+            job.complete();
+        }
     }
     Ok(())
 }
@@ -761,15 +809,33 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
             }
             let kind = name.identity.kind();
             let outcome = if pool.dry_run {
-                removal_outcome(
-                    selector,
-                    label,
-                    kind,
-                    NativeRemoveDisposition::WouldRemove,
-                    None,
-                )
+                let allowed = match &pool.job {
+                    Some(job) => job.before_remove(
+                        &label,
+                        name.identity.dev,
+                        name.identity.ino,
+                        kind,
+                        (!name.identity.is_dir()).then_some(name.identity.ctime),
+                        true,
+                    ),
+                    None => Ok(true),
+                };
+                match allowed {
+                    Ok(allowed) => removal_outcome(
+                        selector,
+                        label,
+                        kind,
+                        if allowed {
+                            NativeRemoveDisposition::WouldRemove
+                        } else {
+                            NativeRemoveDisposition::AlreadyAbsent
+                        },
+                        None,
+                    ),
+                    Err(error) => failed_outcome(selector, label, Some(kind), 0, error),
+                }
             } else {
-                match remove_pinned(&name, None) {
+                match remove_for_job(&pool.job, &label, &name, None) {
                     Ok(RemovePinnedOutcome::Removed) => removal_outcome(
                         selector,
                         label,
@@ -802,6 +868,43 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
 }
 
 fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
+    if let Some(record) = &pool.job {
+        let allowed = identity_from_file(&job.directory).and_then(|identity| {
+            record.before_remove(
+                &job.label,
+                identity.dev,
+                identity.ino,
+                Kind::Dir,
+                None,
+                pool.dry_run,
+            )
+        });
+        match allowed {
+            Ok(true) => {}
+            Ok(false) => {
+                pool.outcome(removal_outcome(
+                    job.selector,
+                    job.label.clone(),
+                    Kind::Dir,
+                    NativeRemoveDisposition::AlreadyAbsent,
+                    None,
+                ));
+                finish_parent(pool, &job, false);
+                return;
+            }
+            Err(error) => {
+                pool.outcome(failed_outcome(
+                    job.selector,
+                    job.label.clone(),
+                    Some(Kind::Dir),
+                    0,
+                    error,
+                ));
+                finish_parent(pool, &job, true);
+                return;
+            }
+        }
+    }
     let names = match read_directory(&job.directory) {
         Ok(names) => names,
         Err(error) => {
@@ -816,105 +919,137 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
             return;
         }
     };
-    for component in names {
+    let mut names = names.into_iter();
+    loop {
         if pool.is_cancelled() {
             break;
         }
-        let identity = match metadata_at(job.directory.as_raw_fd(), &component) {
-            Ok(identity) => identity,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                job.descendant_failed.store(true, Ordering::SeqCst);
-                pool.outcome(failed_outcome(
-                    job.selector,
-                    join_label(&job.label, &component),
-                    None,
-                    1,
-                    error.into(),
-                ));
-                continue;
-            }
-        };
-        if job.partials_only
-            && !identity.is_dir()
-            && (identity.kind() != Kind::File
-                || !crate::fsops::is_partial_name(OsStr::from_bytes(&component)))
-        {
-            continue;
+        let batch: Vec<_> = names
+            .by_ref()
+            .take(256)
+            .map(|component| {
+                let identity = metadata_at(job.directory.as_raw_fd(), &component);
+                (component, identity)
+            })
+            .collect();
+        if batch.is_empty() {
+            break;
         }
-        let name = match component_cstring(&component) {
-            Ok(name) => name,
-            Err(error) => {
-                job.descendant_failed.store(true, Ordering::SeqCst);
-                pool.outcome(failed_outcome(
-                    job.selector,
-                    join_label(&job.label, &component),
-                    Some(identity.kind()),
-                    1,
-                    error,
-                ));
-                continue;
+        if !pool.dry_run {
+            if let Some(record) = &pool.job {
+                record.observe_removals(batch.iter().filter_map(|(component, identity)| {
+                    identity.as_ref().ok().map(|identity| {
+                        (
+                            join_label(&job.label, component),
+                            identity.dev,
+                            identity.ino,
+                            identity.kind(),
+                            (!identity.is_dir()).then_some(identity.ctime),
+                        )
+                    })
+                }));
             }
-        };
-        let pinned = PinnedName {
-            parent: PinnedParent::Directory(job.clone()),
-            name,
-            identity,
-        };
-        let label = join_label(&job.label, &component);
-        job.remaining.fetch_add(1, Ordering::SeqCst);
-        if identity.is_dir() {
-            let directory = match open_directory_at(&job.directory, &component) {
-                Ok(directory) => directory,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    directory_part_done(pool, job.clone());
-                    continue;
-                }
+        }
+        for (component, observation) in batch {
+            if pool.is_cancelled() {
+                break;
+            }
+            let identity = match observation {
+                Ok(identity) => identity,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => {
+                    job.descendant_failed.store(true, Ordering::SeqCst);
                     pool.outcome(failed_outcome(
                         job.selector,
-                        label,
-                        Some(Kind::Dir),
+                        join_label(&job.label, &component),
+                        None,
                         1,
                         error.into(),
                     ));
-                    directory_part_failed(pool, job.clone());
                     continue;
                 }
             };
-            match identity_from_file(&directory)
-                .and_then(|opened| require_same_identity(identity, opened, "directory"))
+            if job.partials_only
+                && !identity.is_dir()
+                && (identity.kind() != Kind::File
+                    || !crate::fsops::is_partial_name(OsStr::from_bytes(&component)))
             {
-                Ok(()) => pool.submit(Task::Scan(Arc::new(DirectoryJob {
-                    selector: job.selector,
-                    partials_only: job.partials_only,
-                    directory,
-                    removal: (!job.partials_only).then_some(pinned),
-                    label,
-                    parent: Some(job.clone()),
-                    remaining: AtomicUsize::new(1),
-                    retries: AtomicUsize::new(0),
-                    descendant_failed: AtomicBool::new(false),
-                }))),
+                continue;
+            }
+            let name = match component_cstring(&component) {
+                Ok(name) => name,
                 Err(error) => {
+                    job.descendant_failed.store(true, Ordering::SeqCst);
                     pool.outcome(failed_outcome(
                         job.selector,
-                        label,
-                        Some(Kind::Dir),
+                        join_label(&job.label, &component),
+                        Some(identity.kind()),
                         1,
                         error,
                     ));
-                    directory_part_failed(pool, job.clone());
+                    continue;
                 }
+            };
+            let pinned = PinnedName {
+                parent: PinnedParent::Directory(job.clone()),
+                name,
+                identity,
+            };
+            let label = join_label(&job.label, &component);
+            job.remaining.fetch_add(1, Ordering::SeqCst);
+            if identity.is_dir() {
+                let directory = match open_directory_at(&job.directory, &component) {
+                    Ok(directory) => directory,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        directory_part_done(pool, job.clone());
+                        continue;
+                    }
+                    Err(error) => {
+                        pool.outcome(failed_outcome(
+                            job.selector,
+                            label,
+                            Some(Kind::Dir),
+                            1,
+                            error.into(),
+                        ));
+                        directory_part_failed(pool, job.clone());
+                        continue;
+                    }
+                };
+                match identity_from_file(&directory)
+                    .and_then(|opened| require_same_identity(identity, opened, "directory"))
+                {
+                    Ok(()) => pool.submit(Task::Scan(Arc::new(DirectoryJob {
+                        selector: job.selector,
+                        partials_only: job.partials_only,
+                        directory,
+                        removal: (!job.partials_only).then_some(pinned),
+                        label,
+                        parent: Some(job.clone()),
+                        remaining: AtomicUsize::new(1),
+                        retries: AtomicUsize::new(0),
+                        descendant_failed: AtomicBool::new(false),
+                    }))),
+                    Err(error) => {
+                        pool.outcome(failed_outcome(
+                            job.selector,
+                            label,
+                            Some(Kind::Dir),
+                            1,
+                            error,
+                        ));
+                        directory_part_failed(pool, job.clone());
+                    }
+                }
+            } else {
+                pool.submit(Task::Leaf {
+                    selector: job.selector,
+                    name: pinned,
+                    _object: None,
+                    label,
+                    parent: Some(job.clone()),
+                });
             }
-        } else {
-            pool.submit(Task::Leaf {
-                selector: job.selector,
-                name: pinned,
-                _object: None,
-                label,
-                parent: Some(job.clone()),
-            });
         }
     }
     directory_part_done(pool, job);
@@ -932,7 +1067,7 @@ fn finish_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
     let result = if pool.dry_run {
         Ok(RemovePinnedOutcome::Removed)
     } else {
-        remove_pinned(removal, Some(&job.directory))
+        remove_for_job(&pool.job, &job.label, removal, Some(&job.directory))
     };
     match result {
         Ok(outcome) => {
@@ -1026,6 +1161,31 @@ enum RemovePinnedOutcome {
 /// directory that is still linked afterwards, whether its name was swapped
 /// or renamed away, is reported as a failure instead of success. Leaves hold
 /// no descriptor, so a swapped leaf cannot be detected afterwards.
+fn remove_for_job(
+    job: &Option<Arc<crate::resume::Job>>,
+    path: &[u8],
+    name: &PinnedName,
+    directory: Option<&File>,
+) -> Result<RemovePinnedOutcome> {
+    if let Some(job) = job {
+        if !job.before_remove(
+            path,
+            name.identity.dev,
+            name.identity.ino,
+            name.identity.kind(),
+            (!name.identity.is_dir()).then_some(name.identity.ctime),
+            false,
+        )? {
+            return Ok(RemovePinnedOutcome::AlreadyAbsent);
+        }
+    }
+    let result = remove_pinned(name, directory)?;
+    if let Some(job) = job {
+        job.removed(path);
+    }
+    Ok(result)
+}
+
 fn remove_pinned(name: &PinnedName, held_directory: Option<&File>) -> Result<RemovePinnedOutcome> {
     let outcome = unlink_pinned(name, held_directory.is_some())?;
     if let Some(directory) = held_directory {
@@ -1142,6 +1302,7 @@ fn identity_from_file(file: &File) -> Result<Identity> {
         dev: metadata.dev(),
         ino: metadata.ino(),
         file_type: metadata.mode() & MODE_TYPE_MASK,
+        ctime: (metadata.ctime(), metadata.ctime_nsec() as u32),
     })
 }
 
@@ -1150,6 +1311,7 @@ fn identity_from_stat(stat: &libc::stat) -> Identity {
         dev: stat_dev(stat),
         ino: stat.st_ino,
         file_type: stat_mode(stat) & MODE_TYPE_MASK,
+        ctime: (stat.st_ctime, stat.st_ctime_nsec as u32),
     }
 }
 

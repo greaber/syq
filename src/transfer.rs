@@ -117,6 +117,7 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
 }
 
 pub struct Opts {
+    pub resume_job: Option<Arc<crate::resume::Job>>,
     pub expressions: crate::expression::Policy,
     pub hash_policy: crate::hashing::HashPolicy,
     pub mapping_metadata: std::collections::HashMap<PathBytes, crate::mapping::Metadata>,
@@ -208,6 +209,22 @@ impl Opts {
                 .map_or(0, |m| m.apply_flags())
     }
 
+    fn policy_for(&self, path: &[u8], current: Option<&Entry>) -> Option<crate::cli::IfExists> {
+        if self
+            .resume_job
+            .as_ref()
+            .is_some_and(|job| job.owns_created(path, current))
+        {
+            match self.if_exists {
+                Some(crate::cli::IfExists::Error | crate::cli::IfExists::ErrorIfDifferent) => {
+                    Some(crate::cli::IfExists::Update)
+                }
+                policy => policy,
+            }
+        } else {
+            self.if_exists
+        }
+    }
     fn protects_existing_contents(&self) -> bool {
         matches!(
             self.if_exists,
@@ -1305,6 +1322,14 @@ pub fn run(mut args: Args) -> Result<i32> {
             "errors": progress.errors.load(Relaxed)
         }));
     }
+    if !dry_run && !matches!(&outcome, Ok(0)) {
+        crate::output::diagnostic!(
+            "syq: changes observed before failure: {} files copied or replaced, {} directories created, {} symlinks created, {} special files created, {} entries removed. Partial writes, metadata changes, or unacknowledged remote changes may also have occurred.",
+            progress.files_done.load(Relaxed), progress.directories_created.load(Relaxed),
+            progress.symlinks_created.load(Relaxed), progress.specials_created.load(Relaxed),
+            progress.deletions_completed.load(Relaxed)
+        );
+    }
     if outcome.is_err() {
         // run_transfer's ticker guard has stopped and joined on every return,
         // including failures in deferred metadata and deletion finalization.
@@ -1708,7 +1733,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
         umask: crate::fsops::process_umask(),
-        copy_id: crate::resume::fresh_copy_id()?,
+        copy_id: match &args.resume_job {
+            Some(job) => job.copy_id,
+            None => crate::resume::fresh_copy_id()?,
+        },
+        resume_job: args.resume_job.clone(),
         ignore: args.ignore_lines.clone(),
         delete: args.delete,
         delete_excluded: args.delete_excluded,
@@ -2311,6 +2340,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             t0.elapsed().as_secs_f64()
         );
     }
+    if !args.dry_run {
+        if let Some(job) = &args.resume_job {
+            job.observe([(dst_root.clone(), dst_root_entry.clone())]);
+        }
+    }
     let mut dst_initially_missing = dst_root_entry.is_none();
     let mut dst_existed = dst_root_entry.is_some();
     let mut dst_entry_is_dir = dst_root_entry
@@ -2318,10 +2352,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .is_some_and(|entry| entry.kind == Kind::Dir);
     match args.target_existence {
         Existence::Any => {}
-        Existence::New if dst_existed => bail!(
-            "target {} already exists, but the selected placement requires a new path",
-            display(&dst_root)
-        ),
+        Existence::New
+            if dst_existed
+                && !args
+                    .resume_job
+                    .as_ref()
+                    .is_some_and(|job| job.owns_created(&dst_root, dst_root_entry.as_ref())) =>
+        {
+            bail!(
+                "target {} already exists, but the selected placement requires a new path",
+                display(&dst_root)
+            )
+        }
         Existence::Existing if !dst_existed => bail!(
             "target {} does not exist, but the selected placement requires an existing path",
             display(&dst_root)
@@ -2785,6 +2827,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     });
                 }
             }
+            if create_root {
+                if let Some(job) = &args.resume_job {
+                    job.published([(dst_root.clone(), (anchor.dev, anchor.ino))]);
+                }
+            }
             destination_anchor
                 .set(anchor)
                 .expect("destination anchor set once");
@@ -2798,6 +2845,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             opts.perms,
         )?;
         mutation_root_condition = target_identity(&created);
+        if let Some(job) = &args.resume_job {
+            job.published([(dst_root.clone(), (created.dev, created.ino))]);
+        }
         if guard_containers {
             container_guard = Some(target_container(&dst_root, &created));
         }

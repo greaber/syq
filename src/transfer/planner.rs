@@ -1594,10 +1594,37 @@ impl Planner<'_> {
             } else {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
+            if !opts.dry_run {
+                if let Some(job) = &opts.resume_job {
+                    job.observe(
+                        dirs.iter()
+                            .zip(&stats)
+                            .map(|((path, _, _), entry)| (path.clone(), entry.clone())),
+                    );
+                }
+            }
             let planned = self.filter_dirs(dirs, stats, dst_root)?;
             if opts.dry_run {
                 self.trace_dry_run_dirs(&planned, dst_root);
             } else {
+                // Save pending metadata before temporarily changing modes or
+                // creating children. Keep the existing execution order.
+                if opts.resume_job.is_some() {
+                    let deferred = self.deferred.len();
+                    let implicit = self.implicit_restorations.len();
+                    let reopened = planned
+                        .iter()
+                        .filter(|(_, _, _, entry)| {
+                            entry.as_ref().is_some_and(|entry| {
+                                entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700
+                            })
+                        })
+                        .map(|(path, ..)| path.clone())
+                        .collect();
+                    self.defer_directory_metadata(&planned, &reopened);
+                    self.deferred.truncate(deferred);
+                    self.implicit_restorations.truncate(implicit);
+                }
                 let Some(reopened_dirs) = self.create_directories(&planned, dst_root)? else {
                     return Ok(());
                 };
@@ -1630,6 +1657,16 @@ impl Planner<'_> {
                 dst_root,
             )?
         };
+        if !opts.dry_run {
+            if let Some(job) = &opts.resume_job {
+                job.observe(
+                    others
+                        .iter()
+                        .zip(&stats)
+                        .map(|(planned, entry)| (planned.dst.clone(), entry.clone())),
+                );
+            }
+        }
         if opts.rsync_creation && !opts.perms && !opts.dry_run {
             // Jobs retain the resolved mode, so old parents need not accumulate
             // with the full directory tree. A wide batch adds at most BATCH more.
@@ -1762,6 +1799,7 @@ impl Planner<'_> {
             e,
             contested,
         } = leaf;
+        let policy = opts.policy_for(&dst_path, dst_entry.as_ref());
         // Never copy a file onto itself (same path, hardlink, or a
         // symlinked alias) — with --inplace that would truncate the
         // source. Only possible when both ends are the same machine.
@@ -1772,7 +1810,7 @@ impl Planner<'_> {
             && dst_entry
                 .as_ref()
                 .is_some_and(|d| d.dev == e.dev && d.ino == e.ino);
-        if same_file && opts.if_exists == Some(crate::cli::IfExists::Error) {
+        if same_file && policy == Some(crate::cli::IfExists::Error) {
             self.existing_conflict(&dst_path, &dst_rel, "destination already exists");
             return;
         }
@@ -1807,11 +1845,11 @@ impl Planner<'_> {
         if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref()) {
             return;
         }
-        if opts.if_exists == Some(crate::cli::IfExists::Error) && dst_entry.is_some() {
+        if policy == Some(crate::cli::IfExists::Error) && dst_entry.is_some() {
             self.existing_conflict(&dst_path, &dst_rel, "destination already exists");
             return;
         }
-        if opts.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)
+        if policy == Some(crate::cli::IfExists::ErrorIfDifferent)
             && dst_entry
                 .as_ref()
                 .is_some_and(|d| d.kind != Kind::File || d.size != e.size)
@@ -1831,7 +1869,7 @@ impl Planner<'_> {
             .is_some_and(|d| opts.metadata_matches(&dst_rel, &e, d));
         let dst_newer = opts.update
             && dst_entry.as_ref().is_some_and(|d| {
-                (d.kind == Kind::File || opts.if_exists.is_some())
+                (d.kind == Kind::File || policy.is_some())
                     && (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
             });
         if dst_newer {
@@ -2045,6 +2083,7 @@ impl Planner<'_> {
             e,
             ..
         } = leaf;
+        let policy = opts.policy_for(&dst_path, dst_entry.as_ref());
         if self.skip_existing(&dst_entry) {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;
@@ -2052,7 +2091,7 @@ impl Planner<'_> {
         if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref()) {
             return;
         }
-        if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder)
+        if policy == Some(crate::cli::IfExists::UpdateIfOlder)
             && dst_entry
                 .as_ref()
                 .is_some_and(|d| (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec))
@@ -2066,8 +2105,8 @@ impl Planner<'_> {
             .is_some_and(|d| d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..]));
 
         if dst_entry.is_some()
-            && (opts.if_exists == Some(crate::cli::IfExists::Error)
-                || (!same && opts.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)))
+            && (policy == Some(crate::cli::IfExists::Error)
+                || (!same && policy == Some(crate::cli::IfExists::ErrorIfDifferent)))
         {
             self.existing_conflict(
                 &dst_path,
@@ -2160,6 +2199,7 @@ impl Planner<'_> {
             e,
             ..
         } = leaf;
+        let policy = opts.policy_for(&dst_path, dst_entry.as_ref());
         if self.skip_existing(&dst_entry) {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;
@@ -2167,7 +2207,7 @@ impl Planner<'_> {
         if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref()) {
             return;
         }
-        if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder)
+        if policy == Some(crate::cli::IfExists::UpdateIfOlder)
             && dst_entry
                 .as_ref()
                 .is_some_and(|d| (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec))
@@ -2179,8 +2219,8 @@ impl Planner<'_> {
             .as_ref()
             .is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
         if dst_entry.is_some()
-            && (opts.if_exists == Some(crate::cli::IfExists::Error)
-                || (!same && opts.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)))
+            && (policy == Some(crate::cli::IfExists::Error)
+                || (!same && policy == Some(crate::cli::IfExists::ErrorIfDifferent)))
         {
             self.existing_conflict(
                 &dst_path,
@@ -2591,7 +2631,30 @@ impl Planner<'_> {
         reopened_dirs: &std::collections::HashSet<PathBytes>,
     ) {
         let opts = self.opts;
+        let deferred_start = self.deferred.len();
+        let implicit_start = self.implicit_restorations.len();
         for (p, dst_rel, e, s) in planned {
+            if let Some(job) = &opts.resume_job {
+                if job.resumed
+                    && (job.owns_created(p, s.as_ref())
+                        || job.original(p).flatten().zip(s.as_ref()).is_some_and(
+                            |(original, current)| {
+                                (original.dev, original.ino) == (current.dev, current.ino)
+                            },
+                        ))
+                {
+                    if let Some((meta, flags)) = job.directory_metadata(p) {
+                        self.deferred.push((
+                            p.clone(),
+                            meta,
+                            flags,
+                            p.iter().filter(|&&byte| byte == b'/').count(),
+                            self.metadata_condition_for(p),
+                        ));
+                        continue;
+                    }
+                }
+            }
             if self.unselected_dirs.contains(p) {
                 // Containers keep receiver-created metadata. Only restore a
                 // mode temporarily reopened for their children. A restricted
@@ -2680,6 +2743,14 @@ impl Planner<'_> {
                 depth,
                 self.metadata_condition_for(p),
             ));
+        }
+        if let Some(job) = &opts.resume_job {
+            job.save_directory_metadata(
+                self.deferred[deferred_start..]
+                    .iter()
+                    .chain(&self.implicit_restorations[implicit_start..])
+                    .map(|(path, meta, flags, ..)| (path.clone(), meta.clone(), *flags)),
+            );
         }
     }
 
@@ -3430,10 +3501,19 @@ impl Planner<'_> {
         let dirs = std::mem::take(&mut self.deletes.dirs);
         let planned = leaves.len() as u64 + dirs.values().map(|v| v.len() as u64).sum::<u64>();
         self.progress.deletions_planned.store(planned, Relaxed);
+        let delete_paths: Vec<_> = leaves
+            .iter()
+            .map(|(path, ..)| path.clone())
+            .chain(dirs.values().flatten().map(|(path, ..)| path.clone()))
+            .collect();
+        let whole_job_total = opts
+            .resume_job
+            .as_ref()
+            .map_or(planned, |job| job.deletion_total(&delete_paths));
         if let Some(max) = opts.max_delete {
-            if planned > max {
+            if whole_job_total > max {
                 self.progress.eprintln(&format!(
-                    "syq: {planned} deletions planned, more than --max-delete {max}; deleting nothing"
+                    "syq: {planned} deletions planned ({whole_job_total} across the job), more than --max-delete {max}; deleting nothing"
                 ));
                 if let Some(results) = self.progress.results_writer().filter(|_| !opts.dry_run) {
                     let blocked = leaves
@@ -3462,6 +3542,11 @@ impl Planner<'_> {
                 self.max_delete_hit = true;
                 self.progress.deletions_blocked.store(planned, Relaxed);
                 return Ok(0);
+            }
+        }
+        if !opts.dry_run {
+            if let Some(job) = &opts.resume_job {
+                job.reserve_deletions(&delete_paths);
             }
         }
         let mut n = 0u64;
@@ -3715,6 +3800,20 @@ impl Planner<'_> {
             results.extend(self.apply(tail)?);
             return Ok(results);
         }
+        let created: Vec<_> = if self.opts.resume_job.is_some() {
+            ops.iter()
+                .enumerate()
+                .filter_map(|(index, op)| match op {
+                    Op::Mkdir { path, .. }
+                    | Op::Symlink { path, .. }
+                    | Op::Mknod { path, .. }
+                    | Op::Hardlink { path, .. } => Some((index, path.clone())),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         match ok(
             self.dst.call(Request::Apply {
                 ops,
@@ -3722,7 +3821,22 @@ impl Planner<'_> {
             })?,
             "apply",
         )? {
-            Response::Applied(v) => Ok(v),
+            Response::Applied(v) => {
+                let paths: Vec<_> = created
+                    .into_iter()
+                    .filter(|(index, _)| v.get(*index).is_some_and(Option::is_none))
+                    .map(|(_, path)| path)
+                    .collect();
+                if !paths.is_empty() {
+                    let observed = self.stat_many(paths.clone())?;
+                    if let Some(job) = &self.opts.resume_job {
+                        job.published(paths.into_iter().zip(observed).filter_map(
+                            |(path, entry)| entry.map(|entry| (path, (entry.dev, entry.ino))),
+                        ));
+                    }
+                }
+                Ok(v)
+            }
             other => bail!("unexpected response {other:?}"),
         }
     }

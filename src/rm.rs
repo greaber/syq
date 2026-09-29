@@ -93,6 +93,9 @@ pub fn run(mut args: Args) -> Result<i32> {
                 "failed",
                 1,
             );
+            if !args.dry_run {
+                crate::output::diagnostic!("syq: {} removals confirmed before failure; additional unacknowledged removals may have occurred", summary.entries_removed);
+            }
             Err(error)
         }
     }
@@ -183,6 +186,7 @@ fn run_remove(
         args.follows_native_source_paths(),
         args.dry_run,
         args.connections,
+        args.resume_job.as_ref(),
         &mut |messages| {
             if trace_resolution {
                 for message in messages {

@@ -342,21 +342,33 @@ impl Conn for LocalConn {
         follow_symlinks: bool,
         dry_run: bool,
         workers: usize,
+        job: Option<&std::sync::Arc<crate::resume::Job>>,
         trace: &mut dyn FnMut(Vec<String>) -> Result<()>,
         sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
     ) -> Result<()> {
         if self.role != LocalConnectionRole::Control {
             bail!("native removal is allowed only on the control connection");
         }
-        crate::native_rm::remove(
+        let endpoint_job = crate::resume::removal_job(job)?;
+        let outcome = crate::native_rm::remove_with_job(
             cwd,
             root,
             selections,
             follow_symlinks,
             dry_run,
             workers,
+            endpoint_job.clone(),
             trace,
             sink,
-        )
+        );
+        if endpoint_job
+            .as_ref()
+            .is_some_and(|endpoint| !endpoint.available())
+        {
+            if let Some(job) = job {
+                job.disable("endpoint journal became unavailable");
+            }
+        }
+        outcome
     }
 }

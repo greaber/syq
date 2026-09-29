@@ -67,6 +67,7 @@ impl Conn for FinishingConn {
         _: bool,
         _: bool,
         _: usize,
+        _job: Option<&std::sync::Arc<crate::resume::Job>>,
         _: &mut dyn FnMut(Vec<String>) -> anyhow::Result<()>,
         _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {

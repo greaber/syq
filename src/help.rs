@@ -157,6 +157,13 @@ pub(crate) fn filesystem(command: Command) -> Command {
     let map = command.get_name() == "syq map";
     let clean = command.get_name() == "syq clean-partials";
     let rm = command.get_name() == "syq rm" || clean;
+    let command = if cp || (rm && !clean) {
+        command.arg(Arg::new("resume").long("resume").value_name("JOB").help(
+            "Resume a previous named job; sources and destinations come from its saved command",
+        ))
+    } else {
+        command
+    };
     let command = command.mut_args(|arg| {
         if arg.is_hide_set() {
             return arg;

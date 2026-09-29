@@ -561,6 +561,7 @@ fn local_source_worker_rejects_destination_mutation_requests() {
             false,
             false,
             1,
+            None,
             &mut trace,
             &mut sink,
         )
@@ -583,6 +584,7 @@ fn local_source_worker_rejects_destination_mutation_requests() {
             false,
             false,
             1,
+            None,
             &mut trace,
             &mut sink,
         )

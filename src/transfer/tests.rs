@@ -188,6 +188,7 @@ impl Conn for PipelineConn {
         _: bool,
         _: bool,
         _: usize,
+        _job: Option<&std::sync::Arc<crate::resume::Job>>,
         _: &mut dyn FnMut(Vec<String>) -> Result<()>,
         _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
     ) -> Result<()> {
@@ -219,6 +220,7 @@ fn pipeline_worker(
     streaming: bool,
 ) -> Worker {
     let opts = Arc::new(Opts {
+        resume_job: None,
         local_copy_fd_budget: true,
         hash_policy: Default::default(),
         mapping_metadata: Default::default(),
@@ -1501,6 +1503,7 @@ impl Conn for SetupConn {
         _: bool,
         _: bool,
         _: usize,
+        _job: Option<&std::sync::Arc<crate::resume::Job>>,
         _: &mut dyn FnMut(Vec<String>) -> Result<()>,
         _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
     ) -> Result<()> {
@@ -1914,6 +1917,7 @@ fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
             _: bool,
             _: bool,
             _: usize,
+            _job: Option<&std::sync::Arc<crate::resume::Job>>,
             _: &mut dyn FnMut(Vec<String>) -> Result<()>,
             _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
         ) -> Result<()> {

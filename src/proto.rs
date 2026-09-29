@@ -715,6 +715,7 @@ pub enum WireRequest<Data> {
         cwd: Option<PathBytes>,
         root: Option<PathBytes>,
         selections: Vec<NativeRemoveSelection>,
+        job: Option<crate::resume::JobSpec>,
         follow_symlinks: bool,
         dry_run: bool,
         workers: usize,
@@ -1210,6 +1211,7 @@ pub enum Response {
     /// An empty batch is an attached native-rm liveness frame.
     NativeRemoveBatch(Vec<NativeRemoveOutcome>),
     NativeRemoveDone,
+    NativeRemoveJobAvailable(bool),
     Stats(Vec<Option<Entry>>),
     /// Absolute operator spelling plus device/inode of the securely opened
     /// directory, or None when an allowed missing suffix was reached.
