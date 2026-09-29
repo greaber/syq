@@ -266,7 +266,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                         response = run(put + ['--if-exists=error', *placement], stdin=stream, env=env)
                         failure(response)
                         assert stream.tell() == 0, 'rejected stream input was consumed'
-                    assert b'--if-exists=error' in response.stderr
+                    assert b'--if-exists=error' in response.stderr, response.stderr
                     assert (STATE.get('reads', 0), STATE.get('writes', 0), STATE['heads']) == (before[0], before[1], before[2] + 1)
                 before = STATE['heads']
                 success(run(put, input=b'x' * len(payload), env=env))
@@ -274,9 +274,9 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 assert STATE['heads'] == before, 'default uploads must not gain a HEAD'
             fifo = Path(temp) / 'unopened-fifo'
             os.mkfifo(fifo)
-            response = run(put + ['--src', str(fifo), '--if-exists=error'], env=env)
+            response = run(base + ['--src', str(fifo), '--to', 's3://bucket', '--as', 'object', '--if-exists=error'], env=env)
             failure(response)
-            assert b'--if-exists=error' in response.stderr
+            assert b'--if-exists=error' in response.stderr, response.stderr
             # The preflight is optional for write-only credentials. Conditional
             # creation remains authoritative after a denial or a stale absence.
             for payload in (b'new object', DATA):
