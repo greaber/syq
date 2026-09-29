@@ -95,6 +95,20 @@ pub(crate) fn record_test_event(variable: &str, event: std::fmt::Arguments<'_>) 
     Ok(())
 }
 
+/// Tests simulate data corrupted in transit: the first received payload whose
+/// check runs after `SYQ_TEST_CORRUPT_PAYLOAD_ONCE` names a missing file fails
+/// its check, and that file is created so later payloads pass.
+#[cfg(debug_assertions)]
+fn test_corrupt_payload_once() -> bool {
+    std::env::var_os("SYQ_TEST_CORRUPT_PAYLOAD_ONCE").is_some_and(|marker| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker)
+            .is_ok()
+    })
+}
+
 #[cfg(debug_assertions)]
 pub(crate) fn test_race_barrier(ready_env: &str, continue_env: &str, label: &str) -> Result<()> {
     let ready = std::env::var_os(ready_env);
@@ -604,6 +618,13 @@ impl FsOps {
         let _hash = self
             .operation
             .span(crate::transfer_observations::Stage::Hashing);
+        #[cfg(debug_assertions)]
+        if test_corrupt_payload_once() {
+            return self
+                .hash_policy
+                .payload_algorithm()
+                .hash(&[bytes, b"corrupted"].concat());
+        }
         self.hash_policy.payload_algorithm().hash(bytes)
     }
 

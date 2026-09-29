@@ -826,3 +826,46 @@ fn dry_run_hash_mapping_reports_source_names_and_timestamp_only_changes() {
         );
     }
 }
+
+#[test]
+fn rejected_small_copy_payloads_reconnect_before_the_ordinary_engine() {
+    // The native small copy selects the destination directory before its
+    // payloads arrive. When the receiver rejects them, here after a simulated
+    // payload-check mismatch, the ordinary engine must start on a fresh
+    // control session and copy the file again.
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("source"), b"small copy payload");
+    let marker = t.path("corrupted-once");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--to",
+            "host",
+            "--as",
+            &t.s("destination"),
+        ])
+        .args(["--rsh", rsh.to_str().unwrap()])
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args(["--no-tcp", "--no-progress"])
+        .args(["--integrity-checking", "transfer=blake3"])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_TEST_CORRUPT_PAYLOAD_ONCE", &marker)
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert!(marker.exists(), "the payload check never ran");
+    assert_eq!(read(&t.path("destination")), b"small copy payload");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("small copy failed (")
+            && stderr.contains("using the ordinary engine on a new control connection"),
+        "{stderr}"
+    );
+}
