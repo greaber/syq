@@ -250,6 +250,7 @@ fn pipeline_worker(
         inplace: false,
         same_host: false,
         allow_sequential_nfs_fallback: false,
+        src_remote: false,
         dst_remote: true,
         restricted_receiver: false,
         dry_run: false,
@@ -2151,117 +2152,122 @@ fn comparing_pull_pipelines_remote_reads_with_a_synchronous_destination() {
 }
 
 #[test]
-fn bandwidth_limited_pull_compares_before_pacing_only_differing_reads() {
-    for basis in [
-        "final",
-        "owned-partial",
-        "candidate",
-        "candidate-with-final",
-        "candidate-reuse-off",
-    ] {
-        let sched = Arc::new(Sched::new(512, 8192));
-        let mut job = pipeline_job(b"source", 1536);
-        // Even a final file must not take precedence over an owned partial.
-        if matches!(
-            basis,
-            "final" | "owned-partial" | "candidate-with-final" | "candidate-reuse-off"
-        ) {
-            job.dst_entry = Some(job.entry.clone());
-        }
-        sched.push_file(job.clone());
-        sched.scan_done();
-        assert!(matches!(sched.next(), Item::File(0)));
-        let src = Arc::new(Mutex::new(PipelineState::default()));
-        let dst = Arc::new(Mutex::new(PipelineState::default()));
-        let data = vec![3; 512];
-        src.lock().unwrap().replies.extend([
-            Response::Hashes(vec![[1; 32], [2; 32], content_digest(&data)]),
-            Response::Block {
-                off: 1024,
-                hash: content_digest(&data),
-                data,
-            },
-            Response::Stats(vec![Some(job.entry.clone())]),
-        ]);
-        dst.lock()
-            .unwrap()
-            .replies
-            .push_back(Response::Prepared(Preparation {
-                partial_size: (basis == "owned-partial").then_some(1536),
-                has_candidates: basis.starts_with("candidate"),
-            }));
-        if matches!(basis, "final" | "candidate-with-final") {
-            dst.lock().unwrap().replies.push_back(Response::HeldHashes {
-                hashes: vec![[1; 32], [2; 32], [9; 32]],
-                len: 1536,
-            });
-        }
-        dst.lock().unwrap().replies.extend([
-            Response::SeededBasis(SeededBasis {
-                hashes: if basis == "final" {
-                    vec![[1; 32], [2; 32]]
-                } else {
-                    vec![[1; 32], [2; 32], [9; 32]]
+fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads() {
+    // A relay must pay before receiving data, just like a pull. Its local
+    // forwarding write must not be the first place the limit is applied.
+    for relay in [false, true] {
+        for basis in [
+            "final",
+            "owned-partial",
+            "candidate",
+            "candidate-with-final",
+            "candidate-reuse-off",
+        ] {
+            let sched = Arc::new(Sched::new(512, 8192));
+            let mut job = pipeline_job(b"source", 1536);
+            // Even a final file must not take precedence over an owned partial.
+            if matches!(
+                basis,
+                "final" | "owned-partial" | "candidate-with-final" | "candidate-reuse-off"
+            ) {
+                job.dst_entry = Some(job.entry.clone());
+            }
+            sched.push_file(job.clone());
+            sched.scan_done();
+            assert!(matches!(sched.next(), Item::File(0)));
+            let src = Arc::new(Mutex::new(PipelineState::default()));
+            let dst = Arc::new(Mutex::new(PipelineState::default()));
+            let data = vec![3; 512];
+            src.lock().unwrap().replies.extend([
+                Response::Hashes(vec![[1; 32], [2; 32], content_digest(&data)]),
+                Response::Block {
+                    off: 1024,
+                    hash: content_digest(&data),
+                    data,
                 },
-                selected_final: basis == "final",
-            }),
-            Response::Ok, // write
-            Response::Ok, // finalize
-        ]);
-        let mut worker = pipeline_worker(&sched, &src, &dst, false);
-        let opts = Arc::get_mut(&mut worker.opts).unwrap();
-        opts.dst_remote = false;
-        opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
-        if basis == "candidate-reuse-off" {
-            opts.tuning.block_reuse = Some(crate::transfer_tuning::BlockReuse::Off);
-        }
-        worker.bwlimit = Some(Arc::new(BandwidthLimit::new(5120)));
-        worker.progress.bytes_total.store(1536, Relaxed);
-        worker.progress.files_total.store(1, Relaxed);
-        worker.handle_file(0).unwrap();
-        assert!(sched.finished());
-        assert_eq!(worker.progress.bytes_unchanged.load(Relaxed), 1024);
-        assert_eq!(worker.progress.bytes_done.load(Relaxed), 512);
-        assert!(!worker.job(0).compare_ranges);
-        let source = src.lock().unwrap();
-        assert!(
-            matches!(
-                source.requests.as_slice(),
-                [
-                    Request::HashBlocks {
-                        block: 512,
-                        len: 1536,
-                        ..
+                Response::Stats(vec![Some(job.entry.clone())]),
+            ]);
+            dst.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::Prepared(Preparation {
+                    partial_size: (basis == "owned-partial").then_some(1536),
+                    has_candidates: basis.starts_with("candidate"),
+                }));
+            if matches!(basis, "final" | "candidate-with-final") {
+                dst.lock().unwrap().replies.push_back(Response::HeldHashes {
+                    hashes: vec![[1; 32], [2; 32], [9; 32]],
+                    len: 1536,
+                });
+            }
+            dst.lock().unwrap().replies.extend([
+                Response::SeededBasis(SeededBasis {
+                    hashes: if basis == "final" {
+                        vec![[1; 32], [2; 32]]
+                    } else {
+                        vec![[1; 32], [2; 32], [9; 32]]
                     },
-                    Request::ReadRange {
-                        off: 1024,
-                        len: 512,
-                        ..
-                    },
-                    Request::StatMany { .. },
-                ]
-            ),
-            "{basis}: {:?}",
-            source.requests
-        );
-        // The budget must be paid before sending the data request, not after
-        // receiving its response. No upper bound assumes a quiet test machine.
-        assert!(
-            source.sent_at[1].duration_since(source.sent_at[0])
-                >= std::time::Duration::from_millis(100),
-            "{basis}"
-        );
-        assert!(source.replies.is_empty());
-        let destination = dst.lock().unwrap();
-        assert!(destination.replies.is_empty());
-        assert!(!destination
-            .requests
-            .iter()
-            .any(|r| matches!(r, Request::StageBasis { .. } | Request::HashWindow { .. })));
-        if !matches!(basis, "final" | "candidate-with-final") {
-            assert!(destination.requests.iter().any(|r| matches!(r,
-                Request::SeedBasis { final_ranges: Some(ranges), .. } if ranges.is_empty()
-            )));
+                    selected_final: basis == "final",
+                }),
+                Response::Ok, // write
+                Response::Ok, // finalize
+            ]);
+            let mut worker = pipeline_worker(&sched, &src, &dst, false);
+            let opts = Arc::get_mut(&mut worker.opts).unwrap();
+            opts.src_remote = true;
+            opts.dst_remote = relay;
+            opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
+            if basis == "candidate-reuse-off" {
+                opts.tuning.block_reuse = Some(crate::transfer_tuning::BlockReuse::Off);
+            }
+            worker.bwlimit = Some(Arc::new(BandwidthLimit::new(5120)));
+            worker.progress.bytes_total.store(1536, Relaxed);
+            worker.progress.files_total.store(1, Relaxed);
+            worker.handle_file(0).unwrap();
+            assert!(sched.finished());
+            assert_eq!(worker.progress.bytes_unchanged.load(Relaxed), 1024);
+            assert_eq!(worker.progress.bytes_done.load(Relaxed), 512);
+            assert!(!worker.job(0).compare_ranges);
+            let source = src.lock().unwrap();
+            assert!(
+                matches!(
+                    source.requests.as_slice(),
+                    [
+                        Request::HashBlocks {
+                            block: 512,
+                            len: 1536,
+                            ..
+                        },
+                        Request::ReadRange {
+                            off: 1024,
+                            len: 512,
+                            ..
+                        },
+                        Request::StatMany { .. },
+                    ]
+                ),
+                "{basis}: {:?}",
+                source.requests
+            );
+            // The budget must be paid before sending the data request, not after
+            // receiving its response. No upper bound assumes a quiet test machine.
+            assert!(
+                source.sent_at[1].duration_since(source.sent_at[0])
+                    >= std::time::Duration::from_millis(100),
+                "{basis}"
+            );
+            assert!(source.replies.is_empty());
+            let destination = dst.lock().unwrap();
+            assert!(destination.replies.is_empty());
+            assert!(!destination
+                .requests
+                .iter()
+                .any(|r| matches!(r, Request::StageBasis { .. } | Request::HashWindow { .. })));
+            if !matches!(basis, "final" | "candidate-with-final") {
+                assert!(destination.requests.iter().any(|r| matches!(r,
+                    Request::SeedBasis { final_ranges: Some(ranges), .. } if ranges.is_empty()
+                )));
+            }
         }
     }
 }

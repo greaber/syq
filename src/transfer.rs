@@ -149,6 +149,7 @@ pub struct Opts {
     /// Automatic copies and explicit -j1 may use one direct userspace writer
     /// for the proven local-filesystem -> asynchronous-NFS topology.
     pub allow_sequential_nfs_fallback: bool,
+    pub src_remote: bool,
     pub dst_remote: bool,
     pub restricted_receiver: bool,
     pub dry_run: bool,
@@ -1701,6 +1702,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         allow_sequential_nfs_fallback: args.connections_default || args.connections == 1,
+        src_remote: src_ep.is_remote(),
         dst_remote: dst_ep.is_remote(),
         restricted_receiver: args.restricted_grant.is_some(),
         dry_run: args.dry_run,

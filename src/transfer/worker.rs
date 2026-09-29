@@ -948,7 +948,7 @@ impl Worker {
                 && reuse_blocks
                 && final_is_file
                 && !self.opts.checksum
-                && !self.bandwidth_limited_pull()
+                && !self.bandwidth_limited_remote_source()
                 && size > 0
             {
                 if final_entry.is_some_and(|entry| entry.size == size)
@@ -1100,12 +1100,12 @@ impl Worker {
         Ok(true)
     }
 
-    fn bandwidth_limited_pull(&self) -> bool {
-        self.bwlimit.is_some() && !self.opts.same_host && !self.opts.dst_remote
+    fn bandwidth_limited_remote_source(&self) -> bool {
+        self.bwlimit.is_some() && self.opts.src_remote
     }
 
     fn resume_ranges(&mut self, idx: usize, job: &WorkerJob) -> Result<Vec<(u64, u64)>> {
-        if self.bandwidth_limited_pull() {
+        if self.bandwidth_limited_remote_source() {
             // Conditional source reads may return data immediately. Compare
             // first so only differing bytes consume bandwidth, and the normal
             // range/stream path pays their budget before requesting them.

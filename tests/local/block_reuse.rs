@@ -679,3 +679,36 @@ fn bandwidth_limited_pulls_transfer_only_differing_blocks() {
         }
     }
 }
+
+#[test]
+fn bandwidth_limited_relays_transfer_only_differing_blocks() {
+    for changed in [0, 1 << 19, 1 << 20] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        let source = prng(1 << 20, 865);
+        let mut old = source.clone();
+        old[..changed].fill(0);
+        write(&t.path("src"), &source);
+        write(&t.path("dst"), &old);
+        set_mtime(&t.path("dst"), 1);
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"]).arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-tcp",
+                "--no-progress", "--resource-limits=bandwidth=1M",
+                "--performance-tuning=workers=1,copy-path=ranges,request-size=128K,comparison-block-size=256K,bw-pacing=average",
+                "--from", "hostA", &t.s("src"), "--to", "hostB",
+                "--coordinate-at", "local", "--as", &t.s("dst")])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("SYQ_DEBUG", "1")
+            .run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), source);
+        assert_eq!(
+            tuning_observed(&out)["range_requests"],
+            changed / (128 << 10)
+        );
+        assert!(partial_files(&t.0).is_empty());
+    }
+}
