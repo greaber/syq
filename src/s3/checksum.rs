@@ -58,7 +58,6 @@ impl Algorithm {
             Self::Md5 => Hasher::Md5(md5::Md5::new()),
         }
     }
-    #[cfg(test)]
     pub fn digest(self, bytes: &[u8]) -> String {
         let mut hash = self.hasher();
         hash.update(bytes);
