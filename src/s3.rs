@@ -7,6 +7,7 @@ mod client;
 mod delete;
 mod diagnostics;
 mod dns;
+mod jobs;
 pub(crate) mod listing;
 mod local;
 pub(crate) mod map;
@@ -364,6 +365,9 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
     }
     let ticker = progress.spawn_ticker();
     let result = (|| {
+        if let Some(job) = args.resume_job.clone() {
+            job.save_inputs(&mut args)?;
+        }
         args.read_copy_inputs()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -402,6 +406,13 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
     } else {
         0
     };
+    if let Some(job) = &args.resume_job {
+        job.flush();
+    }
+    if code != 0 {
+        progress.eprintln(&format!("syq: changes observed before failure: {} files copied or replaced, {} directories created, {} symlinks created, {} entries removed. Partial writes, metadata changes, or unacknowledged remote changes may also have occurred.",
+            progress.files_done.load(Relaxed), progress.directories_created.load(Relaxed), progress.symlinks_created.load(Relaxed), progress.deletions_completed.load(Relaxed)));
+    }
     progress.finish(code == 0);
     if let Some(ticker) = ticker {
         ticker

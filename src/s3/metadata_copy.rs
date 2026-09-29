@@ -160,6 +160,10 @@ impl Prepared {
         self.request.headers["x-amz-copy-source-if-match"] == etag
     }
 
+    pub(super) fn key(&self) -> &str {
+        &self.request.key
+    }
+
     pub(super) fn requests(&self) -> Vec<Unsigned> {
         let Some((id, part_size)) = &self.multipart else {
             return vec![self.request.clone()];
@@ -218,7 +222,7 @@ impl Prepared {
         bucket: &str,
         workers: usize,
         acquire: F,
-    ) -> Result<()>
+    ) -> Result<(Option<String>, Option<String>)>
     where
         F: Fn() -> A,
         A: Future<Output = Result<P>>,
@@ -228,7 +232,7 @@ impl Prepared {
             return client::copy_metadata(client, bucket, self.request.clone()).await;
         };
         let failed = AtomicBool::new(false);
-        let result: Result<()> = async {
+        let result = async {
             let mut parts = stream::iter(0..self.size.div_ceil(*part_size))
                 .take_while(|_| std::future::ready(!failed.load(Relaxed)))
                 .map(|index| {
@@ -277,7 +281,7 @@ impl Prepared {
                 .collect::<Result<Vec<_>>>()?;
             parts.sort_by_key(|part| part.part_number());
             let _permit = acquire().await?;
-            client
+            let output = client
                 .complete_multipart_upload()
                 .bucket(bucket)
                 .key(&self.request.key)
@@ -291,7 +295,10 @@ impl Prepared {
                 .send()
                 .await
                 .context("complete metadata update")?;
-            Ok(())
+            Ok((
+                output.e_tag().map(str::to_owned),
+                output.version_id().map(str::to_owned),
+            ))
         }
         .await;
         if result.is_err() {

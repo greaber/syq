@@ -41,13 +41,15 @@ use tokio::{io::AsyncReadExt, sync::Mutex};
 
 type DirectoryMetadata = Arc<Mutex<Vec<(String, Metadata, Option<u32>, crate::mapping::Metadata)>>>;
 
+type DestinationKeys = HashMap<String, (u64, Option<(i64, u32)>, Option<String>)>;
+
 pub(super) struct Engine {
     args: Arc<Args>,
     options: Options,
     client: Client,
     progress: Arc<Progress>,
     pace: Mutex<tokio::time::Instant>,
-    upload_keys: OnceLock<HashMap<String, u64>>,
+    upload_keys: OnceLock<DestinationKeys>,
     copy_checksum_unsupported: std::sync::atomic::AtomicBool,
     copy_tagging_unsupported: std::sync::atomic::AtomicBool,
     tuning: super::tuning::Tuning,
@@ -197,6 +199,7 @@ impl Engine {
             progress.println(&note);
         }
         super::diagnostics::elapsed(setup, "client_setup", 0);
+        super::jobs::bind(&args, &options)?;
         Ok(Arc::new(Self {
             tuning: super::tuning::Tuning::new(&options, &args, control),
             cancelled: std::sync::atomic::AtomicBool::new(false),
@@ -569,18 +572,17 @@ impl Engine {
                 // Pruning needs every destination key, including keys absent
                 // from the upload plan. Only this complete cache is reusable
                 // by the deletion planner.
-                client::list(
-                    &self.client,
-                    &self.options.bucket,
-                    &prefix,
-                    None,
-                    &mut HashSet::new(),
-                    self.options.concurrency,
-                )
-                .await
-                .map(|listing| Some(listing.into_objects().into_iter().collect()))
+                self.list_destination(&prefix).await.map(Some)
             } else {
-                client::upload_listing(&self.client, &self.options.bucket, &prefix, &keys).await
+                client::upload_listing(&self.client, &self.options.bucket, &prefix, &keys)
+                    .await
+                    .map(|keys| {
+                        keys.map(|keys| {
+                            keys.into_iter()
+                                .map(|(key, size)| (key, (size, None, None)))
+                                .collect()
+                        })
+                    })
             };
             match listing {
                 Ok(Some(keys)) => {
@@ -625,7 +627,14 @@ impl Engine {
             && (self.args.placement != Placement::As || single_object == Some(false));
         let present = (!needs_prefix && exact)
             || client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
-        if (self.args.target_existence == Existence::New && present)
+        let scope = format!("s3-placement:{}", target);
+        let owned = self.args.resume_job.as_ref().is_some_and(|job| {
+            job.object_original(scope.as_bytes()) == Some(None)
+                && job.has_created_objects_beneath(
+                    format!("s3\0{}\0", self.options.bucket).as_bytes(),
+                )
+        });
+        if (self.args.target_existence == Existence::New && present && !owned)
             || (self.args.target_existence == Existence::Existing && !present)
         {
             bail!("S3 destination existence condition failed");
@@ -633,6 +642,11 @@ impl Engine {
         if self.args.placement == Placement::As && single_object == Some(true) && present && !exact
         {
             bail!("S3 destination is a prefix, not an object");
+        }
+        if !self.args.dry_run {
+            if let Some(job) = &self.args.resume_job {
+                job.observe_object(scope.as_bytes(), present.then(|| "present".into()));
+            }
         }
         Ok(())
     }
@@ -756,6 +770,7 @@ impl Engine {
             let object = client::head(&self.client, &self.options.bucket, &source.key).await?;
             object
         };
+        let owned = super::jobs::observe(&self.args, &source.key, existing.as_ref());
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {
@@ -778,6 +793,7 @@ impl Engine {
         anyhow::ensure!(
             source.kind() == ObjectKind::Dir
                 || existing.is_none()
+                || owned
                 || self.args.if_exists != Some(crate::cli::IfExists::Error),
             "destination already exists: {} (--if-exists=error)",
             source.key
@@ -799,7 +815,8 @@ impl Engine {
         } else {
             source.meta.len
         };
-        let protected_existing = self.args.protects_existing_contents()
+        let protected_existing = !owned
+            && self.args.protects_existing_contents()
             && existing.is_some()
             && source.kind() != ObjectKind::Dir;
         anyhow::ensure!(
@@ -979,7 +996,7 @@ impl Engine {
             return Ok(UploadPreparation::Preview(size));
         }
         let must_be_new = self.args.ignore_existing
-            || self.args.target_existence == Existence::New
+            || (self.args.target_existence == Existence::New && !owned)
             || (self.args.protects_existing_contents() && existing.is_none());
         let multipart = if size > part_size && small.is_none() {
             Some(
@@ -1020,7 +1037,7 @@ impl Engine {
             UploadPreparation::Ready(prepared) => *prepared,
         };
         if let Some(update) = &prepared.metadata_update {
-            update
+            let (etag, version) = update
                 .execute(
                     &self.client,
                     &self.options.bucket,
@@ -1032,6 +1049,12 @@ impl Engine {
                     },
                 )
                 .await?;
+            crate::s3::jobs::published(
+                &self.args,
+                update.key(),
+                etag.as_deref(),
+                version.as_deref(),
+            );
             self.progress
                 .bytes_unchanged
                 .fetch_add(prepared.size, Relaxed);
@@ -1091,7 +1114,15 @@ impl Engine {
                     file.drain().await;
                 }
                 match result {
-                    Ok(_) => break,
+                    Ok(output) => {
+                        super::jobs::published(
+                            &self.args,
+                            &source.key,
+                            output.e_tag(),
+                            output.version_id(),
+                        );
+                        break;
+                    }
                     Err(e) if retryable(&e) && attempt < self.options.retries => {
                         super::backoff(attempt).await;
                         attempt += 1;
@@ -1257,7 +1288,8 @@ impl Engine {
                 source.check(&source.open()?)?;
                 let mut completed = completed;
                 completed.sort_by_key(|p| p.part_number());
-                self.client
+                let output = self
+                    .client
                     .complete_multipart_upload()
                     .bucket(&self.options.bucket)
                     .key(&source.key)
@@ -1272,6 +1304,12 @@ impl Engine {
                     .await
                     .map_err(|e| e.into_service_error())
                     .context("complete multipart upload; rerun the command to recover")?;
+                super::jobs::published(
+                    &self.args,
+                    &source.key,
+                    output.e_tag(),
+                    output.version_id(),
+                );
                 Ok(())
             }
             .await;
@@ -1961,6 +1999,14 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
+        let journal_path = destination.job_path(job.path.as_bytes());
+        let current_identity = existing.map(super::jobs::local_identity);
+        let owned = self.args.resume_job.as_ref().is_some_and(|journal| {
+            if !self.args.dry_run {
+                journal.observe_object(&journal_path, current_identity.clone());
+            }
+            journal.owns_object(&journal_path, current_identity.as_deref())
+        });
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {
@@ -2085,6 +2131,7 @@ impl Engine {
         anyhow::ensure!(
             object.kind() == ObjectKind::Dir
                 || existing.is_none()
+                || owned
                 || self.args.if_exists != Some(crate::cli::IfExists::Error),
             "destination already exists: {} (--if-exists=error)",
             job.path
@@ -2106,9 +2153,10 @@ impl Engine {
         if object.kind() == ObjectKind::Dir {
             if !self.args.dry_run {
                 if existing.is_none() {
-                    root.create_missing_parents(&path, 0o777)?;
+                    destination.create_parents(&self.args, &path)?;
                     match root.create_directory(&path, 0o777) {
                         Ok(()) => {
+                            destination.published(&self.args, &job.path)?;
                             self.progress.directories_created.fetch_add(1, Relaxed);
                         }
                         Err(e) if root.metadata(&path).is_ok_and(|m| m.is_dir()) => {
@@ -2117,12 +2165,14 @@ impl Engine {
                         Err(e) => return Err(e),
                     }
                 }
-                directories.lock().await.push((
-                    job.path.clone(),
-                    metadata,
-                    existing.map(|m| m.mode & 0o7777),
-                    explicit,
-                ));
+                let mode = existing.map(|m| m.mode & 0o7777);
+                let mode = self.args.resume_job.as_ref().map_or(mode, |journal| {
+                    journal.original_directory_mode(&journal_path, mode, false)
+                });
+                directories
+                    .lock()
+                    .await
+                    .push((job.path.clone(), metadata, mode, explicit));
             }
             return Ok(Some(0));
         }
@@ -2143,18 +2193,19 @@ impl Engine {
             let same = existing.is_some_and(|m| m.is_symlink()) && root.read_link(&path)? == bytes;
 
             anyhow::ensure!(
-                same || existing.is_none() || !self.args.protects_existing_contents(),
+                same || existing.is_none() || owned || !self.args.protects_existing_contents(),
                 "destination contents differ: {} (--if-exists=error-if-different)",
                 job.path
             );
             if !self.args.dry_run {
-                root.create_missing_parents(&path, 0o777)?;
+                destination.create_parents(&self.args, &path)?;
                 if !same {
                     if existing.is_some() {
                         root.replace_symlink(&path, &bytes)?;
                     } else {
                         root.create_symlink(&path, &bytes)?;
                     }
+                    destination.published(&self.args, &job.path)?;
                     self.progress.symlinks_created.fetch_add(1, Relaxed);
                 }
                 local::apply_metadata(root, &path, &metadata, &self.args, None, explicit, !same)?;
@@ -2179,7 +2230,7 @@ impl Engine {
             }
         }
         anyhow::ensure!(
-            unchanged || existing.is_none() || !self.args.protects_existing_contents(),
+            unchanged || existing.is_none() || owned || !self.args.protects_existing_contents(),
             "destination contents differ: {} (--if-exists=error-if-different)",
             job.path
         );
@@ -2236,7 +2287,7 @@ impl Engine {
             self.progress.add_bytes(object.size);
             return Ok(Some(object.size));
         }
-        root.create_missing_parents(&path, 0o777)?;
+        destination.create_parents(&self.args, &path)?;
         if object.size <= part_size {
             return self
                 .download_single(
@@ -2247,6 +2298,11 @@ impl Engine {
                     existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
                     initial,
                     initial_slot,
+                    &journal_path,
+                    self.args.ignore_existing
+                        || (!owned
+                            && (self.args.target_existence == Existence::New
+                                || self.args.protects_existing_contents())),
                 )
                 .await;
         }
@@ -2397,12 +2453,16 @@ impl Engine {
         )?;
         let m = file.metadata()?;
         if self.args.ignore_existing
-            || self.args.target_existence == Existence::New
-            || self.args.protects_existing_contents()
+            || (!owned
+                && (self.args.target_existence == Existence::New
+                    || self.args.protects_existing_contents()))
         {
             root.publish_new_regular(&partial_path, &path, (m.dev(), m.ino()))?;
         } else {
             root.rename_regular_if_same(&partial_path, &path, (m.dev(), m.ino()))?;
+        }
+        if let Some(journal) = &self.args.resume_job {
+            journal.published_object(&journal_path, format!("{}:{}", m.dev(), m.ino()));
         }
         state.clear()?;
         Ok(Some(object.size))
@@ -2460,6 +2520,8 @@ impl Engine {
         mode: Option<u32>,
         initial: Option<ByteStream>,
         initial_slot: Option<super::tuning::Permit>,
+        journal_path: &[u8],
+        must_be_new: bool,
     ) -> Result<Option<u64>> {
         let (metadata, expected_hash, explicit) = validation;
         let path_buf = path.to_path_buf();
@@ -2519,13 +2581,13 @@ impl Engine {
             self.check_cancelled()?;
             local::apply_file_metadata(&file, metadata, &self.args, mode, explicit)?;
             let m = file.metadata()?;
-            if self.args.ignore_existing
-                || self.args.target_existence == Existence::New
-                || self.args.protects_existing_contents()
-            {
+            if must_be_new {
                 root.publish_new_regular(&partial, path, (m.dev(), m.ino()))?;
             } else {
                 root.rename_regular_if_same(&partial, path, (m.dev(), m.ino()))?;
+            }
+            if let Some(job) = &self.args.resume_job {
+                job.published_object(journal_path, format!("{}:{}", m.dev(), m.ino()));
             }
             Ok(Some(object.size))
         }

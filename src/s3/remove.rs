@@ -48,6 +48,7 @@ struct Entry {
     version: Option<String>,
     marker: bool,
     selector: u64,
+    identity: String,
 }
 impl Entry {
     fn kind(&self) -> &'static str {
@@ -79,16 +80,34 @@ async fn versions(client: &Client, bucket: &str, prefix: &str, exact: bool) -> R
                 anyhow::Error::new(e.into_service_error()).context(message)
             })?;
         let mut past_exact = false;
-        for (key, version, marker) in output
+        for (key, version, marker, identity) in output
             .versions()
             .iter()
-            .map(|v| (v.key(), v.version_id(), false))
-            .chain(
-                output
-                    .delete_markers()
-                    .iter()
-                    .map(|v| (v.key(), v.version_id(), true)),
-            )
+            .map(|v| {
+                (
+                    v.key(),
+                    v.version_id(),
+                    false,
+                    serde_json::to_string(&(
+                        v.version_id(),
+                        v.e_tag(),
+                        v.last_modified().map(|t| (t.secs(), t.subsec_nanos())),
+                    ))
+                    .expect("version identity serializes"),
+                )
+            })
+            .chain(output.delete_markers().iter().map(|v| {
+                (
+                    v.key(),
+                    v.version_id(),
+                    true,
+                    serde_json::to_string(&(
+                        v.version_id(),
+                        v.last_modified().map(|t| (t.secs(), t.subsec_nanos())),
+                    ))
+                    .expect("marker identity serializes"),
+                )
+            }))
         {
             let key = key.context("S3 version listing omitted key")?;
             anyhow::ensure!(
@@ -104,6 +123,7 @@ async fn versions(client: &Client, bucket: &str, prefix: &str, exact: bool) -> R
             }
             entries.push(Entry {
                 key: key.into(),
+                identity,
                 version: Some(version.into()),
                 marker,
                 selector: 0,
@@ -140,21 +160,17 @@ async fn versions(client: &Client, bucket: &str, prefix: &str, exact: bool) -> R
     Ok(entries)
 }
 
-async fn present(client: &Client, bucket: &str, key: &str) -> Result<bool> {
-    match client.head_object().bucket(bucket).key(key).send().await {
-        Ok(_) => Ok(true),
-        Err(error)
-            if error
-                .raw_response()
-                .is_some_and(|r| r.status().as_u16() == 404) =>
-        {
-            Ok(false)
-        }
-        Err(error) => {
-            let message = client::failure("resolve S3 removal key", &error);
-            Err(error.into_service_error()).context(message)
-        }
-    }
+async fn present(client: &Client, bucket: &str, key: &str) -> Result<Option<String>> {
+    let output = client::head_output(client, bucket, key, None).await?;
+    Ok(output.map(|output| {
+        super::jobs::removal_identity(
+            output.content_length().unwrap_or(0).max(0) as u64,
+            output
+                .last_modified()
+                .map(|time| (time.secs(), time.subsec_nanos())),
+            output.e_tag(),
+        )
+    }))
 }
 
 // Share selector interpretation with authorization so approved keys match the
@@ -214,13 +230,18 @@ async fn plan(
         } else {
             format!("{key}/")
         };
+        let current = if !directory && !use_versions {
+            present(client, bucket, &key).await?
+        } else {
+            None
+        };
         let exact = !directory
             && if use_versions {
                 listed.iter().any(|e| {
                     e.key == key && exact_version.is_none_or(|id| e.version.as_deref() == Some(id))
                 })
             } else {
-                present(client, bucket, &key).await?
+                current.is_some()
             };
         if use_versions && exact_version.is_none() && !exact {
             listed.extend(versions(client, bucket, &prefix, false).await?);
@@ -240,18 +261,18 @@ async fn plan(
         let exists;
         if is_tree {
             if !use_versions {
-                listed = client::list(
+                listed = client::list_for_removal(
                     client,
                     bucket,
                     &prefix,
-                    None,
-                    &mut HashSet::new(),
                     args.s3.as_ref().unwrap().concurrency,
+                    args.resume_job.is_some(),
                 )
                 .await?
-                .into_objects()
+                .into_identities()
                 .into_iter()
-                .map(|(key, _)| Entry {
+                .map(|(key, size, time, etag)| Entry {
+                    identity: super::jobs::removal_identity(size, time, etag.as_deref()),
                     key,
                     version: None,
                     marker: false,
@@ -277,6 +298,7 @@ async fn plan(
             } else if exact {
                 listed.push(Entry {
                     key: key.clone(),
+                    identity: current.clone().unwrap(),
                     version: None,
                     marker: false,
                     selector: 0,
@@ -307,6 +329,26 @@ async fn plan(
             }
         }
     }
+    if let Some(job) = &args.resume_job {
+        if entries.iter().any(|entry| entry.identity == "unavailable") {
+            job.disable("S3 omitted object identity from removal discovery");
+        }
+        let identities: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    super::jobs::key(bucket, &entry.key, entry.version.as_deref()),
+                    entry.identity.clone(),
+                )
+            })
+            .collect();
+        let selected = job.prepare_object_removals(&identities, args.dry_run)?;
+        entries = entries
+            .into_iter()
+            .zip(selected)
+            .filter_map(|(entry, selected)| selected.then_some(entry))
+            .collect();
+    }
     // Retain delete markers until all selected data versions have been removed.
     entries.sort_by_key(|e| e.marker);
     Ok(entries)
@@ -335,6 +377,13 @@ fn finished(
         summary.entries_planned += 1;
     } else {
         summary.entries_removed += 1;
+        if let Some(job) = &args.resume_job {
+            job.removed(&super::jobs::key(
+                &args.s3.as_ref().unwrap().bucket,
+                &entry.key,
+                entry.version.as_deref(),
+            ));
+        }
     }
     if result.is_ok() {
         progress.files_done.fetch_add(1, Relaxed);
@@ -420,6 +469,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
             if let Some(note) = note.filter(|_| args.verbose > 0 && !args.quiet) {
                 progress.println(&note);
             }
+            super::jobs::bind(&args, &options)?;
             let entries = plan(&args, &client, &progress, &mut summary).await?;
             if let Some(authorization) = &authorization {
                 if !args.dry_run {
@@ -537,6 +587,12 @@ pub(super) fn run(args: Args) -> Result<i32> {
     } else if summary.entries_failed != 0 {
         summary.exit_code = 23;
         summary.status = "partial";
+    }
+    if let Some(job) = &args.resume_job {
+        job.flush();
+    }
+    if summary.exit_code != 0 {
+        progress.eprintln(&format!("syq: {} removals confirmed before failure; unacknowledged remote removals may also have occurred", summary.entries_removed));
     }
     summary.elapsed_ms = progress.start.elapsed().as_millis() as u64;
     progress.scan_done.store(true, Relaxed);

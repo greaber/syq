@@ -434,6 +434,7 @@ pub(super) fn claim(
 pub(super) struct Destination {
     pub root: Arc<Root>,
     pub prefix: String,
+    requested: Vec<u8>,
 }
 impl Destination {
     pub fn open(args: &Args) -> Result<Self> {
@@ -458,27 +459,25 @@ impl Destination {
             &mut Vec::new(),
         )?;
         let exists = !matches!(&pinned, PinnedPath::Missing(_));
-        if (args.target_existence == Existence::New && exists)
-            || (args.target_existence == Existence::Existing && !exists)
-        {
-            bail!("destination existence condition failed");
-        }
-        match pinned {
-            PinnedPath::Directory(d) => Ok(Self {
+        let requested = path.as_os_str().as_bytes().to_vec();
+        let destination = match pinned {
+            PinnedPath::Directory(d) => Self {
+                requested: requested.clone(),
                 root: Arc::new(Root::from_directory(d.into_parts().0)?),
                 prefix: String::new(),
-            }),
+            },
             PinnedPath::Leaf(l) => {
                 let (p, n, m, _) = l.into_parts();
                 if m.is_dir() {
                     bail!("unexpected directory destination");
                 }
-                Ok(Self {
+                Self {
+                    requested: requested.clone(),
                     root: Arc::new(Root::from_directory(p)?),
                     prefix: std::str::from_utf8(n.as_bytes())
                         .context("S3 download placement requires UTF-8")?
                         .into(),
-                })
+                }
             }
             PinnedPath::Missing(m) => {
                 let (p, parts) = m.into_parts();
@@ -487,13 +486,97 @@ impl Destination {
                     .map(|p| String::from_utf8(p).context("S3 download placement requires UTF-8"))
                     .collect::<Result<Vec<_>>>()?
                     .join("/");
-                Ok(Self {
+                Self {
+                    requested: requested.clone(),
                     root: Arc::new(Root::from_directory(p)?),
                     prefix: path,
-                })
+                }
             }
             _ => bail!("unsupported S3 download destination"),
+        };
+        let identity = if exists {
+            let m = destination
+                .root
+                .metadata(&RelativePath::new(destination.prefix.as_bytes())?)?;
+            Some(super::jobs::local_identity(m))
+        } else {
+            None
+        };
+        let owned = args
+            .resume_job
+            .as_ref()
+            .is_some_and(|job| job.owns_object(&requested, identity.as_deref()));
+        if (args.target_existence == Existence::New && exists && !owned)
+            || (args.target_existence == Existence::Existing && !exists)
+        {
+            bail!("destination existence condition failed");
         }
+        if !args.dry_run {
+            if let Some(job) = &args.resume_job {
+                job.observe_object(&requested, identity);
+            }
+        }
+        Ok(destination)
+    }
+    pub fn job_path(&self, path: &[u8]) -> Vec<u8> {
+        // Paths are relative to the pinned root, which can change between a
+        // missing placement and an existing directory on the next attempt.
+        let mut full = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&self.requested));
+        for _ in self.prefix.split('/').filter(|part| !part.is_empty()) {
+            full.pop();
+        }
+        full.push(std::ffi::OsStr::from_bytes(path));
+        full.as_os_str().as_bytes().to_vec()
+    }
+    pub fn published(&self, args: &Args, path: &str) -> Result<()> {
+        if let Some(job) = &args.resume_job {
+            match self.root.metadata(&RelativePath::new(path.as_bytes())?) {
+                Ok(meta) => job.published_object(
+                    &self.job_path(path.as_bytes()),
+                    super::jobs::local_identity(meta),
+                ),
+                Err(error) => {
+                    job.disable(&format!("could not record published identity: {error:#}"))
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn create_parents(&self, args: &Args, path: &RelativePath) -> Result<()> {
+        let Some(job) = &args.resume_job else {
+            return self.root.create_missing_parents(path, 0o777);
+        };
+        let bytes = path.to_path_buf();
+        let label = bytes.to_str().context("S3 destination requires UTF-8")?;
+        let mut absent = Vec::new();
+        for (index, _) in label.match_indices('/') {
+            let parent = &label[..index];
+            let relative = RelativePath::new(parent.as_bytes())?;
+            let current = match self.root.metadata_optional(&relative) {
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    }) =>
+                {
+                    None
+                }
+                result => result?,
+            };
+            job.observe_object(
+                &self.job_path(parent.as_bytes()),
+                current.map(super::jobs::local_identity),
+            );
+            if current.is_none() {
+                absent.push(parent);
+            }
+        }
+        self.root.create_missing_parents(path, 0o777)?;
+        for parent in absent {
+            self.published(args, parent)?;
+        }
+        Ok(())
     }
 }
 

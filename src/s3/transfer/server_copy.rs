@@ -356,6 +356,7 @@ impl Engine {
                 .get_or_insert_with(Default::default)
                 .extend(metadata.encode());
         }
+        let owned = crate::s3::jobs::observe(&self.args, &key, existing.as_ref().map(|(o, _)| o));
         anyhow::ensure!(
             source.size == job.size,
             "S3 source size changed after planning"
@@ -369,6 +370,7 @@ impl Engine {
         anyhow::ensure!(
             source.kind() == ObjectKind::Dir
                 || existing.is_none()
+                || owned
                 || self.args.if_exists != Some(crate::cli::IfExists::Error),
             "destination already exists: {key} (--if-exists=error)"
         );
@@ -409,7 +411,7 @@ impl Engine {
             anyhow::ensure!(
                 source.kind() == ObjectKind::Dir
                     || matching_contents
-                    || !self.args.protects_existing_contents(),
+                    || owned || !self.args.protects_existing_contents(),
                 "cannot establish matching destination contents: {key} (--if-exists=error-if-different)"
             );
             if matching_contents {
@@ -529,7 +531,7 @@ impl Engine {
         }
         let copy_source = encoded_source(source_bucket, &source);
         let must_be_new = self.args.ignore_existing
-            || self.args.target_existence == Existence::New
+            || (self.args.target_existence == Existence::New && !owned)
             || (self.args.protects_existing_contents() && existing.is_none());
         let multipart = if source.size > self.copy_request_limit(source.size) {
             let selected_tags = if self.args.s3_metadata.tags {
@@ -599,7 +601,7 @@ impl Engine {
                 return Ok(Some(0));
             }
             CopyPreparation::Metadata(update) => {
-                update
+                let (etag, version) = update
                     .execute(
                         &self.client,
                         &self.options.bucket,
@@ -611,6 +613,12 @@ impl Engine {
                         },
                     )
                     .await?;
+                crate::s3::jobs::published(
+                    &self.args,
+                    update.key(),
+                    etag.as_deref(),
+                    version.as_deref(),
+                );
                 self.progress
                     .bytes_unchanged
                     .fetch_add(update.size, Relaxed);
@@ -669,7 +677,7 @@ impl Engine {
                 request
             };
             let expires = desired_head.expires_string().map(str::to_owned);
-            request
+            let output = request
                 .customize()
                 .map_request(move |mut request| {
                     if explicit {
@@ -685,6 +693,12 @@ impl Engine {
                 .await
                 .map_err(|e| e.into_service_error())
                 .context("S3 server-side copy failed")?;
+            crate::s3::jobs::published(
+                &self.args,
+                &key,
+                output.copy_object_result().and_then(|r| r.e_tag()),
+                output.version_id(),
+            );
             self.tuning.requests.completed(source.size);
             self.progress.add_bytes(source.size);
         }
@@ -972,7 +986,8 @@ impl Engine {
             parts.sort_by_key(|part| part.part_number());
             let _slot = self.tuning.requests.acquire().await;
             self.check_cancelled()?;
-            self.client
+            let output = self
+                .client
                 .complete_multipart_upload()
                 .bucket(&self.options.bucket)
                 .key(key)
@@ -986,6 +1001,7 @@ impl Engine {
                 .send()
                 .await
                 .map_err(|e| e.into_service_error())?;
+            crate::s3::jobs::published(&self.args, key, output.e_tag(), output.version_id());
             Ok(())
         }
         .await;

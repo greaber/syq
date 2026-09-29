@@ -44,6 +44,22 @@ pub(super) enum Record {
         ignore: Vec<String>,
         mapping: Option<Bytes>,
     },
+    ObjectObserved {
+        path: Bytes,
+        identity: Option<String>,
+    },
+    ObjectPublished {
+        path: Bytes,
+        identity: String,
+    },
+    ObjectRemoveIntent {
+        path: Bytes,
+        identity: String,
+    },
+    DirectoryMode {
+        path: Bytes,
+        mode: Option<u32>,
+    },
     Invalid,
 }
 
@@ -57,6 +73,10 @@ pub(super) struct EntryState {
     pub directory_metadata: Option<(Meta, u8)>,
     pub removal: Option<RemovalIdentity>,
     pub removed: bool,
+    pub object_original: Option<Option<String>>,
+    pub object_published: Option<String>,
+    pub object_removal: Option<String>,
+    pub directory_mode: Option<Option<u32>>,
 }
 
 #[derive(Default)]
@@ -86,6 +106,33 @@ impl Replay {
                     bail!("job entries precede the saved command");
                 }
                 match record {
+                    Record::ObjectObserved { path, identity } => {
+                        self.entries
+                            .entry(path.decode()?)
+                            .or_default()
+                            .object_original
+                            .get_or_insert(identity);
+                    }
+                    Record::ObjectPublished { path, identity } => {
+                        self.entries
+                            .entry(path.decode()?)
+                            .or_default()
+                            .object_published = Some(identity);
+                    }
+                    Record::ObjectRemoveIntent { path, identity } => {
+                        self.entries
+                            .entry(path.decode()?)
+                            .or_default()
+                            .object_removal
+                            .get_or_insert(identity);
+                    }
+                    Record::DirectoryMode { path, mode } => {
+                        self.entries
+                            .entry(path.decode()?)
+                            .or_default()
+                            .directory_mode
+                            .get_or_insert(mode);
+                    }
                     Record::Observed { path, original } => {
                         let entry = self.entries.entry(path.decode()?).or_default();
                         if !entry.observed {
@@ -455,6 +502,115 @@ impl Job {
         };
         self.record(records);
     }
+    pub fn object_original(&self, path: &[u8]) -> Option<Option<String>> {
+        self.entry(path)?.object_original
+    }
+    pub fn bind_scope(&self, path: &[u8], identity: String) -> Result<()> {
+        if let Some(previous) = self.object_original(path) {
+            anyhow::ensure!(
+                previous.as_ref() == Some(&identity),
+                "endpoint settings changed since the job began"
+            );
+        } else {
+            self.observe_object(path, Some(identity));
+        }
+        Ok(())
+    }
+    pub fn observe_object(&self, path: &[u8], identity: Option<String>) {
+        if self
+            .entry(path)
+            .is_none_or(|entry| entry.object_original.is_none())
+        {
+            self.record(vec![Record::ObjectObserved {
+                path: Bytes::new(path),
+                identity,
+            }]);
+        }
+    }
+    pub fn published_object(&self, path: &[u8], identity: String) {
+        self.record(vec![Record::ObjectPublished {
+            path: Bytes::new(path),
+            identity,
+        }]);
+    }
+    pub fn owns_object(&self, path: &[u8], identity: Option<&str>) -> bool {
+        self.resumed
+            && self.available()
+            && self.entry(path).is_some_and(|entry| {
+                entry.object_original == Some(None)
+                    && identity.is_some()
+                    && entry.object_published.as_deref() == identity
+            })
+    }
+    pub fn has_created_objects_beneath(&self, prefix: &[u8]) -> bool {
+        let state = self.state.lock().unwrap();
+        self.resumed
+            && state.available
+            && state.replay.entries.iter().any(|(path, entry)| {
+                path.starts_with(prefix)
+                    && entry.object_original == Some(None)
+                    && entry.object_published.is_some()
+            })
+    }
+    pub fn was_removed(&self, path: &[u8]) -> bool {
+        self.entry(path).is_some_and(|entry| entry.removed)
+    }
+    #[cfg(test)]
+    pub fn before_remove_object(&self, path: &[u8], identity: &str, dry_run: bool) -> Result<bool> {
+        Ok(self.prepare_object_removals(&[(path.to_vec(), identity.to_owned())], dry_run)?[0])
+    }
+    pub fn prepare_object_removals(
+        &self,
+        entries: &[(Vec<u8>, String)],
+        dry_run: bool,
+    ) -> Result<Vec<bool>> {
+        let mut records = Vec::new();
+        let mut selected = Vec::with_capacity(entries.len());
+        {
+            let state = self.state.lock().unwrap();
+            for (path, identity) in entries {
+                let entry = state.replay.entries.get(path);
+                if entry.is_some_and(|entry| entry.removed) {
+                    selected.push(false);
+                    continue;
+                }
+                if let Some(previous) = entry.and_then(|entry| entry.object_removal.as_ref()) {
+                    anyhow::ensure!(
+                        previous == identity,
+                        "object changed since the earlier removal attempt: {}",
+                        crate::completion_details::display_bytes(path)
+                    );
+                } else if !dry_run {
+                    records.push(Record::ObjectRemoveIntent {
+                        path: Bytes::new(path),
+                        identity: identity.clone(),
+                    });
+                }
+                selected.push(true);
+            }
+        }
+        if !records.is_empty() {
+            self.record(records);
+        }
+        Ok(selected)
+    }
+    pub fn original_directory_mode(
+        &self,
+        path: &[u8],
+        mode: Option<u32>,
+        dry_run: bool,
+    ) -> Option<u32> {
+        if let Some(previous) = self.entry(path).and_then(|entry| entry.directory_mode) {
+            return previous;
+        }
+        if !dry_run {
+            self.record(vec![Record::DirectoryMode {
+                path: Bytes::new(path),
+                mode,
+            }]);
+        }
+        mode
+    }
     pub fn arguments(&self, overrides: &[OsString]) -> Result<(Vec<OsString>, std::path::PathBuf)> {
         self.state
             .lock()
@@ -553,6 +709,36 @@ impl Drop for Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn object_publications_and_removals_survive_reopening() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let base = temp.path().join("jobs");
+        let job = Job::create_at(&base, &["cp".into(), "file".into()]).unwrap();
+        let id = job.id.clone();
+        job.observe_object(b"created", None);
+        job.published_object(b"created", "etag/version".into());
+        job.observe_object(b"preexisting", Some("original".into()));
+        job.published_object(b"preexisting", "etag/version".into());
+        assert!(job.before_remove_object(b"removed", "old", false).unwrap());
+        job.removed(b"removed");
+        assert!(job
+            .before_remove_object(b"uncertain", "old", false)
+            .unwrap());
+        drop(job);
+        let job = Job::open_at(&base, &id).unwrap();
+        assert!(job.owns_object(b"created", Some("etag/version")));
+        assert!(!job.owns_object(b"created", Some("replacement")));
+        assert!(!job.owns_object(b"preexisting", Some("etag/version")));
+        assert!(!job
+            .before_remove_object(b"removed", "replacement", false)
+            .unwrap());
+        assert!(job
+            .before_remove_object(b"uncertain", "old", false)
+            .unwrap());
+        assert!(job
+            .before_remove_object(b"uncertain", "replacement", false)
+            .is_err());
+    }
     #[test]
     fn reopens_command_and_entry_history_then_removes_completed_job() {
         let temp = crate::test_support::tempdir().unwrap();

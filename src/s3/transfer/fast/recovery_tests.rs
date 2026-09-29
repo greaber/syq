@@ -210,6 +210,8 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
             None,
             Some(initial),
             None,
+            b"test-output",
+            false,
         )
         .await;
     seed.await.unwrap();

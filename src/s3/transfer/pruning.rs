@@ -8,9 +8,26 @@ struct Candidate {
     key: Option<String>,
     kind: &'static str,
     identity: Option<(u64, u64)>,
+    journal_path: Vec<u8>,
+    removal_identity: String,
 }
 
 impl Engine {
+    pub(super) async fn list_destination(&self, prefix: &str) -> Result<DestinationKeys> {
+        Ok(client::list_for_removal(
+            &self.client,
+            &self.options.bucket,
+            prefix,
+            self.options.concurrency,
+            self.args.resume_job.is_some(),
+        )
+        .await?
+        .into_identities()
+        .into_iter()
+        .map(|(key, size, time, etag)| (key, (size, time, etag)))
+        .collect())
+    }
+
     pub(super) async fn prune(
         &self,
         mut plan: Plan,
@@ -40,12 +57,42 @@ impl Engine {
         };
         let count = found.len() as u64;
         self.progress.deletions_planned.store(count, Relaxed);
-        if self.args.max_delete.is_some_and(|max| count > max) {
+        let journal_paths: Vec<_> = found
+            .iter()
+            .map(|candidate| candidate.journal_path.clone())
+            .collect();
+        let total = self
+            .args
+            .resume_job
+            .as_ref()
+            .map_or(count, |job| job.deletion_total(&journal_paths));
+        if self.args.max_delete.is_some_and(|max| total > max) {
             self.progress.deletions_blocked.store(count, Relaxed);
             for c in &found {
                 self.deletion_record(c, "blocked", Some("safety_limit"), None);
             }
             return Err(prune::Limit.into());
+        }
+        if let Some(job) = &self.args.resume_job {
+            if found
+                .iter()
+                .any(|candidate| candidate.removal_identity == "unavailable")
+            {
+                job.disable("S3 omitted object identity from deletion discovery");
+            }
+            let identities: Vec<_> = found
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.journal_path.clone(),
+                        candidate.removal_identity.clone(),
+                    )
+                })
+                .collect();
+            job.prepare_object_removals(&identities, self.args.dry_run)?;
+            if !self.args.dry_run {
+                job.reserve_deletions(&journal_paths);
+            }
         }
         if destination.is_none() && !self.args.dry_run {
             self.delete_objects(&found).await?;
@@ -106,6 +153,15 @@ impl Engine {
                     if plan.keeps(&path) {
                         identities.insert((meta.dev, meta.ino));
                     }
+                    if self
+                        .args
+                        .resume_job
+                        .as_ref()
+                        .is_some_and(|job| job.was_removed(&dst.job_path(&path)))
+                    {
+                        plan.protect(&path);
+                        continue;
+                    }
                     if plan.shields(&path) {
                         continue;
                     }
@@ -126,6 +182,15 @@ impl Engine {
                         }
                     }
                     found.push(Candidate {
+                        journal_path: dst.job_path(&path),
+                        removal_identity: if directory {
+                            format!("{}:{}", meta.dev, meta.ino)
+                        } else {
+                            format!(
+                                "{}:{}:{}:{}",
+                                meta.dev, meta.ino, meta.ctime, meta.ctime_nsec
+                            )
+                        },
                         path,
                         key: None,
                         identity: Some((meta.dev, meta.ino)),
@@ -143,24 +208,15 @@ impl Engine {
                 if !prefix.is_empty() {
                     prefix.push('/');
                 }
-                let listed = match self.upload_keys.get() {
+                let listed: Vec<_> = match self.upload_keys.get() {
                     Some(keys) => keys
                         .iter()
                         .filter(|(key, _)| key.starts_with(&prefix))
-                        .map(|(key, size)| (key.clone(), *size))
+                        .map(|(key, value)| (key.clone(), value.clone()))
                         .collect(),
-                    None => client::list(
-                        &self.client,
-                        &self.options.bucket,
-                        &prefix,
-                        None,
-                        &mut HashSet::new(),
-                        self.options.concurrency,
-                    )
-                    .await?
-                    .into_objects(),
+                    None => self.list_destination(&prefix).await?.into_iter().collect(),
                 };
-                for (key, size) in listed {
+                for (key, (size, time, etag)) in listed {
                     self.check_cancelled()?;
                     anyhow::ensure!(
                         key.starts_with(&prefix),
@@ -183,7 +239,23 @@ impl Engine {
                     }
                     // Ignored keys need not be representable as local paths.
                     local::key_path(&path)?;
+                    let journal_path = crate::s3::jobs::key(&self.options.bucket, &key, None);
+                    if self
+                        .args
+                        .resume_job
+                        .as_ref()
+                        .is_some_and(|job| job.was_removed(&journal_path))
+                    {
+                        plan.protect(&path);
+                        continue;
+                    }
                     found.push(Candidate {
+                        journal_path,
+                        removal_identity: crate::s3::jobs::removal_identity(
+                            size,
+                            time,
+                            etag.as_deref(),
+                        ),
                         path,
                         key: Some(key),
                         identity: None,
@@ -233,18 +305,7 @@ impl Engine {
                 } else {
                     format!("{key}/")
                 };
-                keys.extend(
-                    client::list(
-                        &self.client,
-                        &self.options.bucket,
-                        &prefix,
-                        None,
-                        &mut HashSet::new(),
-                        self.options.concurrency,
-                    )
-                    .await?
-                    .into_objects(),
-                );
+                keys.extend(self.list_destination(&prefix).await?);
             }
             let _ = self.upload_keys.set(keys);
         }
@@ -292,6 +353,11 @@ impl Engine {
         match result {
             Ok(()) => {
                 self.progress.deletions_completed.fetch_add(1, Relaxed);
+                if !self.args.dry_run {
+                    if let Some(job) = &self.args.resume_job {
+                        job.removed(&candidate.journal_path);
+                    }
+                }
                 if self.args.verbose > 0 {
                     self.progress.println(&format!(
                         "{} {}",

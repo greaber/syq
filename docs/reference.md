@@ -250,8 +250,8 @@ Ignored paths are also protected from pruning.
 
 ## Resume an interrupted copy
 
-Local filesystem copies and copies with one ordinary SSH endpoint can supply a
-job ID. Resume the saved command without repeating its sources or destination:
+Local filesystem copies, copies with one ordinary SSH endpoint, and S3 uploads,
+downloads and server-side copies can supply a job ID. Resume the saved command without repeating its sources or destination:
 
 ```sh
 syq cp --srcs-in project --into-new backup
@@ -260,11 +260,11 @@ syq cp --resume JOB
 ```
 
 `--resume` requires an existing job. Ordinary first attempts do not use it.
-S3, remote-to-remote, detached, return-destination and descriptor-stream copies
+Remote-to-remote, detached, return-destination and descriptor-stream copies
 do not supply named jobs.
 The job keeps the original working directory, selectors, mappings, ignore rules,
 placement and overwrite policy. New environment option defaults do not change
-it. Resumption rescans the sources; it does not save a source snapshot. It can
+it. S3 jobs also keep the original endpoint and bucket. Resumption rescans the sources; it does not save a source snapshot. It can
 reuse completed output and matching partial-file data, and recognizes files
 it created when enforcing `--if-exists=error` or a `-new` placement. Recorded
 pending directory metadata is applied when the copy finishes. A replaced or

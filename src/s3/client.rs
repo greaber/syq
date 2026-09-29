@@ -803,23 +803,28 @@ pub(super) struct Listing {
 }
 
 type TimedListingObject = (String, u64, Option<(i64, u32)>);
+pub(super) type IdentifiedListingObject = (String, u64, Option<(i64, u32)>, Option<String>);
 
 // Store timestamps with their keys when requested. Plain listings retain the
 // compact pair representation and pay no per-object cost for unused times.
 enum ListingObjects {
     Plain(Vec<(String, u64)>),
     Timed(Vec<TimedListingObject>),
+    Identified(Vec<IdentifiedListingObject>),
 }
 impl ListingObjects {
-    fn new(retain_times: bool) -> Self {
-        if retain_times {
+    fn new(retain_times: bool, retain_identity: bool) -> Self {
+        if retain_identity {
+            Self::Identified(Vec::new())
+        } else if retain_times {
             Self::Timed(Vec::new())
         } else {
             Self::Plain(Vec::new())
         }
     }
-    fn push(&mut self, key: String, size: u64, time: Option<(i64, u32)>) {
+    fn push(&mut self, key: String, size: u64, time: Option<(i64, u32)>, etag: Option<String>) {
         match self {
+            Self::Identified(objects) => objects.push((key, size, time, etag)),
             Self::Plain(objects) => objects.push((key, size)),
             Self::Timed(objects) => objects.push((key, size, time)),
         }
@@ -828,24 +833,32 @@ impl ListingObjects {
         match self {
             Self::Plain(objects) => objects.clear(),
             Self::Timed(objects) => objects.clear(),
+            Self::Identified(objects) => objects.clear(),
         }
     }
     fn is_empty(&self) -> bool {
         match self {
             Self::Plain(objects) => objects.is_empty(),
             Self::Timed(objects) => objects.is_empty(),
+            Self::Identified(objects) => objects.is_empty(),
         }
     }
     fn sort(&mut self) {
         match self {
             Self::Plain(objects) => objects.sort_unstable_by(|a, b| a.0.cmp(&b.0)),
             Self::Timed(objects) => objects.sort_unstable_by(|a, b| a.0.cmp(&b.0)),
+            Self::Identified(objects) => objects.sort_unstable_by(|a, b| a.0.cmp(&b.0)),
         }
     }
 }
 impl Listing {
+    #[cfg(test)]
     pub fn into_objects(self) -> Vec<(String, u64)> {
         match self.objects {
+            ListingObjects::Identified(objects) => objects
+                .into_iter()
+                .map(|(key, size, _, _)| (key, size))
+                .collect(),
             ListingObjects::Plain(objects) => objects,
             ListingObjects::Timed(objects) => objects
                 .into_iter()
@@ -853,8 +866,28 @@ impl Listing {
                 .collect(),
         }
     }
+    pub fn into_identities(self) -> Vec<IdentifiedListingObject> {
+        match self.objects {
+            ListingObjects::Identified(objects) => objects,
+            ListingObjects::Plain(objects) => objects
+                .into_iter()
+                .map(|(key, size)| (key, size, None, None))
+                .collect(),
+            ListingObjects::Timed(objects) => objects
+                .into_iter()
+                .map(|(key, size, time)| (key, size, time, None))
+                .collect(),
+        }
+    }
     pub fn into_entries(self) -> impl Iterator<Item = TimedListingObject> {
         let (plain, timed) = match self.objects {
+            ListingObjects::Identified(objects) => (
+                Vec::new(),
+                objects
+                    .into_iter()
+                    .map(|(key, size, time, _)| (key, size, time))
+                    .collect(),
+            ),
             ListingObjects::Plain(objects) => (objects, Vec::new()),
             ListingObjects::Timed(objects) => (Vec::new(), objects),
         };
@@ -874,6 +907,7 @@ async fn parallel_listing(
     prefix: &str,
     concurrency: usize,
     retain_times: bool,
+    retain_identity: bool,
 ) -> Result<Listing> {
     use super::listing::engine::{self, Entry, Page, Store};
     struct S3<'a> {
@@ -881,6 +915,7 @@ async fn parallel_listing(
         bucket: &'a str,
         root: &'a str,
         retain_times: bool,
+        retain_identity: bool,
         discovery_denied: std::sync::atomic::AtomicBool,
     }
     impl Store for S3<'_> {
@@ -935,7 +970,10 @@ async fn parallel_listing(
                         } else {
                             None
                         },
-                        etag: None,
+                        etag: self
+                            .retain_identity
+                            .then(|| object.e_tag().map(str::to_owned))
+                            .flatten(),
                     })
                 })
                 .collect::<Result<_>>()?;
@@ -966,12 +1004,13 @@ async fn parallel_listing(
             })
         }
     }
-    let mut objects = ListingObjects::new(retain_times);
+    let mut objects = ListingObjects::new(retain_times, retain_identity);
     let store = S3 {
         client,
         bucket,
         root: prefix,
         retain_times,
+        retain_identity,
         discovery_denied: std::sync::atomic::AtomicBool::new(false),
     };
     let collect = |objects: &mut ListingObjects, entry: Entry| -> Result<()> {
@@ -986,7 +1025,7 @@ async fn parallel_listing(
                 .map(|time| (time.secs(), time.subsec_nanos()))
             })
             .transpose()?;
-        objects.push(entry.key, entry.size, time);
+        objects.push(entry.key, entry.size, time, entry.etag);
         Ok(())
     };
     let outcome = engine::enumerate_prefix(&store, prefix, concurrency.min(32), |entry| {
@@ -1018,12 +1057,23 @@ async fn parallel_listing(
     })
 }
 
+pub(super) async fn list_for_removal(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    concurrency: usize,
+    record: bool,
+) -> Result<Listing> {
+    parallel_listing(client, bucket, prefix, concurrency, record, record).await
+}
+
 /// Keep flat listings for small trees and filename filters. Only switch to
 /// directory discovery when the first full page contains only excluded descendants.
 /// A complete directory probe can prune children or descend through a single
 /// included child toward excluded descendants. Limit probes to four per source
 /// selector: deep chains must not turn a flat listing into an unbounded walk.
 /// Wide or truncated probes reuse the flat sample instead of fanning out.
+#[cfg(test)]
 pub(super) async fn list(
     client: &Client,
     bucket: &str,
@@ -1055,10 +1105,10 @@ pub(super) async fn list_with_times(
     retain_times: bool,
 ) -> Result<Listing> {
     if matcher.is_none() {
-        return parallel_listing(client, bucket, prefix, concurrency, retain_times).await;
+        return parallel_listing(client, bucket, prefix, concurrency, retain_times, false).await;
     }
     let mut result = Listing {
-        objects: ListingObjects::new(retain_times),
+        objects: ListingObjects::new(retain_times, false),
         found: false,
         excluded: 0,
     };
@@ -1198,7 +1248,7 @@ pub(super) async fn list_with_times(
                     } else {
                         None
                     };
-                    result.objects.push(key.to_owned(), size, time);
+                    result.objects.push(key.to_owned(), size, time, None);
                 }
             }
             for child in output.common_prefixes() {
@@ -1388,8 +1438,8 @@ pub(super) async fn copy_metadata(
     client: &Client,
     bucket: &str,
     update: super::authorization::Unsigned,
-) -> Result<()> {
-    client
+) -> Result<(Option<String>, Option<String>)> {
+    let output = client
         .copy_object()
         .bucket(bucket)
         .key(&update.key)
@@ -1405,7 +1455,13 @@ pub(super) async fn copy_metadata(
         })
         .send()
         .await?;
-    Ok(())
+    Ok((
+        output
+            .copy_object_result()
+            .and_then(|r| r.e_tag())
+            .map(str::to_owned),
+        output.version_id().map(str::to_owned),
+    ))
 }
 
 #[cfg(test)]

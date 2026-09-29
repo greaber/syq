@@ -353,6 +353,8 @@ fn completed_download_releases_blocking_capacity_for_secondary_hash() {
                     None,
                     Some(ByteStream::from_static(data)),
                     None,
+                    b"test-output",
+                    false,
                 ),
             )
             .await

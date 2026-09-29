@@ -135,8 +135,7 @@ pub(crate) fn start(
     }
     // These execution paths do not yet carry the per-entry journal. Never
     // advertise a token until their mutation and limit accounting is connected.
-    if args.s3.is_some()
-        || args.restricted_grant.is_some()
+    if args.restricted_grant.is_some()
         // The delegated source sees only one remote endpoint, but cannot own
         // a resumable command on behalf of the invoking machine.
         || argv
@@ -145,7 +144,7 @@ pub(crate) fn start(
             .any(|word| word == "--delegated-operands-b64")
         || args.detach
         || args.return_selection.is_some()
-        || (args.interface == crate::cli::Interface::NativeCp
+        || (args.s3.is_none() && args.interface == crate::cli::Interface::NativeCp
             && args
                 .locations
                 .split_last()

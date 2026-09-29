@@ -124,7 +124,7 @@ def assert_comparison(path, *, changed, unchanged):
     return changes
 
 
-def interrupted(args, threshold=5*1024*1024):
+def interrupted(args, threshold=5*1024*1024, return_job=False):
     reader, writer = os.pipe()
     command=[SYQ,'cp','--no-progress','--results-fd',str(writer),'--performance-tuning=s3-part-size=5M,s3-parts-per-object=1,s3-retries=1','--resource-limits=bandwidth=1MiB']
     for name,value in HEADERS.items(): command+=['--s3-header',name+': '+value]
@@ -132,6 +132,7 @@ def interrupted(args, threshold=5*1024*1024):
     os.close(writer)
     deadline=time.monotonic()+60
     observed=0
+    job=None
     selector=selectors.DefaultSelector();selector.register(reader,selectors.EVENT_READ)
     pending=b''
     try:
@@ -144,6 +145,7 @@ def interrupted(args, threshold=5*1024*1024):
                     line,pending=pending.split(b'\n',1)
                     try: event=json.loads(line)
                     except ValueError: raise AssertionError(f'invalid results record: {line!r}')
+                    if event['type'] == 'run': job=event.get('job_id')
                     if event['type'] == 'progress':
                         observed=max(observed,event['bytes_done'])
             if process.poll() is not None: raise AssertionError('copy exited before interruption point')
@@ -159,6 +161,9 @@ def interrupted(args, threshold=5*1024*1024):
         try: os.killpg(process.pid,0)
         except ProcessLookupError: pass
         else: raise AssertionError('copy process group survived interruption')
+    if return_job:
+        assert job, "interrupted copy did not provide a named job"
+        return job
     return observed
 
 
@@ -290,7 +295,7 @@ def check():
 
         # Retrying a partial multipart upload/download must reuse completed work.
         upload_key=PREFIX+'/resume-upload'
-        interrupted([src/'large','--to',remote,'--as',upload_key])
+        upload_job=interrupted([src/'large','--to',remote,'--as-new',upload_key,'--if-exists=error'], return_job=True)
         records=[json.loads(path.read_text()) for path in (root/'cache/syq/s3').glob('*.json')]
         uploads=[record for record in records if 'upload_id' in record]
         assert len(uploads)==1, 'interrupted upload lost its recovery handle'
@@ -299,16 +304,16 @@ def check():
         _, parts=request('GET', upload_key, query={'uploadId': upload_id})
         assert b'<Part>' in parts, 'interrupted upload has no completed parts'
         result_file=root/'upload-result.jsonl'
-        run([src/'large','--to',remote,'--as',upload_key,'--results',result_file])
+        run(['--resume',upload_job,'--resource-limits=bandwidth=1GiB','--results',result_file])
         terminal=json.loads(result_file.read_text().splitlines()[-1])
         assert terminal['bytes_transferred'] < (src/'large').stat().st_size, terminal
         _, body=request('GET',upload_key)
         assert body==(src/'large').read_bytes()
         download_path=root/'resume-download'
-        interrupted(['--from',remote,upload_key,'--as',download_path])
+        download_job=interrupted(['--from',remote,upload_key,'--as-new',download_path,'--if-exists=error'], return_job=True)
         assert not download_path.exists(), 'partial download became visible at final name'
         result_file=root/'download-result.jsonl'
-        run(['--from',remote,upload_key,'--as',download_path,'--results',result_file])
+        run(['--resume',download_job,'--resource-limits=bandwidth=1GiB','--results',result_file])
         terminal=json.loads(result_file.read_text().splitlines()[-1])
         assert terminal['bytes_transferred'] < (src/'large').stat().st_size, terminal
         assert download_path.read_bytes()==(src/'large').read_bytes()
