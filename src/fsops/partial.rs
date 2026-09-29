@@ -458,6 +458,7 @@ impl FsOps {
         })
     }
 
+    #[cfg(test)]
     pub fn hash_and_hold(
         &mut self,
         path: &[u8],
@@ -467,12 +468,44 @@ impl FsOps {
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
     ) -> Result<(Vec<ContentDigest>, u64)> {
+        self.hash_and_hold_window(path, copy_id, 0, block, len, condition, guard)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hash_and_hold_window(
+        &mut self,
+        path: &[u8],
+        copy_id: &CopyId,
+        off: u64,
+        block: u64,
+        len: u64,
+        condition: TargetCondition,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<(Vec<ContentDigest>, u64)> {
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_HASH_BASIS").is_some() {
             bail!("injected retained-basis hash failure");
         }
+        anyhow::ensure!(
+            block > 0 && off.is_multiple_of(block) && off.checked_add(len).is_some(),
+            "invalid hash interval"
+        );
         let rooted = self.rooted_destination_target(path, guard)?;
-        let (mut file, location, label) = if let Some(target) = &rooted {
+        let location = rooted
+            .as_ref()
+            .map(|target| target.location())
+            .unwrap_or_else(|| FileLocation::Path(resolve(path)));
+        let (mut file, location, label) = if off > 0 {
+            let held = self
+                .held_basis
+                .take()
+                .context("no retained comparison basis")?;
+            anyhow::ensure!(
+                held.location == location && held.copy_id == *copy_id,
+                "retained comparison basis does not match requested file"
+            );
+            (held.file, held.location, held.label)
+        } else if let Some(target) = &rooted {
             (
                 target.root.open_regular_read(&target.relative)?,
                 target.location(),
@@ -485,6 +518,7 @@ impl FsOps {
                 .map(|file| (file, FileLocation::Path(p.clone()), p))?
         };
         require_open_target(&file, &label, condition)?;
+        file.seek(SeekFrom::Start(off))?;
         let hashes = hash_reader_observed(
             &mut file,
             block,
@@ -1475,11 +1509,16 @@ impl FsOps {
         copy_id: &CopyId,
     ) -> Result<Vec<ContentDigest>> {
         let HashOptions {
+            off,
             which,
             block,
             len,
             attempt,
         } = options;
+        anyhow::ensure!(
+            block > 0 && off.is_multiple_of(block) && off.checked_add(len).is_some(),
+            "invalid hash interval"
+        );
         if target.source.is_some()
             || (self.destination_root.is_none() && !self.source_roots.is_empty())
         {
@@ -1496,6 +1535,7 @@ impl FsOps {
             if let Some((_, source_target)) = self.source_content_target(target.source)? {
                 let mut file =
                     open_registered_source(&source_target, self.inode_preservation.open_noatime)?;
+                file.seek(SeekFrom::Start(off))?;
                 return hash_reader_observed(
                     &mut file,
                     block,
@@ -1523,7 +1563,7 @@ impl FsOps {
                 let file = open(&target.relative, &target.label)?;
                 (target.relative.clone(), target.label.clone(), file)
             };
-            file.seek(SeekFrom::Start(0))?;
+            file.seek(SeekFrom::Start(off))?;
             if which == Which::Partial {
                 require_safe_rooted_named_partial(&target.root, &relative, &label, &file)?;
             }
@@ -1550,7 +1590,7 @@ impl FsOps {
             .map(Ok)
             .unwrap_or_else(|| open_existing_regular(&p, false))?;
         crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
-        f.seek(SeekFrom::Start(0))?;
+        f.seek(SeekFrom::Start(off))?;
         if which == Which::Partial {
             require_safe_partial(&f, &p)?;
         }
@@ -2467,6 +2507,7 @@ impl FsOps {
                 )
                 .map(Response::Prepared),
             Request::HashAndHold {
+                off,
                 path,
                 copy_id,
                 block,
@@ -2474,7 +2515,15 @@ impl FsOps {
                 condition,
                 guard,
             } => self
-                .hash_and_hold(path, copy_id, *block, *len, *condition, guard.as_ref())
+                .hash_and_hold_window(
+                    path,
+                    copy_id,
+                    *off,
+                    *block,
+                    *len,
+                    *condition,
+                    guard.as_ref(),
+                )
                 .map(|(hashes, len)| Response::HeldHashes { hashes, len }),
             Request::FinishBasis {
                 expected_hash,
@@ -2649,6 +2698,7 @@ impl FsOps {
                 }
             }
             Request::HashBlocks {
+                off,
                 path,
                 source,
                 which,
@@ -2666,6 +2716,7 @@ impl FsOps {
                         guard: guard.as_ref(),
                     },
                     HashOptions {
+                        off: *off,
                         which: *which,
                         block: *block,
                         len: *len,

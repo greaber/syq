@@ -845,8 +845,10 @@ pub enum WireRequest<Data> {
         guard: Option<ContainerGuard>,
     },
     /// Hash an existing final file and retain that open inode as the repair
-    /// basis until FinishBasis or SeedBasis consumes it.
+    /// basis until FinishBasis or SeedBasis consumes it. Offset zero opens a
+    /// new basis; subsequent windows hash that same descriptor.
     HashAndHold {
+        off: u64,
         path: PathBytes,
         copy_id: CopyId,
         block: u64,
@@ -897,6 +899,7 @@ pub enum WireRequest<Data> {
         mode: u32,
     },
     HashBlocks {
+        off: u64,
         path: PathBytes,
         /// Authoritative for source hashing when present. Destination hashing
         /// omits it; a confined source session rejects an omission.

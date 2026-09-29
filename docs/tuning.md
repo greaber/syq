@@ -193,15 +193,18 @@ hashes, payload checks and publication-recovery checks stay in effect. Partial-f
 in every mode: matching bytes from interrupted copies can still be reused,
 even with `off`. The setting controls reuse of the final destination, not partials.
 
-For staged updates, syq prefers a reflink of the old destination. When cloning
-is unavailable, it retains a bounded window of destination bytes while comparing
-them, then writes matching retained bytes or different source bytes. This comparison
-reads each source block once; retained destination bytes are never reread after
-comparison. Explicit whole-file checks can require additional reads.
-Without cloning, this needs buffers for both sides of the current window.
-Ordinary updates can replace the destination even when all its bytes match but
-its metadata differs. Explicit `--hash` and protected-existing-file policies
-retain their read-only content check before staging.
+For staged updates with block reuse enabled, syq first compares equal-length
+files in bounded windows. If all bytes match, it applies metadata without
+replacing the file. On the first difference, it restarts comparison and copying
+through a private output; the already compared prefix is read again. Files with
+different lengths skip this preliminary comparison.
+
+For that private output, syq prefers a reflink of the old destination. When
+cloning is unavailable, it retains a bounded window of destination bytes while
+comparing them, then writes matching retained bytes or different source bytes.
+This copying pass reads each source block once; retained destination bytes are
+never reread after comparison. Without cloning, it needs buffers for both sides
+of the current window. Explicit whole-file checks can require additional reads.
 
 This setting does not select a sequential writer. To isolate comparison and
 reuse costs while keeping range transfers, compare

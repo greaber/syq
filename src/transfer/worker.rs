@@ -905,10 +905,16 @@ impl Worker {
                 None
             };
 
-            // Staged updates can compare and transfer disjoint windows without
-            // a whole-source hash pass. Keep the read-only equality checks for
-            // explicit checksums and protected/in-place destinations above.
+            // Probe equality without creating a sidecar. A difference restarts
+            // the staged pipeline; equal prefixes need not survive that restart.
+            // Explicit checksums and protected/in-place checks stay separate.
             if !inplace && reuse_blocks && final_is_file && !self.opts.checksum && size > 0 {
+                if final_entry.is_some_and(|entry| entry.size == size)
+                    && self.matches_final_windows(&job)?
+                {
+                    self.finish_matched_basis(idx, &job)?;
+                    return Ok((vec![], false));
+                }
                 self.stage_comparison(idx, &job, true)?;
                 return Ok((full(), true));
             }
@@ -1033,6 +1039,53 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    /// Read-only equality probe. On a difference, discard the comparison and
+    /// restart the normal staged pipeline; no prefix bytes are trusted or reused.
+    fn matches_final_windows(&mut self, job: &WorkerJob) -> Result<bool> {
+        let block = self.opts.block;
+        // Start with one block so pervasive differences are cheap to detect,
+        // then amortize RPC overhead with bounded windows for matching files.
+        let window = (64 << 20) / block * block;
+        let mut off = 0;
+        while off < job.entry.size {
+            let len = (if off == 0 { block } else { window }).min(job.entry.size - off);
+            self.src.send(Request::HashBlocks {
+                off,
+                path: job.src.clone(),
+                source: self.source_reference(job),
+                which: Which::Final,
+                copy_id: self.copy_id(),
+                block,
+                len,
+                attempt: job.attempt,
+                guard: None,
+            })?;
+            self.dst.send(Request::HashAndHold {
+                off,
+                path: job.dst.clone(),
+                copy_id: self.copy_id(),
+                block,
+                len,
+                condition: job.target_condition,
+                guard: job.container_guard.clone(),
+            })?;
+            // Drain both endpoints even when one reports an ordinary file error.
+            let source = self.src.recv();
+            let destination = self.dst.recv();
+            let source = Self::hashes(ok(source?, "hash equality window")?)?;
+            let (destination, held_len) =
+                Self::destination_hashes(ok(destination?, "hash retained equality window")?)?;
+            if held_len != Some(job.entry.size)
+                || source.len() as u64 != len.div_ceil(block)
+                || source != destination
+            {
+                return Ok(false);
+            }
+            off += len;
+        }
+        Ok(true)
     }
 
     fn stage_comparison(&mut self, idx: usize, job: &WorkerJob, allow_final: bool) -> Result<()> {
@@ -1264,6 +1317,7 @@ impl Worker {
         let diff = self.diff_with(
             job,
             Request::HashAndHold {
+                off: 0,
                 path: job.dst.clone(),
                 copy_id: self.copy_id(),
                 block: self.opts.block,
@@ -1287,6 +1341,7 @@ impl Worker {
         let block = self.opts.block;
         let size = job.entry.size;
         self.src.send(Request::HashBlocks {
+            off: 0,
             path: job.src.clone(),
             source: self.source_reference(job),
             which: Which::Final,

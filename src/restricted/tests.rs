@@ -3670,6 +3670,7 @@ fn signed_hash_block_and_response_bounds_are_enforced() {
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, DEFAULT_MAX_BYTES);
     let target = root.join("target").as_os_str().as_bytes().to_vec();
     let request = |block, len| Request::HashBlocks {
+        off: 0,
         path: target.clone(),
         source: None,
         which: proto::Which::Final,
@@ -4514,6 +4515,7 @@ fn rooted_scan_and_hash_never_follow_a_payload_symlink() {
     assert!(!entries.iter().any(|entry| entry.path == b"escape/secret"));
 
     let response = crate::fsops::FsOps::new().handle(&Request::HashBlocks {
+        off: 0,
         path: target.join("escape").as_os_str().as_bytes().to_vec(),
         source: None,
         which: proto::Which::Final,
@@ -4572,6 +4574,7 @@ fn restricted_authority_rejects_caller_source_registration() {
             guard: None,
         },
         Request::HashBlocks {
+            off: 0,
             path: root.join("file").as_os_str().as_bytes().to_vec(),
             source: Some(source),
             which: proto::Which::Final,

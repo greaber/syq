@@ -582,6 +582,7 @@ struct PrepareOptions {
 }
 
 struct HashOptions {
+    off: u64,
     which: Which,
     block: u64,
     len: u64,

@@ -299,6 +299,7 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
     assert!(matches!(reply, Response::Prepared(_)), "{reply:?}");
     let mut reader = setup();
     let reply = reader.handle_in_place(&mut Request::HashBlocks {
+        off: 0,
         path: path.clone(),
         source: None,
         which: Which::Partial,

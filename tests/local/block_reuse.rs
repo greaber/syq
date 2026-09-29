@@ -341,7 +341,7 @@ fn on_keeps_whole_file_copy_for_fresh_files_in_a_mixed_batch() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn pipeline_reads_source_once_for_matching_half_and_rewritten_files() {
+fn pipeline_restarts_after_mismatch_and_skips_identical_contents() {
     for matching in [0, 1, 2] {
         let t = Tmp::new();
         let source = prng((8 << 20) + 17, 839);
@@ -366,19 +366,25 @@ fn pipeline_reads_source_once_for_matching_half_and_rewritten_files() {
             .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_SOURCE_READ_EVENTS", t.path("reads"))
             .env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1")
-            .env("SYQ_TEST_FAIL_SOURCE_BLOCK_HASH", "1")
             .run()
             .unwrap();
         assert_output_ok(&out);
         assert_eq!(read(&t.path("dst")), source);
-        let events = fs::read_to_string(t.path("reads")).unwrap();
+        let events = fs::read_to_string(t.path("reads")).unwrap_or_default();
         let mut next = 0u64;
         for event in events.lines() {
             let fields: Vec<_> = event.split_whitespace().collect();
             assert_eq!(fields[1].parse::<u64>().unwrap(), next, "{events}");
             next += fields[2].parse::<u64>().unwrap();
         }
-        assert_eq!(next, source.len() as u64);
+        assert_eq!(
+            next,
+            if matching == 2 {
+                0
+            } else {
+                source.len() as u64
+            }
+        );
         assert_eq!(tuning_observed(&out)["range_requests"], [3, 2, 0][matching]);
         assert!(partial_files(&t.0).is_empty());
     }
@@ -418,7 +424,7 @@ fn pipeline_handles_final_mutation_after_staging() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn pipeline_parallel_ranges_read_each_source_byte_once() {
+fn pipeline_parallel_copy_ranges_read_each_source_byte_once() {
     let t = Tmp::new();
     let source = prng(128 << 20, 841);
     let mut old = source.clone();
@@ -440,7 +446,6 @@ fn pipeline_parallel_ranges_read_each_source_byte_once() {
         .env("SYQ_TEST_SOURCE_READ_EVENTS", t.path("reads"))
         .env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1")
         .env("SYQ_TEST_WORKER_EVENTS", t.path("workers"))
-        .env("SYQ_TEST_FAIL_SOURCE_BLOCK_HASH", "1")
         .run()
         .unwrap();
     assert_output_ok(&out);
@@ -530,6 +535,49 @@ fn pipeline_handles_growing_shrinking_and_empty_files() {
             .unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("dst")), &contents[..source_len]);
+        assert!(partial_files(&t.0).is_empty());
+    }
+}
+
+#[test]
+fn pipeline_equality_probe_spans_windows_and_handles_late_difference() {
+    for mismatch in [None, Some((76 << 20) + 3)] {
+        let t = Tmp::new();
+        let source = vec![b's'; (80 << 20) + 17];
+        let mut old = source.clone();
+        if let Some(offset) = mismatch {
+            old[offset] = b'x';
+        }
+        write(&t.path("src"), &source);
+        write(&t.path("dst"), &old);
+        set_mtime(&t.path("dst"), 1);
+        let before = fs::metadata(t.path("dst")).unwrap();
+        let out = compat_command()
+            .args([
+                "-a",
+                "--no-progress",
+                "--performance-tuning=block-reuse=on,workers=1",
+                &t.s("src"),
+                &t.s("dst"),
+            ])
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), source);
+        let after = fs::metadata(t.path("dst")).unwrap();
+        if mismatch.is_none() {
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            assert_eq!(tuning_observed(&out)["range_requests"], 0);
+        } else {
+            assert_eq!(tuning_observed(&out)["range_requests"], 1);
+        }
+        let src = fs::metadata(t.path("src")).unwrap();
+        assert_eq!(
+            (src.mtime(), src.mtime_nsec()),
+            (after.mtime(), after.mtime_nsec())
+        );
         assert!(partial_files(&t.0).is_empty());
     }
 }

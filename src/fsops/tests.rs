@@ -1866,6 +1866,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                     guard: None,
                 },
                 HashOptions {
+                    off: 0,
                     which: Which::Partial,
                     block: MIN_HASH_BLOCK_BYTES,
                     len: 4,
@@ -1961,6 +1962,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 guard: None,
             },
             HashOptions {
+                off: 0,
                 which: Which::Final,
                 block: MIN_HASH_BLOCK_BYTES,
                 len: 1,
@@ -4321,6 +4323,7 @@ fn source_content_uses_registered_directory_after_name_replacement() {
     ));
 
     let response = worker.handle(&Request::HashBlocks {
+        off: 0,
         path: parallel_marker.clone(),
         source: Some(marker.clone()),
         which: Which::Final,
@@ -4371,6 +4374,7 @@ fn source_content_rejects_a_replaced_exact_leaf() {
             len: 8,
         }),
         worker.handle(&Request::HashBlocks {
+            off: 0,
             path: selected.as_os_str().as_bytes().to_vec(),
             source: Some(selections[0].clone()),
             which: Which::Final,
@@ -4423,6 +4427,7 @@ fn source_content_refuses_symlink_intermediates() {
             len: 6,
         }),
         worker.handle(&Request::HashBlocks {
+            off: 0,
             path: label.clone(),
             source: Some(secret.clone()),
             which: Which::Final,
@@ -4519,6 +4524,7 @@ fn confined_source_content_requires_exact_registered_references() {
 
     for response in [
         worker.handle(&Request::HashBlocks {
+            off: 0,
             path: selected.as_os_str().as_bytes().to_vec(),
             source: None,
             which: Which::Final,
@@ -4549,6 +4555,7 @@ fn confined_source_content_requires_exact_registered_references() {
     );
 
     let response = worker.handle(&Request::HashBlocks {
+        off: 0,
         path: selected.as_os_str().as_bytes().to_vec(),
         source: Some(selections[0].clone()),
         which: Which::Partial,
@@ -4581,6 +4588,7 @@ fn unconfined_source_content_uses_only_the_explicit_legacy_path() {
     assert!(matches!(response, Response::Block { data, .. } if data == b"legacy!!"));
 
     let response = worker.handle(&Request::HashBlocks {
+        off: 0,
         path: sibling.as_os_str().as_bytes().to_vec(),
         source: None,
         which: Which::Final,
@@ -5501,4 +5509,45 @@ fn prefetched_comparison_window_keeps_current_bytes() {
     }
     let staged = ops.partial_path(Path::new("file"), &id).unwrap();
     assert_eq!(fs::read(tree.path().join(staged)).unwrap(), b"firstsecond");
+}
+
+#[test]
+fn equality_windows_keep_the_same_destination_inode() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let block = MIN_HASH_BLOCK_BYTES;
+    fs::write(root.join("file"), vec![b'a'; (block * 2) as usize]).unwrap();
+    let mut ops = FsOps::new();
+    ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
+    ops.destination_prefix = Some(path_bytes(root));
+    let id = [94; 16];
+    let request = |off| Request::HashAndHold {
+        off,
+        path: path_bytes(&root.join("file")),
+        copy_id: id,
+        block,
+        len: block,
+        condition: TargetCondition::Any,
+        guard: None,
+    };
+    let first = ops.handle(&request(0));
+    fs::rename(root.join("file"), root.join("original")).unwrap();
+    fs::write(root.join("file"), vec![b'b'; (block * 2) as usize]).unwrap();
+    let second = ops.handle(&request(block));
+    match (first, second) {
+        (
+            Response::HeldHashes { hashes: a, len: al },
+            Response::HeldHashes { hashes: b, len: bl },
+        ) => {
+            assert_eq!(a, b);
+            assert_eq!(al, block * 2);
+            assert_eq!(al, bl);
+        }
+        other => panic!("unexpected responses {other:?}"),
+    }
+    assert!(matches!(ops.handle(&request(1)), Response::Err(_)));
+    assert!(matches!(
+        ops.handle(&request(u64::MAX - block + 1)),
+        Response::Err(_)
+    ));
 }
