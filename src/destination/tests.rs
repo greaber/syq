@@ -837,10 +837,8 @@ fn named_workers_refuse_mutations_before_transport_shutdown() {
         let temp = crate::test_support::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-        let mut args = args(Path::new("source"), ".");
-        args.compress = false;
-        let (request, _) = request(&args);
-        let approved = approve(&registration, request);
+        let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
+        let approved = approve(&registration, command, request);
         let authority = receiver.sessions.lock().unwrap()[&approved.token]
             .authority
             .clone();
