@@ -74,6 +74,16 @@ impl Command {
                 operands.extend_from_slice(&original[index..]);
                 break;
             }
+            if let Some(flags) = short_flags(value) {
+                for flag in flags {
+                    let key = option_key(&flag).unwrap();
+                    if !changed.iter().any(|(replacement, _)| replacement == &key) {
+                        result.push(flag);
+                    }
+                }
+                index += 1;
+                continue;
+            }
             let key = option_key(value);
             // Each attempt gets its own results stream; never reopen the file
             // or descriptor from an earlier process.
@@ -97,6 +107,23 @@ impl Command {
         result.extend(operands);
         Ok((result, PathBuf::from(self.cwd.os()?)))
     }
+}
+
+// Expand only the short switches that resume permits changing. Unknown or
+// semantic switches still go through the normal rejection path.
+fn short_flags(value: &OsStr) -> Option<Vec<OsString>> {
+    let bytes = value.as_bytes();
+    (bytes.len() > 2
+        && bytes[0] == b'-'
+        && bytes[1..]
+            .iter()
+            .all(|byte| matches!(byte, b'v' | b'q' | b'n')))
+    .then(|| {
+        bytes[1..]
+            .iter()
+            .map(|byte| OsString::from_vec(vec![b'-', *byte]))
+            .collect()
+    })
 }
 
 fn option_key(value: &OsStr) -> Option<String> {
@@ -143,6 +170,15 @@ fn parse_overrides(values: &[OsString]) -> Result<Vec<(String, Vec<OsString>)>> 
     let mut index = 0;
     while index < values.len() {
         let value = &values[index];
+        if let Some(flags) = short_flags(value) {
+            result.extend(
+                flags
+                    .into_iter()
+                    .map(|flag| (option_key(&flag).unwrap(), vec![flag])),
+            );
+            index += 1;
+            continue;
+        }
         let key = option_key(value)
             .context("--resume does not accept new source or destination operands")?;
         let takes_value = option_takes_value(&key)
@@ -159,6 +195,19 @@ fn parse_overrides(values: &[OsString]) -> Result<Vec<(String, Vec<OsString>)>> 
             );
         } else if !takes_value && inline {
             bail!("{key} does not take a value");
+        }
+        if key == "--results" {
+            // Restore changes cwd after constructing the saved invocation.
+            // This new output belongs to the retry's caller, not the old cwd.
+            let path = if inline {
+                OsStr::from_bytes(&value.as_bytes()["--results=".len()..])
+            } else {
+                words[1].as_os_str()
+            };
+            if !path.is_empty() {
+                let absolute = std::path::absolute(path)?;
+                words = vec!["--results".into(), absolute.into_os_string()];
+            }
         }
         result.push((key, words));
         index += 1;
@@ -200,7 +249,11 @@ mod tests {
                 "--prune",
                 "--max-delete=10",
                 "--results",
-                "retry.jsonl"
+                std::env::current_dir()
+                    .unwrap()
+                    .join("retry.jsonl")
+                    .to_str()
+                    .unwrap()
             ])
         );
         assert!(saved.arguments(&words(&["--into", "elsewhere"])).is_err());
@@ -225,10 +278,35 @@ mod tests {
                 "--into",
                 "destination",
                 "--results",
-                "fresh.jsonl",
+                std::env::current_dir()
+                    .unwrap()
+                    .join("fresh.jsonl")
+                    .to_str()
+                    .unwrap(),
                 "--",
                 "--results"
             ])
+        );
+    }
+
+    #[test]
+    fn combined_operational_switches_replace_only_their_own_options() {
+        let saved = Command::new(&words(&["cp", "source", "--as", "destination", "-nv"])).unwrap();
+        let (args, _) = saved.arguments(&words(&["-vv"])).unwrap();
+        assert_eq!(
+            args,
+            words(&["cp", "source", "--as", "destination", "-n", "-v", "-v"])
+        );
+        let (args, _) = saved.arguments(&words(&["-nvv"])).unwrap();
+        assert_eq!(
+            args,
+            words(&["cp", "source", "--as", "destination", "-n", "-v", "-v"])
+        );
+        assert!(saved.arguments(&words(&["-vp"])).is_err());
+        let saved = Command::new(&words(&["cp", "--into", "destination", "--", "-nv"])).unwrap();
+        assert_eq!(
+            saved.arguments(&[]).unwrap().0,
+            words(&["cp", "--into", "destination", "--", "-nv"])
         );
     }
 

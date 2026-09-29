@@ -22,8 +22,8 @@ syq rm --srcs-in cache
 Add `--dry-run -v` to preview what would be removed first.
 A missing path is not an error. Filesystem removal is permanent; completed
 deletions cannot be rolled back. Local, ordinary SSH and S3 removals can supply a job ID. If an interrupted run supplies a job ID,
-`syq rm --resume JOB` retries its saved selection. It skips confirmed removals
-and refuses changed entries whose earlier removal was not confirmed. See
+`syq rm --resume JOB` retries its saved selection. It skips removals confirmed
+in earlier attempts and refuses changed entries whose earlier removal was not confirmed. See
 [named jobs](reference.md#resume-an-interrupted-copy) for records and permitted
 operational changes.
 

@@ -330,3 +330,50 @@ fn delegated_copy_does_not_advertise_a_source_owned_job() {
     assert!(run.get("job_id").is_none_or(serde_json::Value::is_null));
     assert!(!root.join("cache/syq/jobs").exists());
 }
+
+#[test]
+fn retry_results_use_callers_directory_with_combined_short_options() {
+    let temp = test_support::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join("source")).unwrap();
+    fs::create_dir(root.join("destination")).unwrap();
+    fs::create_dir(root.join("retry")).unwrap();
+    fs::write(root.join("destination/stale"), b"stale").unwrap();
+    let first = run(
+        root,
+        &[
+            "cp",
+            "--srcs-in",
+            "source",
+            "--into",
+            "destination",
+            "--prune",
+            "--max-delete",
+            "0",
+            "--results",
+            "first.jsonl",
+        ],
+    );
+    assert_eq!(first.status.code(), Some(25), "{first:?}");
+    let id = job_id(root, "first.jsonl");
+    for results_args in [
+        vec!["--results", "separate.jsonl"],
+        vec!["--results=inline.jsonl"],
+    ] {
+        assert_success(
+            Command::new(env!("CARGO_BIN_EXE_syq"))
+                .current_dir(root.join("retry"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .env_remove("SYQ_OPTIONS")
+                .args(["cp", "--resume", &id, "--max-delete", "1", "-nvv"])
+                .args(results_args)
+                .output()
+                .unwrap(),
+        );
+    }
+    for name in ["separate.jsonl", "inline.jsonl"] {
+        assert_eq!(job_id(&root.join("retry"), name), id);
+        assert!(!root.join(name).exists());
+    }
+    assert!(root.join("destination/stale").exists());
+}

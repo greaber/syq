@@ -73,6 +73,8 @@ pub(super) struct EntryState {
     pub directory_metadata: Option<(Meta, u8)>,
     pub removal: Option<RemovalIdentity>,
     pub removed: bool,
+    // Set only after replay, never by removals in the current attempt.
+    pub removed_before_attempt: bool,
     pub object_original: Option<Option<String>>,
     pub object_published: Option<String>,
     pub object_removal: Option<String>,
@@ -88,6 +90,11 @@ struct Replay {
     inputs: Option<(Vec<String>, Option<Bytes>)>,
 }
 impl Replay {
+    fn start_attempt(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.removed_before_attempt = entry.removed;
+        }
+    }
     fn apply(&mut self, record: Record) -> Result<()> {
         match record {
             Record::Command { command } => {
@@ -231,6 +238,7 @@ impl Job {
     fn open_at(base: &Path, id: &str) -> Result<Self> {
         let mut replay = Replay::default();
         let store = Store::open(base, id, "command", false, |record| replay.apply(record))?;
+        replay.start_attempt();
         let command = replay
             .command
             .as_ref()
@@ -261,6 +269,7 @@ impl Job {
     pub(crate) fn endpoint_at(base: &Path, id: &str, role: &str, resumed: bool) -> Result<Self> {
         let mut replay = Replay::default();
         let mut store = Store::open(base, id, role, !resumed, |record| replay.apply(record))?;
+        replay.start_attempt();
         if !resumed {
             let mut command = Command::new(&["rm".into()])?;
             command.copy_id = parse_id(id)?;
@@ -422,7 +431,9 @@ impl Job {
     ) -> Result<bool> {
         if let Some(previous) = self.entry(path) {
             if previous.removed {
-                return Ok(false);
+                // A directory rescan in this attempt keeps ordinary rm
+                // semantics. Only prior attempts protect recreated paths.
+                return Ok(!previous.removed_before_attempt);
             }
             if previous
                 .removal
@@ -553,7 +564,8 @@ impl Job {
             })
     }
     pub fn was_removed(&self, path: &[u8]) -> bool {
-        self.entry(path).is_some_and(|entry| entry.removed)
+        self.entry(path)
+            .is_some_and(|entry| entry.removed_before_attempt)
     }
     #[cfg(test)]
     pub fn before_remove_object(&self, path: &[u8], identity: &str, dry_run: bool) -> Result<bool> {
@@ -570,8 +582,8 @@ impl Job {
             let state = self.state.lock().unwrap();
             for (path, identity) in entries {
                 let entry = state.replay.entries.get(path);
-                if entry.is_some_and(|entry| entry.removed) {
-                    selected.push(false);
+                if let Some(entry) = entry.filter(|entry| entry.removed) {
+                    selected.push(!entry.removed_before_attempt);
                     continue;
                 }
                 if let Some(previous) = entry.and_then(|entry| entry.object_removal.as_ref()) {
@@ -721,11 +733,16 @@ mod tests {
         job.published_object(b"preexisting", "etag/version".into());
         assert!(job.before_remove_object(b"removed", "old", false).unwrap());
         job.removed(b"removed");
+        assert!(!job.was_removed(b"removed"));
+        assert!(job
+            .before_remove_object(b"removed", "replacement", false)
+            .unwrap());
         assert!(job
             .before_remove_object(b"uncertain", "old", false)
             .unwrap());
         drop(job);
         let job = Job::open_at(&base, &id).unwrap();
+        assert!(job.was_removed(b"removed"));
         assert!(job.owns_object(b"created", Some("etag/version")));
         assert!(!job.owns_object(b"created", Some("replacement")));
         assert!(!job.owns_object(b"preexisting", Some("etag/version")));

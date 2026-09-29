@@ -562,3 +562,65 @@ fn resumed_removal_keeps_replacements_of_completed_entries() {
     assert!(outcomes.iter().any(|outcome| outcome.path == bytes
         && outcome.disposition == NativeRemoveDisposition::AlreadyAbsent));
 }
+
+#[test]
+fn journal_allows_removing_files_recreated_during_the_same_attempt() {
+    for resumed in [false, true] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let selected = temp.path().join("tree");
+        fs::create_dir(&selected).unwrap();
+        let leaf = selected.join("leaf");
+        fs::write(&leaf, b"first").unwrap();
+        let id = "0123456789abcdef0123456789abcdef";
+        let base = temp.path().join("jobs");
+        let mut job = crate::resume::Job::endpoint_at(&base, id, "remove", false).unwrap();
+        if resumed {
+            drop(job);
+            job = crate::resume::Job::endpoint_at(&base, id, "remove", true).unwrap();
+        }
+        let recreated = Arc::new(AtomicBool::new(false));
+        let seen = recreated.clone();
+        let recreate = leaf.clone();
+        let _hook = hook_unlinks_in(temp.path(), move |name| {
+            if name.to_bytes() == b"tree" && !seen.swap(true, Ordering::SeqCst) {
+                assert!(!recreate.exists());
+                fs::write(&recreate, b"second").unwrap();
+            }
+        });
+        let mut outcomes = Vec::new();
+        remove_with_job(
+            None,
+            None,
+            &[NativeRemoveSelection {
+                path: selected.as_os_str().as_bytes().to_vec(),
+                kind: NativeRemoveKind::Directory,
+            }],
+            false,
+            false,
+            2,
+            Some(Arc::new(job)),
+            &mut |_| Ok(()),
+            &mut |batch| {
+                outcomes.extend(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(recreated.load(Ordering::SeqCst));
+        assert!(!selected.exists(), "{outcomes:?}");
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| {
+                    outcome.path == leaf.as_os_str().as_bytes()
+                        && outcome.disposition == NativeRemoveDisposition::Removed
+                })
+                .count(),
+            2,
+            "{outcomes:?}"
+        );
+        assert!(!outcomes
+            .iter()
+            .any(|outcome| outcome.disposition == NativeRemoveDisposition::Failed));
+    }
+}

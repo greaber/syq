@@ -279,7 +279,8 @@ filters, metadata choices or overwrite policy. For a job with pruning,
 For example, use `syq cp --resume JOB --max-delete 100` after checking a
 previously insufficient deletion limit. `--dry-run` previews another attempt
 without consuming the job. Each attempt needs a fresh `--results` file or
-`--results-fd`; output targets from the original command are not reused.
+`--results-fd`; output targets from the original command are not reused. A relative
+`--results` path is resolved from the directory where you invoke the retry.
 
 Job recording is optional. If it is unavailable or fails, the operation
 continues and syq reports that it cannot supply a usable job. Records live in
