@@ -1580,34 +1580,42 @@ fn serve(
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         );
-        assert!(!headers.contains_key("x-amz-meta-syq-blake3"));
         if fault == "upload-metadata" {
             assert_eq!(headers["x-amz-meta-syq-mode"], "416");
             assert_eq!(headers["x-amz-meta-syq-mtime"], "123");
             assert_eq!(headers["x-amz-meta-syq-mtime-nsec"], "456");
         }
 
-        let digest = if fault == "upload-md5" {
-            md5::Md5::digest(&body)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        } else {
-            sha2::Sha256::digest(&body)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        };
-        assert_eq!(headers["x-amz-meta-syq-format"], "2");
-        assert_eq!(headers["x-amz-meta-syq-hash"], digest);
-        assert_eq!(
-            headers["x-amz-meta-syq-hash-algorithm"],
-            if fault == "upload-md5" {
-                "md5"
+        if matches!(fault, "upload-md5" | "upload-sha256") {
+            let digest = if fault == "upload-md5" {
+                md5::Md5::digest(&body)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
             } else {
-                "sha256"
-            }
-        );
+                sha2::Sha256::digest(&body)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            };
+            assert_eq!(headers["x-amz-meta-syq-format"], "2");
+            assert_eq!(headers["x-amz-meta-syq-hash"], digest);
+            assert_eq!(
+                headers["x-amz-meta-syq-hash-algorithm"],
+                if fault == "upload-md5" {
+                    "md5"
+                } else {
+                    "sha256"
+                }
+            );
+            assert!(!headers.contains_key("x-amz-meta-syq-blake3"));
+        } else {
+            assert_eq!(headers["x-amz-meta-syq-format"], "1");
+            assert_eq!(
+                headers["x-amz-meta-syq-blake3"],
+                blake3::hash(&body).to_hex().to_string()
+            );
+        }
         gate.0.store(true, Ordering::Release);
         reply(
             &mut socket,
@@ -2661,12 +2669,16 @@ fn s3_write_headers_reach_only_object_writes() {
 }
 
 #[test]
-fn s3_upload_native_checksum_reuse_and_expected_hash() {
+fn s3_upload_native_checksum_and_whole_file_hash() {
     for (fault, options) in [
         ("upload-default", Vec::new()),
         (
             "upload-sha256",
             vec!["--integrity-checking=transfer=sha256".to_owned()],
+        ),
+        (
+            "upload-md5",
+            vec!["--integrity-checking=transfer=md5".to_owned()],
         ),
     ] {
         let server = Server::start(fault);

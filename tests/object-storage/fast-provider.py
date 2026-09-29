@@ -24,16 +24,11 @@ with tempfile.TemporaryDirectory(prefix='syq-fast-check-') as tmp:
             headers,body=c.request('GET',c.PREFIX+'/'+name)
             assert hashlib.sha256(body).digest()==digest
             fields={k.lower():v for k,v in headers.items()}
-            if fields['x-amz-meta-syq-format']=='1':
-                # Multipart BLAKE3 is checked against the standard hasher in
-                # Rust unit tests; the body above has an independent SHA256.
-                whole=fields['x-amz-meta-syq-blake3']
-                assert len(whole)==64 and int(whole,16)>=0, whole
-            else:
-                assert fields['x-amz-meta-syq-format']=='2', fields
-                algorithm=fields['x-amz-meta-syq-hash-algorithm']
-                assert algorithm in {'sha256','md5'}, algorithm
-                assert fields['x-amz-meta-syq-hash']==hashlib.new(algorithm,body).hexdigest()
+            assert fields['x-amz-meta-syq-format']=='1', fields
+            # Digest correctness is checked against the standard BLAKE3 hasher
+            # in Rust tests; every body above has an independent SHA256 check.
+            whole=fields['x-amz-meta-syq-blake3']
+            assert len(whole)==64 and int(whole,16)>=0, whole
         target=root/'target'
         run('--from','s3://'+c.BUCKET,'--srcs-in',c.PREFIX,'--into',target)
         for name,digest in expected.items():

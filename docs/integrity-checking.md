@@ -61,13 +61,12 @@ For a complete check of a local copy, use an [expected hash](#expected-hashes).
 For local/S3 copies, provider request checksums remain enabled. The `transfer`
 setting does not disable them. Single-part uploads with a SHA-256 request
 checksum also reuse that digest for payload signing, without another hashing
-pass. Pathname uploads always store a whole-file hash: normally the request's
-SHA-256 or MD5 digest for a single-part upload, or BLAKE3 for a multipart upload.
-For large multipart files, BLAKE3 shares the read used to prepare request
-checksums when the part size is a power of two. Other part sizes or whole-file
-algorithms require another local read; automatic part sizes can leave this fast
-path for very large objects. An explicit comparison, transfer, or expected hash
-can select a different stored algorithm.
+pass. Pathname uploads store a whole-file BLAKE3 hash by default, so later
+`--hash` comparisons can use it without downloading the object. An explicit
+comparison, transfer, or expected hash can select a different stored algorithm.
+BLAKE3 shares the read used to prepare request checksums for all automatic part
+sizes. Large multipart files need an additional local read for other whole-file
+algorithms or custom part sizes that are not multiples of 1 KiB.
 The `transfer` setting checks stored hashes on download when present. Use an
 expected hash for objects without a stored hash. See
 [Filesystem differences](object-storage.md#filesystem-differences).

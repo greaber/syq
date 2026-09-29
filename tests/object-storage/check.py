@@ -204,10 +204,9 @@ def check():
         hdr, body = request('GET', placement + '/source/script')
         assert body == (src / 'script').read_bytes()
         fields = {k.lower(): v for k, v in hdr.items()}
-        assert fields['x-amz-meta-syq-format'] == '2'
-        algorithm = fields['x-amz-meta-syq-hash-algorithm']
-        assert algorithm in {'sha256', 'md5'}, algorithm
-        assert fields['x-amz-meta-syq-hash'] == hashlib.new(algorithm, body).hexdigest()
+        assert fields['x-amz-meta-syq-format'] == '1'
+        whole = fields['x-amz-meta-syq-blake3']
+        assert len(whole) == 64 and int(whole, 16) >= 0, whole
         # Existing outputs remain intact on a dry run and no recovery data is created.
         (restored / 'script').write_bytes(b'local edits')
         run(['--from', remote, placement + '/source/script', '--as', restored / 'script', '--if-exists=update', '--dry-run'])

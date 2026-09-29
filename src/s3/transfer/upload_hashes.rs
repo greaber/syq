@@ -52,7 +52,7 @@ pub(super) fn bytes(
 
 // Keep the small-file path to one read for every algorithm. Large files retain
 // independent parallel native part hashing. BLAKE3 can reuse that read when each
-// part is a power-of-two subtree; other whole hashes share one additional read.
+// part starts at a BLAKE3 chunk boundary; other whole hashes share one additional read.
 // The factory gives each parallel part and whole-file pass its own reader. Its
 // end offset lets the caller check source identity after the final read.
 pub(super) fn ranges<R>(
@@ -68,8 +68,7 @@ where
 {
     let native = native_algorithm(native);
     let tree = size > part_size
-        && part_size.is_power_of_two()
-        && part_size >= blake3::CHUNK_LEN as u64
+        && part_size.is_multiple_of(blake3::CHUNK_LEN as u64)
         && (whole == HashAlgorithm::Blake3 || comparison == Some(HashAlgorithm::Blake3));
     let parallel = size >= 32 * 1024 * 1024 && size > part_size;
     let reusable = |algorithm| {
@@ -160,8 +159,8 @@ where
     })
 }
 
-// In tree mode each part is a complete, equally sized BLAKE3 subtree except the
-// final rightmost part. These are exactly the tree shapes supported here.
+// Each aligned part is split into complete BLAKE3 subtrees, with a possibly
+// short final chunk at EOF. No subtree crosses a native part boundary.
 fn parallel_parts<R>(
     size: u64,
     part_size: u64,
@@ -172,10 +171,15 @@ fn parallel_parts<R>(
 where
     R: FnMut(&mut [u8], u64) -> Result<()>,
 {
-    use blake3::hazmat::{merge_subtrees_non_root, merge_subtrees_root, HasherExt, Mode};
-    anyhow::ensure!(
-        !tree || (size > part_size && part_size.is_power_of_two() && part_size >= 1024)
-    );
+    use blake3::hazmat::{
+        left_subtree_len, max_subtree_len, merge_subtrees_non_root, merge_subtrees_root, HasherExt,
+        Mode,
+    };
+    anyhow::ensure!(!tree || (size > part_size && part_size > 0 && part_size.is_multiple_of(1024)));
+    struct Subtree {
+        offset: u64,
+        hash: [u8; 32],
+    }
     let parts = (0..size.div_ceil(part_size))
         .into_par_iter()
         .map(|index| -> Result<_> {
@@ -183,44 +187,72 @@ where
             let end = (start + part_size).min(size);
             let mut read = open(end)?;
             let mut native = native.hasher();
-            let mut subtree = tree.then(|| {
-                let mut hash = blake3::Hasher::new();
-                hash.set_input_offset(start);
-                hash
-            });
+            let mut subtrees = Vec::new();
             let mut buffer = vec![0; part_size.min(1024 * 1024) as usize];
             let mut offset = start;
             while offset < end {
-                let length = (end - offset).min(buffer.len() as u64) as usize;
-                read(&mut buffer[..length], offset)?;
-                native.update(&buffer[..length]);
-                if let Some(subtree) = &mut subtree {
-                    subtree.update(&buffer[..length]);
+                let subtree_start = offset;
+                let remaining = end - offset;
+                let length = if tree && remaining >= blake3::CHUNK_LEN as u64 {
+                    // The largest complete subtree that fits this part and is
+                    // valid at this offset. Only the final chunk can be short.
+                    let complete = 1u64 << (63 - remaining.leading_zeros());
+                    complete.min(max_subtree_len(offset).unwrap_or(complete))
+                } else {
+                    remaining
+                };
+                let subtree_end = offset + length;
+                let mut subtree = tree.then(|| {
+                    let mut hash = blake3::Hasher::new();
+                    hash.set_input_offset(offset);
+                    hash
+                });
+                while offset < subtree_end {
+                    let length = (subtree_end - offset).min(buffer.len() as u64) as usize;
+                    read(&mut buffer[..length], offset)?;
+                    native.update(&buffer[..length]);
+                    if let Some(subtree) = &mut subtree {
+                        subtree.update(&buffer[..length]);
+                    }
+                    offset += length as u64;
                 }
-                offset += length as u64;
+                if let Some(subtree) = subtree {
+                    subtrees.push(Subtree {
+                        offset: subtree_start,
+                        hash: subtree.finalize_non_root(),
+                    });
+                }
             }
-            Ok((native.finalize(), subtree.map(|h| h.finalize_non_root())))
+            Ok((native.finalize(), subtrees))
         })
         .collect::<Result<Vec<_>>>()?;
-    fn merge(parts: &[([u8; 32], Option<[u8; 32]>)], root: bool) -> [u8; 32] {
-        if parts.len() == 1 {
-            return parts[0].1.unwrap();
+    fn merge(subtrees: &[Subtree], end: u64, root: bool) -> [u8; 32] {
+        if subtrees.len() == 1 {
+            return subtrees[0].hash;
         }
-        // BLAKE3's left child is the largest power-of-two subtree that leaves
-        // any input for its right child. Only the rightmost part may be short.
-        let split = parts.len().next_power_of_two() / 2;
-        let left = merge(&parts[..split], false);
-        let right = merge(&parts[split..], false);
+        // Split by bytes, not the number of pieces: aligned parts can produce
+        // different subtree sizes. Complete subtrees never cross this boundary.
+        let start = subtrees[0].offset;
+        let boundary = start + left_subtree_len(end - start);
+        let split = subtrees.partition_point(|subtree| subtree.offset < boundary);
+        debug_assert_eq!(subtrees[split].offset, boundary);
+        let left = merge(&subtrees[..split], boundary, false);
+        let right = merge(&subtrees[split..], end, false);
         if root {
             *merge_subtrees_root(&left, &right, Mode::Hash).as_bytes()
         } else {
             merge_subtrees_non_root(&left, &right, Mode::Hash)
         }
     }
-    let whole = tree.then(|| merge(&parts, true));
+    let mut native = Vec::with_capacity(parts.len());
+    let mut subtrees = Vec::new();
+    for (hash, pieces) in parts {
+        native.push(hash);
+        subtrees.extend(pieces);
+    }
     Ok(PartHashes {
-        native: parts.into_iter().map(|part| part.0).collect(),
-        blake3: whole,
+        native,
+        blake3: tree.then(|| merge(&subtrees, size, true)),
     })
 }
 
@@ -232,7 +264,14 @@ mod tests {
     #[test]
     fn parallel_subtrees_match_standard_blake3_with_one_read() {
         let bytes: Vec<_> = (0..5 * 1024 * 1024 + 31).map(|n| (n % 251) as u8).collect();
-        for part_size in [1024usize, 2048, 1024 * 1024] {
+        for part_size in [
+            1024usize,
+            2048,
+            3 * 1024,
+            5 * 1024,
+            1024 * 1024,
+            5 * 1024 * 1024,
+        ] {
             let sizes = [
                 part_size + 1,
                 2 * part_size,
@@ -241,7 +280,7 @@ mod tests {
                 4 * part_size,
                 bytes.len(),
             ];
-            for size in sizes {
+            for size in sizes.into_iter().filter(|&size| size <= bytes.len()) {
                 for native in [Algorithm::Sha256, Algorithm::Md5] {
                     let read_bytes = AtomicUsize::new(0);
                     let PartHashes {
@@ -280,7 +319,7 @@ mod tests {
             }
         }
         assert!(
-            parallel_parts(4096, 3072, HashAlgorithm::Sha256, true, |_| Ok(
+            parallel_parts(4096, 3073, HashAlgorithm::Sha256, true, |_| Ok(
                 |_: &mut [u8], _| Ok(())
             ))
             .is_err()
@@ -351,65 +390,68 @@ mod tests {
         let bytes: Vec<_> = (0..32 * 1024 * 1024 + 23)
             .map(|n| (n % 251) as u8)
             .collect();
-        for (part_size, whole, comparison, reads) in [
-            (16 * 1024 * 1024, HashAlgorithm::Blake3, None, 1),
-            (5 * 1024 * 1024, HashAlgorithm::Blake3, None, 2),
-            (
-                16 * 1024 * 1024,
-                HashAlgorithm::Blake3,
-                Some(HashAlgorithm::Sha256),
-                2,
-            ),
-            (
-                16 * 1024 * 1024,
-                HashAlgorithm::Sha256,
-                Some(HashAlgorithm::Blake3),
-                2,
-            ),
-        ] {
-            let read_bytes = AtomicUsize::new(0);
-            let opens = AtomicUsize::new(0);
-            let result = ranges(
-                bytes.len() as u64,
-                part_size,
-                Algorithm::Sha256,
-                whole,
-                comparison,
-                |end| {
-                    opens.fetch_add(1, Ordering::Relaxed);
-                    let bytes = &bytes;
-                    let read_bytes = &read_bytes;
-                    let mut next = None;
-                    Ok(move |buffer: &mut [u8], offset| {
-                        assert!(next.is_none_or(|next| next == offset));
-                        next = Some(offset + buffer.len() as u64);
-                        assert!(next.unwrap() <= end);
-                        buffer.copy_from_slice(
-                            &bytes[offset as usize..offset as usize + buffer.len()],
-                        );
-                        read_bytes.fetch_add(buffer.len(), Ordering::Relaxed);
-                        Ok(())
-                    })
-                },
-            )
-            .unwrap();
-            assert_eq!(read_bytes.load(Ordering::Relaxed), reads * bytes.len());
-            assert_eq!(
-                opens.load(Ordering::Relaxed),
-                bytes.len().div_ceil(part_size as usize) + reads - 1
-            );
-            assert_eq!(result.whole, Digest::hash_bytes(whole, &bytes).value);
-            assert_eq!(
-                result.comparison,
-                comparison.map(|a| Digest::hash_bytes(a, &bytes).value)
-            );
-            assert_eq!(
-                result.checksums,
-                bytes
-                    .chunks(part_size as usize)
-                    .map(|b| Algorithm::Sha256.digest(b))
-                    .collect::<Vec<_>>()
-            );
+        for native in [Algorithm::Sha256, Algorithm::Md5] {
+            for (part_size, whole, comparison, reads) in [
+                (16 * 1024 * 1024, HashAlgorithm::Blake3, None, 1),
+                (5 * 1024 * 1024, HashAlgorithm::Blake3, None, 1),
+                (5 * 1024 * 1024 + 1, HashAlgorithm::Blake3, None, 2),
+                (
+                    16 * 1024 * 1024,
+                    HashAlgorithm::Blake3,
+                    Some(HashAlgorithm::Sha256),
+                    2,
+                ),
+                (
+                    16 * 1024 * 1024,
+                    HashAlgorithm::Sha256,
+                    Some(HashAlgorithm::Blake3),
+                    2,
+                ),
+            ] {
+                let read_bytes = AtomicUsize::new(0);
+                let opens = AtomicUsize::new(0);
+                let result = ranges(
+                    bytes.len() as u64,
+                    part_size,
+                    native,
+                    whole,
+                    comparison,
+                    |end| {
+                        opens.fetch_add(1, Ordering::Relaxed);
+                        let bytes = &bytes;
+                        let read_bytes = &read_bytes;
+                        let mut next = None;
+                        Ok(move |buffer: &mut [u8], offset| {
+                            assert!(next.is_none_or(|next| next == offset));
+                            next = Some(offset + buffer.len() as u64);
+                            assert!(next.unwrap() <= end);
+                            buffer.copy_from_slice(
+                                &bytes[offset as usize..offset as usize + buffer.len()],
+                            );
+                            read_bytes.fetch_add(buffer.len(), Ordering::Relaxed);
+                            Ok(())
+                        })
+                    },
+                )
+                .unwrap();
+                assert_eq!(read_bytes.load(Ordering::Relaxed), reads * bytes.len());
+                assert_eq!(
+                    opens.load(Ordering::Relaxed),
+                    bytes.len().div_ceil(part_size as usize) + reads - 1
+                );
+                assert_eq!(result.whole, Digest::hash_bytes(whole, &bytes).value);
+                assert_eq!(
+                    result.comparison,
+                    comparison.map(|a| Digest::hash_bytes(a, &bytes).value)
+                );
+                assert_eq!(
+                    result.checksums,
+                    bytes
+                        .chunks(part_size as usize)
+                        .map(|b| native.digest(b))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
     }
 

@@ -850,13 +850,7 @@ impl Engine {
             bail!("file exceeds the S3 multipart size limit");
         }
         let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
-        let whole_algorithm = requested_algorithm.unwrap_or_else(|| {
-            if size <= part_size {
-                upload_hashes::native_algorithm(algorithm)
-            } else {
-                HashAlgorithm::Blake3
-            }
-        });
+        let whole_algorithm = requested_algorithm.unwrap_or(HashAlgorithm::Blake3);
         let buffer_limit = if self.tuning.tigris() {
             8 << 20
         } else {
