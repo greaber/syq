@@ -417,6 +417,22 @@ impl Root {
     /// Create a new regular leaf. Existing leaves of every type are refused.
     /// Special permission bits require the explicit metadata operations.
     pub(crate) fn create_file(&self, path: &RelativePath, mode: u32) -> Result<File> {
+        self.create_file_with_access(path, mode, libc::O_RDWR)
+    }
+
+    /// Create a new regular leaf for a writer that never reads it back. An
+    /// NFS server can answer a read-write open with a delegation, which the
+    /// client must return before the file is renamed into place.
+    pub(crate) fn create_write_only_file(&self, path: &RelativePath, mode: u32) -> Result<File> {
+        self.create_file_with_access(path, mode, libc::O_WRONLY)
+    }
+
+    fn create_file_with_access(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+        access: libc::c_int,
+    ) -> Result<File> {
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(path)?;
         // O_CREAT | O_EXCL either creates a new regular file or fails. Unlike
@@ -425,7 +441,7 @@ impl Root {
         let file = self
             .open_leaf(
                 path,
-                libc::O_RDWR
+                access
                     | libc::O_CREAT
                     | libc::O_EXCL
                     | libc::O_NOFOLLOW

@@ -183,15 +183,20 @@ impl FsOps {
         target: RootedTarget,
     ) -> Result<SmallStage> {
         self.uncache_rooted(&target.root, &target.relative);
+        let mode = staged_file_mode(&put.meta, put.flags);
         let (partial, label, opened) =
             with_rooted_partial(&target, &put.copy_id, |relative, label| {
-                self.open_private_partial_rooted(
-                    &target.root,
-                    relative,
-                    label,
-                    true,
-                    staged_file_mode(&put.meta, put.flags),
-                )
+                // Nothing reads a small file's sidecar, so a new one is
+                // opened for writing only. One left by an earlier attempt
+                // takes the checked reuse that ranged writes apply.
+                self.uncache_rooted(&target.root, relative);
+                match self.create_write_only_partial(&target.root, relative, mode) {
+                    Ok(file) => Ok(Some((file, None))),
+                    Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
+                        self.open_private_partial_rooted(&target.root, relative, label, true, mode)
+                    }
+                    Err(error) => Err(error),
+                }
             })?;
         let (file, basis_size) = opened.context("sidecar creation was requested")?;
         Ok(SmallStage {
@@ -376,6 +381,33 @@ mod tests {
             before
         );
         assert_eq!(entries(temporary.path()), 4);
+    }
+
+    #[test]
+    fn a_new_sidecar_is_opened_for_writing_only_and_a_leftover_is_reused() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let mut ops = receiver(temporary.path());
+        let access = |stage: &SmallStage| {
+            (unsafe { libc::fcntl(stage.file.as_raw_fd(), libc::F_GETFL) }) & libc::O_ACCMODE
+        };
+        let file = put("file", b"contents");
+        let target = ops.small_target(&file).unwrap();
+        let stage = ops.create_small_stage(&file, target).unwrap();
+        assert_eq!(access(&stage), libc::O_WRONLY);
+        assert!(!stage.reused);
+        // The same copy finds its sidecar again after an interrupted attempt.
+        drop(stage);
+        let target = ops.small_target(&file).unwrap();
+        let stage = ops.create_small_stage(&file, target).unwrap();
+        assert!(stage.reused);
+        ops.write_small_stage(&file, &stage).unwrap();
+        ops.publish_small_stage(&file, &stage).unwrap();
+        assert_eq!(ops.finish_small_stage(&file, stage).unwrap(), None);
+        assert_eq!(
+            fs::read(temporary.path().join("file")).unwrap(),
+            b"contents"
+        );
+        assert_eq!(entries(temporary.path()), 1);
     }
 
     #[test]

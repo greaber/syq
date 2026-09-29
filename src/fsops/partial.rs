@@ -40,6 +40,19 @@ impl FsOps {
         root.create_file(relative, mode)
     }
 
+    pub(super) fn create_write_only_partial(
+        &self,
+        root: &Root,
+        relative: &RelativePath,
+        mode: u32,
+    ) -> Result<File> {
+        #[cfg(target_os = "macos")]
+        if self.inode_preservation.acls {
+            return root.create_private_file(relative);
+        }
+        root.create_write_only_file(relative, mode)
+    }
+
     fn create_inplace_file(root: &Root, relative: &RelativePath, mode: u32) -> Result<File> {
         // Other range workers, or Prepare after a CopyLocal fallback, must
         // reopen this new inode for writing. Finalize applies the requested
