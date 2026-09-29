@@ -1229,11 +1229,18 @@ fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
             } else if requests.is_empty() {
                 crate::output::human_stdout!("No requests awaiting approval");
             } else {
+                // Dim arguments naming files the server reads and this machine
+                // cannot check.
+                let terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
                 for request in requests {
                     crate::output::human_stdout!(
                         "{}\n{}\nNotification: {}\n",
                         request.id,
-                        request.description(),
+                        request.description(|word| if terminal {
+                            format!("\x1b[2m{word}\x1b[0m")
+                        } else {
+                            word.to_owned()
+                        }),
                         request.notification
                     );
                 }

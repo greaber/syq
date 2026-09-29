@@ -40,7 +40,7 @@ fn target_endpoint(target: &str) -> Result<crate::cli::NativeEndpoint> {
     Ok(endpoint)
 }
 
-fn eligible_target(args: &crate::cli::Args) -> Result<String> {
+pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     use crate::cli::{CoordinateAt, Interface, PeerAuth};
     let (destination, sources) = args
         .locations
@@ -134,6 +134,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         &registration,
         Message::Forward {
             target,
+            command: crate::approval_command::current()?,
             request: Box::new(request),
         },
         REQUEST_TIMEOUT + SETUP_TIMEOUT + Duration::from_secs(10),
@@ -171,6 +172,7 @@ impl Receiver {
     pub(super) fn forward(
         &self,
         target: String,
+        command: Vec<Vec<u8>>,
         request: CopyRequest,
         mut stream: TrackedStream,
     ) -> Result<()> {
@@ -178,6 +180,7 @@ impl Receiver {
             anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
         })?;
         target_endpoint(&target)?;
+        crate::approval_command::check_copy(&command, &request, None, Some(&target))?;
         if request.copy.destination != REQUEST_ROOT
             || request.destination.len() > 4096
             || request.destination.contains(&0)
@@ -223,6 +226,7 @@ impl Receiver {
         // of its SSH credentials on another host.
         self.approvals.request_remote(
             &self.requester,
+            &command,
             &target,
             &request,
             self.notifications,
@@ -847,11 +851,24 @@ mod tests {
         assert!(eligible_target(&args).is_err());
     }
 
+    fn forward_command(source: &Path) -> Vec<Vec<u8>> {
+        let source = source.as_os_str().as_bytes().to_vec();
+        [b"cp".to_vec(), b"--src".to_vec(), source]
+            .into_iter()
+            .chain(
+                ["--to", "backup", "--into", "output"]
+                    .iter()
+                    .map(|arg| arg.as_bytes().to_vec()),
+            )
+            .collect()
+    }
+
     #[test]
     fn forward_validation_precedes_approval_and_outbound_ssh() {
         let root = crate::test_support::tempdir().unwrap();
         let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
-        let (valid, _) = request(&args(root.path(), "output"));
+        let command = forward_command(root.path());
+        let (valid, _) = request(&crate::approval_command::parse(&command).unwrap());
         for case in 0..5 {
             let mut copy = valid.clone();
             let mut target = "backup".to_owned();
@@ -866,6 +883,7 @@ mod tests {
                 &registration,
                 Message::Forward {
                     target,
+                    command: command.clone(),
                     request: Box::new(copy)
                 },
                 Duration::from_secs(2)
@@ -881,12 +899,14 @@ mod tests {
         for revoke in [false, true] {
             let root = crate::test_support::tempdir().unwrap();
             let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
-            let (copy, _) = request(&args(root.path(), "output"));
+            let command = forward_command(root.path());
+            let (copy, _) = request(&crate::approval_command::parse(&command).unwrap());
             let task = std::thread::spawn(move || {
                 exchange(
                     &registration,
                     Message::Forward {
                         target: "backup".into(),
+                        command,
                         request: Box::new(copy),
                     },
                     Duration::from_secs(3),
@@ -903,7 +923,7 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(5));
             };
-            let description = pending.description();
+            let description = pending.description(str::to_owned);
             assert!(description.contains("backup"));
             assert!(description.contains("output"));
             assert!(description.contains("SSH access"));

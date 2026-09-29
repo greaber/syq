@@ -258,12 +258,23 @@ pub(super) async fn connect(
     target: &str,
     existence: crate::cli::Existence,
 ) -> Result<Option<Arc<Authorization>>> {
-    use crate::s3::authorization::{Request, Scope, DEFAULT_LIFETIME};
     let crate::cli::AuthFrom::Return(name) = &args.auth_from else {
         return Ok(None);
     };
+    crate::s3::authorization::connect_request(name, request(args, options, target, existence))
+        .await
+        .map(Some)
+}
+
+pub(crate) fn request(
+    args: &crate::cli::Args,
+    options: &Options,
+    target: &str,
+    existence: crate::cli::Existence,
+) -> crate::s3::authorization::Request {
+    use crate::s3::authorization::{Request, Scope, DEFAULT_LIFETIME};
     let upload = options.route == crate::s3::Route::Upload;
-    let request = Request {
+    Request {
         bucket: options.bucket.clone(),
         endpoint: options.endpoint.clone(),
         region: options.region.clone(),
@@ -279,8 +290,6 @@ pub(super) async fn connect(
         delete: false,
         create_only: args.ignore_existing || existence == crate::cli::Existence::New,
         lifetime: DEFAULT_LIFETIME,
-    };
-    crate::s3::authorization::connect_request(name, request)
-        .await
-        .map(Some)
+        headers: crate::s3::authorization::command_headers(options),
+    }
 }

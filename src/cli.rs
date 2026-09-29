@@ -2134,7 +2134,10 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
     let mut command = crate::help::filesystem(NativeCopyCommand::command());
-    let matches = command.try_get_matches_from_mut(full_argv).unwrap_or_else(|error| {
+    // Usage errors return clap errors instead of exiting: the receiving machine
+    // parses a server's copy command to check an approval request. The
+    // command-line entry point exits with clap's formatting and status.
+    let matches = command.try_get_matches_from_mut(full_argv).map_err(|error| {
         // Use the parser's classification, so a filename or an option value
         // that happens to spell an unsupported flag remains an ordinary operand.
         if error.kind() == clap::error::ErrorKind::UnknownArgument {
@@ -2151,12 +2154,12 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
                     _ => None,
                 };
                 if let Some(message) = message {
-                    command.error(error.kind(), message).exit();
+                    return command.error(error.kind(), message);
                 }
             }
         }
-        error.exit()
-    });
+        error
+    })?;
     validate_native_copy_argument_order(&matches)?;
     let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
     let stream = selected_stream_source(&parsed.copy)?;
@@ -2504,9 +2507,8 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
 fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq rm")];
     full_argv.extend_from_slice(argv);
-    let matches = crate::help::filesystem(NativeRmCommand::command())
-        .try_get_matches_from(full_argv)
-        .unwrap_or_else(|error| error.exit());
+    let matches =
+        crate::help::filesystem(NativeRmCommand::command()).try_get_matches_from(full_argv)?;
     let parsed = NativeRmCommand::from_arg_matches(&matches)?;
     validate_native_results_fd(parsed.results_output.results_fd)?;
     let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();

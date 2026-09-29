@@ -28,7 +28,10 @@ pub(crate) fn connect(name: &str, request: Request) -> Result<(UnixStream, Confi
     crate::output::diagnostic!("syq: requesting storage permission from @{name}; approve on that machine with its desktop prompt or syq persist receive pending");
     let (mut stream, reply) = exchange(
         &registration,
-        Message::Storage(request),
+        Message::Storage {
+            command: crate::approval_command::current()?,
+            request,
+        },
         REQUEST_TIMEOUT + Duration::from_secs(10),
     )?;
     anyhow::ensure!(
@@ -129,8 +132,14 @@ pub(crate) fn finish(stream: &mut UnixStream) -> Result<()> {
 }
 
 impl Receiver {
-    pub(super) fn storage(&self, request: Request, mut stream: TrackedStream) -> Result<()> {
+    pub(super) fn storage(
+        &self,
+        command: Vec<Vec<u8>>,
+        request: Request,
+        mut stream: TrackedStream,
+    ) -> Result<()> {
         request.validate()?;
+        crate::approval_command::check_storage(&command, &request, &self.name)?;
         let request_lock = self.request_lock.try_lock().map_err(|_| {
             anyhow::anyhow!("another request is awaiting approval; retry after it is decided")
         })?;
@@ -147,8 +156,13 @@ impl Receiver {
                 || self.generation.load(Ordering::Acquire) != generation
         };
         let cancelled = || receiving_stopped() || requester_closed(&socket);
-        self.approvals
-            .request_storage(&self.requester, &request, self.notifications, cancelled)?;
+        self.approvals.request_storage(
+            &self.requester,
+            &command,
+            &request,
+            self.notifications,
+            cancelled,
+        )?;
         drop(request_lock);
         anyhow::ensure!(
             !cancelled(),

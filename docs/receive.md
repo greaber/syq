@@ -72,8 +72,9 @@ See [Make TCP reachable](server-tuning.md#make-tcp-reachable) for server setup.
 
 ### Approving copies
 
-By default, each incoming copy waits for approval **on your laptop**. Review the destination
-and permissions, then choose **Allow once** or **Deny**. To see the complete
+By default, each incoming copy waits for approval **on your laptop**. The prompt
+shows the server's syq command and where it writes; choose **Allow once** or
+**Deny**. To see the complete
 request, use **Details** on macOS or `syq persist receive pending` in a local
 terminal. You can also approve or deny there:
 

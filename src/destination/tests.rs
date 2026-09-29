@@ -153,6 +153,35 @@ pub(super) fn args(source: &Path, destination: &str) -> Args {
     args.normalize();
     args
 }
+/// A copy command to the test receiver, as the requesting server sends it.
+/// Unless `options` choose otherwise, it uses two workers.
+pub(super) fn command(source: &Path, options: &[&str]) -> Vec<Vec<u8>> {
+    let source = source.as_os_str().as_bytes().to_vec();
+    let workers: &[&str] = if options.contains(&"--performance-tuning") {
+        &[]
+    } else {
+        &["--performance-tuning", "workers=2"]
+    };
+    [b"cp".to_vec(), b"--src".to_vec(), source]
+        .into_iter()
+        .chain(
+            ["--to", "@laptop", "--into", "."]
+                .iter()
+                .chain(options)
+                .chain(workers)
+                .map(|arg| arg.as_bytes().to_vec()),
+        )
+        .collect()
+}
+/// The request the receiver derives from `command`.
+pub(super) fn requested(
+    source: &Path,
+    options: &[&str],
+) -> (Vec<Vec<u8>>, CopyRequest, crate::receipt::RecipientSecret) {
+    let command = command(source, options);
+    let (request, secret) = request(&crate::approval_command::parse(&command).unwrap());
+    (command, request, secret)
+}
 pub(super) fn request(args: &Args) -> (CopyRequest, crate::receipt::RecipientSecret) {
     let (secret, public) = crate::receipt::generate_recipient().unwrap();
     let policy = crate::receipt::ReceiptPolicy {
@@ -250,10 +279,13 @@ pub(super) fn broker(
     };
     (broker, receiver, registration, requests)
 }
-fn approve(registration: &Registration, request: CopyRequest) -> Approved {
+fn approve(registration: &Registration, command: Vec<Vec<u8>>, request: CopyRequest) -> Approved {
     let (_, reply) = exchange(
         registration,
-        Message::Request(Box::new(request)),
+        Message::Request {
+            command,
+            request: Box::new(request),
+        },
         Duration::from_secs(10),
     )
     .unwrap();
@@ -351,11 +383,14 @@ fn named_denial_does_not_issue_authority_or_touch_destination() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, prompts) = broker(&root, Approval::Ask);
-    let (request, _) = request(&args(Path::new("source"), "."));
+    let (command, request, _) = requested(Path::new("source"), &[]);
     let caller = std::thread::spawn(move || {
         exchange(
             &registration,
-            Message::Request(Box::new(request)),
+            Message::Request {
+                command,
+                request: Box::new(request),
+            },
             Duration::from_secs(5),
         )
         .is_err()
@@ -374,10 +409,8 @@ fn named_control_cannot_be_replayed_and_cannot_listen_on_tcp() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let mut args = args(Path::new("source"), ".");
-    args.compress = false;
-    let (request, _) = request(&args);
-    let approved = approve(&registration, request);
+    let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
+    let approved = approve(&registration, command, request);
     let mut conn = control(registration.clone(), &approved);
     assert!(exchange(
         &registration,
@@ -452,10 +485,8 @@ fn named_control_closure_revokes_connected_workers() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let mut args = args(Path::new("source"), ".");
-    args.compress = false;
-    let (request, _) = request(&args);
-    let approved = approve(&registration, request);
+    let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
+    let approved = approve(&registration, command, request);
     let conn = control(registration.clone(), &approved);
     let mut worker = worker_stream(&registration, &approved);
     // macOS may reject SO_RCVTIMEO after the peer has shut down.
@@ -512,10 +543,8 @@ fn pending_hellos(
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let mut args = args(Path::new("source"), ".");
-    args.compress = false;
-    let (request, _) = request(&args);
-    let approved = approve(&registration, request);
+    let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
+    let approved = approve(&registration, command, request);
     let control = control(registration.clone(), &approved);
     receiver
         .sessions
@@ -592,8 +621,8 @@ fn named_abandoned_open_releases_its_session() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let (request, _) = request(&args(Path::new("source"), "."));
-    let approved = approve(&registration, request);
+    let (command, request, _) = requested(Path::new("source"), &[]);
+    let approved = approve(&registration, command, request);
     let (stream, reply) = exchange(
         &registration,
         Message::Open {
@@ -622,8 +651,8 @@ fn named_failed_open_reply_releases_its_session() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let (request, _) = request(&args(Path::new("source"), "."));
-    let approved = approve(&registration, request);
+    let (command, request, _) = requested(Path::new("source"), &[]);
+    let approved = approve(&registration, command, request);
     let mut stream = UnixStream::connect(&registration.socket).unwrap();
     // Linux SHUT_RD reliably refuses the opening reply while the client
     // remains connected, exercising the failed-reply cleanup specifically.
@@ -668,10 +697,12 @@ fn named_copy_with_transport(tcp: bool) {
     fs::write(source.join("large"), vec![42; 5_000_000]).unwrap();
     std::os::unix::fs::symlink("hello", source.join("link")).unwrap();
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
-    let mut args = args(&source, ".");
-    let (request, secret) = request(&args);
+    let (command, request, secret) = requested(&source, &[]);
+    let mut args = crate::approval_command::parse(&command).unwrap();
     let policy = request.constraints.receipt_policy.clone();
-    let approved = approve(&registration, request);
+    let approved = approve(&registration, command, request);
+    // The route below replaces discovery of the named receiver.
+    args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.restricted_grant = Some(route(registration, approved.token.clone()));
     args.named_receipt = Some(Arc::new(NamedReceipt {
@@ -702,8 +733,8 @@ fn named_authorization_expires_before_control_opens() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let (request, _) = request(&args(Path::new("source"), "."));
-    let approved = approve(&registration, request);
+    let (command, request, _) = requested(Path::new("source"), &[]);
+    let approved = approve(&registration, command, request);
     receiver
         .sessions
         .lock()
@@ -729,11 +760,14 @@ fn named_limits_and_scope_validation_precede_approval() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
-    let (mut request, _) = request(&args(Path::new("source"), "."));
+    let (command, mut request, _) = requested(Path::new("source"), &[]);
     request.copy.mutation_scopes[0].path = b"/SYQ-RECEIVE/../outside".to_vec();
     assert!(exchange(
         &registration,
-        Message::Request(Box::new(request)),
+        Message::Request {
+            command,
+            request: Box::new(request),
+        },
         Duration::from_secs(2)
     )
     .is_err());
@@ -804,11 +838,11 @@ fn named_tcp_workers_obey_limits_and_revocation() {
         let root = temp.path().join("receiving");
         fs::create_dir(&root).unwrap();
         let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-        let mut args = args(Path::new("source"), ".");
-        args.compress = false;
-        let (mut request, _) = request(&args);
-        request.copy.limits.max_connections = 1;
-        let approved = approve(&registration, request);
+        let (command, request, _) = requested(
+            Path::new("source"),
+            &["--no-compress", "--performance-tuning", "workers=1"],
+        );
+        let approved = approve(&registration, command, request);
         let mut spec = crate::conn::RemoteSpec::local_receiver(true);
         spec.restricted_grant = Some(route(registration, approved.token.clone()));
         let mut control = spec.connect_with(false, false).unwrap();
@@ -856,10 +890,8 @@ fn named_tcp_connect_failure_uses_approved_ssh_worker() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let mut args = args(Path::new("source"), ".");
-    args.compress = false;
-    let (request, _) = request(&args);
-    let approved = approve(&registration, request);
+    let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
+    let approved = approve(&registration, command, request);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
     spec.restricted_grant = Some(route(registration, approved.token.clone()));
     let mut control = spec.connect_with(false, false).unwrap();
@@ -915,11 +947,11 @@ fn named_tcp_workers_connect_concurrently() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
-    let mut args = args(Path::new("source"), ".");
-    args.compress = false;
-    let (mut request, _) = request(&args);
-    request.copy.limits.max_connections = 8;
-    let approved = approve(&registration, request);
+    let (command, request, _) = requested(
+        Path::new("source"),
+        &["--no-compress", "--performance-tuning", "workers=8"],
+    );
+    let approved = approve(&registration, command, request);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
     spec.restricted_grant = Some(route(registration, approved.token.clone()));
     let mut control = spec.connect_with(false, false).unwrap();
@@ -960,11 +992,11 @@ fn named_tcp_idle_and_partial_arrivals_do_not_block_worker() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
-    let mut args = args(Path::new("source"), ".");
-    args.compress = false;
-    let (mut request, _) = request(&args);
-    request.copy.limits.max_connections = 1;
-    let approved = approve(&registration, request);
+    let (command, request, _) = requested(
+        Path::new("source"),
+        &["--no-compress", "--performance-tuning", "workers=1"],
+    );
+    let approved = approve(&registration, command, request);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
     spec.restricted_grant = Some(route(registration, approved.token.clone()));
     let mut control = spec.connect_with(false, false).unwrap();
