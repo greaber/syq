@@ -1,10 +1,11 @@
-"""Failed checks in manually dispatched test runs on task branches.
+"""Results of manually dispatched test runs on task branches.
 
-A check is one job name in one workflow. A failed check stays failed until a
+A check is one job name in one workflow, and its result is that of its latest
+run that passed or failed. A failed check therefore stays failed until a
 later dispatched run of the same job on the branch passes, so running more
 checks or pushing commits does not hide it. Runs still in progress do not
-count as failures. Used by scripts/branch-status.py and by the
-dispatched-checks commit status on pull requests.
+count as failures. Used by scripts/branch-status.py, scripts/pr-checks.py,
+and the dispatched-checks commit status on pull requests.
 """
 from concurrent.futures import ThreadPoolExecutor
 
@@ -14,6 +15,7 @@ from tooling import ToolError, json_output
 # carry their test or script in the job name so reruns of one check match.
 BRANCH_WORKFLOWS = ("ci.yml", "macos.yml", "rsync-compat.yml", "focused-check.yml")
 FAILED = ("failure", "timed_out")
+DECISIVE = FAILED + ("success",)
 # How far back to look for merged branches: dispatched runs per workflow and
 # merged pull requests. A single branch's runs are queried directly.
 DISPATCHED_RUNS = 100
@@ -77,26 +79,50 @@ def branch_runs(runs, branch, merged, until=None):
             and since < (run.get("createdAt") or "") and (until is None or run["createdAt"] <= until)]
 
 
-def fetch_jobs(repository, run_lists):
-    """The jobs of every undecided run in the given run lists, by run ID."""
-    runs = {run.get("databaseId"): run for runs in run_lists for run in undecided(runs)}
+def fetch_jobs(repository, runs):
+    """The jobs of the given runs, by run ID."""
+    runs = {run.get("databaseId"): run for run in runs}
     return dict(zip(runs, in_parallel(
         [lambda run=run: run_jobs(repository, run) for run in runs.values()])))
 
 
-def failed_checks(runs, jobs):
-    """Failed checks that no later run passed, given each undecided run's jobs."""
+def check_results(runs, jobs):
+    """Each check's latest result among the given runs whose jobs were fetched,
+    in order of first appearance. A cancelled job does not replace an earlier
+    pass or failure; unfinished and skipped jobs are left out."""
     latest = {}
-    for run in undecided(runs):
-        for job in jobs[run.get("databaseId")]:
-            if job.get("conclusion") in FAILED + ("success",):
-                latest[run["workflow"], job.get("name")] = job, run
+    for run in sorted(runs, key=lambda run: run.get("createdAt") or ""):
+        for job in jobs.get(run.get("databaseId"), []):
+            conclusion = job.get("conclusion")
+            key = run["workflow"], job.get("name")
+            if conclusion in DECISIVE or (conclusion not in (None, "", "skipped") and (
+                    latest.get(key, ({}, {}))[0].get("conclusion") not in DECISIVE)):
+                latest[key] = job, run
     return [{"workflow": workflow, "job": name, "conclusion": job.get("conclusion"),
              "head": run.get("headSha") or "", "url": job.get("url") or run.get("url")}
-            for (workflow, name), (job, run) in latest.items()
-            if job.get("conclusion") in FAILED]
+            for (workflow, name), (job, run) in latest.items()]
+
+
+def failed_checks(runs, jobs):
+    """Failed checks that no later run passed. Only undecided runs need their
+    jobs fetched: every check in an earlier run passed."""
+    return [entry for entry in check_results(undecided(runs), jobs)
+            if entry["conclusion"] in FAILED]
 
 
 def running(runs):
     return sorted((run for run in runs if run.get("status") != "completed"),
                   key=lambda run: run.get("createdAt") or "")
+
+
+def result_lines(results, active):
+    """Report lines for check results and unfinished runs, failures first."""
+    labels = {"success": "passed", "failure": "failed", "timed_out": "timed out",
+              "in_progress": "running"}
+    ordered = sorted(results, key=lambda entry: entry["conclusion"] not in FAILED)
+    lines = [f"  {labels.get(entry['conclusion'], entry['conclusion']):<8} {entry['workflow']} "
+             f"{entry['job']} at {entry['head'][:7]}  {entry['url']}" for entry in ordered]
+    lines += [f"  {labels.get(run.get('status'), run.get('status') or 'unknown'):<8} "
+              f"{run['workflow']} at {(run.get('headSha') or '')[:7]}  {run.get('url')}"
+              for run in active]
+    return lines or ["  none"]

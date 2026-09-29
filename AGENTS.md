@@ -156,11 +156,16 @@ the conversation instead.
   change causes, unless the user decides to merge anyway. A failure that
   already happens on `master` does not block the work; name the `master` run
   that shows it. See Verification for how much to run before replying.
-- List the checks in the pull request description as a table with one row per
-  check: the exact command or test name, the short SHA it ran at, and its
-  result (passed, failed, or running). Update rows when running checks finish.
-  The table records what ran where. A new commit does not by itself call for
-  rerunning checks; keep each row's SHA as the commit the check actually ran at.
+- List the checks you ran locally in the pull request description as a table
+  with one row per check: the exact command or test name, the short SHA it ran
+  at, and its result. Add a row only once the check has finished, so no row
+  needs a later update. The table records what ran where. A new commit does
+  not by itself call for rerunning checks; keep each row's SHA as the commit
+  the check actually ran at.
+- Leave CI checks out of the description. GitHub records them, and the
+  scripts below report their current results; a result written into the
+  description goes stale when nobody is left to update it. When the reason for
+  dispatching a particular suite is not obvious, say why in the prose.
 - Run `scripts/branch-status.py` from the task worktree before opening a pull
   request, before asking for review, and before merging, and include its output
   in the report. It fetches `origin/master` and prints the branch SHA,
@@ -173,8 +178,11 @@ the conversation instead.
   recently merged branches, as notes without failing; report them to the user
   even when the current task did not cause them. A failed check in a run
   dispatched on this branch makes it exit 1 until a later run of that check
-  passes. `--check` also runs the Rust baseline below, and `--json` prints the
-  same facts for scripting.
+  passes. It lists the latest result of each check dispatched on the branch
+  and the runs still unfinished; report CI state from this output.
+  `scripts/pr-checks.py <number>` lists the same for any pull request, open or
+  merged, from any checkout. `--check` also runs the Rust baseline below, and
+  `--json` prints the same facts for scripting.
 - Pull requests do not start automated test workflows. The same failed
   dispatched checks fail the pull request's `dispatched-checks` status, which
   branch protection requires, so GitHub refuses the merge until a later run of
@@ -338,12 +346,13 @@ it is intentional" is not that decision.
   gain. Startup latency and throughput are core to the product.
 - Do not flag a missing `CHANGELOG.md` entry on an ordinary PR. The changelog
   is brought up to date during release preparation.
-- Do not repeat checks the pull request lists as passed or running; the
-  implementing agent owns those. Note rows whose SHA is older than the
-  reviewed SHA when later commits could change their result, and report failed
-  checks. Checks still running do not block merge. If a check the pull request
-  does not list matters for the change, say which and why; dispatch it in CI
-  when that is practical.
+- Do not repeat checks the pull request lists as passed, or CI checks that
+  `scripts/pr-checks.py` shows as passed or unfinished; the implementing agent
+  owns those. Take CI state from that script, not from the description. Note
+  results whose SHA is older than the reviewed SHA when later commits could
+  change them, and report failed checks. Checks still running do not block
+  merge. If a check that matters for the change has not run, say which and
+  why; dispatch it in CI when that is practical.
 
 ## PR review freshness
 
@@ -549,10 +558,11 @@ gh workflow run ci.yml --ref <task-branch> -f suites='real-ssh s3'
 `suites` takes the names listed in `SUITES` in `scripts/ci-scope.py`,
 including `rust` (formatting, clippy, and every Rust target), `tooling`,
 `python-sdk`, `linux-arm64`, `macos-intel`, `s3`, `real-ssh`, and single
-real-SSH profiles. Report such checks as running and update the pull request
-when they finish. They keep running if the pull request merges. A later run
-with the same `suites` value on the branch cancels the earlier run of those
-jobs, so dispatch once the change has settled rather than after every commit.
+real-SSH profiles. Report such checks as running in your reply; GitHub keeps
+their results, so the pull request needs no update when they finish. They
+keep running if the pull request merges. A later run with the same `suites`
+value on the branch cancels the earlier run of those jobs, so dispatch once
+the change has settled rather than after every commit.
 A check is a job name, and a combined selection names the `rust` job after
 all its parts, so to clear a failed check, dispatch the same `suites` value
 again or rerun the failed run. The same applies to what you ask of subagents:
@@ -651,9 +661,10 @@ when no SSH or S3 code changed. Run them locally, or selected cases with
 Neither suite is part of `cargo test` or post-merge CI; nightly and full
 manual `ci.yml` runs include both.
 
-Do not describe an earlier run as testing the current tree; the check table's
-SHAs say what ran where. Release validation follows the commit and
-release-preparation evidence rules under release tag lifecycle.
+Do not describe an earlier run as testing the current tree; the SHAs in the
+check table and the status scripts say what ran where. Release validation
+follows the commit and release-preparation evidence rules under release tag
+lifecycle.
 
 Nightly should run every test in the repository. Leaving a test out of
 nightly needs the user's explicit agreement. Full validation remains required
