@@ -118,6 +118,25 @@ pub(super) fn plain_http(endpoint: Option<&str>) -> bool {
         .is_some_and(|url| url.scheme() == "http")
 }
 
+/// The destination received bytes that differ from the request's checksum.
+/// A resend usually succeeds; the caller warns so repeated corruption shows.
+pub(super) fn corrupted<E: aws_sdk_s3::error::ProvideErrorMetadata>(
+    error: &aws_sdk_s3::error::SdkError<
+        E,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> Option<&str> {
+    error
+        .as_service_error()
+        .and_then(|e| e.code())
+        .filter(|code| {
+            matches!(
+                *code,
+                "BadDigest" | "XAmzContentChecksumMismatch" | "XAmzContentSHA256Mismatch"
+            )
+        })
+}
+
 /// Some buckets, such as AWS buckets with an Object Lock default retention
 /// period, reject uploads without Content-MD5 or a checksum. Any other cause of
 /// the same error recurs on the Content-MD5 retry and is reported then.

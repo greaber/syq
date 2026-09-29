@@ -3,6 +3,7 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 
 static REJECTED_PARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CORRUPTED_ONCE: AtomicBool = AtomicBool::new(false);
 
 pub(super) fn serve_upload(
     socket: &mut TcpStream,
@@ -59,6 +60,18 @@ pub(super) fn serve_upload(
                 assert_eq!(headers["content-md5"], content_md5(&body));
             } else {
                 assert_unchecked_upload(headers);
+            }
+            if fault == "recovery-upload-corrupt-once"
+                && !CORRUPTED_ONCE.swap(true, Ordering::SeqCst)
+            {
+                reply(
+                    socket,
+                    400,
+                    &[],
+                    b"<Error><Code>BadDigest</Code></Error>",
+                    false,
+                );
+                return;
             }
             if fault == "recovery-upload-fail" {
                 reply(
@@ -299,6 +312,27 @@ fn plain_http_multipart_parts_send_content_md5() {
         .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(server.gate.0.load(Ordering::Relaxed));
+}
+
+#[test]
+fn multipart_parts_are_resent_after_corruption_with_a_warning() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let server = Server::start("recovery-upload-corrupt-once");
+    std::fs::write(temp.path().join("source"), vec![b'x'; SIZE]).unwrap();
+    let output = server
+        .command_with_retries(temp.path(), 1)
+        .args(["--s3-endpoint", &server.address])
+        .args(["source", "--to", "s3://bucket", "--as", "object"])
+        .capture_output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.0.load(Ordering::Relaxed), "upload completed");
+    let text = output_text(&output);
+    assert!(
+        text.contains("the destination received corrupted data in part")
+            && text.contains("(BadDigest); retrying"),
+        "{text}"
+    );
 }
 
 #[test]

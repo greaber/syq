@@ -58,7 +58,8 @@ send no request checksum. Uploads to a plain `http://` endpoint send Content-MD5
 which the destination checks and the request signature covers, so bytes changed
 in transit are rejected. Syq also sends Content-MD5 to a destination that
 requires a checksum, as AWS does for buckets with an Object Lock default
-retention period. With
+retention period. When a destination reports that it received corrupted data,
+syq warns and resends it, within the `s3-retries` budget. With
 [storage authorization](object-storage.md#authorize-from-your-laptop), uploads
 send SHA-256 or MD5 request checksums. With a `transfer` algorithm, downloads
 also check the object's stored hash when it has one; use an expected hash for

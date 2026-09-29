@@ -1156,6 +1156,18 @@ impl Engine {
                     {
                         retry_with_md5 = true;
                     }
+                    Err(e)
+                        if attempt < self.options.retries
+                            && super::checksum::corrupted(&e).is_some() =>
+                    {
+                        self.progress.warning(&format!(
+                            "{}: the destination received corrupted data ({}); retrying",
+                            source.key,
+                            super::checksum::corrupted(&e).unwrap_or_default()
+                        ));
+                        super::backoff(attempt).await;
+                        attempt += 1;
+                    }
                     Err(e) if retryable(&e) && attempt < self.options.retries => {
                         super::backoff(attempt).await;
                         attempt += 1;
@@ -1343,6 +1355,18 @@ impl Engine {
                                             && super::checksum::requires_checksum(&e) =>
                                     {
                                         retry_with_md5 = true;
+                                    }
+                                    Err(e)
+                                        if attempt < self.options.retries
+                                            && super::checksum::corrupted(&e).is_some() =>
+                                    {
+                                        self.progress.warning(&format!(
+                                            "{}: the destination received corrupted data in part {number} ({}); retrying",
+                                            source.key,
+                                            super::checksum::corrupted(&e).unwrap_or_default()
+                                        ));
+                                        super::backoff(attempt).await;
+                                        attempt += 1;
                                     }
                                     Err(e) if retryable(&e) && attempt < self.options.retries => {
                                         super::backoff(attempt).await;

@@ -144,6 +144,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             b'HTTP header is required for Put Object requests with Object Lock parameters'
                             b'</Message></Error>')
             return
+        if CASE == 'corrupt-once':
+            with LOCK:
+                first = not STATE.get('corrupted')
+                STATE['corrupted'] = True
+            if first:
+                self.reply(400, b'<Error><Code>BadDigest</Code></Error>')
+                return
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if 'partNumber' in query:
             if CASE == 'upload-error':
@@ -612,6 +619,13 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 STATE.update(parts={}, completed=False)
                 success(run(put, input=data, env=plain))
                 assert STATE['published'] == data
+        elif CASE == 'corrupt-once':
+            for data in (b'binary\x00\xff', DATA):
+                STATE.update(parts={}, completed=False, corrupted=False)
+                result = run(put, input=data, env=env)
+                success(result)
+                assert STATE['published'] == data
+                assert b'the destination received corrupted data' in result.stderr, result.stderr
         elif CASE == 'upload-error':
             result = run(put, input=DATA, env=env)
             failure(result)
