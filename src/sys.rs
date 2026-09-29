@@ -5,6 +5,8 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 
 #[cfg(target_os = "linux")]
@@ -45,6 +47,19 @@ pub(crate) const MODE_BLOCK: u32 = libc::S_IFBLK as u32;
 pub(crate) const COMMON_NAME_MAX: usize = 255;
 /// Entries kept by each per-filesystem component-limit cache.
 pub(crate) const NAME_MAX_CACHE_CAP: usize = 1024;
+
+/// The calling thread's descriptor directory. Every thread resolving
+/// `/proc/self/fd` walks the thread-group leader's procfs entries, which
+/// concurrent workers then contend for; `thread-self` gives each its own.
+#[cfg(target_os = "linux")]
+pub(crate) const PROC_FD_DIRECTORY: &str = "/proc/thread-self/fd";
+
+/// Name the object `file` holds. The path is valid only while `file` stays
+/// open, and only within this process: never hand it to a subprocess.
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_fd_path(file: &impl AsRawFd) -> String {
+    format!("{PROC_FD_DIRECTORY}/{}", file.as_raw_fd())
+}
 
 /// Run a call that reports success as zero, retrying while it is interrupted.
 pub(crate) fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {
@@ -175,4 +190,27 @@ pub(crate) fn stat_mode(stat: &libc::stat) -> u32 {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn stat_mode(stat: &libc::stat) -> u32 {
     stat.st_mode as u32
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_fd_path_names_the_held_object_from_any_thread() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("held");
+        std::fs::write(&path, b"held").unwrap();
+        let file = File::open(&path).unwrap();
+        // The name follows the descriptor, not the pathname it was opened by.
+        std::fs::rename(&path, dir.path().join("moved")).unwrap();
+        assert_eq!(std::fs::read(proc_fd_path(&file)).unwrap(), b"held");
+        let read = std::thread::scope(|scope| {
+            scope
+                .spawn(|| std::fs::read(proc_fd_path(&file)))
+                .join()
+                .unwrap()
+        });
+        assert_eq!(read.unwrap(), b"held");
+    }
 }
