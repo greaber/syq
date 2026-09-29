@@ -210,10 +210,10 @@ class StreamTests(unittest.TestCase):
                 with self.client.open_writer(as_new=target, **options, **to) as out:
                     out.write(b"replacement")
             self.assertEqual(target.read_bytes(), b"new")
-            with self.client.open_writer(if_exists="update", as_existing=target, **options, **to) as out:
+            with self.client.open_writer(as_existing=target, **options, **to) as out:
                 out.write(b"updated")
             with self.assertRaises(ValueError):
-                with self.client.open_writer(if_exists="update", as_existing=target, **options, **to) as out:
+                with self.client.open_writer(as_existing=target, **options, **to) as out:
                     out.write(b"aborted")
                     raise ValueError("producer failed")
             self.assertEqual(target.read_bytes(), b"updated")
@@ -466,6 +466,20 @@ class StreamTests(unittest.TestCase):
             finally:
                 stream.abort()
 
+    def test_writer_forwards_object_writing_headers(self):
+        fake = self.root / 'stream-syq'
+        fake.write_text(ready_stub())
+        fake.chmod(0o700)
+        client = syq.Client(executable=fake, timeout=5)
+        stream = client.open_writer(to='s3://bucket', as_='key',
+                                    s3_write_header=['x-amz-storage-class: STANDARD_IA'])
+        try:
+            argv = stream._process.process.args
+            self.assertEqual(argv[argv.index('--s3-write-header') + 1],
+                             'x-amz-storage-class: STANDARD_IA')
+        finally:
+            stream.abort()
+
     def test_timeout_interrupts_blocking_write_and_reaps_child(self):
         fake = self.root / 'slow-syq'
         fake.write_text(ready_stub())
@@ -505,7 +519,7 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(syq.SyqProcessError):
                 async with client.open_writer(as_new=target) as out:
                     await out.write(b"no")
-            async with client.open_writer(if_exists="update", as_existing=target) as out:
+            async with client.open_writer(as_existing=target) as out:
                 await out.write(b"existing")
             async with client.open_reader("object", root=root) as input:
                 self.assertEqual(await input.read(), b"existing")

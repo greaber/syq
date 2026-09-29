@@ -5,6 +5,11 @@ Usage: scripts/ci-scope.py [GITHUB_EVENT_PATH]
 
 Prints `key=value` lines for $GITHUB_OUTPUT. SYQ_TEST_CHANGED_PATHS_FILE
 replaces the event with a list of changed paths for tests.
+
+SYQ_CI_SUITES, set from ci.yml's `suites` dispatch input, selects named suites
+instead of classifying paths; see SUITES below. Each selected suite's job then
+shares a cancellation group with the same suite on the same branch, so a later
+selection of that suite replaces an earlier run.
 """
 from fnmatch import fnmatchcase
 import json
@@ -19,10 +24,42 @@ from tooling import ToolError, output, report_errors
 SCRIPTS = Path(os.path.abspath(__file__)).parent
 ALL_TOOLING = "package installer benchmark release orchestration focused branch workflows setup"
 DOCUMENTATION_PATHS = "docs/mappings.md\ndocs/automation.md\ndocs/commands/map.md"
+REAL_SSH = {
+    "real-ssh-core": {"suite": "core", "profile": "default"},
+    # The one-session profile changes only the destination's sshd, so it skips
+    # the cases that never contact the destination.
+    "real-ssh-max-sessions-1": {"suite": "core", "profile": "max-sessions-1",
+                                "skip": "tests/real-ssh/max-sessions-1.skip"},
+    "real-ssh-metadata": {"suite": "metadata", "profile": "default"},
+    "real-ssh-benchmark": {"suite": "benchmark", "profile": "default"},
+}
+# Suites that ci.yml's `suites` input can select, as the scope outputs each sets.
+SUITES = {
+    "rust": {"native": True, "integration_targets": "all"},
+    "quick": {"tooling": True, "quick_tooling": True},
+    "tooling": {"tooling": True, "tooling_checks": ALL_TOOLING, "all_tooling": True},
+    "shellcheck": {"shellcheck": True},
+    "mapping-docs": {"mapping_docs": True},
+    "python-sdk": {"sdks": True, "python_sdk": True},
+    "linux-arm64": {"linux_arm64": True},
+    "macos-intel": {"macos": True, "macos_intel": True},
+    "s3": {"s3": True},
+    "repository-checks": {"repository_checks": True},
+    **{name: {"real_ssh": [entry]} for name, entry in REAL_SSH.items()},
+    "real-ssh": {"real_ssh": list(REAL_SSH.values())},
+}
 
 
 def run_everything():
     print("\n".join([
+        "suite_selection=false",
+        "rust_label=full",
+        "all_tooling=true",
+        "quick_tooling=false",
+        "s3=true",
+        "repository_checks=true",
+        "macos_intel=true",
+        f"real_ssh_matrix={json.dumps(list(REAL_SSH.values()))}",
         "native=true",
         "sdks=true",
         "python_sdk=true",
@@ -107,9 +144,64 @@ def changed_paths_from_event(event):
     return git("diff", "--no-renames", "--name-only", diff_range), base, head
 
 
+def rust_label(selection):
+    """What a partial rust job runs. Dispatched runs on task branches put it in
+    the job's name, because scripts/branch-status.py matches checks by name."""
+    parts = []
+    if selection["native"]:
+        parts.append("native:" + ",".join(selection["integration_targets"].split() or ["bin"]))
+    if selection["tooling"]:
+        parts.append("tooling:" + ("all" if selection.get("all_tooling") else
+                                   "quick" if selection.get("quick_tooling") else
+                                   ",".join(selection["tooling_checks"].split())))
+    parts += [name for name, key in (("shellcheck", "shellcheck"), ("mapping-docs", "mapping_docs"))
+              if selection[key]]
+    return " ".join(parts) or "none"
+
+
+def select_suites(names):
+    """Print the scope for suites named in ci.yml's `suites` dispatch input."""
+    if os.environ.get("SYQ_CI_SCOPE_COMMIT") or os.environ.get("SYQ_CI_DOCUMENTATION_ONLY") == "true":
+        raise ToolError("suites cannot be combined with scope_commit or documentation_only", 2)
+    # Release evidence uses the latest ci.yml run on a master commit, so a partial
+    # run there would hide a full one. Selected suites are for task branches.
+    if os.environ.get("GITHUB_REF") == "refs/heads/master":
+        raise ToolError("run selected suites on a task branch, not master", 2)
+    unknown = [name for name in names if name not in SUITES]
+    if unknown:
+        raise ToolError(f"unknown suite: {' '.join(unknown)} (choose from {' '.join(SUITES)})", 2)
+    selection = {"native": False, "sdks": False, "python_sdk": False, "tooling": False,
+                 "shellcheck": False, "mapping_docs": False, "linux_arm64": False,
+                 "macos": False, "macos_intel": False, "s3": False, "repository_checks": False,
+                 "all_tooling": False, "quick_tooling": False,
+                 "integration_targets": "", "tooling_checks": "", "real_ssh": []}
+    for name in names:
+        for key, value in SUITES[name].items():
+            if key == "real_ssh":
+                selection[key] += value
+            elif isinstance(value, str):
+                selection[key] = value
+            else:
+                selection[key] = True
+    # Keep the matrix in a fixed order so equal selections share cancellation groups.
+    selected_real_ssh = selection.pop("real_ssh")
+    real_ssh = [entry for entry in REAL_SSH.values() if entry in selected_real_ssh]
+    for key, value in selection.items():
+        print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
+    print(f"rust_label={rust_label(selection)}")
+    print(f"real_ssh_matrix={json.dumps(real_ssh)}")
+    print("suite_selection=true\nconformance=false\nfull_suite=false")
+    print('sdk_matrix=["python"]' if selection["python_sdk"] else 'sdk_matrix=["none"]')
+    print(f"CI scope: selected suites {' '.join(names)}", file=sys.stderr)
+    return 0
+
+
 def main():
     event_path = (sys.argv[1] if len(sys.argv) > 1 else "") or os.environ.get("GITHUB_EVENT_PATH")
     base = head = ""
+    suites = os.environ.get("SYQ_CI_SUITES", "").replace(",", " ").split()
+    if suites:
+        return select_suites(suites)
     changed_paths_file = os.environ.get("SYQ_TEST_CHANGED_PATHS_FILE", "")
     if changed_paths_file:
         try:
@@ -147,6 +239,10 @@ def main():
     for key in keys:
         print(f"{key}={str(selection[key]).lower()}")
     print(f"integration_targets={selection['integration_targets']}")
+    # Only full runs and selected suites run these.
+    print(f"rust_label={rust_label(selection)}")
+    print("suite_selection=false\nall_tooling=false\nquick_tooling=false\ns3=false\n"
+          "repository_checks=false\nmacos_intel=false\nreal_ssh_matrix=[]")
     print("CI scope: " + " ".join(f"{key}={str(selection[key]).lower()}" for key in keys),
           file=sys.stderr)
     print('sdk_matrix=["python"]' if selection["python_sdk"] else 'sdk_matrix=["none"]')
@@ -228,18 +324,18 @@ def classify(paths, preparation_only):
                      "scripts/normalize-python-sdist.py", "scripts/check-python-wheel.py",
                      "scripts/stage-python-sdk.py", "scripts/prepare-python-sdk-release.py",
                      "scripts/run-generated-sdk-post-merge-ci.py", "scripts/select-trusted-pr.jq",
-                     "scripts/test-python-sdk-release-tools.py",
-                     "scripts/test-python-release-preparation.py"):
+                     "tests/tooling/test-python-sdk-release-tools.py",
+                     "scripts/verify-python-release-preparation.py"):
             path_tooling = python_sdk = True
         elif matches(path, "scripts/generate-homebrew-formula.py", "scripts/test-homebrew-formula.py",
-                     "scripts/generate-installer.py", "scripts/test-installer.py"):
+                     "scripts/generate-installer.py", "tests/tooling/test-installer.py"):
             path_tooling = True
         elif matches(path, "tests/real-ssh/*"):
             pass
         elif path == "scripts/setup.lock":
             # Pinned tools run the Rust, SDK, conformance, and tooling tests.
             native = python_sdk = path_tooling = shellcheck = mapping_docs = conformance = True
-        elif matches(path, "scripts/*", "deny.toml"):
+        elif matches(path, "scripts/*", "tests/tooling/*", "deny.toml"):
             path_tooling = True
         elif matches(path, "*.md", "docs/*", ".github/ISSUE_TEMPLATE/*", ".github/dependabot.yml",
                      "LICENSE", ".gitignore", ".claude/*"):
@@ -254,45 +350,49 @@ def classify(paths, preparation_only):
         elif matches(path, "Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
             if not preparation_only:
                 path_tooling_checks.append("package")
-        elif matches(path, "scripts/test-cargo-package.py", "build.rs", "src/identity.rs",
+        elif matches(path, "tests/tooling/test-cargo-package.py", "build.rs", "src/identity.rs",
                      "tests/build_identity.rs"):
             path_tooling_checks.append("package")
-        elif matches(path, "scripts/generate-installer.py", "scripts/test-installer.py"):
+        elif matches(path, "scripts/generate-installer.py", "tests/tooling/test-installer.py"):
             path_tooling_checks.append("installer")
-        elif matches(path, "scripts/try-benchmark*", "scripts/test-try-benchmark.py"):
+        elif matches(path, "scripts/try-benchmark*", "tests/tooling/test-try-benchmark.py"):
             path_tooling_checks.append("benchmark")
-        elif matches(path, "scripts/run-focused-check.py", "scripts/test-run-focused-check.py"):
+        elif matches(path, "scripts/run-focused-check.py", "tests/tooling/test-run-focused-check.py"):
             path_tooling_checks.append("focused")
-        elif matches(path, "scripts/branch-status.py", "scripts/test-branch-status.py"):
+        elif matches(path, "scripts/branch-status.py", "tests/tooling/test-branch-status.py",
+                     "scripts/dispatched_checks.py", "scripts/dispatched-checks-status.py",
+                     "scripts/pr-checks.py", "tests/tooling/test-dispatched-checks-status.py"):
             path_tooling_checks.append("branch")
-        elif matches(path, "scripts/setup.sh", "scripts/test-setup.sh"):
+        elif matches(path, "scripts/setup.sh", "tests/tooling/test-setup.sh"):
             path_tooling_checks.append("setup")
         elif path == "scripts/setup.lock":
             path_tooling_checks += ALL_TOOLING.split()
         elif path == "scripts/verify-release-ci.py":
             path_tooling_checks += ["release", "orchestration"]
-        elif matches(path, "scripts/test-release-tools.py", "scripts/package-release.py",
+        elif matches(path, "tests/tooling/test-release-tools.py", "scripts/package-release.py",
                      "scripts/verify-crates-io-package.py", "scripts/verify-release-*",
                      "scripts/generate-release-*", "scripts/sign-release-*"):
             path_tooling_checks.append("release")
         elif matches(path, "scripts/ci-scope.py", "scripts/*release-orchestration*",
+                     "tests/tooling/test-release-orchestration.py",
+                     "tests/tooling/test-generated-sdk-post-merge-ci.py",
                      "scripts/release-preflight.py", "scripts/release-status.py",
                      "scripts/release-readiness.py", "scripts/release-timings.py",
                      "scripts/release_test_inputs.py", "scripts/release-tag-signers",
                      "scripts/find-release-build.py", "scripts/nightly-ci.py",
-                     "scripts/test-release-readiness.py", "scripts/test-release-timings.py",
-                     "scripts/test-release-test-inputs.py", "scripts/test-find-release-build.py",
-                     "scripts/test-nightly-ci.py", "scripts/*generated-sdk-post-merge-ci.py"):
+                     "tests/tooling/test-release-readiness.py", "tests/tooling/test-release-timings.py",
+                     "tests/tooling/test-release-test-inputs.py", "tests/tooling/test-find-release-build.py",
+                     "tests/tooling/test-nightly-ci.py", "scripts/*generated-sdk-post-merge-ci.py"):
             path_tooling_checks.append("orchestration")
         elif path == "scripts/rsync-compat.py":
             pass
-        elif matches(path, "scripts/*", "deny.toml"):
+        elif matches(path, "scripts/*", "tests/tooling/*", "deny.toml"):
             # Retain broad coverage for tooling whose ownership is not yet mapped,
             # including the shared scripts/tooling.py module.
             path_tooling_checks += ALL_TOOLING.split()
         # Workflows, the release skill, and release docs name scripts by path;
         # check those references whenever a script is added, renamed, or removed.
-        if matches(path, "scripts/*") and "workflows" not in path_tooling_checks:
+        if matches(path, "scripts/*", "tests/tooling/*") and "workflows" not in path_tooling_checks:
             path_tooling_checks.append("workflows")
         # Apply fallback to this path before combining it with other selections.
         if path_tooling and not path_tooling_checks:

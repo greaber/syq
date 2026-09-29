@@ -22,6 +22,7 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-endpoint URL` | Use an S3-compatible service; also accepts `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` |
 | `--s3-region REGION` | Set the signing region explicitly |
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
+| `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects: uploads, multipart starts, and copies; repeatable. Use it for settings such as storage class, or a server-side encryption method or KMS key, that the service rejects or ignores on other requests. Customer-provided encryption key headers (`x-amz-server-side-encryption-customer-*`) are also required on part uploads and reads, so they cannot be write-only. A write header takes precedence over an `--s3-header` of the same name |
 
 See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
 
@@ -61,11 +62,18 @@ objects.
   when unavailable. Existing files with matching contents keep their time unless
   `--copy-metadata=mtime` requests a metadata update;
   `--copy-metadata=permissions,ownership` also restores permissions and ownership.
-  New or changed uploads and server-side copies retain source metadata. On
-  matching contents, only explicitly selected attributes are updated. Special
-  files are unsupported.
+  New or changed uploads store these source file attributes. For matching
+  contents, `--copy-metadata` selects which file attributes to reconcile. S3
+  metadata updates have the object-copy effects described below. Special files
+  are unsupported.
 - **Updates:** `--if-exists=keep`, `--into-new`, and `--as-new` protect individual
-  objects against concurrent creation. Prefix checks are not transactional.
+  objects against concurrent creation. How reliably this works depends on the
+  consistency guarantees of your storage service. Prefix checks are not
+  transactional.
+  `--if-exists=update-if-older` compares stored file timestamps, falling back
+  to S3 Last-Modified when an object has no stored timestamp. S3 Last-Modified
+  reflects uploads and metadata rewrites, rather than the original file's age.
+  Equal timestamps use the normal content comparison.
   `--inplace` and SSH/S3 combinations are unsupported.
 - **Recovery:** Retrying a copy can reuse multipart work. Recovery records are
   stored in the local user cache and removed on success. If that cache cannot be used, for example
@@ -79,13 +87,67 @@ objects.
 ## Copies between S3 buckets
 
 Bucket-to-bucket copies run within one service, using the same endpoint, region,
-and credentials. New or changed copies retain source metadata and tags. For
-unchanged contents, only `--copy-metadata` selections trigger metadata updates;
-changes to tags, encryption, or storage class alone do not trigger a copy.
+and credentials. New or changed copies retain source user metadata, content
+headers, and tags. For matching contents, `--copy-metadata` can reconcile stored
+modification time, permissions, ownership, and these S3 attributes:
 
-The default existing-file policy requires matching stored size/time, whole-file
-hashes, provider checksums, or ETags. If those cannot establish equality, the
-copy reports an error; use `--if-exists=update` to allow replacement. Syq does not
+| Selection | Source attribute to match |
+|---|---|
+| `content-type`, `content-encoding`, `content-language`, `content-disposition` | The corresponding content header |
+| `cache-control`, `expires` | Cache response headers |
+| `website-redirect` | Website redirect location |
+| `user-metadata` | All application user metadata, excluding reserved `syq-*` keys |
+| `tags` | The complete tag set |
+| `storage-class` | Storage class, including for new or changed copies |
+
+For example, `--copy-metadata=content-type,tags` updates those attributes even
+when the contents match. A selected attribute absent on the source is cleared
+at the destination, subject to service defaults. Selecting `user-metadata` or
+`tags` also removes destination-only keys in that set. Unselected destination
+attributes remain unchanged when contents match. These S3 selections require
+named S3 sources and destinations; uploads from files, downloads, and streams
+do not have corresponding source or destination attributes.
+
+Tag-only changes use the tagging API without rewriting the object or creating a
+new object version. Comparing tags requires permission to read source and
+destination tags; updating them requires permission to write destination tags.
+Reading tags uses a known object version when available. Tag updates using
+your own credentials also use the known destination version. Your provider may
+require separate permissions for reading and writing versioned tags. With
+`--auth-from`, updates always target the current destination object; upload
+approval does not allow changing historical versions.
+
+New or changed copies that fit in one server-side copy request use the provider's
+native tag-copy operation, without a separate tag read or support check. Providers
+without tag support may accept that copy without tags. With `tags` explicitly
+selected, multipart copies and tag comparisons read tags separately; if a
+required tagging operation is unsupported, the copy fails.
+
+Updating other metadata copies the destination object onto itself within
+S3, preserving its contents and unselected content headers, tags, and user metadata.
+It retains the destination storage class and the encryption method, KMS key,
+and S3 Bucket Key setting returned by the service. Encryption settings given
+with `--s3-header` or `--s3-write-header` override the selected fields:
+changing a KMS key retains the compatible encryption method, while switching
+away from KMS drops inherited KMS settings. Incompatible explicit encryption settings cause an error. Syq also
+refuses the update if the service reports that it omitted existing metadata from
+its response, because replacing that metadata could lose entries. These rules
+apply to multipart metadata updates too. The update changes S3 Last-Modified and
+creates a new version when bucket versioning is enabled. Object ACLs, Object Lock
+settings, and custom KMS encryption contexts are not preserved by this operation.
+
+New or changed uploads and bucket copies use the provider's storage and encryption
+defaults unless overridden with `--s3-write-header` or, for bucket copies, selecting
+`--copy-metadata=storage-class`. On AWS general-purpose buckets,
+these are STANDARD storage and the destination bucket's default encryption.
+Changes to source encryption alone do not trigger a copy. Source storage class
+changes apply only when explicitly selected; copying a storage class can affect
+storage costs and require restoring an archived object first.
+
+Syq uses stored size/time, whole-file hashes, provider checksums, or ETags to
+identify matching contents. Otherwise, the default policy replaces the destination.
+Use `--if-exists=error-if-different` to reject copies whose contents cannot be
+established as matching. Syq does not
 download both bodies to compare them on this route. `--hash` and expected hashes
 are unsupported.
 

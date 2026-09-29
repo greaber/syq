@@ -49,16 +49,16 @@ pub enum SourceSelection {
     Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize,
 )]
 pub enum IfExists {
-    /// Accept matching contents; report an error for different contents.
-    #[default]
+    /// Reject detected content differences; trusts matching size and mtime unless --hash is set.
     ErrorIfDifferent,
     /// Report an error for every existing destination leaf.
     Error,
     /// Leave existing entries and their metadata alone.
     Keep,
     /// Update contents when they differ and apply requested metadata.
+    #[default]
     Update,
-    /// Update only when the destination is strictly older; keep ties.
+    /// Keep newer destinations; otherwise update differing contents.
     UpdateIfOlder,
 }
 
@@ -109,6 +109,8 @@ pub struct Args {
     /// Whether native copies explicitly reconcile mtime on unchanged entries.
     #[arg(skip)]
     pub(crate) copy_mtime_metadata: bool,
+    #[arg(skip)]
+    pub(crate) s3_metadata: crate::s3::metadata_fields::Selection,
     #[arg(skip)]
     pub(crate) if_exists: Option<IfExists>,
     #[arg(skip)]
@@ -1133,7 +1135,7 @@ struct NativeCopyOperationalArgs {
     #[arg(long)]
     hash: bool,
     /// How to handle existing destination files; directories remain containers
-    #[arg(long, value_enum, value_name = "POLICY", default_value_t = IfExists::ErrorIfDifferent)]
+    #[arg(long, value_enum, value_name = "POLICY", default_value_t = IfExists::Update)]
     if_exists: IfExists,
     /// Update only entries already present; create no missing entries or directories
     #[arg(long = "only-existing", hide = true, conflicts_with_all = ["into_new", "as_new"])]
@@ -1323,6 +1325,26 @@ enum NativeCopyMetadata {
     Atimes,
     /// Preserve birth times; requires a macOS destination
     Crtimes,
+    /// Match Content-Type on S3-to-S3 copies
+    ContentType,
+    /// Match Content-Encoding on S3-to-S3 copies
+    ContentEncoding,
+    /// Match Content-Language on S3-to-S3 copies
+    ContentLanguage,
+    /// Match Content-Disposition on S3-to-S3 copies
+    ContentDisposition,
+    /// Match Cache-Control on S3-to-S3 copies
+    CacheControl,
+    /// Match Expires on S3-to-S3 copies
+    Expires,
+    /// Match the website redirect on S3-to-S3 copies
+    WebsiteRedirect,
+    /// Match application user metadata on S3-to-S3 copies (excluding syq-* keys)
+    UserMetadata,
+    /// Match the complete tag set on S3-to-S3 copies
+    Tags,
+    /// Use the source storage class on S3-to-S3 copies
+    StorageClass,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1394,14 +1416,16 @@ struct NativeCopyFields {
 #[command(
     name = "syq cp",
     version,
-    about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively and symlinks as symlinks. Creating or updating\ncontents sets the source modification time. Use --copy-metadata to match selected metadata even on unchanged files. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Existing files with different contents cause an error; --if-exists selects another policy.\nSource arguments must precede destination arguments.\nExplicit local pipe sources and --src-fd FD read raw bytes; --as-fd FD writes them.",
+    about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively and symlinks as symlinks. Creating or updating\ncontents sets the source modification time. Use --copy-metadata to match selected metadata even on unchanged files. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Existing files are updated when their contents differ; --if-exists selects another policy.\nSource arguments must precede destination arguments.\nExplicit local pipe sources and --src-fd FD read raw bytes; --as-fd FD writes them.",
     before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --copy-metadata=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
-    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Existing files with different contents cause an error; --if-exists selects another policy.\n\nNative copies recurse and copy symlinks as symlinks. Creating or updating file contents sets the source modification time. Use --copy-metadata to apply selected metadata even when contents already match. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --copy-metadata=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --copy-metadata; pipes have no source metadata. Output descriptors receive source timestamps only with --copy-metadata=mtime. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
+    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Existing files are updated when their contents differ; --if-exists selects another policy.\n\nNative copies recurse and copy symlinks as symlinks. Creating or updating file contents sets the source modification time. Use --copy-metadata to apply selected metadata even when contents already match. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --copy-metadata=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --copy-metadata; pipes have no source metadata. Output descriptors receive source timestamps only with --copy-metadata=mtime. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]\n       syq cp [OPTIONS] --src-fd FD --as PATH\n       syq cp [OPTIONS] SOURCE --as-fd FD"
 )]
 struct NativeCopyCommand {
     #[command(flatten)]
     s3: crate::s3::Flags,
+    #[command(flatten)]
+    s3_write: crate::s3::WriteFlags,
     #[command(flatten)]
     copy: NativeCopyFields,
     #[command(flatten)]
@@ -1856,6 +1880,7 @@ fn parse_descriptor_copy(
                 | "s3_region"
                 | "s3_profile"
                 | "s3_header"
+                | "s3_write_header"
                 | "auth_from"
                 | "performance_tuning"
                 | "rsh"
@@ -2108,9 +2133,30 @@ fn parse_descriptor_copy(
 fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
-    let matches = crate::help::filesystem(NativeCopyCommand::command())
-        .try_get_matches_from(full_argv)
-        .unwrap_or_else(|error| error.exit());
+    let mut command = crate::help::filesystem(NativeCopyCommand::command());
+    let matches = command.try_get_matches_from_mut(full_argv).unwrap_or_else(|error| {
+        // Use the parser's classification, so a filename or an option value
+        // that happens to spell an unsupported flag remains an ordinary operand.
+        if error.kind() == clap::error::ErrorKind::UnknownArgument {
+            if let Some(clap::error::ContextValue::String(argument)) =
+                error.get(clap::error::ContextKind::InvalidArg)
+            {
+                let message = match argument.as_str() {
+                    "--only-new" => Some("--only-new is not a syq cp option; use --if-exists=keep to leave existing files unchanged"),
+                    "--skip-newer" => Some("--skip-newer is not a syq cp option; use --if-exists=update-if-older to keep newer destination files"),
+                    "--preserve" if argv.iter().any(|arg| arg == "--preserve=-mtime")
+                        || argv.windows(2).any(|args| args[0] == "--preserve" && args[1] == "-mtime") =>
+                        Some("--preserve=-mtime is not a syq cp option; creating or updating file contents sets the source timestamp and cannot be disabled"),
+                    "--preserve" => Some("--preserve is not a syq cp option; use --copy-metadata to select source metadata to apply, including on unchanged files"),
+                    _ => None,
+                };
+                if let Some(message) = message {
+                    command.error(error.kind(), message).exit();
+                }
+            }
+        }
+        error.exit()
+    });
     validate_native_copy_argument_order(&matches)?;
     let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
     let stream = selected_stream_source(&parsed.copy)?;
@@ -2119,6 +2165,8 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     }
     let NativeCopyCommand {
         s3,
+        // Options::parse reads the object-writing headers from the matches.
+        s3_write: _,
         mut copy,
         remote,
         pscope,
@@ -2830,7 +2878,24 @@ fn apply_native_copy_operational(
             NativeCopyMetadata::Xattrs => args.xattrs = true,
             NativeCopyMetadata::Atimes => args.atimes = 1,
             NativeCopyMetadata::Crtimes => args.crtimes = true,
+            NativeCopyMetadata::ContentType => args.s3_metadata.content_type = true,
+            NativeCopyMetadata::ContentEncoding => args.s3_metadata.content_encoding = true,
+            NativeCopyMetadata::ContentLanguage => args.s3_metadata.content_language = true,
+            NativeCopyMetadata::ContentDisposition => args.s3_metadata.content_disposition = true,
+            NativeCopyMetadata::CacheControl => args.s3_metadata.cache_control = true,
+            NativeCopyMetadata::Expires => args.s3_metadata.expires = true,
+            NativeCopyMetadata::WebsiteRedirect => args.s3_metadata.website_redirect = true,
+            NativeCopyMetadata::UserMetadata => args.s3_metadata.user_metadata = true,
+            NativeCopyMetadata::Tags => args.s3_metadata.tags = true,
+            NativeCopyMetadata::StorageClass => args.s3_metadata.storage_class = true,
         }
+    }
+    if args.s3_metadata.active()
+        && (!args.s3.as_ref().is_some_and(|s3| s3.route.is_server_copy())
+            || args.descriptor_copy.is_some()
+            || args.stream_mapping_fd.is_some())
+    {
+        bail!("S3 content headers, user-metadata, tags and storage-class selections require named S3-to-S3 copies");
     }
     if (args.hardlinks
         || args.acls

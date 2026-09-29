@@ -31,12 +31,17 @@ on:
         description: Timeout in minutes
         type: string
         default: "15"
+      label:
+        description: Names this check in its job name (the helper passes a script digest)
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   check:
+    # scripts/branch-status.py identifies a check by its job name.
+    name: check (${{ inputs.runner }}, ${{ inputs.provider }}${{ inputs.label && format(', {0}', inputs.label) || '' }})
     runs-on: ${{ inputs.provider == 'namespace' && (inputs.runner == 'macos' && 'namespace-profile-syq-macos' || format('namespace-profile-syq-linux;github.run-id={0}', github.run_id)) || (inputs.runner == 'macos-intel' && 'macos-26-intel' || inputs.runner == 'macos' && 'macos-26' || 'ubuntu-24.04') }}
     timeout-minutes: ${{ fromJSON(inputs.timeout) }}
     steps:
@@ -50,8 +55,8 @@ jobs:
       - name: Match the Intel CI test profile
         if: inputs.runner == 'macos-intel'
         run: |
-          printf '%s\n' CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_DEV_DEBUG=0 \
-            CARGO_PROFILE_TEST_OPT_LEVEL=0 CARGO_PROFILE_TEST_DEBUG=0 >> "$GITHUB_ENV"
+          printf '%s\n' CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_TEST_OPT_LEVEL=0 \
+            >> "$GITHUB_ENV"
       - name: Attach Namespace Cargo cache
         if: inputs.cargo_cache && inputs.provider == 'namespace'
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9

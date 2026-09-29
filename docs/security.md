@@ -130,12 +130,21 @@ SSH or syq's direct TCP connections.
 read or alter the traffic, including its authentication token. Use it only
 on a network you trust.
 
+Storage upload approvals include reading object contents and metadata within
+the approved destination paths, for comparisons with existing files. When
+updates are allowed, they also permit reading destination tags, updating tags on
+the current destination object, and copying an object onto itself to update
+metadata. They do not authorize tag changes on historical versions or copying a
+different destination object as the source; bucket-to-bucket copies require a
+separate approved source scope. Upload approval is not a write-only grant.
+
 ## Downloaded executables
 
 Official releases provide executables for each supported operating system and
 CPU architecture. They are published as GitHub release assets and served
 through `dl.syq.christmas`. An installed syq downloads them for explicit
-self-updates and, when needed, to install a matching helper on an SSH server.
+self-updates, explicit `--use-version` selections, and, when needed, to install
+a matching helper on an SSH server.
 Remote helpers use the same release as the client, even when the server needs
 a different platform's executable.
 
@@ -144,7 +153,8 @@ SHA-256 hash of each archive and executable. The installed client carries the
 release public key. It verifies the manifest's Ed25519 signature with that key,
 then checks downloaded files against the signed sizes and hashes before using
 them. The verification key comes from the installed executable, not from the
-server supplying the download.
+server supplying the download. Source builds also carry the official public
+key for explicit `--use-version` selections.
 
 This also applies when the SSH server downloads its own helper: your client
 verifies the manifest and checks the reported archive hash before authorizing
@@ -315,6 +325,12 @@ it is not sandboxed or confined to a copy destination directory.
 [Storage authorization](object-storage.md#authorize-from-your-laptop) gives the
 server signed URLs for approved paths and operations. The secret access key
 stays on your laptop. Approval trusts the server to choose uploaded contents.
+Storage authorization rejects Object Lock headers, including retention periods
+and legal holds, and headers that bypass governance retention. Upload or removal
+approval does not grant control over those protections. Bucket-wide path scopes
+permit operations on the bucket's objects, not creating or deleting the bucket.
+Bucket-configured retention defaults still apply. These restrictions concern delegated signing;
+commands using your own storage credentials remain subject to provider permissions.
 Anyone with the URLs can reuse them until expiry; stopping receiving does not
 revoke them. Filesystem receiver roots, aggregate limits, one-use grants, and
 signed receipts do not apply.

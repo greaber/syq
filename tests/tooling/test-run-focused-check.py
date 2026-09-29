@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Check dispatch quoting, revision selection, and exact-run failure propagation."""
 
+from support import SCRIPTS
+
+import base64
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -12,7 +16,7 @@ import unittest
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
-    "focused_check", Path(__file__).with_name("run-focused-check.py")
+    "focused_check", SCRIPTS / "run-focused-check.py"
 )
 focused = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(focused)
@@ -20,13 +24,18 @@ SHA = "a" * 40
 
 
 class DispatchTests(unittest.TestCase):
-    def invoke(self, args, *, dirty=False, remote=SHA, watch_status=0, response=None):
+    def invoke(self, args, *, dirty=False, remote=SHA, watch_status=0, response=None,
+               label_input=True):
         self.payload = None
+        workflow = "inputs:\n      timeout:\n" + ("      label:\n" if label_input else "")
 
         def output(*cmd, **kwargs):
             if cmd[:3] == ("gh", "repo", "view"):
                 return "example/syq"
             if cmd[:2] == ("gh", "api"):
+                if "/contents/.github/workflows/focused-check.yml?ref=" in cmd[2]:
+                    self.assertTrue(cmd[2].endswith(f"?ref={remote}"))
+                    return base64.b64encode(workflow.encode()).decode()
                 if cmd[2].endswith("/dispatches"):
                     self.payload = json.loads(kwargs["input"])
                     self.assertIn("X-GitHub-Api-Version: 2026-03-10", cmd)
@@ -67,6 +76,13 @@ class DispatchTests(unittest.TestCase):
             path.write_text(script)
             self.assertEqual(self.invoke(["--script", str(path)], watch_status=1), 1)
             self.assertEqual(self.payload["inputs"]["script"], script)
+
+    def test_label_names_the_script_only_when_the_workflow_declares_it(self):
+        self.assertEqual(self.invoke(["--", "true"]), 0)
+        digest = hashlib.sha256(b"true").hexdigest()[:12]
+        self.assertEqual(self.payload["inputs"]["label"], f"script {digest}")
+        self.assertEqual(self.invoke(["--", "true"], label_input=False), 0)
+        self.assertNotIn("label", self.payload["inputs"])
 
     def test_default_ref_requires_clean_pushed_head(self):
         for options in ({"dirty": True}, {"remote": "b" * 40}):

@@ -10,6 +10,8 @@ mod dns;
 pub(crate) mod listing;
 mod local;
 pub(crate) mod map;
+mod metadata_copy;
+pub(crate) mod metadata_fields;
 mod remove;
 pub(crate) use remove::RemoveFlags;
 mod prune;
@@ -90,6 +92,39 @@ pub(crate) struct Flags {
     s3_header: Vec<Header>,
 }
 
+/// Copy-only headers; removal and listing never create objects.
+#[derive(clap::Args, Debug, Default)]
+pub(crate) struct WriteFlags {
+    /// Add a header before signing S3 requests that create or replace objects: uploads, multipart starts, and copies (repeatable; S3-to-S3 metadata/tag overrides are refused)
+    #[arg(long, value_name = "NAME: VALUE", help_heading = "Object storage")]
+    s3_write_header: Vec<Header>,
+}
+
+/// Requests that create or replace an object and so carry its settings:
+/// PutObject, CopyObject (including metadata-only updates), and
+/// CreateMultipartUpload. Part uploads, completion, tagging, and reads do not.
+/// The SDK's `x-id` operation marker is not an S3 subresource.
+pub(crate) fn writes_object<'a>(method: &str, query: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut query = query.into_iter().filter(|name| *name != "x-id");
+    match method {
+        "PUT" => query.next().is_none(),
+        "POST" => query.next() == Some("uploads") && query.next().is_none(),
+        _ => false,
+    }
+}
+
+/// Every-request headers, then object-writing headers when the request writes
+/// an object, so that the latter replace same-named headers on those requests.
+pub(crate) fn applicable_headers<'h, 'q>(
+    every: &'h [Header],
+    write: &'h [Header],
+    method: &str,
+    query: impl IntoIterator<Item = &'q str>,
+) -> impl Iterator<Item = &'h Header> {
+    let writes = writes_object(method, query);
+    every.iter().chain(write.iter().filter(move |_| writes))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Route {
     Upload,
@@ -117,6 +152,7 @@ pub(crate) struct Options {
     pub region: Option<String>,
     pub profile: Option<String>,
     pub headers: Vec<Header>,
+    pub write_headers: Vec<Header>,
     pub concurrency: usize,
     pub part_size: u64,
     pub retries: u32,
@@ -124,6 +160,14 @@ pub(crate) struct Options {
     pub automatic_part_size: bool,
 }
 impl Options {
+    pub fn headers_for<'a>(
+        &self,
+        method: &str,
+        query: impl IntoIterator<Item = &'a str>,
+    ) -> impl Iterator<Item = &Header> {
+        applicable_headers(&self.headers, &self.write_headers, method, query)
+    }
+
     pub fn parse(
         flags: Flags,
         from: Option<&str>,
@@ -156,9 +200,15 @@ impl Options {
             if tuning.has_s3_controls() {
                 bail!("S3 performance tuning requires {endpoint_help}");
             }
-            if ["s3_endpoint", "s3_region", "s3_profile", "s3_header"]
-                .iter()
-                .any(|id| explicit(id))
+            if [
+                "s3_endpoint",
+                "s3_region",
+                "s3_profile",
+                "s3_header",
+                "s3_write_header",
+            ]
+            .iter()
+            .any(|id| explicit(id))
             {
                 bail!("S3 options require {endpoint_help}");
             }
@@ -199,8 +249,18 @@ impl Options {
                 );
             }
         }
+        let write_headers = matches
+            .try_get_many::<Header>("s3_write_header")
+            .ok()
+            .flatten()
+            .map_or_else(Vec::new, |headers| headers.cloned().collect());
+        if to.is_none() && !write_headers.is_empty() {
+            bail!("--s3-write-header requires an S3 destination; downloads create no objects");
+        }
         if from.is_some() && to.is_some() {
-            for Header(name, _) in &flags.s3_header {
+            let headers = (flags.s3_header.iter().map(|h| ("--s3-header", h)))
+                .chain(write_headers.iter().map(|h| ("--s3-write-header", h)));
+            for (flag, Header(name, _)) in headers {
                 if name.starts_with("x-amz-meta-")
                     || matches!(
                         name.as_str(),
@@ -214,7 +274,7 @@ impl Options {
                             | "x-amz-website-redirect-location"
                     )
                 {
-                    bail!("--s3-header {name} is not supported for S3-to-S3 copies: metadata and tag overrides behave differently for single-request and multipart copies");
+                    bail!("{flag} {name} is not supported for S3-to-S3 copies: metadata and tag overrides behave differently for single-request and multipart copies");
                 }
             }
         }
@@ -263,6 +323,7 @@ impl Options {
             region: flags.s3_region,
             profile: flags.s3_profile,
             headers: flags.s3_header,
+            write_headers,
             automatic_concurrency: tuning.s3_part_workers.is_none(),
             automatic_part_size: tuning.s3_part_size.is_none(),
             concurrency,
@@ -420,4 +481,33 @@ pub(super) async fn backoff(attempt: u32) {
         100u64.saturating_mul(1 << attempt.min(7)),
     ))
     .await;
+}
+
+#[cfg(test)]
+mod write_header_tests {
+    use super::writes_object;
+
+    #[test]
+    fn object_writes_are_puts_copies_and_multipart_starts() {
+        for (method, query, writes) in [
+            ("PUT", &[][..], true),
+            ("PUT", &["x-id"][..], true),
+            ("POST", &["uploads"][..], true),
+            ("POST", &["uploads", "x-id"][..], true),
+            ("PUT", &["partNumber", "uploadId", "x-id"][..], false),
+            ("POST", &["uploadId"][..], false),
+            ("PUT", &["tagging"][..], false),
+            ("GET", &[][..], false),
+            ("HEAD", &[][..], false),
+            ("DELETE", &[][..], false),
+            ("POST", &["delete"][..], false),
+            ("GET", &["list-type", "prefix"][..], false),
+        ] {
+            assert_eq!(
+                writes_object(method, query.iter().copied()),
+                writes,
+                "{method} {query:?}"
+            );
+        }
+    }
 }

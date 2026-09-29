@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Build the registry package outside the checkout and require Cargo's VCS
 metadata to produce a stable source identity."""
+from support import ROOT
+
 import json
 import os
 from pathlib import Path
@@ -11,7 +13,7 @@ import tempfile
 
 from tooling import cargo_version
 
-REPOSITORY = Path(os.path.abspath(__file__)).parent.parent
+REPOSITORY = ROOT
 
 
 def run(*args, **kwargs):
@@ -26,7 +28,8 @@ def main():
     version = cargo_version(manifest)
     metadata = run("cargo", "metadata", "--no-deps", "--format-version", "1",
                    "--manifest-path", manifest, stdout=subprocess.PIPE, text=True)
-    target_dir = json.loads(metadata.stdout)["target_directory"]
+    directories = json.loads(metadata.stdout)
+    target_dir = directories["target_directory"]
     package = Path(target_dir, "package", f"syq-{version}.crate")
 
     # Cargo can leave trailing bytes when replacing a same-version archive with a
@@ -53,10 +56,15 @@ def main():
         # a different commit's extracted sources/VCS metadata for the previous package.
         # Rebuild syq itself while keeping compiled dependencies across package checks.
         identity_target = Path(target_dir, "package-identity")
+        # Resolve the checkout's intermediate directory before entering the temporary
+        # package: a workspace-path template would otherwise create a cold cache each time.
+        build_env = {**os.environ, "CARGO_TARGET_DIR": str(identity_target),
+                     "CARGO_BUILD_BUILD_DIR": str(Path(directories["build_directory"],
+                                                       "package-identity"))}
         run("cargo", "clean", "--manifest-path", source_dir / "Cargo.toml", "--package", "syq",
-            "--target-dir", identity_target)
+            env=build_env)
         run("cargo", "build", "--locked", "--manifest-path", source_dir / "Cargo.toml",
-            "--bin", "syq", env={**os.environ, "CARGO_TARGET_DIR": str(identity_target)})
+            "--bin", "syq", env=build_env)
     actual = run(identity_target / "debug/syq", "--build-identity", stdout=subprocess.PIPE,
                  text=True).stdout.rstrip("\n")
     if actual != expected:

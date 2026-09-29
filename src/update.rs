@@ -304,6 +304,10 @@ fn current_helper_from_release(
     if release.version != current_version()? {
         bail!("signed release manifest does not describe this syq build");
     }
+    helper_from_release(target, &release)
+}
+
+fn helper_from_release(target: Target, release: &VerifiedRelease) -> Result<TrustedCurrentHelper> {
     let artifact = release
         .manifest
         .artifacts
@@ -313,7 +317,7 @@ fn current_helper_from_release(
         bail!("release artifact name does not match target {}", target.key);
     }
     Ok(TrustedCurrentHelper {
-        tag: release.manifest.tag,
+        tag: release.manifest.tag.clone(),
         target,
         binary: artifact.binary.clone(),
         archive: artifact.archive.clone(),
@@ -324,13 +328,17 @@ fn current_helper_from_release(
 /// binary hashes both come from the signed manifest, so this is safe for a
 /// different target from the client and never uploads the running executable.
 pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<Vec<u8>> {
+    let cache_path = verified_helper_path(helper)?;
+    fs::read(&cache_path)
+        .with_context(|| format!("read cached remote helper {}", cache_path.display()))
+}
+
+fn verified_helper_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
     let cache_path = helper_cache_path(helper)?;
     if cache_path.is_file() {
         match verify_file_as(&cache_path, &helper.binary, "cached remote helper") {
             Ok(()) => {
-                return fs::read(&cache_path).with_context(|| {
-                    format!("read cached remote helper {}", cache_path.display())
-                });
+                return Ok(cache_path);
             }
             Err(error) => {
                 crate::output::diagnostic!(
@@ -379,8 +387,93 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
     fs::rename(binary.path(), &cache_path)
         .with_context(|| format!("cache verified remote helper at {}", cache_path.display()))?;
     sync_parent(parent)?;
-    fs::read(&cache_path)
-        .with_context(|| format!("read cached remote helper {}", cache_path.display()))
+    Ok(cache_path)
+}
+
+/// An explicit version selection uses a signed manifest cached beside the
+/// executable. Both are verified on reuse, without an online freshness check:
+/// release tags are immutable, and selecting a release deliberately permits
+/// running an older version. This does not replace the normal installation.
+pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
+    let target = Target::local().context("official releases do not support this platform")?;
+    let tag = format!("v{version}");
+    let directory = release_cache_directory(&tag, target)?;
+    let manifest_path = directory.join(MANIFEST_NAME);
+    // Only explicit selection opts every build into the official trust anchor.
+    let key = embedded_public_key()
+        .unwrap_or_else(|_| Cow::Borrowed(include_str!("release-public-key.txt").trim()));
+    let cached = match fs::read(&manifest_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("read cached release manifest"),
+    };
+    let bytes = match &cached {
+        Some(bytes) => bytes.clone(),
+        None => {
+            let temporary = TempFile::new(&std::env::temp_dir(), ".json")?;
+            fetch(
+                &format!("{}/{tag}/{MANIFEST_NAME}", release_downloads()),
+                &temporary,
+                FetchMode::Interactive,
+                MAX_MANIFEST_BYTES,
+            )
+            .map_err(|error| selection_download_error(version, error))?;
+            fs::read(temporary.path())?
+        }
+    };
+    let manifest = verified_manifest(&bytes, key.as_ref())?;
+    let found = validate_manifest(&manifest)?;
+    if found != *version {
+        bail!("signed release manifest describes {found}, but {version} was requested");
+    }
+    let release = VerifiedRelease {
+        manifest,
+        version: found,
+    };
+    let helper = helper_from_release(target, &release)?;
+    let executable = verified_helper_path(&helper)?;
+    if cached.is_none() {
+        verify_executable(&executable, &release)?;
+        let temporary = TempFile::new(&directory, ".json")?;
+        let mut file = temporary.writer()?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(temporary.path(), &manifest_path)?;
+        sync_parent(&directory)?;
+    }
+    Ok(executable)
+}
+
+fn selection_download_error(version: &Version, error: anyhow::Error) -> anyhow::Error {
+    if matches!(
+        error.downcast_ref::<ureq::Error>(),
+        Some(ureq::Error::StatusCode(404))
+    ) {
+        anyhow!("official syq release {version} is not available; check the version passed to --use-version")
+    } else {
+        error.context(format!("fetch official syq release {version}"))
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn missing_release_has_an_actionable_error_but_other_failures_keep_their_cause() {
+        let version = Version::new(9, 9, 9);
+        let missing = selection_download_error(
+            &version,
+            anyhow::Error::new(ureq::Error::StatusCode(404)).context("request URL"),
+        );
+        assert_eq!(missing.to_string(), "official syq release 9.9.9 is not available; check the version passed to --use-version");
+        let unavailable =
+            selection_download_error(&version, anyhow::Error::new(ureq::Error::StatusCode(503)));
+        assert!(matches!(
+            unavailable.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::StatusCode(503))
+        ));
+    }
 }
 
 fn current_version() -> Result<Version> {
@@ -917,6 +1010,10 @@ fn config_dir() -> Result<PathBuf> {
 }
 
 fn helper_cache_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
+    Ok(release_cache_directory(&helper.tag, helper.target)?.join("syq"))
+}
+
+fn release_cache_directory(tag: &str, target: Target) -> Result<PathBuf> {
     let base = if let Some(base) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
         PathBuf::from(base)
     } else {
@@ -927,11 +1024,7 @@ fn helper_cache_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
             })?;
         PathBuf::from(home).join(".cache")
     };
-    Ok(base
-        .join("syq/helpers")
-        .join(&helper.tag)
-        .join(helper.target.key)
-        .join("syq"))
+    Ok(base.join("syq/helpers").join(tag).join(target.key))
 }
 
 fn canonical_current_exe() -> Result<PathBuf> {

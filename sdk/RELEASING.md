@@ -29,6 +29,16 @@ non-fast-forward changes for `sdk-python-v*` tags to the release maintainer,
 alongside the existing `v*` protection. Like binary releases, every SDK release
 uses a signed annotated tag whose signature GitHub recognizes.
 
+## Development checks
+
+For development changes, use the Python SDK checks in
+[`ci.yml`](../.github/workflows/ci.yml). They build the native executable from
+the same commit as the Python code and test them together.
+Between releases, these sources can require features newer than the executable
+pinned for publication. The next native release and its automated SDK
+preparation update that pin; development changes do not need a native release
+before they can merge.
+
 ## Release checks
 
 Update exactly one package version, merge it through the normal protected
@@ -57,8 +67,14 @@ still requires Rust and a C compiler.
 Each wheel is installed and tested on its target, including synchronous and
 async copies with no executable on `PATH`, no writable home/cache location,
 and Python downloads disabled. Package version, `syq.PINNED_SYQ_VERSION`,
-`syq.version()`, and the CLI release identity must agree. The manual
-`publish-sdks.yml` dispatch builds and tests this matrix without publishing.
+`syq.version()`, and the CLI release identity must agree. The **build and publish
+prepared Python SDK releases** workflow
+([`publish-sdks.yml`](../.github/workflows/publish-sdks.yml)) builds and tests
+this matrix without publishing when dispatched manually. Select the prepared
+SDK commit after the matching native release has been published and the SDK
+pin updated. On an unprepared development commit, this workflow can combine
+new Python code with an older native executable and fail compatibility tests;
+use the development checks above to validate changes together.
 
 Python tags use the version in `python/pyproject.toml`:
 
@@ -78,15 +94,12 @@ before entering the protected publishing environment.
 
 ## Automated Python follow-up to a syq release
 
-The `sdks` CI job builds the syq executable from the commit under test and runs
-the Python adapter's candidate compatibility tests against it. These exercise
-the reported version, a real disposable local copy, argument boundaries, and
-failure retention. The syq release tag verifier requires `sdks` alongside the
-Rust and platform checks, so a failing adapter blocks publication of the syq
-release itself. The same job requires the Python package version and packaged
-manifest to match the latest immutable syq release. Until the generated release
-pull request lands, subsequent development therefore cannot acquire a green
-release-eligible `sdks` check or consume the matching Python version.
+The syq release tag verifier requires the development `sdks` check alongside
+the Rust and platform checks, so a failing adapter blocks publication of the
+syq release itself. That check also requires the Python package version and
+packaged manifest to match the latest immutable syq release. Until the generated
+release pull request lands, subsequent development therefore cannot acquire a
+green release-eligible `sdks` check or consume the matching Python version.
 
 After `.github/workflows/release.yml` completes successfully and the GitHub
 release is immutable, `.github/workflows/prepare-python-sdk.yml` downloads its

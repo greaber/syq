@@ -595,6 +595,15 @@ def _s3_arguments(
             argv.append("--s3-header=" + _text_arg(header, label="s3_header"))
 
 
+def _s3_write_arguments(argv: list[Argument], headers: Iterable[str] | None) -> None:
+    if headers is None:
+        return
+    if isinstance(headers, (str, bytes)):
+        raise SyqInvocationError("s3_write_header must be an iterable of header strings")
+    for header in headers:
+        argv.append("--s3-write-header=" + _text_arg(header, label="s3_write_header"))
+
+
 def _warn_unsupported_copy_options(*, only_existing=False,
                                    integrity_checking=None) -> None:
     options = []
@@ -772,9 +781,9 @@ def _copy_arguments(
     if copy_metadata is not None:
         attributes = (copy_metadata,) if isinstance(copy_metadata, str) else tuple(copy_metadata)
         for attribute in attributes:
-            if attribute not in {"mtime", "times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes", "crtimes"}:
+            if attribute not in {"mtime", "times", "permissions", "ownership", "specials", "hardlinks", "acls", "xattrs", "atimes", "crtimes", "content-type", "content-encoding", "content-language", "content-disposition", "cache-control", "expires", "website-redirect", "user-metadata", "tags", "storage-class"}:
                 raise SyqInvocationError(
-                    "--copy-metadata must contain mtime, times, permissions, ownership, specials, hardlinks, acls, xattrs, atimes, or crtimes"
+                    "--copy-metadata must contain mtime, times, permissions, ownership, specials, hardlinks, acls, xattrs, atimes, crtimes, content-type, content-encoding, content-language, content-disposition, cache-control, expires, website-redirect, user-metadata, tags, or storage-class"
                 )
             _append_path_option(argv, "--copy-metadata", attribute)
     if open_noatime:
@@ -1046,6 +1055,7 @@ class Client:
         s3_profile: str | None = None,
         auth_from: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_write_header: Iterable[str] | None = None,
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
@@ -1069,7 +1079,8 @@ class Client:
                          no_tcp=no_tcp, tcp_plain=tcp_plain,
                          tcp_ports=tcp_ports, tcp_congestion=tcp_congestion,
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
-                         s3_profile=s3_profile, s3_header=s3_header, auth_from=auth_from,
+                         s3_profile=s3_profile, s3_header=s3_header, s3_write_header=s3_write_header,
+                         auth_from=auth_from,
                          resource_limits=resource_limits, integrity_checking=integrity_checking,
                          stats=stats, verbose=verbose,
                          quiet=quiet, progress=progress, no_progress=no_progress,
@@ -1248,6 +1259,7 @@ class Client:
         s3_region: str | None = None,
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_write_header: Iterable[str] | None = None,
         auth_from: str | None = None,
         coordinate_at: str | None = None,
         rsh: str | None = None,
@@ -1338,6 +1350,7 @@ class Client:
         )
         _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
                       connection.s3_profile, connection.s3_header)
+        _s3_write_arguments(argv, s3_write_header)
         if auth_from is not None:
             argv.extend(("--auth-from", _text_arg(auth_from, label="auth_from")))
         _append_remote_arguments(

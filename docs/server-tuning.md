@@ -66,23 +66,27 @@ can force extra logins.
 Validate changes with `sshd -t`, then reload SSH using your system's procedure.
 Keep an administrative session open. See [OpenSSH's settings](https://man.openbsd.org/sshd_config#MaxStartups).
 
-## Check local storage placement
+<a id="check-local-storage-placement"></a>
 
-On Linux, inspect the source and destination filesystems:
+## Keep free space available
 
-```sh
-findmnt -T /path/to/source -o TARGET,SOURCE,FSTYPE,OPTIONS
-findmnt -T /path/to/destination-parent -o TARGET,SOURCE,FSTYPE,OPTIONS
-```
+Leave room for growth and allocation; the useful margin depends on your
+filesystem and workload. XFS's [reserved-block pool](https://man7.org/linux/man-pages/man2/ioctl_xfs_setresblks.2.html)
+can enforce headroom even for root writes. An enlarged reserve reduces usable
+space and must be reapplied after mounting; preserve the original emergency
+allowance when lowering it.
 
-Use an existing destination parent and run remote-path checks on the machine
-that owns the path. Copies within a filesystem supporting cloning can share
-storage while remaining independently writable. See [local copies and NFS](speed.md#local-copies-and-nfs)
-for filesystem and mount considerations.
+## Reduce allocation contention
+
+XFS filesystems with only four allocation groups can bottleneck concurrent SSD
+transfers. [More allocation groups](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html)
+can reduce contention. 512 is one example; our tests found similar performance
+across a wide range of higher counts.
 
 ## Measure and track improvements
 
 Use [syq-bench](https://greaber.github.io/syq-bench/reproduce.html) for repeatable
 comparisons. Record the commands, versions, mounts, cache state, and other load.
-Keep reporting and flush settings consistent across runs. See
+Keep reporting and flush settings consistent across runs. Measure copy-command
+completion and any subsequent flush separately. See
 [performance tuning](tuning.md) to compare worker counts and request sizes.

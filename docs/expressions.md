@@ -10,7 +10,7 @@ syq cp --srcs-in project --into backup \
   --where 'src.kind = "file" and src.size between 1MiB and 100MiB'
 
 # Add missing entries and update files whose source is newer.
-syq cp --if-exists=update --srcs-in project --into backup \
+syq cp --srcs-in project --into backup \
   --copy-if 'not dst.exists or src.mtime > dst.mtime'
 
 # Select recent JPEGs, using the existing ignore rules too.

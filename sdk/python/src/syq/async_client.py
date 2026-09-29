@@ -40,6 +40,7 @@ from .client import (
     _argument,
     _copy_arguments,
     _s3_arguments,
+    _s3_write_arguments,
     _insert_mapping_option,
     _map_stream_cwd,
     _map_options,
@@ -572,6 +573,7 @@ class AsyncClient:
         s3_profile: str | None = None,
         auth_from: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_write_header: Iterable[str] | None = None,
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
@@ -597,7 +599,8 @@ class AsyncClient:
                              no_tcp=no_tcp, tcp_plain=tcp_plain,
                              tcp_ports=tcp_ports, tcp_congestion=tcp_congestion,
                              s3_endpoint=s3_endpoint, s3_region=s3_region,
-                             s3_profile=s3_profile, s3_header=s3_header, auth_from=auth_from,
+                             s3_profile=s3_profile, s3_header=s3_header, s3_write_header=s3_write_header,
+                             auth_from=auth_from,
                              resource_limits=resource_limits, integrity_checking=integrity_checking,
                              stats=stats, verbose=verbose,
                              quiet=quiet, progress=progress, no_progress=no_progress,
@@ -828,6 +831,7 @@ class AsyncClient:
         s3_region: str | None = None,
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_write_header: Iterable[str] | None = None,
         auth_from: str | None = None,
         coordinate_at: str | None = None,
         rsh: str | None = None,
@@ -920,6 +924,7 @@ class AsyncClient:
         )
         _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
                       connection.s3_profile, connection.s3_header)
+        _s3_write_arguments(argv, s3_write_header)
         if auth_from is not None:
             argv.extend(("--auth-from", _text_arg(auth_from, label="auth_from")))
         _append_remote_arguments(

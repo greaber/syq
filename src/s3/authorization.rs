@@ -142,6 +142,12 @@ impl Request {
                 || request.query.contains_key("versions"),
             "storage request is outside the approved paths"
         );
+        // The empty key addresses the bucket itself, not an object. Bucket-wide
+        // object scopes still must not authorize creating or deleting buckets.
+        anyhow::ensure!(
+            !request.key.is_empty() || reading,
+            "storage authorization does not permit bucket mutations"
+        );
         for (name, value) in &request.headers {
             // SigV4 takes an explicit Host header in preference to the URL's
             // authority. Only the approved endpoint may supply that authority.
@@ -154,6 +160,12 @@ impl Request {
                     && http::HeaderName::from_bytes(name.as_bytes()).is_ok()
                     && http::HeaderValue::from_str(value).is_ok(),
                 "invalid storage signing header"
+            );
+            anyhow::ensure!(
+                !name.starts_with("x-amz-object-lock-")
+                    && !name.starts_with("x-amz-bucket-object-lock-")
+                    && name != "x-amz-bypass-governance-retention",
+                "storage authorization does not permit Object Lock or retention bypass headers"
             );
         }
         let query = &request.query;
@@ -204,8 +216,12 @@ impl Request {
                         .any(|scope| prefix == &scope.key || scope.contains_prefix(prefix))
                 })
         } else if query.contains_key("tagging") {
-            source
-                && request.method == "GET"
+            ((request.method == "GET" && source)
+                || (destination
+                    && self.upload
+                    && !self.create_only
+                    && (request.method == "GET"
+                        || (request.method == "PUT" && !query.contains_key("versionId")))))
                 && query
                     .keys()
                     .all(|k| matches!(k.as_str(), "tagging" | "versionId"))
@@ -257,11 +273,8 @@ impl Request {
             !request
                 .headers
                 .keys()
-                .any(
-                    |h| (h.starts_with("x-amz-copy-source") && self.source.is_none())
-                        || ((h.starts_with("x-amz-grant-") || h == "x-amz-acl")
-                            && self.acl.get(h) != request.headers.get(h))
-                ),
+                .any(|h| (h.starts_with("x-amz-grant-") || h == "x-amz-acl")
+                    && self.acl.get(h) != request.headers.get(h)),
             "storage ACL or copy headers are outside the approved permissions"
         );
         if let Some(encoded) = request.headers.get("x-amz-copy-source") {
@@ -272,10 +285,12 @@ impl Request {
                 .split_once('/')
                 .context("invalid storage copy source")?;
             anyhow::ensure!(
-                self.source
-                    .as_ref()
-                    .is_some_and(|source| source.bucket == bucket
-                        && source.scopes.iter().any(|scope| scope.contains(key))),
+                (bucket == self.bucket && key == request.key && !self.create_only)
+                    || self
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.bucket == bucket
+                            && source.scopes.iter().any(|scope| scope.contains(key))),
                 "storage copy source is outside the approved paths"
             );
             anyhow::ensure!(
@@ -388,6 +403,7 @@ impl Signer {
             region: request.region.clone(),
             profile: request.profile.clone(),
             headers: vec![],
+            write_headers: vec![],
             concurrency: 1,
             part_size: 8 << 20,
             retries: 1,
@@ -704,13 +720,7 @@ pub(crate) async fn connect(
                 scopes,
             })
         })
-        .transpose()?
-        .or_else(|| {
-            (options.route == super::Route::Upload).then(|| ReadAccess {
-                bucket: options.bucket.clone(),
-                scopes: scopes.clone(),
-            })
-        });
+        .transpose()?;
     let request = Request {
         bucket: options.bucket.clone(),
         endpoint: options.endpoint.clone(),
@@ -740,6 +750,7 @@ pub(super) fn acl_headers(options: &super::Options) -> BTreeMap<String, String> 
     options
         .headers
         .iter()
+        .chain(&options.write_headers)
         .filter(|super::Header(name, _)| name == "x-amz-acl" || name.starts_with("x-amz-grant-"))
         .map(|super::Header(name, value)| (name.clone(), value.clone()))
         .collect()

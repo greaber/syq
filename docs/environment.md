@@ -43,7 +43,7 @@ Default locations include:
 | `~/.cache/syq/tuning.json` | Learned connection counts in the legacy format |
 | `~/.cache/syq/tuning.history-v1.sqlite` | Local tuning timelines and filesystem startup hints |
 | `~/.cache/syq/completion-endpoints.json` | Hosts offered by completion |
-| `~/.cache/syq/helpers/` | Downloaded SSH helpers |
+| `~/.cache/syq/helpers/` | Downloaded SSH helpers and releases selected with `--use-version` |
 | `~/.config/syq/persistence.json` | Whether persistence is enabled |
 | `~/.config/syq/receive.json` | Receiving profiles |
 | `~/.config/syq/install.json`, `last-update-check` | Install receipt and update-check timing |
@@ -51,8 +51,12 @@ Default locations include:
 | `~/.syq-destinations-v3/` | Registered receiving names on a server |
 | `~/.local/share/syq/restricted/` | Receiver enrollment state |
 
-Copies can proceed when optional caches cannot be written. Persistent
-connections need a writable runtime directory. See [Enrollment](remote-reference.md#enrollment)
+Copies can proceed when optional caches cannot be written. They do need a
+little space for private sockets in the temporary directory on each machine:
+`TMPDIR` when it is set, otherwise `/tmp`. Persistent connections need a
+writable runtime directory. If `syq persist on` enabled persistence but syq
+cannot use its setting or runtime directory, a copy warns and connects without
+persistence. See [Enrollment](remote-reference.md#enrollment)
 for receiver state and [Names and profiles](persistence-reference.md#names-and-profiles)
 for backing up or replacing a receiving identity.
 

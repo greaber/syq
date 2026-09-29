@@ -69,6 +69,16 @@ fn unregister_signal_cleanup(path: &Path) {
     }
 }
 
+/// Create an owner-only directory in the temporary directory.
+pub(crate) fn private_temp_dir(prefix: &str) -> io::Result<tempfile::TempDir> {
+    // Request the mode at creation: tempfile otherwise uses 0777 minus the
+    // umask, which can let group members replace entries.
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 pub(crate) struct PrivateBrokerConfig<'a> {
     pub(crate) directory_prefix: &'a str,
     pub(crate) socket_name: &'a str,
@@ -127,12 +137,13 @@ impl PrivateBroker {
         if config.max_connections == 0 {
             bail!("private broker needs at least one connection slot");
         }
-        let mut builder = tempfile::Builder::new();
-        builder.prefix(config.directory_prefix);
         let socket_dir = if in_current_dir {
-            builder.tempdir_in(".")
+            tempfile::Builder::new()
+                .prefix(config.directory_prefix)
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in(".")
         } else {
-            builder.tempdir()
+            private_temp_dir(config.directory_prefix)
         }
         .context("create private broker directory")?;
         std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
@@ -393,6 +404,17 @@ impl Write for TrackedStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_temp_dir_is_created_owner_only() {
+        let directory = private_temp_dir("syq-test-").unwrap();
+        let mode = std::fs::metadata(directory.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
 
     #[test]
     fn broker_uses_private_modes_and_removes_its_directory() {

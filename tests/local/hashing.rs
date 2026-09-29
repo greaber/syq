@@ -808,9 +808,18 @@ fn dry_run_hash_mapping_reports_source_names_and_timestamp_only_changes() {
         assert_eq!(trace["src"]["value"], "input");
         assert_eq!(trace["dst"]["value"], "output");
         assert_eq!(trace["reason"], "metadata_differs");
-        assert_eq!(trace.get("bytes").and_then(|b| b.as_u64()), None);
-        assert_eq!(records.last().unwrap()["files_transferred"], 0);
-        assert_eq!(records.last().unwrap()["files_unchanged"], 1);
+        assert_eq!(
+            trace.get("bytes").and_then(|b| b.as_u64()),
+            if hash { None } else { Some(3) }
+        );
+        assert_eq!(
+            records.last().unwrap()["files_transferred"],
+            if hash { 0 } else { 1 }
+        );
+        assert_eq!(
+            records.last().unwrap()["files_unchanged"],
+            if hash { 1 } else { 0 }
+        );
         assert_eq!(
             fs::metadata(t.path("output")).unwrap().mtime(),
             1_700_000_001

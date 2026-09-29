@@ -13,7 +13,10 @@ impl Engine {
             request
                 .headers
                 .retain(|name, _| crate::s3::authorization::signed_header(name, &request.method));
-            for super::super::Header(name, value) in &self.options.headers {
+            let headers = self
+                .options
+                .headers_for(&request.method, request.query.keys().map(String::as_str));
+            for super::super::Header(name, value) in headers {
                 if crate::s3::authorization::signed_header(name, &request.method) {
                     request.headers.insert(name.clone(), value.clone());
                 }
@@ -33,7 +36,7 @@ impl Engine {
             return Ok(());
         }
         if let Some(update) = &prepared.metadata_update {
-            return self.authorize_requests(vec![update.clone()]).await;
+            return self.authorize_requests(update.requests()).await;
         }
         let key = &prepared.source.key;
         let mut requests = vec![Unsigned::new("HEAD", key)];

@@ -1,5 +1,4 @@
 use super::*;
-use crate::process::CommandExt as _;
 use crate::sched::tests::test_job as pipeline_job;
 
 #[test]
@@ -1582,102 +1581,6 @@ fn existing_destination_setup_rejects_replaced_inode_without_writes() {
             .count(),
         0
     );
-}
-
-#[test]
-#[ignore = "set SYQ_V032_BINARY to the verified official v0.3.2 executable"]
-fn existing_destination_setup_replays_on_v032_receiver() {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    // This probe deliberately speaks the released client's identity. Real
-    // clients retain exact build pinning; it is not a mixed-build bypass.
-    let binary = std::env::var_os("SYQ_V032_BINARY").expect("SYQ_V032_BINARY");
-    let directory = crate::test_support::tempdir().unwrap();
-    let path = directory.path().as_os_str().as_bytes();
-    let entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
-    let mut conn = SetupConn {
-        inner: Endpoint::local().connect_control(false).unwrap(),
-        sent: 0,
-        received: 0,
-        fail_at: None,
-        requests: Vec::new(),
-    };
-    prepare_existing_destination(
-        &mut conn,
-        path,
-        OperatorSymlinkPolicy::FollowAll,
-        &entry,
-        path.to_vec(),
-    )
-    .unwrap();
-    struct Receiver(std::process::Child);
-    impl Drop for Receiver {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let mut receiver = Receiver(
-        Command::new(binary)
-            .arg("--server")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn_guarded()
-            .unwrap(),
-    );
-    let mut input = receiver.0.stdin.take().unwrap();
-    let mut output = receiver.0.stdout.take().unwrap();
-    let identity = b"v0.3.2";
-    input.write_all(b"SYQWIRE\0").unwrap();
-    input
-        .write_all(&(identity.len() as u16).to_be_bytes())
-        .unwrap();
-    input.write_all(identity).unwrap();
-    let mut writer = FrameWriter::with_preamble_written(input, false);
-    writer
-        .write_msg(&Request::Hello {
-            identity: "v0.3.2".into(),
-            compress: false,
-            debug: false,
-            token: Vec::new(),
-            role: ConnectionRole::Control,
-        })
-        .unwrap();
-    let mut header = [0u8; 10];
-    output.read_exact(&mut header).unwrap();
-    assert_eq!(&header[..8], b"SYQWIRE\0");
-    let mut peer_identity = vec![0; u16::from_be_bytes([header[8], header[9]]) as usize];
-    output.read_exact(&mut peer_identity).unwrap();
-    assert_eq!(peer_identity, identity);
-    fn response(output: &mut impl Read) -> Response {
-        let mut length = [0u8; 4];
-        output.read_exact(&mut length).unwrap();
-        let length = u32::from_le_bytes(length) as usize;
-        assert!((1..65536).contains(&length));
-        let mut bytes = vec![0; length];
-        output.read_exact(&mut bytes).unwrap();
-        assert_eq!(bytes[0], 0, "compression was disabled");
-        postcard::from_bytes(&bytes[1..]).unwrap()
-    }
-    assert!(matches!(response(&mut output), Response::HelloOk { .. }));
-    for request in &conn.requests {
-        writer.write_msg(request).unwrap();
-    }
-    assert!(matches!(
-        response(&mut output),
-        Response::DirectorySelection(Some(_))
-    ));
-    assert!(matches!(
-        response(&mut output),
-        Response::DestinationFilesystemInfo(_)
-    ));
-    assert!(matches!(
-        response(&mut output),
-        Response::DestinationRegistered(_)
-    ));
-    drop(writer);
-    assert!(receiver.0.wait().unwrap().success());
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
 #[test]

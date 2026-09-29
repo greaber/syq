@@ -55,6 +55,7 @@ pub(crate) fn run(args: &[OsString]) -> Result<i32> {
         region: command.storage.s3_region,
         profile: command.storage.s3_profile,
         headers: command.storage.s3_header,
+        write_headers: vec![],
         concurrency: 1,
         part_size: 0,
         retries: 10,

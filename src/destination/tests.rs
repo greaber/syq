@@ -70,7 +70,15 @@ fn registration_retries_socket_timeout_but_not_peer_rejection() {
                 let _ = stopped.recv_timeout(Duration::from_secs(15));
             }
         });
-        let result = register("laptop", &path, "test-credential");
+        // Only the unanswered handshake needs a short timeout to fail quickly
+        // through the same real Unix socket timeout. The rejection keeps the
+        // production timeout so a slow peer thread cannot turn it into a retry.
+        let timeout = if reject {
+            REGISTRATION_HANDSHAKE_TIMEOUT
+        } else {
+            Duration::from_millis(200)
+        };
+        let result = register("laptop", &path, "test-credential", timeout);
         let _ = stop.send(());
         peer.join().unwrap();
         if reject {
@@ -489,26 +497,33 @@ fn named_control_closure_revokes_connected_workers() {
     assert!(!root.join("source").exists());
 }
 
-#[test]
-fn named_pending_hello_is_bounded_and_does_not_block_readiness() {
+/// Open two data channels whose hello never arrives. The registry's I/O
+/// timeout decides how long each pending hello holds its worker allowance.
+fn pending_hellos(
+    io_timeout: Duration,
+) -> (
+    impl Sized,
+    Registration,
+    Approved,
+    impl Sized,
+    Vec<UnixStream>,
+) {
     let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
-    let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+    let (broker, receiver, registration, _) = broker(&root, Approval::Always);
     let mut args = args(Path::new("source"), ".");
     args.compress = false;
     let (request, _) = request(&args);
     let approved = approve(&registration, request);
-    let _control = control(registration.clone(), &approved);
+    let control = control(registration.clone(), &approved);
     receiver
         .sessions
         .lock()
         .unwrap()
         .get_mut(&approved.token)
         .unwrap()
-        .channels = Arc::new(crate::private_broker::ConnectionRegistry::new(
-        Duration::from_millis(200),
-    ));
+        .channels = Arc::new(crate::private_broker::ConnectionRegistry::new(io_timeout));
     let mut pending = Vec::new();
     for _ in 0..2 {
         let (stream, reply) = exchange(
@@ -523,6 +538,21 @@ fn named_pending_hello_is_bounded_and_does_not_block_readiness() {
         assert!(matches!(reply, Reply::Ready));
         pending.push(stream);
     }
+    (
+        (temp, broker, receiver),
+        registration,
+        approved,
+        control,
+        pending,
+    )
+}
+
+#[test]
+fn named_pending_hello_is_bounded_and_does_not_block_readiness() {
+    // A long I/O timeout keeps both hellos pending for the whole test, so the
+    // bound is checked without racing their expiry.
+    let (_fixture, registration, approved, _control, _pending) =
+        pending_hellos(Duration::from_secs(60));
     assert!(exchange(
         &registration,
         Message::Open {
@@ -538,9 +568,17 @@ fn named_pending_hello_is_bounded_and_does_not_block_readiness() {
             .1,
         Reply::Ready
     ));
+}
+
+#[test]
+fn named_expired_pending_hellos_release_their_worker_allowance() {
+    let (_fixture, registration, approved, _control, pending) =
+        pending_hellos(Duration::from_millis(200));
+    // The receiver closes each channel when its hello times out; waiting for
+    // that close is waiting for the expiry itself, not a fixed delay.
     for mut stream in pending {
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         stream.read_to_end(&mut Vec::new()).unwrap();
     }

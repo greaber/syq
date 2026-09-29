@@ -19,24 +19,57 @@ pub(super) fn serve_upload(
         "HEAD" => reply(socket, 404, &[], b"", true),
         "GET" => {
             assert!(target.contains("list-type="), "{target}");
-            reply(socket, 200, &[], b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>", false);
+            reply(
+                socket,
+                200,
+                &[],
+                b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+                false,
+            );
         }
-        "POST" if target.contains("uploads") => reply(socket, 200, &[],
-            b"<InitiateMultipartUploadResult><UploadId>new-upload</UploadId></InitiateMultipartUploadResult>", false),
+        "POST" if target.contains("uploads") => {
+            if fault == "recovery-upload-default-hash" {
+                assert_eq!(headers["x-amz-meta-syq-format"], "1");
+                assert_eq!(
+                    headers["x-amz-meta-syq-blake3"],
+                    blake3::hash(&vec![b'x'; SIZE]).to_hex().to_string()
+                );
+            }
+            reply(socket, 200, &[],
+                b"<InitiateMultipartUploadResult><UploadId>new-upload</UploadId></InitiateMultipartUploadResult>", false);
+        }
         "PUT" => {
             use base64::Engine as _;
             use sha2::Digest as _;
             assert!(target.contains("uploadId=new-upload"));
             assert!(body.iter().all(|b| *b == b'x'));
             if let Some(checksum) = headers.get("content-md5") {
-                assert_eq!(*checksum, base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&body)));
+                assert_eq!(
+                    *checksum,
+                    base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&body))
+                );
             } else {
-                assert_eq!(headers["x-amz-checksum-sha256"], base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&body)));
+                assert_eq!(
+                    headers["x-amz-checksum-sha256"],
+                    base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&body))
+                );
             }
             if fault == "recovery-upload-fail" {
-                reply(socket, 403, &[], b"<Error><Code>AccessDenied</Code></Error>", false);
+                reply(
+                    socket,
+                    403,
+                    &[],
+                    b"<Error><Code>AccessDenied</Code></Error>",
+                    false,
+                );
             } else {
-                reply(socket, 200, &[("ETag".into(), "\"part\"".into())], b"", false);
+                reply(
+                    socket,
+                    200,
+                    &[("ETag".into(), "\"part\"".into())],
+                    b"",
+                    false,
+                );
             }
         }
         "POST" => {
@@ -45,7 +78,13 @@ pub(super) fn serve_upload(
             assert!(body.contains("<PartNumber>1</PartNumber>"), "{body}");
             assert!(body.contains("<PartNumber>2</PartNumber>"), "{body}");
             gate.0.store(true, Ordering::Relaxed);
-            reply(socket, 200, &[], b"<CompleteMultipartUploadResult><ETag>done</ETag></CompleteMultipartUploadResult>", false);
+            reply(
+                socket,
+                200,
+                &[],
+                b"<CompleteMultipartUploadResult><ETag>done</ETag></CompleteMultipartUploadResult>",
+                false,
+            );
         }
         "DELETE" => {
             gate.1.store(true, Ordering::Relaxed);
@@ -131,9 +170,12 @@ fn multipart_upload_accepts_read_only_source_and_unavailable_cache() {
             .arg("--srcs-in")
             .arg(&_source.0)
             .args(["--to", "s3://bucket", "--into", "prefix"])
+            .args(["--s3-write-header", &format!("{WRITE_PROBE}: yes")])
             .capture_output()
             .unwrap();
         assert!(output.status.success(), "{mode}: {}", output_text(&output));
+        // Only each object's CreateMultipartUpload, not its parts or completion.
+        assert_eq!(server.probes.load(Ordering::Relaxed), 2, "{mode}");
         // Each multipart object opens its own record, but one warning suffices.
         assert_eq!(
             output_text(&output)
@@ -221,4 +263,17 @@ fn multipart_download_without_cache_publishes_or_cleans_up() {
             .to_string_lossy()
             .ends_with(".partial")));
     }
+}
+
+#[test]
+fn ordinary_multipart_upload_stores_whole_file_hash() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let server = Server::start("recovery-upload-default-hash");
+    std::fs::write(temp.path().join("source"), vec![b'x'; SIZE]).unwrap();
+    let output = server.cp(
+        temp.path(),
+        &["source", "--to", "s3://bucket", "--as", "object"],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.0.load(Ordering::Relaxed));
 }

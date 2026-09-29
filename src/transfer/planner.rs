@@ -488,9 +488,20 @@ impl Planner<'_> {
             | TargetCondition::MatchesFingerprint { dev, ino, .. } => (dev, ino),
             TargetCondition::Any | TargetCondition::Absent => return Ok(None),
         };
-        let current = stat_many(self.dst, vec![self.dst_root.clone()], false)?
-            .pop()
-            .flatten();
+        // Only identity matters here. A plain lookup avoids the rich-metadata
+        // capture that preserving ACLs or xattrs adds to ordinary stats: its
+        // change guard trips on entries this copy's workers are adding to the
+        // root while later batches are still being planned.
+        let current = match ok(
+            self.dst.call(Request::PruneLookup {
+                paths: vec![self.dst_root.clone()],
+                guard: None,
+            })?,
+            "inspect destination root",
+        )? {
+            Response::Stats(mut entries) if entries.len() == 1 => entries.pop().flatten(),
+            other => bail!("unexpected destination inspection response {other:?}"),
+        };
         match current {
             Some(entry) if entry.dev == dev && entry.ino == ino => Ok(Some(entry)),
             _ => bail!(
@@ -1821,11 +1832,7 @@ impl Planner<'_> {
         let dst_newer = opts.update
             && dst_entry.as_ref().is_some_and(|d| {
                 (d.kind == Kind::File || opts.if_exists.is_some())
-                    && if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder) {
-                        (d.mtime, d.mtime_nsec) >= (e.mtime, e.mtime_nsec)
-                    } else {
-                        (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
-                    }
+                    && (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec)
             });
         if dst_newer {
             self.progress.files_excluded.fetch_add(1, Relaxed);
@@ -2048,7 +2055,7 @@ impl Planner<'_> {
         if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder)
             && dst_entry
                 .as_ref()
-                .is_some_and(|d| (d.mtime, d.mtime_nsec) >= (e.mtime, e.mtime_nsec))
+                .is_some_and(|d| (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec))
         {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;
@@ -2163,7 +2170,7 @@ impl Planner<'_> {
         if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder)
             && dst_entry
                 .as_ref()
-                .is_some_and(|d| (d.mtime, d.mtime_nsec) >= (e.mtime, e.mtime_nsec))
+                .is_some_and(|d| (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec))
         {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;

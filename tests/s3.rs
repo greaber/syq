@@ -19,6 +19,12 @@ mod map;
 #[path = "s3/expressions.rs"]
 mod expressions;
 
+#[path = "s3/metadata_updates.rs"]
+mod metadata_updates;
+
+#[path = "s3/metadata_fields.rs"]
+mod metadata_fields;
+
 #[path = "s3/existing_policy.rs"]
 mod existing_policy;
 
@@ -38,12 +44,18 @@ use std::{
     time::Duration,
 };
 
+/// Tests pass this with `--s3-write-header`; the server rejects it on any
+/// request other than PutObject, CopyObject, or CreateMultipartUpload.
+const WRITE_PROBE: &str = "x-syq-write-probe";
+
 struct Server {
     address: String,
     stop: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<()>>,
     gate: Arc<(AtomicBool, AtomicBool)>,
+    /// Requests carrying the write-only probe header; `serve` checks each one.
+    probes: Arc<AtomicUsize>,
 }
 impl Server {
     fn start(fault: &'static str) -> Self {
@@ -53,6 +65,8 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new((AtomicBool::new(false), AtomicBool::new(false)));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let worker_probes = probes.clone();
         let worker_gate = gate.clone();
         let stopping = stop.clone();
         let count = requests.clone();
@@ -63,7 +77,10 @@ impl Server {
                     Ok((socket, _)) => {
                         let count = count.clone();
                         let gate = worker_gate.clone();
-                        workers.push(thread::spawn(move || serve(socket, fault, count, gate)));
+                        let probes = worker_probes.clone();
+                        workers.push(thread::spawn(move || {
+                            serve(socket, fault, count, gate, probes)
+                        }));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2))
@@ -81,6 +98,7 @@ impl Server {
             requests,
             thread: Some(handle),
             gate,
+            probes,
         }
     }
     fn command(&self, temp: &Path) -> Command {
@@ -163,11 +181,30 @@ impl Drop for Server {
 }
 
 const SIZE: usize = 6 * 1024 * 1024 + 7;
+/// PutObject, CopyObject, or CreateMultipartUpload, judged independently of
+/// syq's own classification.
+fn writes_object(method: &str, target: &str) -> bool {
+    let query = target
+        .split_once('?')
+        .map_or(vec![], |(_, query)| query.split('&').collect());
+    let keys = query
+        .iter()
+        .map(|pair| pair.split('=').next().unwrap())
+        .filter(|key| *key != "x-id")
+        .collect::<Vec<_>>();
+    match method {
+        "PUT" => keys.is_empty(),
+        "POST" => keys == ["uploads"],
+        _ => false,
+    }
+}
+
 fn serve(
     mut socket: TcpStream,
     fault: &str,
     requests: Arc<AtomicUsize>,
     gate: Arc<(AtomicBool, AtomicBool)>,
+    probes: Arc<AtomicUsize>,
 ) {
     // BSD can inherit the listener's nonblocking mode; this handler uses
     // blocking I/O with timeouts on every platform.
@@ -208,6 +245,14 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if headers.contains_key(WRITE_PROBE) {
+        let target = first.split_whitespace().nth(1).unwrap();
+        assert!(
+            writes_object(method, target),
+            "object-writing header on {first}"
+        );
+        probes.fetch_add(1, Ordering::Relaxed);
+    }
     if fault.starts_with("existing-policy") {
         existing_policy::serve(
             &mut socket,
@@ -298,6 +343,28 @@ fn serve(
             ],
             data,
             method == "HEAD",
+        );
+        return;
+    }
+    if fault.starts_with("metadata-fields-") {
+        metadata_fields::serve(
+            &mut socket,
+            fault,
+            method,
+            first.split_whitespace().nth(1).unwrap(),
+            &headers,
+            &gate,
+        );
+        return;
+    }
+    if fault.starts_with("metadata-update-") {
+        metadata_updates::serve(
+            &mut socket,
+            fault,
+            method,
+            first.split_whitespace().nth(1).unwrap(),
+            &headers,
+            &gate,
         );
         return;
     }
@@ -489,7 +556,7 @@ fn serve(
                 ),
                 "{path}"
             );
-            assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
+            assert_eq!(headers.get("if-none-match").map(String::as_str), None);
             assert_eq!(headers["x-amz-copy-source-if-match"], "\"source\"");
             if fault.ends_with("changed") {
                 reply(
@@ -580,8 +647,13 @@ fn serve(
             }
         }
 
-        if fault.contains("storage-class") {
-            assert_eq!(headers["x-amz-storage-class"], "INTELLIGENT_TIERING");
+        if fault.contains("override-storage-class") && !writes_object(method, path) {
+            assert_eq!(headers["x-amz-storage-class"], "STANDARD", "{first}");
+        } else if fault.contains("storage-class") {
+            assert_eq!(
+                headers["x-amz-storage-class"], "INTELLIGENT_TIERING",
+                "{first}"
+            );
         } else {
             assert!(
                 !headers.contains_key("x-amz-storage-class"),
@@ -642,6 +714,8 @@ fn serve(
                         "Content-Length".into(),
                         if fault == "server-copy-automatic" {
                             (32 * 1024 * 1024).to_string()
+                        } else if fault == "server-copy-compare-time-tie" && !source {
+                            "3".into()
                         } else if multipart {
                             (6 * 1024 * 1024).to_string()
                         } else {
@@ -706,6 +780,19 @@ fn serve(
                 if fault.ends_with("tags-denied") || fault.ends_with("-known-unsupported") {
                     fields.push(("x-amz-tagging-count".into(), "1".into()));
                 }
+                if fault == "server-copy-compare-time-tie" {
+                    for (name, value) in [
+                        ("format", "1"),
+                        ("kind", "file"),
+                        ("mode", "420"),
+                        ("uid", "0"),
+                        ("gid", "0"),
+                        ("mtime", "10"),
+                        ("mtime-nsec", "0"),
+                    ] {
+                        fields.push((format!("x-amz-meta-syq-{name}"), value.into()));
+                    }
+                }
                 if fault == "server-copy-compare-metadata" {
                     fields.push((
                         "x-amz-meta-project".into(),
@@ -764,7 +851,7 @@ fn serve(
             assert_eq!(headers.get("expires").map(String::as_str), Some("0"));
             reply(&mut socket, 200, &[], b"<InitiateMultipartUploadResult><UploadId>owned</UploadId></InitiateMultipartUploadResult>", false);
         } else if multipart && method == "POST" {
-            assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
+            assert_eq!(headers.get("if-none-match").map(String::as_str), None);
             let length: usize = headers["content-length"].parse().unwrap();
             let mut body = vec![0; length];
             socket.read_exact(&mut body).unwrap();
@@ -880,11 +967,10 @@ fn serve(
                     );
                 }
             } else {
-                if fault.starts_with("server-copy-compare-") {
-                    assert!(!headers.contains_key("if-none-match"));
-                } else {
-                    assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
-                }
+                assert_eq!(
+                    headers.get("if-none-match").map(String::as_str),
+                    (fault == "server-copy-only-new").then_some("*")
+                );
                 assert_eq!(headers["x-amz-website-redirect-location"], "/new-location");
                 assert!(
                     !matches!(
@@ -1508,17 +1594,13 @@ fn serve(
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         );
-        assert!(!headers.contains_key("x-amz-meta-syq-blake3"));
         if fault == "upload-metadata" {
             assert_eq!(headers["x-amz-meta-syq-mode"], "416");
             assert_eq!(headers["x-amz-meta-syq-mtime"], "123");
             assert_eq!(headers["x-amz-meta-syq-mtime-nsec"], "456");
         }
 
-        if matches!(fault, "upload-default" | "upload-metadata") {
-            assert_eq!(headers["x-amz-meta-syq-format"], "1");
-            assert!(!headers.contains_key("x-amz-meta-syq-hash"));
-        } else {
+        if matches!(fault, "upload-md5" | "upload-sha256") {
             let digest = if fault == "upload-md5" {
                 md5::Md5::digest(&body)
                     .iter()
@@ -1539,6 +1621,13 @@ fn serve(
                 } else {
                     "sha256"
                 }
+            );
+            assert!(!headers.contains_key("x-amz-meta-syq-blake3"));
+        } else {
+            assert_eq!(headers["x-amz-meta-syq-format"], "1");
+            assert_eq!(
+                headers["x-amz-meta-syq-blake3"],
+                blake3::hash(&body).to_hex().to_string()
             );
         }
         gate.0.store(true, Ordering::Release);
@@ -1826,6 +1915,7 @@ fn s3_fixture_completes_response_on_inherited_nonblocking_socket() {
             "ok",
             Arc::new(AtomicUsize::new(0)),
             Arc::new((AtomicBool::new(false), AtomicBool::new(false))),
+            Arc::new(AtomicUsize::new(0)),
         )
     });
     let mut response = Vec::new();
@@ -2265,6 +2355,15 @@ fn s3_usage_errors_do_not_contact_storage() {
         ],
         vec!["--from", "s3://bucket/path", "data", "--as", "out"],
         vec!["data", "--into", "out"],
+        vec![
+            "--from",
+            "s3://bucket",
+            "data",
+            "--as",
+            "out",
+            "--s3-write-header",
+            "x-amz-storage-class: STANDARD_IA",
+        ],
     ] {
         let output = server.cp(temp.path(), &args);
         assert_eq!(output.status.code(), Some(2), "{}", output_text(&output));
@@ -2560,12 +2659,40 @@ fn s3_transfer_integrity_is_opt_in_but_framing_stays_mandatory() {
 }
 
 #[test]
-fn s3_upload_native_checksum_reuse_and_expected_hash() {
+fn s3_write_headers_reach_only_object_writes() {
+    let server = Server::start("upload-default");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::write(temp.path().join("source"), b"payload").unwrap();
+    let probe = format!("{WRITE_PROBE}: yes");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "source",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "object",
+            "--s3-write-header",
+            &probe,
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.0.load(Ordering::Acquire));
+    assert_eq!(server.probes.load(Ordering::Relaxed), 1, "one PutObject");
+    assert!(server.requests.load(Ordering::Relaxed) > 1);
+}
+
+#[test]
+fn s3_upload_native_checksum_and_whole_file_hash() {
     for (fault, options) in [
         ("upload-default", Vec::new()),
         (
             "upload-sha256",
             vec!["--integrity-checking=transfer=sha256".to_owned()],
+        ),
+        (
+            "upload-md5",
+            vec!["--integrity-checking=transfer=md5".to_owned()],
         ),
     ] {
         let server = Server::start(fault);
@@ -4150,6 +4277,31 @@ fn server_copy_compares_remote_checksums_etags_and_metadata_without_body_reads()
 }
 
 #[test]
+fn server_copy_update_if_older_copies_different_sizes_on_a_tie() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let server = Server::start("server-copy-compare-time-tie");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--if-exists=update-if-older",
+            "--from",
+            "s3://source",
+            "original",
+            "--to",
+            "s3://destination",
+            "--as",
+            "copied",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(
+        server.requests.load(Ordering::Relaxed),
+        3,
+        "two HEADs and one copy"
+    );
+}
+
+#[test]
 fn server_copy_parts_overlap_and_respect_one_request_limit() {
     for (fault, limit, success) in [
         ("server-copy-multipart-parallel", "2", true),
@@ -4239,6 +4391,8 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
         "server-copy-heads-overlap",
         "server-copy-storage-class",
         "server-copy-multipart-storage-class",
+        "server-copy-override-storage-class",
+        "server-copy-multipart-override-storage-class",
     ] {
         let server = Server::start(fault);
         let temp = crate::test_support::tempdir().unwrap();
@@ -4267,11 +4421,26 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
                 "--if-exists=keep",
             ];
         }
-        if fault.contains("storage-class") {
+        if fault.contains("override-storage-class") {
+            // On object writes, the write header replaces the every-request value.
+            args.extend(["--s3-header", "x-amz-storage-class: STANDARD"]);
+            args.extend([
+                "--s3-write-header",
+                "x-amz-storage-class: INTELLIGENT_TIERING",
+            ]);
+        } else if fault.contains("storage-class") {
             args.extend(["--s3-header", "x-amz-storage-class: INTELLIGENT_TIERING"]);
         }
+        let probe = format!("{WRITE_PROBE}: yes");
+        args.extend(["--s3-write-header", &probe]);
         let output = server.cp(temp.path(), &args);
         assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        // One CopyObject or CreateMultipartUpload; the dry run writes nothing.
+        assert_eq!(
+            server.probes.load(Ordering::Relaxed),
+            usize::from(fault != "server-copy-heads-overlap"),
+            "{fault}"
+        );
     }
 }
 

@@ -120,9 +120,7 @@ pub(crate) fn require_constrained_openssh(program: &str, location: &str) -> Resu
 
 impl SshMultiplexer {
     pub(crate) fn new() -> Result<Self> {
-        let directory = tempfile::Builder::new()
-            .prefix("syq-ssh-")
-            .tempdir()
+        let directory = crate::private_broker::private_temp_dir("syq-ssh-")
             .context("create private SSH control directory")?;
         let path = directory.path().join("socket");
         crate::persistence::validate_openssh_socket_path(&path)?;

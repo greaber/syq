@@ -3,6 +3,7 @@ mod authorization;
 mod fast;
 mod pruning;
 mod server_copy;
+mod upload_hashes;
 
 use super::{
     admission::parallel,
@@ -26,7 +27,6 @@ use aws_sdk_s3::{
 };
 use aws_smithy_types::byte_stream::Length;
 use futures_util::{stream, StreamExt};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::{
@@ -136,7 +136,7 @@ struct PreparedUpload {
     metadata: Metadata,
     must_be_new: bool,
     multipart: Option<PreparedMultipart>,
-    metadata_update: Option<super::authorization::Unsigned>,
+    metadata_update: Option<super::metadata_copy::Prepared>,
 }
 struct PreparedMultipart {
     recorded: bool,
@@ -534,6 +534,19 @@ impl Engine {
             hash.update(header.1.as_bytes());
             hash.update(&[0]);
         }
+        // Object-writing headers change the uploaded object's settings. Without
+        // them, keep earlier identities so existing recovery records still match.
+        // Header names and values cannot contain a newline, so the marker cannot
+        // be confused with an every-request header.
+        if !self.options.write_headers.is_empty() {
+            hash.update(b"\nwrite\n");
+            for header in &self.options.write_headers {
+                hash.update(header.0.as_bytes());
+                hash.update(&[0]);
+                hash.update(header.1.as_bytes());
+                hash.update(&[0]);
+            }
+        }
         format!(
             "syq.s3.v1\n{}\n{}\n{}\n{}\n{}\n{extra}",
             self.options.endpoint.as_deref().unwrap_or("AWS"),
@@ -623,19 +636,13 @@ impl Engine {
         }
         Ok(())
     }
-    fn upload_metadata_matches(&self, source: &Source, size: u64, object: &Object) -> bool {
-        let explicit = source.metadata.unwrap_or_default();
-        let desired = source.metadata(None);
+    fn upload_contents_match(&self, source: &Source, size: u64, object: &Object) -> bool {
         object.kind() == source.kind()
             && object.size == size
-            && object.metadata.as_ref().is_some_and(|m| {
-                (m.mtime, m.nsec) == (desired.mtime, desired.nsec)
-                    && (!(self.args.perms || explicit.mode.is_some()) || m.mode == desired.mode)
-                    && (!(self.args.owner || self.args.group || explicit.uid.is_some())
-                        || m.uid == desired.uid)
-                    && (!(self.args.owner || self.args.group || explicit.gid.is_some())
-                        || m.gid == desired.gid)
-            })
+            && (source.kind() == ObjectKind::Dir
+                || object.metadata.as_ref().is_some_and(|m| {
+                    (m.mtime, m.nsec) == (source.meta.mtime, source.meta.mtime_nsec)
+                }))
     }
 
     fn upload_requested_metadata_matches(&self, source: &Source, object: &Object) -> bool {
@@ -652,6 +659,89 @@ impl Engine {
                 && (flags & crate::proto::flags::OWNER == 0 || m.uid == desired.uid)
                 && (flags & crate::proto::flags::GROUP == 0 || m.gid == desired.gid)
         })
+    }
+
+    async fn prepare_accepted_upload(
+        self: &Arc<Self>,
+        source: Source,
+        object: &Object,
+    ) -> Result<UploadPreparation> {
+        let size = object.size;
+        if self.upload_requested_metadata_matches(&source, object) {
+            self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+            return Ok(UploadPreparation::Skipped);
+        }
+        if self.args.dry_run {
+            self.progress.add_bytes(size);
+            return Ok(UploadPreparation::Preview(size));
+        }
+        let desired = source.metadata(None);
+        let flags =
+            self.args.matching_meta_flags() | source.metadata.map_or(0, |m| m.apply_flags());
+        let _slot = self.tuning.requests.acquire().await;
+        let head = client::head_output(&self.client, &self.options.bucket, &source.key, None)
+            .await?
+            .context("S3 destination disappeared before metadata update")?;
+        anyhow::ensure!(
+            head.e_tag() == Some(&object.etag),
+            "S3 destination changed before metadata update"
+        );
+        let mut metadata = object.metadata.clone().unwrap_or(Metadata {
+            kind: object.kind(),
+            mode: if object.kind() == ObjectKind::Dir {
+                0o777
+            } else {
+                0o666
+            },
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            mtime: object.mtime,
+            nsec: 0,
+            hash: None,
+            hash_algorithm: HashAlgorithm::Blake3,
+        });
+        if flags & crate::proto::flags::TIMES != 0 {
+            metadata.mtime = desired.mtime;
+            metadata.nsec = desired.nsec;
+        }
+        if flags & crate::proto::flags::MODE != 0 {
+            metadata.mode = desired.mode;
+        }
+        if flags & crate::proto::flags::OWNER != 0 {
+            metadata.uid = desired.uid;
+        }
+        if flags & crate::proto::flags::GROUP != 0 {
+            metadata.gid = desired.gid;
+        }
+        let mut fields = head.metadata().cloned().unwrap_or_default();
+        fields.extend(metadata.encode());
+        let update = super::metadata_copy::Prepared::prepare(
+            &self.client,
+            &self.options,
+            &source.key,
+            &head,
+            fields,
+            self.part_size(size),
+            self.copy_request_limit(size),
+        )
+        .await?;
+        drop(_slot);
+        if let Err(error) = self.authorize_requests(update.requests()).await {
+            update.abort(&self.client, &self.options.bucket).await;
+            return Err(error);
+        }
+        Ok(UploadPreparation::Ready(Box::new(PreparedUpload {
+            source,
+            size,
+            part_size: self.part_size(size),
+            algorithm: Algorithm::for_endpoint(self.options.endpoint.as_deref()),
+            checksums: Vec::new(),
+            small: None,
+            metadata,
+            must_be_new: false,
+            multipart: None,
+            metadata_update: Some(update),
+        })))
     }
 
     async fn prepare_upload(self: &Arc<Self>, source: Source) -> Result<UploadPreparation> {
@@ -699,7 +789,7 @@ impl Engine {
                     .metadata
                     .as_ref()
                     .map_or((o.mtime, 0), |m| (m.mtime, m.nsec));
-                time >= (source.meta.mtime, source.meta.mtime_nsec)
+                time > (source.meta.mtime, source.meta.mtime_nsec)
             })
         {
             return Ok(UploadPreparation::Skipped);
@@ -720,7 +810,7 @@ impl Engine {
             "destination contents differ: {} (--if-exists=error-if-different)",
             source.key
         );
-        let whole_algorithm = expected_hash.map(|d| d.algorithm).or_else(|| {
+        let requested_algorithm = expected_hash.map(|d| d.algorithm).or_else(|| {
             if self.args.transfer_integrity {
                 Some(self.args.transfer_hash_type.unwrap_or_default())
             } else if self.args.checksum {
@@ -730,11 +820,11 @@ impl Engine {
             }
         });
         let can_compare_time = source.metadata.is_none_or(|m| m.mtime.is_none());
-        if whole_algorithm.is_none()
+        if requested_algorithm.is_none()
             && can_compare_time
             && existing
                 .as_ref()
-                .is_some_and(|o| self.upload_metadata_matches(&source, size, o))
+                .is_some_and(|o| self.upload_contents_match(&source, size, o))
         {
             if source.kind() == ObjectKind::File {
                 // Opening validates the pinned scan identity without reading the
@@ -743,15 +833,24 @@ impl Engine {
             } else {
                 source.bytes()?;
             }
-            self.progress.bytes_unchanged.fetch_add(size, Relaxed);
-            return Ok(UploadPreparation::Skipped);
+            return self
+                .prepare_accepted_upload(source, existing.as_ref().unwrap())
+                .await;
         }
-        let whole_algorithm =
-            whole_algorithm.or_else(|| protected_existing.then_some(self.args.hash_algorithm));
+        let comparable = existing
+            .as_ref()
+            .filter(|o| o.kind() == source.kind() && o.size == size);
+        let stored_hash = comparable.and_then(|o| self.stored_comparison_hash(o));
+        let comparison_algorithm = (source.kind() != ObjectKind::Dir
+            && comparable.is_some()
+            && (self.args.checksum || protected_existing || stored_hash.is_some()))
+        .then(|| stored_hash.map_or(self.args.hash_algorithm, |(algorithm, _)| algorithm));
         let part_size = self.part_size(size);
         if part_size > 5 * 1024 * 1024 * 1024 {
             bail!("file exceeds the S3 multipart size limit");
         }
+        let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
+        let whole_algorithm = requested_algorithm.unwrap_or(HashAlgorithm::Blake3);
         let buffer_limit = if self.tuning.tigris() {
             8 << 20
         } else {
@@ -774,13 +873,11 @@ impl Engine {
         };
         self.check_cancelled()?;
         let source_clone = source.clone();
-        let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
-        let (whole_digest, checksums, small) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (hashes, small) = tokio::task::spawn_blocking(move || -> Result<_> {
             if source_clone.kind() != ObjectKind::File {
                 let bytes = source_clone.bytes()?;
                 return Ok((
-                    whole_algorithm.map(|a| Digest::hash_bytes(a, &bytes).value),
-                    vec![algorithm.digest(&bytes)],
+                    upload_hashes::bytes(&bytes, algorithm, whole_algorithm, comparison_algorithm),
                     Some(bytes::Bytes::from(bytes)),
                 ));
             }
@@ -790,23 +887,8 @@ impl Engine {
                 let mut bytes = vec![0; size as usize];
                 file.read_exact(&mut bytes)?;
                 source_clone.check(&file)?;
-                let native_algorithm = if algorithm.is_sha256() {
-                    HashAlgorithm::Sha256
-                } else {
-                    HashAlgorithm::Md5
-                };
-                let hash = native_algorithm.hash(&bytes);
-                let checksum = encode_native_parts(native_algorithm, &[hash]).remove(0);
-                let whole = whole_algorithm.map(|a| {
-                    if a == native_algorithm {
-                        Digest::from_hash(a, &hash).value
-                    } else {
-                        Digest::hash_bytes(a, &bytes).value
-                    }
-                });
                 return Ok((
-                    whole,
-                    vec![checksum],
+                    upload_hashes::bytes(&bytes, algorithm, whole_algorithm, comparison_algorithm),
                     Some(bytes::Bytes::from_owner(fast::UploadBuffer {
                         bytes,
                         _reservation: reservation,
@@ -814,96 +896,47 @@ impl Engine {
                     })),
                 ));
             }
-            // Independent native part checksums provide both upload validation
-            // and resume identity. A whole-file hash is optional unless requested.
-            let native_algorithm = match algorithm {
-                Algorithm::Sha256 => HashAlgorithm::Sha256,
-                Algorithm::Md5 => HashAlgorithm::Md5,
-            };
-            let reuse_native = size <= part_size && whole_algorithm == Some(native_algorithm);
-            if size <= part_size || size < 32 * 1024 * 1024 {
-                // For small files, feed every required digest from one read.
-                // Large multipart files retain independent parallel hash work.
-                let mut file = source_clone.open()?;
-                let mut whole = whole_algorithm
-                    .filter(|_| !reuse_native)
-                    .map(HashAlgorithm::hasher);
-                let mut buffer = vec![0; 1024 * 1024];
-                let mut parts = Vec::new();
-                let mut remaining = size;
-                for _ in 0..size.div_ceil(part_size).max(1) {
-                    let mut part = native_algorithm.hasher();
-                    let mut left = remaining.min(part_size);
-                    while left > 0 {
-                        let n = buffer.len().min(left as usize);
-                        file.read_exact(&mut buffer[..n])?;
-                        part.update(&buffer[..n]);
-                        if let Some(whole) = &mut whole {
-                            whole.update(&buffer[..n]);
+            let hashes = upload_hashes::ranges(
+                size,
+                part_size,
+                algorithm,
+                whole_algorithm,
+                comparison_algorithm,
+                |end| {
+                    let file = source_clone.open()?;
+                    let source = &source_clone;
+                    Ok(move |buffer: &mut [u8], offset| {
+                        file.read_exact_at(buffer, offset)?;
+                        if offset + buffer.len() as u64 == end {
+                            source.check(&file)?;
                         }
-                        left -= n as u64;
-                    }
-                    parts.push(part.finalize());
-                    remaining = remaining.saturating_sub(part_size);
-                }
-                source_clone.check(&file)?;
-                let whole = if reuse_native {
-                    Some(Digest::from_hash(native_algorithm, &parts[0]).value)
-                } else {
-                    whole.map(|h| Digest::from_hash(whole_algorithm.unwrap(), &h.finalize()).value)
-                };
-                return Ok((whole, encode_native_parts(native_algorithm, &parts), None));
+                        Ok(())
+                    })
+                },
+            )?;
+            if upload_hashes::uses_parallel_readers(size, part_size) {
+                // Parallel readers can finish at different times. Recheck the
+                // selected pathname after all parts complete, as before.
+                source_clone.check(&source_clone.open()?)?;
             }
-            let (whole, parts) = rayon::join(
-                || -> Result<Option<String>> {
-                    whole_algorithm
-                        .filter(|_| !reuse_native)
-                        .map(|a| local::hash_file_as(source_clone.open()?, a))
-                        .transpose()
-                },
-                || {
-                    (0..size.div_ceil(part_size).max(1))
-                        .into_par_iter()
-                        .map(|index| {
-                            let file = source_clone.open()?;
-                            let offset = index * part_size;
-                            let length = part_size.min(size.saturating_sub(offset));
-                            let mut buffer = vec![0; 1024 * 1024];
-                            let mut hash = native_algorithm.hasher();
-                            let mut done = 0;
-                            while done < length {
-                                let n = buffer.len().min((length - done) as usize);
-                                file.read_exact_at(&mut buffer[..n], offset + done)?;
-                                hash.update(&buffer[..n]);
-                                done += n as u64;
-                            }
-                            source_clone.check(&file)?;
-                            Ok(hash.finalize())
-                        })
-                        .collect::<Result<Vec<_>>>()
-                },
-            );
-            let parts = parts?;
-            let whole = if reuse_native {
-                Some(Digest::from_hash(native_algorithm, &parts[0]).value)
-            } else {
-                whole?
-            };
-            let checksums = encode_native_parts(native_algorithm, &parts);
-            source_clone.check(&source_clone.open()?)?;
-            Ok((whole, checksums, None))
+            Ok((hashes, None))
         })
         .await??;
+        let upload_hashes::Hashes {
+            whole: whole_digest,
+            comparison: comparison_digest,
+            checksums,
+        } = hashes;
         if let Some(expected) = expected_hash {
-            if !whole_digest
-                .as_ref()
-                .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected.value))
-            {
+            if !whole_digest.eq_ignore_ascii_case(&expected.value) {
                 bail!("source does not match expected hash");
             }
         }
-        let mut metadata = source.metadata(whole_digest.clone());
-        metadata.hash_algorithm = whole_algorithm.unwrap_or(HashAlgorithm::Blake3);
+        let store_hash = source.kind() != ObjectKind::Dir || requested_algorithm.is_some();
+        let mut metadata = source.metadata(store_hash.then_some(whole_digest));
+        if store_hash {
+            metadata.hash_algorithm = whole_algorithm;
+        }
         let digest = upload_identity(algorithm, size, part_size, &checksums);
         let mut same_contents = existing.as_ref().is_some_and(|o| {
             o.kind() == source.kind()
@@ -914,36 +947,15 @@ impl Engine {
                             (m.mtime, m.nsec) == (source.meta.mtime, source.meta.mtime_nsec)
                         })))
         });
-        if source.kind() != ObjectKind::Dir
-            && (self.args.checksum || (protected_existing && !same_contents))
-        {
-            if let Some(object) = &existing {
-                let algorithm = self.args.hash_algorithm;
-                let source_hash = if whole_algorithm == Some(algorithm) {
-                    whole_digest.clone().unwrap()
-                } else {
-                    let source = source.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if source.kind() == ObjectKind::File {
-                            local::hash_file_as(source.open()?, algorithm)
-                        } else {
-                            Ok(Digest::hash_bytes(algorithm, &source.bytes()?).value)
-                        }
-                    })
-                    .await??
-                };
-                let destination_hash = match object
-                    .metadata
-                    .as_ref()
-                    .filter(|m| m.hash_algorithm == algorithm)
-                    .and_then(|m| m.hash.clone())
-                {
-                    Some(hash) => hash,
+        if self.args.checksum || !same_contents {
+            if let (Some(object), Some(algorithm), Some(source_hash)) =
+                (comparable, comparison_algorithm, comparison_digest)
+            {
+                let destination_hash = match stored_hash {
+                    Some((_, hash)) => hash.to_owned(),
                     None => self.remote_hash_as(object, algorithm).await?,
                 };
-                same_contents = object.kind() == source.kind()
-                    && object.size == size
-                    && source_hash == destination_hash;
+                same_contents = source_hash.eq_ignore_ascii_case(&destination_hash);
             }
         }
         if same_contents && expected_hash.is_some() {
@@ -958,47 +970,9 @@ impl Engine {
             source.key
         );
         if same_contents {
-            if let Some(object) = &existing {
-                let old = object.metadata.clone().unwrap_or(Metadata {
-                    kind: object.kind(),
-                    mode: if object.kind() == ObjectKind::Dir {
-                        0o777
-                    } else {
-                        0o666
-                    },
-                    uid: unsafe { libc::geteuid() },
-                    gid: unsafe { libc::getegid() },
-                    mtime: object.mtime,
-                    nsec: 0,
-                    hash: None,
-                    hash_algorithm: HashAlgorithm::Blake3,
-                });
-                metadata.hash = old.hash.clone();
-                metadata.hash_algorithm = old.hash_algorithm;
-                let flags = self.args.matching_meta_flags()
-                    | source.metadata.map_or(0, |m| m.apply_flags());
-                if flags & crate::proto::flags::TIMES == 0 {
-                    metadata.mtime = old.mtime;
-                    metadata.nsec = old.nsec;
-                }
-                if flags & crate::proto::flags::MODE == 0 {
-                    metadata.mode = old.mode;
-                }
-                if flags & crate::proto::flags::OWNER == 0 {
-                    metadata.uid = old.uid;
-                }
-                if flags & crate::proto::flags::GROUP == 0 {
-                    metadata.gid = old.gid;
-                }
-            }
-        }
-        let unchanged = same_contents
-            && existing
-                .as_ref()
-                .is_some_and(|o| self.upload_requested_metadata_matches(&source, o));
-        if unchanged {
-            self.progress.bytes_unchanged.fetch_add(size, Relaxed);
-            return Ok(UploadPreparation::Skipped);
+            return self
+                .prepare_accepted_upload(source, existing.as_ref().unwrap())
+                .await;
         }
         if self.args.dry_run {
             self.progress.add_bytes(size);
@@ -1007,27 +981,7 @@ impl Engine {
         let must_be_new = self.args.ignore_existing
             || self.args.target_existence == Existence::New
             || (self.args.protects_existing_contents() && existing.is_none());
-        let metadata_update = if same_contents {
-            let head = client::head_output(&self.client, &self.options.bucket, &source.key, None)
-                .await?
-                .context("S3 destination disappeared before metadata update")?;
-            anyhow::ensure!(
-                Some(&head.e_tag().unwrap_or_default().to_owned())
-                    == existing.as_ref().map(|o| &o.etag),
-                "S3 destination changed before metadata update"
-            );
-            let mut fields = head.metadata().cloned().unwrap_or_default();
-            fields.extend(metadata.encode());
-            Some(client::metadata_update_request(
-                &self.options.bucket,
-                &source.key,
-                &head,
-                fields,
-            )?)
-        } else {
-            None
-        };
-        let multipart = if metadata_update.is_none() && size > part_size && small.is_none() {
+        let multipart = if size > part_size && small.is_none() {
             Some(
                 self.prepare_multipart(&source, digest, part_size, &metadata, algorithm)
                     .await?,
@@ -1045,7 +999,7 @@ impl Engine {
             metadata,
             must_be_new,
             multipart,
-            metadata_update,
+            metadata_update: None,
         };
         if let Err(error) = self.authorize_upload(&prepared).await {
             self.abort_unrecorded_preparation(&prepared).await;
@@ -1066,8 +1020,18 @@ impl Engine {
             UploadPreparation::Ready(prepared) => *prepared,
         };
         if let Some(update) = &prepared.metadata_update {
-            let _slot = self.tuning.requests.acquire().await;
-            client::copy_metadata(&self.client, &self.options.bucket, update.clone()).await?;
+            update
+                .execute(
+                    &self.client,
+                    &self.options.bucket,
+                    self.part_workers(),
+                    || async {
+                        let slot = self.tuning.requests.acquire().await;
+                        self.check_cancelled()?;
+                        Ok(slot)
+                    },
+                )
+                .await?;
             self.progress
                 .bytes_unchanged
                 .fetch_add(prepared.size, Relaxed);
@@ -1324,6 +1288,9 @@ impl Engine {
         Ok(Some(size))
     }
     async fn abort_unrecorded_preparation(&self, prepared: &PreparedUpload) {
+        if let Some(update) = &prepared.metadata_update {
+            update.abort(&self.client, &self.options.bucket).await;
+        }
         if let Some(multipart) = &prepared.multipart {
             if !multipart.recorded {
                 self.abort_unrecorded_upload(&prepared.source.key, &multipart.upload.upload_id)
@@ -2124,7 +2091,7 @@ impl Engine {
         );
         if self.args.update
             && object.kind() != ObjectKind::Dir
-            && existing.is_some_and(|m| !m.is_dir() && (m.mtime, m.mtime_nsec) >= source_time)
+            && existing.is_some_and(|m| !m.is_dir() && (m.mtime, m.mtime_nsec) > source_time)
         {
             return Ok(None);
         }
@@ -2200,37 +2167,22 @@ impl Engine {
         }
         let mut unchanged = false;
         if let Some(m) = existing.filter(|m| m.is_file() && m.len == object.size) {
-            if self.args.checksum {
-                if metadata.hash.is_none() || metadata.hash_algorithm != self.args.hash_algorithm {
-                    unchanged = self.verify_download(root, &path, &object).await?;
-                } else {
-                    let file = root.open_regular_read(&path)?;
-                    let algorithm = metadata.hash_algorithm;
-                    let hash =
-                        tokio::task::spawn_blocking(move || local::hash_file_as(file, algorithm))
-                            .await??;
-                    unchanged = metadata.hash.as_ref() == Some(&hash);
-                }
-            } else {
-                unchanged = explicit.mtime.is_none() && (m.mtime, m.mtime_nsec) == source_time;
-            }
-        }
-
-        if !unchanged && self.args.protects_existing_contents() {
-            if let Some(current) = existing {
-                anyhow::ensure!(
-                    current.is_file() && current.len == object.size,
-                    "destination contents differ: {} (--if-exists=error-if-different)",
-                    job.path
-                );
+            unchanged = !self.args.checksum
+                && explicit.mtime.is_none()
+                && (m.mtime, m.mtime_nsec) == source_time;
+            if !unchanged
+                && (self.args.checksum
+                    || self.args.protects_existing_contents()
+                    || self.stored_comparison_hash(&object).is_some())
+            {
                 unchanged = self.verify_download(root, &path, &object).await?;
-                anyhow::ensure!(
-                    unchanged,
-                    "destination contents differ: {} (--if-exists=error-if-different)",
-                    job.path
-                );
             }
         }
+        anyhow::ensure!(
+            unchanged || existing.is_none() || !self.args.protects_existing_contents(),
+            "destination contents differ: {} (--if-exists=error-if-different)",
+            job.path
+        );
         if unchanged && expected_hash.is_some() {
             unchanged = self
                 .verify_expected_local(root, &path, expected_hash)
@@ -2651,13 +2603,25 @@ impl Engine {
         object: &Object,
     ) -> Result<bool> {
         let file = root.open_regular_read(path)?;
-        let algorithm = self.args.hash_algorithm;
+        let stored = self.stored_comparison_hash(object);
+        let algorithm = stored.map_or(self.args.hash_algorithm, |(algorithm, _)| algorithm);
         let expected =
             tokio::task::spawn_blocking(move || local::hash_file_as(file, algorithm)).await??;
-        Ok(self.remote_hash(object).await? == expected)
+        let actual = match stored {
+            Some((_, hash)) => hash.to_owned(),
+            None => self.remote_hash_as(object, algorithm).await?,
+        };
+        Ok(actual.eq_ignore_ascii_case(&expected))
     }
-    async fn remote_hash(&self, object: &Object) -> Result<String> {
-        self.remote_hash_as(object, self.args.hash_algorithm).await
+
+    fn stored_comparison_hash<'a>(&self, object: &'a Object) -> Option<(HashAlgorithm, &'a str)> {
+        let metadata = object.metadata.as_ref()?;
+        // Explicit --hash selects the comparison algorithm. Automatic comparisons
+        // can reuse any supported stored whole-file hash.
+        if self.args.checksum && metadata.hash_algorithm != self.args.hash_algorithm {
+            return None;
+        }
+        Some((metadata.hash_algorithm, metadata.hash.as_deref()?))
     }
     async fn remote_hash_as(&self, object: &Object, algorithm: HashAlgorithm) -> Result<String> {
         let _slot = self.tuning.requests.acquire().await;

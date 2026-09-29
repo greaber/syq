@@ -375,8 +375,9 @@ all suites, and a failed nightly is retried on subsequent nights. Unchanged
 inputs only run the small scope checks. Full runs include SDKs, both rsync
 platforms, Linux ARM64, Intel macOS compilation/updater tests, the complete
 Apple Silicon suite with its root-only and live-network tests, the disposable
-S3 suite, every real-SSH suite and profile, the documentation checks, and the
-compatibility checks against released binaries. These nightly-only `ci.yml`
+S3 suite, every real-SSH suite and profile, the documentation checks, the
+compatibility checks against released binaries, and, in scheduled runs only, the release
+builds for every platform. These nightly-only `ci.yml`
 jobs are outside `release-certification`, but a failure in any of them fails
 the `ci.yml` run, so that run cannot serve as release evidence. Intel compilation/updater checks use unoptimized binaries
 without debug information; the shipped release binaries remain optimized.

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-SCRIPT = Path(__file__).resolve().parents[3] / "scripts/test-python-release-preparation.py"
+SCRIPT = Path(__file__).resolve().parents[3] / "scripts/verify-python-release-preparation.py"
 spec = importlib.util.spec_from_file_location("preparation", SCRIPT)
 preparation = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(preparation)

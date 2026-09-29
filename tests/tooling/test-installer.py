@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Exercise generated installer target selection and failure paths without
 network access or real user paths."""
+from support import SCRIPTS
+
 import hashlib
 import json
 import os
@@ -10,7 +12,6 @@ import subprocess
 import tempfile
 import unittest
 
-SCRIPTS = Path(os.path.abspath(__file__)).parent
 TARGETS = {
     "linux-x86_64": ("Linux", "x86_64"),
     "linux-aarch64": ("Linux", "arm64"),

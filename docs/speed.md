@@ -113,8 +113,7 @@ use it only on a trusted network. Restricted receivers refuse it.
 For local copies, syq uses the filesystem's copy optimizations automatically
 when it can. On filesystems that support cloning, this can avoid physically
 copying every byte. You can also copy to or from a mounted NFS directory using
-its local path. See [Check local storage placement](server-tuning.md#check-local-storage-placement)
-for how the source and destination filesystems affect performance.
+its local path.
 
 Reported bytes count the file's size even when cloning avoids physical I/O,
 so the displayed rate can exceed disk throughput.

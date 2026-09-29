@@ -62,7 +62,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 | Argument / option | Meaning |
 |---|---|
-| `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Accept matching contents; report an error for different contents<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Update only when the destination is strictly older; keep ties<br><br>[default: error-if-different] |
+| `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Reject detected content differences; trusts matching size and mtime unless --hash is set<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Keep newer destinations; otherwise update differing contents<br><br>[default: update] |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
@@ -75,7 +75,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow` | Follow symlinks in all directly supplied filesystem paths |
 | `--follow-src` | Follow symlinks in directly supplied source paths |
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
-| `--copy-metadata <FEATURE>` | Match selected source metadata, including on unchanged files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Match source modification times, including on unchanged files<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination |
+| `--copy-metadata <FEATURE>` | Match selected source metadata, including on unchanged files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Match source modification times, including on unchanged files<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination<br>- content-type: Match Content-Type on S3-to-S3 copies<br>- content-encoding: Match Content-Encoding on S3-to-S3 copies<br>- content-language: Match Content-Language on S3-to-S3 copies<br>- content-disposition: Match Content-Disposition on S3-to-S3 copies<br>- cache-control: Match Cache-Control on S3-to-S3 copies<br>- expires: Match Expires on S3-to-S3 copies<br>- website-redirect: Match the website redirect on S3-to-S3 copies<br>- user-metadata: Match application user metadata on S3-to-S3 copies (excluding syq-* keys)<br>- tags: Match the complete tag set on S3-to-S3 copies<br>- storage-class: Use the source storage class on S3-to-S3 copies |
 | `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
 | `--sparse` | Turn written zero ranges into sparse holes |
 
@@ -121,6 +121,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--s3-region <REGION>` | S3 signing region, used as given (otherwise syq asks AWS where the bucket is) |
 | `--s3-profile <NAME>` | AWS shared configuration/credentials profile |
 | `--s3-header <NAME: VALUE>` | Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused) |
+| `--s3-write-header <NAME: VALUE>` | Add a header before signing S3 requests that create or replace objects: uploads, multipart starts, and copies (repeatable; S3-to-S3 metadata/tag overrides are refused) |
 
 <a id="performance-tuning"></a>
 
@@ -162,12 +163,12 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 ## Update policies
 
-The default `--if-exists=error-if-different` accepts matching contents and
-reports differing contents as an error. Use `error` to require every selected
-file to be absent, `keep` to leave existing files untouched, `update` to permit
-content updates, or `update-if-older` to update strictly older destinations.
-Equal timestamps keep the destination. These choices do not change whether
-size/time or hashes are used for comparison. See
+The default `--if-exists=update` updates existing files when their contents
+differ. Use `error-if-different` to accept matching contents and reject differences,
+`error` to require every selected file to be absent, `keep` to leave existing
+files untouched, or `update-if-older` to keep newer destinations and otherwise
+update differing contents. Timestamp ties use the normal comparison. These choices
+do not change whether size/time or hashes are used for comparison. See
 [existing-file policies](../reference.md#choose-which-existing-files-to-update).
 
 `--into-existing` requires the destination directory to exist but allows new
@@ -175,10 +176,10 @@ files inside it. `--if-exists=keep` can add children to an existing directory, b
 does not change that directory's permissions to make it writable.
 
 `--if-exists=keep` and `update-if-older` cannot combine with `--inplace`: an
-interrupted write could leave a file that a retry skips. The default policy
-rejects differing final contents, including incomplete output from an interrupted
-in-place copy. Changing to `--if-exists=update`
-authorizes updates to all differing selected files. Restricted receivers also
+interrupted write could leave a file that a retry skips. With
+`--if-exists=error-if-different`, a retry rejects differing final contents,
+including incomplete output from an interrupted in-place copy. The default
+`update` policy can repair that incomplete file. Restricted receivers also
 reject `--as-new --inplace`, because direct writes do not enforce that destination
 condition. S3 and named receiving destinations do not support `--inplace`; see
 [Copy limits](../persistence-reference.md#copy-limits).
@@ -204,8 +205,8 @@ deleted as extras.
 
 If the source has both `Report.txt` and `report.txt`, a case-insensitive
 destination cannot store both. Syq does not check for that before copying,
-and a later file can conflict with or, with `--if-exists=update`, replace the
-earlier one. The same problem applies to distinct
+and a later file can replace the earlier one or, with a protective existing-file
+policy, report a conflict. The same problem applies to distinct
 Unicode spellings that the destination treats as one name. Rename the source
 entries or use a destination that can distinguish them. Unsupported names
 are reported as copy errors.
@@ -262,8 +263,8 @@ read pipes; `--copy-metadata=specials` copies the pipe itself.
 
 A named destination is replaced only after the transfer succeeds. The `-new`
 and `-existing` placement conditions apply as usual, before a named pipe is
-opened. S3 new-object writes also refuse replacement if an object appears
-during the upload.
+opened. S3 `-new` placements and `--if-exists=keep` also refuse replacement
+if an object appears during the upload.
 
 If the producer fails halfway through, syq can still successfully save the
 bytes it received: EOF does not tell it whether the producer succeeded.
@@ -306,11 +307,12 @@ worker count, and `--no-tcp` keeps data on SSH. S3 transfers one object using
 multipart controls; see [Descriptor copies](../object-storage.md#descriptor-copies).
 
 Restart recovery, named receiving destinations, detached execution,
-directory selection, and `--hash` are unsupported. The default existing-file
-policy compares an existing named destination with the received stream before
-accepting it; a dry run cannot perform that comparison. Output descriptors are
-already opened by the caller and receive bytes directly; they do not apply the
-per-path existing-file policy (except `keep`, which always skips).
+directory selection, and `--hash` are unsupported.
+`--if-exists=error-if-different` compares an existing named destination with the
+received stream before accepting it; a dry run cannot perform that comparison.
+Output descriptors are already opened by the caller and receive bytes directly;
+they do not apply the per-path existing-file policy (except `keep`, which always
+skips).
 
 ### Descriptor offsets and metadata
 

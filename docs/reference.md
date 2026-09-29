@@ -4,8 +4,7 @@
 syq cp project --into backup
 ```
 
-This copies `project` to `backup/project`. Existing files with different contents
-cause an error; use `--if-exists=update` to allow updates. Unrelated files stay.
+This copies `project` to `backup/project`. Existing files are updated when their contents differ. Unrelated files stay.
 
 <a id="more-options"></a>
 
@@ -144,21 +143,20 @@ when copying between filesystems with different naming rules.
 
 ## Choose which existing files to update
 
-By default, syq copies missing files, accepts existing files whose contents
-match, and reports an error for different contents. Existing directories remain
-containers. Choose another policy with `--if-exists`:
+By default, syq copies missing files and updates existing files whose contents
+differ. Existing directories remain containers. Choose another policy with `--if-exists`:
 
 | Value | Existing files |
 |---|---|
-| `error-if-different` (default) | Accept matching contents; reject differences |
+| `error-if-different` | Accept matching contents; reject differences |
 | `error` | Reject every existing file, including identical files |
 | `keep` | Leave contents and metadata alone |
-| `update` | Update differing contents and apply requested metadata |
-| `update-if-older` | Update only when the destination timestamp is strictly older; keep ties |
+| `update` (default) | Update differing contents and apply requested metadata |
+| `update-if-older` | Keep newer destinations; otherwise update differing contents |
 
 Comparison is independent of this policy: matching size and modification time
-can establish equality; `--hash` requests content comparison. If the default
-policy cannot establish equality from metadata, local/SSH copies and S3
+can establish equality; `--hash` requests content comparison. If
+`error-if-different` cannot establish equality from metadata, local/SSH copies and S3
 uploads/downloads compare contents before accepting an existing regular file.
 Bucket-to-bucket copies require matching object metadata or identifiers; see
 [S3 copies](object-storage.md#copies-between-s3-buckets). Explicit metadata requests apply after
@@ -185,7 +183,7 @@ A dry run can still install syq on the server; see
 Use `--prune` to remove destination entries that are absent from the source:
 
 ```sh
-syq cp --if-exists=update --prune --max-delete 100 --srcs-in build --into-existing deploy
+syq cp --prune --max-delete 100 --srcs-in build --into-existing deploy
 ```
 
 This makes the contents of `deploy` match `build`: it copies changes, then
@@ -197,10 +195,10 @@ Placement determines where pruning happens. Compare:
 
 ```sh
 # Mirror build inside backup/build; leave the rest of backup alone.
-syq cp --if-exists=update --prune build --into backup
+syq cp --prune build --into backup
 
 # Mirror build directly inside backup; remove extras throughout backup.
-syq cp --if-exists=update --prune --srcs-in build --into backup
+syq cp --prune --srcs-in build --into backup
 ```
 
 See [Pruning](commands/cp.md#pruning) for restrictions and files kept for recovery.
@@ -211,7 +209,7 @@ Use `--where` to select source entries and `--copy-if` to decide which
 source/destination pairs may be updated:
 
 ```sh
-syq cp --if-exists=update --srcs-in project --into backup \
+syq cp --srcs-in project --into backup \
   --where 'src.kind = "file" and src.size >= 1MiB' \
   --copy-if 'not dst.exists or src.mtime > dst.mtime'
 ```
@@ -260,7 +258,7 @@ been created. Partial-file resume is independent of
 comparison against an existing final destination. Unless `--inplace` is selected,
 syq assembles each updated file beside the destination and replaces it when
 complete. With `--inplace`, interrupted bytes are in the final file itself.
-With the default existing-file policy, a retry rejects a differing final file:
+With `--if-exists=error-if-different`, a retry rejects a differing final file:
 it cannot distinguish incomplete output from a pre-existing file that must remain
 untouched. Changing to `--if-exists=update` authorizes updates to all differing
 selected files; it does not preserve the original policy. Reusing matching parts
@@ -307,7 +305,7 @@ By default, syq builds an updated file beside the old one and replaces it when
 complete. `--inplace` writes directly into the destination file instead:
 
 ```sh
-syq cp --if-exists=update --inplace large-file --to server --into /backup
+syq cp --inplace large-file --to server --into /backup
 ```
 
 This avoids the disk space for a second full copy and can reduce disk I/O.
@@ -327,9 +325,14 @@ in-place writes with other copy policies.
 Creating a named file or updating its contents sets its modification time to
 the source time. Accepting unchanged contents leaves destination metadata alone.
 Use `--copy-metadata=mtime` to make modification times match even on unchanged
-files. Other metadata can be selected the same way, for example
+files. If identical files have different modification times, accepting them can
+require reading their full contents again on each run, including downloading an
+S3 object when no usable stored hash is available. Copying `mtime` lets later
+runs use the size/time comparison. Other metadata can be selected the same way, for example
 `--copy-metadata=permissions,ownership`. `times` remains an alias for `mtime`.
 Explicit mapping `metadata.mtime` also sets the requested destination time.
+S3-to-S3 copies also support [content headers, user metadata, tags, and storage
+class](object-storage.md#copies-between-s3-buckets).
 
 Existing files keep their destination permissions. New files use the
 source read, write, and execute permissions, limited by the destination umask.

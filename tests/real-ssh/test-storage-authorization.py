@@ -177,8 +177,12 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             assert skew.returncode != 0 and 'requires matching syq builds' in skew.stderr, skew.stderr
             assert json.loads(run('syq', 'persist', 'receive', 'pending', '--json')) == []
             print('case: multipart upload finishes after authorizer disconnects', flush=True)
-            copy([remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/large'])
-            assert hashlib.sha256(checks.request('GET', prefix+'/large')[1]).hexdigest() == expected
+            # The authorizer signs object-writing headers only where the copy sends them.
+            copy([remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/large',
+                  '--s3-write-header', 'x-amz-meta-write-probe: yes'])
+            headers, body = checks.request('GET', prefix+'/large')
+            assert hashlib.sha256(body).hexdigest() == expected
+            assert {k.lower(): v for k, v in headers.items()}['x-amz-meta-write-probe'] == 'yes'
             print('case: descriptor upload and download continue without the authorizer', flush=True)
             copy(['--src-fd', '0', '--to', 's3://syq-storage-test', '--as', prefix+'/descriptor'],
                  redirection=' < /tmp/syq-storage-authorization/source')
@@ -192,7 +196,8 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             assert hashlib.sha256(checks.request('GET', prefix+'/pipe')[1]).hexdigest() == expected
             print('case: prepared multipart server-side copy', flush=True)
             copy([prefix+'/large', '--from', 's3://syq-storage-test', '--to', 's3://syq-storage-test',
-                  '--as', prefix+'/server-copy'], disconnect=False)
+                  '--as', prefix+'/server-copy', '--s3-write-header', 'x-amz-storage-class: STANDARD'],
+                 disconnect=False)
             assert hashlib.sha256(checks.request('GET', prefix+'/server-copy')[1]).hexdigest() == expected
             print('case: single-request copy preserves object metadata', flush=True)
             checks.request('PUT', prefix+'/small-source', b'small copy', headers={'x-amz-meta-example': 'kept', 'content-type': 'text/plain'})
@@ -203,22 +208,25 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
             assert {k.lower(): v for k, v in headers.items()}['x-amz-meta-example'] == 'kept'
             print('case: approved metadata-only updates keep contents and unrelated headers', flush=True)
             metadata_source = remote_root+'/metadata-source'
-            run('ssh', 'source', shlex.join(['python3', '-c',
-                "from pathlib import Path; import os; p=Path(%r); p.write_bytes(b'small copy'); os.utime(p,(123,123))" % metadata_source]))
-            for descriptor in [False, True]:
-                key = prefix+('/metadata-stream' if descriptor else '/metadata-file')
-                checks.request('PUT', key, b'small copy', headers={
-                    'x-amz-meta-example': 'kept', 'content-type': 'text/plain'})
-                source_args = ['--src-fd', '0'] if descriptor else [metadata_source]
-                copy([*source_args, '--to', 's3://syq-storage-test', '--as', key,
-                      '--copy-metadata=mtime'], disconnect=False,
-                     redirection=(' < '+metadata_source) if descriptor else '')
-                headers, body = checks.request('GET', key)
-                headers = {k.lower(): v for k, v in headers.items()}
-                assert body == b'small copy'
-                assert headers['x-amz-meta-example'] == 'kept', headers
-                assert headers['content-type'] == 'text/plain', headers
-                assert headers['x-amz-meta-syq-mtime'] == '123', headers
+            for payload in [b'small copy', b'x'*(5*1024*1024+1)]:
+                run('ssh', 'source', shlex.join(['python3', '-c',
+                    "from pathlib import Path; import os; p=Path(%r); p.write_bytes(b'small copy' if %d==10 else b'x'*%d); os.utime(p,(123,123))" % (metadata_source, len(payload), len(payload))]))
+                for descriptor in [False, True]:
+                    key = prefix+('/metadata-stream' if descriptor else '/metadata-file')+('-multipart' if len(payload)>5*1024*1024 else '')
+                    checks.request('PUT', key, payload, headers={
+                        'x-amz-meta-example': 'kept', 'content-type': 'text/plain'})
+                    source_args = ['--src-fd', '0'] if descriptor else [metadata_source]
+                    copy([*source_args, '--to', 's3://syq-storage-test', '--as', key,
+                          '--copy-metadata=mtime', '--if-exists=error-if-different',
+                          '--s3-write-header', 'x-amz-meta-write-probe: yes'], disconnect=False,
+                         redirection=(' < '+metadata_source) if descriptor else '')
+                    headers, body = checks.request('GET', key)
+                    headers = {k.lower(): v for k, v in headers.items()}
+                    assert body == payload
+                    assert headers['x-amz-meta-write-probe'] == 'yes', headers
+                    assert headers['x-amz-meta-example'] == 'kept', headers
+                    assert headers['content-type'] == 'text/plain', headers
+                    assert headers['x-amz-meta-syq-mtime'] == '123', headers
             print('case: mixed paths and callbacks share one offline approval', flush=True)
             copy(['--to', 's3://syq-storage-test', '--into', prefix+'/mixed'], mapping='upload')
             for name in ['ordinary', 'known', 'unknown']:
