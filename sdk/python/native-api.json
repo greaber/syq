@@ -42,7 +42,6 @@
         "receiver-receipt",
         "hash",
         "if-exists",
-        "resume",
         "only-existing",
         "no-compress",
         "ignore",

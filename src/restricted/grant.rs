@@ -64,7 +64,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
             || (args.target_existence == Existence::New && args.placement == Placement::As))
     {
         bail!(
-            "--inplace cannot be combined with --if-exists=keep, --only-existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
+            "--inplace cannot be combined with --only-new, --only-existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
     if !args.dry_run && args.delete && args.max_delete.is_none() {

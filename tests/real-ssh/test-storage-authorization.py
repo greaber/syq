@@ -255,7 +255,7 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
                     assert checks.request('GET', marker)[1] == b''
                 assert checks.request('GET', neighbor)[1] == b'keep'
             print('case: interrupted multipart work resumes after a fresh approval', flush=True)
-            resumed = ['--resume', remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/resumed']
+            resumed = [remote_root+'/source', '--to', 's3://syq-storage-test', '--as', prefix+'/resumed']
             copy(resumed, interrupt=True)
             # Inspect the known recovery upload directly. Bucket-wide unfinished
             # upload listings are not consistent across S3-compatible providers.

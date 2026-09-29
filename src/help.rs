@@ -197,7 +197,6 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "ignore"
                     | "copy_metadata"
                     | "if_exists"
-                    | "resume"
                     | "hash"
                     | "bwlimit"
                     | "no_progress"
@@ -287,8 +286,8 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         | "max_size" | "where_expression" => ("Sources and filtering", 0),
         "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
         | "as_fd" | "mapping" => ("Destination and mapping", 1),
-        "if_exists" | "resume" | "ignore_existing" | "existing" | "update" | "copy_if"
-        | "inplace" | "prune" | "max_delete" => ("Updates and deletion", 2),
+        "if_exists" | "ignore_existing" | "existing" | "update" | "copy_if" | "inplace"
+        | "prune" | "max_delete" => ("Updates and deletion", 2),
         "copy_metadata" | "sparse" | "open_noatime" | "follow" | "follow_src" | "follow_dst" => {
             ("Metadata and symlinks", 3)
         }

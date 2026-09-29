@@ -122,17 +122,7 @@ struct Connector {
 }
 impl HttpConnector for Connector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-        // Multipart abort is cleanup, including after cancellation has stopped
-        // the part uploads. Ordinary object deletion must remain cancellable.
-        let abort = request.method() == "DELETE"
-            && url::Url::parse(request.uri())
-                .is_ok_and(|url| url.query_pairs().any(|(key, _)| key == "uploadId"));
-        let response = self.call_inner(request);
-        if abort {
-            response
-        } else {
-            self.cancellation.wrap(response)
-        }
+        self.cancellation.wrap(self.call_inner(request))
     }
 }
 impl Connector {

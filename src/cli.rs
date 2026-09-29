@@ -112,8 +112,6 @@ pub struct Args {
     #[arg(skip)]
     pub(crate) if_exists: Option<IfExists>,
     #[arg(skip)]
-    pub(crate) resume: bool,
-    #[arg(skip)]
     pub(crate) results_override: Option<std::sync::Arc<crate::results::ResultsWriter>>,
     #[arg(skip)]
     pub(crate) parsed_mapping: Option<std::sync::Arc<crate::mapping::ParsedManifest>>,
@@ -1137,9 +1135,6 @@ struct NativeCopyOperationalArgs {
     /// How to handle existing destination files; directories remain containers
     #[arg(long, value_enum, value_name = "POLICY", default_value_t = IfExists::ErrorIfDifferent)]
     if_exists: IfExists,
-    /// Resume an interrupted copy and save recovery checkpoints where supported
-    #[arg(long)]
-    resume: bool,
     /// Update only entries already present; create no missing entries or directories
     #[arg(long = "only-existing", hide = true, conflicts_with_all = ["into_new", "as_new"])]
     existing: bool,
@@ -2767,7 +2762,6 @@ fn apply_native_copy_operational(
         where_expression,
         copy_if,
         if_exists,
-        resume,
         existing,
         no_compress,
         integrity_checking_arg,
@@ -2791,12 +2785,7 @@ fn apply_native_copy_operational(
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
-    args.resume = resume;
-    args.if_exists = Some(if resume && if_exists == IfExists::Error {
-        IfExists::ErrorIfDifferent
-    } else {
-        if_exists
-    });
+    args.if_exists = Some(if_exists);
     args.ignore_existing = if_exists == IfExists::Keep;
     anyhow::ensure!(
         !(existing && if_exists == IfExists::Keep),
@@ -2819,9 +2808,6 @@ fn apply_native_copy_operational(
         "--inplace cannot combine with --if-exists=keep or --if-exists=update-if-older"
     );
     args.inplace = inplace;
-    if resume && args.target_existence == Existence::New {
-        args.target_existence = Existence::Any;
-    }
     args.open_noatime = open_noatime;
     args.sparse = sparse;
     for attribute in copy_metadata {

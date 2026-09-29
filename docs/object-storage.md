@@ -67,10 +67,8 @@ objects.
 - **Updates:** `--if-exists=keep`, `--into-new`, and `--as-new` protect individual
   objects against concurrent creation. Prefix checks are not transactional.
   `--inplace` and SSH/S3 combinations are unsupported.
-- **Recovery:** `--resume` reuses multipart work and prepares checkpoints for
-  another interruption. Without it, ordinary copies do not use the recovery
-  cache; adding it after an interruption restarts unfinished objects. Recovery
-  records are stored in the local user cache and removed on success. If that cache cannot be used, for example
+- **Recovery:** Retrying a copy can reuse multipart work. Recovery records are
+  stored in the local user cache and removed on success. If that cache cannot be used, for example
   because it is read-only or belongs to another user, the copy continues with a
   warning, but unsaved progress cannot be reused on a later run.
   If you abandon an upload, remove its unfinished parts with provider tools or a
