@@ -28,7 +28,7 @@ helpers, or other programs; the rest of the environment is passed through.
 | `SYQ_TUNING_HISTORY_SIZE` | History retention target, default `10M` |
 | `SYQ_DEBUG` | Add internal diagnostics to stderr |
 | `SYQ_S3_DIAGNOSTICS=1` | Add S3 request diagnostics to stderr |
-| `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Relocate cache, preference, and runtime files |
+| `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Relocate cache, preference, and runtime files; a relative `XDG_CACHE_HOME` is ignored |
 
 Diagnostic formats can change between versions. For scripts, use
 [automation results](automation.md). Usual system variables such as `HOME`,
