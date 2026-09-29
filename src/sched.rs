@@ -45,6 +45,8 @@ impl<D, S: BorrowMut<FileJobData>> DerefMut for FileJob<D, S> {
 
 #[derive(Clone, Debug)]
 pub struct FileJobData {
+    /// Compare bounded windows against the prepared private output.
+    pub compare_ranges: bool,
     pub src: PathBytes,
     /// Descriptor-session authority corresponding to `src`. Source workers,
     /// and Linux destination workers using CopyLocal, claim its root during

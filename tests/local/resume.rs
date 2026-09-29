@@ -898,7 +898,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
 
     let mut first = compat_command()
         .args([
-            "-a",
+            "-ac",
             "--performance-tuning",
             "workers=1,block-reuse=on",
             "--resource-limits",
@@ -918,7 +918,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     );
 
     let second = syq(&[
-        "-a",
+        "-ac",
         "--performance-tuning",
         "workers=1,block-reuse=on",
         "--resource-limits",
@@ -950,7 +950,7 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
 
     let mut child = compat_command()
         .args([
-            "-a",
+            "-ac",
             "--performance-tuning",
             "workers=1,block-reuse=on",
             "--resource-limits",
@@ -997,7 +997,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
 
     let mut first = compat_command()
         .args([
-            "-a",
+            "-ac",
             "--performance-tuning",
             "workers=1,block-reuse=on",
             "--resource-limits",
@@ -1017,7 +1017,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     );
 
     let second = syq(&[
-        "-a",
+        "-ac",
         "--performance-tuning",
         "workers=1,block-reuse=on",
         "--resource-limits",
@@ -1776,7 +1776,7 @@ fn clean_partials_selects_only_current_regular_files() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn resume_uses_the_verified_buffer_when_candidate_changes_or_disappears() {
+fn resume_uses_the_private_stage_when_candidate_changes_or_disappears() {
     for remove in [false, true] {
         let t = Tmp::new();
         let data = vec![b'a'; 2 << 20];
@@ -1796,13 +1796,13 @@ fn resume_uses_the_verified_buffer_when_candidate_changes_or_disappears() {
                 &t.s("src"),
                 &t.s("out"),
             ])
-            .env("SYQ_TEST_REUSE_READY_FILE", &ready)
-            .env("SYQ_TEST_REUSE_CONTINUE_FILE", &continuation)
+            .env("SYQ_TEST_STAGED_BASIS_READY_FILE", &ready)
+            .env("SYQ_TEST_STAGED_BASIS_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
-        wait_for_confinement_marker(&mut child, &ready, "verified candidate buffer");
+        wait_for_confinement_marker(&mut child, &ready, "private candidate stage");
         if remove {
             fs::remove_file(&candidate).unwrap();
         } else {
@@ -2005,7 +2005,7 @@ fn partial_candidates_do_not_disable_local_whole_file_copies() {
 
 #[cfg(all(target_os = "linux", debug_assertions))]
 #[test]
-fn seeding_preallocates_before_copying_donor_bytes() {
+fn staging_failure_preserves_final_and_donor() {
     for existing in [false, true] {
         let t = Tmp::new();
         write(&t.path("src"), &vec![b'a'; 5 << 20]);
@@ -2022,12 +2022,12 @@ fn seeding_preallocates_before_copying_donor_bytes() {
                 &t.s("src"),
                 &t.s("out"),
             ])
-            .env("SYQ_TEST_FALLOCATE_ERRNO", "no_space")
+            .env("SYQ_TEST_FAIL_STAGE_BASIS", "1")
             .run()
             .unwrap();
         assert!(!out.status.success());
         assert!(
-            stderr_of(&out).contains("preallocate destination file"),
+            stderr_of(&out).contains("seed comparison basis"),
             "{}",
             stderr_of(&out)
         );

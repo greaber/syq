@@ -580,12 +580,25 @@ impl FsOps {
         final_ranges: Option<&[(u64, u64)]>,
         attempt: u32,
     ) -> Result<SeededBasis> {
+        self.seed_basis_impl(target, len, block, final_ranges, attempt, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_basis_impl(
+        &mut self,
+        target: PartialTarget<'_>,
+        len: u64,
+        block: u64,
+        final_ranges: Option<&[(u64, u64)]>,
+        attempt: u32,
+        stage_only: bool,
+    ) -> Result<SeededBasis> {
         let PartialTarget {
             path,
             id: copy_id,
             guard,
         } = target;
-        if !hash_response_fits(block, len) {
+        if !hash_response_fits(block, if stage_only { 0 } else { len }) {
             bail!("invalid block reuse request");
         }
         if let Some(ranges) = final_ranges {
@@ -602,6 +615,11 @@ impl FsOps {
                 previous_end = end;
             }
         }
+        #[cfg(debug_assertions)]
+        if stage_only && std::env::var_os("SYQ_TEST_FAIL_STAGE_BASIS").is_some() {
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                .context("seed comparison basis");
+        }
         let target = self.destination_mutation_target(path, guard)?;
         let expected = target.location();
         // A previous failed job may have left a hold on this connection. It is
@@ -610,6 +628,14 @@ impl FsOps {
             .held_basis
             .take()
             .filter(|held| held.location == expected && held.copy_id == *copy_id);
+        #[cfg(target_os = "macos")]
+        if stage_only {
+            self.try_clone_basis(
+                &target,
+                copy_id,
+                final_ranges.is_none_or(|ranges| !ranges.is_empty()),
+            )?;
+        }
         let (relative, _label, opened) =
             with_rooted_partial(&target, copy_id, |relative, label| {
                 self.open_private_partial_rooted(
@@ -668,6 +694,27 @@ impl FsOps {
                 .or_else(|| target.root.open_regular_read(&target.relative).ok());
             selected_final = input.as_ref().and(final_ranges);
         }
+        if stage_only {
+            if let Some(input) = input.as_ref() {
+                let _copy = self
+                    .operation
+                    .span(crate::transfer_observations::Stage::FilesystemCopy);
+                super::basis_copy::seed(input, &output, len)?;
+            }
+            #[cfg(debug_assertions)]
+            test_race_barrier(
+                "SYQ_TEST_STAGED_BASIS_READY_FILE",
+                "SYQ_TEST_STAGED_BASIS_CONTINUE_FILE",
+                "staged comparison basis",
+            )?;
+            // Never replace an existing partial with an older final-file donor.
+            self.set_copy_length(&output, len)?;
+            self.cache_file(location, attempt, true, output);
+            return Ok(SeededBasis {
+                hashes: Vec::new(),
+                selected_final: false,
+            });
+        }
         if basis_size.unwrap_or(0) == 0 {
             self.preallocate_new_partial(&output, len)?;
         }
@@ -721,6 +768,49 @@ impl FsOps {
             hashes,
             selected_final: selected_final.is_some(),
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn try_clone_basis(
+        &mut self,
+        target: &RootedTarget,
+        copy_id: &CopyId,
+        allow_final: bool,
+    ) -> Result<()> {
+        // APFS cloning creates a new name. Try it before opening a new sidecar,
+        // and never unlink or replace an existing resumable output to clone.
+        with_rooted_partial(target, copy_id, |relative, _| {
+            if target.root.metadata_optional(relative)?.is_some() {
+                return Ok(());
+            }
+            let mut donor = None;
+            for candidate in self.candidate_partials(target) {
+                let file = RelativePath::new(&candidate)
+                    .and_then(|path| target.root.open_regular_read(&path));
+                if let Ok(file) = file {
+                    if file
+                        .metadata()
+                        .is_ok_and(|m| is_owned_partial(&m) && m.len() > 0)
+                    {
+                        donor = Some(file);
+                        break;
+                    }
+                }
+            }
+            if donor.is_none() && allow_final {
+                donor = target.root.open_regular_read(&target.relative).ok();
+            }
+            if let Some(file) = donor {
+                let metadata = file.metadata()?;
+                // Clone the donor's actual size; preparation resizes it to the
+                // planned output length, including growth and shrinkage.
+                let _ = target
+                    .root
+                    .clone_file(&file, &metadata, relative, metadata.len())?;
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1359,6 +1449,10 @@ impl FsOps {
         if target.source.is_some()
             || (self.destination_root.is_none() && !self.source_roots.is_empty())
         {
+            #[cfg(debug_assertions)]
+            if std::env::var_os("SYQ_TEST_FAIL_SOURCE_BLOCK_HASH").is_some() {
+                bail!("injected whole-source hash failure");
+            }
             if target.guard.is_some() {
                 bail!("source block hash cannot carry a destination guard");
             }
@@ -1435,6 +1529,63 @@ impl FsOps {
         )
     }
 
+    fn hash_window(
+        &mut self,
+        partial: PartialTarget<'_>,
+        off: u64,
+        len: u32,
+        block: u64,
+        attempt: u32,
+    ) -> Result<Vec<ContentDigest>> {
+        anyhow::ensure!(
+            crate::proto::hash_window_fits(off, len, block),
+            "invalid hash window"
+        );
+        let target = self.destination_mutation_target(partial.path, partial.guard)?;
+        let (relative, label, file) =
+            with_rooted_partial(&target, partial.id, |relative, label| {
+                let location = FileLocation::Rooted {
+                    root: target.root.identity(),
+                    relative: relative.clone(),
+                };
+                if let Some(file) = self.cached_clone(location.clone(), attempt, true)? {
+                    return Ok(file);
+                }
+                // A range worker alternates reads and writes on this private inode.
+                // Cache a read/write descriptor on its first comparison; caching a
+                // read-only descriptor would break writes, and a later write-only
+                // cache entry would break the next comparison window.
+                let file = target.root.open_regular_read_write(relative)?;
+                require_safe_rooted_named_partial(&target.root, relative, label, &file)?;
+                self.cache_file(location, attempt, true, file.try_clone()?);
+                Ok(file)
+            })?;
+        require_safe_rooted_named_partial(&target.root, &relative, &label, &file)?;
+        let mut buffer = vec![0; block.min(u64::from(len)) as usize];
+        let mut hashes = Vec::with_capacity(u64::from(len).div_ceil(block) as usize);
+        let end = off + u64::from(len);
+        let mut pos = off;
+        while pos < end {
+            let n = (end - pos).min(block) as usize;
+            let bytes = &mut buffer[..n];
+            {
+                let reading = self
+                    .operation
+                    .span(crate::transfer_observations::Stage::SourceRead);
+                file.read_exact_at(bytes, pos)?;
+                reading.bytes(n as u64);
+            }
+            {
+                let _hash = self
+                    .operation
+                    .span(crate::transfer_observations::Stage::Hashing);
+                hashes.push(self.hash_policy.algorithm.hash(bytes));
+            }
+            pos += n as u64;
+        }
+        Ok(hashes)
+    }
+
     pub(crate) fn begin_source_range(&mut self, _range: std::ops::Range<u64>) {
         #[cfg(target_os = "linux")]
         self.read_ahead.begin_stream(_range);
@@ -1497,6 +1648,11 @@ impl FsOps {
                 result
             };
             read.with_context(|| format!("read {} @{off}+{len}", p.display()))?;
+            #[cfg(debug_assertions)]
+            record_test_event(
+                "SYQ_TEST_SOURCE_READ_EVENTS",
+                format_args!("read {off} {len}"),
+            )?;
             let hash = {
                 if self.hash_policy.transfer_integrity {
                     let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
@@ -1880,6 +2036,8 @@ impl FsOps {
                 Request::HashBlocks { .. }
                     | Request::HashAndHold { .. }
                     | Request::SeedBasis { .. }
+                    | Request::StageBasis { .. }
+                    | Request::HashWindow { .. }
             )
         {
             return Response::Err("injected block-comparison failure".into());
@@ -2166,6 +2324,75 @@ impl FsOps {
                     expected_hash.as_ref(),
                 )
                 .map(publication_response),
+            Request::StageBasis {
+                path,
+                copy_id,
+                len,
+                block,
+                allow_final,
+                attempt,
+                guard,
+            } => self
+                .seed_basis_impl(
+                    PartialTarget {
+                        path,
+                        id: copy_id,
+                        guard: guard.as_ref(),
+                    },
+                    *len,
+                    *block,
+                    if *allow_final { None } else { Some(&[]) },
+                    *attempt,
+                    true,
+                )
+                .map(|_| Response::Ok),
+            Request::HashWindow {
+                path,
+                copy_id,
+                off,
+                len,
+                block,
+                attempt,
+                guard,
+            } => self
+                .hash_window(
+                    PartialTarget {
+                        path,
+                        id: copy_id,
+                        guard: guard.as_ref(),
+                    },
+                    *off,
+                    *len,
+                    *block,
+                    *attempt,
+                )
+                .map(Response::Hashes),
+            Request::ReadComparedRange {
+                path,
+                source,
+                attempt,
+                off,
+                len,
+                expected,
+            } => self
+                .read_range(path, source.as_ref(), *attempt, *off, *len)
+                .map(|reply| match reply {
+                    Response::Block { off, hash, data } => {
+                        let comparison = if self.hash_policy.transfer_integrity
+                            && self.hash_policy.payload_algorithm() == self.hash_policy.algorithm
+                        {
+                            hash
+                        } else {
+                            self.hash_policy.algorithm.hash(&data)
+                        };
+                        if comparison == *expected {
+                            Response::RangeMatched { off, len: *len }
+                        } else {
+                            Response::Block { off, hash, data }
+                        }
+                    }
+                    other => other,
+                }),
             Request::SeedBasis {
                 path,
                 copy_id,

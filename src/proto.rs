@@ -43,6 +43,19 @@ const MODE_SYMLINK: u32 = libc::S_IFLNK;
 #[cfg(not(target_os = "linux"))]
 const MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
 
+/// Windows may use sub-block requests for bandwidth pacing, but cannot ask
+/// for an unbounded number of digests or allocate an unbounded read buffer.
+pub(crate) fn hash_window_fits(off: u64, len: u32, block: u64) -> bool {
+    len > 0
+        && u64::from(len) <= MAX_READ_BYTES
+        && block > 0
+        && block <= MAX_READ_BYTES
+        && u64::from(len).div_ceil(block) <= 1024
+        && off
+            .checked_add(u64::from(len))
+            .is_some_and(|end| end <= i64::MAX as u64)
+}
+
 pub fn hash_response_fits(block: u64, len: u64) -> bool {
     if !(MIN_HASH_BLOCK_BYTES..=MAX_HASH_BLOCK_BYTES).contains(&block) {
         return false;
@@ -1020,6 +1033,35 @@ pub enum WireRequest<Data> {
     NativeMap(crate::native_map::Options),
     /// Configure and select a bounded small push without reading its payloads.
     PrepareSmallFiles(SmallCopyRequest),
+    /// Stage a private basis without reading source data or hashing the whole file.
+    StageBasis {
+        path: PathBytes,
+        copy_id: CopyId,
+        len: u64,
+        block: u64,
+        allow_final: bool,
+        attempt: u32,
+        guard: Option<ContainerGuard>,
+    },
+    /// Hash one bounded window of the prepared private output.
+    HashWindow {
+        path: PathBytes,
+        copy_id: CopyId,
+        off: u64,
+        len: u32,
+        block: u64,
+        attempt: u32,
+        guard: Option<ContainerGuard>,
+    },
+    /// Read once, returning either a match or those same bytes for writing.
+    ReadComparedRange {
+        path: PathBytes,
+        source: Option<RegisteredPath>,
+        attempt: u32,
+        off: u64,
+        len: u32,
+        expected: ContentDigest,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1166,6 +1208,7 @@ impl Request {
                 | Request::StatMany { .. }
                 | Request::HashBlocks { .. }
                 | Request::ReadRange { .. }
+                | Request::ReadComparedRange { .. }
                 | Request::ReadStream(_)
                 | Request::StopReadStream
                 | Request::ShrinkReadStream { .. }
@@ -1297,6 +1340,10 @@ pub enum Response {
     NativeMapDone,
     /// One bit per offered file; true requests its payload (including empty files).
     SmallFilesPrepared(Vec<bool>),
+    RangeMatched {
+        off: u64,
+        len: u32,
+    },
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

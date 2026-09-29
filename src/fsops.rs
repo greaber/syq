@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod apply;
+mod basis_copy;
 mod entry;
 mod limits;
 mod operator;
@@ -1672,7 +1673,9 @@ impl FsOps {
             | Request::HashAndHold { guard, .. }
             | Request::FinishBasis { guard, .. }
             | Request::SeedBasis { guard, .. }
+            | Request::StageBasis { guard, .. }
             | Request::HashBlocks { guard, .. }
+            | Request::HashWindow { guard, .. }
             | Request::WriteRange { guard, .. }
             | Request::Finalize { guard, .. }
             | Request::FileHash { guard, .. }
@@ -1701,6 +1704,7 @@ impl FsOps {
             Request::Apply { guard, .. }
             | Request::Prepare { guard, .. }
             | Request::SeedBasis { guard, .. }
+            | Request::StageBasis { guard, .. }
             | Request::FinishBasis { guard, .. }
             | Request::WriteRange { guard, .. }
             | Request::Finalize { guard, .. } => guard.is_none(),
@@ -2002,6 +2006,8 @@ impl FsOps {
             | Request::HashAndHold { path, guard, .. }
             | Request::FinishBasis { path, guard, .. }
             | Request::SeedBasis { path, guard, .. }
+            | Request::StageBasis { path, guard, .. }
+            | Request::HashWindow { path, guard, .. }
             | Request::HashBlocks { path, guard, .. }
             | Request::WriteRange { path, guard, .. }
             | Request::Finalize { path, guard, .. }
@@ -2012,7 +2018,7 @@ impl FsOps {
                     map(path)?;
                 }
             }
-            Request::ReadRange { path, .. } => map(path)?,
+            Request::ReadRange { path, .. } | Request::ReadComparedRange { path, .. } => map(path)?,
             Request::CopyLocal { dst, .. } => map(dst)?,
             Request::ReadSmallBatch(reads) => {
                 for read in reads {

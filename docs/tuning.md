@@ -193,6 +193,13 @@ hashes, payload checks and publication-recovery checks stay in effect. Partial-f
 in every mode: matching bytes from interrupted copies can still be reused,
 even with `off`. The setting controls reuse of the final destination, not partials.
 
+For ordinary staged updates, syq first populates a private partial from the
+old destination, using reflinks where available. It then compares bounded
+windows and reads each source block once, sending only different bytes. This
+can replace the destination even when all its bytes match but its metadata
+differs. Explicit `--hash` and protected-existing-file policies retain their
+read-only content check before staging.
+
 This setting does not select a sequential writer. To isolate comparison and
 reuse costs while keeping range transfers, compare
 `copy-path=ranges,block-reuse=on` with `copy-path=ranges,block-reuse=off`.
@@ -212,9 +219,13 @@ syq cp --srcs-in source --to host --into destination \
 ```
 
 Set `request-size` too: it otherwise follows the comparison block size.
-At 64 KiB, files must be smaller than 130 GiB or comparison fails. Increase
-`comparison-block-size` for larger files; doubling it doubles that limit.
-Both endpoints still read the full file to compare it.
+Both endpoints still read the full file to compare it. Staged updates and
+partial resume compare bounded windows; their hash memory does not grow with
+file size. Explicit whole-file comparisons (`--hash`, protected-existing-file
+policies, and in-place reuse) still have a hash-response limit: at 64 KiB,
+files must be smaller than 130 GiB. Increasing `comparison-block-size`
+increases that limit proportionally. A smaller effective request size, including
+bandwidth pacing, also reduces staged comparison granularity.
 
 In `syq rsync`, `-B` / `--block-size` selects the comparison block size.
 Do not combine it with `comparison-block-size`.

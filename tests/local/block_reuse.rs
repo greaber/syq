@@ -338,3 +338,166 @@ fn on_keeps_whole_file_copy_for_fresh_files_in_a_mixed_batch() {
         assert!(partial_files(&t.path("dst")).is_empty());
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn pipeline_reads_source_once_for_matching_half_and_rewritten_files() {
+    for matching in [0, 1, 2] {
+        let t = Tmp::new();
+        let source = prng((8 << 20) + 17, 839);
+        let mut old = source.clone();
+        if matching < 2 {
+            old[4 << 20..].fill(b'x');
+        }
+        if matching == 0 {
+            old[..4 << 20].fill(b'y');
+        }
+        write(&t.path("src"), &source);
+        write(&t.path("dst"), &old);
+        set_mtime(&t.path("dst"), 1);
+        let out = compat_command()
+            .args([
+                "-a",
+                "--no-progress",
+                "--performance-tuning=block-reuse=on,workers=1",
+                &t.s("src"),
+                &t.s("dst"),
+            ])
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_SOURCE_READ_EVENTS", t.path("reads"))
+            .env("SYQ_TEST_FAIL_SOURCE_BLOCK_HASH", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), source);
+        let events = fs::read_to_string(t.path("reads")).unwrap();
+        let mut next = 0u64;
+        for event in events.lines() {
+            let fields: Vec<_> = event.split_whitespace().collect();
+            assert_eq!(fields[1].parse::<u64>().unwrap(), next, "{events}");
+            next += fields[2].parse::<u64>().unwrap();
+        }
+        assert_eq!(next, source.len() as u64);
+        assert_eq!(tuning_observed(&out)["range_requests"], [3, 2, 0][matching]);
+        assert!(partial_files(&t.0).is_empty());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn pipeline_uses_private_basis_when_final_is_replaced() {
+    let t = Tmp::new();
+    let source = prng(8 << 20, 840);
+    let mut old = source.clone();
+    old[4 << 20..].fill(b'x');
+    write(&t.path("src"), &source);
+    write(&t.path("dst"), &old);
+    set_mtime(&t.path("dst"), 1);
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--performance-tuning=block-reuse=on,workers=1",
+            &t.s("src"),
+            &t.s("dst"),
+        ])
+        .env("SYQ_TEST_STAGED_BASIS_READY_FILE", &ready)
+        .env("SYQ_TEST_STAGED_BASIS_CONTINUE_FILE", &continuation)
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "private comparison basis");
+    // Change the same donor inode after seeding. Matching blocks must come
+    // from the private stage, even on a filesystem without reflinks.
+    write(&t.path("dst"), &vec![b'z'; source.len()]);
+    release_confinement_barrier(&continuation);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(read(&t.path("dst")), source);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn pipeline_parallel_ranges_read_each_source_byte_once() {
+    let t = Tmp::new();
+    let source = prng(128 << 20, 841);
+    let mut old = source.clone();
+    for block in old.chunks_mut(4 << 20).step_by(2) {
+        block.fill(b'x');
+    }
+    write(&t.path("src"), &source);
+    write(&t.path("dst"), &old);
+    set_mtime(&t.path("dst"), 1);
+    let out = compat_command()
+        .args([
+            "-a",
+            "--no-progress",
+            "--bwlimit=64M",
+            "--performance-tuning=block-reuse=on,workers=2",
+            &t.s("src"),
+            &t.s("dst"),
+        ])
+        .env("SYQ_TEST_SOURCE_READ_EVENTS", t.path("reads"))
+        .env("SYQ_TEST_WORKER_EVENTS", t.path("workers"))
+        .env("SYQ_TEST_FAIL_SOURCE_BLOCK_HASH", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), source);
+    let events = fs::read_to_string(t.path("reads")).unwrap();
+    let mut reads: Vec<(u64, u64)> = events
+        .lines()
+        .map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields[1].parse().unwrap(), fields[2].parse().unwrap())
+        })
+        .collect();
+    reads.sort_unstable();
+    let mut next = 0;
+    for (off, len) in reads {
+        assert_eq!(off, next, "{events}");
+        next += len;
+    }
+    assert_eq!(next, source.len() as u64);
+    let workers = fs::read_to_string(t.path("workers")).unwrap();
+    let ids: std::collections::BTreeSet<_> = workers
+        .lines()
+        .filter(|line| line.starts_with("compare-range "))
+        .map(|line| line.split_whitespace().nth(1).unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{workers}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn pipeline_recovers_dropped_write_with_matching_prefix() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    t.expose_remote_syq();
+    let source = prng(24 << 20, 842);
+    let mut old = source.clone();
+    old[4 << 20..].fill(b'x');
+    write(&t.path("src"), &source);
+    write(&t.path("dst/file"), &old);
+    set_mtime(&t.path("dst/file"), 1);
+    let out = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--stats",
+            "--performance-tuning=pipeline-depth=4",
+            &t.s("src"),
+            &format!("fake:{}/file", t.s("dst")),
+        ],
+    )
+    .env("SYQ_TEST_DROP_AFTER_REQUEST", "write")
+    .env("SYQ_TEST_DROP_AFTER_N_REQUESTS", "2")
+    .env("SYQ_TEST_DROP_MARKER", t.path("dropped"))
+    .run()
+    .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/file")), source);
+    assert!(t.path("dropped").exists());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("connection dropped; reopening"));
+    assert!(partial_files(&t.path("dst")).is_empty());
+}

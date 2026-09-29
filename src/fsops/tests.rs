@@ -5210,3 +5210,171 @@ fn partial_seeding_does_not_fall_back_to_final_when_disallowed() {
         b"final bytes"
     );
 }
+
+#[test]
+fn comparison_window_reads_staged_bytes_after_donor_changes() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let original = vec![17; 2 * MIN_HASH_BLOCK_BYTES as usize + 7];
+    let path = tree.path().join("file");
+    fs::write(&path, &original).unwrap();
+    let mut ops = destination_ops(tree.path());
+    let id = [97; 16];
+    assert!(matches!(
+        ops.handle(&Request::StageBasis {
+            path: path_bytes(&path),
+            copy_id: id,
+            len: original.len() as u64,
+            block: MIN_HASH_BLOCK_BYTES,
+            allow_final: true,
+            attempt: 0,
+            guard: None,
+        }),
+        Response::Ok
+    ));
+    fs::write(&path, vec![91; original.len()]).unwrap();
+    let reply = ops.handle(&Request::HashWindow {
+        path: path_bytes(&path),
+        copy_id: id,
+        off: MIN_HASH_BLOCK_BYTES,
+        len: MIN_HASH_BLOCK_BYTES as u32 + 7,
+        block: MIN_HASH_BLOCK_BYTES,
+        attempt: 0,
+        guard: None,
+    });
+    let Response::Hashes(hashes) = reply else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(
+        hashes,
+        [
+            ops.hash_policy
+                .algorithm
+                .hash(&original[..MIN_HASH_BLOCK_BYTES as usize]),
+            ops.hash_policy.algorithm.hash(&[17; 7])
+        ]
+    );
+    // Bounded sub-block hashes support the receiver's pacing request ceiling.
+    let reply = ops.handle(&Request::HashWindow {
+        path: path_bytes(&path),
+        copy_id: id,
+        off: 3,
+        len: 13,
+        block: 8,
+        attempt: 0,
+        guard: None,
+    });
+    assert!(
+        matches!(reply, Response::Hashes(h) if h == vec![ops.hash_policy.algorithm.hash(&[17; 8]), ops.hash_policy.algorithm.hash(&[17; 5])])
+    );
+    for (off, len, block) in [
+        (0, 1, 0),
+        (0, 1025, 1),
+        (u64::MAX, 2, 1),
+        (0, 0, 1),
+        (0, MAX_READ_BYTES as u32 + 1, MAX_READ_BYTES),
+    ] {
+        assert!(matches!(
+            ops.handle(&Request::HashWindow {
+                path: path_bytes(&path),
+                copy_id: id,
+                off,
+                len,
+                block,
+                attempt: 0,
+                guard: None,
+            }),
+            Response::EndpointError(_)
+        ));
+    }
+}
+
+#[test]
+fn compared_reads_preserve_independent_payload_integrity() {
+    use crate::hashing::{HashAlgorithm, HashPolicy};
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("source");
+    fs::write(&path, b"file contents").unwrap();
+    for algorithm in [
+        HashAlgorithm::Blake3,
+        HashAlgorithm::Sha256,
+        HashAlgorithm::Md5,
+        HashAlgorithm::Xxh3,
+    ] {
+        for integrity in [false, true] {
+            let mut ops = FsOps::new();
+            ops.set_hash_policy(HashPolicy {
+                algorithm,
+                transfer_integrity: integrity,
+                transfer_hash_type: Some(HashAlgorithm::Sha256),
+            });
+            for matches in [false, true] {
+                let reply = ops.handle(&Request::ReadComparedRange {
+                    path: path.as_os_str().as_bytes().to_vec(),
+                    source: None,
+                    attempt: 0,
+                    off: 5,
+                    len: 8,
+                    expected: algorithm.hash(if matches { b"contents" } else { b"changed!" }),
+                });
+                if matches {
+                    assert!(matches!(reply, Response::RangeMatched { off: 5, len: 8 }));
+                } else {
+                    let Response::Block { off, hash, data } = reply else {
+                        panic!("{reply:?}");
+                    };
+                    assert_eq!(off, 5);
+                    assert_eq!(data, b"contents");
+                    assert_eq!(
+                        hash,
+                        if integrity {
+                            HashAlgorithm::Sha256.hash(&data)
+                        } else {
+                            [0; 32]
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pipeline_requests_keep_endpoint_authority() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let input = tree.path().join("source");
+    fs::write(&input, b"inside").unwrap();
+    let (mut source, paths, _control) = registered_source_worker(&[&input], false);
+    let compared = |reference| Request::ReadComparedRange {
+        path: b"/untrusted/spelling".to_vec(),
+        source: reference,
+        attempt: 0,
+        off: 0,
+        len: 6,
+        expected: crate::hashing::HashAlgorithm::Blake3.hash(b"inside"),
+    };
+    assert!(matches!(
+        source.handle(&compared(Some(paths[0].clone()))),
+        Response::RangeMatched { .. }
+    ));
+    assert!(matches!(
+        source.handle(&compared(None)),
+        Response::EndpointError(_)
+    ));
+    let mut destination = destination_ops(tree.path());
+    assert!(matches!(
+        destination.handle(&compared(Some(paths[0].clone()))),
+        Response::EndpointError(_)
+    ));
+    let stage = Request::StageBasis {
+        path: path_bytes(&tree.path().join("new")),
+        copy_id: [98; 16],
+        len: 100,
+        block: MIN_HASH_BLOCK_BYTES,
+        allow_final: true,
+        attempt: 0,
+        guard: None,
+    };
+    assert!(!stage.allowed_on_source_worker());
+    assert!(matches!(FsOps::new().handle(&stage), Response::Err(_)));
+    assert!(!tree.path().join("new").exists());
+}
