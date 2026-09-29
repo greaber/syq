@@ -14,18 +14,16 @@ hash from a trusted source to check authenticity; see [Expected hashes](#expecte
 
 Syq normally skips files whose size and modification time match. For filesystem
 copies, `syq cp` compares whole seconds exactly and ignores as many trailing
-fractional digits as are zero in the destination timestamp. For example, destination `.120000000`
-seconds matches source `.123456789`; a whole-second destination timestamp
-ignores the source fraction entirely. This accommodates destinations that
-truncate fractional seconds, but it also ignores coincidental trailing zeros;
-the rule uses the timestamp, not a measurement of filesystem precision.
-Directory metadata previews use the same fractional precision rule. `syq rsync`
-compares whole seconds only when checking file contents.
+fractional digits as are zero in the destination timestamp: destination
+`.120000000` seconds matches source `.123456789`, and a whole-second destination
+timestamp ignores the source fraction entirely. This accommodates destinations
+that truncate fractional seconds. `syq rsync` compares whole seconds, as rsync
+does.
 
-Local/S3 copies compare timestamps exactly, including stored nanoseconds; they
-do not use the filesystem rule above. Uploads need syq metadata on the existing
-object for this shortcut. Downloads use the stored source timestamp, or S3's
-modification time in whole seconds when syq metadata is absent.
+Local/S3 copies compare timestamps exactly, including stored nanoseconds.
+Uploads need syq metadata on the existing object for this shortcut. Downloads
+use the stored source timestamp, or S3's modification time in whole seconds when
+syq metadata is absent.
 
 A timestamp difference outside that precision triggers checking even when the
 source is older. Use `--hash` to check contents even when size and timestamp
@@ -38,18 +36,15 @@ syq cp --hash --srcs-in project --into backup
 `--hash` uses BLAKE3. In rsync syntax, use `-c` or `--checksum` for the same
 comparison.
 
-When a local/S3 copy has matching size but a different timestamp, syq compares
-the local file with a whole-file hash stored in the object's syq metadata, when
-one is available. A matching hash avoids uploading or downloading the object and
-leaves the destination timestamp alone. `error-if-different` uploads and downloads
-also reuse stored hashes when possible.
-Explicit `--hash` comparisons use BLAKE3; if the object has no stored BLAKE3 hash,
-syq reads its contents to compute one.
+File uploads store a whole-file hash in the object's syq metadata: BLAKE3,
+unless a `transfer` algorithm or expected hash selects another. When a local/S3
+copy has matching size but a different timestamp, syq compares the local file
+with that stored hash when one is available. A matching hash avoids uploading or
+downloading the object and leaves the destination timestamp alone;
+`error-if-different` copies also use stored hashes. `--hash` needs a stored
+BLAKE3 hash; without one, syq reads the object's contents to compute it.
 
 ## Payload checks
-
-Extra payload checks default to `transfer=off`. Enable them with, for example,
-`--integrity-checking transfer=blake3`.
 
 SSH and encrypted TCP retain their transport authentication independently.
 `--tcp-plain` does not enable payload checks automatically, and checksums do
@@ -61,19 +56,13 @@ For a complete check of a local copy, use an [expected hash](#expected-hashes).
 For local/S3 copies, uploads over HTTPS rely on it to protect the transfer and
 send no request checksum. Uploads to a plain `http://` endpoint send Content-MD5,
 which the destination checks and the request signature covers, so bytes changed
-in transit are rejected. When a destination rejects an upload without a
-checksum, as AWS does for buckets with an Object Lock default retention period,
-syq retries with Content-MD5 and sends it for the rest of the copy. With
+in transit are rejected. Syq also sends Content-MD5 to a destination that
+requires a checksum, as AWS does for buckets with an Object Lock default
+retention period. With
 [storage authorization](object-storage.md#authorize-from-your-laptop), uploads
-send SHA-256 request checksums instead (Content-MD5 on R2 and for streams).
-Pathname uploads store a whole-file BLAKE3 hash by default, so later `--hash`
-comparisons can use it without downloading the object. An explicit comparison,
-transfer, or expected hash can select a different stored algorithm. Uploads read
-each source file once to hash it. With storage authorization, large files need a
-second local read for whole-file algorithms other than BLAKE3, or for custom part
-sizes that are not multiples of 1 KiB.
-The `transfer` setting checks stored hashes on download when present. Use an
-expected hash for objects without a stored hash. See
+send SHA-256 or MD5 request checksums. With a `transfer` algorithm, downloads
+also check the object's stored hash when it has one; use an expected hash for
+objects without a stored hash. See
 [Filesystem differences](object-storage.md#filesystem-differences).
 
 Server-side S3 copies preserve stored hashes without reading or verifying
@@ -110,8 +99,6 @@ Differences are shown as planned updates. Add `--if-exists=error-if-different`
 to report them as errors instead. For machine-readable output, add
 [`--results`](automation.md); for two servers, see
 [remote comparisons](remote-reference.md#verification).
-
-S3 comparisons may use a stored object hash without reading the object body.
 
 ## Consistency and durability
 
