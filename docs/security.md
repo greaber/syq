@@ -324,22 +324,10 @@ it is not sandboxed or confined to a copy destination directory.
 
 [Storage authorization](object-storage.md#authorize-from-your-laptop) gives the
 server signed URLs for approved paths and operations. The secret access key
-stays on your laptop. Each URL is fixed to one operation on one object or
-listing, and expires at a set time. Bucket-wide path scopes permit operations
-on the bucket's objects, not creating or deleting the bucket. Approval trusts
-the server to choose uploaded contents.
-
-A signed URL does not reliably fix the request's headers. Syq refuses to sign
-Object Lock headers, which set retention periods and legal holds or bypass
-governance retention, but some storage services, such as MinIO, accept headers
-that a URL did not cover. The server can then choose settings such as tags,
-retention, or legal holds, up to what the authorizing credentials allow. If a
-bucket uses Object Lock, authorize with a profile whose credentials cannot set
-retention or legal holds or bypass governance retention: on AWS and MinIO, leave
-out the `s3:PutObjectRetention`, `s3:PutObjectLegalHold`, and
-`s3:BypassGovernanceRetention` permissions. Retention defaults configured on
-the bucket still apply.
-
+stays on your laptop. Approval trusts the server to choose uploaded contents
+and object settings, such as tags or Object Lock retention, within the
+authorizing credentials' permissions: some services accept request headers that
+a signature does not cover.
 Anyone with the URLs can reuse them until expiry; stopping receiving does not
 revoke them. Filesystem receiver roots, aggregate limits, one-use grants, and
 signed receipts do not apply.

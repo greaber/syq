@@ -167,8 +167,7 @@ disconnecting. Data travels directly between the server and storage.
 Authorization lasts up to seven days, subject to credentials and provider
 policies; restarting requires fresh approval. Both machines need the same syq
 build. See [Storage authorization](security.md#storage-authorization) for the
-security implications, including which credentials to use for a bucket with
-Object Lock.
+security implications.
 
 <a id="shell-pipelines"></a>
 
