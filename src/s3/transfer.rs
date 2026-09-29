@@ -1994,17 +1994,33 @@ impl Engine {
         if permitted == Some(false) {
             return Ok(None);
         }
-        // A fresh file obtains metadata with its first data request. For a
-        // multipart download, receiving these headers is enough to start the
-        // other ranges; the first body is consumed alongside them.
-        // Existing files still use HEAD so an unchanged object is not fetched.
-        let mut initial_slot = None;
-        let initial = if existing.is_none()
+        // A fresh file, or an ordinary update with a different listed size,
+        // needs the body anyway. Obtain metadata with its first data request.
+        // Keep HEAD when metadata could still reject the copy or prove equality.
+        // For multipart downloads these headers let the other ranges start
+        // while the first body is consumed alongside them.
+        let needs_body = existing.is_none()
+            || (job.source_object.is_none()
+                && existing.is_some_and(|m| m.is_file() && m.len != job.size)
+                && !self.args.update
+                && !self.args.protects_existing_contents());
+        let mut get_first = needs_body
             && !self.args.dry_run
             && !job.key.ends_with('/')
             && selected == Some(true)
-            && permitted == Some(true)
-        {
+            && permitted == Some(true);
+        // A saved first range can exist before the destination is published.
+        // Check recovery before fetching it, and keep this state for the normal
+        // identity and range checks below so the record is opened only once.
+        let recovery = if get_first && job.size > part_size {
+            let recovery = self.open_download_state(root, &job.key, &job.path)?;
+            get_first = recovery.1.is_none();
+            Some(recovery)
+        } else {
+            None
+        };
+        let mut initial_slot = None;
+        let initial = if get_first {
             initial_slot = Some(self.tuning.requests.acquire().await);
             Some(
                 self.client
@@ -2250,14 +2266,10 @@ impl Engine {
                 )
                 .await;
         }
-        let extra = format!(
-            "download:{}:{}:{}",
-            root.identity().dev,
-            root.identity().ino,
-            job.path
-        );
-        let state = State::open(&self.identity(&object.key, &extra))?;
-        let mut saved: Option<DownloadState> = state.load()?;
+        let (state, mut saved) = match recovery {
+            Some(recovery) => recovery,
+            None => self.open_download_state(root, &object.key, &job.path)?,
+        };
         if let Some(old) = &saved {
             if old.schema != 1 && old.schema != 2 {
                 bail!("unsupported S3 download recovery schema");
@@ -2531,6 +2543,21 @@ impl Engine {
         }
         .await;
         result
+    }
+    fn open_download_state(
+        &self,
+        root: &Root,
+        key: &str,
+        path: &str,
+    ) -> Result<(State, Option<DownloadState>)> {
+        let extra = format!(
+            "download:{}:{}:{path}",
+            root.identity().dev,
+            root.identity().ino,
+        );
+        let state = State::open(&self.identity(key, &extra))?;
+        let saved = state.load()?;
+        Ok((state, saved))
     }
     fn new_download_state(
         &self,

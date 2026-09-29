@@ -9,6 +9,9 @@ struct ExpressionServer {
 }
 impl ExpressionServer {
     fn new() -> Self {
+        Self::with_fault("")
+    }
+    fn with_fault(fault: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
@@ -70,8 +73,13 @@ impl ExpressionServer {
                     reply(&mut socket, 403, &[], b"", true);
                     continue;
                 }
+                let body = if fault == "size-changed" {
+                    &b"extra"[..]
+                } else {
+                    &b"data"[..]
+                };
                 let mut headers = vec![
-                    ("Content-Length".into(), "4".into()),
+                    ("Content-Length".into(), body.len().to_string()),
                     ("ETag".into(), "\"fixture\"".into()),
                     (
                         "Last-Modified".into(),
@@ -87,7 +95,9 @@ impl ExpressionServer {
                     ("syq-format", "1"),
                     (
                         "syq-kind",
-                        if key.ends_with("/link") {
+                        if fault == "invalid-kind" {
+                            "dir"
+                        } else if key.ends_with("/link") {
                             "symlink"
                         } else {
                             "file"
@@ -102,6 +112,12 @@ impl ExpressionServer {
                 ] {
                     headers.push((format!("x-amz-meta-{name}"), value.into()));
                 }
+                headers.push((
+                    "x-amz-meta-syq-blake3".into(),
+                    blake3::hash(if fault == "corrupt" { b"wrong" } else { body })
+                        .to_hex()
+                        .to_string(),
+                ));
                 let range = request
                     .lines()
                     .any(|line| line.to_ascii_lowercase().starts_with("range:"));
@@ -112,7 +128,7 @@ impl ExpressionServer {
                     &mut socket,
                     if range { 206 } else { 200 },
                     &headers,
-                    b"data",
+                    body,
                     method == "HEAD",
                 );
             }
@@ -361,4 +377,171 @@ fn listing_rejection_protects_existing_counterparts_during_prune() {
         b"existing"
     );
     assert!(!temp.path().join("out/extra").exists());
+}
+
+#[test]
+fn different_sized_files_get_metadata_with_the_required_body() {
+    for options in [
+        vec![],
+        vec!["--copy-if", "src.size != dst.size"],
+        vec!["--hash"],
+        vec!["--copy-metadata=mtime,permissions"],
+        vec!["--resource-limits=s3-requests=1,s3-objects=1"],
+    ] {
+        let temp = test_support::tempdir().unwrap();
+        let destination = temp.path().join("out/keep");
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(&destination, b"old").unwrap();
+        let server = ExpressionServer::new();
+        let mut args = vec!["--where", "src.name = 'keep'"];
+        args.extend(options);
+        let output = server.copy(temp.path(), &args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            output_text(&output)
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"data");
+        assert!(
+            server.object_heads().is_empty(),
+            "{args:?}: {:?}",
+            server.object_heads()
+        );
+        assert_eq!(server.gets(), 1, "{args:?}");
+    }
+}
+
+#[test]
+fn download_metadata_decisions_keep_heads_before_bodies() {
+    for (contents, time, options, succeeds, heads, gets) in [
+        (b"data".as_slice(), 123, vec![], true, 1, 0),
+        // Stored BLAKE3 proves equality even when local mtime differs.
+        (b"data".as_slice(), 456, vec![], true, 1, 0),
+        (
+            b"old".as_slice(),
+            456,
+            vec!["--copy-if", "src.mode = 0o700"],
+            true,
+            1,
+            1,
+        ),
+        (
+            b"old".as_slice(),
+            456,
+            vec!["--copy-if", "src.mode = 0o600"],
+            true,
+            1,
+            0,
+        ),
+        (
+            b"old".as_slice(),
+            456,
+            vec!["--if-exists=update-if-older"],
+            true,
+            1,
+            0,
+        ),
+        (
+            b"old".as_slice(),
+            456,
+            vec!["--if-exists=error-if-different"],
+            false,
+            1,
+            0,
+        ),
+        (
+            b"old".as_slice(),
+            456,
+            vec!["--if-exists=error"],
+            false,
+            1,
+            0,
+        ),
+        (b"old".as_slice(), 456, vec!["--if-exists=keep"], true, 0, 0),
+        (b"old".as_slice(), 456, vec!["--dry-run"], true, 1, 0),
+        (
+            b"old".as_slice(),
+            456,
+            vec!["--copy-if", "src.size = dst.size"],
+            true,
+            0,
+            0,
+        ),
+    ] {
+        let temp = test_support::tempdir().unwrap();
+        let destination = temp.path().join("out/keep");
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(&destination, contents).unwrap();
+        std::fs::File::open(&destination)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(time))
+            .unwrap();
+        let server = ExpressionServer::new();
+        let mut args = vec!["--where", "src.name = 'keep'"];
+        args.extend(options);
+        let output = server.copy(temp.path(), &args);
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "{args:?}: {}",
+            output_text(&output)
+        );
+        assert_eq!(server.object_heads().len(), heads, "{args:?}");
+        assert_eq!(server.gets(), gets, "{args:?}");
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            if gets == 0 { contents } else { b"data" }
+        );
+        if gets == 0 {
+            assert_eq!(
+                std::fs::metadata(&destination).unwrap().modified().unwrap(),
+                std::time::UNIX_EPOCH + Duration::from_secs(time)
+            );
+        }
+    }
+}
+
+#[test]
+fn changed_size_get_validates_headers_and_integrity_before_replacement() {
+    for fault in ["size-changed", "invalid-kind", "corrupt"] {
+        let temp = test_support::tempdir().unwrap();
+        let destination = temp.path().join("out/keep");
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(&destination, b"old").unwrap();
+        let server = ExpressionServer::with_fault(fault);
+        let output = server.copy(
+            temp.path(),
+            &[
+                "--where",
+                "src.name = 'keep'",
+                "--integrity-checking=transfer=blake3",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+        assert!(
+            server.object_heads().is_empty(),
+            "{fault}: {:?}",
+            server.object_heads()
+        );
+        assert_eq!(server.gets(), 1, "{fault}");
+    }
+}
+
+#[test]
+fn changed_size_get_still_restores_stored_symlinks() {
+    let temp = test_support::tempdir().unwrap();
+    let destination = temp.path().join("out/link");
+    std::fs::create_dir(temp.path().join("out")).unwrap();
+    std::fs::write(&destination, b"old").unwrap();
+    let server = ExpressionServer::new();
+    let output = server.copy(temp.path(), &["--where", "src.name = 'link'"]);
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(std::fs::read_link(&destination).unwrap(), Path::new("data"));
+    assert!(server.object_heads().is_empty());
+    assert_eq!(server.gets(), 1);
 }
