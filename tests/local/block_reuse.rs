@@ -365,6 +365,7 @@ fn pipeline_reads_source_once_for_matching_half_and_rewritten_files() {
             ])
             .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_SOURCE_READ_EVENTS", t.path("reads"))
+            .env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1")
             .env("SYQ_TEST_FAIL_SOURCE_BLOCK_HASH", "1")
             .run()
             .unwrap();
@@ -385,7 +386,7 @@ fn pipeline_reads_source_once_for_matching_half_and_rewritten_files() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn pipeline_uses_private_basis_when_final_is_replaced() {
+fn pipeline_handles_final_mutation_after_staging() {
     let t = Tmp::new();
     let source = prng(8 << 20, 840);
     let mut old = source.clone();
@@ -407,8 +408,8 @@ fn pipeline_uses_private_basis_when_final_is_replaced() {
         .start()
         .unwrap();
     wait_for_confinement_marker(&mut child, &ready, "private comparison basis");
-    // Change the same donor inode after seeding. Matching blocks must come
-    // from the private stage, even on a filesystem without reflinks.
+    // Change the same donor inode after staging. A clone preserves the old
+    // bytes; without cloning, comparison must detect the new donor bytes.
     write(&t.path("dst"), &vec![b'z'; source.len()]);
     release_confinement_barrier(&continuation);
     assert!(child.wait().unwrap().success());
@@ -437,6 +438,7 @@ fn pipeline_parallel_ranges_read_each_source_byte_once() {
             &t.s("dst"),
         ])
         .env("SYQ_TEST_SOURCE_READ_EVENTS", t.path("reads"))
+        .env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1")
         .env("SYQ_TEST_WORKER_EVENTS", t.path("workers"))
         .env("SYQ_TEST_FAIL_SOURCE_BLOCK_HASH", "1")
         .run()
@@ -490,6 +492,7 @@ fn pipeline_recovers_dropped_write_with_matching_prefix() {
             &format!("fake:{}/file", t.s("dst")),
         ],
     )
+    .env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1")
     .env("SYQ_TEST_DROP_AFTER_REQUEST", "write")
     .env("SYQ_TEST_DROP_AFTER_N_REQUESTS", "2")
     .env("SYQ_TEST_DROP_MARKER", t.path("dropped"))
@@ -500,4 +503,33 @@ fn pipeline_recovers_dropped_write_with_matching_prefix() {
     assert!(t.path("dropped").exists());
     assert!(String::from_utf8_lossy(&out.stderr).contains("connection dropped; reopening"));
     assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[test]
+fn pipeline_handles_growing_shrinking_and_empty_files() {
+    for (source_len, destination_len) in [
+        (9 << 20, 5 << 20),
+        (5 << 20, 9 << 20),
+        (0, 5 << 20),
+        (5 << 20, 0),
+    ] {
+        let t = Tmp::new();
+        let contents = prng(source_len.max(destination_len), 843);
+        write(&t.path("src"), &contents[..source_len]);
+        write(&t.path("dst"), &contents[..destination_len]);
+        set_mtime(&t.path("dst"), 1);
+        let output = compat_command()
+            .args([
+                "-a",
+                "--performance-tuning=block-reuse=on,workers=1",
+                &t.s("src"),
+                &t.s("dst"),
+            ])
+            .env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst")), &contents[..source_len]);
+        assert!(partial_files(&t.0).is_empty());
+    }
 }

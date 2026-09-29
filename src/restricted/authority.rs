@@ -2466,6 +2466,38 @@ impl RestrictedAuthority {
                 }
                 *guard = Some(self.guard.clone());
             }
+            Request::ReuseComparedRange {
+                path,
+                copy_id,
+                off,
+                len,
+                guard,
+                ..
+            } => {
+                anyhow::ensure!(
+                    self.copy.policy.publication == PublicationPolicy::AtomicStaged,
+                    "in-place signed receiver forbids staged block reuse"
+                );
+                let declared = self.declared_size(path, *copy_id)?;
+                anyhow::ensure!(
+                    off.checked_add(u64::from(*len))
+                        .is_some_and(|end| end <= declared),
+                    "reused block extends past declared file size"
+                );
+                outcomes.push(PendingOutcome::FileStage {
+                    index: 0,
+                    path: path.clone(),
+                    copy_id: *copy_id,
+                    size: declared,
+                    inplace: false,
+                    stage: FileStage::Write,
+                    skip_if_absent: false,
+                    observation_hold: None,
+                });
+                // No payload crossed the transport. Logical file capacity was
+                // reserved by StageBasis, just as for a native cloned basis.
+                *guard = Some(self.guard.clone());
+            }
             Request::WriteRange {
                 path,
                 inplace,

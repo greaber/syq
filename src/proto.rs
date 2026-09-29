@@ -1045,12 +1045,22 @@ pub enum WireRequest<Data> {
     },
     /// Hash one bounded window of the prepared private output.
     HashWindow {
+        final_basis: bool,
         path: PathBytes,
         copy_id: CopyId,
         off: u64,
         len: u32,
         block: u64,
         attempt: u32,
+        guard: Option<ContainerGuard>,
+    },
+    /// Commit the exact destination buffer previously hashed for this window.
+    ReuseComparedRange {
+        path: PathBytes,
+        copy_id: CopyId,
+        attempt: u32,
+        off: u64,
+        len: u32,
         guard: Option<ContainerGuard>,
     },
     /// Read once, returning either a match or those same bytes for writing.
@@ -1340,6 +1350,9 @@ pub enum Response {
     NativeMapDone,
     /// One bit per offered file; true requests its payload (including empty files).
     SmallFilesPrepared(Vec<bool>),
+    BasisStaged {
+        compare_final: bool,
+    },
     RangeMatched {
         off: u64,
         len: u32,

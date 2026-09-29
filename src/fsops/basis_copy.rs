@@ -5,13 +5,22 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 
+#[cfg(target_os = "linux")]
+pub(super) fn try_clone(input: &File, output: &File, len: u64) -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_BASIS_CLONE_UNSUPPORTED").is_some() {
+        return false;
+    }
+    crate::local_copy::try_clone(input, output, len)
+}
+
 pub(super) fn seed(input: &File, output: &File, len: u64) -> io::Result<()> {
     let len = len.min(input.metadata()?.len());
     if len == 0 {
         return Ok(());
     }
     #[cfg(target_os = "linux")]
-    if crate::local_copy::try_clone(input, output, len) {
+    if try_clone(input, output, len) {
         return Ok(());
     }
     // Whole-file copy_file_range can materialize holes on ext4. Discover data

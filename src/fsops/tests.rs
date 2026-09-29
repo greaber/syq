@@ -5217,6 +5217,11 @@ fn comparison_window_reads_staged_bytes_after_donor_changes() {
     let original = vec![17; 2 * MIN_HASH_BLOCK_BYTES as usize + 7];
     let path = tree.path().join("file");
     fs::write(&path, &original).unwrap();
+    fs::write(
+        tree.path().join(".file.syq-tmp.abcdefghijklmnop"),
+        &original,
+    )
+    .unwrap();
     let mut ops = destination_ops(tree.path());
     let id = [97; 16];
     assert!(matches!(
@@ -5225,14 +5230,15 @@ fn comparison_window_reads_staged_bytes_after_donor_changes() {
             copy_id: id,
             len: original.len() as u64,
             block: MIN_HASH_BLOCK_BYTES,
-            allow_final: true,
+            allow_final: false,
             attempt: 0,
             guard: None,
         }),
-        Response::Ok
+        Response::BasisStaged { .. }
     ));
     fs::write(&path, vec![91; original.len()]).unwrap();
     let reply = ops.handle(&Request::HashWindow {
+        final_basis: false,
         path: path_bytes(&path),
         copy_id: id,
         off: MIN_HASH_BLOCK_BYTES,
@@ -5255,6 +5261,7 @@ fn comparison_window_reads_staged_bytes_after_donor_changes() {
     );
     // Bounded sub-block hashes support the receiver's pacing request ceiling.
     let reply = ops.handle(&Request::HashWindow {
+        final_basis: false,
         path: path_bytes(&path),
         copy_id: id,
         off: 3,
@@ -5275,6 +5282,7 @@ fn comparison_window_reads_staged_bytes_after_donor_changes() {
     ] {
         assert!(matches!(
             ops.handle(&Request::HashWindow {
+                final_basis: false,
                 path: path_bytes(&path),
                 copy_id: id,
                 off,
@@ -5377,4 +5385,120 @@ fn pipeline_requests_keep_endpoint_authority() {
     assert!(!stage.allowed_on_source_worker());
     assert!(matches!(FsOps::new().handle(&stage), Response::Err(_)));
     assert!(!tree.path().join("new").exists());
+}
+
+#[test]
+fn retained_comparison_bytes_survive_donor_mutation_and_reject_replay() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("file");
+    fs::write(&path, b"old bytes").unwrap();
+    let mut ops = destination_ops(tree.path());
+    let id = [99; 16];
+    let stage = ops.handle(&Request::StageBasis {
+        path: path_bytes(&path),
+        copy_id: id,
+        len: 9,
+        block: MIN_HASH_BLOCK_BYTES,
+        allow_final: false,
+        attempt: 2,
+        guard: None,
+    });
+    assert!(matches!(
+        stage,
+        Response::BasisStaged {
+            compare_final: false
+        }
+    ));
+    let hash = ops.handle(&Request::HashWindow {
+        final_basis: true,
+        path: path_bytes(&path),
+        copy_id: id,
+        off: 0,
+        len: 9,
+        block: 9,
+        attempt: 2,
+        guard: None,
+    });
+    assert!(
+        matches!(hash, Response::Hashes(h) if h == vec![ops.hash_policy.algorithm.hash(b"old bytes")])
+    );
+    fs::write(&path, b"new bytes").unwrap();
+    let reuse = |copy_id, attempt, off, len| Request::ReuseComparedRange {
+        path: path_bytes(&path),
+        copy_id,
+        attempt,
+        off,
+        len,
+        guard: None,
+    };
+    for request in [
+        reuse([98; 16], 2, 0, 9),
+        reuse(id, 1, 0, 9),
+        reuse(id, 2, 1, 9),
+        reuse(id, 2, 0, 8),
+    ] {
+        assert!(matches!(ops.handle(&request), Response::EndpointError(_)));
+    }
+    assert!(matches!(ops.handle(&reuse(id, 2, 0, 9)), Response::Ok));
+    assert!(matches!(
+        ops.handle(&reuse(id, 2, 0, 9)),
+        Response::EndpointError(_)
+    ));
+    let staged = ops.partial_path(Path::new("file"), &id).unwrap();
+    assert_eq!(fs::read(tree.path().join(staged)).unwrap(), b"old bytes");
+    assert_eq!(fs::read(&path).unwrap(), b"new bytes");
+}
+
+#[test]
+fn prefetched_comparison_window_keeps_current_bytes() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("file");
+    fs::write(&path, b"firstsecond").unwrap();
+    let mut ops = destination_ops(tree.path());
+    let id = [100; 16];
+    assert!(matches!(
+        ops.handle(&Request::StageBasis {
+            path: path_bytes(&path),
+            copy_id: id,
+            len: 11,
+            block: MIN_HASH_BLOCK_BYTES,
+            allow_final: false,
+            attempt: 2,
+            guard: None,
+        }),
+        Response::BasisStaged {
+            compare_final: false
+        }
+    ));
+    for (off, bytes) in [(0, b"first".as_slice()), (5, b"second".as_slice())] {
+        let response = ops.handle(&Request::HashWindow {
+            final_basis: true,
+            path: path_bytes(&path),
+            copy_id: id,
+            off,
+            len: bytes.len() as u32,
+            block: bytes.len() as u64,
+            attempt: 2,
+            guard: None,
+        });
+        assert!(
+            matches!(response, Response::Hashes(h) if h == vec![ops.hash_policy.algorithm.hash(bytes)])
+        );
+    }
+    fs::write(&path, b"replacement").unwrap();
+    for (off, len) in [(0, 5), (5, 6)] {
+        assert!(matches!(
+            ops.handle(&Request::ReuseComparedRange {
+                path: path_bytes(&path),
+                copy_id: id,
+                attempt: 2,
+                off,
+                len,
+                guard: None,
+            }),
+            Response::Ok
+        ));
+    }
+    let staged = ops.partial_path(Path::new("file"), &id).unwrap();
+    assert_eq!(fs::read(tree.path().join(staged)).unwrap(), b"firstsecond");
 }

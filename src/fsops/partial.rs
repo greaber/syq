@@ -581,6 +581,7 @@ impl FsOps {
         attempt: u32,
     ) -> Result<SeededBasis> {
         self.seed_basis_impl(target, len, block, final_ranges, attempt, false)
+            .map(|(basis, _)| basis)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -592,7 +593,7 @@ impl FsOps {
         final_ranges: Option<&[(u64, u64)]>,
         attempt: u32,
         stage_only: bool,
-    ) -> Result<SeededBasis> {
+    ) -> Result<(SeededBasis, bool)> {
         let PartialTarget {
             path,
             id: copy_id,
@@ -685,6 +686,7 @@ impl FsOps {
         // A previous transfer's partial is usually closer to the source than
         // the old final. Use the final only when no readable candidate exists.
         let mut selected_final = None;
+        let mut final_donor = false;
         if final_ranges.is_none_or(|ranges| !ranges.is_empty())
             && basis_size.unwrap_or(0) == 0
             && input.is_none()
@@ -693,13 +695,35 @@ impl FsOps {
                 .map(|held| held.file)
                 .or_else(|| target.root.open_regular_read(&target.relative).ok());
             selected_final = input.as_ref().and(final_ranges);
+            final_donor = input.is_some();
         }
         if stage_only {
+            let mut compare_final = false;
             if let Some(input) = input.as_ref() {
                 let _copy = self
                     .operation
                     .span(crate::transfer_observations::Stage::FilesystemCopy);
-                super::basis_copy::seed(input, &output, len)?;
+                if final_donor {
+                    let donor = input.metadata()?;
+                    #[cfg(target_os = "linux")]
+                    let cloned = super::basis_copy::try_clone(input, &output, len.min(donor.len()));
+                    #[cfg(not(target_os = "linux"))]
+                    let cloned = false;
+                    // APFS was tried before creating the sidecar. Without a
+                    // clone, retain bounded windows instead of copying bytes
+                    // that comparison may immediately replace.
+                    compare_final = !cloned;
+                    if compare_final
+                        && donor.len() > 0
+                        && donor.blocks().saturating_mul(512) >= donor.len()
+                    {
+                        // Keep the existing dense-file allocation policy. Do
+                        // not materialize sparse donor holes or cloned extents.
+                        self.preallocate_new_partial(&output, len)?;
+                    }
+                } else {
+                    super::basis_copy::seed(input, &output, len)?;
+                }
             }
             #[cfg(debug_assertions)]
             test_race_barrier(
@@ -710,10 +734,13 @@ impl FsOps {
             // Never replace an existing partial with an older final-file donor.
             self.set_copy_length(&output, len)?;
             self.cache_file(location, attempt, true, output);
-            return Ok(SeededBasis {
-                hashes: Vec::new(),
-                selected_final: false,
-            });
+            return Ok((
+                SeededBasis {
+                    hashes: Vec::new(),
+                    selected_final: false,
+                },
+                compare_final,
+            ));
         }
         if basis_size.unwrap_or(0) == 0 {
             self.preallocate_new_partial(&output, len)?;
@@ -764,10 +791,13 @@ impl FsOps {
             self.set_copy_length(&output, len)?;
         }
         self.cache_file(location, attempt, true, output);
-        Ok(SeededBasis {
-            hashes,
-            selected_final: selected_final.is_some(),
-        })
+        Ok((
+            SeededBasis {
+                hashes,
+                selected_final: selected_final.is_some(),
+            },
+            false,
+        ))
     }
 
     #[cfg(target_os = "macos")]
@@ -777,6 +807,10 @@ impl FsOps {
         copy_id: &CopyId,
         allow_final: bool,
     ) -> Result<()> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_BASIS_CLONE_UNSUPPORTED").is_some() {
+            return Ok(());
+        }
         // APFS cloning creates a new name. Try it before opening a new sidecar,
         // and never unlink or replace an existing resumable output to clone.
         with_rooted_partial(target, copy_id, |relative, _| {
@@ -1536,12 +1570,102 @@ impl FsOps {
         len: u32,
         block: u64,
         attempt: u32,
+        final_basis: bool,
     ) -> Result<Vec<ContentDigest>> {
         anyhow::ensure!(
             crate::proto::hash_window_fits(off, len, block),
             "invalid hash window"
         );
         let target = self.destination_mutation_target(partial.path, partial.guard)?;
+        if !final_basis {
+            self.comparison_window = None;
+        }
+        if final_basis {
+            let location = target.location();
+            let file = if let Some(file) = self.cached_clone(location.clone(), attempt, false)? {
+                file
+            } else {
+                let Ok(file) = target.root.open_regular_read(&target.relative) else {
+                    // The old destination is only an optional basis. If it
+                    // disappears, force every block in this window from source.
+                    return Ok(vec![
+                        self.hash_policy.algorithm.hash(&[]);
+                        u64::from(len).div_ceil(block) as usize
+                    ]);
+                };
+                self.cache_file(location.clone(), attempt, false, file.try_clone()?);
+                file
+            };
+            let metadata = file.metadata()?;
+            let mut window = self
+                .comparison_window
+                .take()
+                .filter(|window| {
+                    window.location == location
+                        && window.copy_id == *partial.id
+                        && window.attempt == attempt
+                })
+                .unwrap_or_else(|| ComparisonWindow {
+                    location,
+                    copy_id: *partial.id,
+                    attempt,
+                    blocks: Vec::new(),
+                    sparse: metadata.blocks().saturating_mul(512) < metadata.len(),
+                });
+            let retained: u64 = window
+                .blocks
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum();
+            anyhow::ensure!(
+                retained + u64::from(len) <= MAX_READ_BYTES,
+                "too many unconsumed comparison bytes"
+            );
+            anyhow::ensure!(
+                window
+                    .blocks
+                    .iter()
+                    .all(|(pos, bytes)| *pos >= off + u64::from(len)
+                        || pos + bytes.len() as u64 <= off),
+                "overlapping comparison windows"
+            );
+            let mut hashes = Vec::new();
+            let end = off + u64::from(len);
+            let mut pos = off;
+            while pos < end {
+                let n = (end - pos).min(block) as usize;
+                let mut bytes = vec![0; n];
+                let mut got = 0;
+                {
+                    let reading = self
+                        .operation
+                        .span(crate::transfer_observations::Stage::SourceRead);
+                    while got < n {
+                        match file.read_at(&mut bytes[got..], pos + got as u64) {
+                            Ok(0) => break,
+                            Ok(n) => got += n,
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    reading.bytes(got as u64);
+                }
+                let _hash = self
+                    .operation
+                    .span(crate::transfer_observations::Stage::Hashing);
+                if got == n {
+                    hashes.push(self.hash_policy.algorithm.hash(&bytes));
+                    window.blocks.push((pos, bytes));
+                } else {
+                    // Missing donor bytes can never be confirmed as a match.
+                    hashes.push(self.hash_policy.algorithm.hash(&[]));
+                }
+                pos += n as u64;
+            }
+            self.comparison_window = Some(window);
+            return Ok(hashes);
+        }
+
         let (relative, label, file) =
             with_rooted_partial(&target, partial.id, |relative, label| {
                 let location = FileLocation::Rooted {
@@ -1584,6 +1708,34 @@ impl FsOps {
             pos += n as u64;
         }
         Ok(hashes)
+    }
+
+    fn reuse_compared_range(
+        &mut self,
+        partial: PartialTarget<'_>,
+        attempt: u32,
+        off: u64,
+        len: u32,
+    ) -> Result<()> {
+        let target = self.destination_mutation_target(partial.path, partial.guard)?;
+        let window = self
+            .comparison_window
+            .as_mut()
+            .context("no retained comparison window")?;
+        anyhow::ensure!(
+            window.location == target.location()
+                && window.copy_id == *partial.id
+                && window.attempt == attempt,
+            "comparison window belongs to another file or attempt"
+        );
+        let index = window
+            .blocks
+            .iter()
+            .position(|(pos, bytes)| *pos == off && bytes.len() == len as usize)
+            .context("no retained comparison block at this offset and length")?;
+        let (_, bytes) = window.blocks.remove(index);
+        let sparse = self.sparse || window.sparse;
+        self.write_range_bytes(partial, false, attempt, off, &bytes, sparse)
     }
 
     pub(crate) fn begin_source_range(&mut self, _range: std::ops::Range<u64>) {
@@ -1697,8 +1849,27 @@ impl FsOps {
         if self.hash_policy.transfer_integrity && actual_hash != hash {
             bail!("block hash mismatch on receive @{off}");
         }
+        self.write_range_bytes(target, inplace, attempt, off, data, self.sparse)
+    }
+
+    fn write_range_bytes(
+        &mut self,
+        target: PartialTarget<'_>,
+        inplace: bool,
+        attempt: u32,
+        off: u64,
+        data: &[u8],
+        sparse: bool,
+    ) -> Result<()> {
+        let operation = self.operation.clone();
         let rooted = self.destination_mutation_target(target.path, target.guard)?;
-        let sparse = self.sparse;
+        if let Some(window) = self.comparison_window.as_mut().filter(|window| {
+            window.location == rooted.location()
+                && window.copy_id == *target.id
+                && window.attempt == attempt
+        }) {
+            window.blocks.retain(|(pos, _)| *pos != off);
+        }
         let mut write = |relative: &RelativePath, label: &Path| {
             let file = self.cached_rooted(label, &rooted.root, relative, attempt, !inplace)?;
             let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
@@ -2345,8 +2516,9 @@ impl FsOps {
                     *attempt,
                     true,
                 )
-                .map(|_| Response::Ok),
+                .map(|(_, compare_final)| Response::BasisStaged { compare_final }),
             Request::HashWindow {
+                final_basis,
                 path,
                 copy_id,
                 off,
@@ -2365,8 +2537,28 @@ impl FsOps {
                     *len,
                     *block,
                     *attempt,
+                    *final_basis,
                 )
                 .map(Response::Hashes),
+            Request::ReuseComparedRange {
+                path,
+                copy_id,
+                attempt,
+                off,
+                len,
+                guard,
+            } => self
+                .reuse_compared_range(
+                    PartialTarget {
+                        path,
+                        id: copy_id,
+                        guard: guard.as_ref(),
+                    },
+                    *attempt,
+                    *off,
+                    *len,
+                )
+                .map(|_| Response::Ok),
             Request::ReadComparedRange {
                 path,
                 source,

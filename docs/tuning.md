@@ -193,12 +193,15 @@ hashes, payload checks and publication-recovery checks stay in effect. Partial-f
 in every mode: matching bytes from interrupted copies can still be reused,
 even with `off`. The setting controls reuse of the final destination, not partials.
 
-For ordinary staged updates, syq first populates a private partial from the
-old destination, using reflinks where available. It then compares bounded
-windows and reads each source block once, sending only different bytes. This
-can replace the destination even when all its bytes match but its metadata
-differs. Explicit `--hash` and protected-existing-file policies retain their
-read-only content check before staging.
+For staged updates, syq prefers a reflink of the old destination. When cloning
+is unavailable, it retains a bounded window of destination bytes while comparing
+them, then writes matching retained bytes or different source bytes. This comparison
+reads each source block once; retained destination bytes are never reread after
+comparison. Explicit whole-file checks can require additional reads.
+Without cloning, this needs buffers for both sides of the current window.
+Ordinary updates can replace the destination even when all its bytes match but
+its metadata differs. Explicit `--hash` and protected-existing-file policies
+retain their read-only content check before staging.
 
 This setting does not select a sequential writer. To isolate comparison and
 reuse costs while keeping range transfers, compare
@@ -238,6 +241,9 @@ threshold follows the effective request size, including bandwidth limits.
 `copy-path=streaming` forces streaming and disables whole-file and small-file
 shortcuts. `copy-path=auto-streaming` keeps those shortcuts and streams the
 remaining ranges.
+
+Staged block reuse and partial resume use bounded comparison requests in every
+copy-path mode, including `streaming`.
 
 An explicit `request-size` also sets the streaming block size; bandwidth and
 receiver limits may reduce it. Setting `pipeline-depth` disables automatic
