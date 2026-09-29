@@ -16,9 +16,23 @@ fn policy() -> crate::receipt::ReceiptPolicy {
         },
     }
 }
-/// What the requesting server sends for `command`.
+/// What the requesting server sends for `command`: it parses the command as a
+/// command line, reads its ignore and mapping files, then builds the request.
 fn copy_request(command: &[Vec<u8>]) -> crate::destination::CopyRequest {
-    crate::restricted::named_request(&parse(command).unwrap(), policy()).unwrap()
+    let argv: Vec<OsString> = command
+        .iter()
+        .map(|arg| OsString::from_vec(arg.clone()))
+        .collect();
+    let mut args = crate::cli::Args::parse_args(&argv).unwrap();
+    args.normalize();
+    crate::persistence::mark_explicit_scope(&mut args);
+    args.read_copy_inputs().unwrap();
+    if args.native_mapping.is_some() {
+        args.mapping_contents = Some(std::sync::Arc::new(
+            std::sync::Arc::unwrap_or_clone(crate::mapping::load(&args).unwrap()).input,
+        ));
+    }
+    crate::restricted::named_request(&args, policy()).unwrap()
 }
 fn storage_request(command: &[Vec<u8>]) -> crate::s3::authorization::Request {
     let args = parse(command).unwrap();
@@ -60,7 +74,7 @@ fn copy_requests_must_match_the_command_shown() {
 }
 
 #[test]
-fn server_files_may_only_supply_their_own_narrowing_inputs() {
+fn server_files_supply_only_their_own_contents() {
     // Parsing on this machine must not read the server's files.
     let with_files = command(&[
         "cp",
@@ -73,24 +87,130 @@ fn server_files_may_only_supply_their_own_narrowing_inputs() {
         "--into",
         "runs",
     ]);
-    let mut request = copy_request(&with_files);
+    let mut request =
+        crate::restricted::named_request(&parse(&with_files).unwrap(), policy()).unwrap();
     request.constraints.filters.ignore = vec!["*.tmp".into()];
     request.constraints.mapping = Some(crate::mapping::Authorization::from_contents(b"{}"));
     check_copy(&with_files, &request, Some("laptop"), None).unwrap();
     request.copy.policy.deletion = crate::delegation::DeletionPolicy::DeleteDestinationOnly;
     assert!(check_copy(&with_files, &request, Some("laptop"), None).is_err());
 
-    // Without those options, ignore rules come only from the command.
+    // Without a mapping file, the server cannot add a mapping.
     let inline = command(&[
         "cp", "--src", "results", "--ignore", "*.log", "--to", "@laptop",
     ]);
     let mut request = copy_request(&inline);
+    assert_eq!(request.constraints.filters.ignore, ["*.log"]);
     check_copy(&inline, &request, Some("laptop"), None).unwrap();
-    request.constraints.filters.ignore = vec!["*.tmp".into()];
-    assert!(check_copy(&inline, &request, Some("laptop"), None).is_err());
-    let mut request = copy_request(&inline);
     request.constraints.mapping = Some(crate::mapping::Authorization::from_contents(b"{}"));
     assert!(check_copy(&inline, &request, Some("laptop"), None).is_err());
+}
+
+#[test]
+fn inline_ignore_rules_are_enforced_in_command_order() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let file = temp.path().join("rules");
+    std::fs::write(&file, "*.tmp\ncache/\n").unwrap();
+    let file = file.to_str().unwrap();
+    let with_file = command(&[
+        "cp",
+        "--src",
+        "tree",
+        "--ignore",
+        "a",
+        "--ignore-from",
+        file,
+        "--ignore",
+        "b",
+        "--to",
+        "@laptop",
+        "--into",
+        "runs",
+        "--prune",
+        "--max-delete",
+        "5",
+    ]);
+    let request = copy_request(&with_file);
+    assert_eq!(
+        request.constraints.filters.ignore,
+        ["a", "*.tmp", "cache/", "b"]
+    );
+    check_copy(&with_file, &request, Some("laptop"), None).unwrap();
+    for (lines, accepted) in [
+        (&["a", "b"][..], true),
+        (&["a", "anything", "b"], true),
+        (&["a", "*.tmp"], false),
+        (&["*.tmp", "b"], false),
+        (&["b", "a"], false),
+        (&["a", "b", "extra"], false),
+        (&["extra", "a", "b"], false),
+        (&[], false),
+    ] {
+        let mut changed = request.clone();
+        changed.constraints.filters.ignore = lines.iter().map(|line| line.to_string()).collect();
+        assert_eq!(
+            check_copy(&with_file, &changed, Some("laptop"), None).is_ok(),
+            accepted,
+            "{lines:?}"
+        );
+    }
+
+    let inline = command(&[
+        "cp", "--src", "tree", "--ignore", "a", "--ignore", "b", "--to", "@laptop",
+    ]);
+    let request = copy_request(&inline);
+    check_copy(&inline, &request, Some("laptop"), None).unwrap();
+    for lines in [&["a"][..], &["b", "a"], &["a", "b", "c"], &[]] {
+        let mut changed = request.clone();
+        changed.constraints.filters.ignore = lines.iter().map(|line| line.to_string()).collect();
+        assert!(
+            check_copy(&inline, &changed, Some("laptop"), None).is_err(),
+            "{lines:?}"
+        );
+    }
+}
+
+#[test]
+fn derivation_ignores_this_machines_files() {
+    // A source path that is a pipe here names an ordinary file on the server.
+    let temp = crate::test_support::tempdir().unwrap();
+    let fifo = temp.path().join("fifo");
+    let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let fifo = fifo.to_str().unwrap();
+    let copy = command(&["cp", "--src", fifo, "--to", "@laptop", "--into", "runs"]);
+    let request = crate::restricted::named_request(
+        &parse_with(&copy, crate::cli::SourceProbe::AssumeFiles).unwrap(),
+        policy(),
+    )
+    .unwrap();
+    check_copy(&copy, &request, Some("laptop"), None).unwrap();
+
+    // A source that is a pipe on the server becomes a stream upload there.
+    let upload = command(&[
+        "cp",
+        "--src",
+        "/server/pipe",
+        "--to",
+        "s3://bucket",
+        "--as",
+        "log",
+        "--auth-from",
+        "@laptop",
+    ]);
+    let args = parse_with(&upload, crate::cli::SourceProbe::AssumePipes).unwrap();
+    let plan = args.descriptor_copy.as_ref().unwrap();
+    let stream = crate::s3::stream::authorization_request(
+        &args,
+        args.s3.as_ref().unwrap(),
+        plan.key.as_deref().unwrap(),
+        plan.placement.existence,
+    );
+    check_storage(&upload, &stream, "laptop").unwrap();
+    check_storage(&upload, &storage_request(&upload), "laptop").unwrap();
+    let mut changed = stream.clone();
+    changed.scopes[0].key = "other".into();
+    assert!(check_storage(&upload, &changed, "laptop").is_err());
 }
 
 #[test]
@@ -257,7 +377,7 @@ fn displayed_commands_escape_unusual_text_and_mark_server_files() {
         );
     }
     assert_eq!(
-        render(&shown, str::to_owned, |word| format!("[{word}]"))
+        render(&shown, None, str::to_owned, |word| format!("[{word}]"))
             .split(' ')
             .filter(|word| word.starts_with('['))
             .collect::<Vec<_>>(),
@@ -332,6 +452,17 @@ fn server_side_preparation_matches_derivation_for_many_copy_options() {
             "--ignore-from",
             ignore,
         ],
+        &["--src", "tree", "--to", "@laptop", "--ignore", "*.log"],
+        &[
+            "--src",
+            "tree",
+            "--ignore-from",
+            ignore,
+            "--ignore",
+            "keep/",
+            "--to",
+            "@laptop",
+        ],
         &["--mapping", mapping, "--to", "@laptop", "--into", "runs"],
         &["--src", "tree", "--to", "@laptop", "--dry-run"],
         &["--src", "tree", "--to", "@laptop", "--no-compress"],
@@ -346,17 +477,7 @@ fn server_side_preparation_matches_derivation_for_many_copy_options() {
     ];
     for case in cases {
         let command = command(&[&["cp"][..], case].concat());
-        let mut args = parse(&command).unwrap_or_else(|e| panic!("{case:?}: {e:#}"));
-        crate::persistence::mark_explicit_scope(&mut args);
-        args.read_copy_inputs().unwrap();
-        if args.native_mapping.is_some() {
-            args.mapping_contents = Some(std::sync::Arc::new(
-                std::sync::Arc::unwrap_or_clone(crate::mapping::load(&args).unwrap()).input,
-            ));
-        }
-        let request = crate::restricted::named_request(&args, policy())
-            .unwrap_or_else(|e| panic!("{case:?}: {e:#}"));
-        check_copy(&command, &request, Some("laptop"), None)
+        check_copy(&command, &copy_request(&command), Some("laptop"), None)
             .unwrap_or_else(|e| panic!("{case:?}: {e:#}"));
     }
 }
@@ -381,4 +502,20 @@ fn displayed_commands_hide_customer_encryption_keys() {
     );
     assert!(text.contains("<redacted>\" --s3-header"), "{text}");
     assert!(text.contains("bWQ1") && text.contains("STANDARD"), "{text}");
+}
+
+#[test]
+fn long_commands_are_shortened_in_desktop_prompts() {
+    let mut argv = vec!["cp".to_owned()];
+    for index in 0..10_000 {
+        argv.extend(["--src".to_owned(), format!("source-{index}")]);
+    }
+    argv.extend(["--to".into(), "@laptop".into()]);
+    let shown = display(&command(
+        &argv.iter().map(String::as_str).collect::<Vec<_>>(),
+    ));
+    let short = render(&shown, Some(400), str::to_owned, str::to_owned);
+    assert!(short.chars().count() < 450, "{}", short.len());
+    assert!(short.ends_with("… (full command in Details)"));
+    assert!(render(&shown, None, str::to_owned, str::to_owned).ends_with("--to @laptop"));
 }

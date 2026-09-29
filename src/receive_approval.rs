@@ -14,6 +14,9 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(300);
+/// Desktop prompts show about this much of a requesting command; Details and
+/// `persist receive pending` show all of it.
+const DESKTOP_COMMAND_CHARS: usize = 400;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -169,10 +172,11 @@ impl Summary {
     /// the server reads and this machine cannot check.
     fn command_text(
         &self,
+        limit: Option<usize>,
         plain: impl Fn(&str) -> String,
         server_input: impl Fn(&str) -> String,
     ) -> String {
-        crate::approval_command::render(&self.command, plain, server_input)
+        crate::approval_command::render(&self.command, limit, plain, server_input)
     }
     /// Keep the decision visible; the full description remains available in
     /// the macOS Details view and in `persist receive pending` on both platforms.
@@ -190,7 +194,7 @@ impl Summary {
         if self.command.is_empty() {
             return text(&body);
         }
-        let command = self.command_text(text, |word| {
+        let command = self.command_text(Some(DESKTOP_COMMAND_CHARS), text, |word| {
             if markup {
                 format!("<i>{}</i>", escape_markup(word))
             } else {
@@ -228,7 +232,7 @@ impl Summary {
         } else {
             format!(
                 "\nServer command: {}",
-                self.command_text(str::to_owned, server_input)
+                self.command_text(None, str::to_owned, server_input)
             )
         };
         let body = match &self.details {

@@ -596,6 +596,35 @@ impl Args {
         self.native_follow || self.native_follow_dst
     }
 
+    /// Parse another machine's `cp` or `rm` command without inspecting this
+    /// machine's filesystem. Whether a pathname source is a pipe depends on the
+    /// requesting machine, so `sources` states the assumption.
+    pub(crate) fn parse_requesting_command(
+        argv: &[OsString],
+        sources: SourceProbe,
+    ) -> Result<Args> {
+        match argv.first().and_then(|arg| arg.to_str()) {
+            Some("cp") => {
+                reject_detached_dash_native_values(&argv[1..])?;
+                parse_native_copy_with(&argv[1..], sources)
+            }
+            Some("rm") => parse_native(&argv[1..], Interface::NativeRm),
+            _ => bail!("requests must come from syq cp or syq rm"),
+        }
+    }
+
+    /// Ignore inputs in command order: inline patterns, and `None` for each
+    /// file whose lines are read in its place.
+    pub(crate) fn ignore_template(&self) -> Vec<Option<&str>> {
+        self.pending_ignore_inputs
+            .iter()
+            .map(|input| match input {
+                IgnoreInput::Pattern(pattern) => Some(pattern.as_str()),
+                IgnoreInput::File(_) => None,
+            })
+            .collect()
+    }
+
     /// Parse the command line. Native copy defers reading ignore sources until
     /// after return handoff, retaining their order among inline patterns.
     pub fn parse_args(argv: &[OsString]) -> Result<Args> {
@@ -1772,8 +1801,20 @@ fn descriptor_path(path: &std::path::Path) -> Option<i32> {
     std::str::from_utf8(number).ok()?.parse().ok()
 }
 
+/// How parsing decides whether a pathname source is a pipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceProbe {
+    /// Inspect this machine's filesystem.
+    Filesystem,
+    /// Assume regular files, directories, or symlinks.
+    AssumeFiles,
+    /// Assume a pipe.
+    AssumePipes,
+}
+
 fn selected_stream_source(
     copy: &NativeCopyFields,
+    probe: SourceProbe,
 ) -> Result<Option<(crate::descriptor_copy::fd::Source, Option<OsString>)>> {
     use crate::descriptor_copy::fd::Source;
     use std::os::unix::fs::FileTypeExt;
@@ -1810,7 +1851,9 @@ fn selected_stream_source(
         let candidate = if let Some(fd) = descriptor_path(&path).filter(|_| root.is_none()) {
             Some((Source::Descriptor(fd), None))
         } else {
-            let is_fifo = if root.is_some() {
+            let is_fifo = if probe != SourceProbe::Filesystem {
+                probe == SourceProbe::AssumePipes
+            } else if root.is_some() {
                 matches!(crate::descriptor_copy::resolve_source(path.as_os_str().as_bytes(), root.as_deref(), follow),
                     Ok(crate::rooted::PinnedPath::Leaf(leaf)) if leaf.metadata().is_fifo())
             } else {
@@ -2131,6 +2174,10 @@ fn parse_descriptor_copy(
 }
 
 fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
+    parse_native_copy_with(argv, SourceProbe::Filesystem)
+}
+
+fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
     let mut command = crate::help::filesystem(NativeCopyCommand::command());
@@ -2162,7 +2209,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     })?;
     validate_native_copy_argument_order(&matches)?;
     let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
-    let stream = selected_stream_source(&parsed.copy)?;
+    let stream = selected_stream_source(&parsed.copy, sources)?;
     if parsed.copy.src_fd.is_some() || parsed.copy.as_fd.is_some() || stream.is_some() {
         return parse_descriptor_copy(parsed, &matches, stream);
     }

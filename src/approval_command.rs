@@ -19,26 +19,53 @@ pub(crate) fn current() -> Result<Vec<Vec<u8>>> {
         .collect())
 }
 
-/// Parse a requesting command without reading its input files, descriptors, or
-/// this machine's environment options.
+/// Parse a requesting command without reading its input files, descriptors,
+/// this machine's filesystem, or its environment options.
 pub(crate) fn parse(command: &[Vec<u8>]) -> Result<crate::cli::Args> {
+    parse_with(command, crate::cli::SourceProbe::AssumeFiles)
+}
+
+fn parse_with(command: &[Vec<u8>], sources: crate::cli::SourceProbe) -> Result<crate::cli::Args> {
     anyhow::ensure!(
         command.iter().map(|arg| arg.len() + 1).sum::<usize>() <= MAX_COMMAND_BYTES,
         "requesting command is too long"
-    );
-    anyhow::ensure!(
-        matches!(command.first().map(Vec::as_slice), Some(b"cp" | b"rm")),
-        "requests must come from syq cp or syq rm"
     );
     let argv: Vec<OsString> = command
         .iter()
         .map(|arg| OsString::from_vec(arg.clone()))
         .collect();
-    let mut args = crate::cli::Args::parse_args(&argv)
+    let mut args = crate::cli::Args::parse_requesting_command(&argv, sources)
         .map_err(|error| anyhow::anyhow!("{error:#}"))
         .context("cannot parse the requesting command")?;
     args.normalize();
     Ok(args)
+}
+
+/// Whether `lines` consists of the command's inline ignore patterns in order,
+/// with any lines at the places where it reads ignore files.
+fn follows_ignore_template(template: &[Option<&str>], lines: &[String]) -> bool {
+    // reachable[j]: the template items so far can end just before line j.
+    let mut reachable = vec![false; lines.len() + 1];
+    reachable[0] = true;
+    for item in template {
+        let mut next = vec![false; lines.len() + 1];
+        match item {
+            Some(pattern) => {
+                for (j, line) in lines.iter().enumerate() {
+                    next[j + 1] = reachable[j] && line == pattern;
+                }
+            }
+            None => {
+                let mut earlier = false;
+                for j in 0..=lines.len() {
+                    earlier |= reachable[j];
+                    next[j] = earlier;
+                }
+            }
+        }
+        reachable = next;
+    }
+    reachable[lines.len()]
 }
 
 fn ensure_same<T: serde::Serialize>(requested: &T, derived: &T) -> Result<()> {
@@ -76,26 +103,45 @@ pub(crate) fn check_copy(
     }
     let mut derived =
         crate::restricted::named_request(&args, request.constraints.receipt_policy.clone())?;
-    // The server reads these files; this machine cannot. Both only narrow the
-    // copy: a mapping limits the destination paths, and ignore rules protect
-    // matching destination entries.
+    // The server reads these files; this machine cannot. A mapping only limits
+    // the destination paths. Ignore file lines take their places among the
+    // command's own patterns, which must all be present in order.
     if args.native_mapping.is_some() {
         derived.constraints.mapping = request.constraints.mapping.clone();
     }
-    if !args.ignore_from.is_empty() {
-        derived.constraints.filters.ignore = request.constraints.filters.ignore.clone();
-    }
+    anyhow::ensure!(
+        follows_ignore_template(&args.ignore_template(), &request.constraints.filters.ignore),
+        "the request's ignore rules do not match the command that produced it"
+    );
+    derived.constraints.filters.ignore = request.constraints.filters.ignore.clone();
     ensure_same(request, &derived)
 }
 
 /// Storage authorization. The server may take the endpoint from its
-/// environment when the command does not name one.
+/// environment when the command does not name one. A pathname source is a
+/// stream upload when it is a pipe on the server, so either reading matches.
 pub(crate) fn check_storage(
     command: &[Vec<u8>],
     request: &crate::s3::authorization::Request,
     receiver: &str,
 ) -> Result<()> {
-    let args = parse(command)?;
+    use crate::cli::SourceProbe;
+    let files = check_storage_as(command, request, receiver, SourceProbe::AssumeFiles);
+    if files.is_err()
+        && check_storage_as(command, request, receiver, SourceProbe::AssumePipes).is_ok()
+    {
+        return Ok(());
+    }
+    files
+}
+
+fn check_storage_as(
+    command: &[Vec<u8>],
+    request: &crate::s3::authorization::Request,
+    receiver: &str,
+    sources: crate::cli::SourceProbe,
+) -> Result<()> {
+    let args = parse_with(command, sources)?;
     let options = args
         .s3
         .as_ref()
@@ -174,16 +220,25 @@ fn secret_header(header: &[u8]) -> bool {
 }
 
 /// Join displayed arguments, styling the values of options whose files are read
-/// on the server: this machine cannot see or check their contents.
+/// on the server: this machine cannot see or check their contents. With a
+/// `limit`, keep about that many characters, so a long command cannot push the
+/// rest of a prompt out of view.
 pub(crate) fn render(
     display: &[String],
+    limit: Option<usize>,
     plain: impl Fn(&str) -> String,
     server_input: impl Fn(&str) -> String,
 ) -> String {
     const OPTIONS: [&str; 2] = ["--mapping", "--ignore-from"];
     let mut words = Vec::with_capacity(display.len());
     let mut value = false;
+    let mut length = 0;
     for word in display {
+        length += word.chars().count() + 1;
+        if limit.is_some_and(|limit| length > limit) {
+            words.push(plain("… (full command in Details)"));
+            break;
+        }
         let inline = OPTIONS.iter().any(|option| {
             word.strip_prefix(option)
                 .is_some_and(|v| v.starts_with('='))
