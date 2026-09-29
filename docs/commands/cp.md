@@ -62,6 +62,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 | Argument / option | Meaning |
 |---|---|
+| `--resume <JOB>` | Resume a previous named job; sources and destinations come from its saved command |
 | `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Reject detected content differences; trusts matching size and mtime unless --hash is set<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Keep newer destinations; otherwise update differing contents<br><br>[default: update] |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
@@ -150,12 +151,6 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--progress` | Show progress even when stderr is not a terminal |
 | `--no-progress` | Never show the human progress display |
 | `--stats` | Print transfer statistics, worker waits, endpoint operations and CPU at the end |
-
-## Other options
-
-| Argument / option | Meaning |
-|---|---|
-| `--resume <JOB>` | Resume a previous named job; sources and destinations come from its saved command |
 
 ## Help and version
 

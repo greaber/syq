@@ -170,8 +170,22 @@ fn check_interrupted_directory(copy_permissions: bool) {
         command
             .current_dir(root)
             .env("XDG_CACHE_HOME", root.join("cache"))
-            .env("SYQ_TEST_PARTIAL_READY_FILE", &ready)
-            .env("SYQ_TEST_PARTIAL_CONTINUE_FILE", root.join("continue"))
+            .env(
+                if copy_permissions {
+                    "SYQ_TEST_PARTIAL_READY_FILE"
+                } else {
+                    "SYQ_TEST_FINALIZE_READY_FILE"
+                },
+                &ready,
+            )
+            .env(
+                if copy_permissions {
+                    "SYQ_TEST_PARTIAL_CONTINUE_FILE"
+                } else {
+                    "SYQ_TEST_FINALIZE_CONTINUE_FILE"
+                },
+                root.join("continue"),
+            )
             .args([
                 "--srcs-in",
                 "source",
@@ -245,4 +259,48 @@ fn check_interrupted_directory(copy_permissions: bool) {
     for directory in ["source/nested", "destination/nested", "baseline/nested"] {
         fs::set_permissions(root.join(directory), fs::Permissions::from_mode(0o700)).unwrap();
     }
+}
+
+#[test]
+fn resume_uses_saved_mapping_when_the_original_manifest_is_replaced() {
+    let temp = test_support::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join("destination")).unwrap();
+    fs::create_dir(root.join("source")).unwrap();
+    for name in ["a", "b", "unrelated"] {
+        fs::write(root.join("source").join(name), name.as_bytes()).unwrap();
+    }
+    fs::write(root.join("destination/b"), b"obstacle").unwrap();
+    let line = |name: &str| {
+        serde_json::json!({
+            "src": {"encoding":"utf-8", "value":name},
+            "dst": {"encoding":"utf-8", "value":name},
+        })
+        .to_string()
+            + "\n"
+    };
+    fs::write(root.join("mapping"), line("a") + &line("b")).unwrap();
+    let first = run(
+        root,
+        &[
+            "cp",
+            "-C",
+            "source",
+            "--mapping",
+            "mapping",
+            "--into",
+            "destination",
+            "--if-exists=error",
+            "--results",
+            "first.jsonl",
+        ],
+    );
+    assert!(!first.status.success(), "{first:?}");
+    let id = job_id(root, "first.jsonl");
+    fs::write(root.join("mapping"), line("unrelated")).unwrap();
+    fs::remove_file(root.join("destination/b")).unwrap();
+    assert_success(run(root, &["cp", "--resume", &id]));
+    assert_eq!(fs::read(root.join("destination/a")).unwrap(), b"a");
+    assert_eq!(fs::read(root.join("destination/b")).unwrap(), b"b");
+    assert!(!root.join("destination/unrelated").exists());
 }

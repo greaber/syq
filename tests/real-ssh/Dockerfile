@@ -104,5 +104,6 @@ ENTRYPOINT ["/usr/local/libexec/syq-real-ssh-entrypoint"]
 
 COPY tests/real-ssh/test-stream-mappings.py /usr/local/libexec/syq-test-stream-mappings.py
 
+COPY tests/real-ssh/test-job-resume.py /usr/local/libexec/syq-test-job-resume.py
 COPY tests/real-ssh/test-map-generation.py /usr/local/libexec/syq-test-map-generation.py
 COPY tests/real-ssh/test-metadata.py /usr/local/libexec/syq-test-metadata.py

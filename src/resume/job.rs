@@ -47,13 +47,15 @@ pub(super) enum Record {
     Invalid,
 }
 
+type RemovalIdentity = (u64, u64, Kind, Option<(i64, u32)>);
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct EntryState {
     pub observed: bool,
     pub original: Option<Entry>,
     pub published: Option<(u64, u64)>,
     pub directory_metadata: Option<(Meta, u8)>,
-    pub removal: Option<(u64, u64, Kind, Option<(i64, u32)>)>,
+    pub removal: Option<RemovalIdentity>,
     pub removed: bool,
 }
 
@@ -240,6 +242,9 @@ impl Job {
         })
     }
     pub fn save_inputs(&self, args: &mut crate::cli::Args) -> Result<()> {
+        if self.state.lock().unwrap().replay.inputs.is_some() {
+            return Ok(());
+        }
         args.read_copy_inputs()?;
         let mapping = if args.native_mapping.is_some() {
             let parsed = crate::mapping::load(args)?;
@@ -344,11 +349,11 @@ impl Job {
             values
                 .into_iter()
                 .filter(|(path, _, _)| {
-                    !state
+                    state
                         .replay
                         .entries
                         .get(path)
-                        .is_some_and(|entry| entry.directory_metadata.is_some())
+                        .is_none_or(|entry| entry.directory_metadata.is_none())
                 })
                 .map(|(path, meta, flags)| Record::DirectoryMetadata {
                     path: Bytes::new(&path),
@@ -433,11 +438,11 @@ impl Job {
             entries
                 .into_iter()
                 .filter(|(path, ..)| {
-                    !state
+                    state
                         .replay
                         .entries
                         .get(path)
-                        .is_some_and(|entry| entry.removal.is_some())
+                        .is_none_or(|entry| entry.removal.is_none())
                 })
                 .map(|(path, dev, ino, kind, ctime)| Record::RemoveIntent {
                     path: Bytes::new(&path),
@@ -525,6 +530,26 @@ impl Job {
     }
 }
 
+fn id_string(id: crate::proto::CopyId) -> String {
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+fn parse_id(id: &str) -> Result<crate::proto::CopyId> {
+    if !super::store::valid_id(id) {
+        bail!("invalid job ID");
+    }
+    let mut result = [0; 16];
+    for (index, byte) in result.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&id[index * 2..index * 2 + 2], 16)?;
+    }
+    Ok(result)
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,25 +584,5 @@ mod tests {
         job.complete();
         drop(job);
         assert!(Job::open_at(&base, &id).is_err());
-    }
-}
-
-fn id_string(id: crate::proto::CopyId) -> String {
-    id.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-fn parse_id(id: &str) -> Result<crate::proto::CopyId> {
-    if !super::store::valid_id(id) {
-        bail!("invalid job ID");
-    }
-    let mut result = [0; 16];
-    for (index, byte) in result.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&id[index * 2..index * 2 + 2], 16)?;
-    }
-    Ok(result)
-}
-
-impl Drop for Job {
-    fn drop(&mut self) {
-        self.flush();
     }
 }

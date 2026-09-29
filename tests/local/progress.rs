@@ -403,6 +403,13 @@ fn progress_bar_slow_copy_stays_on_one_line_and_leaves_final_counts() {
     assert!(out.status.success(), "{out:?}");
     assert_eq!(read(&t.path("dst")), data);
     let stderr = String::from_utf8(out.stderr).unwrap();
+    let (job, stderr) = stderr
+        .split_once('\n')
+        .expect("job announcement precedes progress");
+    assert!(
+        job.starts_with("syq: job ") && job.contains("resume with syq cp --resume "),
+        "{job}"
+    );
     assert!(
         stderr.contains("100%  done  2.00 MiB/2.00 MiB"),
         "{stderr:?}"
@@ -444,7 +451,17 @@ fn progress_bar_is_opt_in_for_pipes_and_disabled_by_no_progress() {
             .run()
             .unwrap();
         assert!(out.status.success(), "{out:?}");
-        assert!(out.stderr.is_empty(), "{dst}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if dst == "quiet" {
+            assert!(stderr.is_empty(), "{dst}: {out:?}");
+        } else {
+            assert!(stderr.starts_with("syq: job "), "{dst}: {out:?}");
+            assert_eq!(
+                stderr.lines().count(),
+                1,
+                "no progress frames: {dst}: {out:?}"
+            );
+        }
     }
 }
 

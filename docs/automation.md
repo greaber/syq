@@ -111,7 +111,10 @@ must be upgraded to decode S3 endpoint kinds; local and SSH streams retain
 their existing representation.
 
 Copy runs also carry `prune` and `mapping`. Removal has one source endpoint
-regardless of selector count and omits those copy fields.
+regardless of selector count and omits those copy fields. An optional `job_id`
+identifies a saved resumption job shared across attempts; each attempt still has
+its own `run_id`. Keep the job ID before an interruption. Successful completion
+removes its records, and a later recording failure can make it unavailable.
 
 For S3 downloads using `--if-exists=keep`, unchanged-file totals
 include skipped symlinks selected through a prefix, but exclude symlinks named

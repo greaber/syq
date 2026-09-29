@@ -133,9 +133,10 @@ pub(crate) fn start(
     {
         return Ok(());
     }
-    // Remote coordinator/receiver integration is installed separately. Do not
-    // advertise a token whose execution state is not yet journaled here.
-    if args.detach
+    // These execution paths do not yet carry the per-entry journal. Never
+    // advertise a token until their mutation and limit accounting is connected.
+    if args.s3.is_some()
+        || args.detach
         || args.return_selection.is_some()
         || (args.interface == crate::cli::Interface::NativeCp
             && args
@@ -150,9 +151,6 @@ pub(crate) fn start(
     match Job::create(argv) {
         Ok(job) => {
             let job = std::sync::Arc::new(job);
-            if args.interface == crate::cli::Interface::NativeCp {
-                job.save_inputs(args)?;
-            }
             if job.available() {
                 if !args.quiet {
                     crate::output::diagnostic!(

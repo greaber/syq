@@ -250,25 +250,49 @@ Ignored paths are also protected from pruning.
 
 ## Resume an interrupted copy
 
-Rerunning a copy can reuse completed files and matching parts of interrupted
-files. Placement conditions and `--if-exists` apply on every run. A `-new`
-placement or `--if-exists=error` can therefore prevent a retry once entries have
-been created. Partial-file resume is independent of
-[`block-reuse`](tuning.md#compare-block-reuse-with-full-replacement), which controls
-comparison against an existing final destination. Unless `--inplace` is selected,
-syq assembles each updated file beside the destination and replaces it when
-complete. With `--inplace`, interrupted bytes are in the final file itself.
-With `--if-exists=error-if-different`, a retry rejects a differing final file:
-it cannot distinguish incomplete output from a pre-existing file that must remain
-untouched. Changing to `--if-exists=update` authorizes updates to all differing
-selected files; it does not preserve the original policy. Reusing matching parts
-follows the block-reuse policy.
+Local filesystem copies and copies with one ordinary SSH endpoint can supply a
+job ID. Resume the saved command without repeating its sources or destination:
 
-A copy may temporarily make a newly created directory writable while filling it.
-After interruption, syq cannot distinguish that directory from a pre-existing
-writable directory. A retry treats it as an existing container, so its permissions
-and modification time may differ from an uninterrupted copy. Explicit
-`--copy-metadata=permissions,mtime` makes those attributes match the source.
+```sh
+syq cp --srcs-in project --into-new backup
+# After an interruption, use the ID printed by that invocation:
+syq cp --resume JOB
+```
+
+`--resume` requires an existing job. Ordinary first attempts do not use it.
+S3, remote-to-remote, detached, return-destination and descriptor-stream copies
+do not supply named jobs.
+The job keeps the original working directory, selectors, mappings, ignore rules,
+placement and overwrite policy. New environment option defaults do not change
+it. Resumption rescans the sources; it does not save a source snapshot. It can
+reuse completed output and matching partial-file data, and recognizes files
+it created when enforcing `--if-exists=error` or a `-new` placement. Recorded
+pending directory metadata is applied when the copy finishes. A replaced or
+unrecorded destination can still cause a conflict; resumption does not authorize
+overwriting arbitrary existing files.
+
+You can change progress and verbosity, results output, resource limits,
+performance tuning and connection settings. You cannot change paths, mappings,
+filters, metadata choices or overwrite policy. For a job with pruning,
+`--max-delete` can change, and earlier reserved removals still count against it.
+For example, use `syq cp --resume JOB --max-delete 100` after checking a
+previously insufficient deletion limit. `--dry-run` previews another attempt
+without consuming the job. Each attempt needs a fresh `--results` file or
+`--results-fd`; output targets from the original command are not reused.
+
+Job recording is optional. If it is unavailable or fails, the operation
+continues and syq reports that it cannot supply a usable job. Records live in
+`$XDG_CACHE_HOME/syq/jobs`, or `$HOME/.cache/syq/jobs`, and grow with the entries
+observed. Successful jobs are removed; interrupted jobs remain until removed
+manually. Keep endpoint records as well when resuming an SSH removal. These
+records support process interruption, not a power-loss durability guarantee.
+
+Without a job, rerun the original command to reuse matching destination bytes.
+Its placement and overwrite policy are checked afresh, so a `-new` placement or
+`--if-exists=error` can reject output created by the earlier attempt. Unless
+`--inplace` is selected, syq assembles updated files beside their destinations;
+with `--inplace`, interrupted bytes are in the final file itself. Reuse of an
+existing final file follows the [block-reuse policy](tuning.md#compare-block-reuse-with-full-replacement).
 
 Partial files may remain after a successful retry. To remove them:
 

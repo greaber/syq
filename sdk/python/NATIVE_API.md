@@ -75,7 +75,10 @@ filesystem and remote checks happen in syq.
 
 ## cp
 
-`cp(*sources, **options)` → [CpResult](https://greaber.github.io/syq/python-results.html#cpresult) copies files. Choose one placement option unless every destination is a callback.
+`cp(*sources, **options)` → [CpResult](https://greaber.github.io/syq/python-results.html#cpresult) copies files. Choose one placement option unless every destination is a callback,
+or use `cp(resume=job_id)` to resume a saved job without sources or placement.
+Obtain the ID from `RunEvent.job_id` through `on_event`. Resumption keeps the
+saved scope and accepts only the CLI's operational overrides.
 In addition to the shared arguments above, it accepts:
 
 | Options | Values / purpose |
@@ -95,7 +98,7 @@ In addition to the shared arguments above, it accepts:
 | `open_noatime` | Boolean: request file reads without access-time updates; warns and continues if unavailable |
 | `sparse` | Boolean: turn written zero ranges into sparse holes on filesystem destinations |
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
-| `max_delete` | Nonnegative integer deletion limit; requires `prune=True` |
+| `max_delete` | Nonnegative integer deletion limit; requires `prune=True`, or a resumed job that already prunes |
 | `resource_limits` | Comma-separated ceilings that keep automatic tuning, e.g. `"bandwidth=10M,workers=4"`; a concurrency key conflicts with the same key in `performance_tuning` |
 | `performance_tuning` | Comma-separated overrides, e.g. `"workers=4"` or `"s3-objects=4,s3-parts-per-object=8,s3-requests=16"`; omitted means automatic |
 | `s3_endpoint`, `s3_region`, `s3_profile` | Endpoint URL, signing region, and AWS profile strings |
@@ -273,8 +276,9 @@ Directory and contents selectors reject a final symlink even with following
 enabled.
 
 `rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-results.html#rmresult) removes selected entries. Besides the shared
-arguments, it accepts `on`, `dry_run`, `performance_tuning`, `syq_path`,
+arguments, it accepts `resume`, `on`, `dry_run`, `performance_tuning`, `syq_path`,
 `no_bootstrap`, `pscope`, `on_event`, `results`, and `check` with the types above.
+`rm(resume=job_id)` restores the saved selectors.
 It supports local, ordinary SSH, and S3 endpoints. Command-restricted receivers
 reject removal. See [Remove files](https://greaber.github.io/syq/remove.html).
 
@@ -673,6 +677,7 @@ Invocation details. `started_at` is Unix seconds; `mode` is `"cp"` or `"rm"`.
 
 ```python
 run_id: str
+job_id: str | None
 started_at: int
 syq_version: str
 mode: str

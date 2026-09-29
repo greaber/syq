@@ -1463,6 +1463,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Post-parse validation lives inside the wrapper's error coverage, so
     // its failures still settle the stream with a failed terminal record.
     let mut args = args;
+    if let Some(job) = args.resume_job.clone() {
+        job.save_inputs(&mut args)?;
+    }
     // The executing build consumes stdin once, then shares immutable bytes with
     // authorization and remote coordination. Neither may reopen the manifest.
     let mapping_entries = if args.native_mapping.is_some() {

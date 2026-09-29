@@ -448,14 +448,13 @@ impl Pool {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|sender| sender.try_send(task));
+            .expect("native removal submitted work after shutdown")
+            .try_send(task);
         match queued {
-            Some(Ok(())) => return,
-            Some(Err(mpsc::TrySendError::Full(task)))
-            | Some(Err(mpsc::TrySendError::Disconnected(task))) => {
+            Ok(()) => return,
+            Err(mpsc::TrySendError::Full(task)) | Err(mpsc::TrySendError::Disconnected(task)) => {
                 process_task(self, task);
             }
-            None => unreachable!("native removal submitted work after shutdown"),
         }
         self.task_done();
     }

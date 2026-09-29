@@ -204,6 +204,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "follow_src"
                     | "follow_dst"
                     | "prune"
+                    | "resume"
                     | "help"
                     | "version"
             ) || (map && id == "include")
@@ -242,7 +243,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 | "receiver_max_bytes"
                 | "receiver_receipt" => "Remote-to-remote transfers",
                 "help" | "version" => "Help and version",
-                "dry_run" | "verbose" | "quiet" => "Preview and output",
+                "dry_run" | "verbose" | "quiet" | "resume" => "Preview and output",
                 _ => "Copy policy and filtering",
             }
         };
@@ -291,7 +292,7 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
         | "as_fd" | "mapping" => ("Destination and mapping", 1),
         "if_exists" | "ignore_existing" | "existing" | "update" | "copy_if" | "inplace"
-        | "prune" | "max_delete" => ("Updates and deletion", 2),
+        | "prune" | "max_delete" | "resume" => ("Updates and deletion", 2),
         "copy_metadata" | "sparse" | "open_noatime" | "follow" | "follow_src" | "follow_dst" => {
             ("Metadata and symlinks", 3)
         }

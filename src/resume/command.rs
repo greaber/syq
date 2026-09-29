@@ -212,6 +212,27 @@ mod tests {
     }
 
     #[test]
+    fn keeps_option_like_operands_after_double_dash() {
+        let saved =
+            Command::new(&words(&["cp", "--into", "destination", "--", "--results"])).unwrap();
+        let (restored, _) = saved
+            .arguments(&words(&["--results", "fresh.jsonl"]))
+            .unwrap();
+        assert_eq!(
+            restored,
+            words(&[
+                "cp",
+                "--into",
+                "destination",
+                "--results",
+                "fresh.jsonl",
+                "--",
+                "--results"
+            ])
+        );
+    }
+
+    #[test]
     fn preserves_non_utf8_paths() {
         let input = OsString::from_vec(b"file-\xff".to_vec());
         let saved = Command::new(&["rm".into(), input.clone()]).unwrap();

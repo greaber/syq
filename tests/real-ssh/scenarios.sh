@@ -246,6 +246,9 @@ for commit in (b'', b'C'):
     assert result.stdout == (payload if commit else b'local producer')
 PY_DESCRIPTORS
 
+printf 'case: named jobs across ordinary SSH\n'
+python3 /usr/local/libexec/syq-test-job-resume.py
+
 printf 'case: remote mapping generation\n'
 python3 /usr/local/libexec/syq-test-map-generation.py
 

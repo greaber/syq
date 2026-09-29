@@ -541,6 +541,9 @@ impl Worker {
             Response::Ok => None,
             other => bail!("unexpected publication reply: {other:?}"),
         };
+        if let (Some(record), Some(identity)) = (&self.opts.resume_job, identity) {
+            record.published([(job.dst.clone(), identity)]);
+        }
         self.record_hardlink_identity(idx, job, identity)
     }
 

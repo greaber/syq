@@ -19,7 +19,8 @@ pub(super) fn cache_directory() -> Result<PathBuf> {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .context("job recording needs HOME or an absolute XDG_CACHE_HOME")?;
+        .filter(|path| path.is_absolute())
+        .context("job recording needs an absolute HOME or XDG_CACHE_HOME")?;
     Ok(base.join("syq/jobs"))
 }
 
