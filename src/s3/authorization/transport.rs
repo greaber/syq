@@ -283,15 +283,12 @@ mod tests {
             },
             socket,
         ));
-        let signed =
-            "https://storage.example/fixture/key?tagging&versionId=known&X-Amz-Signature=fixture";
+        let signed = "https://storage.example/fixture/key?tagging&X-Amz-Signature=fixture";
         {
             let mut state = authorization.state.lock().unwrap();
             state.connection = None;
             state.requests.insert(
-                Unsigned::new("PUT", "key")
-                    .query("tagging", "")
-                    .query("versionId", "known"),
+                Unsigned::new("PUT", "key").query("tagging", ""),
                 signed.into(),
             );
         }
@@ -316,7 +313,6 @@ mod tests {
             .put_object_tagging()
             .bucket("fixture")
             .key("key")
-            .version_id("known")
             .tagging(
                 Tagging::builder()
                     .tag_set(Tag::builder().key("tag").value("value").build().unwrap())

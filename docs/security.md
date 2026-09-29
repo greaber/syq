@@ -132,10 +132,11 @@ on a network you trust.
 
 Storage upload approvals include reading object contents and metadata within
 the approved destination paths, for comparisons with existing files. When
-updates are allowed, they also permit reading destination tags and copying an
-object onto itself to update metadata. They do not authorize copying a different
-destination object as the source; bucket-to-bucket copies require a separate
-approved source scope. Upload approval is not a write-only grant.
+updates are allowed, they also permit reading destination tags, updating tags on
+the current destination object, and copying an object onto itself to update
+metadata. They do not authorize tag changes on historical versions or copying a
+different destination object as the source; bucket-to-bucket copies require a
+separate approved source scope. Upload approval is not a write-only grant.
 
 ## Downloaded executables
 

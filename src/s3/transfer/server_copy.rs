@@ -139,7 +139,6 @@ struct PreparedCopy {
     copy_source: String,
     must_be_new: bool,
     explicit: bool,
-    tags: Option<Vec<Tag>>,
     multipart: Option<PreparedCopyMultipart>,
 }
 struct PreparedCopyMultipart {
@@ -479,7 +478,13 @@ impl Engine {
         if matching_contents {
             let old_head = &existing.as_ref().unwrap().1;
             if same_metadata(&desired_head, old_head) {
-                let version = old_head.version_id().map(str::to_owned);
+                // Upload approvals allow changing the current object, not
+                // metadata on an arbitrary historical version.
+                let version = if self.authorization.is_some() {
+                    None
+                } else {
+                    old_head.version_id().map(str::to_owned)
+                };
                 let mut request =
                     super::super::authorization::Unsigned::new("PUT", &key).query("tagging", "");
                 if let Some(version) = &version {
@@ -522,19 +527,19 @@ impl Engine {
             anyhow::ensure!(source_head.missing_meta().unwrap_or(0) == 0,
                 "cannot copy user metadata: the service omitted source metadata (x-amz-missing-meta)");
         }
-        let selected_tags = if self.args.s3_metadata.tags {
-            Some(
-                self.selected_tags(source_bucket, &source.key, &source_head)
-                    .await?,
-            )
-        } else {
-            None
-        };
         let copy_source = encoded_source(source_bucket, &source);
         let must_be_new = self.args.ignore_existing
             || self.args.target_existence == Existence::New
             || (self.args.protects_existing_contents() && existing.is_none());
         let multipart = if source.size > self.copy_request_limit(source.size) {
+            let selected_tags = if self.args.s3_metadata.tags {
+                Some(
+                    self.selected_tags(source_bucket, &source.key, &source_head)
+                        .await?,
+                )
+            } else {
+                None
+            };
             Some(
                 self.prepare_multipart_copy(
                     &source,
@@ -555,7 +560,6 @@ impl Engine {
             copy_source,
             must_be_new,
             explicit: explicit.flags() != 0 || matching_contents,
-            tags: selected_tags,
             multipart,
         };
         if let Err(error) = self.authorize_copy(&prepared).await {
@@ -626,7 +630,6 @@ impl Engine {
             copy_source,
             must_be_new,
             explicit,
-            tags,
             multipart,
         } = *work;
         if let Some(multipart) = multipart {
@@ -645,15 +648,7 @@ impl Engine {
                     source_head.website_redirect_location().map(str::to_owned),
                 )
                 .metadata_directive(MetadataDirective::Copy)
-                .tagging_directive(if tags.is_some() {
-                    TaggingDirective::Replace
-                } else {
-                    TaggingDirective::Copy
-                })
-                .set_tagging(
-                    tags.as_deref()
-                        .map(super::super::metadata_copy::encode_tags),
-                )
+                .tagging_directive(TaggingDirective::Copy)
                 .set_storage_class(self.args.s3_metadata.storage_class.then(|| {
                     desired_head
                         .storage_class()
@@ -753,20 +748,7 @@ impl Engine {
                     "x-amz-metadata-directive",
                     if work.explicit { "REPLACE" } else { "COPY" },
                 )
-                .header(
-                    "x-amz-tagging-directive",
-                    if work.tags.is_some() {
-                        "REPLACE"
-                    } else {
-                        "COPY"
-                    },
-                );
-            if let Some(tags) = &work.tags {
-                request = request.header(
-                    "x-amz-tagging",
-                    &super::super::metadata_copy::encode_tags(tags),
-                );
-            }
+                .header("x-amz-tagging-directive", "COPY");
             if let Some(redirect) = work.source_head.website_redirect_location() {
                 request = request.header("x-amz-website-redirect-location", redirect);
             }

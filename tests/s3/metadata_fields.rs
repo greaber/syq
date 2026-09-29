@@ -26,6 +26,8 @@ pub(super) fn serve(
     let source = target.starts_with("/source/");
     let large = fault.contains("large");
     let fresh = fault.contains("fresh");
+    let changed = fault.contains("changed");
+    let copy_body = fresh || changed;
     let all = fault.contains("all");
     let empty = fault.contains("empty");
     let tags = fault.contains("tags") || all;
@@ -74,7 +76,10 @@ pub(super) fn serve(
                     "x-amz-meta-syq-mode".into(),
                     if source { "384" } else { "416" }.into(),
                 ),
-                ("x-amz-meta-syq-mtime".into(), "10".into()),
+                (
+                    "x-amz-meta-syq-mtime".into(),
+                    if changed && !source { "20" } else { "10" }.into(),
+                ),
                 ("x-amz-meta-syq-mtime-nsec".into(), "0".into()),
                 ("x-amz-meta-syq-uid".into(), "1000".into()),
                 ("x-amz-meta-syq-gid".into(), "1000".into()),
@@ -104,6 +109,10 @@ pub(super) fn serve(
             reply(socket, 200, &fields, b"", true);
         }
         "GET" if target.contains("tagging") => {
+            assert!(
+                !copy_body || large,
+                "native copies must not read tags separately"
+            );
             if fault.contains("unsupported") {
                 reply(
                     socket,
@@ -151,7 +160,7 @@ pub(super) fn serve(
             reply(socket, 200, &[], b"", false);
         }
         "POST" if target.contains("uploads") => {
-            check_fields(headers, all, empty, fresh);
+            check_fields(headers, all, empty, copy_body);
             assert_eq!(headers["x-amz-tagging"], "source=a%20b");
             reply(socket, 200, &[], b"<InitiateMultipartUploadResult><UploadId>fields</UploadId></InitiateMultipartUploadResult>", false);
         }
@@ -164,7 +173,7 @@ pub(super) fn serve(
                 .unwrap();
             assert_eq!(
                 copy,
-                if fresh {
+                if copy_body {
                     "source/original?versionId=source-version"
                 } else {
                     "destination/copied"
@@ -172,7 +181,7 @@ pub(super) fn serve(
             );
             assert_eq!(
                 headers["x-amz-copy-source-if-match"],
-                if fresh {
+                if copy_body {
                     "\"source\""
                 } else {
                     "\"destination\""
@@ -188,15 +197,13 @@ pub(super) fn serve(
                     false,
                 );
             } else {
-                check_fields(headers, all, empty, fresh);
-                if fresh {
+                check_fields(headers, all, empty, copy_body);
+                if copy_body {
                     assert_eq!(headers["x-amz-metadata-directive"], "COPY");
+                    assert_eq!(headers["x-amz-tagging-directive"], "COPY");
+                    assert!(!headers.contains_key("x-amz-tagging"));
                 }
-                if tags && fresh {
-                    assert_eq!(headers["x-amz-tagging-directive"], "REPLACE");
-                    assert_eq!(headers["x-amz-tagging"], "source=a%20b");
-                }
-                if !fresh {
+                if !copy_body {
                     assert_eq!(headers["x-amz-metadata-directive"], "REPLACE");
                     assert_eq!(
                         headers["x-amz-tagging-directive"],
@@ -302,7 +309,10 @@ fn selected_s3_metadata_keeps_destination_contents_and_unselected_attributes() {
         ("metadata-fields-fresh-large-missing", "storage-class,user-metadata"),
         ("metadata-fields-fresh-tags", "storage-class,tags"),
         ("metadata-fields-fresh-tags-unsupported", "storage-class,tags"),
+        ("metadata-fields-changed-tags-unsupported", "storage-class,tags"),
+        ("metadata-fields-tags-unsupported", "tags"),
         ("metadata-fields-fresh-large", "storage-class,tags"),
+        ("metadata-fields-fresh-large-unsupported", "storage-class,tags"),
     ] {
         let temp = test_support::tempdir().unwrap();
         let server = Server::start(fault);
@@ -311,7 +321,9 @@ fn selected_s3_metadata_keeps_destination_contents_and_unselected_attributes() {
             .capture_output().unwrap();
         let incomplete_copy = fault.contains("missing")
             && (!fault.contains("fresh") || fault.contains("large"));
-        if fault.contains("unsupported") {
+        let unsupported_read = fault.contains("unsupported")
+            && (!(fault.contains("fresh") || fault.contains("changed")) || fault.contains("large"));
+        if unsupported_read {
             assert!(!out.status.success(), "{fault}");
             assert!(output_text(&out).contains("read explicitly selected S3 tags"), "{}", output_text(&out));
         } else if incomplete_copy {
@@ -320,7 +332,7 @@ fn selected_s3_metadata_keeps_destination_contents_and_unselected_attributes() {
         } else {
             assert!(out.status.success(), "{fault}: {}", output_text(&out));
         }
-        assert_eq!(server.gate.1.load(Ordering::Relaxed), !fault.contains("same-tags") && !incomplete_copy && !fault.contains("unsupported"), "{fault}");
+        assert_eq!(server.gate.1.load(Ordering::Relaxed), !fault.contains("same-tags") && !incomplete_copy && !unsupported_read, "{fault}");
     }
 }
 

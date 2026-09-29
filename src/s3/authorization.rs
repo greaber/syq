@@ -220,7 +220,8 @@ impl Request {
                 || (destination
                     && self.upload
                     && !self.create_only
-                    && matches!(request.method.as_str(), "GET" | "PUT")))
+                    && (request.method == "GET"
+                        || (request.method == "PUT" && !query.contains_key("versionId")))))
                 && query
                     .keys()
                     .all(|k| matches!(k.as_str(), "tagging" | "versionId"))
