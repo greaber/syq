@@ -16,6 +16,7 @@ fn approval() -> Request {
         delete: false,
         create_only: true,
         lifetime: DEFAULT_LIFETIME,
+        headers: Default::default(),
     }
 }
 #[test]
@@ -64,7 +65,7 @@ fn old_request_shapes_do_not_acquire_storage_authority() {
     assert!(serde_json::from_value::<Request>(value).is_err());
 }
 #[test]
-fn released_upload_authorization_cannot_sign_object_lock_or_retention_bypass() {
+fn upload_authorization_signs_object_lock_and_retention_bypass_only_when_the_command_adds_them() {
     // Keep the v0.7.1 JSON shapes literal: tightening signing policy must not
     // change how existing approval/request fields are read.
     let approval: Request = serde_json::from_str(
@@ -132,9 +133,14 @@ fn released_upload_authorization_cannot_sign_object_lock_or_retention_bypass() {
             assert!(signer.request.permits(&forbidden).is_err(), "{name}");
             let error = signer.sign(&forbidden).unwrap_err().to_string();
             assert!(
-                error.contains("Object Lock or retention bypass"),
+                error.contains(&format!("does not permit the {name} header")),
                 "{name}: {error}"
             );
+            // A header shown in the approved command is signed with that value.
+            signer.request.headers.insert((name.into(), value.into()));
+            signer.sign(&forbidden).unwrap();
+            assert!(signer.sign(&request.clone().header(name, "other")).is_err());
+            signer.request.headers.clear();
             // Forged wire requests cannot evade the lowercase-header check.
             assert!(signer
                 .sign(&request.clone().header(&name.to_ascii_uppercase(), value))
@@ -620,4 +626,35 @@ fn tag_updates_require_overwritable_destination_scope() {
         .is_err());
     permission.upload = false;
     assert!(permission.permits(&write).is_err());
+}
+
+#[test]
+fn signing_adds_only_syq_headers_and_those_the_command_shows() {
+    let mut request = approval();
+    request.create_only = false;
+    let permits = |request: &Request, name: &str, value: &str| {
+        request.permits(&Unsigned::new("PUT", "allowed/file").header(name, value))
+    };
+    for (name, value) in [
+        ("x-amz-checksum-crc64nvme", "AAAAAAAAAAA="),
+        ("x-amz-meta-syq-mtime", "1"),
+        ("content-md5", "AAAAAAAAAAAAAAAAAAAAAA=="),
+        ("x-amz-storage-class", "STANDARD"),
+    ] {
+        permits(&request, name, value).unwrap();
+    }
+    for (name, value) in [
+        ("x-amz-request-payer", "requester"),
+        ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ("x-goog-meta-probe", "1"),
+        ("x-tigris-regions", "fra"),
+    ] {
+        assert!(permits(&request, name, value).is_err(), "{name}");
+        request.headers.insert((name.into(), value.into()));
+        permits(&request, name, value).unwrap();
+        assert!(permits(&request, name, "changed").is_err(), "{name}");
+    }
+    request.validate().unwrap();
+    request.headers.insert(("Bad Name".into(), "x".into()));
+    assert!(request.validate().is_err());
 }

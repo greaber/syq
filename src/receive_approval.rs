@@ -14,6 +14,9 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(300);
+/// Desktop prompts show about this much of a requesting command; Details and
+/// `persist receive pending` show all of it.
+const DESKTOP_COMMAND_CHARS: usize = 400;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -65,9 +68,15 @@ pub(crate) struct Summary {
     pub from: String,
     pub expires_at: u64,
     pub notification: String,
+    /// The requesting command, one displayed argument per element. Commands
+    /// run on this machine keep their literal arguments in `argv`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
     // Local desktop presentation only: preserve the released pending JSON shape.
     #[serde(skip)]
     desktop_copy_notice: Option<String>,
+    #[serde(skip)]
+    desktop_storage: Option<String>,
     #[serde(flatten)]
     pub details: Details,
 }
@@ -108,6 +117,7 @@ pub(crate) enum StorageKind {
 impl Summary {
     fn new(
         from: &str,
+        command: &[Vec<u8>],
         request: &crate::destination::CopyRequest,
         lifetime: Duration,
         inspect_local_destination: bool,
@@ -146,7 +156,9 @@ impl Summary {
             expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
                 + lifetime.as_secs(),
             notification: "starting".into(),
+            command: crate::approval_command::display(command),
             desktop_copy_notice: copy_notice(request, inspect_local_destination),
+            desktop_storage: None,
         })
     }
     pub(crate) fn kind(&self) -> Kind {
@@ -156,13 +168,50 @@ impl Summary {
             Details::Storage { .. } => Kind::Storage,
         }
     }
+    /// The requesting command. `server_input` styles arguments naming files that
+    /// the server reads and this machine cannot check.
+    fn command_text(
+        &self,
+        limit: Option<usize>,
+        plain: impl Fn(&str) -> String,
+        server_input: impl Fn(&str) -> String,
+    ) -> String {
+        crate::approval_command::render(&self.command, limit, plain, server_input)
+    }
     /// Keep the decision visible; the full description remains available in
     /// the macOS Details view and in `persist receive pending` on both platforms.
-    fn desktop_description(&self) -> String {
+    /// With `markup`, the text is escaped for notify-send and server inputs are
+    /// italic.
+    fn desktop_description(&self, markup: bool) -> String {
+        let text = |text: &str| {
+            if markup {
+                escape_markup(text)
+            } else {
+                text.to_owned()
+            }
+        };
+        let body = self.desktop_body();
+        if self.command.is_empty() {
+            return text(&body);
+        }
+        let command = self.command_text(Some(DESKTOP_COMMAND_CHARS), text, |word| {
+            if markup {
+                format!("<i>{}</i>", escape_markup(word))
+            } else {
+                word.to_owned()
+            }
+        });
+        format!("{command}\n\n{}", text(&body))
+    }
+    fn desktop_body(&self) -> String {
         match &self.details {
-            Details::Storage { description, .. } => format!("From: {}\n{description}", self.from),
+            Details::Storage { description, .. } => format!(
+                "From: {}\n{}",
+                self.from,
+                self.desktop_storage.as_deref().unwrap_or(description)
+            ),
             Details::Copy { destination, max_delete, .. } => {
-                let mut body = format!("To: {destination}\nFrom: {}", self.from);
+                let mut body = format!("From: {}\nWrites to: {destination}", self.from);
                 if let Some(notice) = &self.desktop_copy_notice {
                     body.push_str(&format!("\n\n{notice}"));
                 }
@@ -177,7 +226,15 @@ impl Summary {
             ),
         }
     }
-    fn details_description(&self) -> String {
+    fn details_description(&self, server_input: impl Fn(&str) -> String) -> String {
+        let command = if self.command.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nServer command: {}",
+                self.command_text(None, str::to_owned, server_input)
+            )
+        };
         let body = match &self.details {
             Details::Storage { description, .. } => description.clone(),
             Details::Copy { destination, permission, max_bytes, max_entries, max_delete, preserve_permissions } =>
@@ -185,9 +242,10 @@ impl Summary {
             Details::Command { argv, cwd, permission, .. } =>
                 format!("Command (literal arguments): {}\nWorking directory: {cwd}\n{permission}\nScripts and build files used by this command have not been inspected by syq.", argv.join(" ")),
         };
-        format!("From: {}\n{body}", self.from)
+        format!("From: {}{command}\n{body}", self.from)
     }
-    pub(crate) fn description(&self) -> String {
+    /// `server_input` styles arguments naming files that the server reads.
+    pub(crate) fn description(&self, server_input: impl Fn(&str) -> String) -> String {
         let question = match self.kind() {
             Kind::Copy => "Allow this copy once?",
             Kind::Command => "Run this command once?",
@@ -195,7 +253,7 @@ impl Summary {
         };
         format!(
             "{}\n\n{question}\nLocal command: syq persist receive approve {}",
-            self.details_description(),
+            self.details_description(server_input),
             self.id
         )
     }
@@ -259,6 +317,63 @@ fn copy_notice(
     None
 }
 
+/// A short storage prompt: what the approval lets the server do, beyond the
+/// command shown above it. The full description stays in Details.
+fn storage_access(command: &[Vec<u8>], request: &crate::s3::authorization::Request) -> String {
+    use crate::s3::authorization::{Removal, Scope};
+    fn locations(bucket: &str, scopes: &[Scope]) -> String {
+        let mut shown: Vec<_> = scopes
+            .iter()
+            .take(3)
+            .map(|scope| format!("s3://{bucket}/{}", scope.key))
+            .map(|location| format!("{:?}", location))
+            .collect();
+        if scopes.len() > 3 {
+            shown.push(format!("and {} more", scopes.len() - 3));
+        }
+        shown.join(", ")
+    }
+    let verb = if request.upload {
+        if request.create_only {
+            "Creates in"
+        } else {
+            "Writes to"
+        }
+    } else if request.delete {
+        "Deletes in"
+    } else {
+        "Reads"
+    };
+    let mut lines = vec![format!(
+        "{verb}: {}",
+        locations(&request.bucket, &request.scopes)
+    )];
+    if let Some(source) = &request.source {
+        lines.push(format!(
+            "Reads: {}",
+            locations(&source.bucket, &source.scopes)
+        ));
+    }
+    if let Some(endpoint) = &request.endpoint {
+        if !command.iter().any(|arg| arg.starts_with(b"--s3-endpoint")) {
+            lines.push(format!("Endpoint (set on the server): {endpoint:?}"));
+        }
+    }
+    if request.delete
+        && matches!(
+            request.removal,
+            Some(Removal::Version(_) | Removal::AllVersions)
+        )
+    {
+        lines.push("Deleting versions is permanent.".into());
+    }
+    lines.push(format!(
+        "Signed requests stay usable for up to {} days, even after you disconnect.",
+        request.lifetime.div_ceil(24 * 60 * 60)
+    ));
+    lines.join("\n")
+}
+
 struct Pending {
     summary: Summary,
     deadline: Instant,
@@ -302,12 +417,13 @@ impl Queue {
     pub(crate) fn request(
         &self,
         from: &str,
+        command: &[Vec<u8>],
         request: &crate::destination::CopyRequest,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
         self.wait(
-            Summary::new(from, request, TIMEOUT, true)?,
+            Summary::new(from, command, request, TIMEOUT, true)?,
             notifications,
             TIMEOUT,
             cancelled,
@@ -316,12 +432,13 @@ impl Queue {
     pub(crate) fn request_remote(
         &self,
         from: &str,
+        command: &[Vec<u8>],
         target: &str,
         request: &crate::destination::CopyRequest,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
-        let mut summary = Summary::new(from, request, TIMEOUT, false)?;
+        let mut summary = Summary::new(from, command, request, TIMEOUT, false)?;
         if let Details::Copy {
             destination,
             permission,
@@ -356,7 +473,9 @@ impl Queue {
             from: format!("{from:?}"),
             expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TIMEOUT.as_secs(),
             notification: "starting".into(),
+            command: Vec::new(),
             desktop_copy_notice: None,
+            desktop_storage: None,
             details: Details::Command {
                 kind: CommandKind::Command,
                 argv: argv.iter().map(|arg| format!("{:?}", std::ffi::OsStr::from_bytes(arg))).collect(),
@@ -368,6 +487,7 @@ impl Queue {
     pub(crate) fn request_storage(
         &self,
         from: &str,
+        command: &[Vec<u8>],
         request: &crate::s3::authorization::Request,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
@@ -448,7 +568,9 @@ impl Queue {
                 expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
                     + TIMEOUT.as_secs(),
                 notification: "starting".into(),
+                command: crate::approval_command::display(command),
                 desktop_copy_notice: None,
+                desktop_storage: Some(storage_access(command, request)),
                 details: Details::Storage {
                     kind: StorageKind::Storage,
                     description,
@@ -580,7 +702,6 @@ impl Queue {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 fn escape_markup(text: &str) -> String {
     // notify-send applies g_strcompress to its body argument before passing
     // it to D-Bus. Preserve escaped filename bytes through that extra parser.
@@ -618,7 +739,7 @@ const APPLESCRIPT: &str = r#"on run argv
     end try
 end run"#;
 fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
-    let description = summary.desktop_description();
+    let description = summary.desktop_description(cfg!(not(target_os = "macos")));
     let title = summary.kind().title();
     #[cfg(target_os = "macos")]
     {
@@ -630,7 +751,7 @@ fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
             &description,
             &lifetime.as_secs().max(1).to_string(),
             title,
-            &summary.details_description(),
+            &summary.details_description(str::to_owned),
         ]);
         cmd
     }
@@ -646,9 +767,10 @@ fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
         .arg(format!("--expire-time={}", lifetime.as_millis()))
         .arg("--")
         .arg(title)
-        .arg(escape_markup(&format!(
-            "{description}\n\nDetails: syq persist receive pending"
-        )));
+        .arg(format!(
+            "{description}\n\n{}",
+            escape_markup("Details: syq persist receive pending")
+        ));
         cmd
     }
 }
@@ -756,7 +878,9 @@ mod tests {
             },
             expires_at: 0,
             notification: String::new(),
+            command: Vec::new(),
             desktop_copy_notice: Some("Existing destination entries may be overwritten.".into()),
+            desktop_storage: None,
         }
     }
     fn copy_request(path: &std::path::Path) -> crate::destination::CopyRequest {
@@ -840,10 +964,10 @@ mod tests {
             copy_notice(&copy_request(&missing.join("child")), true),
             None
         );
-        let mut summary = Summary::new("server", &request, TIMEOUT, true).unwrap();
-        assert!(!summary.desktop_description().contains("overwrite"));
+        let mut summary = Summary::new("server", &[], &request, TIMEOUT, true).unwrap();
+        assert!(!summary.desktop_description(false).contains("overwrite"));
         assert!(summary
-            .details_description()
+            .details_description(str::to_owned)
             .contains("May create and overwrite matching entries"));
         // No presentation-only field enters the released pending JSON contract.
         let json = serde_json::to_value(&summary).unwrap();
@@ -931,22 +1055,96 @@ mod tests {
         }
     }
     #[test]
+    fn prompts_lead_with_the_server_command_and_mark_server_files() {
+        let mut summary = summary();
+        summary.command = crate::approval_command::display(&[
+            b"cp".to_vec(),
+            b"--mapping".to_vec(),
+            b"<map>".to_vec(),
+            b"--to".to_vec(),
+            b"@laptop".to_vec(),
+        ]);
+        let plain = summary.desktop_description(false);
+        assert!(plain.starts_with("syq cp --mapping \"<map>\" --to @laptop\n\nFrom: server\n"));
+        assert!(plain.contains("Writes to: /tmp/receiving"));
+        let markup = summary.desktop_description(true);
+        assert!(markup.starts_with("syq cp --mapping <i>\"&lt;map&gt;\"</i> --to @laptop\n"));
+        assert!(!markup.contains("<map>"));
+        let details = summary.details_description(|word| format!("[{word}]"));
+        assert!(details.contains("Server command: syq cp --mapping [\"<map>\"] --to @laptop"));
+        // The command enters the pending JSON for local clients.
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["command"][0], "syq");
+    }
+    #[test]
+    fn storage_prompts_summarize_access_beyond_the_command() {
+        use crate::s3::authorization::{Removal, Request, Scope};
+        let scope = |key: &str| Scope {
+            key: key.into(),
+            descendants: true,
+        };
+        let mut request = Request {
+            bucket: "bucket".into(),
+            endpoint: Some("https://storage.example".into()),
+            region: None,
+            profile: None,
+            scopes: vec![scope("runs")],
+            source: None,
+            removal: None,
+            acl: Default::default(),
+            upload: true,
+            delete: false,
+            create_only: false,
+            lifetime: crate::s3::authorization::DEFAULT_LIFETIME,
+            headers: Default::default(),
+        };
+        let command = [b"cp".to_vec()];
+        let access = storage_access(&command, &request);
+        assert!(
+            access.starts_with("Writes to: \"s3://bucket/runs\"\n"),
+            "{access}"
+        );
+        assert!(access.contains("Endpoint (set on the server): \"https://storage.example\""));
+        assert!(
+            access.ends_with("up to 7 days, even after you disconnect."),
+            "{access}"
+        );
+        let named = [
+            b"cp".to_vec(),
+            b"--s3-endpoint=https://storage.example".to_vec(),
+        ];
+        assert!(!storage_access(&named, &request).contains("Endpoint"));
+
+        request.upload = false;
+        request.delete = true;
+        request.removal = Some(Removal::AllVersions);
+        request.scopes = ["a", "b", "c", "d", "e"].map(scope).to_vec();
+        let access = storage_access(&command, &request);
+        assert!(
+            access.starts_with(
+                "Deletes in: \"s3://bucket/a\", \"s3://bucket/b\", \"s3://bucket/c\", and 2 more\n"
+            ),
+            "{access}"
+        );
+        assert!(access.contains("Deleting versions is permanent."));
+    }
+    #[test]
     fn compact_copy_prompt_keeps_deletion_limits_visible() {
         let mut summary = summary();
         for limit in [1, 2] {
             if let Details::Copy { max_delete, .. } = &mut summary.details {
                 *max_delete = limit;
             }
-            let compact = summary.desktop_description();
+            let compact = summary.desktop_description(false);
             assert!(compact.contains("Existing destination entries may be overwritten."));
             assert!(compact.contains(&format!("Deletion limit (files or folders): {limit}.")));
             assert!(!compact.contains("100 bytes"));
         }
-        let desktop_details = summary.details_description();
+        let desktop_details = summary.details_description(str::to_owned);
         assert!(desktop_details.contains("not been inspected"));
         assert!(!desktop_details.contains("Allow this copy once?"));
         assert!(!desktop_details.contains("Local command:"));
-        let details = summary.description();
+        let details = summary.description(str::to_owned);
         assert!(details.contains("100 bytes, 3 entries; at most 2 deletions"));
         assert!(details.contains("not been inspected"));
     }
@@ -1052,8 +1250,8 @@ mod tests {
         {
             assert_eq!(args[0], "-e");
             assert_eq!(args[1], APPLESCRIPT);
-            assert_eq!(args[3], summary.desktop_description());
-            assert_eq!(args[6], summary.details_description());
+            assert_eq!(args[3], summary.desktop_description(false));
+            assert_eq!(args[6], summary.details_description(str::to_owned));
             assert!(args[3].contains(text));
             assert!(args[6].contains(text));
             assert!(!APPLESCRIPT.contains(text));

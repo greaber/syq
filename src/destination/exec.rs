@@ -385,7 +385,9 @@ mod tests {
             let json = serde_json::to_value(&summary).unwrap();
             assert_eq!(json["kind"], "command");
             assert!(json.get("destination").is_none());
-            assert!(summary.description().contains("Runs as your local user"));
+            assert!(summary
+                .description(str::to_owned)
+                .contains("Runs as your local user"));
             assert!(!root.path().join("marker").exists());
             assert!(receiver
                 .approvals

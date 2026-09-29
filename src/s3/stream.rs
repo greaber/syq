@@ -4,6 +4,7 @@ mod authorization;
 use super::{checksum::Algorithm, client, Options};
 use crate::descriptor_copy::fd::{Descriptor, Source};
 use anyhow::{bail, Context, Result};
+pub(crate) use authorization::request as authorization_request;
 pub(crate) use authorization::Prepared;
 use aws_sdk_s3::{
     primitives::ByteStream,
