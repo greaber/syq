@@ -38,10 +38,11 @@ syq cp --hash --srcs-in project --into backup
 `--hash` uses BLAKE3. In rsync syntax, use `-c` or `--checksum` for the same
 comparison.
 
-When an S3 download has matching size but a different timestamp, syq can compare
-the local file with a whole-file hash stored in the object's syq metadata. A
-matching hash avoids downloading the object and leaves the local timestamp alone.
-`error-if-different` uploads and downloads also reuse stored hashes when possible.
+When a local/S3 copy has matching size but a different timestamp, syq compares
+the local file with a whole-file hash stored in the object's syq metadata, when
+one is available. A matching hash avoids uploading or downloading the object and
+leaves the destination timestamp alone. `error-if-different` uploads and downloads
+also reuse stored hashes when possible.
 Explicit `--hash` comparisons use BLAKE3; if the object has no stored BLAKE3 hash,
 syq reads its contents to compute one.
 
@@ -60,9 +61,15 @@ For a complete check of a local copy, use an [expected hash](#expected-hashes).
 For local/S3 copies, provider request checksums remain enabled. The `transfer`
 setting does not disable them. Single-part uploads with a SHA-256 request
 checksum also reuse that digest for payload signing, without another hashing
-pass. The `transfer` algorithm records a whole-file hash on upload and checks
-stored hashes on download when present. Use an expected hash for objects without
-a stored hash. See [Filesystem differences](object-storage.md#filesystem-differences).
+pass. Pathname uploads store a whole-file BLAKE3 hash by default, so later
+`--hash` comparisons can use it without downloading the object. An explicit
+comparison, transfer, or expected hash can select a different stored algorithm.
+BLAKE3 shares the read used to prepare request checksums for all automatic part
+sizes. Large multipart files need an additional local read for other whole-file
+algorithms or custom part sizes that are not multiples of 1 KiB.
+The `transfer` setting checks stored hashes on download when present. Use an
+expected hash for objects without a stored hash. See
+[Filesystem differences](object-storage.md#filesystem-differences).
 
 Server-side S3 copies preserve stored hashes without reading or verifying
 object bodies. They do not support content-hash comparison, extra transfer

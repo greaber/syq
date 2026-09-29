@@ -23,7 +23,12 @@ with tempfile.TemporaryDirectory(prefix='syq-fast-check-') as tmp:
         for name,digest in expected.items():
             headers,body=c.request('GET',c.PREFIX+'/'+name)
             assert hashlib.sha256(body).digest()==digest
-            assert 'x-amz-meta-syq-blake3' not in {k.lower() for k in headers}
+            fields={k.lower():v for k,v in headers.items()}
+            assert fields['x-amz-meta-syq-format']=='1', fields
+            # Digest correctness is checked against the standard BLAKE3 hasher
+            # in Rust tests; every body above has an independent SHA256 check.
+            whole=fields['x-amz-meta-syq-blake3']
+            assert len(whole)==64 and int(whole,16)>=0, whole
         target=root/'target'
         run('--from','s3://'+c.BUCKET,'--srcs-in',c.PREFIX,'--into',target)
         for name,digest in expected.items():
@@ -35,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix='syq-fast-check-') as tmp:
         assert {p.name:p.stat().st_ino for p in target.iterdir()}==before
         assert not list((cache/'syq'/'s3').glob('*.json'))
         assert not list(target.glob('.syq-s3-*'))
-        # Compare objects without stored hashes, including same-size corruption.
+        # Compare object contents, including same-size corruption.
         comparison = ('--if-exists=update', '--dry-run', '--hash', '--from', 's3://'+c.BUCKET,
                       '--srcs-in', c.PREFIX, '--into', target)
         run(*comparison, '--results', root/'matching.ndjson')
