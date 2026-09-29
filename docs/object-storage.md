@@ -111,12 +111,11 @@ do not have corresponding source or destination attributes.
 Tag-only changes use the tagging API without rewriting the object or creating a
 new object version. Comparing tags requires permission to read source and
 destination tags; updating them requires permission to write destination tags.
-Reading tags uses a
-known object version when available; your provider may require separate
-permission for versioned tags. Tag updates using your own credentials also use
-the known destination version. With `--auth-from`, updates always target the
-current destination object; upload approval does not allow changing historical
-versions.
+Reading tags uses a known object version when available. Tag updates using
+your own credentials also use the known destination version. Your provider may
+require separate permissions for reading and writing versioned tags. With
+`--auth-from`, updates always target the current destination object; upload
+approval does not allow changing historical versions.
 
 New or changed copies that fit in one server-side copy request use the provider's
 native tag-copy operation, without a separate tag read or support check. Providers
