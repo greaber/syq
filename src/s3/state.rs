@@ -275,6 +275,20 @@ fn is_kind(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
 mod tests {
     use super::*;
 
+    /// Reopen a record after dropping its holder. Parallel tests fork child
+    /// processes; until a child execs, it shares this process's open lock, so a
+    /// lock just released can briefly still look held.
+    fn reopen(directory: &std::path::Path, identity: &[u8]) -> Result<State> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match State::open_at(directory.to_path_buf(), identity) {
+                Err(error) if blocked(&error) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                result => return result,
+            }
+        }
+    }
     #[test]
     fn unavailable_cache_does_not_require_persistence() {
         let temp = crate::test_support::tempdir().unwrap();
@@ -345,7 +359,7 @@ mod tests {
             .unwrap();
         }
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let reopened = State::open_at(directory.clone(), b"upload");
+        let reopened = reopen(&directory, b"upload");
         let mode = std::fs::metadata(&directory).unwrap().mode() & 0o777;
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         let reopened = reopened.unwrap();
@@ -391,7 +405,7 @@ mod tests {
         state.clear().unwrap();
         assert!(!state.has_record());
         drop(state);
-        let next = State::open_at(directory, b"download").unwrap();
+        let next = reopen(&directory, b"download").unwrap();
         assert!(next.load::<serde_json::Value>().unwrap().is_none());
     }
 
@@ -445,7 +459,7 @@ mod tests {
             std::fs::hard_link,
         ] {
             link(&other, &path).unwrap();
-            let state = State::open_at(directory.clone(), b"download").unwrap();
+            let state = reopen(&directory, b"download").unwrap();
             assert!(state.load::<serde_json::Value>().unwrap().is_none());
             state
                 .save(&serde_json::json!({"parts": {"0": "new"}}))
@@ -461,7 +475,7 @@ mod tests {
 
         let lock = directory.join(format!("{name}.lock"));
         std::fs::hard_link(&lock, temp.path().join("lock-alias")).unwrap();
-        let state = State::open_at(directory.clone(), b"download").unwrap();
+        let state = reopen(&directory, b"download").unwrap();
         assert!(state.persistent.is_none());
         std::fs::remove_file(temp.path().join("lock-alias")).unwrap();
 
@@ -470,7 +484,7 @@ mod tests {
         std::os::unix::fs::symlink(&directory, &alias).unwrap();
         let state = State::open_at(alias, b"download").unwrap();
         assert!(state.persistent.is_none());
-        assert!(State::open_at(directory, b"download")
+        assert!(reopen(&directory, b"download")
             .unwrap()
             .persistent
             .is_some());
