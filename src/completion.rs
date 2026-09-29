@@ -479,10 +479,13 @@ fn update_cache(mut update: impl FnMut(&mut CompletionCache) -> bool) -> Result<
     }
     // The cache is disposable: the rename keeps it whole, and it is not
     // synced, because that would delay every remote command that updates it.
+    // Serialize first: writing JSON straight to the file costs a system call
+    // per token.
+    let mut bytes = serde_json::to_vec_pretty(&cache)?;
+    bytes.push(b'\n');
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("create temporary completion cache in {}", parent.display()))?;
-    serde_json::to_writer_pretty(&mut temporary, &cache)?;
-    temporary.write_all(b"\n")?;
+    temporary.write_all(&bytes)?;
     temporary
         .persist(&path)
         .map_err(|error| error.error)
