@@ -260,8 +260,9 @@ syq cp --resume JOB
 ```
 
 `--resume` requires an existing job. Ordinary first attempts do not use it.
-Remote-to-remote, detached, return-destination and descriptor-stream copies
-do not supply named jobs.
+Remote-to-remote copies can supply jobs when started with `--coordinate-at local`;
+that route passes data through the invoking machine. Direct remote-to-remote,
+detached, return-destination and descriptor-stream copies do not supply named jobs.
 The job keeps the original working directory, selectors, mappings, ignore rules,
 placement and overwrite policy. New environment option defaults do not change
 it. S3 jobs also keep the original endpoint and bucket. Resumption rescans the sources; it does not save a source snapshot. It can

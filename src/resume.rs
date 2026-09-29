@@ -145,6 +145,7 @@ pub(crate) fn start(
         || args.detach
         || args.return_selection.is_some()
         || (args.s3.is_none() && args.interface == crate::cli::Interface::NativeCp
+            && args.coordinate_at != crate::cli::CoordinateAt::Local
             && args
                 .locations
                 .split_last()
