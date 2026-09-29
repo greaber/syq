@@ -3830,7 +3830,12 @@ impl Planner<'_> {
             results.extend(self.apply(tail)?);
             return Ok(results);
         }
-        let created: Vec<_> = if self.opts.resume_job.is_some() {
+        let created: Vec<_> = if self
+            .opts
+            .resume_job
+            .as_ref()
+            .is_some_and(|job| job.available())
+        {
             ops.iter()
                 .enumerate()
                 .filter_map(|(index, op)| match op {
@@ -3857,25 +3862,8 @@ impl Planner<'_> {
                     .filter(|(index, _)| v.get(*index).is_some_and(Option::is_none))
                     .map(|(_, path)| path)
                     .collect();
-                if !paths.is_empty() {
-                    let observed = match ok(
-                        self.dst.call(Request::StatMany {
-                            paths: paths.clone(),
-                            sources: None,
-                            follow: false,
-                            identity_only: true,
-                            guard: self.container_guard.clone(),
-                        })?,
-                        "record published identities",
-                    )? {
-                        Response::Stats(entries) if entries.len() == paths.len() => entries,
-                        other => bail!("unexpected publication identity response {other:?}"),
-                    };
-                    if let Some(job) = &self.opts.resume_job {
-                        job.published(paths.into_iter().zip(observed).filter_map(
-                            |(path, entry)| entry.map(|entry| (path, (entry.dev, entry.ino))),
-                        ));
-                    }
+                if let Some(job) = &self.opts.resume_job {
+                    record_published_identities(self.dst, job, paths, self.container_guard.clone());
                 }
                 Ok(v)
             }
@@ -3968,4 +3956,45 @@ pub(super) fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p 
     }
     let rest = path.strip_prefix(dst_root)?;
     Some(rest.strip_prefix(b"/").unwrap_or(rest))
+}
+
+/// Identity collection is optional bookkeeping after the mutation succeeded.
+/// Its failure must invalidate the token without changing the mutation result.
+pub(super) fn record_published_identities(
+    destination: &mut dyn Conn,
+    job: &crate::resume::Job,
+    paths: Vec<PathBytes>,
+    guard: Option<ContainerGuard>,
+) {
+    if paths.is_empty() || !job.available() {
+        return;
+    }
+    let observed = (|| -> Result<Vec<Option<Entry>>> {
+        match ok(
+            destination.call(Request::StatMany {
+                paths: paths.clone(),
+                sources: None,
+                follow: false,
+                identity_only: true,
+                guard,
+            })?,
+            "record published identities",
+        )? {
+            Response::Stats(entries)
+                if entries.len() == paths.len() && entries.iter().all(Option::is_some) =>
+            {
+                Ok(entries)
+            }
+            other => bail!("incomplete publication identity response {other:?}"),
+        }
+    })();
+    match observed {
+        Ok(entries) => job.published(
+            paths
+                .into_iter()
+                .zip(entries)
+                .filter_map(|(path, entry)| entry.map(|entry| (path, (entry.dev, entry.ino)))),
+        ),
+        Err(error) => job.disable(&format!("could not record published identities: {error:#}")),
+    }
 }

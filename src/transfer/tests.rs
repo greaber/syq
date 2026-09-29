@@ -2099,3 +2099,43 @@ fn local_copy_progress_is_live_but_failure_retracts_completion_credit() {
         );
     }
 }
+
+#[test]
+fn publication_identity_failure_disables_recording_without_more_requests() {
+    for response in [
+        None,
+        Some(Response::EndpointError("identity lookup failed".into())),
+        Some(Response::Stats(Vec::new())),
+        Some(Response::Stats(vec![None])),
+    ] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let job = crate::resume::Job::endpoint_at(
+            &temporary.path().join("jobs"),
+            "0123456789abcdef0123456789abcdef",
+            "copy",
+            false,
+        )
+        .unwrap();
+        let fail_receive = response.is_none().then_some(1);
+        let state = Arc::new(Mutex::new(PipelineState {
+            replies: response.into_iter().collect(),
+            fail_receive,
+            ..Default::default()
+        }));
+        let mut destination = PipelineConn(state.clone());
+        planner::record_published_identities(
+            &mut destination,
+            &job,
+            vec![b"created".to_vec()],
+            None,
+        );
+        assert!(!job.available());
+        planner::record_published_identities(
+            &mut destination,
+            &job,
+            vec![b"another".to_vec()],
+            None,
+        );
+        assert_eq!(state.lock().unwrap().requests.len(), 1);
+    }
+}

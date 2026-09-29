@@ -366,7 +366,8 @@ pub mod flags {
     pub const REQUIRE_OWNER: u8 = 32;
     pub const REQUIRE_GROUP: u8 = 64;
     /// Return the identity of the held, completed inode for hardlink followers.
-    /// This changes only the reply; restricted grants do not authorize it.
+    /// This changes only the reply; restricted receivers settle each outcome
+    /// before treating a publication as belonging to the grant.
     pub const REPORT_IDENTITY: u8 = 128;
 }
 

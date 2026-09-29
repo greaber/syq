@@ -1055,6 +1055,9 @@ impl RestrictedAuthority {
                 proto::Response::Applied(results) => results
                     .get(index)
                     .and_then(|error| error.as_ref().map(proto::WireError::as_str)),
+                proto::Response::PublishedBatch(results) => results
+                    .get(index)
+                    .and_then(|result| result.as_ref().err().map(proto::WireError::as_str)),
                 _ => None,
             }
         };

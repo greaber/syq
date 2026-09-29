@@ -2142,6 +2142,46 @@ fn provisional_creations_are_forgotten_when_execution_fails() {
 }
 
 #[test]
+fn identity_publication_batch_does_not_claim_failed_creations() {
+    use proto::TargetCondition::{Absent, Any};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+    )
+    .unwrap();
+    let kept = target.join("kept");
+    let failed = target.join("failed");
+    let puts = [&kept, &failed].map(|path| {
+        let Request::PutSmallBatch(mut puts) = small_put(path) else {
+            unreachable!()
+        };
+        let mut put = puts.pop().unwrap();
+        put.flags |= proto::flags::REPORT_IDENTITY;
+        put
+    });
+    let mut request = Request::PutSmallBatch(puts.into());
+    let settlement = authority.authorize(&mut request, false).unwrap();
+    authority.settle(
+        settlement,
+        &proto::Response::PublishedBatch(vec![Ok(Some((1, 2))), Err("raced".into())]),
+    );
+    let mut again = small_put(&kept);
+    authority.authorize(&mut again, false).unwrap();
+    assert_eq!(small_put_condition(&again), Any);
+    let mut again = small_put(&failed);
+    authority.authorize(&mut again, false).unwrap();
+    assert_eq!(small_put_condition(&again), Absent);
+    fs::write(&failed, b"foreign").unwrap();
+    assert!(authority.authorize(&mut small_put(&failed), false).is_err());
+}
+
+#[test]
 fn a_refused_request_leaves_no_provisional_creations_behind() {
     use proto::TargetCondition::{Absent, Any};
     let temporary = crate::test_support::tempdir().unwrap();
@@ -2729,6 +2769,11 @@ fn older_observation_does_not_release_newer_real_reservation() {
 
 #[test]
 fn receipt_policy_records_each_outcome_and_closure_state_then_encrypts_it() {
+    check_receipt_outcomes(false);
+    check_receipt_outcomes(true);
+}
+
+fn check_receipt_outcomes(report_identity: bool) {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
@@ -2776,7 +2821,11 @@ fn receipt_policy_records_each_outcome_and_closure_state_then_encrypts_it() {
         data: b"new".to_vec(),
         hash: crate::fsops::content_digest(b"new"),
         meta: plain_meta(),
-        flags: 0,
+        flags: if report_identity {
+            proto::flags::REPORT_IDENTITY
+        } else {
+            0
+        },
         inplace: false,
         condition: proto::TargetCondition::Any,
         guard: None,
@@ -2784,10 +2833,12 @@ fn receipt_policy_records_each_outcome_and_closure_state_then_encrypts_it() {
     let mut batch = Request::PutSmallBatch(vec![put(&copied), put(&failed)]);
     let settlement = authority.authorize(&mut batch, false).unwrap();
     fs::write(&copied, b"new").unwrap();
-    authority.settle(
-        settlement,
-        &proto::Response::Applied(vec![None, Some("executor rejected it".into())]),
-    );
+    let response = if report_identity {
+        proto::Response::PublishedBatch(vec![Ok(Some((1, 2))), Err("executor rejected it".into())])
+    } else {
+        proto::Response::Applied(vec![None, Some("executor rejected it".into())])
+    };
+    authority.settle(settlement, &response);
     let mut delete = apply(Op::Unlink {
         path: path_bytes(&removed),
     });
