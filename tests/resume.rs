@@ -304,3 +304,29 @@ fn resume_uses_saved_mapping_when_the_original_manifest_is_replaced() {
     assert_eq!(fs::read(root.join("destination/b")).unwrap(), b"b");
     assert!(!root.join("destination/unrelated").exists());
 }
+
+#[test]
+fn delegated_copy_does_not_advertise_a_source_owned_job() {
+    let temp = test_support::tempdir().unwrap();
+    let root = temp.path();
+    fs::write(root.join("source"), b"copied").unwrap();
+    // Internal remote coordinator argv carries base64 path operands.
+    let output = run(
+        root,
+        &[
+            "cp",
+            "--delegated-operands-b64",
+            "c291cmNl",
+            "--as",
+            "ZGVzdGluYXRpb24",
+            "--results",
+            "result.jsonl",
+        ],
+    );
+    assert_success(output);
+    assert_eq!(fs::read(root.join("destination")).unwrap(), b"copied");
+    let text = fs::read_to_string(root.join("result.jsonl")).unwrap();
+    let run: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!(run.get("job_id").is_none_or(serde_json::Value::is_null));
+    assert!(!root.join("cache/syq/jobs").exists());
+}
