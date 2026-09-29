@@ -5554,3 +5554,46 @@ fn equality_windows_keep_the_same_destination_inode() {
         assert!(format!("{response:?}").contains("invalid hash interval"));
     }
 }
+
+#[test]
+fn directory_changes_share_each_directory_between_two_threads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mkdir = |path: String| Op::Mkdir {
+        path: path.into_bytes(),
+        mode: 0o755,
+        condition: TargetCondition::Any,
+    };
+    // Two busy directories, many directories of one entry each, and
+    // operations that the selection leaves out.
+    let mut ops = Vec::new();
+    for index in 0..300 {
+        ops.push(mkdir(format!("busy/a{index}")));
+        ops.push(mkdir(format!("skipped/{index}")));
+        ops.push(mkdir(format!("other/b{index}")));
+        ops.push(mkdir(format!("single{index}/leaf")));
+    }
+    let selected: Vec<usize> = (0..ops.len()).filter(|index| index % 4 != 1).collect();
+    let active = [AtomicUsize::new(0), AtomicUsize::new(0)];
+    let peak = [AtomicUsize::new(0), AtomicUsize::new(0)];
+    let results = parallel_by_directory(&ops, &selected, |op| {
+        let path = op_path(op);
+        let busy = [&b"busy/"[..], b"other/"]
+            .iter()
+            .position(|directory| path.starts_with(directory));
+        if let Some(directory) = busy {
+            let now = active[directory].fetch_add(1, Ordering::SeqCst) + 1;
+            peak[directory].fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            active[directory].fetch_sub(1, Ordering::SeqCst);
+        }
+        path.to_vec()
+    });
+    let expected: Vec<_> = selected
+        .iter()
+        .map(|&index| op_path(&ops[index]).to_vec())
+        .collect();
+    assert_eq!(results, expected);
+    for directory in &peak {
+        assert_eq!(directory.load(Ordering::SeqCst), 2);
+    }
+}

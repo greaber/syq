@@ -2554,7 +2554,8 @@ impl FsOps {
     }
 
     /// Ops within a batch are independent (the planner orders batches so that
-    /// parents come first), so they run in parallel too.
+    /// parents come first), so they run in parallel too. Those that change
+    /// directory entries share their directory between at most two threads.
     pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<WireError>> {
         // SetMeta depends on the object existing, so create everything first,
         // then apply metadata — otherwise a parallel SetMeta can beat its
@@ -2592,8 +2593,8 @@ impl FsOps {
             }
             return out;
         }
-        let cres = parallel_map(&create_idx, |&i| {
-            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
+        let cres = parallel_by_directory(ops, &create_idx, |op| {
+            apply_one(op, guard, destination_root.clone(), destination_prefix)
                 .err()
                 .as_ref()
                 .map(wire_error)
@@ -2666,8 +2667,74 @@ fn stat_with_parent(
 const PAR_THREADS: usize = 32;
 const PAR_MIN: usize = 32;
 
+fn metadata_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(PAR_THREADS)
+            .thread_name(|index| format!("syq-metadata-{index}"))
+            .build()
+            .expect("metadata worker pool")
+    })
+}
+
 fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     parallel_map_init(items, || (), |_, item| f(item))
+}
+
+/// Run the selected operations, which create or remove directory entries.
+/// The kernel changes one directory's entries one at a time, so threads
+/// beyond the second only contend for it. Directories spread over the pool;
+/// the operations of each run in order on at most two of its threads.
+fn parallel_by_directory<R: Send>(
+    ops: &[Op],
+    selected: &[usize],
+    f: impl Fn(&Op) -> R + Sync,
+) -> Vec<R> {
+    if selected.len() < PAR_MIN {
+        return selected.iter().map(|&index| f(&ops[index])).collect();
+    }
+    let mut directories = HashMap::<&[u8], Vec<usize>>::new();
+    for (position, &index) in selected.iter().enumerate() {
+        let path = op_path(&ops[index]);
+        let directory = path
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .map_or(&path[..0], |separator| &path[..separator]);
+        directories.entry(directory).or_default().push(position);
+    }
+    let shares: Vec<&[usize]> = directories
+        .values()
+        .flat_map(|positions| {
+            let (first, second) = if positions.len() < 2 * PAR_MIN {
+                (positions.as_slice(), &positions[..0])
+            } else {
+                positions.split_at(positions.len() / 2)
+            };
+            [first, second]
+        })
+        .filter(|share| !share.is_empty())
+        .collect();
+    use rayon::prelude::*;
+    let done: Vec<Vec<(usize, R)>> = metadata_pool().install(|| {
+        shares
+            .par_iter()
+            .map(|share| {
+                share
+                    .iter()
+                    .map(|&position| (position, f(&ops[selected[position]])))
+                    .collect()
+            })
+            .collect()
+    });
+    let mut results: Vec<Option<R>> = selected.iter().map(|_| None).collect();
+    for (position, result) in done.into_iter().flatten() {
+        results[position] = Some(result);
+    }
+    results
+        .into_iter()
+        .map(|result| result.expect("every selected operation ran"))
+        .collect()
 }
 
 // State belongs to one bounded input chunk and is discarded before returning.
@@ -2684,15 +2751,7 @@ fn parallel_map_init<T: Sync, R: Send, S>(
     }
     let chunk = items.len().div_ceil(PAR_THREADS).max(1);
     use rayon::prelude::*;
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    let pool = POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(PAR_THREADS)
-            .thread_name(|index| format!("syq-metadata-{index}"))
-            .build()
-            .expect("metadata worker pool")
-    });
-    pool.install(|| {
+    metadata_pool().install(|| {
         items
             .par_chunks(chunk)
             .flat_map_iter(|chunk| {
