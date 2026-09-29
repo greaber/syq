@@ -4,9 +4,10 @@
 Usage: scripts/branch-status.py [--json] [--check]
 
 Reports the worktree, the branch's pull request, the latest post-merge and
-nightly CI runs on master, and failed checks in test runs dispatched on this
-branch or on recently merged branches. Its output is what a status report or
-review request should state.
+nightly CI runs on master, the latest result of each check dispatched on this
+branch, and failed checks left by recently merged branches. Its output is what
+a status report or review request should state. scripts/pr-checks.py lists
+the dispatched checks of any pull request.
 
 Fetches origin's master, since a local master branch is updated only by
 manual pulls and says nothing about current master. Otherwise only reads git
@@ -33,10 +34,9 @@ import shutil
 import subprocess
 import sys
 
-from dispatched_checks import (BRANCH_WORKFLOWS, branch_runs, dispatched_runs, failed_checks,
-                                fetch_jobs, in_parallel, merged_from_branch,
-                                merged_pull_requests, run_jobs,
-                                running, undecided)
+from dispatched_checks import (BRANCH_WORKFLOWS, branch_runs, check_results, dispatched_runs,
+                               failed_checks, fetch_jobs, in_parallel, merged_from_branch,
+                               merged_pull_requests, result_lines, run_jobs, running, undecided)
 from tooling import ToolError, json_output, output, report_errors
 
 REPOSITORY = "greaber/syq"
@@ -233,7 +233,10 @@ def report(json_report, check):
 
     merged_runs = [(merged_pr, [run for run in pr_runs if not cleared(
         run["workflow"], merged_pr.get("mergedAt") or "")]) for merged_pr, pr_runs in merged_runs]
-    jobs = fetch_jobs(REPOSITORY, [own_runs] + [pr_runs for _, pr_runs in merged_runs])
+    # Every run on this branch is listed; merged branches only need their failures.
+    jobs = fetch_jobs(REPOSITORY, own_runs + [run for _, pr_runs in merged_runs
+                                              for run in undecided(pr_runs)])
+    branch_results = check_results(own_runs, jobs)
     branch_failed = failed_checks(own_runs, jobs)
     branch_running = running(own_runs)
     for entry in branch_failed:
@@ -291,7 +294,8 @@ def report(json_report, check):
                 "behind_master": behind_master,
             },
             "master_ci": master_runs, "pull_request": pr, "pull_request_head": pr_head_relation,
-            "dispatched": {"failed": branch_failed, "running": branch_running},
+            "dispatched": {"results": branch_results, "failed": branch_failed,
+                           "running": branch_running},
             "merged_failures": merged_failed, "checks": checks, "notes": notes,
             "warnings": warnings, "exit_status": exit_status,
         }, indent=2, ensure_ascii=False))
@@ -341,13 +345,8 @@ def report(json_report, check):
         else:
             lines.append("  checks: all completed successfully")
     if branch != "HEAD":
-        lines += ["", f"Dispatched test runs on {branch}:"]
-        lines += [f"  failed   {entry['workflow']} {entry['job']} at {entry['head'][:7]}  "
-                  f"{entry['url']}" for entry in branch_failed]
-        lines += [f"  running  {run['workflow']} at {(run.get('headSha') or '')[:7]}  {run.get('url')}"
-                  for run in branch_running]
-        if not branch_failed and not branch_running:
-            lines.append("  no failed or running checks")
+        lines += ["", f"Dispatched checks on {branch} (latest result of each, then unfinished runs):"]
+        lines += result_lines(branch_results, branch_running)
     if merged_failed:
         lines += ["", "Failures left by merged pull requests (until a full run on master passes):"]
         lines += [f"  #{entry['number']} {entry['workflow']} {entry['job']} at {entry['head'][:7]}  "

@@ -23,7 +23,7 @@ import os
 import sys
 
 from dispatched_checks import (BRANCH_WORKFLOWS, branch_runs, dispatched_runs, failed_checks,
-                               fetch_jobs, in_parallel, merged_from_branch, running)
+                               fetch_jobs, in_parallel, merged_from_branch, running, undecided)
 from tooling import ToolError, json_output, output, report_errors
 
 CONTEXT = "dispatched-checks"
@@ -82,7 +82,7 @@ def post(repository, pr):
             for workflow in BRANCH_WORKFLOWS])
         runs = branch_runs([run for workflow_runs in runs[1:] for run in workflow_runs],
                            branch, runs[0])
-        failed = failed_checks(runs, fetch_jobs(repository, [runs]))
+        failed = failed_checks(runs, fetch_jobs(repository, undecided(runs)))
         active = running(runs)
     state, description, url = status(pr, failed, active)
     # GitHub limits a status description to 140 characters.

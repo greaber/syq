@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 STATUS = SCRIPTS / "branch-status.py"
+PR_CHECKS = SCRIPTS / "pr-checks.py"
 
 FAKE_GH = """#!/bin/sh
 case "$1:$2" in
@@ -44,6 +45,9 @@ case "$1:$2" in
     ;;
   run:view)
     cat "$SYQ_TEST_RUNS_DIR/jobs-$3.json"
+    ;;
+  pr:view)
+    printf '%s\n' "$SYQ_TEST_PR_JSON"
     ;;
   pr:list)
     case " $* " in
@@ -160,9 +164,9 @@ class BranchStatusTests(unittest.TestCase):
         (self.runs / f"jobs-{run_id}.json").write_text(json.dumps({"jobs": [
             {"name": name, "conclusion": conclusion} for name, conclusion in jobs.items()]}))
 
-    def status(self, *args, pr=None, expected=0, split=False):
+    def status(self, *args, pr=None, expected=0, split=False, script=STATUS):
         result = subprocess.run(
-            [str(STATUS), *args], cwd=self.repo, text=True, stdout=subprocess.PIPE,
+            [str(script), *args], cwd=self.repo, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if split else subprocess.STDOUT,
             env={**os.environ, "SYQ_TEST_RUNS_DIR": str(self.runs),
                  "SYQ_TEST_MERGED_JSON": json.dumps(self.merged),
@@ -362,10 +366,15 @@ class BranchStatusTests(unittest.TestCase):
         report = json.loads(self.status("--json", expected=1))
         self.assertEqual([entry["job"] for entry in report["dispatched"]["failed"]], ["s3"])
         self.assertEqual([run["databaseId"] for run in report["dispatched"]["running"]], [13])
+        # Passed checks are listed with the commit they ran at.
+        self.assertEqual([(entry["job"], entry["conclusion"]) for entry in report["dispatched"]["results"]],
+                         [("s3", "failure"), ("real-ssh (core, default)", "success"), ("rust", "success")])
         # A later pass of the same job resolves it.
         self.dispatch("ci.yml", 14, "2026-02-04T00:00:00Z", {"s3": "success"})
         output = self.status()
-        self.assertIn("  running  ci.yml at", output)
+        self.assertIn(f"  passed   ci.yml s3 at {self.short}  https://example.invalid/runs/14/s3", output)
+        self.assertIn(f"  passed   ci.yml real-ssh (core, default) at {self.previous[:7]}", output)
+        self.assertIn(f"  running  ci.yml at {self.short}  https://example.invalid/runs/13", output)
         self.assertNotIn("failed   ci.yml", output)
         self.assertNotIn("WARNING", output)
 
@@ -375,6 +384,16 @@ class BranchStatusTests(unittest.TestCase):
         report = json.loads(self.status("--json", expected=1))
         self.assertEqual([entry["job"] for entry in report["dispatched"]["failed"]],
                          ["real-ssh (core, default)"])
+
+    def test_a_cancelled_rerun_does_not_replace_a_result(self):
+        self.dispatch("ci.yml", 17, "2026-02-01T00:00:00Z", {"s3": "failure", "rust": "success"})
+        self.dispatch("ci.yml", 18, "2026-02-02T00:00:00Z",
+                      {"s3": "cancelled", "rust": "cancelled", "sdks": "cancelled",
+                       "macos": "skipped"})
+        report = json.loads(self.status("--json", expected=1))
+        self.assertEqual([(entry["job"], entry["conclusion"]) for entry in report["dispatched"]["results"]],
+                         [("s3", "failure"), ("rust", "success"), ("sdks", "cancelled")])
+        self.assertIn("  cancelled ci.yml sdks at", self.status(expected=1))
 
     def test_this_branch_is_queried_beyond_the_shared_window(self):
         # Runs on busy branches can push this branch's run out of the shared list.
@@ -403,7 +422,7 @@ class BranchStatusTests(unittest.TestCase):
                         "mergedAt": "2026-02-02T00:00:00Z", "isCrossRepository": False}]
         self.full_run("ci.yml", 90, "2026-02-03T00:00:00Z")
         output = self.status()
-        self.assertIn("  no failed or running checks", output)
+        self.assertIn("Dispatched checks on task (latest result of each, then unfinished runs):\n  none\n", output)
         self.assertNotIn("WARNING", output)
 
     def test_an_old_merge_of_this_branch_name_is_found_directly(self):
@@ -413,7 +432,7 @@ class BranchStatusTests(unittest.TestCase):
         self.branch_merged = [{"number": 2, "url": "https://example.invalid/pull/2",
                                "headRefName": "task", "mergedAt": "2026-01-02T00:00:00Z",
                                "isCrossRepository": False}]
-        self.assertIn("  no failed or running checks", self.status())
+        self.assertIn("unfinished runs):\n  none\n", self.status())
 
     def test_failure_left_by_a_merge_is_reported_until_a_full_run_on_master(self):
         self.dispatch("ci.yml", 41, "2026-02-01T00:00:00Z", {"s3": "failure"}, branch="merged-task")
@@ -463,6 +482,53 @@ class BranchStatusTests(unittest.TestCase):
 
     def test_usage_errors(self):
         self.assertIn("usage:", self.status("--bogus", expected=2))
+        for args in ([], ["7", "8"], ["--bogus"]):
+            self.assertIn("usage:", self.status(*args, expected=2, script=PR_CHECKS))
+
+    def pr_checks(self, *args, expected=0, **changes):
+        pr = {"number": 7, "url": "https://example.invalid/pull/7", "state": "OPEN",
+              "headRefName": "task", "headRefOid": self.head, "mergedAt": None,
+              "isCrossRepository": False, **changes}
+        return self.status(*args, "7", pr=pr, expected=expected, script=PR_CHECKS)
+
+    def test_pr_checks_lists_the_branch_results(self):
+        self.dispatch("ci.yml", 61, "2026-02-01T00:00:00Z", {"s3": "failure", "rust": "success"},
+                      head=self.previous)
+        self.dispatch("macos.yml", 62, "2026-02-02T00:00:00Z", {"macos": "success"})
+        self.dispatch("ci.yml", 63, "2026-02-03T00:00:00Z", {"s3": None}, status="queued")
+        self.dispatch("ci.yml", 64, "2026-02-01T00:00:00Z", {"s3": "success"}, branch="other")
+        output = self.pr_checks(expected=1)
+        self.assertIn(f"  branch task, GitHub head {self.short}", output)
+        lines = output.splitlines()
+        start = lines.index("Dispatched checks (latest result of each, then unfinished runs):")
+        self.assertEqual(lines[start + 1:], [
+            f"  failed   ci.yml s3 at {self.previous[:7]}  https://example.invalid/runs/61/s3",
+            f"  passed   ci.yml rust at {self.previous[:7]}  https://example.invalid/runs/61/rust",
+            f"  passed   macos.yml macos at {self.short}  https://example.invalid/runs/62/macos",
+            f"  queued   ci.yml at {self.short}  https://example.invalid/runs/63"])
+        report = json.loads(self.pr_checks("--json", expected=1))
+        self.assertEqual([run["databaseId"] for run in report["running"]], [63])
+        self.assertEqual(report["exit_status"], 1)
+
+    def test_pr_checks_of_a_merged_pull_request(self):
+        # Runs dispatched before the merge still count while they finish; a
+        # later run on the reused branch name and an earlier merge's runs do not.
+        self.dispatch("ci.yml", 71, "2026-01-01T00:00:00Z", {"rust": "failure"})
+        self.dispatch("ci.yml", 72, "2026-02-01T00:00:00Z", {"s3": "success"})
+        self.dispatch("ci.yml", 73, "2026-02-03T00:00:00Z", {"s3": "failure"})
+        self.branch_merged = [
+            {"number": 2, "url": "https://example.invalid/pull/2", "headRefName": "task",
+             "mergedAt": "2026-01-02T00:00:00Z", "isCrossRepository": False},
+            {"number": 7, "url": "https://example.invalid/pull/7", "headRefName": "task",
+             "mergedAt": "2026-02-02T00:00:00Z", "isCrossRepository": False}]
+        report = json.loads(self.pr_checks("--json", state="MERGED",
+                                           mergedAt="2026-02-02T00:00:00Z"))
+        self.assertEqual([(entry["job"], entry["conclusion"]) for entry in report["results"]],
+                         [("s3", "success")])
+
+    def test_pr_checks_of_a_fork_lists_nothing(self):
+        self.dispatch("ci.yml", 81, "2026-02-01T00:00:00Z", {"s3": "failure"})
+        self.assertIn("unfinished runs):\n  none\n", self.pr_checks(isCrossRepository=True))
 
 
 if __name__ == "__main__":
