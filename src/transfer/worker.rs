@@ -254,16 +254,17 @@ impl Worker {
     /// representatives keep the per-file path, which inspects the destination
     /// before deciding what to write.
     fn replaces_without_comparison(&self, job: &FileJobData, existing: &Entry) -> bool {
-        existing.kind == Kind::File
-            && job.target_condition == TargetCondition::Any
-            && !self.opts.protects_existing_contents()
-            && !self.opts.checksum
-            && !self.opts.restricted_receiver
-            && !(self.opts.hardlinks && job.entry.nlink > 1)
-            && !self
+        let inspects_destination = self.opts.protects_existing_contents()
+            || self.opts.checksum
+            || self.opts.restricted_receiver
+            || (self.opts.hardlinks && job.entry.nlink > 1)
+            || self
                 .opts
                 .tuning
-                .reuse_destination_blocks(self.opts.same_host)
+                .reuse_destination_blocks(self.opts.same_host);
+        existing.kind == Kind::File
+            && job.target_condition == TargetCondition::Any
+            && !inspects_destination
     }
 
     pub(super) fn fail_small_batch(
