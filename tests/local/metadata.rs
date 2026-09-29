@@ -308,6 +308,44 @@ fn native_copies_need_no_writable_source_or_home() {
     assert_eq!(fs::read_dir(t.path("home/.config")).unwrap().count(), 0);
 }
 
+// Optional caches live under the home directory, but syq never creates the
+// home directory itself.
+#[test]
+fn copies_do_not_create_a_missing_home() {
+    let t = Tmp::new();
+    fake_ssh(&t);
+    write(&t.path("source/file"), b"no home");
+    for route in ["local", "push"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args([
+                "cp",
+                "--no-progress",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+            ])
+            .env("HOME", t.path("missing-home"))
+            .env_remove("XDG_CACHE_HOME")
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("PATH", format!("{}:/usr/bin:/bin", t.s("bin")))
+            .env("FAKE_REMOTE_HOME", t.path("missing-home"))
+            .env("FAKE_REMOTE_BIN", t.path("bin"))
+            .env("FAKE_RSH_LOG", t.path("ssh.log"));
+        command.args(["--srcs-in", &t.s("source")]);
+        if route == "push" {
+            command.args(["--to", "host"]);
+        }
+        command.args(["--into", &t.s(&format!("destination-{route}"))]);
+        let output = command.run().unwrap();
+        assert_output_ok(&output);
+        assert_eq!(
+            read(&t.path(&format!("destination-{route}/file"))),
+            b"no home"
+        );
+    }
+    assert!(!t.path("missing-home").exists());
+}
+
 // Several content sources map onto the destination root; the last one's
 // metadata wins, as for any other directory.
 #[test]

@@ -72,6 +72,7 @@ mod transfer_tuning;
 mod tune;
 mod update;
 mod use_version;
+mod user_dirs;
 mod wire_budget;
 mod write_gate;
 

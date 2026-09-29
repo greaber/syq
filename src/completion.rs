@@ -312,6 +312,14 @@ fn remember_endpoint(user: Option<&str>, host: &str, port: Option<u16>) -> Resul
     let endpoint = parse_native_endpoint(Some(&label))?
         .ok_or_else(|| anyhow!("validated endpoint unexpectedly became local"))?;
     update_cache(|cache| {
+        // Repeated commands to the same host leave the file untouched.
+        if cache
+            .endpoints
+            .first()
+            .is_some_and(|cached| cached.matches(&endpoint))
+        {
+            return false;
+        }
         cache.endpoints.retain(|cached| !cached.matches(&endpoint));
         cache.endpoints.insert(
             0,
@@ -324,15 +332,8 @@ fn remember_endpoint(user: Option<&str>, host: &str, port: Option<u16>) -> Resul
 }
 
 fn cache_path() -> Result<PathBuf> {
-    let root = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".cache"))
-        })
-        .context("cannot locate completion cache: both XDG_CACHE_HOME and HOME are unset")?;
+    let root = crate::user_dirs::cache_dir()
+        .context("cannot locate completion cache: no home directory or absolute XDG_CACHE_HOME")?;
     Ok(root.join("syq").join(CACHE_FILE))
 }
 
@@ -465,21 +466,27 @@ fn update_cache(mut update: impl FnMut(&mut CompletionCache) -> bool) -> Result<
     let parent = path.parent().expect("cache file has a parent");
     let directory = open_cache_directory(parent, true)?.expect("created cache directory");
     let _lock = lock_cache(parent, &directory)?;
-    let mut cache = read_cache()?;
+    // A cache damaged by a crash is replaced rather than blocking updates.
+    let mut cache = match read_cache() {
+        Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+            CompletionCache::default()
+        }
+        cache => cache?,
+    };
     let changed = update(&mut cache);
     if !changed {
         return Ok(false);
     }
+    // The cache is disposable: the rename keeps it whole, and it is not
+    // synced, because that would delay every remote command that updates it.
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("create temporary completion cache in {}", parent.display()))?;
     serde_json::to_writer_pretty(&mut temporary, &cache)?;
     temporary.write_all(b"\n")?;
-    temporary.as_file().sync_all()?;
     temporary
         .persist(&path)
         .map_err(|error| error.error)
         .with_context(|| format!("replace completion cache {}", path.display()))?;
-    directory.sync_all()?;
     Ok(true)
 }
 

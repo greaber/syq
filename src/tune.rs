@@ -196,15 +196,7 @@ fn cache_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("SYQ_TUNING_CACHE") {
         return (!path.is_empty()).then(|| PathBuf::from(path));
     }
-    std::env::var_os("XDG_CACHE_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|path| !path.is_empty())
-                .map(|home| PathBuf::from(home).join(".cache"))
-        })
-        .map(|root| root.join("syq/tuning.json"))
+    crate::user_dirs::cache_dir().map(|root| root.join("syq/tuning.json"))
 }
 
 #[cfg(test)]
