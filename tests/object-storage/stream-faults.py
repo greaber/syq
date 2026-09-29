@@ -129,8 +129,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if CASE == 'existing-policy' and STATE['existing'] is not None and 'partNumber=' not in self.path and self.headers.get('If-None-Match') == '*':
             self.reply(412, b'<Error><Code>PreconditionFailed</Code></Error>')
             return
-        # Validate the checksum independently of syq's code.
-        assert self.headers['x-amz-checksum-sha256'] == base64.b64encode(hashlib.sha256(data).digest()).decode()
+        # Ordinary uploads rely on HTTPS: no request checksum and no payload
+        # hash. A destination that requires one gets Content-MD5 instead.
+        assert not any(k.lower().startswith('x-amz-checksum') for k in self.headers), self.headers
+        assert self.headers['x-amz-content-sha256'] == 'UNSIGNED-PAYLOAD'
+        if 'Content-MD5' in self.headers:
+            assert CASE == 'object-lock'
+            assert self.headers['Content-MD5'] == base64.b64encode(hashlib.md5(data).digest()).decode()
+        elif CASE == 'object-lock':
+            with LOCK: STATE['rejected'] = STATE.get('rejected', 0) + 1
+            self.reply(400, b'<Error><Code>InvalidRequest</Code><Message>Content-MD5 OR x-amz-checksum- '
+                            b'HTTP header is required for Put Object requests with Object Lock parameters'
+                            b'</Message></Error>')
+            return
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if 'partNumber' in query:
             if CASE == 'upload-error':
@@ -151,7 +162,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             STATE['published'] = data
             STATE['completed'] = True
             STATE['metadata'] = {k.lower(): v for k, v in self.headers.items() if k.lower().startswith('x-amz-meta-')}
-        self.reply(200, headers={'ETag': '"part"', 'x-amz-checksum-sha256': self.headers['x-amz-checksum-sha256']})
+        self.reply(200, headers={'ETag': '"part"'})
 
     def do_POST(self):
         STATE['writes'] += 1
@@ -582,6 +593,14 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 result = run(put + ['--src-fd', str(source.fileno())], env=env, pass_fds=(source.fileno(),))
                 success(result)
                 assert STATE['published'] == DATA
+        elif CASE == 'object-lock':
+            for data in (b'binary\x00\xff', DATA):
+                STATE.update(parts={}, completed=False, rejected=0)
+                success(run(put, input=data, env=env))
+                assert STATE['published'] == data
+                # One rejection switches the copy to Content-MD5; parts already
+                # in flight may each be rejected once.
+                assert 1 <= STATE['rejected'] <= 2, STATE['rejected']
         elif CASE == 'upload-error':
             result = run(put, input=DATA, env=env)
             failure(result)

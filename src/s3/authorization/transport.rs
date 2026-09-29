@@ -36,7 +36,7 @@ impl HttpConnector for Connector {
                     .body()
                     .bytes()
                     .ok_or_else(|| failure("tag request body is not buffered"))?;
-                let md5 = crate::s3::checksum::Algorithm::Md5.digest(body);
+                let md5 = crate::s3::checksum::Algorithm::Md5.digest(body).unwrap();
                 request.headers_mut().remove("x-amz-checksum-crc32");
                 request
                     .headers_mut()
@@ -182,6 +182,7 @@ mod tests {
                     Some(
                         crate::s3::checksum::Algorithm::Md5
                             .digest(request.body().bytes().unwrap())
+                            .unwrap()
                             .as_str()
                     )
                 );
@@ -197,7 +198,9 @@ mod tests {
 
     #[tokio::test]
     async fn delegated_transport_preserves_approved_payload_digest() {
-        let checksum = crate::s3::checksum::Algorithm::Sha256.digest(b"abc");
+        let checksum = crate::s3::checksum::Algorithm::Sha256
+            .digest(b"abc")
+            .unwrap();
         for (method, query, header, value, expected) in [
             (
                 "PUT",

@@ -1,23 +1,19 @@
-//! Whole-object identities and provider part checksums from the same file read.
-use super::{encode_native_parts, Algorithm, Digest, HashAlgorithm, Result};
+//! Whole-object identities, and any provider part checksums, from one file read.
+use super::{Algorithm, Digest, HashAlgorithm, Result};
 use rayon::prelude::*;
 
 pub(super) struct Hashes {
     pub whole: String,
     pub comparison: Option<String>,
+    /// One per part; empty when uploads send no request checksum.
     pub checksums: Vec<String>,
+    /// Parts were read concurrently, so no single read saw the file finish.
+    pub concurrent: bool,
 }
 
 struct PartHashes {
-    native: Vec<[u8; 32]>,
+    checksums: Vec<String>,
     blake3: Option<[u8; 32]>,
-}
-
-pub(super) fn native_algorithm(algorithm: Algorithm) -> HashAlgorithm {
-    match algorithm {
-        Algorithm::Sha256 => HashAlgorithm::Sha256,
-        Algorithm::Md5 => HashAlgorithm::Md5,
-    }
 }
 
 pub(super) fn bytes(
@@ -26,37 +22,26 @@ pub(super) fn bytes(
     whole: HashAlgorithm,
     comparison: Option<HashAlgorithm>,
 ) -> Hashes {
-    let native = native_algorithm(native);
-    let hash = native.hash(bytes);
-    let digest = |algorithm| {
-        if algorithm == native {
-            Digest::from_hash(algorithm, &hash).value
-        } else {
-            Digest::hash_bytes(algorithm, bytes).value
-        }
-    };
-    let whole_digest = digest(whole);
+    let whole_digest = Digest::hash_bytes(whole, bytes).value;
     let comparison = comparison.map(|algorithm| {
         if algorithm == whole {
             whole_digest.clone()
         } else {
-            digest(algorithm)
+            Digest::hash_bytes(algorithm, bytes).value
         }
     });
     Hashes {
         whole: whole_digest,
         comparison,
-        checksums: encode_native_parts(native, &[hash]),
+        checksums: native.digest(bytes).into_iter().collect(),
+        concurrent: false,
     }
 }
 
-pub(super) fn uses_parallel_readers(size: u64, part_size: u64) -> bool {
-    size >= 32 * 1024 * 1024 && size > part_size
-}
-
-// Keep the small-file path to one read for every algorithm. Large files retain
-// independent parallel native part hashing. BLAKE3 can reuse that read when each
-// part starts at a BLAKE3 chunk boundary; other whole hashes share one additional read.
+// Keep the small-file path to one read for every algorithm. Large files read
+// parts in parallel for any request checksums and for BLAKE3, whose subtrees can
+// reuse that read when each part starts at a BLAKE3 chunk boundary. Other whole
+// hashes use one sequential read, alongside the parts when they have work.
 // The factory gives each parallel part and whole-file pass its own reader. Its
 // end offset lets the caller check source identity after the final read.
 pub(super) fn ranges<R>(
@@ -70,15 +55,12 @@ pub(super) fn ranges<R>(
 where
     R: FnMut(&mut [u8], u64) -> Result<()>,
 {
-    let native = native_algorithm(native);
     let tree = size > part_size
         && part_size.is_multiple_of(blake3::CHUNK_LEN as u64)
         && (whole == HashAlgorithm::Blake3 || comparison == Some(HashAlgorithm::Blake3));
-    let parallel = uses_parallel_readers(size, part_size);
-    let reusable = |algorithm| {
-        (size <= part_size && algorithm == native)
-            || (parallel && tree && algorithm == HashAlgorithm::Blake3)
-    };
+    let parallel =
+        size >= 32 * 1024 * 1024 && size > part_size && (native != Algorithm::None || tree);
+    let reusable = |algorithm| parallel && tree && algorithm == HashAlgorithm::Blake3;
     let mut whole_hashes: Vec<_> = [Some(whole), comparison]
         .into_iter()
         .flatten()
@@ -89,10 +71,7 @@ where
             }
             hashes
         });
-    let PartHashes {
-        native: parts,
-        blake3,
-    } = if parallel {
+    let PartHashes { checksums, blake3 } = if parallel {
         let (whole_result, parts) = rayon::join(
             || -> Result<()> {
                 if !whole_hashes.is_empty() {
@@ -125,16 +104,18 @@ where
             while offset < end {
                 let length = (end - offset).min(buffer.len() as u64) as usize;
                 read(&mut buffer[..length], offset)?;
-                hash.update(&buffer[..length]);
+                if let Some(hash) = &mut hash {
+                    hash.update(&buffer[..length]);
+                }
                 for (_, whole) in &mut whole_hashes {
                     whole.update(&buffer[..length]);
                 }
                 offset += length as u64;
             }
-            parts.push(hash.finalize());
+            parts.extend(hash.map(|hash| hash.finish()));
         }
         PartHashes {
-            native: parts,
+            checksums: parts,
             blake3: None,
         }
     };
@@ -143,9 +124,7 @@ where
         .map(|(algorithm, hash)| Digest::from_hash(algorithm, &hash.finalize()))
         .collect();
     let digest = |algorithm| {
-        if size <= part_size && algorithm == native {
-            Digest::from_hash(algorithm, &parts[0]).value
-        } else if let Some(hash) = blake3.filter(|_| algorithm == HashAlgorithm::Blake3) {
+        if let Some(hash) = blake3.filter(|_| algorithm == HashAlgorithm::Blake3) {
             Digest::from_hash(algorithm, &hash).value
         } else {
             digests
@@ -159,16 +138,17 @@ where
     Ok(Hashes {
         whole: digest(whole),
         comparison: comparison.map(digest),
-        checksums: encode_native_parts(native, &parts),
+        checksums,
+        concurrent: parallel,
     })
 }
 
 // Each aligned part is split into complete BLAKE3 subtrees, with a possibly
-// short final chunk at EOF. No subtree crosses a native part boundary.
+// short final chunk at EOF. No subtree crosses a provider part boundary.
 fn parallel_parts<R>(
     size: u64,
     part_size: u64,
-    native: HashAlgorithm,
+    native: Algorithm,
     tree: bool,
     open: impl Fn(u64) -> Result<R> + Sync,
 ) -> Result<PartHashes>
@@ -214,7 +194,9 @@ where
                 while offset < subtree_end {
                     let length = (subtree_end - offset).min(buffer.len() as u64) as usize;
                     read(&mut buffer[..length], offset)?;
-                    native.update(&buffer[..length]);
+                    if let Some(native) = &mut native {
+                        native.update(&buffer[..length]);
+                    }
                     if let Some(subtree) = &mut subtree {
                         subtree.update(&buffer[..length]);
                     }
@@ -227,7 +209,7 @@ where
                     });
                 }
             }
-            Ok((native.finalize(), subtrees))
+            Ok((native.map(|hash| hash.finish()), subtrees))
         })
         .collect::<Result<Vec<_>>>()?;
     fn merge(subtrees: &[Subtree], end: u64, root: bool) -> [u8; 32] {
@@ -248,14 +230,14 @@ where
             merge_subtrees_non_root(&left, &right, Mode::Hash)
         }
     }
-    let mut native = Vec::with_capacity(parts.len());
+    let mut checksums = Vec::with_capacity(parts.len());
     let mut subtrees = Vec::new();
-    for (hash, pieces) in parts {
-        native.push(hash);
+    for (checksum, pieces) in parts {
+        checksums.extend(checksum);
         subtrees.extend(pieces);
     }
     Ok(PartHashes {
-        native,
+        checksums,
         blake3: tree.then(|| merge(&subtrees, size, true)),
     })
 }
@@ -285,26 +267,20 @@ mod tests {
                 bytes.len(),
             ];
             for size in sizes.into_iter().filter(|&size| size <= bytes.len()) {
-                for native in [Algorithm::Sha256, Algorithm::Md5] {
+                for native in [Algorithm::None, Algorithm::Sha256, Algorithm::Md5] {
                     let read_bytes = AtomicUsize::new(0);
                     let PartHashes {
-                        native: parts,
+                        checksums: parts,
                         blake3: whole,
-                    } = parallel_parts(
-                        size as u64,
-                        part_size as u64,
-                        native_algorithm(native),
-                        true,
-                        |_| {
-                            Ok(|buffer: &mut [u8], offset| {
-                                buffer.copy_from_slice(
-                                    &bytes[offset as usize..offset as usize + buffer.len()],
-                                );
-                                read_bytes.fetch_add(buffer.len(), Ordering::Relaxed);
-                                Ok(())
-                            })
-                        },
-                    )
+                    } = parallel_parts(size as u64, part_size as u64, native, true, |_| {
+                        Ok(|buffer: &mut [u8], offset| {
+                            buffer.copy_from_slice(
+                                &bytes[offset as usize..offset as usize + buffer.len()],
+                            );
+                            read_bytes.fetch_add(buffer.len(), Ordering::Relaxed);
+                            Ok(())
+                        })
+                    })
                     .unwrap();
                     assert_eq!(
                         Digest::from_hash(HashAlgorithm::Blake3, &whole.unwrap()).value,
@@ -313,21 +289,19 @@ mod tests {
                     );
                     assert_eq!(read_bytes.load(Ordering::Relaxed), size);
                     assert_eq!(
-                        encode_native_parts(native_algorithm(native), &parts),
+                        parts,
                         bytes[..size]
                             .chunks(part_size)
-                            .map(|b| native.digest(b))
+                            .filter_map(|b| native.digest(b))
                             .collect::<Vec<_>>()
                     );
                 }
             }
         }
-        assert!(
-            parallel_parts(4096, 3073, HashAlgorithm::Sha256, true, |_| Ok(
-                |_: &mut [u8], _| Ok(())
-            ))
-            .is_err()
-        );
+        assert!(parallel_parts(4096, 3073, Algorithm::None, true, |_| Ok(
+            |_: &mut [u8], _| Ok(())
+        ))
+        .is_err());
     }
 
     #[test]
@@ -337,7 +311,7 @@ mod tests {
         // threshold, and final parts with uneven lengths all share one read.
         for size in [0, 101, bytes.len()] {
             for part_size in [1024 * 1024 + 3, 3 * 1024 * 1024, 8 * 1024 * 1024] {
-                for native in [Algorithm::Sha256, Algorithm::Md5] {
+                for native in [Algorithm::None, Algorithm::Sha256, Algorithm::Md5] {
                     for whole in [
                         HashAlgorithm::Blake3,
                         HashAlgorithm::Sha256,
@@ -375,11 +349,11 @@ mod tests {
                             Digest::hash_bytes(HashAlgorithm::Sha256, &bytes[..size]).value
                         );
                         let expected: Vec<_> = if size == 0 {
-                            vec![native.digest(&[])]
+                            native.digest(&[]).into_iter().collect()
                         } else {
                             bytes[..size]
                                 .chunks(part_size as usize)
-                                .map(|b| native.digest(b))
+                                .filter_map(|b| native.digest(b))
                                 .collect()
                         };
                         assert_eq!(result.checksums, expected);
@@ -394,7 +368,7 @@ mod tests {
         let bytes: Vec<_> = (0..32 * 1024 * 1024 + 23)
             .map(|n| (n % 251) as u8)
             .collect();
-        for native in [Algorithm::Sha256, Algorithm::Md5] {
+        for native in [Algorithm::None, Algorithm::Sha256, Algorithm::Md5] {
             for (part_size, whole, comparison, reads) in [
                 (16 * 1024 * 1024, HashAlgorithm::Blake3, None, 1),
                 (5 * 1024 * 1024, HashAlgorithm::Blake3, None, 1),
@@ -438,11 +412,17 @@ mod tests {
                     },
                 )
                 .unwrap();
+                // Without request checksums or BLAKE3 subtrees, parts have no
+                // work: one sequential read computes the whole-file hash.
+                let parts_idle = native == Algorithm::None && !part_size.is_multiple_of(1024);
+                assert_eq!(result.concurrent, !parts_idle);
+                let (reads, expected_opens) = if parts_idle {
+                    (1, 1)
+                } else {
+                    (reads, bytes.len().div_ceil(part_size as usize) + reads - 1)
+                };
                 assert_eq!(read_bytes.load(Ordering::Relaxed), reads * bytes.len());
-                assert_eq!(
-                    opens.load(Ordering::Relaxed),
-                    bytes.len().div_ceil(part_size as usize) + reads - 1
-                );
+                assert_eq!(opens.load(Ordering::Relaxed), expected_opens);
                 assert_eq!(result.whole, Digest::hash_bytes(whole, &bytes).value);
                 assert_eq!(
                     result.comparison,
@@ -452,7 +432,7 @@ mod tests {
                     result.checksums,
                     bytes
                         .chunks(part_size as usize)
-                        .map(|b| native.digest(b))
+                        .filter_map(|b| native.digest(b))
                         .collect::<Vec<_>>()
                 );
             }

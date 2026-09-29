@@ -58,15 +58,20 @@ its checksum.
 
 For a complete check of a local copy, use an [expected hash](#expected-hashes).
 
-For local/S3 copies, provider request checksums remain enabled. The `transfer`
-setting does not disable them. Single-part uploads with a SHA-256 request
-checksum also reuse that digest for payload signing, without another hashing
-pass. Pathname uploads store a whole-file BLAKE3 hash by default, so later
-`--hash` comparisons can use it without downloading the object. An explicit
-comparison, transfer, or expected hash can select a different stored algorithm.
-BLAKE3 shares the read used to prepare request checksums for all automatic part
-sizes. Large multipart files need an additional local read for other whole-file
-algorithms or custom part sizes that are not multiples of 1 KiB.
+For local/S3 copies, uploads rely on HTTPS to protect the transfer and send no
+request checksum. Over a plain `http://` endpoint, only TCP's checksum protects
+uploaded bytes. When a destination rejects an upload without a checksum, as AWS
+does for buckets with an Object Lock default retention period, syq retries with
+Content-MD5 and sends it for the rest of the copy, reading files again to compute
+it. With
+[storage authorization](object-storage.md#authorize-from-your-laptop), uploads
+send SHA-256 request checksums instead (Content-MD5 on R2 and for streams).
+Pathname uploads store a whole-file BLAKE3 hash by default, so later `--hash`
+comparisons can use it without downloading the object. An explicit comparison,
+transfer, or expected hash can select a different stored algorithm. Uploads read
+each source file once to hash it. With storage authorization, large files need a
+second local read for whole-file algorithms other than BLAKE3, or for custom part
+sizes that are not multiples of 1 KiB.
 The `transfer` setting checks stored hashes on download when present. Use an
 expected hash for objects without a stored hash. See
 [Filesystem differences](object-storage.md#filesystem-differences).
@@ -76,8 +81,8 @@ object bodies. They do not support content-hash comparison, extra transfer
 hashing, or expected hashes.
 
 Filesystem descriptor copies accept `transfer=ALGORITHM` for optional payload
-checks. S3 descriptor copies reject extra transfer hashing: they keep provider
-checksums but do not store syq hash metadata. Descriptor copies do not reread the result by default.
+checks. S3 descriptor copies reject extra transfer hashing because they do not
+store syq hash metadata. Descriptor copies do not reread the result by default.
 
 <a id="expected-digests"></a>
 

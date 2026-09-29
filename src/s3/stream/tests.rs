@@ -243,6 +243,7 @@ async fn entries_share_s3_admission_and_failed_producer_does_not_cancel_client()
         requests: tokio::sync::Semaphore::new(controls.s3_requests.unwrap()).into(),
         objects: tokio::sync::Semaphore::new(3).into(),
         bandwidth: None,
+        content_md5: Default::default(),
     };
     tokio::time::timeout(Duration::from_secs(10), async {
         tokio::try_join!(
