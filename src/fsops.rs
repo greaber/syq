@@ -2684,8 +2684,8 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 
 /// Run the selected operations, which create or remove directory entries.
 /// The kernel changes one directory's entries one at a time, so threads
-/// beyond the second only contend for it. Directories spread over the pool;
-/// the operations of each run in order on at most two of its threads.
+/// beyond the second only contend for it. Directories spread over the pool,
+/// and each is worked on by at most two of its threads.
 fn parallel_by_directory<R: Send>(
     ops: &[Op],
     selected: &[usize],
@@ -2703,17 +2703,23 @@ fn parallel_by_directory<R: Send>(
             .map_or(&path[..0], |separator| &path[..separator]);
         directories.entry(directory).or_default().push(position);
     }
-    let shares: Vec<&[usize]> = directories
-        .values()
-        .flat_map(|positions| {
-            let (first, second) = if positions.len() < 2 * PAR_MIN {
-                (positions.as_slice(), &positions[..0])
-            } else {
-                positions.split_at(positions.len() / 2)
-            };
-            [first, second]
+    let shares: Vec<Vec<usize>> = directories
+        .into_values()
+        .flat_map(|mut positions| {
+            if positions.len() < 2 * PAR_MIN {
+                return vec![positions];
+            }
+            // XFS gives each new directory the next allocation group in turn,
+            // and the files of a directory allocate from its group. Workers
+            // fill neighbouring directories at the same time, so directories
+            // created in name order would put them into the same few groups
+            // together. A scattered order leaves no pattern to fall into.
+            positions.sort_unstable_by_key(|position| {
+                (*position as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            });
+            let second = positions.split_off(positions.len() / 2);
+            vec![positions, second]
         })
-        .filter(|share| !share.is_empty())
         .collect();
     use rayon::prelude::*;
     let done: Vec<Vec<(usize, R)>> = metadata_pool().install(|| {
