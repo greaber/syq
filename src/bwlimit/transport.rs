@@ -3,7 +3,9 @@ use std::io::{self, Write};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const MAX_CHUNK: u64 = 64 * 1024;
+// At high rates leave a complete encrypted TCP record in one socket write.
+// At low rates the rate/100 bound still limits a write to about 10 ms of data.
+const MAX_CHUNK: u64 = 1024 * 1024;
 const CANCEL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// One budget for all sending connections in a copy. Idle credit is bounded,
@@ -61,6 +63,9 @@ impl Budget {
         }
         let now = Instant::now();
         let delay = self.reserve(now, bytes);
+        if delay.is_zero() {
+            return Ok(());
+        }
         while now.elapsed() < delay {
             if stopped() {
                 return Err(cancelled());
