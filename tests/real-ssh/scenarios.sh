@@ -902,7 +902,23 @@ python3 /usr/local/libexec/syq-test-receiver-revoke.py
 
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
-syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions --tcp-congestion cubic \
+# Exercise explicit congestion selection without requiring the CI kernel to
+# permit cubic. Both endpoints run as an unprivileged user.
+source_congestion=$(ssh source 'cat /proc/sys/net/ipv4/tcp_allowed_congestion_control')
+destination_congestion=$(ssh destination 'cat /proc/sys/net/ipv4/tcp_allowed_congestion_control')
+shared_congestion=
+for algorithm in $source_congestion; do
+    case " $destination_congestion " in
+        *" $algorithm "*) shared_congestion=$algorithm; break ;;
+    esac
+done
+if [ -z "$shared_congestion" ]; then
+    printf 'no shared allowed TCP congestion algorithm: source=%s destination=%s\n' \
+        "$source_congestion" "$destination_congestion" >&2
+    exit 1
+fi
+printf 'explicit TCP congestion algorithm: %s\n' "$shared_congestion"
+syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions --tcp-congestion "$shared_congestion" \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 assert_same_tree \
