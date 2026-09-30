@@ -2648,5 +2648,82 @@ fn empty_remote_directory_skips_redundant_destination_batch_lookup() {
             !populated,
             "{destination} {policy:?}: widest lookup {widest}\n{lookups}"
         );
+        // Preflight stats the root once. A missing root is then created and
+        // identity-checked per batch; an empty one is re-read once for its
+        // metadata; a populated one takes the batch lookup plus leaf stats.
+        let expected = match destination {
+            "missing" => 3,
+            "empty" => 2,
+            _ => 3,
+        };
+        assert_eq!(
+            destination_lookup_count(&lookups),
+            expected,
+            "{destination} {policy:?}: {lookups}"
+        );
+    }
+}
+
+/// A destination that preflight found missing and that planning never creates
+/// (a single file placed with --as, or a dry run) is absent for every batch
+/// without another lookup.
+#[cfg(debug_assertions)]
+#[test]
+fn missing_remote_target_is_not_looked_up_again_during_planning() {
+    for (label, sources, placement, extra) in [
+        (
+            // --stats keeps the single file out of the small-copy offer.
+            "file",
+            &["--src", "src/file"][..],
+            &["--as", "dst-file"][..],
+            &["--stats"][..],
+        ),
+        (
+            "dry-run",
+            &["--srcs-in", "src"][..],
+            &["--into", "dst"][..],
+            &["--dry-run"][..],
+        ),
+        (
+            "existing",
+            &["--srcs-in", "src"][..],
+            &["--into", "dst"][..],
+            &["--only-existing"][..],
+        ),
+    ] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        write(&t.path("src/file"), b"payload");
+        write(&t.path("src/nested/other"), b"other");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.arg("cp").current_dir(&t.0);
+        command.args(sources).args(["--to", "host"]).args(placement);
+        command.args(extra);
+        command.args([
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--no-tcp",
+            "-q",
+        ]);
+        let output = command
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("SYQ_TEST_DESTINATION_LOOKUPS", t.path("lookups"))
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(t.path("dst-file").exists(), label == "file", "{label}");
+        assert!(!t.path("dst").exists(), "{label}");
+        let lookups = fs::read_to_string(t.path("lookups")).unwrap_or_default();
+        assert_eq!(
+            destination_lookup_count(&lookups),
+            1,
+            "{label}: only the preflight stat\n{lookups}"
+        );
     }
 }

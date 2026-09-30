@@ -3053,6 +3053,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // --existing, --inplace, --copy-if) need no per-entry lookup: each
         // makes the default decision for an absent destination.
         destination_children_known_missing: fresh_destination,
+        destination_root_known_missing: dst_initially_missing,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),

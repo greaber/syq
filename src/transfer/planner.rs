@@ -25,6 +25,9 @@ pub(super) struct Planner<'a> {
     /// The destination was missing or empty at preflight. Its root may
     /// still have metadata to preserve; only descendants are known absent.
     pub(super) destination_children_known_missing: bool,
+    /// The destination root itself was missing at preflight. Until this copy
+    /// creates it, planning treats it as absent without another lookup.
+    pub(super) destination_root_known_missing: bool,
     /// Called after jobs are queued; starts streaming only when useful work exists.
     pub(super) start_streaming: &'a dyn Fn(),
     pub(super) source_partials: u64,
@@ -3534,10 +3537,11 @@ impl Planner<'_> {
 
     /// Destination stats for a fresh tree: every descendant is absent. The
     /// root keeps its lookup so an existing empty root's metadata is
-    /// preserved, unless this copy created it and the mutation-root identity
-    /// check already observed it this batch. Earlier batches may have
-    /// created a shared directory; inspect it again so creation accounting
-    /// and metadata decisions see that state.
+    /// preserved, unless it was missing at preflight: then it is absent until
+    /// this copy creates it, after which the mutation-root identity check has
+    /// already observed it this batch. Earlier batches may have created a
+    /// shared directory; inspect it again so creation accounting and
+    /// metadata decisions see that state.
     fn stat_fresh_descendants<'p>(
         &mut self,
         root_entry: Option<&Entry>,
@@ -3550,6 +3554,7 @@ impl Planner<'_> {
             if path == &self.dst_root {
                 match root_entry {
                     Some(root) => stats[index] = Some(root.clone()),
+                    None if self.destination_root_known_missing => {}
                     None => {
                         positions.push(index);
                         inspect.push(path.clone());
