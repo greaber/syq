@@ -23,6 +23,60 @@ fn enlarge_pipe(file: &File) {
     }
 }
 
+// macOS poll can miss FIFO readability while a large blocking write is
+// pending, leaving both ends asleep despite buffered data. select wakes for
+// that data. Keep bounded waits so owned streams can still be cancelled.
+#[cfg(target_os = "macos")]
+fn stream_ready(fd: i32, events: i16, timeout_ms: i32) -> i32 {
+    unsafe extern "C" {
+        // The _DARWIN_UNLIMITED_SELECT entry point accepts descriptors above
+        // FD_SETSIZE when supplied with a sufficiently large bitmap.
+        #[link_name = "select$DARWIN_EXTSN"]
+        fn select_unlimited(
+            nfds: libc::c_int,
+            read: *mut libc::fd_set,
+            write: *mut libc::fd_set,
+            error: *mut libc::fd_set,
+            timeout: *mut libc::timeval,
+        ) -> libc::c_int;
+    }
+    debug_assert!(fd >= 0);
+    debug_assert!(events == libc::POLLIN || events == libc::POLLOUT);
+    // Use the stack for ordinary descriptors, and contiguous fd_set blocks
+    // for high descriptors. FD_SET itself only sees an index within one block.
+    let mut stack = [unsafe { std::mem::zeroed::<libc::fd_set>() }];
+    let mut heap;
+    let block = fd as usize / libc::FD_SETSIZE;
+    let sets = if block == 0 {
+        &mut stack[..]
+    } else {
+        heap = vec![stack[0]; block + 1];
+        &mut heap[..]
+    };
+    unsafe { libc::FD_SET(fd % libc::FD_SETSIZE as i32, &mut sets[block]) };
+    let mut timeout = libc::timeval {
+        tv_sec: (timeout_ms / 1000).into(),
+        tv_usec: ((timeout_ms % 1000) * 1000).into(),
+    };
+    let null = std::ptr::null_mut();
+    let (read, write) = if events == libc::POLLIN {
+        (sets.as_mut_ptr(), null)
+    } else {
+        (null, sets.as_mut_ptr())
+    };
+    unsafe { select_unlimited(fd + 1, read, write, null, &mut timeout) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stream_ready(fd: i32, events: i16, timeout_ms: i32) -> i32 {
+    let mut poll = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut poll, 1, timeout_ms) }
+}
+
 /// A caller-owned descriptor, or an explicitly selected local FIFO.
 #[derive(Clone, Debug)]
 pub(crate) enum Source {
@@ -226,16 +280,8 @@ impl Descriptor {
             if self.cancelled.load(Relaxed) {
                 bail!("stream cancelled");
             }
-            let mut poll = libc::pollfd {
-                fd: self.file.as_raw_fd(),
-                events,
-                revents: 0,
-            };
-            let rc = unsafe { libc::poll(&mut poll, 1, 100) };
-            // macOS FIFO readiness can remain unset while a large write is
-            // pending. Retry the nonblocking I/O after the bounded wait too;
-            // waiting only for a readiness event can deadlock both ends.
-            if rc >= 0 {
+            let rc = stream_ready(self.file.as_raw_fd(), events, 100);
+            if rc > 0 {
                 return Ok(());
             }
             if rc < 0 {
@@ -276,12 +322,7 @@ impl Descriptor {
         while bytes.len() < size {
             self.check_cancelled()?;
             if !bytes.is_empty() && !fill {
-                let mut poll = libc::pollfd {
-                    fd: self.file.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+                let ready = stream_ready(self.file.as_raw_fd(), libc::POLLIN, 0);
                 if ready == 0 {
                     break;
                 }
@@ -451,6 +492,48 @@ mod tests {
         let bytes = bytes.expect("large FIFO read stalled").unwrap();
         written.unwrap();
         assert_eq!(bytes, expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn readiness_handles_descriptors_above_fd_setsize() {
+        // macOS shells can start with a soft limit below FD_SETSIZE. Raise it
+        // for this test, without changing the hard limit, and restore on drop.
+        struct RestoreLimit(libc::rlimit);
+        impl Drop for RestoreLimit {
+            fn drop(&mut self) {
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
+            }
+        }
+        let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let _restore = RestoreLimit(limit);
+        limit.rlim_cur = limit.rlim_cur.max((libc::FD_SETSIZE + 32) as libc::rlim_t);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let (source, mut writer) = UnixStream::pair().unwrap();
+        let high = unsafe {
+            libc::fcntl(
+                source.as_raw_fd(),
+                libc::F_DUPFD_CLOEXEC,
+                libc::FD_SETSIZE as i32,
+            )
+        };
+        assert!(high >= libc::FD_SETSIZE as i32);
+        let mut source = unsafe { File::from_raw_fd(high) };
+        assert_eq!(stream_ready(high, libc::POLLIN, 0), 0);
+        assert_eq!(stream_ready(high, libc::POLLOUT, 0), 1);
+        writer.write_all(b"x").unwrap();
+        assert_eq!(stream_ready(high, libc::POLLIN, 100), 1);
+        let mut byte = [0];
+        source.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+        assert_eq!(stream_ready(high, libc::POLLIN, 0), 0);
+        drop(writer);
+        assert_eq!(stream_ready(high, libc::POLLIN, 100), 1);
+        assert_eq!(source.read(&mut byte).unwrap(), 0);
     }
 
     #[test]
