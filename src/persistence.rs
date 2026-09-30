@@ -87,26 +87,45 @@ struct PersistenceConfig {
     enabled: bool,
 }
 
+/// An `--rsh` ssh command's own options and the directory they were given
+/// in: relative paths in them, such as `-F ssh.conf` or `-i key`, depend on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SshOptions {
+    pub(crate) options: Vec<String>,
+    pub(crate) directory: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EndpointRecord {
     pub(crate) user: Option<String>,
     pub(crate) host: String,
     pub(crate) port: Option<u16>,
-    /// The `--rsh` ssh command's own options for this connection. Omitted
-    /// when empty, so default connections keep the original record format.
+    /// The `--rsh` ssh command's own options for this connection and the
+    /// directory they were given in. Omitted for default connections, which
+    /// keep the original record format.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) ssh_options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ssh_options_directory: Option<PathBuf>,
 }
 
 impl EndpointRecord {
-    fn new(user: Option<&str>, host: &str, port: Option<u16>, ssh_options: &[String]) -> Self {
+    fn new(user: Option<&str>, host: &str, port: Option<u16>, ssh: Option<&SshOptions>) -> Self {
         Self {
             user: user.map(str::to_owned),
             host: host.to_owned(),
             port,
-            ssh_options: ssh_options.to_vec(),
+            ssh_options: ssh.map(|ssh| ssh.options.clone()).unwrap_or_default(),
+            ssh_options_directory: ssh.map(|ssh| ssh.directory.clone()),
         }
+    }
+
+    fn ssh(&self) -> Option<SshOptions> {
+        Some(SshOptions {
+            options: self.ssh_options.clone(),
+            directory: self.ssh_options_directory.clone()?,
+        })
     }
 
     pub(crate) fn label(&self) -> String {
@@ -298,7 +317,7 @@ fn connect(
         endpoint.user.as_deref(),
         &endpoint.host,
         endpoint.port,
-        &[],
+        None,
     )?;
     multiplexer.defer_receiving();
     let multiplexer = Arc::new(multiplexer);
@@ -353,9 +372,9 @@ pub(crate) fn mark_explicit_scope(args: &mut Args) -> Result<()> {
         && args
             .rsh
             .as_deref()
-            .is_some_and(|rsh| !crate::conn::rsh_shares_connections(rsh))
+            .is_some_and(|rsh| !crate::conn::rsh_persists_connections(rsh))
     {
-        bail!("--pscope requires the default ssh or an --rsh ssh command whose options do not set up connection sharing");
+        bail!("--pscope requires the default ssh or an --rsh ssh command without its own connection-sharing options or debug logging");
     }
     Ok(())
 }
@@ -436,17 +455,17 @@ pub(crate) fn prepare_endpoint(
     user: Option<&str>,
     host: &str,
     port: Option<u16>,
-    options: &[String],
+    ssh: Option<&SshOptions>,
 ) -> Result<PathBuf> {
     validate_scope(scope)?;
     if scope.join(crate::receive_service::CLOSING).exists() {
         bail!("persistence scope is closing");
     }
-    let key = endpoint_key(user, host, port, options);
+    let key = endpoint_key(user, host, port, ssh);
     let socket = scope.join(&key);
     validate_openssh_socket_path(&socket)?;
     let record_path = scope.join(format!("{key}.json"));
-    let expected = EndpointRecord::new(user, host, port, options);
+    let expected = EndpointRecord::new(user, host, port, ssh);
     let record_bytes = serde_json::to_vec(&expected)?;
     let mut temporary = tempfile::NamedTempFile::new_in(scope)
         .with_context(|| format!("create endpoint record in {}", scope.display()))?;
@@ -624,7 +643,7 @@ fn create_ephemeral_scope() -> Result<PathBuf> {
 }
 
 pub(crate) fn initialize_scope(scope: &Path) -> Result<()> {
-    validate_openssh_socket_path(&scope.join(endpoint_key(None, "", None, &[])))?;
+    validate_openssh_socket_path(&scope.join(endpoint_key(None, "", None, None)))?;
     secure_directory(scope, true, true)?;
     create_marker(scope)?;
     validate_scope(scope)
@@ -726,10 +745,16 @@ fn secure_directory(path: &Path, create: bool, tighten: bool) -> Result<File> {
     Ok(directory)
 }
 
-/// `options` from an `--rsh` ssh command select a separate connection, so a
-/// login made with one key, jump host, or configuration is never reused by a
-/// command that asked for another. Without options the key is unchanged.
-fn endpoint_key(user: Option<&str>, host: &str, port: Option<u16>, options: &[String]) -> String {
+/// An `--rsh` ssh command's options, with the directory they were given in,
+/// select a separate connection, so a login made with one key, jump host, or
+/// configuration is never reused by a command that asked for another. Without
+/// them the key is unchanged.
+fn endpoint_key(
+    user: Option<&str>,
+    host: &str,
+    port: Option<u16>,
+    ssh: Option<&SshOptions>,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(user.unwrap_or("").as_bytes());
@@ -739,9 +764,12 @@ fn endpoint_key(user: Option<&str>, host: &str, port: Option<u16>, options: &[St
         hasher.update(b":");
         hasher.update(port.to_be_bytes());
     }
-    if !options.is_empty() {
+    if let Some(ssh) = ssh {
         hasher.update(b"\0ssh-options");
-        for option in options {
+        let directory = ssh.directory.as_os_str().as_encoded_bytes();
+        hasher.update((directory.len() as u64).to_be_bytes());
+        hasher.update(directory);
+        for option in &ssh.options {
             hasher.update((option.len() as u64).to_be_bytes());
             hasher.update(option.as_bytes());
         }
@@ -797,7 +825,7 @@ fn scope_records(scope: &Path) -> Result<Vec<(String, EndpointRecord)>> {
                 record.user.as_deref(),
                 &record.host,
                 record.port,
-                &record.ssh_options,
+                record.ssh().as_ref(),
             );
             if key != expected_key {
                 bail!(
@@ -843,9 +871,12 @@ fn socket_is_live(path: &Path) -> bool {
 #[derive(Serialize)]
 struct ConnectionStatus {
     endpoint: String,
-    /// The `--rsh` ssh command's own options for this connection.
+    /// The `--rsh` ssh command's own options for this connection, and the
+    /// directory they were given in.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ssh_options: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh_options_directory: Option<PathBuf>,
     state: String,
     ssh_connected: bool,
     receiving_enabled: Option<bool>,
@@ -873,7 +904,7 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
         // opened with other ssh options.
         let receiving_enabled = receiving_servers
             .as_ref()
-            .filter(|_| record.ssh_options.is_empty())
+            .filter(|_| record.ssh().is_none())
             .map(|profiles| {
                 profiles
                     .iter()
@@ -898,6 +929,7 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
         connections.push(ConnectionStatus {
             endpoint: record.label(),
             ssh_options: record.ssh_options.clone(),
+            ssh_options_directory: record.ssh_options_directory.clone(),
             state: state.to_owned(),
             ssh_connected: ssh_live,
             receiving_enabled,
@@ -924,10 +956,11 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
     crate::output::human_stdout!("connections: {}", connections.len());
     for connection in connections {
         let mut line = format!("  {}", connection.endpoint);
-        if !connection.ssh_options.is_empty() {
+        if let Some(directory) = &connection.ssh_options_directory {
             line.push_str(&format!(
-                " (ssh options: {})",
-                shell_words::join(&connection.ssh_options)
+                " (ssh options: {}; in {})",
+                shell_words::join(&connection.ssh_options),
+                directory.display()
             ));
         }
         line.push_str(&format!("  {}", connection.state));
@@ -956,7 +989,7 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
             }
         }
         // Only a copy with the same --rsh options reopens such a connection.
-        if connection.state == "inactive" && connection.ssh_options.is_empty() {
+        if connection.state == "inactive" && connection.ssh_options_directory.is_none() {
             line.push_str(&format!(
                 "; run syq persist connect {}",
                 shell_words::quote(&connection.endpoint)
@@ -1102,10 +1135,10 @@ mod tests {
         let temporary = tempfile::tempdir_in("/tmp").unwrap();
         let scope = temporary.path().join("scope");
         initialize_scope(&scope).unwrap();
-        let first = prepare_endpoint(&scope, Some("alice"), "example", None, &[]).unwrap();
-        let same = prepare_endpoint(&scope, Some("alice"), "example", None, &[]).unwrap();
+        let first = prepare_endpoint(&scope, Some("alice"), "example", None, None).unwrap();
+        let same = prepare_endpoint(&scope, Some("alice"), "example", None, None).unwrap();
         let alternate =
-            prepare_endpoint(&scope, Some("alice"), "example", Some(2222), &[]).unwrap();
+            prepare_endpoint(&scope, Some("alice"), "example", Some(2222), None).unwrap();
         assert_eq!(first, same);
         assert_ne!(first, alternate);
         assert_eq!(scope_records(&scope).unwrap().len(), 2);
@@ -1118,14 +1151,14 @@ mod tests {
         let temporary = tempfile::tempdir_in("/tmp").unwrap();
         let scope = temporary.path().join("scope");
         initialize_scope(&scope).unwrap();
-        prepare_endpoint(&scope, None, "example", None, &[]).unwrap();
+        prepare_endpoint(&scope, None, "example", None, None).unwrap();
         // An older version could create this scope; moving a scope can also
         // make a previously valid endpoint path exceed the creation budget.
         let long = temporary.path().join("x".repeat(100));
         std::fs::rename(scope, &long).unwrap();
         assert!(validate_scope(&long).is_ok());
         assert!(print_scope_status(&long, "ephemeral", false).is_ok());
-        assert!(prepare_endpoint(&long, None, "example", None, &[]).is_err());
+        assert!(prepare_endpoint(&long, None, "example", None, None).is_err());
         close_scope(&long).unwrap();
         assert!(!long.exists());
     }
@@ -1142,7 +1175,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    prepare_endpoint(&scope, Some("alice"), "example", Some(2222), &[]).unwrap()
+                    prepare_endpoint(&scope, Some("alice"), "example", Some(2222), None).unwrap()
                 })
             })
             .collect();
@@ -1168,7 +1201,7 @@ mod tests {
 
     #[test]
     fn master_exit_targets_the_recorded_endpoint_and_socket() {
-        let record = EndpointRecord::new(Some("alice"), "example", Some(2222), &[]);
+        let record = EndpointRecord::new(Some("alice"), "example", Some(2222), None);
         let command =
             master_exit_command(Path::new("/run/user/1/scope/cm-deadbeefdeadbeef"), &record);
         let args: Vec<_> = command
@@ -1197,7 +1230,7 @@ mod tests {
         let path = PathBuf::from(OsString::from_vec(
             b"/tmp/scope with space/%h/non-utf8-\xff/socket".to_vec(),
         ));
-        let command = master_exit_command(&path, &EndpointRecord::new(None, "example", None, &[]));
+        let command = master_exit_command(&path, &EndpointRecord::new(None, "example", None, None));
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args[0], OsStr::new("-S"));
         assert_eq!(

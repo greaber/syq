@@ -333,28 +333,46 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 );
             }
             // An --rsh ssh command shares and persists connections like the
-            // default ssh, keyed by its options. A remote-to-remote
-            // coordinator's shell was chosen for it by the invoking machine
-            // and never persists a login on the server.
-            let ssh_options: Option<Vec<String>> = match &args.rsh {
-                None => Some(Vec::new()),
+            // default ssh, keyed by its options and the directory they were
+            // given in. A remote-to-remote coordinator's shell was chosen for
+            // it by the invoking machine and never persists a login on the
+            // server.
+            let sharing: Option<(Option<crate::persistence::SshOptions>, bool)> = match &args.rsh {
+                None => Some((None, true)),
                 Some(_) if args.delegated || args.restricted_grant.is_some() => None,
-                Some(_) => crate::conn::shareable_ssh_options(&rsh).map(<[String]>::to_vec),
+                Some(_) => crate::conn::shareable_ssh_options(&rsh).map(|sharing| {
+                    if sharing.options.is_empty() {
+                        (None, sharing.persist)
+                    } else {
+                        match std::env::current_dir() {
+                            Ok(directory) => (
+                                Some(crate::persistence::SshOptions {
+                                    options: sharing.options.to_vec(),
+                                    directory,
+                                }),
+                                sharing.persist,
+                            ),
+                            // Without the directory, relative paths in the
+                            // options cannot be keyed; share only this run.
+                            Err(_) => (None, false),
+                        }
+                    }
+                }),
             };
-            let ssh_multiplexer = match ssh_options {
+            let ssh_multiplexer = match sharing {
                 None => None,
                 // A restricted grant keeps a private connection for this run.
                 Some(_) if args.restricted_grant.is_some() => {
                     Some(Arc::new(SshMultiplexer::new()?))
                 }
-                Some(options) => {
+                Some((ssh, persist)) => {
                     // Connection sharing and persistence only save logins. When
                     // their local state cannot be used, connect without them. An
                     // explicit --pscope is a command-line argument, so a bad one
                     // stays an error.
-                    let persistent =
-                        crate::persistence::scope_for_implicit_ssh(args.pscope.as_deref())
-                            .and_then(|scope| {
+                    let persistent = if persist {
+                        crate::persistence::scope_for_implicit_ssh(args.pscope.as_deref()).and_then(
+                            |scope| {
                                 scope
                                     .map(|scope| {
                                         SshMultiplexer::persistent(
@@ -362,11 +380,15 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                                             loc.user.as_deref(),
                                             h,
                                             loc.port,
-                                            &options,
+                                            ssh.as_ref(),
                                         )
                                     })
                                     .transpose()
-                            });
+                            },
+                        )
+                    } else {
+                        Ok(None)
+                    };
                     let persistent = match persistent {
                         Ok(persistent) => persistent,
                         Err(error) if args.pscope.is_some() => return Err(error),

@@ -379,7 +379,7 @@ pub struct Args {
     /// in-place write leaves a newer-looking final file those filters would then skip forever
     #[arg(long, conflicts_with_all = ["update", "ignore_existing"])]
     pub inplace: bool,
-    /// Remote shell command (default: ssh); controls agent forwarding when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing
+    /// Remote shell command (default: ssh); controls agent forwarding when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
     /// Use this exact syq executable on the remote instead of the managed helper
@@ -1304,7 +1304,7 @@ struct NativeRemoteArgs {
     /// Choose the endpoint that runs the coordinator
     #[arg(long, value_enum, default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
     coordinate_at: CoordinateAt,
-    /// Remote shell command (default: ssh); the command owns SSH and agent policy when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing
+    /// Remote shell command (default: ssh); the command owns SSH and agent policy when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run
     #[arg(long = "rsh", value_name = "COMMAND")]
     rsh: Option<String>,
     #[command(flatten)]
@@ -1550,7 +1550,7 @@ struct NativeMapCommand {
     /// Filter emitted mapping entries with a source expression
     #[arg(long = "where", value_name = "EXPR")]
     where_expression: Option<String>,
-    /// Remote shell command (default: ssh). An ssh command keeps shared and persistent connections unless its options configure connection sharing
+    /// Remote shell command (default: ssh). An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run
     #[arg(long, value_name = "COMMAND")]
     rsh: Option<String>,
     #[command(flatten)]

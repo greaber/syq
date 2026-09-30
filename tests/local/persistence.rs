@@ -178,9 +178,11 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
     let ssh = fake_ssh(&t);
     let scope = ephemeral_scope(&t);
     write(&t.path("src"), b"shared");
-    let copy = |rsh: Option<&str>, destination: &str| {
+    let copy_in = |directory: &str, rsh: Option<&str>, destination: &str| {
         write(&t.path("rsh.log"), b"");
+        fs::create_dir_all(t.path(directory)).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.current_dir(t.path(directory));
         command.args([
             "cp",
             "--no-progress",
@@ -188,8 +190,8 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
             "--syq-path",
             env!("CARGO_BIN_EXE_syq"),
         ]);
-        // A scope needs a command whose connections syq can share.
-        if !rsh.is_some_and(|rsh| rsh.contains("Control")) {
+        // A scope needs a command whose connections syq can persist.
+        if !rsh.is_some_and(|rsh| rsh.contains("Control") || rsh.contains("-v")) {
             command.arg("--pscope").arg(&scope);
         }
         if let Some(rsh) = rsh {
@@ -219,6 +221,7 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
             .collect();
         (sockets, log)
     };
+    let copy = |rsh: Option<&str>, destination: &str| copy_in("work", rsh, destination);
 
     let (default, _) = copy(None, "default");
     let (first, _) = copy(Some("-o ServerAliveInterval=7"), "first");
@@ -233,9 +236,50 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
     assert_ne!(other, default);
     assert_eq!(read(&t.path("again")), b"shared");
 
+    // Relative paths in options depend on the directory, so the same options
+    // given elsewhere get their own connection.
+    let (elsewhere, _) = copy_in(
+        "elsewhere",
+        Some("-o ServerAliveInterval=7"),
+        "elsewhere-copy",
+    );
+    assert_eq!(elsewhere.len(), 1);
+    assert_ne!(elsewhere, first);
+
     // Options that set up sharing themselves keep full control of it.
     let (own, log) = copy(Some("-o ControlPath=none"), "own");
     assert!(own.is_empty(), "{log}");
+    // Debug output shares a connection only within its own run.
+    let (verbose, log) = copy(Some("-v -o ServerAliveInterval=7"), "verbose");
+    assert_eq!(verbose.len(), 1, "{log}");
+    assert!(
+        !verbose
+            .iter()
+            .any(|socket| socket.starts_with(scope.to_str().unwrap())),
+        "{log}"
+    );
+
+    // Only the connection without options gets a pool of ready sessions,
+    // which open sessions with syq's own ssh options.
+    let pools = || {
+        fs::read_dir(&scope)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".pool")
+            })
+            .count()
+    };
+    wait_for(
+        "the default connection's pool",
+        std::time::Duration::from_secs(15),
+        || pools() >= 1,
+    );
+    assert_eq!(pools(), 1);
 
     let scope_text = scope.to_str().unwrap();
     let status = persistence_command(&t, &["status", "--pscope", scope_text])
@@ -244,11 +288,11 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
     assert_output_ok(&status);
     let status = String::from_utf8_lossy(&status.stdout);
     assert!(
-        status.contains("(ssh options: -o 'ServerAliveInterval=7')"),
+        status.contains("(ssh options: -o 'ServerAliveInterval=7'; in "),
         "{status}"
     );
     assert!(
-        status.contains("(ssh options: -o 'ServerAliveInterval=9')"),
+        status.contains("(ssh options: -o 'ServerAliveInterval=9'; in "),
         "{status}"
     );
     let closed = persistence_command(&t, &["off", "--pscope", scope_text])

@@ -1659,7 +1659,7 @@ fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let scope = directory.path().join("scope");
     crate::persistence::initialize_scope(&scope).unwrap();
-    let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None, &[]).unwrap();
+    let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None, None).unwrap();
     let socket = crate::session_pool::socket_path(&multiplexer.path);
     let mut spec = RemoteSpec::local_receiver(true);
     spec.local_process = false;
@@ -1686,12 +1686,12 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
     crate::persistence::initialize_scope(&base).unwrap();
     // The socket name is stable per endpoint, and a dead leftover at the
     // path is cleared so a fresh master can bind.
-    let probe = SshMultiplexer::persistent(&base, Some("u"), "example", None, &[]).unwrap();
+    let probe = SshMultiplexer::persistent(&base, Some("u"), "example", None, None).unwrap();
     std::fs::write(&probe.path, b"stale").unwrap();
-    let multiplexer = SshMultiplexer::persistent(&base, Some("u"), "example", None, &[]).unwrap();
+    let multiplexer = SshMultiplexer::persistent(&base, Some("u"), "example", None, None).unwrap();
     assert_eq!(probe.path, multiplexer.path);
     let alternate_port =
-        SshMultiplexer::persistent(&base, Some("u"), "example", Some(2222), &[]).unwrap();
+        SshMultiplexer::persistent(&base, Some("u"), "example", Some(2222), None).unwrap();
     assert_ne!(multiplexer.path, alternate_port.path);
     assert!(!multiplexer.path.exists());
     assert_eq!(
@@ -1758,6 +1758,7 @@ fn verbose_ssh_is_limited_to_nonpersistent_unrestricted_helpers() {
         persistent: true,
         idle_timeout: "300",
         automatic_receiving: false,
+        session_pool: true,
         reuse_for_workers: AtomicBool::new(false),
         workers_rejected: AtomicBool::new(false),
     }));
@@ -1781,6 +1782,7 @@ fn persistent_control_path_is_one_byte_exact_openssh_argument() {
         persistent: true,
         idle_timeout: "300",
         automatic_receiving: false,
+        session_pool: true,
         reuse_for_workers: AtomicBool::new(false),
         workers_rejected: AtomicBool::new(false),
     };
@@ -2129,6 +2131,7 @@ fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
         "ssh -o ControlMaster=auto",
         "ssh -ocontrolpath=/tmp/socket",
         "ssh -o 'ControlPersist 10'",
+        "ssh -o ' ControlPath=none'",
         "tsh ssh",
         "ssh host",
         "ssh -- -p",
@@ -2138,6 +2141,26 @@ fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
     }
     assert_eq!(
         shareable_ssh_options(&words("ssh -p 2222")).unwrap(),
-        ["-p", "2222"]
+        SshSharing {
+            options: &words("-p 2222"),
+            persist: true
+        }
+    );
+    // A debug log level shares connections only within the run.
+    for verbose in [
+        "ssh -v",
+        "ssh -4vC",
+        "ssh -o LogLevel=DEBUG2",
+        "ssh -o 'LogLevel verbose'",
+    ] {
+        assert!(
+            !shareable_ssh_options(&words(verbose)).unwrap().persist,
+            "{verbose}"
+        );
+    }
+    assert!(
+        shareable_ssh_options(&words("ssh -o LogLevel=QUIET"))
+            .unwrap()
+            .persist
     );
 }
