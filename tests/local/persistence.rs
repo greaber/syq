@@ -211,8 +211,12 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
             .unwrap();
         assert_output_ok(&out);
         let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+        // The default connection's pool runs in the background and logs its
+        // own checks and spares; only this command's sessions count.
+        let (checks, spares) = pool_lines(&log);
         let sockets: std::collections::BTreeSet<String> = log
             .lines()
+            .filter(|line| !checks.contains(line) && !spares.contains(line))
             .filter_map(|line| {
                 let words: Vec<&str> = line.split_whitespace().collect();
                 let at = words.iter().position(|word| *word == "-S")?;
