@@ -5652,48 +5652,6 @@ fn deleted_file_descriptor_check_distinguishes_replacement_and_other_files() {
 }
 
 #[cfg(target_os = "linux")]
-fn deleted_file_is_open(path: &Path) -> bool {
-    // Inodes can be reused by parallel tests after the donor is closed. The
-    // unique fixture path still identifies it after unlink or replacement.
-    let mut deleted = path.as_os_str().to_os_string();
-    deleted.push(" (deleted)");
-    fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
-        let fd = entry.unwrap().path();
-        match fs::read_link(&fd) {
-            Ok(target) => target.as_os_str() == deleted,
-            // Other tests can close descriptors while we enumerate them.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-            Err(error) => panic!("read descriptor {}: {error}", fd.display()),
-        }
-    })
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn deleted_file_descriptor_check_distinguishes_replacement_and_other_files() {
-    let tree = crate::test_support::tempdir().unwrap();
-    let path = tree.path().join("file");
-    fs::write(&path, b"donor").unwrap();
-    let donor = File::open(&path).unwrap();
-    assert!(!deleted_file_is_open(&path));
-    fs::remove_file(&path).unwrap();
-    assert!(deleted_file_is_open(&path));
-
-    fs::write(&path, b"replacement").unwrap();
-    let replacement = File::open(&path).unwrap();
-    let other_path = tree.path().join("other");
-    fs::write(&other_path, b"other").unwrap();
-    let other = File::open(&other_path).unwrap();
-    fs::remove_file(&other_path).unwrap();
-    assert!(deleted_file_is_open(&path));
-
-    drop(donor);
-    assert!(!deleted_file_is_open(&path));
-    assert!(deleted_file_is_open(&other_path));
-    drop((replacement, other));
-}
-
-#[cfg(target_os = "linux")]
 #[test]
 fn comparison_workers_release_donor_descriptors_before_publication() {
     let tree = crate::test_support::tempdir().unwrap();
