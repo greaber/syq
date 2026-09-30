@@ -312,8 +312,9 @@ fn inspect_file_system(file: &File) -> FileSystemTraits {
     }
 }
 
+/// The mount `file` was opened through, on kernels that name mounts.
 #[cfg(target_os = "linux")]
-fn file_system_key(file: &File, dev: u64) -> FileSystemKey {
+fn mount_id(file: &File) -> Option<u64> {
     let mut stat = std::mem::MaybeUninit::<libc::statx>::uninit();
     let result = unsafe {
         libc::statx(
@@ -324,33 +325,24 @@ fn file_system_key(file: &File, dev: u64) -> FileSystemKey {
             stat.as_mut_ptr(),
         )
     };
-    if result == 0 {
-        let stat = unsafe { stat.assume_init() };
-        if stat.stx_mask & libc::STATX_MNT_ID != 0 {
-            return FileSystemKey::Mount(stat.stx_mnt_id);
-        }
+    if result != 0 {
+        return None;
     }
-    FileSystemKey::Device(dev)
+    let stat = unsafe { stat.assume_init() };
+    (stat.stx_mask & libc::STATX_MNT_ID != 0).then_some(stat.stx_mnt_id)
+}
+
+#[cfg(target_os = "linux")]
+fn file_system_key(file: &File, dev: u64) -> FileSystemKey {
+    mount_id(file).map_or(FileSystemKey::Device(dev), FileSystemKey::Mount)
 }
 
 /// The filesystem a new entry of `directory` would live on, with its traits.
 #[cfg(target_os = "linux")]
 fn directory_file_system(directory: &File) -> io::Result<(FileSystemKey, FileSystemTraits)> {
-    let mut stat = std::mem::MaybeUninit::<libc::statx>::uninit();
-    let named_mount = unsafe {
-        libc::statx(
-            directory.as_raw_fd(),
-            c"".as_ptr(),
-            libc::AT_EMPTY_PATH,
-            libc::STATX_MNT_ID,
-            stat.as_mut_ptr(),
-        ) == 0
-            && stat.assume_init().stx_mask & libc::STATX_MNT_ID != 0
-    };
-    let key = if named_mount {
-        FileSystemKey::Mount(unsafe { stat.assume_init() }.stx_mnt_id)
-    } else {
-        FileSystemKey::Device(directory.metadata()?.dev())
+    let key = match mount_id(directory) {
+        Some(mount) => FileSystemKey::Mount(mount),
+        None => FileSystemKey::Device(directory.metadata()?.dev()),
     };
     Ok((key, file_system_traits(directory, key)))
 }

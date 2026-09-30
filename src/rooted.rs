@@ -199,7 +199,7 @@ pub(crate) struct MutationTurn {
 /// filesystem.
 pub(crate) struct ReplacementTurn {
     #[cfg(any(target_os = "linux", test))]
-    _permit: directory_gate::Permit,
+    _permit: Option<directory_gate::Permit>,
 }
 
 /// An existing directory opened once as the authority boundary.
@@ -208,6 +208,8 @@ pub(crate) struct Root {
     identity: RootIdentity,
     #[cfg(target_os = "linux")]
     partial_name_limits: OnceLock<Mutex<HashMap<Vec<Vec<u8>>, usize>>>,
+    #[cfg(target_os = "linux")]
+    serializes_replacement: OnceLock<bool>,
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) test_name_limit: std::sync::atomic::AtomicUsize,
     #[cfg(all(test, target_os = "linux"))]
@@ -241,6 +243,8 @@ impl Root {
             directory,
             #[cfg(target_os = "linux")]
             partial_name_limits: OnceLock::new(),
+            #[cfg(target_os = "linux")]
+            serializes_replacement: OnceLock::new(),
             #[cfg(all(test, target_os = "linux"))]
             test_name_limit: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, target_os = "linux"))]
@@ -274,12 +278,35 @@ impl Root {
         Ok(directory_gate::acquire(self.identity, parents))
     }
 
-    /// Wait to replace files beneath this root. Take it before a directory
-    /// turn, and only around publication.
+    /// Whether this root's filesystem frees inodes under one lock for the
+    /// whole filesystem, as ext4 does. Replacing files there is bounded per
+    /// filesystem; elsewhere replacements scaled with the workers, or the
+    /// bound made no difference.
+    #[cfg(any(target_os = "linux", test))]
+    fn serializes_replacement(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            *self.serializes_replacement.get_or_init(|| {
+                let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                // SAFETY: fstatfs writes only into the local struct.
+                unsafe {
+                    libc::fstatfs(self.directory.as_raw_fd(), stats.as_mut_ptr()) == 0
+                        && stats.assume_init().f_type as u32 == libc::EXT4_SUPER_MAGIC as u32
+                }
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    /// Wait to replace files beneath this root, where its filesystem needs
+    /// that. Take it before a directory turn, and only around publication.
     pub(crate) fn replacement_turn(&self) -> ReplacementTurn {
         ReplacementTurn {
             #[cfg(any(target_os = "linux", test))]
-            _permit: directory_gate::replacement(self.identity.dev),
+            _permit: self
+                .serializes_replacement()
+                .then(|| directory_gate::replacement(self.identity.dev)),
         }
     }
 
