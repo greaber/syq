@@ -692,10 +692,6 @@ pub enum WireRequest<Data> {
         token: Vec<u8>,
         role: ConnectionRole,
     },
-    /// Allocate one source-side budget shared by TCP and independent SSH workers.
-    CreateSendBudget {
-        rate: u64,
-    },
     /// Ask the server to accept data connections over TCP (see crypto.rs).
     /// `key` is None for plaintext; `token` authenticates plaintext connections.
     TcpListen {
@@ -1084,6 +1080,10 @@ pub enum WireRequest<Data> {
         len: u32,
         expected: ContentDigest,
     },
+    /// Allocate one source-side budget shared by TCP and independent SSH workers.
+    CreateSendBudget {
+        rate: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1244,7 +1244,6 @@ impl Request {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Response {
-    SendBudget(crate::descriptor_broker::DescriptorTicket),
     HelloOk {
         identity: String,
         platform: String,
@@ -1370,6 +1369,7 @@ pub enum Response {
         off: u64,
         len: u32,
     },
+    SendBudget(crate::descriptor_broker::DescriptorTicket),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

@@ -403,12 +403,12 @@ impl DescriptorSession {
     }
 }
 
+type SendBudget = (Arc<crate::bwlimit::transport::Budget>, DescriptorTicket);
+
 /// A process-local view of one endpoint session. The control connection
 /// creates the descriptor broker lazily when it registers a root. TCP workers
 /// share this slot and clone the root directly; a fresh independent-worker
 /// process has an empty slot and acquires the same root over the broker socket.
-type SendBudget = (Arc<crate::bwlimit::transport::Budget>, DescriptorTicket);
-
 #[derive(Clone)]
 pub(crate) struct DescriptorSessionSlot {
     session: Arc<Mutex<Option<DescriptorSession>>>,

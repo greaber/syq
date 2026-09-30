@@ -69,6 +69,7 @@ fn network_cap_is_aggregate_and_keeps_small_file_batches() {
             .run()
             .unwrap();
         assert_output_ok(&out);
+        assert!(!stderr_of(&out).contains("bw-pacing has no effect"));
         assert_same_tree(&t.path("src"), &t.path("dst"));
         if mode == 2 {
             let stderr = stderr_of(&out);
@@ -103,11 +104,16 @@ fn network_compression_is_charged_after_compressing() {
         let t = Tmp::new();
         write(&t.path("src"), &vec![b'x'; 4 << 20]);
         let mut cmd = command(&t, mode, pull, "1M");
-        cmd.args(paths(&t, pull, false));
+        cmd.arg("--performance-tuning=bw-pacing=average")
+            .args(paths(&t, pull, false));
         let start = std::time::Instant::now();
         let out = cmd.run().unwrap();
         assert_output_ok(&out);
         assert_eq!(read(&t.path("dst")), read(&t.path("src")));
+        assert_eq!(
+            stderr_of(&out).matches("bw-pacing has no effect").count(),
+            1
+        );
         assert!(
             start.elapsed() < Duration::from_secs(3),
             "logical bytes appear to be paced: {out:?}"
@@ -200,4 +206,41 @@ fn relay_caps_both_legs_and_keeps_comparison_pipelining() {
             .unwrap()
             .contains("compare "));
     }
+}
+
+#[test]
+fn declining_small_copy_leaves_control_traffic_unpaced() {
+    let t = Tmp::new();
+    let mut sources = Vec::new();
+    // Each file exceeds the small-copy ceiling but the destination already
+    // matches. No data should move; long names make the later stat/planning
+    // requests alone take much longer than the deadline if control is paced.
+    for n in 0..64 {
+        let name = format!("{n:02}-{}", "x".repeat(160));
+        for directory in ["src", "dst"] {
+            let path = t.path(&format!("{directory}/{name}"));
+            write(&path, b"");
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(2 << 20)
+                .unwrap();
+            set_mtime(&path, 1);
+        }
+        sources.push(t.s(&format!("src/{name}")));
+    }
+    let mut cmd = command(&t, 1, false, "1"); // 1 KiB/s
+    let child = cmd
+        .arg("--no-compress")
+        .args(&sources)
+        .args(["--to", "127.0.0.1", "--into", &t.s("dst")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = wait_for_child_output(child, Duration::from_secs(8));
+    assert_output_ok(&out);
+    assert_eq!(tuning_observed(&out)["native_small_copies"], 0, "{out:?}");
+    assert!(stderr_of(&out).contains("unchanged"), "{out:?}");
 }

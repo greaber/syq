@@ -670,6 +670,10 @@ fn attempt_small_copy(
     dst_ctl: &mut dyn Conn,
     roots: &[RegisteredSourceRoot],
     source_entries: Option<Vec<Entry>>,
+    pacing: Option<(
+        Arc<crate::bwlimit::transport::Budget>,
+        std::sync::Weak<Sched>,
+    )>,
     progress: &Progress,
     t0: std::time::Instant,
 ) -> Result<SmallCopy> {
@@ -911,6 +915,11 @@ fn attempt_small_copy(
                 );
             }
             source_reader = Some(reader);
+            // Preparation can decline without sending payload. Leave that
+            // control session unpaced; after payload, recovery reconnects.
+            if let Some((budget, scheduler)) = pacing {
+                dst_ctl.pace_outgoing(budget, scheduler)?;
+            }
             dst_ctl.call(Request::CopySmallFiles(payloads))?
         }
         other => other,
@@ -923,7 +932,7 @@ fn attempt_small_copy(
         Response::SmallFilesCopied(SmallCopyResponse {
             outcome: SmallCopyOutcome::UnsupportedTarget,
             ..
-        }) => {
+        }) if !prepared => {
             if debug() {
                 crate::output::diagnostic!(
                     "syq: small copy: a destination is not a regular file; using the ordinary engine"
@@ -934,7 +943,7 @@ fn attempt_small_copy(
         Response::SmallFilesCopied(SmallCopyResponse {
             outcome: SmallCopyOutcome::CapacityShort,
             ..
-        }) => {
+        }) if !prepared => {
             if debug() {
                 crate::output::diagnostic!(
                     "syq: small copy: capacity preflight would refuse; using the ordinary engine"
@@ -2338,6 +2347,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && (opts.src_remote || opts.dst_remote))
         .then(|| Arc::new(crate::bwlimit::transport::Budget::new(args.bwlimit_bytes)));
     if let Some(budget) = &transport_budget {
+        if opts.tuning.bw_pacing.is_some() {
+            crate::output::diagnostic!(
+                "syq: bw-pacing has no effect on this copy; the bandwidth cap paces compressed bytes at the sender"
+            );
+        }
         for (ep, ctl, source) in [
             (&src_ep, &mut src_ctl, true),
             (&dst_ep, &mut dst_ctl, false),
@@ -2369,9 +2383,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // The bounded offer replaces the destination configuration turn. Its
     // selected payloads use this control connection without data workers.
     if small_copy_candidate {
-        if let Some(budget) = &transport_budget {
-            dst_ctl.pace_outgoing(budget.clone(), Arc::downgrade(&sched))?;
-        }
         match attempt_small_copy(
             &args,
             &opts,
@@ -2383,6 +2394,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &mut *dst_ctl,
             source_roots.get().expect("source roots registered"),
             small_entries,
+            transport_budget
+                .as_ref()
+                .map(|budget| (budget.clone(), Arc::downgrade(&sched))),
             &progress,
             t0,
         )? {
