@@ -300,9 +300,9 @@ mod tests {
     }
 
     #[test]
-    fn live_dump_finds_loopback_by_interface_name_without_running_ip() {
-        // Loopback has host scope, so the dump itself skips it; read the
-        // interface table instead to prove indexes resolve to device names.
+    fn interface_indexes_resolve_to_names_and_live_dump_succeeds() {
+        // Loopback has host scope, so the dump skips it; check name
+        // resolution through its fixed index instead.
         assert_eq!(interface_name(1).as_deref(), Some("lo"));
         dump_addresses().unwrap();
     }
