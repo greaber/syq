@@ -108,14 +108,15 @@ pub(crate) fn socket_closed(socket: &std::net::TcpStream) -> bool {
         // BSD/macOS poll need not report HUP for a peer's FIN. A nonblocking
         // peek observes EOF without changing shared descriptor flags.
         let mut byte = 0u8;
-        return unsafe {
+        let received = unsafe {
             libc::recv(
                 socket.as_raw_fd(),
                 (&mut byte as *mut u8).cast(),
                 1,
                 libc::MSG_PEEK | libc::MSG_DONTWAIT,
             )
-        } == 0;
+        };
+        received == 0
     }
     #[cfg(target_os = "linux")]
     false
@@ -278,11 +279,22 @@ mod tests {
 
     #[test]
     fn vectored_records_preserve_headers_and_partial_writes() {
-        // Vec's default vectored writer only writes the first slice, exercising
-        // partial progress as well as the boundary across header and body.
+        struct ShortWriter(Vec<u8>);
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let n = bytes.len().min(7);
+                self.0.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        // The default vectored writer uses only the first slice. Short writes
+        // exercise partial progress and the boundary across header and body.
         let mut writer = PacedWriter {
             handshake_pending: None,
-            inner: Vec::new(),
+            inner: ShortWriter(Vec::new()),
             budget: std::sync::Arc::new(Budget::new(u64::MAX)),
             stopped: || false,
         };
@@ -295,7 +307,7 @@ mod tests {
             assert!(n <= MAX_CHUNK as usize);
             io::IoSlice::advance_slices(&mut remaining, n);
         }
-        assert_eq!(writer.inner, [header.as_slice(), &body].concat());
+        assert_eq!(writer.inner.0, [header.as_slice(), &body].concat());
     }
 
     #[test]

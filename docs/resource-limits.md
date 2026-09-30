@@ -20,7 +20,8 @@ syq cp data --to server --into backup --resource-limits bandwidth=10M
 
 For ordinary TCP pushes and pulls, this limits outgoing data-connection bytes to
 10 MiB/s across all workers. It counts compressed bytes, including syq framing
-and TCP encryption records, but excludes connection setup, SSH control traffic, and IP/TCP headers.
+and TCP encryption records, but excludes connection setup, SSH control traffic,
+and IP/TCP headers.
 Compressible files can therefore copy at a higher logical rate. Small bursts
 remain possible because the operating system buffers network writes.
 
