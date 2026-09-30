@@ -1406,6 +1406,7 @@ impl RemoteSpec {
         }
         let multiplexer = self.ssh_multiplexer.as_ref()?;
         if !multiplexer.persistent
+            || !multiplexer.session_pool
             || self.local_process
             || self.restricted_grant.is_some()
             || !self
@@ -1827,7 +1828,7 @@ impl RemoteSpec {
             // ready. The pool is started here, after this connection is up,
             // so it never sits on the critical path.
             if let Some(multiplexer) = &self.ssh_multiplexer {
-                if multiplexer.persistent {
+                if multiplexer.persistent && multiplexer.session_pool {
                     crate::session_pool::ensure(&multiplexer.path, &self.pool_endpoint());
                     if multiplexer.automatic_receiving {
                         crate::receive_service::ensure(&multiplexer.path, self);

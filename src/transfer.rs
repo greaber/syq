@@ -303,8 +303,6 @@ impl Opts {
     fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
         crate::copy_policy::CopyPolicy {
             same_host: self.same_host,
-            // Payload checks do not disable same-host copy shortcuts.
-            checksum: self.checksum,
             force_ranges: self.tuning.force_ranges(),
             bandwidth_limited,
             receiver_copy_disabled: !cfg!(any(target_os = "linux", target_os = "macos"))
@@ -336,44 +334,81 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                     "an explicit endpoint SSH port requires the default ssh or an --rsh command whose executable is ssh"
                 );
             }
-            let ssh_multiplexer = if args.rsh.is_some() {
-                None
-            } else if args.restricted_grant.is_some() {
-                Some(Arc::new(SshMultiplexer::new()?))
-            } else {
-                // Connection sharing and persistence only save logins. When
-                // their local state cannot be used, connect without them. An
-                // explicit --pscope is a command-line argument, so a bad one
-                // stays an error.
-                let persistent = crate::persistence::scope_for_implicit_ssh(args.pscope.as_deref())
-                    .and_then(|scope| {
-                        scope
-                            .map(|scope| {
-                                SshMultiplexer::persistent(&scope, loc.user.as_deref(), h, loc.port)
-                            })
-                            .transpose()
-                    });
-                let persistent = match persistent {
-                    Ok(persistent) => persistent,
-                    Err(error) if args.pscope.is_some() => return Err(error),
-                    Err(error) => {
-                        crate::output::diagnostic!(
-                            "syq: warning: cannot use persistent SSH connections ({error:#}); continuing without persistence"
-                        );
-                        None
+            // An --rsh ssh command shares and persists connections like the
+            // default ssh, keyed by its options with relative file paths made
+            // absolute. A remote-to-remote coordinator's shell was chosen for
+            // it by the invoking machine and never persists a login on the
+            // server.
+            let sharing: Option<(Option<crate::persistence::SshOptions>, bool)> = match &args.rsh {
+                None => Some((None, true)),
+                Some(_) if args.delegated || args.restricted_grant.is_some() => None,
+                Some(_) => crate::conn::shareable_ssh_options(&rsh).map(|sharing| {
+                    if sharing.options.is_empty() {
+                        return (None, sharing.persist);
                     }
-                };
-                match persistent {
-                    Some(multiplexer) => Some(multiplexer),
-                    None => SshMultiplexer::new()
-                        .inspect_err(|error| {
-                            crate::output::diagnostic!(
-                                "syq: warning: cannot share SSH connections ({error:#}); each SSH session logs in separately"
-                            );
-                        })
-                        .ok(),
+                    let directory = std::env::current_dir().ok();
+                    match crate::conn::persistent_ssh_options(sharing.options, directory.as_deref())
+                    {
+                        Some(options) => (Some(options), sharing.persist),
+                        // A relative path or command directory that cannot be
+                        // recorded cannot be keyed safely; share only within
+                        // this run.
+                        None => (None, false),
+                    }
+                }),
+            };
+            let ssh_multiplexer = match sharing {
+                None => None,
+                // A restricted grant keeps a private connection for this run.
+                Some(_) if args.restricted_grant.is_some() => {
+                    Some(Arc::new(SshMultiplexer::new()?))
                 }
-                .map(Arc::new)
+                Some((ssh, persist)) => {
+                    // Connection sharing and persistence only save logins. When
+                    // their local state cannot be used, connect without them. An
+                    // explicit --pscope is a command-line argument, so a bad one
+                    // stays an error.
+                    let persistent = if persist {
+                        crate::persistence::scope_for_implicit_ssh(args.pscope.as_deref()).and_then(
+                            |scope| {
+                                scope
+                                    .map(|scope| {
+                                        SshMultiplexer::persistent(
+                                            &scope,
+                                            loc.user.as_deref(),
+                                            h,
+                                            loc.port,
+                                            ssh.as_ref(),
+                                        )
+                                    })
+                                    .transpose()
+                            },
+                        )
+                    } else {
+                        Ok(None)
+                    };
+                    let persistent = match persistent {
+                        Ok(persistent) => persistent,
+                        Err(error) if args.pscope.is_some() => return Err(error),
+                        Err(error) => {
+                            crate::output::diagnostic!(
+                                "syq: warning: cannot use persistent SSH connections ({error:#}); continuing without persistence"
+                            );
+                            None
+                        }
+                    };
+                    match persistent {
+                        Some(multiplexer) => Some(multiplexer),
+                        None => SshMultiplexer::new()
+                            .inspect_err(|error| {
+                                crate::output::diagnostic!(
+                                    "syq: warning: cannot share SSH connections ({error:#}); each SSH session logs in separately"
+                                );
+                            })
+                            .ok(),
+                    }
+                    .map(Arc::new)
+                }
             };
             Endpoint::Remote(RemoteSpec {
                 local_process: false,

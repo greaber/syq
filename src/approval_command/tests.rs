@@ -25,7 +25,7 @@ fn copy_request(command: &[Vec<u8>]) -> crate::destination::CopyRequest {
         .collect();
     let mut args = crate::cli::Args::parse_args(&argv).unwrap();
     args.normalize();
-    crate::persistence::mark_explicit_scope(&mut args);
+    crate::persistence::mark_explicit_scope(&mut args).unwrap();
     args.read_copy_inputs().unwrap();
     if args.native_mapping.is_some() {
         args.mapping_contents = Some(std::sync::Arc::new(

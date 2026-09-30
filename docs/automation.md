@@ -313,7 +313,11 @@ messages may change at any time.
 `syq persist status --json` reports the persistence setting, scope, and endpoints
 without starting connections. Endpoint states are `starting`, `connecting`,
 `ready`, `reconnecting`, `failed`, or `inactive`. Each entry also reports whether
-SSH is connected and the receiving state and errors.
+SSH is connected and the receiving state and errors. A connection opened by an
+`--rsh` ssh command with its own options lists them in `ssh_options`, with
+relative file paths made absolute, and, when an option runs a local command
+such as `ProxyCommand`, the directory it ran in as `ssh_options_directory`;
+receiving does not apply to it, so its `receiving_enabled` is `null`.
 
 With receiving enabled for an endpoint, `ready` means its allowed receiving
 profiles are online; SSH can reconnect on its next use. If receiving preferences

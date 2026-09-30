@@ -723,6 +723,8 @@ fn ensure_inner(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<bool
             user: remote.user.clone(),
             host: remote.host.clone(),
             port: remote.port,
+            ssh_options: Vec::new(),
+            ssh_options_directory: None,
         },
         program: remote.program_command(&[]),
     };
