@@ -98,7 +98,6 @@ def check_source_roots():
 
 
 def check():
-    check_source_roots()
     prefix = checks.PREFIX + '/selection'
     remote = 's3://' + checks.BUCKET
     objects = {f'{prefix}/archive/{i:04}.tmp': b'ignored' for i in range(1001)}
@@ -169,6 +168,7 @@ def check():
         (source / 'two').write_bytes(b'two')
         checks.run(['--srcs-in', source, '--to', remote, '--into', prefix, '--prune'])
         assert set(checks.listing(prefix + '/')) == {prefix + '/one', prefix + '/two'}
+    check_source_roots()
     print('Paginated S3 selection, directory markers, ordered negations, and empty selection passed', flush=True)
 
 
