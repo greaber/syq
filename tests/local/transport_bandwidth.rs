@@ -242,5 +242,8 @@ fn declining_small_copy_leaves_control_traffic_unpaced() {
     let out = wait_for_child_output(child, Duration::from_secs(8));
     assert_output_ok(&out);
     assert_eq!(tuning_observed(&out)["native_small_copies"], 0, "{out:?}");
-    assert!(stderr_of(&out).contains("unchanged"), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("128 MiB unchanged (64 files)"),
+        "{out:?}"
+    );
 }
