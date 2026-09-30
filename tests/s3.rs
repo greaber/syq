@@ -4116,7 +4116,7 @@ fn s3_ignore_anchoring_restarts_at_each_selected_source() {
             true,
             0,
             1,
-            2,
+            3, // selector HEAD, LIST, and the included object's HEAD
         ),
     ] {
         let server = Server::start(fault);
