@@ -2161,6 +2161,7 @@ impl RestrictedAuthority {
         touched: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
         self.check_deadline()?;
+        let bounded_basis = matches!(request, Request::StageBasis { .. });
         match request {
             Request::ConfigureHashing(policy) => {
                 if *policy != self.hash_policy() {
@@ -2338,6 +2339,21 @@ impl RestrictedAuthority {
                 self.check_observation_path(path)?;
                 *guard = Some(self.guard.clone());
             }
+            Request::HashWindow {
+                path,
+                off,
+                len,
+                block,
+                guard,
+                ..
+            } => {
+                anyhow::ensure!(
+                    crate::proto::hash_window_fits(*off, *len, *block),
+                    "invalid hash window"
+                );
+                self.check_observation_path(path)?;
+                *guard = Some(self.guard.clone());
+            }
             Request::HashAndHold {
                 path,
                 block,
@@ -2349,7 +2365,15 @@ impl RestrictedAuthority {
                 self.check_observation_path(path)?;
                 *guard = Some(self.guard.clone());
             }
-            Request::SeedBasis {
+            Request::StageBasis {
+                path,
+                copy_id,
+                len,
+                block,
+                guard,
+                ..
+            }
+            | Request::SeedBasis {
                 path,
                 copy_id,
                 len,
@@ -2357,7 +2381,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                self.check_hash_request(*block, *len)?;
+                self.check_hash_request(*block, if bounded_basis { 0 } else { *len })?;
                 if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
                     bail!("in-place signed receiver forbids staged basis creation");
                 }
@@ -2440,6 +2464,41 @@ impl RestrictedAuthority {
                     // the receipt must know even if no final step follows.
                     touched.push(path.clone());
                 }
+                *guard = Some(self.guard.clone());
+            }
+            Request::ReuseComparedRange {
+                path,
+                copy_id,
+                off,
+                len,
+                guard,
+                ..
+            } => {
+                anyhow::ensure!(
+                    self.copy.policy.publication == PublicationPolicy::AtomicStaged,
+                    "in-place signed receiver forbids staged block reuse"
+                );
+                self.check_mutation_path(path, false)?;
+                let declared = self.declared_size(path, *copy_id)?;
+                anyhow::ensure!(
+                    *len > 0
+                        && off
+                            .checked_add(u64::from(*len))
+                            .is_some_and(|end| end <= declared),
+                    "reused block extends past declared file size"
+                );
+                outcomes.push(PendingOutcome::FileStage {
+                    index: 0,
+                    path: path.clone(),
+                    copy_id: *copy_id,
+                    size: declared,
+                    inplace: false,
+                    stage: FileStage::Write,
+                    skip_if_absent: false,
+                    observation_hold: None,
+                });
+                // No payload crossed the transport. Logical file capacity was
+                // reserved by StageBasis, just as for a native cloned basis.
                 *guard = Some(self.guard.clone());
             }
             Request::WriteRange {
@@ -2558,6 +2617,7 @@ impl RestrictedAuthority {
             }
             Request::CopyLocal { .. }
             | Request::ReadRange { .. }
+            | Request::ReadComparedRange { .. }
             | Request::ReadStream(_)
             | Request::ShrinkReadStream { .. }
             | Request::StopReadStream

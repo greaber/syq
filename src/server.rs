@@ -622,7 +622,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 blocks += 1;
                 bytes += data.len() as u64;
             }
-            Request::ReadRange { len, .. } => {
+            Request::ReadRange { len, .. } | Request::ReadComparedRange { len, .. } => {
                 blocks += 1;
                 bytes += *len as u64;
             }
@@ -1347,7 +1347,10 @@ fn drop_after_handling_for_test(request: &Request) -> bool {
         return false;
     };
     let matches = match kind.to_string_lossy().as_ref() {
-        "read" => matches!(request, Request::ReadRange { .. }),
+        "read" => matches!(
+            request,
+            Request::ReadRange { .. } | Request::ReadComparedRange { .. }
+        ),
         "write" => matches!(request, Request::WriteRange { .. }),
         "finalize" => matches!(request, Request::Finalize { .. }),
         _ => false,

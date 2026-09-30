@@ -3670,6 +3670,7 @@ fn signed_hash_block_and_response_bounds_are_enforced() {
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, DEFAULT_MAX_BYTES);
     let target = root.join("target").as_os_str().as_bytes().to_vec();
     let request = |block, len| Request::HashBlocks {
+        off: 0,
         path: target.clone(),
         source: None,
         which: proto::Which::Final,
@@ -4514,6 +4515,7 @@ fn rooted_scan_and_hash_never_follow_a_payload_symlink() {
     assert!(!entries.iter().any(|entry| entry.path == b"escape/secret"));
 
     let response = crate::fsops::FsOps::new().handle(&Request::HashBlocks {
+        off: 0,
         path: target.join("escape").as_os_str().as_bytes().to_vec(),
         source: None,
         which: proto::Which::Final,
@@ -4572,6 +4574,7 @@ fn restricted_authority_rejects_caller_source_registration() {
             guard: None,
         },
         Request::HashBlocks {
+            off: 0,
             path: root.join("file").as_os_str().as_bytes().to_vec(),
             source: Some(source),
             which: proto::Which::Final,
@@ -4677,4 +4680,91 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
         guard: None,
     };
     assert!(authority.authorize(&mut time_request, false).is_err());
+}
+
+#[test]
+fn signed_comparison_requests_enforce_scope_identity_and_bounds() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let root = tree.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 16 << 20);
+    let target = root.join("target").as_os_str().as_bytes().to_vec();
+    let outside = tree.path().join("outside").as_os_str().as_bytes().to_vec();
+    let id = [104; 16];
+    let stage = |path, len| Request::StageBasis {
+        path,
+        copy_id: id,
+        len,
+        block: 4 << 20,
+        allow_final: true,
+        attempt: 0,
+        guard: None,
+    };
+    let hash = |path, off, len| Request::HashWindow {
+        final_basis: true,
+        path,
+        copy_id: id,
+        off,
+        len,
+        block: 4 << 20,
+        attempt: 0,
+        guard: None,
+    };
+    let reuse = |path, copy_id, off, len| Request::ReuseComparedRange {
+        path,
+        copy_id,
+        attempt: 0,
+        off,
+        len,
+        guard: None,
+    };
+    assert!(authority
+        .authorize(&mut reuse(target.clone(), id, 0, 4 << 20), false)
+        .is_err());
+    assert!(authority
+        .authorize(&mut stage(outside.clone(), 8 << 20), false)
+        .is_err());
+    assert!(authority
+        .authorize(&mut stage(target.clone(), 17 << 20), false)
+        .is_err());
+    let mut allowed = stage(target.clone(), 8 << 20);
+    authority.authorize(&mut allowed, false).unwrap();
+    assert!(matches!(
+        allowed,
+        Request::StageBasis { guard: Some(_), .. }
+    ));
+    let mut allowed = hash(target.clone(), 0, 4 << 20);
+    authority.authorize(&mut allowed, false).unwrap();
+    assert!(matches!(
+        allowed,
+        Request::HashWindow { guard: Some(_), .. }
+    ));
+    for mut request in [
+        hash(outside.clone(), 0, 4 << 20),
+        hash(target.clone(), u64::MAX, 4 << 20),
+        hash(target.clone(), 0, (64 << 20) + 1),
+        reuse(outside, id, 0, 4 << 20),
+        reuse(target.clone(), [105; 16], 0, 4 << 20),
+        reuse(target.clone(), id, 8 << 20, 1),
+        reuse(target.clone(), id, u64::MAX, 1),
+        reuse(target.clone(), id, 0, 0),
+    ] {
+        assert!(
+            authority.authorize(&mut request, false).is_err(),
+            "{request:?}"
+        );
+    }
+    let mut allowed = reuse(target.clone(), id, 0, 4 << 20);
+    authority.authorize(&mut allowed, false).unwrap();
+    assert!(matches!(
+        allowed,
+        Request::ReuseComparedRange { guard: Some(_), .. }
+    ));
+    authority.copy.policy.publication = PublicationPolicy::InPlace;
+    assert!(authority
+        .authorize(&mut stage(target.clone(), 8 << 20), false)
+        .is_err());
+    assert!(authority
+        .authorize(&mut reuse(target, id, 0, 4 << 20), false)
+        .is_err());
 }

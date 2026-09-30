@@ -1909,29 +1909,35 @@ fn pscope_is_shared_by_transfer_surfaces_and_refuses_unrelated_directories() {
 fn partial_candidates_do_not_break_empty_replacement_or_unchanged_files() {
     for candidate in [".out.syq-tmp.abcdefghijklmnop", ".syq-tmp.abcdefghijklmnop"] {
         for empty in [true, false] {
-            let t = Tmp::new();
-            let source = if empty { vec![] } else { vec![b'a'; 5 << 20] };
-            write(&t.path("src"), &source);
-            write(
-                &t.path("out"),
-                if empty { b"old contents" } else { &source },
-            );
-            write(&t.path(candidate), b"stale");
-            let before = fs::metadata(t.path("out")).unwrap().ino();
-            run_native_ok(&[
-                "cp",
-                "--if-exists=update",
-                "--hash",
-                &t.s("src"),
-                "--as",
-                &t.s("out"),
-            ]);
-            assert_eq!(read(&t.path("out")), source);
-            if !empty {
-                assert_eq!(fs::metadata(t.path("out")).unwrap().ino(), before);
+            for checksum in [false, true] {
+                let t = Tmp::new();
+                let source = if empty { vec![] } else { vec![b'a'; 5 << 20] };
+                write(&t.path("src"), &source);
+                write(
+                    &t.path("out"),
+                    if empty { b"old contents" } else { &source },
+                );
+                if !empty {
+                    // Without --hash, unchanged means size and mtime agree.
+                    set_mtime(&t.path("src"), 1_600_000_000);
+                    set_mtime(&t.path("out"), 1_600_000_000);
+                }
+                write(&t.path(candidate), b"stale");
+                let before = fs::metadata(t.path("out")).unwrap().ino();
+                let src = t.s("src");
+                let dst = t.s("out");
+                let mut args = vec!["cp", "--if-exists=update", &src, "--as", &dst];
+                if checksum {
+                    args.push("--hash");
+                }
+                run_native_ok(&args);
+                assert_eq!(read(&t.path("out")), source);
+                if !empty {
+                    assert_eq!(fs::metadata(t.path("out")).unwrap().ino(), before);
+                }
+                assert_eq!(read(&t.path(candidate)), b"stale");
+                assert_eq!(partial_files(&t.0).len(), 1);
             }
-            assert_eq!(read(&t.path(candidate)), b"stale");
-            assert_eq!(partial_files(&t.0).len(), 1);
         }
     }
 }

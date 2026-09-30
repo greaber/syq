@@ -3165,6 +3165,8 @@ impl Planner<'_> {
         self.sched.push_file(FileJob {
             dst_entry,
             data: FileJobData {
+                compare_ranges: false,
+                compare_final: false,
                 src,
                 source,
                 dst,

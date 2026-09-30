@@ -428,7 +428,10 @@ impl FsOps {
                 )
             })?;
         let Some((file, basis_size)) = opened else {
-            return Ok(Preparation::default());
+            return Ok(Preparation {
+                partial_size: None,
+                has_candidates: !self.candidate_partials(&target).is_empty(),
+            });
         };
         if let Some(old_size) = basis_size {
             if old_size > size {
@@ -458,6 +461,7 @@ impl FsOps {
         })
     }
 
+    #[cfg(test)]
     pub fn hash_and_hold(
         &mut self,
         path: &[u8],
@@ -467,12 +471,44 @@ impl FsOps {
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
     ) -> Result<(Vec<ContentDigest>, u64)> {
+        self.hash_and_hold_window(path, copy_id, 0, block, len, condition, guard)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hash_and_hold_window(
+        &mut self,
+        path: &[u8],
+        copy_id: &CopyId,
+        off: u64,
+        block: u64,
+        len: u64,
+        condition: TargetCondition,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<(Vec<ContentDigest>, u64)> {
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_HASH_BASIS").is_some() {
             bail!("injected retained-basis hash failure");
         }
+        anyhow::ensure!(
+            block > 0 && off.is_multiple_of(block) && off.checked_add(len).is_some(),
+            "invalid hash interval"
+        );
         let rooted = self.rooted_destination_target(path, guard)?;
-        let (mut file, location, label) = if let Some(target) = &rooted {
+        let location = rooted
+            .as_ref()
+            .map(|target| target.location())
+            .unwrap_or_else(|| FileLocation::Path(resolve(path)));
+        let (mut file, location, label) = if off > 0 {
+            let held = self
+                .held_basis
+                .take()
+                .context("no retained comparison basis")?;
+            anyhow::ensure!(
+                held.location == location && held.copy_id == *copy_id,
+                "retained comparison basis does not match requested file"
+            );
+            (held.file, held.location, held.label)
+        } else if let Some(target) = &rooted {
             (
                 target.root.open_regular_read(&target.relative)?,
                 target.location(),
@@ -485,6 +521,7 @@ impl FsOps {
                 .map(|file| (file, FileLocation::Path(p.clone()), p))?
         };
         require_open_target(&file, &label, condition)?;
+        file.seek(SeekFrom::Start(off))?;
         let hashes = hash_reader_observed(
             &mut file,
             block,
@@ -499,11 +536,13 @@ impl FsOps {
             file,
         });
         #[cfg(debug_assertions)]
-        test_race_barrier(
-            "SYQ_TEST_BASIS_READY_FILE",
-            "SYQ_TEST_BASIS_CONTINUE_FILE",
-            "basis-ready",
-        )?;
+        if off == 0 {
+            test_race_barrier(
+                "SYQ_TEST_BASIS_READY_FILE",
+                "SYQ_TEST_BASIS_CONTINUE_FILE",
+                "basis-ready",
+            )?;
+        }
         // Hashing is intentionally limited to the source length. Report the
         // retained inode's length afterward so a file that grew since the
         // planner's stat cannot be mistaken for an exact content match.
@@ -580,12 +619,26 @@ impl FsOps {
         final_ranges: Option<&[(u64, u64)]>,
         attempt: u32,
     ) -> Result<SeededBasis> {
+        self.seed_basis_impl(target, len, block, final_ranges, attempt, false)
+            .map(|(basis, _)| basis)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_basis_impl(
+        &mut self,
+        target: PartialTarget<'_>,
+        len: u64,
+        block: u64,
+        final_ranges: Option<&[(u64, u64)]>,
+        attempt: u32,
+        stage_only: bool,
+    ) -> Result<(SeededBasis, bool)> {
         let PartialTarget {
             path,
             id: copy_id,
             guard,
         } = target;
-        if !hash_response_fits(block, len) {
+        if !hash_response_fits(block, if stage_only { 0 } else { len }) {
             bail!("invalid block reuse request");
         }
         if let Some(ranges) = final_ranges {
@@ -610,6 +663,14 @@ impl FsOps {
             .held_basis
             .take()
             .filter(|held| held.location == expected && held.copy_id == *copy_id);
+        #[cfg(target_os = "macos")]
+        if stage_only {
+            self.try_clone_basis(
+                &target,
+                copy_id,
+                final_ranges.is_none_or(|ranges| !ranges.is_empty()),
+            )?;
+        }
         let (relative, _label, opened) =
             with_rooted_partial(&target, copy_id, |relative, label| {
                 self.open_private_partial_rooted(
@@ -659,6 +720,7 @@ impl FsOps {
         // A previous transfer's partial is usually closer to the source than
         // the old final. Use the final only when no readable candidate exists.
         let mut selected_final = None;
+        let mut final_donor = false;
         if final_ranges.is_none_or(|ranges| !ranges.is_empty())
             && basis_size.unwrap_or(0) == 0
             && input.is_none()
@@ -667,6 +729,60 @@ impl FsOps {
                 .map(|held| held.file)
                 .or_else(|| target.root.open_regular_read(&target.relative).ok());
             selected_final = input.as_ref().and(final_ranges);
+            final_donor = input.is_some();
+        }
+        if stage_only {
+            let mut compare_final = false;
+            if let Some(input) = input.as_ref() {
+                let _copy = self
+                    .operation
+                    .span(crate::transfer_observations::Stage::FilesystemCopy);
+                if final_donor {
+                    let donor = input.metadata()?;
+                    #[cfg(target_os = "linux")]
+                    let cloned = super::basis_copy::try_clone(input, &output, len.min(donor.len()));
+                    #[cfg(not(target_os = "linux"))]
+                    let cloned = false;
+                    // APFS was tried before creating the sidecar. Without a
+                    // clone, retain bounded windows instead of copying bytes
+                    // that comparison may immediately replace.
+                    compare_final = !cloned;
+                    if compare_final
+                        && donor.len() > 0
+                        && donor.blocks().saturating_mul(512) >= donor.len()
+                    {
+                        // Keep the existing dense-file allocation policy. Do
+                        // not materialize sparse donor holes or cloned extents.
+                        self.preallocate_new_partial(&output, len)?;
+                    }
+                } else {
+                    let donor = input.metadata()?;
+                    super::basis_copy::seed(input, &output, len, || {
+                        // Preserve sparse extents and successful clones. Dense
+                        // donors still reserve capacity before copying begins.
+                        if donor.blocks().saturating_mul(512) >= donor.len() {
+                            self.preallocate_new_partial(&output, len)?;
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
+            #[cfg(debug_assertions)]
+            test_race_barrier(
+                "SYQ_TEST_STAGED_BASIS_READY_FILE",
+                "SYQ_TEST_STAGED_BASIS_CONTINUE_FILE",
+                "staged comparison basis",
+            )?;
+            // Never replace an existing partial with an older final-file donor.
+            self.set_copy_length(&output, len)?;
+            self.cache_file(location, attempt, true, output);
+            return Ok((
+                SeededBasis {
+                    hashes: Vec::new(),
+                    selected_final: false,
+                },
+                compare_final,
+            ));
         }
         if basis_size.unwrap_or(0) == 0 {
             self.preallocate_new_partial(&output, len)?;
@@ -717,10 +833,60 @@ impl FsOps {
             self.set_copy_length(&output, len)?;
         }
         self.cache_file(location, attempt, true, output);
-        Ok(SeededBasis {
-            hashes,
-            selected_final: selected_final.is_some(),
-        })
+        Ok((
+            SeededBasis {
+                hashes,
+                selected_final: selected_final.is_some(),
+            },
+            false,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn try_clone_basis(
+        &mut self,
+        target: &RootedTarget,
+        copy_id: &CopyId,
+        allow_final: bool,
+    ) -> Result<()> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_BASIS_CLONE_UNSUPPORTED").is_some() {
+            return Ok(());
+        }
+        // APFS cloning creates a new name. Try it before opening a new sidecar,
+        // and never unlink or replace an existing resumable output to clone.
+        with_rooted_partial(target, copy_id, |relative, _| {
+            if target.root.metadata_optional(relative)?.is_some() {
+                return Ok(());
+            }
+            let mut donor = None;
+            for candidate in self.candidate_partials(target) {
+                let file = RelativePath::new(&candidate)
+                    .and_then(|path| target.root.open_regular_read(&path));
+                if let Ok(file) = file {
+                    if file
+                        .metadata()
+                        .is_ok_and(|m| is_owned_partial(&m) && m.len() > 0)
+                    {
+                        donor = Some(file);
+                        break;
+                    }
+                }
+            }
+            if donor.is_none() && allow_final {
+                donor = target.root.open_regular_read(&target.relative).ok();
+            }
+            if let Some(file) = donor {
+                let metadata = file.metadata()?;
+                // Clone the donor's actual size; preparation resizes it to the
+                // planned output length, including growth and shrinkage.
+                let _ = target
+                    .root
+                    .clone_file(&file, &metadata, relative, metadata.len())?;
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1351,14 +1517,23 @@ impl FsOps {
         copy_id: &CopyId,
     ) -> Result<Vec<ContentDigest>> {
         let HashOptions {
+            off,
             which,
             block,
             len,
             attempt,
         } = options;
+        anyhow::ensure!(
+            block > 0 && off.is_multiple_of(block) && off.checked_add(len).is_some(),
+            "invalid hash interval"
+        );
         if target.source.is_some()
             || (self.destination_root.is_none() && !self.source_roots.is_empty())
         {
+            #[cfg(debug_assertions)]
+            if std::env::var_os("SYQ_TEST_FAIL_SOURCE_BLOCK_HASH").is_some() {
+                bail!("injected whole-source hash failure");
+            }
             if target.guard.is_some() {
                 bail!("source block hash cannot carry a destination guard");
             }
@@ -1368,6 +1543,7 @@ impl FsOps {
             if let Some((_, source_target)) = self.source_content_target(target.source)? {
                 let mut file =
                     open_registered_source(&source_target, self.inode_preservation.open_noatime)?;
+                file.seek(SeekFrom::Start(off))?;
                 return hash_reader_observed(
                     &mut file,
                     block,
@@ -1395,7 +1571,7 @@ impl FsOps {
                 let file = open(&target.relative, &target.label)?;
                 (target.relative.clone(), target.label.clone(), file)
             };
-            file.seek(SeekFrom::Start(0))?;
+            file.seek(SeekFrom::Start(off))?;
             if which == Which::Partial {
                 require_safe_rooted_named_partial(&target.root, &relative, &label, &file)?;
             }
@@ -1422,7 +1598,7 @@ impl FsOps {
             .map(Ok)
             .unwrap_or_else(|| open_existing_regular(&p, false))?;
         crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
-        f.seek(SeekFrom::Start(0))?;
+        f.seek(SeekFrom::Start(off))?;
         if which == Which::Partial {
             require_safe_partial(&f, &p)?;
         }
@@ -1433,6 +1609,176 @@ impl FsOps {
             Some(&self.operation),
             self.hash_policy.algorithm,
         )
+    }
+
+    fn hash_window(
+        &mut self,
+        partial: PartialTarget<'_>,
+        off: u64,
+        len: u32,
+        block: u64,
+        attempt: u32,
+        final_basis: bool,
+    ) -> Result<Vec<ContentDigest>> {
+        anyhow::ensure!(
+            crate::proto::hash_window_fits(off, len, block),
+            "invalid hash window"
+        );
+        let target = self.destination_mutation_target(partial.path, partial.guard)?;
+        if !final_basis {
+            self.comparison_window = None;
+        }
+        if final_basis {
+            let location = target.location();
+            // Only the bytes need to survive this request. Keeping a donor
+            // descriptor in the window would pin replaced files after an error
+            // or cancellation, while the connection continues serving other work.
+            let Ok(file) = target.root.open_regular_read(&target.relative) else {
+                return Ok(vec![
+                    self.hash_policy.algorithm.hash(&[]);
+                    u64::from(len).div_ceil(block) as usize
+                ]);
+            };
+            let metadata = file.metadata()?;
+            let mut window = self
+                .comparison_window
+                .take()
+                .filter(|window| {
+                    window.location == location
+                        && window.copy_id == *partial.id
+                        && window.attempt == attempt
+                })
+                .unwrap_or_else(|| ComparisonWindow {
+                    location,
+                    copy_id: *partial.id,
+                    attempt,
+                    blocks: Vec::new(),
+                    sparse: metadata.blocks().saturating_mul(512) < metadata.len(),
+                });
+            let retained: u64 = window
+                .blocks
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum();
+            anyhow::ensure!(
+                retained + u64::from(len) <= MAX_READ_BYTES,
+                "too many unconsumed comparison bytes"
+            );
+            anyhow::ensure!(
+                window
+                    .blocks
+                    .iter()
+                    .all(|(pos, bytes)| *pos >= off + u64::from(len)
+                        || pos + bytes.len() as u64 <= off),
+                "overlapping comparison windows"
+            );
+            let mut hashes = Vec::new();
+            let end = off + u64::from(len);
+            let mut pos = off;
+            while pos < end {
+                let n = (end - pos).min(block) as usize;
+                let mut bytes = vec![0; n];
+                let mut got = 0;
+                {
+                    let reading = self
+                        .operation
+                        .span(crate::transfer_observations::Stage::SourceRead);
+                    while got < n {
+                        match file.read_at(&mut bytes[got..], pos + got as u64) {
+                            Ok(0) => break,
+                            Ok(n) => got += n,
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    reading.bytes(got as u64);
+                }
+                let _hash = self
+                    .operation
+                    .span(crate::transfer_observations::Stage::Hashing);
+                if got == n {
+                    hashes.push(self.hash_policy.algorithm.hash(&bytes));
+                    window.blocks.push((pos, bytes));
+                } else {
+                    // Missing donor bytes can never be confirmed as a match.
+                    hashes.push(self.hash_policy.algorithm.hash(&[]));
+                }
+                pos += n as u64;
+            }
+            self.comparison_window = (!window.blocks.is_empty()).then_some(window);
+            return Ok(hashes);
+        }
+
+        let (relative, label, file) =
+            with_rooted_partial(&target, partial.id, |relative, label| {
+                let location = FileLocation::Rooted {
+                    root: target.root.identity(),
+                    relative: relative.clone(),
+                };
+                if let Some(file) = self.cached_clone(location.clone(), attempt, true)? {
+                    return Ok(file);
+                }
+                // A range worker alternates reads and writes on this private inode.
+                // Cache a read/write descriptor on its first comparison; caching a
+                // read-only descriptor would break writes, and a later write-only
+                // cache entry would break the next comparison window.
+                let file = target.root.open_regular_read_write(relative)?;
+                require_safe_rooted_named_partial(&target.root, relative, label, &file)?;
+                self.cache_file(location, attempt, true, file.try_clone()?);
+                Ok(file)
+            })?;
+        require_safe_rooted_named_partial(&target.root, &relative, &label, &file)?;
+        let mut buffer = vec![0; block.min(u64::from(len)) as usize];
+        let mut hashes = Vec::with_capacity(u64::from(len).div_ceil(block) as usize);
+        let end = off + u64::from(len);
+        let mut pos = off;
+        while pos < end {
+            let n = (end - pos).min(block) as usize;
+            let bytes = &mut buffer[..n];
+            {
+                let reading = self
+                    .operation
+                    .span(crate::transfer_observations::Stage::SourceRead);
+                file.read_exact_at(bytes, pos)?;
+                reading.bytes(n as u64);
+            }
+            {
+                let _hash = self
+                    .operation
+                    .span(crate::transfer_observations::Stage::Hashing);
+                hashes.push(self.hash_policy.algorithm.hash(bytes));
+            }
+            pos += n as u64;
+        }
+        Ok(hashes)
+    }
+
+    fn reuse_compared_range(
+        &mut self,
+        partial: PartialTarget<'_>,
+        attempt: u32,
+        off: u64,
+        len: u32,
+    ) -> Result<()> {
+        let target = self.destination_mutation_target(partial.path, partial.guard)?;
+        let window = self
+            .comparison_window
+            .as_mut()
+            .context("no retained comparison window")?;
+        anyhow::ensure!(
+            window.location == target.location()
+                && window.copy_id == *partial.id
+                && window.attempt == attempt,
+            "comparison window belongs to another file or attempt"
+        );
+        let index = window
+            .blocks
+            .iter()
+            .position(|(pos, bytes)| *pos == off && bytes.len() == len as usize)
+            .context("no retained comparison block at this offset and length")?;
+        let (_, bytes) = window.blocks.remove(index);
+        let sparse = self.sparse || window.sparse;
+        self.write_range_bytes(partial, false, attempt, off, &bytes, sparse)
     }
 
     pub(crate) fn begin_source_range(&mut self, _range: std::ops::Range<u64>) {
@@ -1497,6 +1843,11 @@ impl FsOps {
                 result
             };
             read.with_context(|| format!("read {} @{off}+{len}", p.display()))?;
+            #[cfg(debug_assertions)]
+            record_test_event(
+                "SYQ_TEST_SOURCE_READ_EVENTS",
+                format_args!("read {off} {len}"),
+            )?;
             let hash = {
                 if self.hash_policy.transfer_integrity {
                     let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
@@ -1541,8 +1892,34 @@ impl FsOps {
         if self.hash_policy.transfer_integrity && actual_hash != hash {
             bail!("block hash mismatch on receive @{off}");
         }
+        self.write_range_bytes(target, inplace, attempt, off, data, self.sparse)
+    }
+
+    fn write_range_bytes(
+        &mut self,
+        target: PartialTarget<'_>,
+        inplace: bool,
+        attempt: u32,
+        off: u64,
+        data: &[u8],
+        sparse: bool,
+    ) -> Result<()> {
+        let operation = self.operation.clone();
         let rooted = self.destination_mutation_target(target.path, target.guard)?;
-        let sparse = self.sparse;
+        if let Some(window) = self.comparison_window.as_mut().filter(|window| {
+            window.location == rooted.location()
+                && window.copy_id == *target.id
+                && window.attempt == attempt
+        }) {
+            window.blocks.retain(|(pos, _)| *pos != off);
+        }
+        if self
+            .comparison_window
+            .as_ref()
+            .is_some_and(|window| window.blocks.is_empty())
+        {
+            self.comparison_window = None;
+        }
         let mut write = |relative: &RelativePath, label: &Path| {
             let file = self.cached_rooted(label, &rooted.root, relative, attempt, !inplace)?;
             let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
@@ -1880,6 +2257,8 @@ impl FsOps {
                 Request::HashBlocks { .. }
                     | Request::HashAndHold { .. }
                     | Request::SeedBasis { .. }
+                    | Request::StageBasis { .. }
+                    | Request::HashWindow { .. }
             )
         {
             return Response::Err("injected block-comparison failure".into());
@@ -2138,6 +2517,7 @@ impl FsOps {
                 )
                 .map(Response::Prepared),
             Request::HashAndHold {
+                off,
                 path,
                 copy_id,
                 block,
@@ -2145,7 +2525,15 @@ impl FsOps {
                 condition,
                 guard,
             } => self
-                .hash_and_hold(path, copy_id, *block, *len, *condition, guard.as_ref())
+                .hash_and_hold_window(
+                    path,
+                    copy_id,
+                    *off,
+                    *block,
+                    *len,
+                    *condition,
+                    guard.as_ref(),
+                )
                 .map(|(hashes, len)| Response::HeldHashes { hashes, len }),
             Request::FinishBasis {
                 expected_hash,
@@ -2166,6 +2554,96 @@ impl FsOps {
                     expected_hash.as_ref(),
                 )
                 .map(publication_response),
+            Request::StageBasis {
+                path,
+                copy_id,
+                len,
+                block,
+                allow_final,
+                attempt,
+                guard,
+            } => self
+                .seed_basis_impl(
+                    PartialTarget {
+                        path,
+                        id: copy_id,
+                        guard: guard.as_ref(),
+                    },
+                    *len,
+                    *block,
+                    if *allow_final { None } else { Some(&[]) },
+                    *attempt,
+                    true,
+                )
+                .map(|(_, compare_final)| Response::BasisStaged { compare_final }),
+            Request::HashWindow {
+                final_basis,
+                path,
+                copy_id,
+                off,
+                len,
+                block,
+                attempt,
+                guard,
+            } => self
+                .hash_window(
+                    PartialTarget {
+                        path,
+                        id: copy_id,
+                        guard: guard.as_ref(),
+                    },
+                    *off,
+                    *len,
+                    *block,
+                    *attempt,
+                    *final_basis,
+                )
+                .map(Response::Hashes),
+            Request::ReuseComparedRange {
+                path,
+                copy_id,
+                attempt,
+                off,
+                len,
+                guard,
+            } => self
+                .reuse_compared_range(
+                    PartialTarget {
+                        path,
+                        id: copy_id,
+                        guard: guard.as_ref(),
+                    },
+                    *attempt,
+                    *off,
+                    *len,
+                )
+                .map(|_| Response::Ok),
+            Request::ReadComparedRange {
+                path,
+                source,
+                attempt,
+                off,
+                len,
+                expected,
+            } => self
+                .read_range(path, source.as_ref(), *attempt, *off, *len)
+                .map(|reply| match reply {
+                    Response::Block { off, hash, data } => {
+                        let comparison = if self.hash_policy.transfer_integrity
+                            && self.hash_policy.payload_algorithm() == self.hash_policy.algorithm
+                        {
+                            hash
+                        } else {
+                            self.hash_policy.algorithm.hash(&data)
+                        };
+                        if comparison == *expected {
+                            Response::RangeMatched { off, len: *len }
+                        } else {
+                            Response::Block { off, hash, data }
+                        }
+                    }
+                    other => other,
+                }),
             Request::SeedBasis {
                 path,
                 copy_id,
@@ -2230,6 +2708,7 @@ impl FsOps {
                 }
             }
             Request::HashBlocks {
+                off,
                 path,
                 source,
                 which,
@@ -2247,6 +2726,7 @@ impl FsOps {
                         guard: guard.as_ref(),
                     },
                     HashOptions {
+                        off: *off,
                         which: *which,
                         block: *block,
                         len: *len,

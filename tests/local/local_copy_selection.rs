@@ -954,10 +954,14 @@ fn macos_clone_rmdir_failure_keeps_complete_partial_for_resume() {
             &t.s("src"),
             &t.s("dst"),
         ])
-        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        // Comparison reads the source, but a complete partial needs no payload
+        // transfer or destination range writes.
+        .env("SYQ_TEST_FAIL_WRITE_RANGE_NAME", "dst")
+        .env("SYQ_DEBUG", "1")
         .run()
         .unwrap();
     assert_output_ok(&out);
+    assert_eq!(tuning_observed(&out)["range_requests"], 0);
     assert_eq!(read(&t.path("dst")), data);
     assert_eq!(partial_files(&t.0), partials);
     assert_eq!(read(&partials[0]), data);

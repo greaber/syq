@@ -1866,6 +1866,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                     guard: None,
                 },
                 HashOptions {
+                    off: 0,
                     which: Which::Partial,
                     block: MIN_HASH_BLOCK_BYTES,
                     len: 4,
@@ -1961,6 +1962,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 guard: None,
             },
             HashOptions {
+                off: 0,
                 which: Which::Final,
                 block: MIN_HASH_BLOCK_BYTES,
                 len: 1,
@@ -4321,6 +4323,7 @@ fn source_content_uses_registered_directory_after_name_replacement() {
     ));
 
     let response = worker.handle(&Request::HashBlocks {
+        off: 0,
         path: parallel_marker.clone(),
         source: Some(marker.clone()),
         which: Which::Final,
@@ -4371,6 +4374,7 @@ fn source_content_rejects_a_replaced_exact_leaf() {
             len: 8,
         }),
         worker.handle(&Request::HashBlocks {
+            off: 0,
             path: selected.as_os_str().as_bytes().to_vec(),
             source: Some(selections[0].clone()),
             which: Which::Final,
@@ -4423,6 +4427,7 @@ fn source_content_refuses_symlink_intermediates() {
             len: 6,
         }),
         worker.handle(&Request::HashBlocks {
+            off: 0,
             path: label.clone(),
             source: Some(secret.clone()),
             which: Which::Final,
@@ -4519,6 +4524,7 @@ fn confined_source_content_requires_exact_registered_references() {
 
     for response in [
         worker.handle(&Request::HashBlocks {
+            off: 0,
             path: selected.as_os_str().as_bytes().to_vec(),
             source: None,
             which: Which::Final,
@@ -4549,6 +4555,7 @@ fn confined_source_content_requires_exact_registered_references() {
     );
 
     let response = worker.handle(&Request::HashBlocks {
+        off: 0,
         path: selected.as_os_str().as_bytes().to_vec(),
         source: Some(selections[0].clone()),
         which: Which::Partial,
@@ -4581,6 +4588,7 @@ fn unconfined_source_content_uses_only_the_explicit_legacy_path() {
     assert!(matches!(response, Response::Block { data, .. } if data == b"legacy!!"));
 
     let response = worker.handle(&Request::HashBlocks {
+        off: 0,
         path: sibling.as_os_str().as_bytes().to_vec(),
         source: None,
         which: Which::Final,
@@ -5209,4 +5217,506 @@ fn partial_seeding_does_not_fall_back_to_final_when_disallowed() {
         fs::read(directory.path().join("file")).unwrap(),
         b"final bytes"
     );
+}
+
+#[test]
+fn comparison_window_reads_staged_bytes_after_donor_changes() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let original = vec![17; 2 * MIN_HASH_BLOCK_BYTES as usize + 7];
+    let path = tree.path().join("file");
+    fs::write(&path, &original).unwrap();
+    fs::write(
+        tree.path().join(".file.syq-tmp.abcdefghijklmnop"),
+        &original,
+    )
+    .unwrap();
+    let mut ops = destination_ops(tree.path());
+    let id = [97; 16];
+    assert!(matches!(
+        ops.handle(&Request::StageBasis {
+            path: path_bytes(&path),
+            copy_id: id,
+            len: original.len() as u64,
+            block: MIN_HASH_BLOCK_BYTES,
+            allow_final: false,
+            attempt: 0,
+            guard: None,
+        }),
+        Response::BasisStaged { .. }
+    ));
+    fs::write(&path, vec![91; original.len()]).unwrap();
+    let reply = ops.handle(&Request::HashWindow {
+        final_basis: false,
+        path: path_bytes(&path),
+        copy_id: id,
+        off: MIN_HASH_BLOCK_BYTES,
+        len: MIN_HASH_BLOCK_BYTES as u32 + 7,
+        block: MIN_HASH_BLOCK_BYTES,
+        attempt: 0,
+        guard: None,
+    });
+    let Response::Hashes(hashes) = reply else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(
+        hashes,
+        [
+            ops.hash_policy
+                .algorithm
+                .hash(&original[..MIN_HASH_BLOCK_BYTES as usize]),
+            ops.hash_policy.algorithm.hash(&[17; 7])
+        ]
+    );
+    // Bounded sub-block hashes support the receiver's pacing request ceiling.
+    let reply = ops.handle(&Request::HashWindow {
+        final_basis: false,
+        path: path_bytes(&path),
+        copy_id: id,
+        off: 3,
+        len: 13,
+        block: 8,
+        attempt: 0,
+        guard: None,
+    });
+    assert!(
+        matches!(reply, Response::Hashes(h) if h == vec![ops.hash_policy.algorithm.hash(&[17; 8]), ops.hash_policy.algorithm.hash(&[17; 5])])
+    );
+    for (off, len, block) in [
+        (0, 1, 0),
+        (0, 1025, 1),
+        (u64::MAX, 2, 1),
+        (0, 0, 1),
+        (0, MAX_READ_BYTES as u32 + 1, MAX_READ_BYTES),
+    ] {
+        assert!(matches!(
+            ops.handle(&Request::HashWindow {
+                final_basis: false,
+                path: path_bytes(&path),
+                copy_id: id,
+                off,
+                len,
+                block,
+                attempt: 0,
+                guard: None,
+            }),
+            Response::EndpointError(_)
+        ));
+    }
+}
+
+#[test]
+fn compared_reads_preserve_independent_payload_integrity() {
+    use crate::hashing::{HashAlgorithm, HashPolicy};
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("source");
+    fs::write(&path, b"file contents").unwrap();
+    for algorithm in [
+        HashAlgorithm::Blake3,
+        HashAlgorithm::Sha256,
+        HashAlgorithm::Md5,
+        HashAlgorithm::Xxh3,
+    ] {
+        for integrity in [false, true] {
+            let mut ops = FsOps::new();
+            ops.set_hash_policy(HashPolicy {
+                algorithm,
+                transfer_integrity: integrity,
+                transfer_hash_type: Some(HashAlgorithm::Sha256),
+            });
+            for matches in [false, true] {
+                let reply = ops.handle(&Request::ReadComparedRange {
+                    path: path.as_os_str().as_bytes().to_vec(),
+                    source: None,
+                    attempt: 0,
+                    off: 5,
+                    len: 8,
+                    expected: algorithm.hash(if matches { b"contents" } else { b"changed!" }),
+                });
+                if matches {
+                    assert!(matches!(reply, Response::RangeMatched { off: 5, len: 8 }));
+                } else {
+                    let Response::Block { off, hash, data } = reply else {
+                        panic!("{reply:?}");
+                    };
+                    assert_eq!(off, 5);
+                    assert_eq!(data, b"contents");
+                    assert_eq!(
+                        hash,
+                        if integrity {
+                            HashAlgorithm::Sha256.hash(&data)
+                        } else {
+                            [0; 32]
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pipeline_requests_keep_endpoint_authority() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let input = tree.path().join("source");
+    fs::write(&input, b"inside").unwrap();
+    let (mut source, paths, _control) = registered_source_worker(&[&input], false);
+    let compared = |reference| Request::ReadComparedRange {
+        path: b"/untrusted/spelling".to_vec(),
+        source: reference,
+        attempt: 0,
+        off: 0,
+        len: 6,
+        expected: crate::hashing::HashAlgorithm::Blake3.hash(b"inside"),
+    };
+    assert!(matches!(
+        source.handle(&compared(Some(paths[0].clone()))),
+        Response::RangeMatched { .. }
+    ));
+    assert!(matches!(
+        source.handle(&compared(None)),
+        Response::EndpointError(_)
+    ));
+    let mut destination = destination_ops(tree.path());
+    assert!(matches!(
+        destination.handle(&compared(Some(paths[0].clone()))),
+        Response::EndpointError(_)
+    ));
+    let stage = Request::StageBasis {
+        path: path_bytes(&tree.path().join("new")),
+        copy_id: [98; 16],
+        len: 100,
+        block: MIN_HASH_BLOCK_BYTES,
+        allow_final: true,
+        attempt: 0,
+        guard: None,
+    };
+    assert!(!stage.allowed_on_source_worker());
+    assert!(matches!(FsOps::new().handle(&stage), Response::Err(_)));
+    assert!(!tree.path().join("new").exists());
+}
+
+#[test]
+fn retained_comparison_bytes_survive_donor_mutation_and_reject_replay() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("file");
+    fs::write(&path, b"old bytes").unwrap();
+    let mut ops = destination_ops(tree.path());
+    let id = [99; 16];
+    let stage = ops.handle(&Request::StageBasis {
+        path: path_bytes(&path),
+        copy_id: id,
+        len: 9,
+        block: MIN_HASH_BLOCK_BYTES,
+        allow_final: false,
+        attempt: 2,
+        guard: None,
+    });
+    assert!(matches!(
+        stage,
+        Response::BasisStaged {
+            compare_final: false
+        }
+    ));
+    let hash = ops.handle(&Request::HashWindow {
+        final_basis: true,
+        path: path_bytes(&path),
+        copy_id: id,
+        off: 0,
+        len: 9,
+        block: 9,
+        attempt: 2,
+        guard: None,
+    });
+    assert!(
+        matches!(hash, Response::Hashes(h) if h == vec![ops.hash_policy.algorithm.hash(b"old bytes")])
+    );
+    fs::write(&path, b"new bytes").unwrap();
+    let reuse = |copy_id, attempt, off, len| Request::ReuseComparedRange {
+        path: path_bytes(&path),
+        copy_id,
+        attempt,
+        off,
+        len,
+        guard: None,
+    };
+    for request in [
+        reuse([98; 16], 2, 0, 9),
+        reuse(id, 1, 0, 9),
+        reuse(id, 2, 1, 9),
+        reuse(id, 2, 0, 8),
+    ] {
+        assert!(matches!(ops.handle(&request), Response::EndpointError(_)));
+    }
+    assert!(matches!(ops.handle(&reuse(id, 2, 0, 9)), Response::Ok));
+    assert!(matches!(
+        ops.handle(&reuse(id, 2, 0, 9)),
+        Response::EndpointError(_)
+    ));
+    let staged = ops.partial_path(Path::new("file"), &id).unwrap();
+    assert_eq!(fs::read(tree.path().join(staged)).unwrap(), b"old bytes");
+    assert_eq!(fs::read(&path).unwrap(), b"new bytes");
+}
+
+#[test]
+fn prefetched_comparison_window_keeps_current_bytes() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("file");
+    fs::write(&path, b"firstsecond").unwrap();
+    let mut ops = destination_ops(tree.path());
+    let id = [100; 16];
+    assert!(matches!(
+        ops.handle(&Request::StageBasis {
+            path: path_bytes(&path),
+            copy_id: id,
+            len: 11,
+            block: MIN_HASH_BLOCK_BYTES,
+            allow_final: false,
+            attempt: 2,
+            guard: None,
+        }),
+        Response::BasisStaged {
+            compare_final: false
+        }
+    ));
+    for (off, bytes) in [(0, b"first".as_slice()), (5, b"second".as_slice())] {
+        let response = ops.handle(&Request::HashWindow {
+            final_basis: true,
+            path: path_bytes(&path),
+            copy_id: id,
+            off,
+            len: bytes.len() as u32,
+            block: bytes.len() as u64,
+            attempt: 2,
+            guard: None,
+        });
+        assert!(
+            matches!(response, Response::Hashes(h) if h == vec![ops.hash_policy.algorithm.hash(bytes)])
+        );
+    }
+    fs::write(&path, b"replacement").unwrap();
+    for (off, len) in [(0, 5), (5, 6)] {
+        assert!(matches!(
+            ops.handle(&Request::ReuseComparedRange {
+                path: path_bytes(&path),
+                copy_id: id,
+                attempt: 2,
+                off,
+                len,
+                guard: None,
+            }),
+            Response::Ok
+        ));
+    }
+    let staged = ops.partial_path(Path::new("file"), &id).unwrap();
+    assert_eq!(fs::read(tree.path().join(staged)).unwrap(), b"firstsecond");
+}
+
+#[test]
+fn equality_windows_keep_the_same_destination_inode() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let block = MIN_HASH_BLOCK_BYTES;
+    fs::write(root.join("file"), vec![b'a'; (block * 2) as usize]).unwrap();
+    let mut ops = FsOps::new();
+    ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
+    ops.destination_prefix = Some(path_bytes(root));
+    let id = [94; 16];
+    let request = |off| Request::HashAndHold {
+        off,
+        path: path_bytes(&root.join("file")),
+        copy_id: id,
+        block,
+        len: block,
+        condition: TargetCondition::Any,
+        guard: None,
+    };
+    let first = ops.handle(&request(0));
+    fs::rename(root.join("file"), root.join("original")).unwrap();
+    fs::write(root.join("file"), vec![b'b'; (block * 2) as usize]).unwrap();
+    let second = ops.handle(&request(block));
+    match (first, second) {
+        (
+            Response::HeldHashes { hashes: a, len: al },
+            Response::HeldHashes { hashes: b, len: bl },
+        ) => {
+            assert_eq!(a, b);
+            assert_eq!(al, block * 2);
+            assert_eq!(al, bl);
+        }
+        other => panic!("unexpected responses {other:?}"),
+    }
+    for off in [1, u64::MAX - block + 1] {
+        let response = ops.handle(&request(off));
+        assert!(
+            matches!(response, Response::Err(_) | Response::EndpointError(_)),
+            "{response:?}"
+        );
+        assert!(format!("{response:?}").contains("invalid hash interval"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn comparison_workers_release_donor_descriptors_before_publication() {
+    use std::os::unix::fs::MetadataExt;
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("file");
+    fs::write(&path, b"abcdefgh").unwrap();
+    let old = fs::metadata(&path).unwrap();
+    let id = [103; 16];
+    let mut creator = destination_ops(tree.path());
+    assert!(matches!(
+        creator.handle(&Request::StageBasis {
+            path: path_bytes(&path),
+            copy_id: id,
+            len: 8,
+            block: MIN_HASH_BLOCK_BYTES,
+            allow_final: false,
+            attempt: 0,
+            guard: None,
+        }),
+        Response::BasisStaged { .. }
+    ));
+    let mut workers = [destination_ops(tree.path()), destination_ops(tree.path())];
+    for (index, ops) in workers.iter_mut().enumerate() {
+        let off = index as u64 * 4;
+        assert!(matches!(
+            ops.handle(&Request::HashWindow {
+                final_basis: true,
+                path: path_bytes(&path),
+                copy_id: id,
+                off,
+                len: 4,
+                block: 4,
+                attempt: 0,
+                guard: None,
+            }),
+            Response::Hashes(_)
+        ));
+        let request = if index == 0 {
+            Request::ReuseComparedRange {
+                path: path_bytes(&path),
+                copy_id: id,
+                attempt: 0,
+                off,
+                len: 4,
+                guard: None,
+            }
+        } else {
+            Request::WriteRange {
+                path: path_bytes(&path),
+                inplace: false,
+                copy_id: id,
+                attempt: 0,
+                off,
+                hash: ops.hash_policy.payload_algorithm().hash(b"WXYZ"),
+                data: b"WXYZ".to_vec().into(),
+                guard: None,
+            }
+        };
+        assert!(matches!(ops.handle(&request), Response::Ok));
+        assert!(ops.comparison_window.is_none());
+    }
+    let partial = creator.partial_path(Path::new("file"), &id).unwrap();
+    fs::rename(tree.path().join(partial), &path).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"abcdWXYZ");
+    // Keep all sessions alive while checking every descriptor, including those
+    // owned by workers which never execute Finalize.
+    for entry in fs::read_dir("/proc/self/fd").unwrap().flatten() {
+        if let Ok(meta) = fs::metadata(entry.path()) {
+            assert_ne!(
+                (meta.dev(), meta.ino()),
+                (old.dev(), old.ino()),
+                "donor still open: {:?}",
+                entry.path()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unconsumed_comparison_windows_do_not_pin_deleted_donors_after_failure() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("file");
+    fs::write(&path, b"abcdefgh").unwrap();
+    let old = fs::metadata(&path).unwrap();
+    let mut ops = destination_ops(tree.path());
+    let id = [104; 16];
+    for off in [0, 4] {
+        assert!(matches!(
+            ops.handle(&Request::HashWindow {
+                path: path_bytes(&path),
+                copy_id: id,
+                off,
+                len: 4,
+                block: 4,
+                attempt: 0,
+                final_basis: true,
+                guard: None,
+            }),
+            Response::Hashes(_)
+        ));
+    }
+    // A failed request leaves both the active and prefetched bytes unconsumed.
+    assert!(!matches!(
+        ops.handle(&Request::ReuseComparedRange {
+            path: path_bytes(&path),
+            copy_id: id,
+            attempt: 0,
+            off: 999,
+            len: 4,
+            guard: None,
+        }),
+        Response::Ok
+    ));
+    fs::remove_file(&path).unwrap();
+    assert_eq!(ops.comparison_window.as_ref().unwrap().blocks.len(), 2);
+    for entry in fs::read_dir("/proc/self/fd").unwrap().flatten() {
+        if let Ok(meta) = fs::metadata(entry.path()) {
+            assert_ne!(
+                (meta.dev(), meta.ino()),
+                (old.dev(), old.ino()),
+                "unconsumed comparison pinned deleted donor: {:?}",
+                entry.path()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn staged_basis_uses_apfs_clone_and_keeps_an_independent_snapshot() {
+    for len in [4097, 8192, 16384] {
+        let tree = crate::test_support::tempdir().unwrap();
+        let path = tree.path().join("file");
+        fs::write(&path, vec![7; 8192]).unwrap();
+        let id = [105; 16];
+        let mut ops = destination_ops(tree.path());
+        let response = ops.handle(&Request::StageBasis {
+            path: path_bytes(&path),
+            copy_id: id,
+            len,
+            block: MIN_HASH_BLOCK_BYTES,
+            allow_final: true,
+            attempt: 0,
+            guard: None,
+        });
+        // With a final donor, false proves that cloning created the sidecar;
+        // falling back to buffered comparison returns compare_final=true.
+        assert!(
+            matches!(
+                response,
+                Response::BasisStaged {
+                    compare_final: false
+                }
+            ),
+            "APFS clone was not used: {response:?}"
+        );
+        let partial = ops.partial_path(Path::new("file"), &id).unwrap();
+        fs::write(&path, vec![9; 8192]).unwrap();
+        let mut expected = vec![7; 8192];
+        expected.resize(len as usize, 0);
+        assert_eq!(fs::read(tree.path().join(partial)).unwrap(), expected);
+    }
 }

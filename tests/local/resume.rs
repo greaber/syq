@@ -1776,7 +1776,7 @@ fn clean_partials_selects_only_current_regular_files() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn resume_uses_the_verified_buffer_when_candidate_changes_or_disappears() {
+fn resume_uses_the_private_stage_when_candidate_changes_or_disappears() {
     for remove in [false, true] {
         let t = Tmp::new();
         let data = vec![b'a'; 2 << 20];
@@ -1796,13 +1796,13 @@ fn resume_uses_the_verified_buffer_when_candidate_changes_or_disappears() {
                 &t.s("src"),
                 &t.s("out"),
             ])
-            .env("SYQ_TEST_REUSE_READY_FILE", &ready)
-            .env("SYQ_TEST_REUSE_CONTINUE_FILE", &continuation)
+            .env("SYQ_TEST_STAGED_BASIS_READY_FILE", &ready)
+            .env("SYQ_TEST_STAGED_BASIS_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
-        wait_for_confinement_marker(&mut child, &ready, "verified candidate buffer");
+        wait_for_confinement_marker(&mut child, &ready, "private candidate stage");
         if remove {
             fs::remove_file(&candidate).unwrap();
         } else {
@@ -2015,13 +2015,14 @@ fn seeding_preallocates_before_copying_donor_bytes() {
         write(&t.path(".out.syq-tmp.abcdefghijklmnop"), b"donor");
         let out = compat_command()
             .args([
-                "-ac",
+                "-a",
                 "--resource-limits",
                 "bandwidth=1G",
                 "--no-progress",
                 &t.s("src"),
                 &t.s("out"),
             ])
+            .env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1")
             .env("SYQ_TEST_FALLOCATE_ERRNO", "no_space")
             .run()
             .unwrap();

@@ -193,6 +193,20 @@ hashes, payload checks and publication-recovery checks stay in effect. Partial-f
 in every mode: matching bytes from interrupted copies can still be reused,
 even with `off`. The setting controls reuse of the final destination, not partials.
 
+With block reuse enabled, files with identical contents can finish without
+rewriting data even when their metadata differs. A difference near the end can
+add almost a full extra read of both files before copying. An output already
+being written by the current run resumes before that probe.
+Leftover partials from earlier runs do not bypass checking whether the completed
+file already matches.
+
+Changed files still use atomic replacement unless `--inplace` is selected.
+Reflinks can reduce replacement writes on supporting filesystems; otherwise the
+replacement must include every byte, including matching blocks. Comparison can
+use up to 64 MiB of destination buffers per worker (up to 32 MiB at default
+request settings), in addition to source payload buffers. Increasing the worker
+count increases this memory cost.
+
 This setting does not select a sequential writer. To isolate comparison and
 reuse costs while keeping range transfers, compare
 `copy-path=ranges,block-reuse=on` with `copy-path=ranges,block-reuse=off`.
@@ -212,9 +226,15 @@ syq cp --srcs-in source --to host --into destination \
 ```
 
 Set `request-size` too: it otherwise follows the comparison block size.
-At 64 KiB, files must be smaller than 130 GiB or comparison fails. Increase
-`comparison-block-size` for larger files; doubling it doubles that limit.
-Both endpoints still read the full file to compare it.
+Both endpoints still read the full file to compare it. Most staged updates and
+partial resume compare bounded windows; their hash memory does not grow with
+file size. Bandwidth-limited pulls and relays compare before requesting source
+data, so matching blocks do not consume the bandwidth budget. These copies and
+explicit whole-file comparisons (`--hash`, protected-existing-file policies,
+and in-place reuse) have a hash-response limit: at 64 KiB, files must be smaller
+than 130 GiB. Increasing `comparison-block-size` increases that limit proportionally.
+A smaller effective request size, including
+bandwidth pacing, also reduces staged comparison granularity.
 
 In `syq rsync`, `-B` / `--block-size` selects the comparison block size.
 Do not combine it with `comparison-block-size`.
@@ -227,6 +247,9 @@ threshold follows the effective request size, including bandwidth limits.
 `copy-path=streaming` forces streaming and disables whole-file and small-file
 shortcuts. `copy-path=auto-streaming` keeps those shortcuts and streams the
 remaining ranges.
+
+Staged block reuse and partial resume use bounded comparison requests in every
+copy-path mode, including `streaming`.
 
 An explicit `request-size` also sets the streaming block size; bandwidth and
 receiver limits may reduce it. Setting `pipeline-depth` disables automatic

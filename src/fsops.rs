@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod apply;
+mod basis_copy;
 mod entry;
 mod limits;
 mod operator;
@@ -463,6 +464,7 @@ pub struct FsOps {
     /// One final-file descriptor retained between the hash response and the
     /// controller's decision to repair or accept that exact inode.
     held_basis: Option<HeldBasis>,
+    comparison_window: Option<ComparisonWindow>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
     partial_directory_order: VecDeque<FileLocation>,
     operator_selection: Option<OperatorDirectorySelection>,
@@ -471,6 +473,14 @@ pub struct FsOps {
     allow_unconfined_source_paths: bool,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
+}
+
+struct ComparisonWindow {
+    location: FileLocation,
+    copy_id: CopyId,
+    attempt: u32,
+    blocks: Vec<(u64, Vec<u8>)>,
+    sparse: bool,
 }
 
 struct HeldBasis {
@@ -586,6 +596,7 @@ struct PrepareOptions {
 }
 
 struct HashOptions {
+    off: u64,
     which: Which,
     block: u64,
     len: u64,
@@ -653,6 +664,7 @@ impl FsOps {
             fds: HashMap::new(),
             fd_order: Vec::new(),
             held_basis: None,
+            comparison_window: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),
             prepared_small_copy: None,
@@ -1693,7 +1705,10 @@ impl FsOps {
             | Request::HashAndHold { guard, .. }
             | Request::FinishBasis { guard, .. }
             | Request::SeedBasis { guard, .. }
+            | Request::StageBasis { guard, .. }
+            | Request::ReuseComparedRange { guard, .. }
             | Request::HashBlocks { guard, .. }
+            | Request::HashWindow { guard, .. }
             | Request::WriteRange { guard, .. }
             | Request::Finalize { guard, .. }
             | Request::FileHash { guard, .. }
@@ -1722,6 +1737,8 @@ impl FsOps {
             Request::Apply { guard, .. }
             | Request::Prepare { guard, .. }
             | Request::SeedBasis { guard, .. }
+            | Request::StageBasis { guard, .. }
+            | Request::ReuseComparedRange { guard, .. }
             | Request::FinishBasis { guard, .. }
             | Request::WriteRange { guard, .. }
             | Request::Finalize { guard, .. } => guard.is_none(),
@@ -2023,6 +2040,9 @@ impl FsOps {
             | Request::HashAndHold { path, guard, .. }
             | Request::FinishBasis { path, guard, .. }
             | Request::SeedBasis { path, guard, .. }
+            | Request::StageBasis { path, guard, .. }
+            | Request::ReuseComparedRange { path, guard, .. }
+            | Request::HashWindow { path, guard, .. }
             | Request::HashBlocks { path, guard, .. }
             | Request::WriteRange { path, guard, .. }
             | Request::Finalize { path, guard, .. }
@@ -2033,7 +2053,7 @@ impl FsOps {
                     map(path)?;
                 }
             }
-            Request::ReadRange { path, .. } => map(path)?,
+            Request::ReadRange { path, .. } | Request::ReadComparedRange { path, .. } => map(path)?,
             Request::CopyLocal { dst, .. } => map(dst)?,
             Request::ReadSmallBatch(reads) => {
                 for read in reads {

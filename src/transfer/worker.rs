@@ -767,6 +767,10 @@ impl Worker {
 
     pub(super) fn handle_file(&mut self, idx: usize) -> Result<()> {
         let job = self.job(idx);
+        if job.compare_ranges {
+            // A source-change retry chooses its policy again from current facts.
+            self.sched.jobs.lock().unwrap()[idx].compare_ranges = false;
+        }
         let size = job.entry.size;
         let opts = self.opts.clone();
         let _ = &opts;
@@ -922,12 +926,41 @@ impl Worker {
             }
             // Resume an owned output or a previous invocation's partial,
             // independently of the policy for reusing the final destination.
-            if prepared.partial_size.is_some() || (!reuse_blocks && prepared.has_candidates) {
+            if prepared.partial_size.is_some()
+                || (prepared.has_candidates
+                    && !reuse_blocks
+                    && (!self.opts.checksum || !final_is_file))
+            {
                 if size == 0 {
+                    // Discovery can report a donor without creating our output.
+                    // Even an empty replacement needs its own file to publish.
+                    if prepared.partial_size.is_none() {
+                        self.prepare_file(&job, true)?;
+                    }
                     return Ok((vec![], true));
                 }
-                return Ok((self.diff_blocks(&job, Which::Partial)?, true));
+                return Ok((self.resume_ranges(idx, &job)?, true));
             }
+            // Probe equality without creating a sidecar. A difference restarts
+            // the staged pipeline; equal prefixes need not survive that restart.
+            // Explicit checksums and protected/in-place checks stay separate.
+            if !inplace
+                && reuse_blocks
+                && final_is_file
+                && !self.opts.checksum
+                && !self.bandwidth_limited_remote_source()
+                && size > 0
+            {
+                if final_entry.is_some_and(|entry| entry.size == size)
+                    && self.matches_final_windows(&job)?
+                {
+                    self.finish_matched_basis(idx, &job)?;
+                    return Ok((vec![], false));
+                }
+                self.stage_comparison(idx, &job, true)?;
+                return Ok((full(), true));
+            }
+
             if !reuse_blocks {
                 // An explicit checksum may still establish a complete match.
                 // A differing final file contributes no blocks to the output.
@@ -939,7 +972,7 @@ impl Worker {
                     }
                     let prepared = self.prepare_file(&job, true)?;
                     if prepared.partial_size.is_some() || prepared.has_candidates {
-                        return Ok((self.diff_blocks(&job, Which::Partial)?, true));
+                        return Ok((self.resume_ranges(idx, &job)?, true));
                     }
                 }
                 return Ok((full(), true));
@@ -956,7 +989,7 @@ impl Worker {
                 ));
             }
             if prepared.has_candidates {
-                return Ok((self.diff_blocks(&job, Which::Partial)?, true));
+                return Ok((self.resume_ranges(idx, &job)?, true));
             }
             Ok((full(), true))
         })();
@@ -1017,6 +1050,104 @@ impl Worker {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Read-only equality probe. On a difference, discard the comparison and
+    /// restart the normal staged pipeline; no prefix bytes are trusted or reused.
+    fn matches_final_windows(&mut self, job: &WorkerJob) -> Result<bool> {
+        let block = self.opts.block;
+        // Start with one block so pervasive differences are cheap to detect,
+        // then amortize RPC overhead with bounded windows for matching files.
+        let window = (64 << 20) / block * block;
+        let mut off = 0;
+        while off < job.entry.size {
+            let len = (if off == 0 { block } else { window }).min(job.entry.size - off);
+            self.src.send(Request::HashBlocks {
+                off,
+                path: job.src.clone(),
+                source: self.source_reference(job),
+                which: Which::Final,
+                copy_id: self.copy_id(),
+                block,
+                len,
+                attempt: job.attempt,
+                guard: None,
+            })?;
+            self.dst.send(Request::HashAndHold {
+                off,
+                path: job.dst.clone(),
+                copy_id: self.copy_id(),
+                block,
+                len,
+                condition: job.target_condition,
+                guard: job.container_guard.clone(),
+            })?;
+            // Drain both endpoints even when one reports an ordinary file error.
+            let source = self.src.recv();
+            let destination = self.dst.recv();
+            let source = Self::hashes(ok(source?, "hash equality window")?)?;
+            let (destination, held_len) =
+                Self::destination_hashes(ok(destination?, "hash retained equality window")?)?;
+            if held_len != Some(job.entry.size)
+                || source.len() as u64 != len.div_ceil(block)
+                || source != destination
+            {
+                return Ok(false);
+            }
+            off += len;
+        }
+        Ok(true)
+    }
+
+    fn bandwidth_limited_remote_source(&self) -> bool {
+        self.bwlimit.is_some() && self.opts.src_remote
+    }
+
+    fn resume_ranges(&mut self, idx: usize, job: &WorkerJob) -> Result<Vec<(u64, u64)>> {
+        if self.bandwidth_limited_remote_source() {
+            // Conditional source reads may return data immediately. Compare
+            // first so only differing bytes consume bandwidth, and the normal
+            // range/stream path pays their budget before requesting them.
+            // Empty final ranges prohibit using the final file if the partial
+            // disappears before seeding.
+            return self
+                .diff_with(
+                    job,
+                    self.seed_request(job, Some(Vec::new())),
+                    "seed partial",
+                )
+                .map(|diff| diff.ranges);
+        }
+        self.stage_comparison(idx, job, false)?;
+        Ok(if job.entry.size == 0 {
+            vec![]
+        } else {
+            vec![(0, job.entry.size)]
+        })
+    }
+
+    fn stage_comparison(&mut self, idx: usize, job: &WorkerJob, allow_final: bool) -> Result<()> {
+        let compare_final = match ok(
+            self.dst.call(Request::StageBasis {
+                path: job.dst.clone(),
+                copy_id: self.copy_id(),
+                len: job.entry.size,
+                block: self.opts.block,
+                allow_final,
+                attempt: job.attempt,
+                guard: job.container_guard.clone(),
+            })?,
+            "stage comparison basis",
+        )? {
+            Response::BasisStaged { compare_final } => compare_final,
+            other => bail!("unexpected staging response {other:?}"),
+        };
+        let mut jobs = self.sched.jobs.lock().unwrap();
+        jobs[idx].compare_ranges = true;
+        jobs[idx].compare_final = compare_final;
+        drop(jobs);
+        self.sched.request_direct_fallback();
         Ok(())
     }
 
@@ -1119,43 +1250,6 @@ impl Worker {
         entry.mtime = meta.mtime;
         entry.mtime_nsec = meta.mtime_nsec;
         entry
-    }
-
-    /// Hash blocks on both sides (in parallel) and return the ranges that differ.
-    pub(super) fn diff_blocks(&mut self, job: &WorkerJob, which: Which) -> Result<Vec<(u64, u64)>> {
-        if which == Which::Partial {
-            // Empty final ranges still allow partial donors, but prohibit falling
-            // back to the final file if a partial disappears before seeding.
-            return self
-                .diff_with(
-                    job,
-                    self.seed_request(
-                        job,
-                        (!self
-                            .opts
-                            .tuning
-                            .reuse_destination_blocks(self.opts.same_host))
-                        .then(Vec::new),
-                    ),
-                    "seed and hash destination",
-                )
-                .map(|diff| diff.ranges);
-        }
-        self.diff_with(
-            job,
-            Request::HashBlocks {
-                path: job.dst.clone(),
-                source: None,
-                which,
-                copy_id: self.copy_id(),
-                block: self.opts.block,
-                len: job.entry.size,
-                attempt: job.attempt,
-                guard: None,
-            },
-            "hash destination",
-        )
-        .map(|diff| diff.ranges)
     }
 
     pub(super) fn reuse_blocks(
@@ -1262,6 +1356,7 @@ impl Worker {
         let diff = self.diff_with(
             job,
             Request::HashAndHold {
+                off: 0,
                 path: job.dst.clone(),
                 copy_id: self.copy_id(),
                 block: self.opts.block,
@@ -1285,6 +1380,7 @@ impl Worker {
         let block = self.opts.block;
         let size = job.entry.size;
         self.src.send(Request::HashBlocks {
+            off: 0,
             path: job.src.clone(),
             source: self.source_reference(job),
             which: Which::Final,
@@ -1371,6 +1467,11 @@ impl Worker {
             let range = h.lock().unwrap();
             range.end - range.pos
         };
+        let idx = h.lock().unwrap().idx;
+        let job = self.job(idx);
+        if job.compare_ranges {
+            return self.transfer_comparing_range(&job, h, credited);
+        }
         if self
             .opts
             .tuning
@@ -1408,6 +1509,265 @@ impl Worker {
             )?;
         }
         result
+    }
+
+    /// Keep comparison memory bounded by a request window, independent of file
+    /// size. Each source reply either commits a matching block or carries the
+    /// exact bytes just hashed; differing source bytes are never read twice.
+    fn transfer_comparing_range(
+        &mut self,
+        job: &WorkerJob,
+        handle: &RangeHandle,
+        credited: &mut u64,
+    ) -> Result<()> {
+        // Scheduler methods acquire its lock before inspecting range handles.
+        let idx = handle.lock().unwrap().idx;
+        let block = self.opts.block.min(self.transfer_block());
+        let depth = self.opts.tuning.pipeline_depth();
+        let read_depth = if self.src.supports_request_pipelining() {
+            depth
+        } else {
+            1
+        };
+        let hash_depth = if self.dst.supports_request_pipelining() {
+            depth
+        } else {
+            1
+        };
+        // Two windows may retain destination bytes. Bound their combined size.
+        let window = block
+            .saturating_mul(read_depth.max(hash_depth) as u64)
+            .min(crate::proto::MAX_READ_BYTES / 2)
+            .max(block);
+        let prefetch =
+            self.dst.supports_request_pipelining() && window <= crate::proto::MAX_READ_BYTES / 2;
+        let mut matched = 0;
+        let mut reads = std::collections::VecDeque::new();
+        let mut writes = std::collections::VecDeque::new();
+        let mut next_window = None;
+        let mut pending_hash = false;
+        let result = (|| -> Result<()> {
+            loop {
+                if self.sched.is_aborted() || self.sched.is_failed(idx) {
+                    break;
+                }
+                let (start, end, hashes) = if let Some(window) = next_window.take() {
+                    window
+                } else {
+                    let Some((start, end)) = self.claim_comparison_window(handle, window) else {
+                        break;
+                    };
+                    let request = self.hash_window_request(job, start, end, block);
+                    let hashes = Self::window_hashes(self.dst.call(request)?, start, end, block)?;
+                    (start, end, hashes)
+                };
+                // This response precedes the write acknowledgments below.
+                // The receiver hashes ahead while the source reads this window.
+                let ahead = if prefetch {
+                    self.claim_comparison_window(handle, window)
+                } else {
+                    None
+                };
+                if let Some((off, end)) = ahead {
+                    self.dst
+                        .send(self.hash_window_request(job, off, end, block))?;
+                    pending_hash = true;
+                }
+                let mut blocks = hashes.into_iter().enumerate();
+                loop {
+                    while reads.len() < read_depth {
+                        let Some((index, expected)) = blocks.next() else {
+                            break;
+                        };
+                        let off = start + index as u64 * block;
+                        let len = (end - off).min(block);
+                        self.src.send(Request::ReadComparedRange {
+                            path: job.src.clone(),
+                            source: self.source_reference(job),
+                            attempt: job.attempt,
+                            off,
+                            len: len as u32,
+                            expected,
+                        })?;
+                        reads.push_back((off, len));
+                        self.benchmark.max_request_bytes =
+                            self.benchmark.max_request_bytes.max(len);
+                    }
+                    let Some((expected_off, expected_len)) = reads.pop_front() else {
+                        break;
+                    };
+                    match ok(self.src.recv()?, "compare source block")? {
+                        Response::RangeMatched { off, len } => {
+                            validate_range_reply(expected_off, expected_len, off, len as usize)?;
+                            if job.compare_final {
+                                self.dst.send(Request::ReuseComparedRange {
+                                    path: job.dst.clone(),
+                                    copy_id: self.copy_id(),
+                                    attempt: job.attempt,
+                                    off,
+                                    len,
+                                    guard: job.container_guard.clone(),
+                                })?;
+                                writes.push_back((expected_len, true));
+                            } else {
+                                Self::acknowledge_comparison(
+                                    &self.progress,
+                                    job,
+                                    expected_len,
+                                    true,
+                                    credited,
+                                    &mut matched,
+                                );
+                            }
+                        }
+                        Response::Block { off, hash, data } => {
+                            validate_range_reply(expected_off, expected_len, off, data.len())?;
+                            self.benchmark.range_requests += 1;
+                            self.limit(expected_len);
+                            self.dst.send(Request::WriteRange {
+                                path: job.dst.clone(),
+                                inplace: false,
+                                copy_id: self.copy_id(),
+                                attempt: job.attempt,
+                                off,
+                                hash,
+                                data: data.into(),
+                                guard: job.container_guard.clone(),
+                            })?;
+                            writes.push_back((expected_len, false));
+                        }
+                        _ => {
+                            return Err(anyhow::Error::new(RangeReplyMismatch)
+                                .context("invalid comparison reply"))
+                        }
+                    }
+                }
+                if let Some((off, end)) = ahead {
+                    let response = self.dst.recv();
+                    pending_hash = false;
+                    next_window =
+                        Some((off, end, Self::window_hashes(response?, off, end, block)?));
+                }
+                while let Some((len, reused)) = writes.pop_front() {
+                    match ok(self.dst.recv()?, "write compared block")? {
+                        Response::Ok => {}
+                        _ => {
+                            return Err(anyhow::Error::new(RangeReplyMismatch)
+                                .context("invalid comparison write acknowledgment"))
+                        }
+                    }
+                    Self::acknowledge_comparison(
+                        &self.progress,
+                        job,
+                        len,
+                        reused,
+                        credited,
+                        &mut matched,
+                    );
+                }
+            }
+            Ok(())
+        })();
+        if result.as_ref().is_err_and(|e| e.is::<RangeReplyMismatch>()) {
+            return result;
+        }
+        // Drain in wire order, even after an ordinary endpoint error. Source
+        // failures must not leave a hash reply mistaken for a write acknowledgment.
+        let source_end = crate::conn::drain_range_replies(&mut *self.src, reads.len(), "compare");
+        let hash_end = crate::conn::drain_range_replies(
+            &mut *self.dst,
+            usize::from(pending_hash),
+            "hash window",
+        );
+        let destination_end = crate::conn::drain_range_replies_with(
+            &mut *self.dst,
+            writes,
+            "write",
+            |(len, reused)| {
+                Self::acknowledge_comparison(
+                    &self.progress,
+                    job,
+                    len,
+                    reused,
+                    credited,
+                    &mut matched,
+                );
+            },
+        );
+        let result = result.and(source_end).and(hash_end).and(destination_end);
+        if result.is_err() && self.transport_dead() {
+            job.done.fetch_sub(matched, Relaxed);
+            self.progress.bytes_unchanged.fetch_sub(matched, Relaxed);
+            self.progress.bytes_total.fetch_add(matched, Relaxed);
+        }
+        #[cfg(debug_assertions)]
+        if result.is_ok() {
+            crate::fsops::record_test_event(
+                "SYQ_TEST_WORKER_EVENTS",
+                format_args!("compare-range {} {} {} {}", self.id, idx, credited, matched),
+            )?;
+        }
+        result
+    }
+
+    fn claim_comparison_window(&self, handle: &RangeHandle, window: u64) -> Option<(u64, u64)> {
+        if !self.gate.allowed(self.id) {
+            self.sched.release_rest(handle);
+        }
+        let mut range = handle.lock().unwrap();
+        let start = range.pos;
+        let end = range.end.min(start.saturating_add(window));
+        range.pos = end;
+        (start < end).then_some((start, end))
+    }
+
+    fn hash_window_request(&self, job: &WorkerJob, start: u64, end: u64, block: u64) -> Request {
+        Request::HashWindow {
+            final_basis: job.compare_final,
+            path: job.dst.clone(),
+            copy_id: self.copy_id(),
+            off: start,
+            len: (end - start) as u32,
+            block,
+            attempt: job.attempt,
+            guard: job.container_guard.clone(),
+        }
+    }
+
+    fn window_hashes(
+        response: Response,
+        start: u64,
+        end: u64,
+        block: u64,
+    ) -> Result<Vec<ContentDigest>> {
+        match ok(response, "hash comparison window")? {
+            Response::Hashes(hashes) if hashes.len() as u64 == (end - start).div_ceil(block) => {
+                Ok(hashes)
+            }
+            _ => {
+                Err(anyhow::Error::new(RangeReplyMismatch)
+                    .context("invalid comparison hash window"))
+            }
+        }
+    }
+
+    fn acknowledge_comparison(
+        progress: &Progress,
+        job: &WorkerJob,
+        len: u64,
+        reused: bool,
+        credited: &mut u64,
+        matched: &mut u64,
+    ) {
+        job.done.fetch_add(len, Relaxed);
+        if reused {
+            *matched += len;
+            progress.bytes_unchanged.fetch_add(len, Relaxed);
+            progress.bytes_total.fetch_sub(len, Relaxed);
+        } else {
+            *credited += len;
+            progress.add_bytes(len);
+        }
     }
 
     pub(super) fn acknowledge_range_write(
