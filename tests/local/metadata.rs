@@ -448,7 +448,7 @@ fn native_cp_activity_covers_short_copies_and_preserves_terminal_order() {
             "--results",
             "activity.ndjson",
             "--stats",
-            "-q",
+            "--no-progress",
         ],
         None,
     );
@@ -482,7 +482,7 @@ fn native_cp_activity_covers_short_copies_and_preserves_terminal_order() {
             .iter()
             .any(|a| a["observed_ns"].as_u64().unwrap() > 0)));
     let stderr = stderr_of(&out);
-    assert!(stderr.contains("Observed worker time:"));
+    assert!(stderr.contains("Observed worker time:"), "{stderr}");
     assert!(stderr.contains("worker 0 (process "), "{stderr}");
     assert!(stderr.contains("bytes"), "{stderr}");
     assert!(stderr.contains("CPU: user"), "{stderr}");
