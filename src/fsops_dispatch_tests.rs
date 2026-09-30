@@ -19,6 +19,7 @@ fn put(path: &[u8]) -> SmallPut {
         inplace: false,
         condition: TargetCondition::Any,
         guard: None,
+        replaces: false,
     }
 }
 

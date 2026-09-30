@@ -341,10 +341,45 @@ fn version_prefix_keeps_command_completion_and_never_completes_a_download() {
     for words in [
         vec!["syq", "--use-version", "0.7.1", "cp", "--int"],
         vec!["syq", "--use-version=0.7.1", "cp", "--int"],
+        vec![
+            "syq",
+            "--version-is",
+            ">=0.7.1, <1.0.0 | 2.0.0",
+            "cp",
+            "--int",
+        ],
+        vec!["syq", "--version-is=0.7.1", "cp", "--int"],
+        vec![
+            "syq",
+            "--version-is=0.7.1",
+            "--use-version",
+            "0.7.0",
+            "cp",
+            "--int",
+        ],
+        vec![
+            "syq",
+            "--use-version=0.7.0",
+            "--version-is",
+            "0.7.1",
+            "cp",
+            "--int",
+        ],
     ] {
         let words = words.into_iter().map(OsString::from).collect::<Vec<_>>();
         assert!(values(candidates(words.len() - 1, &words).unwrap()).contains(&b"--into".to_vec()));
     }
-    let words = ["syq", "--use-version", ""].map(OsString::from);
-    assert!(candidates(2, &words).unwrap().is_empty());
+    for args in [
+        vec!["syq", "--use-version", ""],
+        vec!["syq", "--version-is", ""],
+        vec!["syq", "--use-version=0.7.0", "--version-is", ""],
+        vec!["syq", "--version-is=0.7.1", "--use-version", ""],
+    ] {
+        let words = args.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(candidates(words.len() - 1, &words).unwrap().is_empty());
+    }
+    let words = ["syq", "--version-is=0.7.1", "c"].map(OsString::from);
+    assert!(values(candidates(2, &words).unwrap()).contains(&b"cp".to_vec()));
+    let words = ["syq", "--vers"].map(OsString::from);
+    assert!(values(candidates(1, &words).unwrap()).contains(&b"--version-is".to_vec()));
 }
