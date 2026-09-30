@@ -448,7 +448,6 @@ fn native_cp_activity_covers_short_copies_and_preserves_terminal_order() {
             "--results",
             "activity.ndjson",
             "--stats",
-            "-q",
         ],
         None,
     );
