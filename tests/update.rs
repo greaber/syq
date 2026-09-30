@@ -663,8 +663,10 @@ fn use_version_preserves_raw_arguments_environment_input_and_exit_status() {
     fs::remove_dir_all(fixture.temp.path("fixtures")).unwrap();
     let raw = std::ffi::OsString::from_vec(b"name-\xff".to_vec());
     let mut child = Command::new(&fixture.installed)
+        .args(["--version-is", env!("CARGO_PKG_VERSION")])
         .args(["--use-version=0.7.0", "cp", "--future-option", "two words"])
         .arg(raw)
+        .env("SYQ_TEST_RELEASE_BUILD", "1")
         .env("SYQ_CP_OPTIONS", "--future-environment-option")
         .env("XDG_CACHE_HOME", fixture.temp.path("cache"))
         .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
@@ -740,7 +742,10 @@ fn use_version_rejects_misplaced_root_selection_before_early_exit() {
         vec!["--self-update", "--use-version=9.9.9"],
     ] {
         let output = fixture.command_at_args(&fixture.installed, &args);
-        assert_failure_contains(&output, "--use-version must be the first argument");
+        assert_failure_contains(
+            &output,
+            "--use-version must precede the command and other options",
+        );
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stderr.ends_with(b"\n"), "{output:?}");
         assert!(output.stdout.is_empty());
@@ -787,4 +792,189 @@ fn use_version_invalid_selection_diagnostics_end_with_a_newline() {
         assert!(output.stderr.ends_with(b"\n"), "{output:?}");
         assert!(output.stdout.is_empty());
     }
+}
+
+#[test]
+fn version_is_checks_numeric_expressions_before_early_exit() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let current = env!("CARGO_PKG_VERSION");
+    let exact = format!("=={current}");
+    let range = format!(">=0.0.0, <{}, !=0.0.0", next_release_version());
+    let either = format!("0.0.0 | {current}");
+    for expression in [current, &exact, &range, &either] {
+        let output = fixture.command_at_args(
+            &fixture.installed,
+            &["--version-is", expression, "--version"],
+        );
+        assert_success(&output);
+        assert_eq!(output.stdout, format!("syq {current}\n").as_bytes());
+    }
+    let mismatch = format!("!={current}");
+    for action in [
+        "--version",
+        "-V",
+        "--help",
+        "--help-all",
+        "--build-identity",
+    ] {
+        let output =
+            fixture.command_at_args(&fixture.installed, &["--version-is", &mismatch, action]);
+        assert_failure_contains(&output, &format!("invoked syq {current} does not satisfy"));
+        assert_failure_contains(&output, &mismatch);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.ends_with(b"\n"));
+    }
+    assert!(!fixture.temp.path("cache").exists());
+    assert!(!fixture.config.exists());
+}
+
+#[test]
+fn version_is_rejects_invalid_expressions_and_prefixes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let hidden_invalid = format!("{} | invalid", env!("CARGO_PKG_VERSION"));
+    for expression in ["", "^0.7.1", "0.7", "0.7.1 || 0.7.2", &hidden_invalid] {
+        let output =
+            fixture.command_at_args(&fixture.installed, &["--version-is", expression, "--help"]);
+        assert_failure_contains(&output, "invalid --version-is expression");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.ends_with(b"\n"));
+    }
+    for args in [
+        vec!["--version-is"],
+        vec!["--version-is=0.7.1", "--version-is=0.7.1"],
+        vec!["--help", "--version-is=0.7.1"],
+        vec!["--version", "--version-is=0.7.1"],
+        vec!["--build-identity", "--version-is=0.7.1"],
+        vec!["--self-update", "--version-is=0.7.1"],
+    ] {
+        let output = fixture.command_at_args(&fixture.installed, &args);
+        assert_failure_contains(&output, "--version-is");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    let output = Command::new(&fixture.installed)
+        .arg("--version-is")
+        .arg(OsString::from_vec(b"0.7.\xff".to_vec()))
+        .arg("--help")
+        .capture_output()
+        .unwrap();
+    assert_failure_contains(&output, "--version-is requires an expression");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!fixture.temp.path("cache").exists());
+}
+
+#[test]
+fn version_is_is_consumed_before_selecting_an_older_release_in_either_order() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let current = env!("CARGO_PKG_VERSION");
+    assert_ne!(current, "0.7.0");
+    let inline = format!("--version-is={current}");
+    // The selected fixture knows only --version and --build-identity, and its
+    // version does not satisfy this guard. Passing the guard through would fail.
+    for args in [
+        vec![
+            "--version-is",
+            current,
+            "--use-version",
+            "0.7.0",
+            "--version",
+        ],
+        vec!["--use-version=0.7.0", &inline, "--version"],
+    ] {
+        let output = fixture.command_at_args(&fixture.installed, &args);
+        assert_success(&output);
+        assert_eq!(output.stdout, b"syq 0.7.0\n");
+    }
+}
+
+#[test]
+fn version_is_failure_precedes_downloads_updates_environment_and_copying() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let missing = format!("!={}", env!("CARGO_PKG_VERSION"));
+    let inline = format!("--version-is={missing}");
+    for args in [
+        vec!["--version-is", &missing, "--use-version=0.7.0", "--version"],
+        vec!["--use-version", "0.7.0", &inline, "--version"],
+        vec!["--version-is", &missing, "--self-update"],
+    ] {
+        let output = fixture.command_at_args(&fixture.installed, &args);
+        assert_failure_contains(&output, "does not satisfy --version-is");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+    }
+    let source = fixture.temp.path("source");
+    let destination = fixture.temp.path("destination");
+    fs::write(&source, b"source contents").unwrap();
+    for (expression, expected) in [
+        (&missing[..], "does not satisfy"),
+        ("^1.0.0", "invalid --version-is"),
+    ] {
+        let output = Command::new(&fixture.installed)
+            .args(["--version-is", expression, "cp"])
+            .arg(&source)
+            .arg("--as")
+            .arg(&destination)
+            .env("SYQ_TEST_RELEASE_BUILD", "1")
+            .env("SYQ_CP_OPTIONS", "'unterminated")
+            .env("XDG_CACHE_HOME", fixture.temp.path("cache"))
+            .capture_output()
+            .unwrap();
+        assert_failure_contains(&output, expected);
+        assert!(!destination.exists());
+    }
+    assert!(!fixture.temp.path("cache").exists());
+    assert!(!fixture.config.exists());
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
+    assert_eq!(fs::read(source).unwrap(), b"source contents");
+}
+
+#[test]
+fn version_is_rejects_development_builds_even_with_release_helpers() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    for helpers in ["0", "1"] {
+        let output = Command::new(&fixture.installed)
+            .args([
+                "--version-is",
+                env!("CARGO_PKG_VERSION"),
+                "--use-version=0.7.0",
+                "--version",
+            ])
+            .env("SYQ_TEST_RELEASE_BUILD", "0")
+            .env("SYQ_TEST_RELEASE_HELPERS", helpers)
+            .env("XDG_CACHE_HOME", fixture.temp.path("cache"))
+            .capture_output()
+            .unwrap();
+        assert_failure_contains(&output, "--version-is only supports release builds");
+        assert_failure_contains(&output, "invoked development build");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+    }
+    assert!(!fixture.temp.path("cache").exists());
+}
+
+#[test]
+fn version_is_allows_a_matching_copy_and_preserves_flag_like_filenames() {
+    let temp = test_support::tempdir().unwrap();
+    let source = temp.path().join("--version-is=0.0.0");
+    let destination = temp.path().join("destination");
+    fs::write(&source, b"payload").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .current_dir(temp.path())
+        .args(["--version-is", env!("CARGO_PKG_VERSION"), "cp", "--as"])
+        .arg(&destination)
+        .args(["--", "--version-is=0.0.0"])
+        .env("SYQ_TEST_RELEASE_BUILD", "1")
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .capture_output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(fs::read(destination).unwrap(), b"payload");
+    assert_eq!(fs::read(source).unwrap(), b"payload");
 }
