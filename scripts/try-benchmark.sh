@@ -35,7 +35,8 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
 
 After --, tune syq with --performance-tuning, --resource-limits,
 --tcp-ports, --tcp-congestion (each takes a value), or --no-tcp, --no-compress,
---no-tcp-encryption, --inplace, --stats, --no-progress, -v/-vv/--verbose.
+--no-tcp-encryption (--tcp-plain through v0.7.1), --inplace, --stats,
+--no-progress, -v/-vv/--verbose.
 These options also apply to syq setup/warm-up/calibration; rsync and cp are unchanged.
 Add -v/-vv/--verbose after -- to show full commands and scratch paths.
 Use --tool syq --rounds 1 --size quick for one scored syq copy per workload.
@@ -78,6 +79,7 @@ remote() { ssh -o ControlMaster=no -o ControlPath=none -o ControlPersist=no -o C
 active_pid=
 terminal_pgid=
 local_root=
+syq_metadata=
 dest_root=
 remote_root=
 host=
@@ -282,14 +284,14 @@ warm_up() {
 
 copy_with() {
     local tool=$1 source=$2 destination=$3
-    local command=() syq_options=(--copy-metadata=permissions --stats --results "$local_root/trial.json")
+    local command=() syq_options=("$syq_metadata" --stats --results "$local_root/trial.json")
     $show_syq_summary || syq_options+=(--suppress-summary)
     # Always suppress the tiny setup copy's summary, keeping bootstrap
     # diagnostics and authentication prompts live. Supported
     # by the released v0.3.2 CLI as well as current builds.
-    [[ ${4:-} != setup ]] || syq_options=(--copy-metadata=permissions --suppress-summary --no-progress)
-    [[ ${4:-} != calibration ]] || syq_options=(--copy-metadata=permissions --suppress-summary --results "$local_root/calibration.json")
-    [[ ${4:-} != warmup ]] || syq_options=(--copy-metadata=permissions --suppress-summary --results "$local_root/warmup.json")
+    [[ ${4:-} != setup ]] || syq_options=("$syq_metadata" --suppress-summary --no-progress)
+    [[ ${4:-} != calibration ]] || syq_options=("$syq_metadata" --suppress-summary --results "$local_root/calibration.json")
+    [[ ${4:-} != warmup ]] || syq_options=("$syq_metadata" --suppress-summary --results "$local_root/warmup.json")
     if $has_syq_options; then syq_options+=("${syq_extra[@]}"); fi
     case $tool in
         syq)
@@ -497,7 +499,7 @@ main() {
                             verbose=true; show_syq_summary=true; syq_extra+=("$1"); shift ;;
                         --stats)
                             show_syq_summary=true; syq_extra+=("$1"); shift ;;
-                        --no-tcp|--no-compress|--no-tcp-encryption|--inplace|--no-progress)
+                        --no-tcp|--no-compress|--no-tcp-encryption|--tcp-plain|--inplace|--no-progress)
                             syq_extra+=("$1"); shift ;;
                         *) fail "Unsupported syq benchmark option: $1 (see --help for tuning options)" ;;
                     esac
@@ -600,6 +602,15 @@ main() {
     export XDG_CONFIG_HOME="$local_root/config"
     export XDG_RUNTIME_DIR="$local_root/runtime"
     run syq persist off || fail 'Could not disable syq persistence for this benchmark.'
+    # Releases through v0.7.1 select metadata with --preserve; later builds
+    # use --copy-metadata and refuse --preserve. Probe with an empty dry run.
+    mkdir "$local_root/metadata-probe"
+    if syq cp --copy-metadata=permissions --dry-run --no-progress --suppress-summary \
+        --srcs-in "$local_root/metadata-probe" --into "$local_root/metadata-probe-copy" >/dev/null 2>&1; then
+        syq_metadata=--copy-metadata=permissions
+    else
+        syq_metadata=--preserve=permissions
+    fi
     printf '\nVersions:\n'
     syq_identity=$(syq --build-identity)
     printf 'syq: %s\n' "$syq_identity"
